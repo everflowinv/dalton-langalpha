@@ -518,6 +518,19 @@ class InMemoryChannelStore:
                     return [{"thread_id": r["thread_id"]}]
             return []
 
+        if (
+            "SELECT" in norm
+            and "FROM dalton_channel_inbound_events WHERE run_id = %s" in norm
+            and "COALESCE(MAX(" not in norm
+        ):
+            rid = str(params[0])
+            only_fb = "fallback_pending = TRUE" in norm
+            return [
+                dict(r)
+                for _, r in sorted(self.inbound_events.items())
+                if r.get("run_id") == rid and (not only_fb or r.get("fallback_pending"))
+            ]
+
         if "SELECT run_id FROM dalton_channel_inbound_events WHERE thread_id = %s AND status IN" in norm:
             tid = str(params[0])
             for r in reversed(list(self.inbound_events.values())):
@@ -549,6 +562,10 @@ class InMemoryChannelStore:
             row = self.inbound_events.get((plat, mid))
             if not row:
                 return []
+            if "SET sent_to_current_count = sent_to_current_count + 1" in norm:
+                row["sent_to_current_count"] = int(row.get("sent_to_current_count") or 0) + 1
+                row["updated_at"] = now
+                return [{"sent_to_current_count": row["sent_to_current_count"]}]
             if "SET status = 'ignored', raw_payload = %s" in norm:
                 row["status"] = "ignored"
                 val = params[0].obj if hasattr(params[0], "obj") else params[0]
@@ -1425,6 +1442,17 @@ class InMemoryChannelStore:
                     and str(r.get("weixin_account_id")) not in excluded
                 ]
                 return matches[:1]
+            if "WHERE thread_id = %s AND weixin_account_id IS NOT NULL" in norm:
+                tid = str(params[0])
+                excluded = {str(x) for x in (params[1] or [])} if len(params) > 1 else set()
+                r = self.thread_watches.get(tid)
+                if (
+                    r
+                    and r.get("weixin_account_id") is not None
+                    and str(r.get("weixin_account_id")) not in excluded
+                ):
+                    return [{"?column?": 1}]
+                return []
             if "WHERE thread_id = %s" in norm:
                 tid = str(params[0])
                 r = self.thread_watches.get(tid)
@@ -1531,6 +1559,19 @@ class InMemoryChannelStore:
                     for r in self.background_runs.values()
                     if r.get("fallback_pending")
                 ]
+            if "WHERE thread_id = %s::uuid AND run_id = %s" in norm:
+                tid_q, rid_q = str(params[0]), str(params[1])
+                r = self.background_runs.get(rid_q)
+                if r and str(r.get("thread_id") or "") == tid_q:
+                    return [dict(r)]
+                return []
+            if "WHERE run_id = %s" in norm:
+                rid_q = str(params[0])
+                only_fb = "fallback_pending = TRUE" in norm
+                r = self.background_runs.get(rid_q)
+                if r and (not only_fb or r.get("fallback_pending")):
+                    return [dict(r)]
+                return []
             if "WHERE" in norm:
                 p_idx = 0
                 uid_filter = None
@@ -1713,7 +1754,14 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
-            schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+            if len(params) == 11:
+                schunks, tchunks, pmids, fstat, fresp, st, _st2, is_bt2_p, ecode, emsg, dkey = params
+            elif len(params) == 10:
+                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, _lease_s, dkey = params
+                is_bt2_p = False
+            else:
+                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+                is_bt2_p = False
             r = self.deliveries[str(dkey)]
             r["sent_chunks"] = int(schunks)
             r["total_chunks"] = int(tchunks)
@@ -1723,7 +1771,9 @@ class InMemoryChannelStore:
                 fresp.obj if hasattr(fresp, "obj") else fresp
             )
             r["status"] = str(st)
-            if ecode is not None:
+            if str(st) == "sent" and is_bt2_p:
+                r["error_code"] = None
+            elif ecode is not None:
                 r["error_code"] = str(ecode)
             if emsg is not None:
                 r["error_message"] = str(emsg)
@@ -1761,6 +1811,13 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_background_runs SET sent_to_current_count = sent_to_current_count + 1" in norm:
+            if "WHERE thread_id = %s::uuid AND run_id = %s" in norm:
+                tid_q, rid = str(params[0]), str(params[1])
+                r = self.background_runs.get(rid)
+                if r and str(r.get("thread_id") or "") == tid_q:
+                    r["sent_to_current_count"] = int(r.get("sent_to_current_count") or 0) + 1
+                    return [{"sent_to_current_count": r["sent_to_current_count"]}]
+                return []
             rid = str(params[0])
             r = self.background_runs.get(rid)
             if r:
@@ -1979,6 +2036,22 @@ class InMemoryChannelStore:
                     "updated_at": now,
                 }
             return [{"targets": self.automation_runs[exec_id]["targets"]}]
+
+        if "SELECT 1 FROM dalton_channel_deliveries WHERE execution_id = %s AND delivery_key LIKE %s AND status = 'in_flight'" in norm:
+            exec_id = str(params[0])
+            like_pat = str(params[1])
+            prefix = like_pat.split("%", 1)[0]
+            suffix = like_pat.rsplit("%", 1)[-1]
+            for r in self.deliveries.values():
+                dkey = str(r.get("delivery_key") or "")
+                if (
+                    str(r.get("execution_id") or "") == exec_id
+                    and r.get("status") == "in_flight"
+                    and dkey.startswith(prefix)
+                    and dkey.endswith(suffix)
+                ):
+                    return [{"?column?": 1}]
+            return []
 
         if "SELECT DISTINCT target_address FROM dalton_channel_deliveries WHERE execution_id = %s" in norm:
             exec_id = str(params[0])
@@ -3446,6 +3519,109 @@ def test_outbound_deliveries_progress_steers_recover_automation_and_weixin(
     assert r_fin_direct.json()["status"] == "finished"
     assert r_fin_direct.json()["previous_status"] == "registered"
     assert len(r_fin_direct.json()["targets"]) == 1
+
+    # BW2: mark_finished=True MUST keep status='finishing' while an `:charts` delivery
+    # for the execution is still `in_flight`, and once settled only the first caller writes
+    # `finished` without a later caller overwriting persisted targets.
+    exec_id_3 = str(uuid4())
+    r_reg_3 = client.post(
+        "/api/v1/dalton/channels/internal/automation-runs",
+        headers=headers,
+        json={
+            "execution_id": exec_id_3,
+            "user_id": "u-alice",
+            "automation_name": "concurrent-charts-guard",
+            "entries": ["feishu"],
+        },
+    )
+    assert r_reg_3.status_code == 200
+    r_claim_3 = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={"status": "completed", "mark_finished": False},
+    )
+    assert r_claim_3.status_code == 200
+    assert r_claim_3.json()["status"] == "finishing"
+
+    charts_key_3 = f"automation:{exec_id_3}:feishu:charts"
+    store.deliveries[charts_key_3] = {
+        "delivery_key": charts_key_3,
+        "execution_id": exec_id_3,
+        "kind": "automation",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+    }
+    r_blocked_finish = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": False,
+                    "via": None,
+                    "error": "premature",
+                }
+            ],
+        },
+    )
+    assert r_blocked_finish.status_code == 200
+    assert r_blocked_finish.json()["status"] == "finishing"
+    assert store.automation_runs[exec_id_3]["status"] == "finishing"
+
+    # Once `:charts` settles to `sent`, the legitimate finisher transitions `finishing -> finished`,
+    # and a subsequent concurrent `mark_finished=True` cannot overwrite the persisted targets.
+    store.deliveries[charts_key_3]["status"] = "sent"
+    r_settled_finish = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": True,
+                    "via": "fallback",
+                    "error": None,
+                }
+            ],
+        },
+    )
+    assert r_settled_finish.status_code == 200
+    assert r_settled_finish.json()["status"] == "finished"
+    assert r_settled_finish.json()["previous_status"] == "finishing"
+
+    r_late_overwrite = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": False,
+                    "via": None,
+                    "error": "late overwrite must be ignored",
+                }
+            ],
+        },
+    )
+    assert r_late_overwrite.status_code == 200
+    assert r_late_overwrite.json()["status"] == "finished"
+    assert r_late_overwrite.json()["previous_status"] == "finished"
+    assert r_late_overwrite.json()["targets"][0]["reached"] is True
+    assert r_late_overwrite.json()["targets"][0]["error"] is None
 
     # §6.1: Legacy singleton /internal/weixin-state is removed (404)
     assert (
@@ -8766,6 +8942,282 @@ async def test_discord_channel_entry_endpoint_isolation_and_reference_guard(
     assert store.user_settings["u-admin"]["apps"]["discord"]["chats"][locked_addr]["workspace_id"] == locked_ws
 
 
+@asynccontextmanager
+async def _isolated_empty_test_database(
+    raw_dsn: str | None,
+    *,
+    tag: str,
+):
+    """Create a fresh, empty isolated ``*_test`` PostgreSQL database, apply both Alembic
+    migration chains to it, yield its DSN, and drop the database on exit.
+
+    Never mutates or requires emptiness of the shared base ``*_test`` database.
+    """
+    import asyncio
+    from pathlib import Path
+    import re
+    from urllib.parse import urlsplit, urlunsplit
+
+    if raw_dsn is None or not raw_dsn.strip():
+        pytest.skip("DALTON_CHANNEL_GATEWAY_TEST_DSN is not set")
+    base_uri = raw_dsn.strip()
+    parsed = urlsplit(base_uri)
+    base_db = parsed.path.lstrip("/")
+    if (
+        any(ch.isspace() for ch in base_uri)
+        or parsed.scheme not in ("postgresql", "postgres")
+        or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+        or parsed.query != ""
+        or parsed.fragment != ""
+        or not base_db
+        or "/" in base_db
+        or not base_db.endswith("_test")
+        or len(base_db) <= len("_test")
+    ):
+        pytest.fail(
+            "Invalid DALTON_CHANNEL_GATEWAY_TEST_DSN: expected a local postgresql:// or postgres:// URL "
+            "(127.0.0.1, localhost, or ::1) targeting a *_test database with no query or fragment"
+        )
+
+    from alembic import command
+    from alembic.config import Config
+    from psycopg import sql as pg_sql
+
+    clean_tag = re.sub(r"[^a-z0-9]+", "_", tag.lower()).strip("_")[:20] or "cg"
+    isolated_db = f"dalton_cg_{clean_tag}_{uuid4().hex[:10]}_test"
+    isolated_uri = urlunsplit(
+        (parsed.scheme, parsed.netloc, f"/{isolated_db}", parsed.query, parsed.fragment)
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    if isolated_uri.startswith("postgresql://"):
+        sa_url = "postgresql+psycopg://" + isolated_uri[len("postgresql://") :]
+    else:
+        sa_url = "postgresql+psycopg://" + isolated_uri[len("postgres://") :]
+    escaped_sa_url = sa_url.replace("%", "%%")
+
+    core_cfg = Config(str(repo_root / "alembic.ini"))
+    core_cfg.set_main_option("script_location", str(repo_root / "migrations"))
+    core_cfg.set_main_option("sqlalchemy.url", escaped_sa_url)
+
+    dalton_cfg = Config(str(repo_root / "alembic.ini"))
+    dalton_cfg.set_main_option(
+        "script_location", str(repo_root / "src" / "dalton" / "migrations")
+    )
+    dalton_cfg.set_main_option("sqlalchemy.url", escaped_sa_url)
+    dalton_cfg.set_main_option("version_table", "alembic_version_dalton")
+
+    created = False
+    try:
+        try:
+            async with await psycopg.AsyncConnection.connect(
+                base_uri, autocommit=True
+            ) as admin_conn:
+                await admin_conn.execute(
+                    pg_sql.SQL("CREATE DATABASE {}").format(
+                        pg_sql.Identifier(isolated_db)
+                    )
+                )
+            created = True
+        except BaseException as exc:
+            if isinstance(exc, pytest.fail.Exception):
+                raise
+            pytest.fail(
+                f"Configured DALTON_CHANNEL_GATEWAY_TEST_DSN database is unreachable ({type(exc).__name__})"
+            )
+
+        def _upgrade_both_trees() -> None:
+            command.upgrade(core_cfg, "head")
+            command.upgrade(dalton_cfg, "head")
+
+        await asyncio.to_thread(_upgrade_both_trees)
+        yield isolated_uri
+    finally:
+        if created:
+            try:
+                async with await psycopg.AsyncConnection.connect(
+                    base_uri, autocommit=True
+                ) as admin_conn:
+                    await admin_conn.execute(
+                        """
+                        SELECT pg_terminate_backend(pid)
+                        FROM pg_stat_activity
+                        WHERE datname = %s AND pid <> pg_backend_pid()
+                        """,
+                        (isolated_db,),
+                    )
+                    await admin_conn.execute(
+                        pg_sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                            pg_sql.Identifier(isolated_db)
+                        )
+                    )
+            except Exception:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_bi2_isolated_empty_test_database_creates_migrates_and_drops_unique_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BI2: `_isolated_empty_test_database` creates its own fresh `*_test` database,
+    runs both Alembic migration trees on that isolated database (never depending on shared DB state),
+    and drops the isolated database in teardown.
+    """
+    from alembic import command as alembic_command
+
+    executed_sql: list[str] = []
+    upgraded_urls: list[str] = []
+
+    class _FakeAdminConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt: Any, params: Any = None) -> None:
+            executed_sql.append(str(stmt))
+
+    connect_mock = create_autospec(
+        psycopg.AsyncConnection.connect,
+        return_value=_FakeAdminConn(),
+    )
+    monkeypatch.setattr(psycopg.AsyncConnection, "connect", connect_mock)
+
+    def _capture_upgrade(cfg: Any, rev: str) -> None:
+        upgraded_urls.append(str(cfg.get_main_option("sqlalchemy.url")))
+        assert rev == "head"
+
+    upgrade_mock = create_autospec(alembic_command.upgrade, side_effect=_capture_upgrade)
+    monkeypatch.setattr(alembic_command, "upgrade", upgrade_mock)
+
+    base_dsn = "postgresql://postgres:postgres@127.0.0.1:5432/shared_dirty_test"
+    async with _isolated_empty_test_database(base_dsn, tag="discord_native") as isolated_dsn:
+        assert isolated_dsn != base_dsn
+        assert isolated_dsn.startswith("postgresql://postgres:postgres@127.0.0.1:5432/dalton_cg_discord_native_")
+        assert isolated_dsn.endswith("_test")
+        assert len(upgraded_urls) == 2
+        assert all(isolated_dsn.split("/")[-1] in u for u in upgraded_urls)
+
+    assert any("CREATE DATABASE" in s for s in executed_sql)
+    assert any("DROP DATABASE IF EXISTS" in s for s in executed_sql)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bt1_feishu_pending_topics_real_postgres_seventh_topic_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BT1 Real PostgreSQL test: in a group with 7 pending Feishu topics (all with
+    `first_reply_message_id` and no `external_topic_id`), the 7th (oldest) topic still
+    matches via `lookup_bot_topic` both without and with `initiator_platform_user_id`,
+    and pagination traverses all 7 without silent truncation.
+    """
+    import os
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
+
+    raw_dsn = os.environ.get("DALTON_CHANNEL_GATEWAY_TEST_DSN")
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    async with _isolated_empty_test_database(raw_dsn, tag="bt1_pending_topics") as db_uri:
+        pool = AsyncConnectionPool(
+            conninfo=db_uri,
+            min_size=1,
+            max_size=4,
+            open=False,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        )
+        await pool.open()
+        await pool.wait()
+        try:
+            chat_addr = f"feishu:oc_bt1_pg_{uuid4().hex[:8]}"
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    # Insert 7 pending topics ordered oldest (idx=1) to newest (idx=7)
+                    for idx in range(1, 8):
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_bot_topics (
+                                platform, chat_address, canonical_scope_key,
+                                external_topic_id, root_message_id, first_reply_message_id,
+                                initiator_dalton_user_id, initiator_platform_user_id,
+                                status, created_at, last_active_at
+                            )
+                            VALUES (
+                                'feishu', %s, %s,
+                                NULL, %s, %s,
+                                %s, %s,
+                                'pending',
+                                NOW() - (%s || ' minutes')::interval,
+                                NOW() - (%s || ' minutes')::interval
+                            )
+                            """,
+                            (
+                                chat_addr,
+                                f"chat:{chat_addr}:topic:om_root_{idx}",
+                                f"om_root_{idx}",
+                                f"om_reply_{idx}",
+                                f"u-bt1-{idx}",
+                                "ou_bt1_oldest" if idx == 1 else f"ou_bt1_other_{idx}",
+                                str(100 - idx),
+                                str(100 - idx),
+                            ),
+                        )
+
+                # 1) Without initiator or root_message_id: all 7 pending topics returned, including oldest #1 (7th in recency)
+                res_all = await cg_db.lookup_bot_topic(
+                    platform="feishu",
+                    chat_address=chat_addr,
+                    match_mode="inbound_followup",
+                    external_topic_id="omt_bt1_pg_7",
+                    conn=conn,
+                )
+                assert res_all["found"] is False
+                all_scopes = [c["canonical_scope_key"] for c in res_all.get("pending_candidates", [])]
+                assert len(all_scopes) == 7
+                assert all_scopes[-1] == f"chat:{chat_addr}:topic:om_root_1"
+
+                # 2) With initiator_platform_user_id of oldest #1: prioritized first ahead of 6 newer topics
+                res_init = await cg_db.lookup_bot_topic(
+                    platform="feishu",
+                    chat_address=chat_addr,
+                    match_mode="inbound_followup",
+                    external_topic_id="omt_bt1_pg_7",
+                    initiator_platform_user_id="ou_bt1_oldest",
+                    conn=conn,
+                )
+                init_scopes = [c["canonical_scope_key"] for c in res_init.get("pending_candidates", [])]
+                assert len(init_scopes) == 7
+                assert init_scopes[0] == f"chat:{chat_addr}:topic:om_root_1"
+
+                # 3) Pagination traverses all 7 without dropping the 7th
+                paged_scopes: list[str] = []
+                offset = 0
+                while True:
+                    page = await cg_db.lookup_bot_topic(
+                        platform="feishu",
+                        chat_address=chat_addr,
+                        match_mode="inbound_followup",
+                        external_topic_id="omt_bt1_pg_7",
+                        pending_limit=3,
+                        pending_offset=offset,
+                        conn=conn,
+                    )
+                    batch = page.get("pending_candidates", [])
+                    paged_scopes.extend(c["canonical_scope_key"] for c in batch)
+                    if not page.get("pending_candidates_has_more"):
+                        break
+                    offset += len(batch)
+                assert paged_scopes == all_scopes
+        finally:
+            await pool.close()
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_discord_native_interactions_real_postgres_concurrency_and_state(
@@ -8786,168 +9238,125 @@ async def test_discord_native_interactions_real_postgres_concurrency_and_state(
     import asyncio
     import importlib
     import os
-    from pathlib import Path
     import pkgutil
     import sys
-    from urllib.parse import urlsplit
 
     __tracebackhide__ = True
     raw_dsn = os.environ.get("DALTON_CHANNEL_GATEWAY_TEST_DSN")
-    if raw_dsn is None or not raw_dsn.strip():
-        pytest.skip("DALTON_CHANNEL_GATEWAY_TEST_DSN is not set")
-    db_uri = raw_dsn.strip()
-    del raw_dsn
 
-    parsed_dsn = urlsplit(db_uri)
-    db_name = parsed_dsn.path.lstrip("/")
-    if (
-        any(ch.isspace() for ch in db_uri)
-        or parsed_dsn.scheme not in ("postgresql", "postgres")
-        or parsed_dsn.hostname not in ("127.0.0.1", "localhost", "::1")
-        or parsed_dsn.query != ""
-        or parsed_dsn.fragment != ""
-        or not db_name
-        or "/" in db_name
-        or not db_name.endswith("_test")
-        or len(db_name) <= len("_test")
-    ):
-        db_uri = "<redacted>"
-        parsed_dsn = None
-        pytest.fail(
-            "Invalid DALTON_CHANNEL_GATEWAY_TEST_DSN: expected a local postgresql:// or postgres:// URL "
-            "(127.0.0.1, localhost, or ::1) targeting a *_test database with no query or fragment"
-        )
-
-    from alembic import command
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-    from psycopg import sql as pg_sql
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool
 
-    repo_root = Path(__file__).resolve().parents[3]
-    if db_uri.startswith("postgresql://"):
-        sa_url = "postgresql+psycopg://" + db_uri[len("postgresql://") :]
-    else:
-        sa_url = "postgresql+psycopg://" + db_uri[len("postgres://") :]
-    escaped_sa_url = sa_url.replace("%", "%%")
-
-    core_cfg = Config(str(repo_root / "alembic.ini"))
-    core_cfg.set_main_option("script_location", str(repo_root / "migrations"))
-    core_cfg.set_main_option("sqlalchemy.url", escaped_sa_url)
-    expected_core_heads = set(ScriptDirectory.from_config(core_cfg).get_heads())
-
-    dalton_cfg = Config(str(repo_root / "alembic.ini"))
-    dalton_cfg.set_main_option(
-        "script_location", str(repo_root / "src" / "dalton" / "migrations")
-    )
-    dalton_cfg.set_main_option("sqlalchemy.url", escaped_sa_url)
-    dalton_cfg.set_main_option("version_table", "alembic_version_dalton")
-    expected_dalton_heads = set(ScriptDirectory.from_config(dalton_cfg).get_heads())
-
-    needs_migrations = False
-    try:
-        async with await psycopg.AsyncConnection.connect(
-            db_uri, autocommit=True, row_factory=dict_row
-        ) as check_conn:
-            async with check_conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT tablename
-                    FROM pg_tables
-                    WHERE schemaname = 'public'
-                    ORDER BY tablename
-                    """
-                )
-                public_tables = [str(r["tablename"]) for r in await cur.fetchall()]
-                if not public_tables:
-                    needs_migrations = True
-                else:
-                    if (
-                        "alembic_version" not in public_tables
-                        or "alembic_version_dalton" not in public_tables
-                    ):
-                        pytest.fail(
-                            "Target _test database is neither empty nor migrated to both Alembic version tables"
-                        )
-                    await cur.execute("SELECT version_num FROM public.alembic_version")
-                    core_revs = {str(r["version_num"]) for r in await cur.fetchall()}
-                    await cur.execute(
-                        "SELECT version_num FROM public.alembic_version_dalton"
-                    )
-                    dalton_revs = {str(r["version_num"]) for r in await cur.fetchall()}
-                    if (
-                        core_revs != expected_core_heads
-                        or dalton_revs != expected_dalton_heads
-                    ):
-                        pytest.fail(
-                            "Target _test database is not at the expected Alembic heads"
-                        )
-                    for tbl in public_tables:
-                        if tbl in ("alembic_version", "alembic_version_dalton"):
-                            continue
-                        await cur.execute(
-                            pg_sql.SQL(
-                                "SELECT EXISTS (SELECT 1 FROM {}) AS has_rows"
-                            ).format(pg_sql.Identifier("public", tbl))
-                        )
-                        has_rows_row = await cur.fetchone()
-                        if has_rows_row and bool(has_rows_row["has_rows"]):
-                            pytest.fail(
-                                f"Refusing to run against non-empty user table public.{tbl}"
-                            )
-    except BaseException as exc:
-        if isinstance(exc, pytest.fail.Exception):
-            raise
-        pytest.fail(
-            f"Configured DALTON_CHANNEL_GATEWAY_TEST_DSN database is unreachable ({type(exc).__name__})"
+    async with _isolated_empty_test_database(raw_dsn, tag="discord_native") as db_uri:
+        pool = AsyncConnectionPool(
+            conninfo=db_uri,
+            min_size=2,
+            max_size=5,
+            open=False,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
         )
+        await pool.open()
+        await pool.wait()
 
-    if needs_migrations:
+        prefix = uuid4().hex[:8]
+        alice_uid = f"u-pg-alice-{prefix}"
+        bob_uid = f"u-pg-bob-{prefix}"
+        ext_uid = f"u-pg-ext-{prefix}"
+        alice_email = f"{alice_uid}@dalton.test"
+        bob_email = f"{bob_uid}@dalton.test"
+        ext_email = f"{ext_uid}@external.test"
+        alice_puid = f"dc_pg_alice_{prefix}"
+        bob_puid = f"dc_pg_bob_{prefix}"
+        ext_puid = f"dc_pg_ext_{prefix}"
 
-        def _upgrade_both_trees() -> None:
-            command.upgrade(core_cfg, "head")
-            command.upgrade(dalton_cfg, "head")
+        ws_cn = str(uuid4())
+        ws_macro = str(uuid4())
+        ws_amb_1 = str(uuid4())
+        ws_amb_2 = str(uuid4())
+        home_wid = str(get_home_workspace_id(alice_uid))
+        active_tid = str(uuid4())
+        active_rid = str(uuid4())
+        macro_thread_id = str(uuid4())
+        home_thread_id = str(uuid4())
+        guild_chat_id = f"932170193180958741/14812560{prefix}"
+        guild_addr = f"discord:{guild_chat_id}"
+        guild_scope = f"chat:{guild_chat_id}"
+        revoke_chat_id = f"932170193180958741/14812569{prefix}"
+        revoke_addr = f"discord:{revoke_chat_id}"
+        revoke_scope = f"chat:{revoke_chat_id}"
 
-        await asyncio.to_thread(_upgrade_both_trees)
+        try:
+            await _run_discord_native_real_postgres_assertions(
+                pool=pool,
+                monkeypatch=monkeypatch,
+                prefix=prefix,
+                alice_uid=alice_uid,
+                bob_uid=bob_uid,
+                ext_uid=ext_uid,
+                alice_email=alice_email,
+                bob_email=bob_email,
+                ext_email=ext_email,
+                alice_puid=alice_puid,
+                bob_puid=bob_puid,
+                ext_puid=ext_puid,
+                ws_cn=ws_cn,
+                ws_macro=ws_macro,
+                ws_amb_1=ws_amb_1,
+                ws_amb_2=ws_amb_2,
+                home_wid=home_wid,
+                active_tid=active_tid,
+                active_rid=active_rid,
+                macro_thread_id=macro_thread_id,
+                home_thread_id=home_thread_id,
+                guild_chat_id=guild_chat_id,
+                guild_addr=guild_addr,
+                guild_scope=guild_scope,
+                revoke_chat_id=revoke_chat_id,
+                revoke_addr=revoke_addr,
+                revoke_scope=revoke_scope,
+                asyncio=asyncio,
+                importlib=importlib,
+                pkgutil=pkgutil,
+                sys=sys,
+            )
+        finally:
+            await pool.close()
 
-    pool = AsyncConnectionPool(
-        conninfo=db_uri,
-        min_size=2,
-        max_size=5,
-        open=False,
-        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
-    )
-    await pool.open()
-    await pool.wait()
 
-    prefix = uuid4().hex[:8]
-    alice_uid = f"u-pg-alice-{prefix}"
-    bob_uid = f"u-pg-bob-{prefix}"
-    ext_uid = f"u-pg-ext-{prefix}"
-    alice_email = f"{alice_uid}@dalton.test"
-    bob_email = f"{bob_uid}@dalton.test"
-    ext_email = f"{ext_uid}@external.test"
-    alice_puid = f"dc_pg_alice_{prefix}"
-    bob_puid = f"dc_pg_bob_{prefix}"
-    ext_puid = f"dc_pg_ext_{prefix}"
-
-    ws_cn = str(uuid4())
-    ws_macro = str(uuid4())
-    ws_amb_1 = str(uuid4())
-    ws_amb_2 = str(uuid4())
-    home_wid = str(get_home_workspace_id(alice_uid))
-    active_tid = str(uuid4())
-    active_rid = str(uuid4())
-    macro_thread_id = str(uuid4())
-    home_thread_id = str(uuid4())
-    guild_chat_id = f"932170193180958741/14812560{prefix}"
-    guild_addr = f"discord:{guild_chat_id}"
-    guild_scope = f"chat:{guild_chat_id}"
-    revoke_chat_id = f"932170193180958741/14812569{prefix}"
-    revoke_addr = f"discord:{revoke_chat_id}"
-    revoke_scope = f"chat:{revoke_chat_id}"
-
+async def _run_discord_native_real_postgres_assertions(
+    *,
+    pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+    alice_uid: str,
+    bob_uid: str,
+    ext_uid: str,
+    alice_email: str,
+    bob_email: str,
+    ext_email: str,
+    alice_puid: str,
+    bob_puid: str,
+    ext_puid: str,
+    ws_cn: str,
+    ws_macro: str,
+    ws_amb_1: str,
+    ws_amb_2: str,
+    home_wid: str,
+    active_tid: str,
+    active_rid: str,
+    macro_thread_id: str,
+    home_thread_id: str,
+    guild_chat_id: str,
+    guild_addr: str,
+    guild_scope: str,
+    revoke_chat_id: str,
+    revoke_addr: str,
+    revoke_scope: str,
+    asyncio: Any,
+    importlib: Any,
+    pkgutil: Any,
+    sys: Any,
+) -> None:
     try:
         @asynccontextmanager
         async def _real_get_db_connection(existing_conn: Any = None):
@@ -10043,4 +10452,4 @@ async def test_discord_native_interactions_real_postgres_concurrency_and_state(
                         (alice_uid, bob_uid, ext_uid),
                     )
         finally:
-            await pool.close()
+            pass

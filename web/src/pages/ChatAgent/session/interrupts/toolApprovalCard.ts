@@ -9,10 +9,12 @@ import type { ActionRequest } from '@/types/sse';
 import { isDirectToolName, parseDirectToolName } from '../../utils/directTools';
 
 // DALTON-HOOK(notify-routes): conversational Feishu notify actions reuse the tool approval card.
+// DALTON-HOOK(report-delivery): report_profile confirmation card reuses the same approval card & confirm_token flow.
 export const DALTON_NOTIFY_APPROVAL_TYPES = new Set([
   'dalton_notify_set_route',
   'dalton_notify_add_personal_target',
   'dalton_notify_test',
+  'dalton_report_delivery_set',
 ]);
 
 const daltonConfirmTokens = new Map<string, string>();

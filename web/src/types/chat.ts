@@ -191,6 +191,13 @@ export interface DeleteThreadSegment {
   order: number;
 }
 
+// DALTON-HOOK(cos-settings-tools): archive_workspace confirmation card segment
+export interface ArchiveWorkspaceSegment {
+  type: 'archive_workspace';
+  proposalId: string;
+  order: number;
+}
+
 export interface CreditPauseSegment {
   type: 'credit_pause';
   proposalId: string;
@@ -203,6 +210,17 @@ export interface ToolApprovalSegment {
   proposalId: string;
   order: number;
 }
+
+// DALTON-HOOK(watchlist): re-export personal watchlist proposal types from Dalton module
+export type {
+  WatchlistProposalActionType,
+  WatchlistProposalAffectedTicker,
+  WatchlistProposalAffectedWorkspace,
+  WatchlistProposalSegment,
+  WatchlistProposalState,
+  WatchlistProposalWorkspaceTaskChange,
+} from '@/lib/dalton/watchlistChatTypes';
+import type { WatchlistProposalSegment, WatchlistProposalState } from '@/lib/dalton/watchlistChatTypes';
 
 export type ContentSegment =
   | ReasoningSegment
@@ -217,8 +235,10 @@ export type ContentSegment =
   | DeleteWorkspaceSegment
   | StopWorkspaceSegment
   | DeleteThreadSegment
+  | ArchiveWorkspaceSegment // DALTON-HOOK(cos-settings-tools)
   | CreditPauseSegment
-  | ToolApprovalSegment;
+  | ToolApprovalSegment
+  | WatchlistProposalSegment; // DALTON-HOOK(watchlist)
 
 // --- Process Records ---
 
@@ -464,19 +484,34 @@ export interface PTCAgentProposalState {
   steer_id?: string;
 }
 
+// DALTON-HOOK(cos-settings-tools): one workspace item in a whole-computer archive snapshot
+export interface ArchiveWorkspaceSnapshotItem {
+  workspace_id: string;
+  name: string;
+  dir_name: string;
+  status: string;
+  is_stand_in?: boolean;
+}
+
 export interface SecretaryActionProposalState {
   proposalId?: string;
   status: string;
-  actionType: 'delete_workspace' | 'stop_workspace' | 'delete_thread';
+  // DALTON-HOOK(cos-settings-tools): include archive_workspace in secretary action cards
+  actionType: 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace';
   workspace_id?: string;
   workspace_name?: string | null;
   thread_id?: string;
-  // DALTON-HOOK(cos-settings-tools): tool_call_id correlation and failure info
+  // DALTON-HOOK(cos-settings-tools): archive snapshot fields, tool_call_id correlation, and failure info
+  computer_id?: string | null;
+  computer_name?: string | null;
+  expected_workspaces?: ArchiveWorkspaceSnapshotItem[];
+  archived_workspace_count?: number;
   tool_call_id?: string;
   failure_code?: string;
   failure_error?: string;
   interruptId?: string;
 }
+
 
 /**
  * ``resuming`` is the in-flight leg and exists because a resume can be refused:
@@ -664,6 +699,8 @@ export type AssistantMessage = {
   questionProposals?: Record<string, QuestionProposalState>;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, SecretaryActionProposalState>;
+  // DALTON-HOOK(watchlist): personal watchlist confirmation proposals
+  watchlistProposals?: Record<string, WatchlistProposalState>;
   creditPauses?: Record<string, CreditPauseState>;
   toolApprovals?: Record<string, ToolApprovalState>;
   // Runtime flags

@@ -24,6 +24,7 @@ export interface MonitorSummary {
   artifact_code?: string | null;
   workspace_id?: string | null;
   entry_path?: string | null;
+  entry_file_type?: 'html' | 'markdown' | 'other';
   owner_user_id?: string;
   owner_name: string | null;
   owner_email: string | null;
@@ -110,6 +111,59 @@ export interface UpdateMonitorPayload {
   keep_updated?: boolean;
 }
 
+export interface SharedDocumentSummary {
+  doc_id: string;
+  artifact_id: string;
+  artifact_code: string | null;
+  workspace_id: string | null;
+  entry_path: string;
+  file_name: string;
+  title: string;
+  owner_user_id: string;
+  owner_name: string | null;
+  owner_email: string | null;
+  visibility: MonitorVisibility;
+  member_user_ids: string[];
+  published_seq: number;
+  keep_updated: boolean;
+  acl_revision: number;
+  url: string;
+  created_at: string;
+  updated_at: string;
+  can_manage: boolean;
+  is_owner?: boolean;
+}
+
+export interface ShareDocumentPayload {
+  workspace_id: string;
+  path: string;
+  title?: string;
+  visibility: MonitorVisibility;
+  member_user_ids?: string[];
+  keep_updated: boolean;
+  label?: string | null;
+  files?: readonly string[];
+  loaded?: readonly string[];
+  earlier?: readonly string[];
+  page_sha256?: string;
+  confirm_pause_token?: string | null;
+}
+
+export interface ShareDocumentResponse {
+  document: SharedDocumentSummary;
+  cut?: boolean;
+  auto_publish_paused?: boolean;
+  auto_publish_pause_token?: string | null;
+  auto_publish_pause_notice?: string | null;
+}
+
+export interface UpdateSharedDocumentPayload {
+  title?: string;
+  visibility?: MonitorVisibility;
+  member_user_ids?: string[];
+  keep_updated?: boolean;
+}
+
 export function monitorPermalink(slug: string, origin = typeof window !== 'undefined' ? window.location.origin : ''): string {
   return `${origin}/monitors/${encodeURIComponent(slug)}`;
 }
@@ -180,4 +234,41 @@ export async function deleteMonitor(slug: string): Promise<void> {
 export async function listCompanyMembers(): Promise<CompanyMemberOption[]> {
   const { data } = await api.get<{ members: CompanyMemberOption[] }>('/api/v1/dalton/monitors/company-members');
   return data.members ?? [];
+}
+
+export async function listSharedDocuments(): Promise<SharedDocumentSummary[]> {
+  const { data } = await api.get<{ documents: SharedDocumentSummary[] }>(
+    '/api/v1/dalton/monitors/shared-documents',
+  );
+  return data.documents ?? [];
+}
+
+export async function getSharedDocumentByArtifact(
+  artifactId: string,
+): Promise<SharedDocumentSummary | null> {
+  const { data } = await api.get<{ document: SharedDocumentSummary | null }>(
+    `/api/v1/dalton/monitors/shared-documents/by-artifact/${encodeURIComponent(artifactId)}`,
+  );
+  return data.document ?? null;
+}
+
+export async function shareDocument(
+  payload: ShareDocumentPayload,
+): Promise<ShareDocumentResponse> {
+  const { data } = await api.post<ShareDocumentResponse>(
+    '/api/v1/dalton/monitors/shared-documents',
+    payload,
+  );
+  return data;
+}
+
+export async function updateSharedDocument(
+  artifactId: string,
+  payload: UpdateSharedDocumentPayload,
+): Promise<{ document: SharedDocumentSummary }> {
+  const { data } = await api.patch<{ document: SharedDocumentSummary }>(
+    `/api/v1/dalton/monitors/shared-documents/by-artifact/${encodeURIComponent(artifactId)}`,
+    payload,
+  );
+  return data;
 }

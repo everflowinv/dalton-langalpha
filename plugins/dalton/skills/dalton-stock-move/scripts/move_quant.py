@@ -47,8 +47,22 @@ HIST_LOOKBACK_DAYS = 60      # 窗口起点前 60 个交易日计算日超额标
 MIN_HIST_SAMPLES = 20        # 历史样本数 > 20 才计算 σ 和 z 值
 ADTV_LOOKBACK_DAYS = 20      # 当日成交量对比前 20 个交易日均量（不含当日）
 
-PRIVATE_TICKERS = {"SPCX", "OPENAI", "ANTHROPIC"}
+PRIVATE_TICKERS: set[str] = {"OPENAI"}
 DEFAULT_FUTURES = ["NQ=F", "ES=F"]
+
+
+def is_private_company_entry(entry: dict[str, Any] | None) -> bool:
+    """以覆盖数据字段为准判断是否未上市（仅保留 OPENAI 兜底，不再写死 SPCX / Anthropic）。"""
+    if not isinstance(entry, dict):
+        return False
+    is_priv = entry.get("is_private")
+    if is_priv is True or (isinstance(is_priv, str) and is_priv.strip().lower() == "true"):
+        return True
+    listed = entry.get("listed")
+    if listed is False or (isinstance(listed, str) and listed.strip().lower() == "false"):
+        return True
+    status = str(entry.get("listing_status") or "").strip().lower()
+    return status in ("private", "unlisted")
 NON_US_EXTENDED_UNSUPPORTED_SUFFIXES = (
     ".HK", ".SH", ".SS", ".SZ", ".T", ".L", ".KS", ".KQ", ".TW", ".TWO",
     ".DE", ".PA", ".AS", ".TO", ".AX", ".SI", ".NS", ".BO",
@@ -74,12 +88,16 @@ def _cn_price_fallback():
     return _cn_price_fallback_mod
 
 
-def supports_extended_session(symbol: str) -> tuple[bool, str | None]:
+def supports_extended_session(
+    symbol: str,
+    *,
+    company_entry: dict[str, Any] | None = None,
+) -> tuple[bool, str | None]:
     """检查标的是否支持美股盘前/盘后（pre/post）分钟线计算。"""
     s = (symbol or "").strip().upper()
     if not s:
         return False, "标的代码为空"
-    if s in PRIVATE_TICKERS:
+    if s in PRIVATE_TICKERS or is_private_company_entry(company_entry):
         return False, f"未上市标的 {s} 不支持行情查询"
     if s.startswith("^"):
         return (
@@ -287,6 +305,11 @@ def resolve_peers_and_etf(
     if companies and (not peers or not etf):
         entry = next((c for c in companies if str(c.get("ticker", "")).upper() == t), None)
         if entry:
+            private_in_cov = {
+                str(c.get("ticker", "")).upper()
+                for c in companies
+                if is_private_company_entry(c) and c.get("ticker")
+            }
             if not peers:
                 cov_peers: list[str] = []
                 raw_peers = entry.get("peers") or []
@@ -294,7 +317,9 @@ def resolve_peers_and_etf(
                     cov_peers = [
                         str(p).upper()
                         for p in raw_peers
-                        if str(p).upper() != t and str(p).upper() not in PRIVATE_TICKERS
+                        if str(p).upper() != t
+                        and str(p).upper() not in PRIVATE_TICKERS
+                        and str(p).upper() not in private_in_cov
                     ]
                 elif entry.get("peer_group"):
                     pg = entry["peer_group"]
@@ -303,6 +328,7 @@ def resolve_peers_and_etf(
                         for c in companies
                         if c.get("peer_group") == pg
                         and str(c.get("ticker", "")).upper() != t
+                        and not is_private_company_entry(c)
                         and str(c.get("ticker", "")).upper() not in PRIVATE_TICKERS
                     ]
                 if cov_peers:
@@ -1096,6 +1122,7 @@ def compute_session_quant_from_intraday(
     session_date: str | None = None,
     futures: list[str] | None = None,
     peer_source: str | None = None,
+    coverage_by_ticker: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     基于含盘前盘后（prepost=True）的日内分钟线计算盘前（pre）或盘后（post）异动，
@@ -1115,7 +1142,8 @@ def compute_session_quant_from_intraday(
             "warnings": [f"Unsupported session {session}"],
         }
 
-    ok_sym, reason = supports_extended_session(target)
+    cov_map = coverage_by_ticker or {}
+    ok_sym, reason = supports_extended_session(target, company_entry=cov_map.get(target.upper().strip()))
     if not ok_sym:
         return {
             "ok": False,
@@ -1282,7 +1310,7 @@ def compute_session_quant_from_intraday(
     for p in peers:
         if p == target:
             continue
-        ok_p, p_reason = supports_extended_session(p)
+        ok_p, p_reason = supports_extended_session(p, company_entry=cov_map.get(p.upper().strip()))
         if not ok_p:
             warnings_list.append(p_reason or f"同组标的 {p} 不支持 {sess} 时段，已跳过")
             continue
@@ -1399,10 +1427,16 @@ def run_analyze(
 
     t = ticker.upper().strip()
     sess = (session or "regular").strip().lower()
+    companies = load_coverage_yaml(coverage_path)
+    coverage_by_ticker = {
+        str(c.get("ticker", "")).upper().strip(): c
+        for c in companies
+        if isinstance(c, dict) and str(c.get("ticker", "")).strip()
+    }
     peers, sector_etf, peer_source = resolve_peers_and_etf(t, peers_arg, etf_arg, coverage_path)
 
     if sess in ("pre", "post"):
-        ok_sym, reason = supports_extended_session(t)
+        ok_sym, reason = supports_extended_session(t, company_entry=coverage_by_ticker.get(t))
         if not ok_sym:
             return {
                 "ok": False,
@@ -1450,11 +1484,22 @@ def run_analyze(
             if futures_arg
             else list(DEFAULT_FUTURES)
         )
-        supported_peers = [p for p in peers if supports_extended_session(p)[0]]
+        supported_peers = [
+            p
+            for p in peers
+            if supports_extended_session(p, company_entry=coverage_by_ticker.get(p))[0]
+        ]
         symbols = sorted(
             {t}
             | set(supported_peers)
-            | ({sector_etf} if sector_etf and supports_extended_session(sector_etf)[0] else set())
+            | (
+                {sector_etf}
+                if sector_etf
+                and supports_extended_session(
+                    sector_etf, company_entry=coverage_by_ticker.get(sector_etf)
+                )[0]
+                else set()
+            )
             | set(fut_syms)
         )
         dl_start = prev_trading_dt.isoformat()
@@ -1503,6 +1548,7 @@ def run_analyze(
             session_date=sess_date,
             futures=fut_syms,
             peer_source=peer_source,
+            coverage_by_ticker=coverage_by_ticker,
         )
 
     end_dt, start_dt, n_days, _ = parse_window_spec(window, end_override)

@@ -58,7 +58,10 @@ const ml = vi.hoisted(() => ({
   actions: null as Record<string, unknown> | null,
   folders: null as { dirName?: string | null; previousDirNames?: readonly string[] | null } | null,
 }));
-const ci = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+const ci = vi.hoisted(() => ({
+  props: null as Record<string, unknown> | null,
+  getModelOptions: null as (() => Record<string, unknown>) | null,
+}));
 
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ preferences: h.preferences, isLoading: false, isLoaded: true }),
@@ -140,12 +143,17 @@ vi.mock('@/pages/ChatAgent/components/MessageList', async () => {
   return { default: MessageListStub, LiveMessageList: LiveMessageListStub };
 });
 
-vi.mock('@/components/ui/chat-input', () => ({
-  default: (props: Record<string, unknown>) => {
+vi.mock('@/components/ui/chat-input', async () => {
+  const React = await import('react');
+  const ChatInputStub = React.forwardRef((props: Record<string, unknown>, ref: React.ForwardedRef<unknown>) => {
     ci.props = props;
+    React.useImperativeHandle(ref, () => ({
+      ...(ci.getModelOptions ? { getModelOptions: () => ci.getModelOptions?.() } : {}),
+    }), []);
     return <div data-testid="chat-input" />;
-  },
-}));
+  });
+  return { default: ChatInputStub };
+});
 
 // The real hook, watched for the role the panel gives it.
 vi.mock('@/pages/ChatAgent/hooks/useThreadModel', async (importActual) => {
@@ -1836,6 +1844,118 @@ describe('MarketChatPanel', () => {
       await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', { llm_model: 'gpt-5' }));
       expect(ci.props!.model).toBe('gpt-5');
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): Q2a — widget prompt turns forward ONLY model and modelPickSeq in Dalton builds (no composer effort, fast mode, or subagents) and {} in non-Dalton builds
+    it('forwards only model and modelPickSeq (excluding composer effort, fast mode, and subagent settings) when sending a widget prompt', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      ci.getModelOptions = () => ({
+        model: (ci.props?.sendModel as string | null | undefined) ?? null,
+        reasoningEffort: 'high',
+        fastMode: true,
+        subagentsAllowed: false,
+        marketWatch: ['AAPL'],
+      });
+
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+      api.updateThread.mockResolvedValueOnce({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+
+      try {
+        const view = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+        await vi.waitFor(() => expect(ci.props!.model).toBe('gemini-4-neon-medium-oauth'));
+
+        await act(async () => {
+          await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        });
+
+        act(() => {
+          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('from a widget');
+        });
+
+        expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
+        const sendOpts = h.handleSendMessage.mock.calls[0][3] as Record<string, unknown>;
+        expect(sendOpts).toEqual({
+          model: 'gemini-4-neon-high-oauth',
+          modelPickSeq: expect.any(Number),
+        });
+        expect(sendOpts).not.toHaveProperty('reasoningEffort');
+        expect(sendOpts).not.toHaveProperty('fastMode');
+        expect(sendOpts).not.toHaveProperty('subagentsAllowed');
+        expect(sendOpts).not.toHaveProperty('marketWatch');
+
+        // Non-Dalton build sends {} without forwarding composer options.
+        view.unmount();
+        h.handleSendMessage.mockClear();
+        agSeriesMock.isDaltonBuild = false;
+        renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+        await vi.waitFor(() => expect(ml.actions?.onWidgetSendPrompt).toBeTypeOf('function'));
+        act(() => {
+          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('non-dalton widget');
+        });
+        expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
+        expect(h.handleSendMessage.mock.calls[0][3]).toEqual({});
+      } finally {
+        ci.getModelOptions = null;
+      }
+    });
+
+    // DALTON-HOOK(antigravity-series): R5 — MarketChatPanel forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions
+    it('forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions in Dalton builds', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      ci.getModelOptions = () => ({
+        model: (ci.props?.sendModel as string | null | undefined) ?? null,
+        reasoningEffort: null,
+        fastMode: false,
+      });
+
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+      api.updateThread.mockResolvedValueOnce({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+
+      try {
+        renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+        await vi.waitFor(() => expect(ci.props!.model).toBe('gemini-4-neon-medium-oauth'));
+
+        await act(async () => {
+          await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        });
+
+        expect(ci.props!.sendModelSeq).toEqual(expect.any(Number));
+        const { useChatMessages } = await import('@/pages/ChatAgent/hooks/useChatMessages');
+        const lastCall = vi.mocked(useChatMessages).mock.calls.at(-1);
+        const readComposerOptions = (lastCall?.[2] as { readComposerOptions?: () => Record<string, unknown> | undefined } | undefined)?.readComposerOptions;
+        expect(readComposerOptions?.()).toMatchObject({
+          model: 'gemini-4-neon-high-oauth',
+          modelPickSeq: ci.props!.sendModelSeq,
+        });
+      } finally {
+        ci.getModelOptions = null;
+      }
     });
   });
 });

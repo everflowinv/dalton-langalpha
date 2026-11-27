@@ -256,6 +256,8 @@ _dalton_data_task_scheduler_task: asyncio.Task | None = None
 _dalton_chat_upload_cleanup_task: asyncio.Task | None = None
 # DALTON-HOOK(team-model-catalog): hold strong reference to catalog prewarm follower task
 _dalton_team_catalog_follow_task: asyncio.Task | None = None
+# DALTON-HOOK(watchlist): hold strong reference to one-shot startup outbox reconcile scan
+_dalton_watchlist_reconcile_startup_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -272,7 +274,8 @@ async def lifespan(app: FastAPI):
         _dalton_transcription_reconcile_task, \
         _dalton_data_task_scheduler_task, \
         _dalton_chat_upload_cleanup_task, \
-        _dalton_team_catalog_follow_task
+        _dalton_team_catalog_follow_task, \
+        _dalton_watchlist_reconcile_startup_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -520,6 +523,22 @@ async def lifespan(app: FastAPI):
             config=agent_config,
             cleanup_interval=300,  # 5 minutes
         )
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        try:
+            recovered_archiving = (
+                await workspace_manager.recover_archiving_computers_on_startup()
+            )
+            if recovered_archiving:
+                logger.info(
+                    "startup_recovered_archiving_computers count=%d",
+                    recovered_archiving,
+                )
+        except Exception as exc:
+            logger.warning(
+                "startup_recover_archiving_computers_failed exc_type=%s",
+                type(exc).__name__,
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
 
@@ -898,7 +917,12 @@ async def lifespan(app: FastAPI):
                 "or one sooner than 7 days; parts of an upload interrupted "
                 "mid-transfer are kept and billed without one, and a Drive file "
                 "sent in parts may stay open up to 6 days before one aborts it. "
-                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days."
+                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days. "
+                # DALTON-HOOK(drive-guidance): MinIO has no such rule; say what stands in for it
+                "On MinIO the equivalent is its stale_uploads_expiry setting "
+                "(MINIO_API_STALE_UPLOADS_EXPIRY, 24h by default), set to 168h or longer "
+                "before turning the Drive on; MinIO keeps that setting to itself, so this "
+                "warning appears there either way."
             )
     except Exception as e:
         logger.info(f"Skipped the multipart cleanup rule check: {e!r}")
@@ -945,6 +969,16 @@ async def lifespan(app: FastAPI):
         _dalton_health_startup_task = asyncio.create_task(
             run_startup_health_check_once(),
             name="dalton-startup-data-source-health",
+        )
+
+    # DALTON-HOOK(watchlist): one-shot startup scan to drain unfinished watchlist outbox jobs
+    from src.dalton.settings import is_dalton_enabled
+    from src.dalton.watchlist.reconciler import run_startup_reconcile_scan
+
+    if is_dalton_enabled():
+        _dalton_watchlist_reconcile_startup_task = asyncio.create_task(
+            run_startup_reconcile_scan(),
+            name="dalton-startup-watchlist-reconcile",
         )
 
     # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
@@ -1037,6 +1071,11 @@ async def lifespan(app: FastAPI):
         _dalton_health_startup_task.cancel()
         await asyncio.gather(_dalton_health_startup_task, return_exceptions=True)
         _dalton_health_startup_task = None
+    # DALTON-HOOK(watchlist): cancel startup watchlist reconcile scan on shutdown if still running
+    if _dalton_watchlist_reconcile_startup_task is not None:
+        _dalton_watchlist_reconcile_startup_task.cancel()
+        await asyncio.gather(_dalton_watchlist_reconcile_startup_task, return_exceptions=True)
+        _dalton_watchlist_reconcile_startup_task = None
     # DALTON-HOOK(transcriptions-reconcile): cancel periodic ASR reconciliation task on shutdown
     if _dalton_transcription_reconcile_task is not None:
         _dalton_transcription_reconcile_task.cancel()
@@ -1855,6 +1894,10 @@ if self_hosted():
 
 # Include all routers
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
+# DALTON-HOOK(share-redaction): mount controlled owner thread media endpoint
+from src.dalton.share_media import owner_media_router as _dalton_owner_media_router
+
+app.include_router(_dalton_owner_media_router)
 app.include_router(search_router)  # /api/v1/search - Conversation search (command palette)
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(home_router)  # /api/v1/workspaces/home* - Home and its stand-in

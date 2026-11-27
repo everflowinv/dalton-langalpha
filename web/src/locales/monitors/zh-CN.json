@@ -59,7 +59,35 @@
     "publicConfirmTitle": "确认公开发布？",
     "publicConfirmMessage": "设为“任何人（公开链接）”后，互联网上任何持有链接的人都可以查看此监控面板及其实时数据。确认继续发布？",
     "publicConfirmButton": "确认公开",
-    "publishedToast": "已发布到监控面板"
+    "publishedToast": "已发布到监控面板",
+    "sharedDocumentToast": "已更新文档分享设置"
+  },
+  "sharedDocuments": {
+    "title": "分享的文档",
+    "sharedByMe": "我分享的",
+    "sharedWithMe": "分享给我的",
+    "sharedBy": "分享人：{{owner}}",
+    "updatedAt": "更新时间：{{time}}",
+    "openLink": "打开",
+    "stopSharing": "停止分享",
+    "stopSharingConfirmTitle": "确认停止分享？",
+    "stopSharingConfirmMessage": "停止分享「{{name}}」后，原链接将转为仅自己可见。确认继续？",
+    "stopSharingConfirmButton": "确认停止分享",
+    "stopSharingSuccess": "已停止分享",
+    "stopSharingFailed": "停止分享失败，请重试",
+    "visibility": {
+      "members": "仅指定同事",
+      "company": "团队",
+      "public": "公开链接"
+    }
+  },
+  "markdown": {
+    "viewRaw": "查看原文",
+    "viewRendered": "查看渲染",
+    "download": "下载",
+    "downloadFailed": "下载失败，请重试",
+    "linkUnavailable": "需授权或暂缺",
+    "backToDocument": "返回 {{name}}"
   },
   "demo": {
     "title": "实时数据监控示例",

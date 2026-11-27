@@ -1614,16 +1614,20 @@ class TestAnalystOutboundGuardAndKeepUpdated:
 
         # 3) dalton_report_delivery (including DM target!) blocked on set/clear
         rd_tool = report_delivery_mod.create_report_delivery_tools()[0]
-        rd_out = json.loads(
-            await rd_tool.ainvoke(
-                {
+        rd_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {
                     "action": "set",
                     "automation_id": "auto-1",
                     "report_targets": ["feishu:user:ou_123"],
                 },
-                config=analyst_cfg,
-            )
+                "id": "tc-rd-block",
+                "type": "tool_call",
+            },
+            config=analyst_cfg,
         )
+        rd_out = json.loads(rd_cmd.update["messages"][0].content)
         assert rd_out["ok"] is False and rd_out["error"] == "colleague_outbound_blocked"
 
         # 4) automation_report(action="submit") blocked
@@ -1804,6 +1808,16 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             create_autospec(dalton_settings_mod.is_artifact_publishing_enabled, return_value=True),
         )
 
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "list_workspace_auto_update_shared_documents",
+            create_autospec(
+                shared_doc_mod.list_workspace_auto_update_shared_documents,
+                return_value=[],
+            ),
+        )
         await snapshot_mod.keep_updated_after_turn(workspace_id="ws-1", user_id="u-b")
         keep_one_spy.assert_not_called()
 
@@ -2174,10 +2188,20 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             "is_artifact_publishing_enabled",
             create_autospec(dalton_settings_mod.is_artifact_publishing_enabled, return_value=True),
         )
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
         monkeypatch.setattr(
             monitor_service_mod,
             "republish_workspace_monitors_after_turn",
             create_autospec(monitor_service_mod.republish_workspace_monitors_after_turn, return_value=None),
+        )
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "republish_workspace_shared_documents_after_turn",
+            create_autospec(
+                shared_doc_mod.republish_workspace_shared_documents_after_turn,
+                return_value=None,
+            ),
         )
         monkeypatch.setattr(
             artifacts_db_mod,
@@ -4287,6 +4311,16 @@ class TestR6SharingAuthGating:
                 dalton_settings_mod.is_dalton_multiuser_auth_enabled, return_value=False
             ),
         )
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "list_workspace_auto_update_shared_documents",
+            create_autospec(
+                shared_doc_mod.list_workspace_auto_update_shared_documents,
+                return_value=[],
+            ),
+        )
         await snapshot_mod.keep_updated_after_turn(workspace_id="ws-1", user_id="u-b")
         # Real monitor refresh ran for both monitors with only 1 initial workspace read (zero per-monitor re-reads)
         assert mon_ws_get_spy.await_count == 1
@@ -4731,16 +4765,26 @@ class TestR6SharingAuthGating:
 
         # 3) dalton_report_delivery set & clear skip is_run_outbound_blocked
         rd_tool = report_delivery_mod.create_report_delivery_tools()[0]
-        r_rd_set = json.loads(
-            await rd_tool.ainvoke(
-                {"action": "set", "automation_id": ""}, config=cfg
-            )
+        r_rd_set_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {"action": "set", "automation_id": ""},
+                "id": "tc-rd-set",
+                "type": "tool_call",
+            },
+            config=cfg,
         )
-        r_rd_clear = json.loads(
-            await rd_tool.ainvoke(
-                {"action": "clear", "automation_id": ""}, config=cfg
-            )
+        r_rd_clear_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {"action": "clear", "automation_id": ""},
+                "id": "tc-rd-clear",
+                "type": "tool_call",
+            },
+            config=cfg,
         )
+        r_rd_set = json.loads(r_rd_set_cmd.update["messages"][0].content)
+        r_rd_clear = json.loads(r_rd_clear_cmd.update["messages"][0].content)
         assert r_rd_set["error"] == "invalid_request"
         assert r_rd_clear["error"] == "invalid_request"
 

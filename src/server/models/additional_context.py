@@ -171,6 +171,14 @@ class ChatUploadContext(AdditionalContextBase):
     )
 
 
+# DALTON-HOOK(watchlist): personal watchlist chat context (validated & privacy-stripped on shared turns)
+class WatchlistContext(AdditionalContextBase):
+    """Context injecting the caller's personal watchlist summary on private turns."""
+
+    type: Literal["watchlist_context"] = "watchlist_context"
+    content: str = Field(..., max_length=64000, description="Personal watchlist context summary")
+
+
 AdditionalContext = Annotated[
     Union[
         Annotated[SkillContext, Tag("skills")],
@@ -181,6 +189,7 @@ AdditionalContext = Annotated[
         Annotated[WidgetContext, Tag("widget")],
         Annotated[ChartSelectionContext, Tag("chart_selection")],
         Annotated[ChatUploadContext, Tag("chat_upload")],
+        Annotated[WatchlistContext, Tag("watchlist_context")],
     ],
     Discriminator(lambda v: v.get("type") if isinstance(v, dict) else getattr(v, "type", None)),
 ]

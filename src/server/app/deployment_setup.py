@@ -11,7 +11,6 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from src.server.auth import owner_requests
 from src.server.database.encryption import encryption_configured
 from src.server.models.setup_settings import (
     SaveKeysRequest,
@@ -27,11 +26,13 @@ def _owner_only(request: Request) -> None:
     """These routes have no caller to check, being the deployment's own, and a
     container on the machine must not set the keys every computer gets."""
     # DALTON-HOOK(dalton-auth): defense in depth — refuse these routes under any Dalton deployment or sign-in mode
+    # DALTON-HOOK(share-redaction): enforce trusted loopback/owner gate for unkeyed OSS setup routes
+    from src.dalton.auth.dispatch import verify_oss_local_owner
     from src.dalton.settings import get_dalton_auth_mode, is_dalton_enabled
 
     if is_dalton_enabled() or get_dalton_auth_mode() != "oss":
         raise HTTPException(status_code=403, detail="Deployment setup is disabled")
-    owner_requests.refuse_unless_owner(request.scope)
+    verify_oss_local_owner(request.scope)
 
 
 router = APIRouter(

@@ -1263,3 +1263,115 @@ async def test_ai_finance_oversized_report_splits_and_submits_compliant_cards(
     submit_calls = [c for c in called_actions if c.get("action") == "submit"]
     assert len(submit_calls) == 1
     assert len(submit_calls[0]["cards"]) == len(split_for_submit)
+
+
+@pytest.mark.asyncio
+async def test_ai_finance_finish_confirms_sent_when_card_contains_inline_code_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.database.automation_reports import (
+        automation_report_content_sha256,
+        read_automation_report_status,
+        submit_automation_report,
+    )
+    from src.dalton.notify.dispatch import dispatch_automation_report
+    from src.dalton.tools import ai_finance_report_tools as af_tools
+    from src.dalton.tools import automation_report_tools as auto_tools
+
+    md = MARKDOWN.replace("### 来源说明", "核心指标 `16,956.0`（`+46.7%`）。\n\n### 来源说明")
+    cards = reports.render_daily_cards(md, DATE)
+    assert "`16,956.0`" in json.dumps(cards, ensure_ascii=False)
+    saved_stub = {
+        "batch_id": DATE,
+        "report_run_id": f"ai-finance:{DATE}",
+        "body_sha256": hashlib.sha256(md.encode("utf-8")).hexdigest(),
+        "content_sha256": reports.card_content_sha256(cards),
+        "seen_status": "pending",
+        "reused": False,
+        "card": cards[0],
+        "cards": cards,
+    }
+
+    stored: dict[str, Any] = {}
+
+    async def _fake_submit(**kwargs: Any) -> dict[str, Any]:
+        forwarded_cards = kwargs["cards"]
+        digest = automation_report_content_sha256(
+            profile=reports.PROFILE,
+            content_kind="cards",
+            cards=forwarded_cards,
+            failure_text=None,
+        )
+        stored["report_run_id"] = kwargs["report_run_id"]
+        stored["content_sha256"] = digest
+        stored["execution_id"] = kwargs["execution_id"]
+        return {
+            "ok": True,
+            "action": "submit",
+            "quiet": False,
+            "report_run_id": kwargs["report_run_id"],
+            "profile": reports.PROFILE,
+            "content_kind": "cards",
+            "content_sha256": digest,
+            "execution_id": kwargs["execution_id"],
+            "delivery_confirmed": False,
+            "status": "pending",
+            "targets": ["feishu:chat:oc_af"],
+            "created": True,
+        }
+
+    async def _fake_status(**kwargs: Any) -> dict[str, Any]:
+        if not stored:
+            return {
+                "ok": True,
+                "action": "status",
+                "found": False,
+                "delivery_confirmed": False,
+            }
+        return {
+            "ok": True,
+            "action": "status",
+            "quiet": False,
+            "found": True,
+            "report_run_id": stored["report_run_id"],
+            "profile": reports.PROFILE,
+            "content_kind": "cards",
+            "content_sha256": stored["content_sha256"],
+            "execution_id": stored["execution_id"],
+            "delivery_confirmed": True,
+            "status": "sent",
+            "targets": ["feishu:chat:oc_af"],
+        }
+
+    monkeypatch.setattr(
+        auto_tools,
+        "submit_automation_report",
+        create_autospec(submit_automation_report, side_effect=_fake_submit),
+    )
+    monkeypatch.setattr(
+        auto_tools,
+        "read_automation_report_status",
+        create_autospec(read_automation_report_status, side_effect=_fake_status),
+    )
+    monkeypatch.setattr(
+        auto_tools,
+        "dispatch_automation_report",
+        create_autospec(
+            dispatch_automation_report,
+            return_value={"ok": True, "delivery_confirmed": True, "status": "sent"},
+        ),
+    )
+    monkeypatch.setattr(
+        auto_tools,
+        "is_internal_or_admin",
+        create_autospec(is_internal_or_admin, return_value=True),
+    )
+
+    out = json.loads(await af_tools._finish("submit", _config(), saved_stub))
+    assert out["ok"] is True
+    assert out["status"] == "sent"
+    assert out["delivery_confirmed"] is True
+    assert out["code"] == "seen_pending"

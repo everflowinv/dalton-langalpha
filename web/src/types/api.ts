@@ -220,10 +220,12 @@ export interface Workspace {
   // DALTON-HOOK(colleague-access): read-only auto-publish pause flag & CAS token for PublishDialog
   auto_publish_paused?: boolean;
   auto_publish_pause_token?: string | null;
-  // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome on create
+  // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome and dedup availability warning on create
   coverage_unit?: Record<string, unknown> | null;
   coverage_unit_warning?: string | null;
   coverage_unit_warning_detail?: CoverageUnitWarningDetail | null;
+  dedup_warning?: string | null;
+  dedup_warning_code?: string | null;
   [key: string]: unknown;
 }
 
@@ -1008,6 +1010,14 @@ export interface ThreadSharePermissions {
   audience?: ShareAudience;
 }
 
+// DALTON-HOOK(share-redaction): DB-only counts of items hidden when allow_files=false
+export interface ShareRedactionSummary {
+  widgets: number;
+  tool_calls: number;
+  images: number;
+  attachments: number;
+}
+
 export interface ThreadShareStatus {
   is_shared: boolean;
   share_token: string;
@@ -1015,7 +1025,11 @@ export interface ThreadShareStatus {
   permissions: ThreadSharePermissions;
   /** The audiences the owner may choose now. Absent from an older server. */
   audiences?: ShareAudience[];
+  // DALTON-HOOK(share-redaction): populated on share panel open (?include_summary=true) and POST /share
+  redaction_summary?: ShareRedactionSummary | null;
 }
+
+export type ThreadShareResponse = ThreadShareStatus;
 
 // --- Share links (files and apps) ---
 

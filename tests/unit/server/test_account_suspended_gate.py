@@ -40,6 +40,7 @@ MESSAGE = (
 
 
 def _gated() -> set:
+    from src.dalton import share_media  # DALTON-HOOK(share-redaction)
     from src.dalton.app import transcriptions  # DALTON-HOOK(dalton-auth)
     from src.server.app import drive_mount, livefs
 
@@ -54,6 +55,8 @@ def _gated() -> set:
         drive_mount._caller,
         # DALTON-HOOK(dalton-auth): transcription routes admit session or task-ticket callers.
         transcriptions._transcription_caller_gate,
+        # DALTON-HOOK(share-redaction): owner media route verifies token + account standing via route dependency.
+        share_media._owner_media_caller_gate,
     }
 
 
@@ -93,6 +96,9 @@ NO_USER_CREDENTIAL = {
     # Authenticated in its handler, by ``authenticate_websocket``, which
     # refuses a suspended account (mounted only with market data on).
     ("WS", "/ws/v1/market-data/aggregates/{market}"),
+    # Large workspace-file download: authenticated by a short-lived HMAC ticket
+    # in its handler, which then calls ``admit_caller`` for the ticket's user.
+    ("GET", "/api/v1/dalton/workspace-files/download"),
     # Share links: the owner's public_links policy governs them.
     ("GET", "/api/v1/public/shared/{share_token}/files"),
     ("POST", "/api/v1/public/shared/{share_token}/files/resolve"),
@@ -100,6 +106,10 @@ NO_USER_CREDENTIAL = {
     ("GET", "/api/v1/public/shared/{share_token}/files/download"),
     ("GET", "/api/v1/public/shared/{share_token}/files/serve/{path:path}"),
     ("GET", "/api/v1/public/shared/{share_token}/replay"),
+    # DALTON-HOOK(share-redaction): public shared media route is governed by share token & allow_files policy.
+    ("GET", "/api/v1/public/shared/{share_token}/media/{media_ref}"),
+    # Share-preview OpenGraph fragment: reads no credential, answers brand-only on any failure.
+    ("GET", "/api/v1/public/og-meta"),
     # Redirects an old preview URL to the page that resolves it for its owner.
     ("GET", "/api/v1/preview/{workspace_id}/{port}"),
     ("GET", "/api/v1/preview/{workspace_id}/{port}/{path:path}"),
@@ -149,6 +159,10 @@ NO_USER_CREDENTIAL = {
     ("GET", "/api/v1/dalton/channels/internal/weixin/login-sessions/{session_key}"),
     ("GET", "/api/v1/dalton/internal/usage/by-model"),
     ("PATCH", "/api/v1/dalton/channels/internal/weixin/login-sessions/{session_key}"),
+    ("POST", "/api/v1/dalton/channels/internal/action-tokens/bind-card"),
+    ("POST", "/api/v1/dalton/channels/internal/action-tokens/consume"),
+    ("POST", "/api/v1/dalton/channels/internal/action-tokens/inspect-gate"),
+    ("POST", "/api/v1/dalton/channels/internal/action-tokens/mint"),
     ("POST", "/api/v1/dalton/channels/internal/automation-notifications/plan"),
     ("POST", "/api/v1/dalton/channels/internal/automation-runs"),
     ("POST", "/api/v1/dalton/channels/internal/automation-runs/{execution_id}/finish"),
@@ -168,6 +182,9 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/release"),
     ("POST", "/api/v1/dalton/channels/internal/inbound/progress"),
     ("POST", "/api/v1/dalton/channels/internal/inbound/register-and-resolve"),
+    ("POST", "/api/v1/dalton/channels/internal/interrupt-resumes/ack"),
+    ("POST", "/api/v1/dalton/channels/internal/interrupt-resumes/claim-text"),
+    ("POST", "/api/v1/dalton/channels/internal/interrupt-runtime-config"),
     ("POST", "/api/v1/dalton/channels/internal/session/command"),
     ("POST", "/api/v1/dalton/channels/internal/steers/reconcile"),
     ("POST", "/api/v1/dalton/channels/internal/weixin/accounts/reconcile"),
@@ -932,3 +949,68 @@ async def test_monitor_grant_route_refuses_suspended_viewer_or_owner(
     with TestClient(app) as client:
         resp = client.get(f"/api/v1/dalton/monitors/g/{grant.token}/v/1/index.html")
     assert resp.status_code == expected_status
+
+
+@pytest.mark.asyncio
+async def test_owner_media_route_refuses_suspended_user_holding_previously_minted_token(
+    monkeypatch,
+):
+    """DALTON-HOOK(share-redaction): a suspended user presenting a previously minted owner media token is refused 403."""
+    from fastapi.testclient import TestClient
+
+    from src.dalton import share_media
+    from src.server.services import membership as membership_svc
+
+    thread_id = "11111111-1111-4111-8111-111111111111"
+    viewer_id = "suspended-owner-u"
+
+    monkeypatch.setenv("DALTON_MEDIA_SIGNING_SECRET", "suspended-gate-test-secret-32chars!")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+    monkeypatch.setattr(
+        share_media,
+        "is_dalton_multiuser_auth_enabled",
+        create_autospec(share_media.is_dalton_multiuser_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        membership_svc,
+        "teams_door_open",
+        create_autospec(membership_svc.teams_door_open, return_value=True),
+    )
+    monkeypatch.setattr(
+        api,
+        "get_user_id_any_state",
+        create_autospec(api.get_user_id_any_state, return_value=viewer_id),
+    )
+
+    async def _suspended_standing(uid: str, **_kwargs):
+        assert uid == viewer_id
+        return Standing(SUSPENDED, SUSPENDED)
+
+    monkeypatch.setattr(
+        f"{ACCOUNT}.read_standing",
+        create_autospec(
+            __import__(ACCOUNT, fromlist=["read_standing"]).read_standing,
+            side_effect=_suspended_standing,
+        ),
+    )
+    serve_spy = create_autospec(share_media._serve_media_payload, return_value=None)
+    monkeypatch.setattr(share_media, "_serve_media_payload", serve_spy)
+
+    # Token minted BEFORE the account was suspended
+    old_token = share_media.mint_owner_media_token(
+        thread_id=thread_id,
+        viewer_id=viewer_id,
+        backend="upstream",
+        ref_id=f"private-media/response-images/{thread_id}/chart.png",
+    )
+
+    app = FastAPI()
+    app.include_router(share_media.owner_media_router)
+    with TestClient(app) as client:
+        resp = client.get(
+            f"/api/v1/threads/{thread_id}/media/{old_token}",
+            headers={"Authorization": "Bearer valid-pre-suspension-jwt"},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["type"] == ACCOUNT_SUSPENDED
+    serve_spy.assert_not_called()

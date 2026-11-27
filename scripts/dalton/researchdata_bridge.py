@@ -2453,14 +2453,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "query": "ask",
             "search": "ask",
         },
-        "accepted_params": ["ticker", "query", "start", "end", "limit"],
-        "accepted_nested_params": [],
+        "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
+        "accepted_nested_params": ["max_pages", "start_page", "deadline_at", "deadline_s"],
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
             "quote": ["ticker"],
         },
-        "optional_params": ["operation", "ticker", "start", "end", "limit"],
+        "optional_params": ["operation", "ticker", "start", "end", "limit", "params"],
         "param_formats": {
             "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'。filings / quote 用；ask 不单独接受 ticker（桥接层会并入 query）",
             "start": "YYYY-MM-DD（filings 必填；ask 的日期写进 query）",
@@ -3336,6 +3336,125 @@ TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
 _HK_DOT_RE = re.compile(r"^0*(\d{1,5})\.HK$", re.IGNORECASE)
 _CN_DOT_RE = re.compile(r"^(\d{6})\.(SH|SZ|SS)$", re.IGNORECASE)
 _US_DOT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9.\-]{0,15})\.US$", re.IGNORECASE)
+
+def _load_sec_issuer_map_data() -> dict[str, Any]:
+    """Load the canonical SEC issuer map JSON from ``plugins/dalton_sec/`` without importing ``src``."""
+    here = Path(__file__).resolve()
+    candidates = (
+        here.with_name("sec_issuer_map.json"),
+        *(parent / "plugins" / "dalton_sec" / "sec_issuer_map.json" for parent in here.parents),
+    )
+    for path in candidates:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+_SEC_ISSUER_MAP_DATA: dict[str, Any] = _load_sec_issuer_map_data()
+_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
+    str(k).upper(): str(v).upper()
+    for k, v in (_SEC_ISSUER_MAP_DATA.get("dual_listed_sec_issuer_map") or {}).items()
+}
+_CONFIRMED_NON_SEC_ISSUERS: frozenset[str] = frozenset(
+    str(item).upper() for item in (_SEC_ISSUER_MAP_DATA.get("confirmed_non_sec_issuers") or ())
+)
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(str(pat), re.IGNORECASE), str(label))
+    for pat, label in (_SEC_ISSUER_MAP_DATA.get("non_sec_market_patterns") or ())
+)
+_SEC_A_SHARE_RE = re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE)
+_SEC_HK_RE = re.compile(r"^(?:HK:)?0*(\d{1,5})(?:\.HK)?$", re.IGNORECASE)
+
+
+def _sec_hk_candidates(raw: str) -> tuple[str, ...]:
+    m_hk = _SEC_HK_RE.fullmatch(raw)
+    if not m_hk:
+        return ()
+    if not (
+        raw.endswith(".HK")
+        or raw.startswith("HK:")
+        or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))
+    ):
+        return ()
+    num = int(m_hk.group(1))
+    return (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}", f"HK:{num:04d}", f"HK:{num:05d}")
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
+def _lookup_sec_watchlist_alias(raw: str) -> str | None:
+    alias_map = None
+    for mod_name in ("scripts.dalton.alphaengine_search_cache", "alphaengine_search_cache"):
+        try:
+            mod = __import__(mod_name, fromlist=["_CORE_WATCHLIST_ALIASES"])
+            alias_map = getattr(mod, "_CORE_WATCHLIST_ALIASES", None)
+            if isinstance(alias_map, dict):
+                break
+        except Exception:
+            continue
+    if not isinstance(alias_map, dict):
+        return None
+    cands = {raw, *_sec_hk_candidates(raw)}
+    for canon, aliases in alias_map.items():
+        canon_str = str(canon or "").strip().upper()
+        if not canon_str or _detect_non_sec_ticker(canon_str) is not None:
+            continue
+        if any(str(a or "").strip().upper() in cands for a in (aliases or ())):
+            return canon_str
+    return None
+
+
+def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
+        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
+    for cand in _sec_hk_candidates(raw):
+        if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
+            return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
+    return _lookup_sec_watchlist_alias(raw)
+
+
+def _is_confirmed_non_sec_ticker(ticker: str | None) -> bool:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return False
+    if _SEC_A_SHARE_RE.fullmatch(raw):
+        return True
+    if raw in _CONFIRMED_NON_SEC_ISSUERS:
+        return True
+    for cand in _sec_hk_candidates(raw):
+        if cand in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    if raw.startswith(("KR:", "KS:", "KQ:")):
+        code = raw.split(":", 1)[1].strip()
+        if f"{code}.KS" in _CONFIRMED_NON_SEC_ISSUERS or f"{code}.KQ" in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    return False
+
+
+def _classify_sec_ticker(ticker: str | None) -> tuple[str, str | None, str | None]:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return ("direct", raw, None)
+    mapped = _resolve_sec_issuer_ticker(raw)
+    market_label = _detect_non_sec_ticker(raw)
+    if mapped is not None:
+        return ("mapped", mapped, market_label)
+    if market_label is not None:
+        if _is_confirmed_non_sec_ticker(raw):
+            return ("confirmed_non_sec", None, market_label)
+        return ("unmapped_non_us", None, market_label)
+    return ("direct", raw, None)
 
 
 def _normalize_ticker_for_route(route: str, ticker: str) -> str:
@@ -4464,6 +4583,13 @@ def _normalize_and_validate_call_args(
             cn_hk_refused = [
                 k for k in ("query", "start", "end") if str(normalized.get(k) or "").strip()
             ]
+        if (
+            route == "cn-hk"
+            and eff_op != "filings"
+            and isinstance(normalized.get("params"), dict)
+            and any(v is not None for v in normalized["params"].values())
+        ):
+            cn_hk_refused.append("params")
         if cn_hk_refused:
             return normalized, norm_view, {
                 "_declared_sources": [],
@@ -4475,11 +4601,66 @@ def _normalize_and_validate_call_args(
                 "unsupported_parameters": cn_hk_refused,
                 "error": (
                     f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
-                    "filings 用 ticker/start/end；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "filings 用 ticker/start/end（可选 params.max_pages/start_page/deadline_at/deadline_s）；quote 只用 ticker（当前报价，没有历史日期）；"
                     "自然语言问题用 operation='ask'，公司和日期写进 query。"
                 ),
                 "normalized_params": norm_view,
             }
+        if route == "cn-hk" and eff_op == "filings" and isinstance(normalized.get("params"), dict):
+            for cn_pk, cn_max in (("max_pages", 20), ("start_page", 200)):
+                cn_pv = normalized["params"].get(cn_pk)
+                if cn_pv is None:
+                    continue
+                if isinstance(cn_pv, bool) or not isinstance(cn_pv, int) or not 1 <= cn_pv <= cn_max:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.{cn_pk} 须为 1–{cn_max} 的正整数（当前为 {cn_pv!r}）。",
+                        "hint": f"请将 params.{cn_pk} 设为 1–{cn_max} 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_da = normalized["params"].get("deadline_at")
+            if cn_da is not None:
+                if (
+                    isinstance(cn_da, bool)
+                    or not isinstance(cn_da, (int, float))
+                    or not math.isfinite(float(cn_da))
+                    or not 0 < float(cn_da) < 1e11
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_at 须为有效的 Unix 时间戳（秒）（当前为 {cn_da!r}）。",
+                        "hint": "请将 params.deadline_at 设为正的 Unix 时间戳（秒），或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_dl = normalized["params"].get("deadline_s")
+            if cn_dl is not None:
+                if (
+                    isinstance(cn_dl, bool)
+                    or not isinstance(cn_dl, (int, float))
+                    or not math.isfinite(float(cn_dl))
+                    or not 0 < float(cn_dl) <= 600
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_s 须为 0–600 之间的正数（当前为 {cn_dl!r}）。",
+                        "hint": "请将 params.deadline_s 设为 0–600 之间的正数（秒），或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
         missing_req: list[str] = []
         if route == "alphaengine":
             p_cur = dict(normalized.get("params")) if isinstance(normalized.get("params"), dict) else {}
@@ -5588,11 +5769,23 @@ def _classify_error_category_and_hint(
         or xueqiu_login_expired
     )
 
+    internal_serialization_signal = (
+        err_code in ("serialization_error", "internal_serialization_error")
+        or status == "internal_error"
+        or "keys must be str, int, float, bool or none" in err_lower
+        or "is not json serializable" in err_lower
+        or "内部序列化" in err_text
+    )
+
     _succeeded, failed_legs = (
         _collect_multi_source_health(payload) if route == "all" else ([], [])
     )
 
-    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
+    if internal_serialization_signal:
+        payload["error_code"] = payload.get("error_code") or "internal_serialization_error"
+        payload["status"] = "internal_error"
+        category = "内部错误"
+    elif existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配", "内部错误"):
         category = existing_cat
     elif route == "all" and failed_legs:
         leg_cats = {
@@ -5632,7 +5825,12 @@ def _classify_error_category_and_hint(
     if existing_hint and not _hint_conflicts_with_category(category, existing_hint):
         return category, existing_hint
 
-    if category == "参数错误":
+    if category == "内部错误":
+        hint = (
+            "服务端内部数据序列化失败（非调用参数错误）；请勿修改参数盲目重试，"
+            "可稍后重试或改用备用数据源。"
+        )
+    elif category == "参数错误":
         if ae_query_sort:
             hint = (
                 "有关键词的主题检索必须使用 sort='relevance'；无关键词浏览才可使用 sort='newest'。"
@@ -8386,7 +8584,47 @@ class ResearchDataBridge:
             )
         )
 
-    def compute_timeout(self, tool_name: str, arguments: dict[str, Any]) -> int:
+    @staticmethod
+    def _extract_cnhk_deadline_remaining_s(
+        arguments: Mapping[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> float | None:
+        """Return remaining seconds until cn-hk filings deadline_at (or legacy deadline_s)."""
+        route = str(arguments.get("route") or "").strip()
+        if route != "cn-hk":
+            return None
+        params = arguments.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        raw_at = params.get("deadline_at")
+        if (
+            raw_at is not None
+            and not isinstance(raw_at, bool)
+            and isinstance(raw_at, (int, float))
+            and math.isfinite(float(raw_at))
+            and 0 < float(raw_at) < 1e11
+        ):
+            cur = time.time() if now_ts is None else float(now_ts)
+            return max(0.0, float(raw_at) - cur)
+        raw_s = params.get("deadline_s")
+        if (
+            raw_s is not None
+            and not isinstance(raw_s, bool)
+            and isinstance(raw_s, (int, float))
+            and math.isfinite(float(raw_s))
+            and float(raw_s) > 0
+        ):
+            return min(float(raw_s), 600.0)
+        return None
+
+    def compute_timeout(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> int:
         """Compute clamped timeout in seconds for a tool call."""
         ceiling = max(10, self.cfg.caller_budget_s - 25)
         if tool_name == "catalog":
@@ -8409,8 +8647,13 @@ class ResearchDataBridge:
 
         req_timeout = arguments.get("timeout")
         if isinstance(req_timeout, int) and not isinstance(req_timeout, bool) and req_timeout > 0:
-            return max(1, min(req_timeout, max_s, ceiling))
-        return max(5, min(default_s, max_s, ceiling))
+            orig_timeout = max(1, min(req_timeout, max_s, ceiling))
+        else:
+            orig_timeout = max(5, min(default_s, max_s, ceiling))
+        cnhk_rem_s = self._extract_cnhk_deadline_remaining_s(arguments, now_ts=now_ts)
+        if cnhk_rem_s is not None:
+            return min(orig_timeout, max(1, int(math.ceil(cnhk_rem_s + 5.0))))
+        return orig_timeout
 
     def _research_code_root(self) -> Path:
         """Resolve active research_runtime code directory."""
@@ -14357,6 +14600,59 @@ class ResearchDataBridge:
                 pruned_all_params = dict(p_all)
                 pruned_all_params["sources"] = list(enabled_local)
                 call_args["params"] = pruned_all_params
+        if (
+            tool_name == "finance"
+            and route == "sec"
+            and operation in ("list-filings", "")
+        ):
+            sec_ticker = str(call_args.get("ticker") or "").strip()
+            ticker_kind, mapped_sec, non_sec_market = _classify_sec_ticker(sec_ticker)
+            if ticker_kind == "mapped" and mapped_sec is not None:
+                call_args["ticker"] = mapped_sec
+                norm_params_view["ticker"] = mapped_sec
+            elif ticker_kind == "confirmed_non_sec":
+                alt_hint = (
+                    '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
+                    if non_sec_market in ("港股", "A股")
+                    else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
+                )
+                non_sec_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "not_sec_filer",
+                    "error_code": "not_sec_filer",
+                    "error_category": "没有匹配",
+                    "sec_filer": False,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                    "hint": alt_hint,
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, non_sec_payload, is_error=True
+                )
+            elif ticker_kind == "unmapped_non_us":
+                unmapped_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "sec_issuer_mapping_not_found",
+                    "error_code": "sec_issuer_mapping_not_found",
+                    "error_category": "没有匹配",
+                    "sec_filer": None,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"未找到 {sec_ticker} 对应的美股/ADR 代码或 SEC CIK 映射（属于{non_sec_market}）；若该公司以 ADR/20-F 在 SEC 申报，请改用其美股代码或 10 位 CIK 查询。",
+                    "hint": "请提供该公司对应的美股 ADR 代码或 SEC CIK，或改用当地交易所/cn-hk 路由查询。",
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, unmapped_payload, is_error=True
+                )
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None
@@ -15026,7 +15322,27 @@ class ResearchDataBridge:
                             asyncio.sleep(test_delay_s),
                             timeout=rem_delay,
                         )
+                    elapsed_so_far = time.monotonic() - t0
                     remaining_budget_s = max(0.1, deadline_mono - time.monotonic())
+                    if tool_name != "catalog" and route == "cn-hk":
+                        cnhk_rem_after_q = self._extract_cnhk_deadline_remaining_s(call_args)
+                        if cnhk_rem_after_q is not None:
+                            params_map = call_args.get("params")
+                            if (
+                                isinstance(params_map, Mapping)
+                                and params_map.get("deadline_at") is None
+                                and params_map.get("deadline_s") is not None
+                            ):
+                                cnhk_rem_after_q = max(0.0, cnhk_rem_after_q - elapsed_so_far)
+                            subproc_cap_s = min(float(eff_timeout), cnhk_rem_after_q + 5.0)
+                            remaining_budget_s = min(remaining_budget_s, max(1.0, subproc_cap_s))
+                            call_args["timeout"] = max(
+                                1,
+                                min(
+                                    int(call_args.get("timeout") or eff_timeout),
+                                    int(math.ceil(cnhk_rem_after_q + 5.0)),
+                                ),
+                            )
                     rpc_req = {
                         "jsonrpc": "2.0",
                         "id": req_id if req_id is not None else 1,

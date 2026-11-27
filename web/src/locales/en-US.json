@@ -474,6 +474,9 @@
       "createAnyway": "Create anyway",
       "ownerLabel": "Owner: {{owner}}",
       "leadLabel": "Lead: {{lead}}"
+    },
+    "dedup": {
+      "unavailableTitle": "Company deduplication unavailable"
     }
   },
   "computer": {
@@ -774,6 +777,20 @@
       "refreshAria": "Refresh sandbox status",
       "refresh": "Refresh status",
       "archive": "Archive",
+      "archiveDialog": {
+        "title": "Confirm computer archive",
+        "description": "Archiving moves this entire computer and every workspace on it to cold storage. Starting it again takes longer (~1–5 minutes) and uses no compute while archived.",
+        "computerLabel": "Target computer:",
+        "affectedTitle": "Workspaces on this computer ({{count}})",
+        "loading": "Loading workspaces on this computer...",
+        "loadFailed": "Failed to load workspaces on this computer. Please try again.",
+        "scopeChanged": "情况已变化，请重新发起",
+        "confirm": "Confirm archive",
+        "archiving": "Archiving...",
+        "cancel": "Cancel",
+        "expandWorkspaces": "Show all {{count}} workspaces",
+        "collapseWorkspaces": "Show fewer workspaces"
+      },
       "sandboxId": "Sandbox ID:"
     },
     "ssh": {
@@ -1015,7 +1032,29 @@
     "identityFailed": "Couldn't confirm account permissions. Please retry.",
     "externalReadOnlyHint": "External members can only manage existing shares.",
     "externalStopOnlyHint": "Use the switch above to stop sharing this conversation.",
-    "updateFailed": "Couldn't update sharing settings. Please try again."
+    "updateFailed": "Couldn't update sharing settings. Please try again.",
+    "redactedWidgetTitle": "Interactive widget hidden",
+    "redactedWidgetDescription": "This share includes conversation text only; interactive widgets and workspace data are omitted.",
+    "redactedImageLabel": "Image hidden",
+    "loadEarlierMessages": "Load earlier messages",
+    "boundaryLine": "Shared content includes the full text of model responses.",
+    "boundaryAllHidden": "Tool calls, reasoning, interactive widgets, images, and workspace files are automatically hidden.",
+    "boundaryWithFiles": "Workspace file access is enabled; interactive widgets, tool calls, images, and workspace files are included.",
+    "boundarySummaryPrefix": "Automatically hides {{items}} from this conversation.",
+    "boundaryCountWidgets_one": "{{count}} interactive widget (shown as placeholder)",
+    "boundaryCountWidgets_other": "{{count}} interactive widgets (shown as placeholders)",
+    "boundaryCountToolCalls_one": "{{count}} tool call and reasoning",
+    "boundaryCountToolCalls_other": "{{count}} tool calls and reasoning",
+    "boundaryCountImages_one": "{{count}} image",
+    "boundaryCountImages_other": "{{count}} images",
+    "boundaryCountAttachments_one": "{{count}} attachment",
+    "boundaryCountAttachments_other": "{{count}} attachments",
+    "boundaryListSeparator": ", ",
+    "boundaryListLastTwo": "{{first}} and {{second}}",
+    "boundaryListLastMany": "{{head}}, and {{last}}",
+    "previewVisitorView": "Preview visitor view",
+    "previewMemberView": "Preview member view",
+    "downloadNotPermitted": "Downloads are turned off for this share."
   },
   "shareLink": {
     "title": "Share {{file}}",
@@ -1917,11 +1956,80 @@
         "approved": "Thread deleted",
         "rejected": "Thread deletion declined"
       },
+      "archiveWorkspace": {
+        "title": "Archive Computer",
+        "approved": "Archived computer {{computer}} ({{count}} workspaces)",
+        "rejected": "Archive cancelled",
+        "failed": "Archive failed",
+        "failedWithReason": "Archive failed: {{reason}}",
+        "scopeChanged": "情况已变化，请重新发起",
+        "computerLabel": "Target computer:",
+        "affectedHint": "All {{count}} workspaces on this computer will be archived:",
+        "confirm": "Confirm archive",
+        "archiving": "Archiving...",
+        "decline": "Cancel",
+        "expandWorkspaces": "Show all {{count}} workspaces",
+        "collapseWorkspaces": "Show fewer workspaces"
+      },
       "workspaceLabel": "Workspace:",
       "threadLabel": "Thread:",
       "unknownId": "unknown",
       "confirm": "Confirm",
       "decline": "Decline"
+    },
+    "watchlistConfirm": {
+      "actions": {
+        "watchlist_batch_add": "Batch Add to Personal Watchlist",
+        "watchlist_set_tier": "Change Watchlist Tier",
+        "watchlist_remove": "Remove from Personal Watchlist",
+        "watchlist_tier_policy": "Update Tier Monitoring Policy"
+      },
+      "tiers": {
+        "core": "Core",
+        "watch": "Watch",
+        "radar": "Radar"
+      },
+      "tasks": {
+        "watch": "Intraday Watch",
+        "delta": "Thesis Delta",
+        "move": "Price Move Alert",
+        "earnings": "Earnings Brief"
+      },
+      "summary": {
+        "create": "Create {{count}}",
+        "update": "Update {{count}}",
+        "resume": "Resume {{count}}",
+        "pause": "Pause {{count}}"
+      },
+      "settled": {
+        "approved": "Personal watchlist updated",
+        "partial": "Watchlist updated (some task syncs pending)",
+        "rejected": "Watchlist change cancelled",
+        "failed": "Watchlist update failed",
+        "failedWithReason": "Watchlist update failed: {{reason}}",
+        "scopeChanged": "Watchlist state changed. Please retry."
+      },
+      "affectedCompanies": "Affected companies ({{count}})",
+      "affectedWorkspaces": "Affected workspaces & tasks ({{count}})",
+      "policyDiffTitle": "Policy changes (before → after)",
+      "policyOff": "Off",
+      "confirm": "Confirm",
+      "submitting": "Applying…",
+      "decline": "Cancel",
+      "retryReconcile": "Retry sync",
+      "retrying": "Syncing…",
+      "retryRunningError": "Sync is already running in the background. Please try again shortly.",
+      "retryPartialError": "Some tasks are still pending sync. Please retry.",
+      "retryFailedError": "Sync retry failed. Please try again.",
+      "changeLabels": {
+        "create": "Create",
+        "update": "Update",
+        "resume": "Resume",
+        "pause": "Pause",
+        "preserveUserPause": "keep manual pause",
+        "preserveTracker": "managed by tracker",
+        "preserveHandoff": "keep handoff pause"
+      }
     },
     "userQuestion": {
       "answered": "Answered: {{answer}}",

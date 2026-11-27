@@ -1203,6 +1203,10 @@ def pause_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
     update_kwargs: Dict[str, Any] = {"status": "paused"}
     if current["trigger_type"] != "once":
         update_kwargs["next_run_at"] = None
+    # DALTON-HOOK(watchlist): persist paused_by_user on manual pause of Dalton-managed automations
+    from src.dalton.watchlist.pause_guards import apply_manual_pause_metadata
+
+    apply_manual_pause_metadata(current, update_kwargs)
     return update_kwargs
 
 
@@ -1221,6 +1225,10 @@ def apply_locked_pause_schedule(
         effective_kwargs["next_run_at"] = None
     else:
         effective_kwargs.pop("next_run_at", None)
+    # DALTON-HOOK(watchlist): persist paused_by_user on locked manual pause of Dalton-managed automations
+    from src.dalton.watchlist.pause_guards import apply_manual_pause_metadata
+
+    apply_manual_pause_metadata(locked_row, effective_kwargs, from_locked_row=True)
 
 
 def _replaced_by_tracker_refusal(row: Any) -> AutomationRefusal | None:
@@ -1245,7 +1253,10 @@ def resume_refusal(current: Dict[str, Any]) -> AutomationRefusal | None:
             f"(must be 'paused' or 'disabled')",
             field="status",
         )
-    when = current.get("next_run_at")
+    # DALTON-HOOK(watchlist): resolve saved once_schedule_at when Dalton once pause cleared next_run_at
+    from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+    when = resolve_paused_once_schedule_at(current) if current["trigger_type"] == "once" else current.get("next_run_at")
     if (
         current["trigger_type"] == "once"
         and current["status"] == "paused"
@@ -1282,7 +1293,10 @@ def resume_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
             current.get("timezone", "UTC"),
         )
     elif current["trigger_type"] == "once":
-        when = current.get("next_run_at")
+        # DALTON-HOOK(watchlist): restore saved once_schedule_at on manual resume of paused Dalton once row
+        from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+        when = resolve_paused_once_schedule_at(current)
         # Disabled by the run it already had: back on, it waits for Run now,
         # as a one-time automation whose run failed does.
         update_kwargs["next_run_at"] = when if when and when > datetime.now(timezone.utc) else None
@@ -1308,7 +1322,10 @@ def apply_locked_resume_schedule(
             locked_row.get("timezone", "UTC"),
         )
     elif locked_row.get("trigger_type") == "once":
-        when_locked = locked_row.get("next_run_at")
+        # DALTON-HOOK(watchlist): restore saved once_schedule_at under lock when resuming paused Dalton once row
+        from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+        when_locked = resolve_paused_once_schedule_at(locked_row)
         if when_locked and when_locked > datetime.now(timezone.utc):
             effective_kwargs["next_run_at"] = when_locked
         elif locked_row.get("status") == "disabled":
@@ -1740,6 +1757,9 @@ async def pause_automation(
         )
 
     update_kwargs = pause_update_fields(current)
+    # DALTON-HOOK(watchlist): defer pause metadata write to _reconcile_locked_pause so pre-lock
+    # metadata copy cannot overwrite concurrent metadata updates (e.g. report_profile confirmation).
+    update_kwargs.pop("metadata", None)
 
     # DALTON-HOOK(company-automations): reconcile locked pause state and record pause history
     async def _reconcile_locked_pause(
@@ -1837,6 +1857,12 @@ async def resume_automation(
             except HTTPException as exc:
                 raise TargetRefused(exc, field="workspace_id") from None
         apply_locked_resume_schedule(locked_row, effective_kwargs)
+        # DALTON-HOOK(watchlist): enforce live watchlist earnings-stage policy under row lock on resume
+        from src.dalton.watchlist.pause_guards import assert_locked_earnings_resume_allowed
+
+        await assert_locked_earnings_resume_allowed(
+            user_id, locked_row, effective_kwargs, conn=locked_conn
+        )
 
     outer_ctx = get_current_history_context()
     eff_actor_for_ctx = (

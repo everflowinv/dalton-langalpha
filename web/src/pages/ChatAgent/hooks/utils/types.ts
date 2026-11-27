@@ -33,6 +33,15 @@ export interface HtmlWidgetData {
   title: string;
   /** Inline data file contents — injected as window.__WIDGET_DATA__ in the iframe. */
   data?: Record<string, string>;
+  // DALTON-HOOK(share-redaction): static redacted placeholder marker for allow_files=false shared replays
+  redacted?: boolean;
+}
+
+// DALTON-HOOK(share-redaction): history_page SSE event shape for paginated replays
+export interface HistoryPageEvent {
+  event?: 'history_page';
+  first_turn_index?: number | null;
+  has_more?: boolean;
 }
 
 /** Data for a preview URL panel. */

@@ -39,6 +39,7 @@ import {
 import {
   type CollectedChartLayerRef,
   type CollectedHtmlWidgetRef,
+  type PendingChartDeliveryReceipt,
   chartLayerCompositeKey,
   collectPublishedChartLayers,
   collectReportSourceChartLayers,
@@ -208,6 +209,7 @@ function confirmationFields(value: object): {
 /** Chinese names for the actions that only the web app can confirm. */
 const WEB_ONLY_ACTION_LABELS: Record<string, string> = {
   create_workspace: "新建工作区",
+  archive_workspace: "归档工作区",
   delete_workspace: "删除工作区",
   delete_thread: "删除对话",
   ptc_agent: "把任务交给工作区分析师",
@@ -391,6 +393,10 @@ export class ChannelGatewayOrchestrator {
   private readonly inFlightChartSettlements = new Map<
     string,
     Promise<boolean>
+  >();
+  private readonly pendingChartReceipts = new Map<
+    string,
+    PendingChartDeliveryReceipt
   >();
   private static readonly MAX_SETTLED_DELIVERABLE_KEYS = 2_000;
   private readonly logger = createSubsystemLogger("orchestrator");
@@ -9168,6 +9174,23 @@ export class ChannelGatewayOrchestrator {
     return true;
   }
 
+  private isWatchBusyError(err: unknown): boolean {
+    if (!(err instanceof BackendHttpError) || err.status !== 409) {
+      return false;
+    }
+    const bodyObj = err.body as {
+      code?: unknown;
+      detail?: { code?: unknown } | null;
+    } | null;
+    const errCode =
+      typeof bodyObj?.code === "string"
+        ? bodyObj.code
+        : typeof bodyObj?.detail?.code === "string"
+          ? bodyObj.detail.code
+          : "";
+    return errCode === "watch_busy";
+  }
+
   private async syncWatchReconnectState(
     handle: ActiveWatchHandle,
   ): Promise<boolean> {
@@ -9176,10 +9199,19 @@ export class ChannelGatewayOrchestrator {
     }
     handle.syncingReconnect = true;
     try {
-      const rec = await this.backend.recoverState({
-        mode: "watch_reconnect",
-        thread_id: handle.threadId,
-      });
+      let rec: I7RecoverResponse;
+      try {
+        rec = await this.backend.recoverState({
+          mode: "watch_reconnect",
+          thread_id: handle.threadId,
+        });
+      } catch (err) {
+        if (this.isWatchBusyError(err)) {
+          handle.needsReconnectSync = true;
+          return false;
+        }
+        throw err;
+      }
 
       let allSettled = true;
       if (
@@ -9298,10 +9330,22 @@ export class ChannelGatewayOrchestrator {
    * Reconnect `/watch` after 45s keepalive timeout or 30m periodic rotation (§1.3.4).
    */
   async reconnectThreadWatch(threadId: string): Promise<void> {
-    const rec = await this.backend.recoverState({
-      mode: "watch_reconnect",
-      thread_id: threadId,
-    });
+    let rec: I7RecoverResponse;
+    try {
+      rec = await this.backend.recoverState({
+        mode: "watch_reconnect",
+        thread_id: threadId,
+      });
+    } catch (err) {
+      if (this.isWatchBusyError(err)) {
+        const existing = this.activeWatches.get(threadId);
+        if (existing) {
+          existing.needsReconnectSync = true;
+        }
+        return;
+      }
+      throw err;
+    }
 
     for (const bg of rec.background_runs ?? []) {
       await this.recoverSingleBackgroundRun(bg, rec.thread_watches);
@@ -10906,6 +10950,7 @@ export class ChannelGatewayOrchestrator {
         initialSnapshots: params.initialSnapshots,
         widgets: params.widgets,
         outboundBlocked: params.outboundBlocked,
+        pendingReceipts: this.pendingChartReceipts,
         nowFn: this.nowFn,
       });
       if (res.settled) {

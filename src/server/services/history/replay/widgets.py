@@ -7,6 +7,8 @@ import json
 import logging
 from typing import Any
 
+# DALTON-HOOK(share-redaction): read widget payloads across private-media/ and legacy keys
+from src.dalton.share_media import read_controlled_object_bytes
 from src.utils.storage import get_bytes
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,14 @@ async def _resolve_widget_data_refs(turn_items: list[dict[str, Any]]) -> None:
     if not pending:
         return
 
+    # DALTON-HOOK(share-redaction): try private-media/ first via controlled reader, preserving patched get_bytes in tests
     raws = await asyncio.gather(
-        *(asyncio.to_thread(get_bytes, ref["key"]) for _payload, ref in pending)
+        *(
+            asyncio.to_thread(
+                read_controlled_object_bytes, ref["key"], reader=get_bytes
+            )
+            for _payload, ref in pending
+        )
     )
     for (payload, ref), raw in zip(pending, raws):
         if raw is None:

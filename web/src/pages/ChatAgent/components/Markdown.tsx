@@ -33,6 +33,8 @@ import { FootnoteLink, isFootnoteLink } from './markdown/FootnoteLink';
 import MermaidDiagram from './markdown/MermaidDiagram';
 import TableScroller from './markdown/TableScroller';
 import { InPlaceSwap } from '@/components/ui/crossfade';
+// DALTON-HOOK(share-redaction): redacted image placeholder, HAST resource stripper, and shared diagram-render context
+import { RedactedImage, rehypeStripResourceStyles, useSharedRedaction } from '@/components/dalton/RedactedSharePlaceholders';
 
 // Sanitize schema: extends GitHub-style defaults to allow KaTeX output,
 // cite-bubble custom element, and MathML/SVG for accessibility.
@@ -69,6 +71,14 @@ const sanitizeSchema = {
     line: ['x1', 'x2', 'y1', 'y2'],
   },
 };
+
+// DALTON-HOOK(share-redaction): allow <redacted-image alt> only when allowDiagramRender is false
+const redactedSanitizeSchema = {
+  ...sanitizeSchema,
+  tagNames: [...sanitizeSchema.tagNames, 'redacted-image'],
+  attributes: { ...sanitizeSchema.attributes, 'redacted-image': ['alt'] },
+};
+const AllowDiagramRender = createContext(true);
 
 interface CodeBlockProps {
   language: string | null;
@@ -129,6 +139,7 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
   const { t } = useTranslation();
   const { theme } = useTheme();
   const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
+  const allowDiagramRender = useContext(AllowDiagramRender); // DALTON-HOOK(share-redaction)
   const effectiveTheme = codeTheme ?? theme;
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -202,7 +213,8 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
       <div style={{ margin: compact ? '4px 0' : '6px 0' }}>
         <div className="rounded overflow-hidden"
           style={{ backgroundColor: '#f7f6f3', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
-          {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme="light" fallback={source} /> : source}
+          {/* DALTON-HOOK(share-redaction): render mermaid as plain code text when diagram rendering is disabled */}
+          {allowDiagramRender && language === 'mermaid' && !live ? <MermaidDiagram code={code} theme="light" fallback={source} /> : source}
         </div>
       </div>
     );
@@ -235,7 +247,8 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
         {/* DALTON-HOOK(mobile-web): allow horizontal scroll for non-wrapped code blocks on mobile */}
         <div className={isMobile ? 'overflow-x-auto' : undefined} data-code-scroll={isMobile ? 'horizontal' : undefined}>
           <TypingLine.Provider value={live ? { line: typingLine } : null}>
-            {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme={effectiveTheme} fallback={highlighted} /> : highlighted}
+            {/* DALTON-HOOK(share-redaction): render mermaid as plain code text when diagram rendering is disabled */}
+            {allowDiagramRender && language === 'mermaid' && !live ? <MermaidDiagram code={code} theme={effectiveTheme} fallback={highlighted} /> : highlighted}
           </TypingLine.Provider>
         </div>
       </div>
@@ -615,12 +628,17 @@ export type RehypePlugins = NonNullable<React.ComponentProps<typeof ReactMarkdow
 const REHYPE_PLUGINS: RehypePlugins = [
   [rehypeKatex, { strict: false }], rehypeRaw, [rehypeSanitize, sanitizeSchema],
 ];
+// DALTON-HOOK(share-redaction): enable <redacted-image> and post-sanitize resource/attribute stripping when allowDiagramRender is false
+const REDACTED_REHYPE_PLUGINS: RehypePlugins = [
+  [rehypeKatex, { strict: false }], rehypeRaw, [rehypeSanitize, redactedSanitizeSchema], rehypeStripResourceStyles,
+];
 
 // The rehype passes, then those that run after the sanitizer: the caller's
 // and the fade's. They only rework what the sanitizer already passed (the
 // fade wraps text in spans carrying a mark id).
-const withPostSanitizePasses = (fresh: string, after: RehypePlugins | undefined): RehypePlugins => {
-  const base = after?.length ? [...REHYPE_PLUGINS, ...after] : REHYPE_PLUGINS;
+const withPostSanitizePasses = (fresh: string, after: RehypePlugins | undefined, allowDiagramRender = true): RehypePlugins => {
+  const core = allowDiagramRender ? REHYPE_PLUGINS : REDACTED_REHYPE_PLUGINS;
+  const base = after?.length ? [...core, ...after] : core;
   return fresh ? [...base, [rehypeFreshText, fresh] as RehypePlugins[number]] : base;
 };
 
@@ -634,6 +652,8 @@ interface MarkdownBlockProps {
   rehypeAfter: RehypePlugins | undefined;
   /** This block's pass from `rehypeForBlock`, run last. */
   blockPass: RehypePlugins[number] | null;
+  // DALTON-HOOK(share-redaction): propagate diagram-render gate to rehype pipeline
+  allowDiagramRender?: boolean;
 }
 
 // One parsed block. Memoized on its source and its fresh key, so a streaming
@@ -648,12 +668,13 @@ interface MarkdownBlockProps {
 // rebuild every highlighted token on each new line. Closing the fence counts
 // its lines at once, one remount per fence. While the block is live, that
 // fence highlights only its typing line per tick (CodeBlock).
-const MarkdownBlock = React.memo(function MarkdownBlock({ source, components, live, fresh, rehypeAfter, blockPass }: MarkdownBlockProps) {
+const MarkdownBlock = React.memo(function MarkdownBlock({ source, components, live, fresh, rehypeAfter, blockPass, allowDiagramRender = true }: MarkdownBlockProps) {
   const { lineKey, openFence } = useMemo(() => scanStreamingBlock(source), [source]);
+  // DALTON-HOOK(share-redaction): switch to REDACTED_REHYPE_PLUGINS when allowDiagramRender is false
   const rehypePlugins = useMemo(() => {
-    const passes = withPostSanitizePasses(fresh, rehypeAfter);
+    const passes = withPostSanitizePasses(fresh, rehypeAfter, allowDiagramRender);
     return blockPass ? [...passes, blockPass] : passes;
-  }, [fresh, rehypeAfter, blockPass]);
+  }, [fresh, rehypeAfter, blockPass, allowDiagramRender]);
   return (
     <LiveFence.Provider value={live ? openFence : -1}>
       <ReactMarkdown key={lineKey} remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components}>
@@ -672,6 +693,8 @@ interface MarkdownProps {
   onOpenFile?: OpenFileHandler;
   /** Called with the fragment of a same-document link (`[Valuation](#valuation)`). */
   onAnchorLink?: (fragment: string) => void;
+  // DALTON-HOOK(monitors): custom renderer for permission-checked relative links in shared Markdown views
+  renderFileLink?: (info: { href: string; children: React.ReactNode }) => React.ReactNode;
   /** Force code blocks to use a specific syntax theme regardless of app theme */
   codeTheme?: 'light' | 'dark';
   /** The content is still arriving, so a fence open at its end is still being written. */
@@ -688,6 +711,8 @@ interface MarkdownProps {
    * is part of every block's memo.
    */
   rehypeForBlock?: (fileLine: (line: number) => number) => RehypePlugins[number];
+  /** DALTON-HOOK(share-redaction): false in text-only shares to render mermaid as code text, register redacted-image, and strip resource styles. */
+  allowDiagramRender?: boolean;
 }
 
 // An image the source embeds, by its destination as written: `<...>` or bare.
@@ -703,8 +728,11 @@ function embeddedImagesKey(source: string): string {
   return [...found].sort().join('\n');
 }
 
-function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false, rehypeAfter, rehypeForBlock }: MarkdownProps): React.ReactElement {
+function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, renderFileLink, codeTheme, streaming = false, rehypeAfter, rehypeForBlock, allowDiagramRender }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
+  // DALTON-HOOK(share-redaction): default to true (or inherit SharedRedactionContext inside SharedChatView)
+  const shareRedaction = useSharedRedaction();
+  const effectiveAllowDiagramRender = allowDiagramRender ?? shareRedaction.allowDiagramRender;
   const folders = useWorkspaceFolders();
   const rootDir = folders?.rootDir;
   const otherRoots = folders?.otherRoots;
@@ -749,7 +777,12 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       result = { ...result, pre: themedPre };
     }
 
-    if (!onOpenFile && !onAnchorLink && variant !== 'chat') return result;
+    // DALTON-HOOK(share-redaction): map <redacted-image alt> to static RedactedImage only when allowDiagramRender is false
+    if (!effectiveAllowDiagramRender) {
+      result = { ...result, 'redacted-image': RedactedImage };
+    }
+
+    if (!onOpenFile && !onAnchorLink && !renderFileLink && variant !== 'chat') return result;
 
     // Fallback: detect __wsref__ links inside inline code spans that survived
     // normalizeFileRefs' backtick unwrapping (e.g., nested backticks, extra whitespace).
@@ -808,6 +841,8 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
         if (isImagePath(href) && !embedded.has(normalizeFilePath(href!, folders))) {
           return <WorkspaceImage src={href} alt={textOf(children)} />;
         }
+        // DALTON-HOOK(monitors): delegate shared-viewer relative links to permission-checked renderer
+        if (renderFileLink) return renderFileLink({ href: href!, children });
         if (onOpenFile) {
           const wsRef = parseWsPath(href);
           const { path, location } = splitFileLocation(href!);
@@ -840,7 +875,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       return <DefaultA node={_node} href={href} {...props}>{children}</DefaultA>;
     };
     return { ...result, a: fileAwareA };
-  }, [onOpenFile, onAnchorLink, variant, config.components, codeTheme, folders, embeddedImages]);
+  }, [onOpenFile, onAnchorLink, renderFileLink, variant, config.components, codeTheme, folders, embeddedImages, effectiveAllowDiagramRender]);
 
   // Rendered markdown is always long-form reading content — every call site
   // (transcript, detail panels, memos) gets the content face here.
@@ -850,14 +885,17 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       className={`markdown-root font-content ${config.className} ${className}`.trim()}
       style={{ ...config.style, ...style }}
     >
-      {blocks.map((block, i) => (
-        <React.Fragment key={i}>
-          {/* mdast-to-hast puts a newline text node between top-level siblings;
-              keep the DOM identical to a whole-document render. */}
-          {i > 0 && '\n'}
-          <MarkdownBlock source={block} components={components} live={streaming && i === blocks.length - 1} fresh={freshKeys[i]} rehypeAfter={rehypeAfter} blockPass={blockPasses?.[i] ?? null} />
-        </React.Fragment>
-      ))}
+      {/* DALTON-HOOK(share-redaction): provide allowDiagramRender to CodeBlock and MarkdownBlock */}
+      <AllowDiagramRender.Provider value={effectiveAllowDiagramRender}>
+        {blocks.map((block, i) => (
+          <React.Fragment key={i}>
+            {/* mdast-to-hast puts a newline text node between top-level siblings;
+                keep the DOM identical to a whole-document render. */}
+            {i > 0 && '\n'}
+            <MarkdownBlock source={block} components={components} live={streaming && i === blocks.length - 1} fresh={freshKeys[i]} rehypeAfter={rehypeAfter} blockPass={blockPasses?.[i] ?? null} allowDiagramRender={effectiveAllowDiagramRender} />
+          </React.Fragment>
+        ))}
+      </AllowDiagramRender.Provider>
     </div>
   );
 }

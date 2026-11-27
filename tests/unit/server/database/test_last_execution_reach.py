@@ -986,13 +986,32 @@ def _run_full_last_execution_probe_sqlite(
 
 
 @pytest.mark.asyncio
-async def test_colleague_workspace_thread_preserves_original_workspace_id_after_task_move():
-    """Round 3 item 1: caller-readable thread in a live colleague workspace keeps its real workspace_id after task move."""
+async def test_colleague_workspace_thread_preserves_original_workspace_id_after_task_move(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Caller-readable thread in a live colleague workspace keeps its real workspace_id
+    when colleague thread read access is granted, and strips the thread link (falling
+    back to caller's own task workspace) when colleague access is disabled or hidden."""
+    from src.dalton import sharing as sharing_mod
+
     sq, ids = _build_sqlite_history_world()
+    sq.executescript(
+        """
+        ALTER TABLE workspaces ADD COLUMN config TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE conversation_threads ADD COLUMN metadata TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN is_shared INTEGER DEFAULT 0;
+        ALTER TABLE conversation_threads ADD COLUMN msg_type TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN llm_model TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN reasoning_effort TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN fast_mode INTEGER DEFAULT 0;
+        ALTER TABLE conversation_threads ADD COLUMN title TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN created_at TEXT;
+        """
+    )
     get_conn, _, _ = _sqlite_async_db(sq)
-    colleague_thread = "t8888881-0000-4000-8000-000000000001"
-    reused_other_thread = "t8888882-0000-4000-8000-000000000002"
-    colleague_in_own_ws_thread = "t8888883-0000-4000-8000-000000000003"
+    colleague_thread = "88888881-0000-4000-8000-000000000001"
+    reused_other_thread = "88888882-0000-4000-8000-000000000002"
+    colleague_in_own_ws_thread = "88888883-0000-4000-8000-000000000003"
     exec_colleague_run = "e8888881-0000-4000-8000-000000000001"
     exec_reused_other = "e8888882-0000-4000-8000-000000000002"
     exec_colleague_in_own_ws = "e8888883-0000-4000-8000-000000000003"
@@ -1022,7 +1041,38 @@ async def test_colleague_workspace_thread_preserves_original_workspace_id_after_
         )
         sq.commit()
 
-        with patch("src.server.database.automation_executions.get_db_connection", new=get_conn):
+        # Case 1: sharing + colleague dispatch enabled -> owner's colleague thread is readable.
+        monkeypatch.setattr(sharing_mod, "_sharing_auth_enabled", lambda: True)
+        monkeypatch.setattr(sharing_mod, "_multiuser_auth_enabled", lambda: True)
+        monkeypatch.setattr(sharing_mod, "is_colleague_dispatch_enabled", lambda: True)
+        monkeypatch.setattr(
+            sharing_mod,
+            "require_team_reader",
+            create_autospec(sharing_mod.require_team_reader, return_value=ids["owner"]),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_user_tier",
+            create_autospec(sharing_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "classify_owner_tier",
+            create_autospec(sharing_mod.classify_owner_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_workspace_sharing",
+            create_autospec(
+                sharing_mod.get_workspace_sharing,
+                return_value={"web_access": "hidden", "cos_access": "hidden"},
+            ),
+        )
+
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn),
+            patch("src.server.database.pool.get_db_connection", new=get_conn),
+        ):
             session_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
             comp_a_rows, _ = await exec_db.list_executions(
                 ids["owner"], computer_id=ids["comp_a"], limit=50
@@ -1036,15 +1086,29 @@ async def test_colleague_workspace_thread_preserves_original_workspace_id_after_
 
         # Caller-owned thread in live colleague workspace keeps colleague's real workspace_id (not rewritten to ws_a1).
         assert session_by_id[exec_colleague_run]["workspace_id"] == ids["ws_other_priv"]
+        assert session_by_id[exec_colleague_run]["conversation_thread_id"] == colleague_thread
         assert comp_a_by_id[exec_colleague_run]["workspace_id"] == ids["ws_other_priv"]
-        # Reused thread belonging to other in other's private workspace still falls back to task workspace ws_a1.
+        # Reused thread belonging to other in other's private workspace strips thread link and falls back to ws_a1.
         assert session_by_id[exec_reused_other]["workspace_id"] == ids["ws_a1"]
+        assert session_by_id[exec_reused_other]["conversation_thread_id"] is None
         assert comp_a_by_id[exec_reused_other]["workspace_id"] == ids["ws_a1"]
         # Workspace owner can read a colleague's thread in owner's own live workspace.
         assert session_by_id[exec_colleague_in_own_ws]["workspace_id"] == ids["ws_a1"]
         assert comp_a_by_id[exec_colleague_in_own_ws]["workspace_id"] == ids["ws_a1"]
         # Colleague's computer never becomes reachable via owner's computer token.
         assert comp_other_rows == []
+
+        # Case 2 (O1/Q1): colleague dispatch disabled + hidden colleague workspace ->
+        # strips colleague thread link and does not expose ws_other_priv.
+        monkeypatch.setattr(sharing_mod, "is_colleague_dispatch_enabled", lambda: False)
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn),
+            patch("src.server.database.pool.get_db_connection", new=get_conn),
+        ):
+            hidden_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
+        hidden_by_id = {r["automation_execution_id"]: r for r in hidden_rows}
+        assert hidden_by_id[exec_colleague_run]["workspace_id"] == ids["ws_a1"]
+        assert hidden_by_id[exec_colleague_run]["conversation_thread_id"] is None
     finally:
         sq.close()
 

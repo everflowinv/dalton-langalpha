@@ -10229,4 +10229,112 @@ describe("Round 10 Fixes (Codex R9 + Grok R9)", () => {
       await h.cleanup();
     }
   });
-});
+  });
+
+  it("BE2: throttles immediate empty getupdates polls with a minimum interval, aborts wait promptly on stop, and isolates per-account intervals", async () => {
+    // 1) Consecutive immediate empty returns are rate-limited (cannot spin hundreds of times in 120ms)
+    const backend = createMockBackend();
+    const ctrl1 = new AbortController();
+    let emptyPollCalls = 0;
+    const monitor1 = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be21",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_1",
+      ilinkBotId: "bot_be2_1",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrl1.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        emptyPollCalls += 1;
+        if (emptyPollCalls > 10) {
+          ctrl1.abort();
+        }
+        return new Response(
+          JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const run1 = monitor1.start();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const abortStart = Date.now();
+    ctrl1.abort();
+    await waitBounded(run1, "monitor1 exited promptly when aborted during empty-poll wait");
+    const abortElapsedMs = Date.now() - abortStart;
+    // With default 1000ms minimum empty-poll interval, in 150ms only 1 poll should have fired,
+    // and aborting during the ~850ms remaining wait MUST exit immediately (< 150ms).
+    expect(emptyPollCalls).toBe(1);
+    expect(abortElapsedMs).toBeLessThan(150);
+
+    // 2) Multi-account independence: account A receiving immediate empty polls waits its interval
+    //    while account B receiving messages polls back-to-back without waiting on account A.
+    const ctrlA = new AbortController();
+    const ctrlB = new AbortController();
+    let callsA = 0;
+    let callsB = 0;
+    const thirdCallB = defer<void>();
+    const monitorA = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be2a",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_a",
+      ilinkBotId: "bot_be2_a",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrlA.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        callsA += 1;
+        return new Response(
+          JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const monitorB = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be2b",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_b",
+      ilinkBotId: "bot_be2_b",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrlB.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        callsB += 1;
+        if (callsB >= 3) {
+          thirdCallB.resolve();
+          ctrlB.abort();
+        }
+        return new Response(
+          JSON.stringify({
+            ret: 0,
+            msgs: [
+              {
+                message_id: `msg_b_${callsB}`,
+                from_user_id: "wx_user_b",
+                message_type: 1,
+                item_list: [{ type: 1, text_item: { text: `hi ${callsB}` } }],
+              },
+            ],
+            get_updates_buf: "",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const runA = monitorA.start();
+    const runB = monitorB.start();
+    await waitBounded(thirdCallB.promise, "account B completed 3 non-empty polls independently");
+    await waitBounded(runB, "monitorB exited");
+    expect(callsB).toBe(3);
+    expect(callsA).toBe(1);
+    ctrlA.abort();
+    await waitBounded(runA, "monitorA exited");
+  });

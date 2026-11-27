@@ -363,6 +363,8 @@ class PTCAgent:
         # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
         research_writing_enabled: bool = False,
         member_context: MemberContext | None = None,
+        # DALTON-HOOK(watchlist): withhold personal watchlist tool on individually shared threads
+        thread_is_shared: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -1166,12 +1168,21 @@ class PTCAgent:
 
         # DALTON-HOOK(dalton-tools): build role-scoped Dalton tools before rendering prompt
         # DALTON-HOOK(team-memory-toggle): mount conversation_search and render its prompt line from deployment/tier availability only (not personal toggle)
+        # DALTON-HOOK(watchlist): withhold personal watchlist tool on shared or foreign workspace turns
         from src.dalton.tools import build_dalton_tools
+        from src.dalton.watchlist.privacy import is_personal_watchlist_turn_allowed
 
         dalton_tools = build_dalton_tools(
             role,
             filesystem_backend,
             user_tier=user_tier,
+            allow_personal_watchlist=is_personal_watchlist_turn_allowed(
+                own_data=own_data,
+                thread_is_shared=thread_is_shared,
+                user_id=user_id,
+                owner_id=owner_id,
+                workspace_owner_id=workspace_owner_id,
+            ),
         )
         conversation_search_available = any(
             getattr(t, "name", None) == "conversation_search" for t in dalton_tools
@@ -1187,6 +1198,17 @@ class PTCAgent:
         dalton_report_delivery_enabled = any(
             getattr(t, "name", None) == "dalton_report_delivery" for t in dalton_tools
         )
+        if dalton_report_delivery_enabled and user_id:
+            from src.dalton.tools.report_delivery_tools import (
+                ReportDeliveryHitlCleanupMiddleware,
+            )
+
+            main_only_middleware.append(
+                ReportDeliveryHitlCleanupMiddleware(
+                    thread_id=str(thread_id or ""),
+                    caller_user_id=str(user_id),
+                )
+            )
         # DALTON-HOOK(colleague-access): gate CoS hand-off & analyst colleague_workspace prompts on actual capability/mounted tool
         from src.dalton.capabilities import CapabilityId, has_capability
 
@@ -1545,6 +1567,9 @@ class PTCAgent:
                 # The workflow store the file tools mount (``workflow_fs``).
                 user_id=owner_id,
                 prebuilt_workflows=get_prebuilt_workflows(),
+                # DALTON-HOOK(workflow-discovered-tools): pass workspace MCP registry
+                # for server-side tool discovery in topic-research when bridge is off.
+                mcp_registry=mcp_registry,
             )
             tools.append(run_workflow_tool)
 

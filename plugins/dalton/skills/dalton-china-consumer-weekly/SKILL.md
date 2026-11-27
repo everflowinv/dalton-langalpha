@@ -138,7 +138,7 @@ python3 .agents/skills/dalton-china-consumer-weekly/scripts/china_consumer_weekl
 
 成稿补扫周日 08:00 采集之后的公告：`finance(route="cn-hk", operation="filings", ticker=..., start=采集时刻, end=成稿时刻)`。命中的用 `add-note` 入库。
 
-卡片按 `templates/weekly-card.md` 写到 `temp/china-consumer-weekly/<friday>-card.md`。全文按 `templates/weekly-report.md` 写到 `temp/china-consumer-weekly/<friday>.md`。卡片最后一节是待验证。不用 Markdown 表格，正文不出现 `$`。
+卡片按 `templates/weekly-card.md` 写到 `temp/china-consumer-weekly/<friday>-card.md`。全文按 `templates/weekly-report.md` 写到 `temp/china-consumer-weekly/<friday>.md`。卡片最后一节是待验证。不用 Markdown 表格，正文不出现 `$`。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 ```bash
 python3 .agents/skills/dalton-china-consumer-weekly/scripts/china_consumer_weekly.py \

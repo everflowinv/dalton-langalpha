@@ -699,11 +699,36 @@ async def _sync_home_coverage_for_preflight(
     is_home_dalton = (
         kind in ("calendar", "director_daily", "director_weekly") or not ticker
     ) and not str(kind).startswith("sector_")
-    if not is_home_dalton or not persist:
+    if not persist:
         return None
 
     company_execution = is_company_system_user(user_id)
     eff_sync_timeout = max(0.05, float(sync_timeout_s or HOME_COVERAGE_SYNC_TIMEOUT_S))
+
+    # Item 11: ANY personal preflight belonging to user_id (including company-ticker tasks)
+    # scans and drains unfinished personal watchlist outbox jobs.
+    if not company_execution:
+        try:
+            from src.dalton.watchlist.reconciler import TierPolicyReconciler
+
+            await asyncio.wait_for(
+                TierPolicyReconciler().reconcile_pending_jobs(
+                    user_id, sync_home=not is_home_dalton
+                ),
+                timeout=eff_sync_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs timed out after %.2fs for user=%s",
+                eff_sync_timeout,
+                user_id,
+            )
+        except Exception as e:
+            logger.debug("[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs skipped: %s", e)
+
+    if not is_home_dalton:
+        return None
+
     group_refresh_summary: Optional[str] = None
     # Company execution must not refresh member groups or create member calendar tasks.
     if kind == "calendar" and not company_execution:
@@ -726,15 +751,63 @@ async def _sync_home_coverage_for_preflight(
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
 
-    async def _render_and_sync() -> None:
+    # Item 13 / r4 Decision 6: capture roster_revision and ONLY completed unsynced jobs BEFORE render
+    covered_job_ids: list[str] | None = None
+    rendered_revision: int | None = None
+    if not company_execution:
+        try:
+            from src.dalton.watchlist.policies import (
+                get_user_roster_state,
+                list_unfinished_reconcile_jobs,
+            )
+
+            roster_state = await get_user_roster_state(user_id)
+            rendered_revision = int(roster_state.get("roster_revision") or 0)
+            unsynced_before = await list_unfinished_reconcile_jobs(user_id)
+            covered_job_ids = [
+                str(j["job_id"])
+                for j in unsynced_before
+                if j.get("job_id")
+                and not j.get("yaml_synced")
+                and not (j.get("pending_tickers") or [])
+                and not (j.get("failed_items") or [])
+                and int(j.get("roster_revision") or 0) <= rendered_revision
+            ]
+        except Exception as e:
+            logger.debug("[DALTON_PREFLIGHT] list_unfinished_reconcile_jobs skipped: %s", e)
+
+    async def _render_and_sync() -> bool:
         if company_execution:
             yaml_text = await render_company_coverage_yaml()
-        else:
-            yaml_text = await render_coverage_yaml(user_id)
-        await sync_user_coverage_to_home(user_id, yaml_text=yaml_text)
+            return bool(await sync_user_coverage_to_home(user_id, yaml_text=yaml_text))
+        yaml_text = await render_coverage_yaml(user_id)
+        sync_kwargs: dict[str, Any] = {"yaml_text": yaml_text}
+        if rendered_revision is not None:
+            import inspect as _inspect
+
+            try:
+                _sync_params = _inspect.signature(sync_user_coverage_to_home).parameters
+                if "roster_revision" in _sync_params or any(
+                    p.kind == _inspect.Parameter.VAR_KEYWORD for p in _sync_params.values()
+                ):
+                    sync_kwargs["roster_revision"] = rendered_revision
+            except (TypeError, ValueError):
+                sync_kwargs["roster_revision"] = rendered_revision
+        return bool(await sync_user_coverage_to_home(user_id, **sync_kwargs))
 
     try:
-        await asyncio.wait_for(_render_and_sync(), timeout=eff_sync_timeout)
+        synced = await asyncio.wait_for(_render_and_sync(), timeout=eff_sync_timeout)
+        if synced and not company_execution and covered_job_ids:
+            try:
+                from src.dalton.watchlist.reconciler import TierPolicyReconciler
+
+                await TierPolicyReconciler().mark_yaml_synced_for_user(
+                    user_id,
+                    covered_job_ids=covered_job_ids,
+                    max_revision=rendered_revision,
+                )
+            except Exception as e:
+                logger.debug("[DALTON_PREFLIGHT] mark_yaml_synced_for_user skipped: %s", e)
     except asyncio.TimeoutError:
         logger.warning(
             "[DALTON_PREFLIGHT] sync_user_coverage_to_home timed out after %.2fs for user=%s",
@@ -760,6 +833,8 @@ _SEEN_WATERMARK_KEYS: tuple[str, ...] = (
     "last_sec_accession",
     "seen_cnhk_filings",
     "last_cnhk_check_date",
+    "cnhk_probe_resume_pages",
+    "cnhk_probe_unresolved_truncated_dates",
 )
 
 
@@ -908,10 +983,14 @@ def _merge_wake_results(
     signals: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     incomplete: list[str] = []
+    degraded: list[str] = []
     for item in wakes:
         for probe_name in item.incomplete_probes:
             if probe_name not in incomplete:
                 incomplete.append(probe_name)
+        for src_name in item.degraded_sources:
+            if src_name not in degraded:
+                degraded.append(src_name)
         for sig in item.signals:
             pair = (str(sig.get("probe") or ""), str(sig.get("signal_key") or ""))
             if not pair[1] or pair in seen:
@@ -929,6 +1008,7 @@ def _merge_wake_results(
             signals=signals,
         ),
         incomplete_probes=incomplete,
+        degraded_sources=degraded,
     )
 
 
@@ -1096,6 +1176,7 @@ def _build_wake_preflight_result(
     ticker: Optional[str],
     signals: list[dict[str, Any]],
     group_refresh_summary: Optional[str] = None,
+    degraded_sources: Optional[list[str]] = None,
 ) -> PreflightResult:
     """Build a waking ``PreflightResult`` and its ``wake_context`` consistently."""
     wake_ctx = format_wake_directive(
@@ -1114,6 +1195,7 @@ def _build_wake_preflight_result(
         reason=f"{len(signals)}_signals",
         signals=signals,
         wake_context=wake_ctx,
+        degraded_sources=list(degraded_sources or []),
     )
 
 
@@ -1322,8 +1404,9 @@ async def _conclude_preflight(
             effective_candidates.append(cand)
     candidate_signals = effective_candidates
 
+    degraded_sources = _degraded_sources_of(probe_progress)
+
     if not candidate_signals:
-        degraded_sources = _degraded_sources_of(probe_progress)
         skip_reason = "sources_degraded" if degraded_sources else "no_new_signals"
         log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
         if persist and not _wake_already_committed(probe_progress):
@@ -1398,7 +1481,14 @@ async def _conclude_preflight(
     woke_signals = direct_signals + triage_kept
 
     if not woke_signals:
-        skip_reason = triage_reason if triage_candidates else "no_new_signals"
+        skip_reason = (
+            triage_reason
+            if triage_candidates
+            else ("sources_degraded" if degraded_sources else "no_new_signals")
+        )
+        log_signals = list(triage_skipped)
+        if degraded_sources:
+            log_signals.append({"degraded_sources": degraded_sources})
         if persist and not _wake_already_committed(probe_progress):
             try:
                 await watch_db.insert_preflight_log(
@@ -1407,7 +1497,7 @@ async def _conclude_preflight(
                     workspace_id=workspace_id,
                     decision="skip",
                     reason=skip_reason,
-                    signals=triage_skipped,
+                    signals=log_signals,
                 )
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
@@ -1417,6 +1507,7 @@ async def _conclude_preflight(
             reason=skip_reason,
             signals=[],
             wake_context=None,
+            degraded_sources=degraded_sources,
         )
 
     # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
@@ -1599,6 +1690,7 @@ async def _conclude_preflight(
                 if not s.get("signal_id") or str(s["signal_id"]) in claimed_ids
             ]
             if not woke_signals:
+                log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
                 if persist and not _wake_already_committed(probe_progress):
                     try:
                         await watch_db.insert_preflight_log(
@@ -1607,7 +1699,7 @@ async def _conclude_preflight(
                             workspace_id=workspace_id,
                             decision="skip",
                             reason="already_claimed_by_concurrent_run",
-                            signals=[],
+                            signals=log_signals,
                         )
                     except Exception as e:
                         logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
@@ -1617,9 +1709,11 @@ async def _conclude_preflight(
                     reason="already_claimed_by_concurrent_run",
                     signals=[],
                     wake_context=None,
+                    degraded_sources=degraded_sources,
                 )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
+            log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
             if persist and not _wake_already_committed(probe_progress):
                 try:
                     await watch_db.insert_preflight_log(
@@ -1628,7 +1722,7 @@ async def _conclude_preflight(
                         workspace_id=workspace_id,
                         decision="skip",
                         reason="claim_failed",
-                        signals=[],
+                        signals=log_signals,
                     )
                 except Exception as log_err:
                     logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", log_err)
@@ -1638,6 +1732,7 @@ async def _conclude_preflight(
                 reason="claim_failed",
                 signals=[],
                 wake_context=None,
+                degraded_sources=degraded_sources,
             )
 
     # A real wake happened: the stale-todo sweep-up rides along, and only then
@@ -1664,6 +1759,7 @@ async def _conclude_preflight(
         ticker=ticker,
         signals=woke_signals,
         group_refresh_summary=group_refresh_summary,
+        degraded_sources=degraded_sources,
     )
     _remember_wake(probe_progress, result, name=name, ticker=ticker)
     if persist and stale_signals:
@@ -2185,6 +2281,8 @@ async def _preflight_check_inner(
                     state.get("cnhk_probe_partial") is True
                     or state.get("cnhk_probe_truncated_this_run") is True
                     or bool(state.get("cnhk_probe_unresolved_truncated_dates"))
+                    or bool(state.get("cnhk_probe_resume_pages"))
+                    or bool(state.get("cnhk_probe_page_backoff"))
                 ):
                     _note_probe_not_succeeded(probe_progress)
                     _note_probe_degraded(probe_progress, probe_name)
@@ -2342,6 +2440,9 @@ async def _log_wake_result(
 ) -> None:
     """Write the wake log. A failure only warns; the wake itself still stands."""
     try:
+        log_signals = list(result.signals)
+        if result.degraded_sources:
+            log_signals.append({"degraded_sources": list(result.degraded_sources)})
         # DALTON-HOOK(preflight): persist complete wake_context (with optional coverage_group_refresh block)
         await watch_db.insert_preflight_log(
             automation_id=automation_id,
@@ -2349,7 +2450,7 @@ async def _log_wake_result(
             workspace_id=workspace_id,
             decision=_allowed_decision(result.decision),
             reason=str(result.reason or ""),
-            signals=list(result.signals),
+            signals=log_signals,
             wake_context=result.wake_context,
         )
     except Exception as e:

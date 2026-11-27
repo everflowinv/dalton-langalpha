@@ -93,7 +93,8 @@ export function restoreToolApprovalsPending(
       }
     }
     // DALTON-HOOK(cos-settings-tools): restore submitting/rejected workspace & secretary cards when resume POST is refused
-    for (const bucket of ['workspaceProposals', 'secretaryActionProposals'] as const) {
+    // DALTON-HOOK(watchlist): also restore submitting/rejected watchlist confirmation cards on resume refusal
+    for (const bucket of ['workspaceProposals', 'secretaryActionProposals', 'watchlistProposals'] as const) {
       const proposals = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
       if (!proposals) continue;
       let pChanged = false;
@@ -128,7 +129,8 @@ export function failProposalsScopeChanged(
     const msg = m as AssistantMessage;
     let nextMsg = msg;
     let changed = false;
-    for (const bucket of ['workspaceProposals', 'secretaryActionProposals'] as const) {
+    // DALTON-HOOK(watchlist): include watchlistProposals when backend rejects resume with 409 scope_changed
+    for (const bucket of ['workspaceProposals', 'secretaryActionProposals', 'watchlistProposals'] as const) {
       const proposals = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
       if (!proposals) continue;
       let pChanged = false;

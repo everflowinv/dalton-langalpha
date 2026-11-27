@@ -21,7 +21,7 @@ from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
     user_automations_lock,
 )
-from src.dalton.coverage import get_user_tier, set_user_coverage_tier
+from src.dalton.coverage import get_user_tier
 from src.dalton.services.company_automations import (
     automation_history_context,
     get_current_history_context,
@@ -282,6 +282,8 @@ async def _resolve_workspace_ticker(
     existing_rows: list[dict[str, Any]] | None = None,
     *,
     registered_units: Mapping[str, Mapping[str, Any]] | None = None,
+    conn: Any = None,
+    raise_on_db_error: bool = False,
 ) -> str:
     """Resolve the uppercase company ticker for a workspace, or raise.
 
@@ -295,8 +297,14 @@ async def _resolve_workspace_ticker(
     """
     ws: dict[str, Any] | None = None
     try:
-        ws = await ws_db.get_workspace(str(workspace_id))
+        ws = (
+            await ws_db.get_workspace(str(workspace_id), conn=conn)
+            if conn is not None
+            else await ws_db.get_workspace(str(workspace_id))
+        )
     except Exception as exc:
+        if raise_on_db_error:
+            raise
         logger.debug("[DALTON_TRACKING] get_workspace(%s) failed: %s", workspace_id, exc)
 
     from src.dalton.coverage.identity import resolve_workspace_coverage_identity
@@ -305,6 +313,8 @@ async def _resolve_workspace_ticker(
         ws if ws is not None else {"workspace_id": str(workspace_id)},
         registered_units=registered_units,
         automations=existing_rows,
+        conn=conn,
+        raise_on_doc_error=raise_on_db_error,
     )
     if identity.is_home:
         raise ValueError("Home workspace does not support company auto-tracking")
@@ -421,7 +431,18 @@ def _derive_status_and_details(
     ]
 
     total_expected = len(countable_names)
-    if len(existing_standard) == total_expected and len(active_tasks) == total_expected:
+    if len(expected_names) == 0:
+        any_active_company = any(
+            str(r.get("status") or "").lower() == "active"
+            for r in company_rows
+        )
+        if any_active_company:
+            status = "enabled"
+            label = LABEL_ENABLED_ZH
+        else:
+            status = "disabled"
+            label = LABEL_DISABLED_ZH
+    elif len(existing_standard) == total_expected and len(active_tasks) == total_expected:
         status = "enabled"
         label = LABEL_ENABLED_ZH
     elif len(existing_standard) == 0 or (
@@ -1551,6 +1572,7 @@ async def enable_tracking(
     *,
     force: bool = False,
     respect_user_pause: bool = True,
+    override_pause_versions: Mapping[str, int] | None = None,
     viewer_user_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
@@ -1636,7 +1658,121 @@ async def enable_tracking(
                 tier=resolved_tier,
                 company_rows=company_rows,
             )
-            if not force and respect_user_pause and raw_current.get("paused_by_user"):
+            specs = build_company_watch_specs(
+                ticker=ticker,
+                workspace_id=ws_id,
+                tier=resolved_tier,
+                unit_id=unit_id_for_specs,
+            )
+
+            # Item 10 / r4 Decision 3: when tier is radar or produces no standard specs, NEVER resume any task
+            # (even if force=True); pause active standard tasks AND unstarted earnings once tasks by policy.
+            if not specs:
+                paused_ids_empty: list[str] = []
+                t_lower_empty = str(ticker).strip().lower()
+                t_slug_empty = t_lower_empty.replace(".", "-")
+                std_prefixes_empty = tuple(
+                    dict.fromkeys((f"dalton-{t_lower_empty}-", f"dalton-{t_slug_empty}-"))
+                )
+                std_suffixes_empty = ("watch", "delta", "move-up", "move-down")
+                for r in company_rows:
+                    r_name = str(r.get("name") or "").strip().lower()
+                    auto_id = str(r.get("automation_id") or "").strip()
+                    r_status = str(r.get("status") or "active").strip().lower()
+                    if not auto_id or r_status in ("disabled", "completed", "deleted"):
+                        continue
+                    is_std_row = any(
+                        r_name == f"{p}{sfx}"
+                        for p in std_prefixes_empty
+                        for sfx in std_suffixes_empty
+                    )
+                    from src.dalton.watchlist.reconciler import is_unstarted_earn_once
+
+                    is_unstarted_earn_once_row = (
+                        any(r_name.startswith(f"{p}earn-") for p in std_prefixes_empty)
+                        and await is_unstarted_earn_once(r, conn=conn)
+                    )
+                    if not (is_std_row or is_unstarted_earn_once_row):
+                        continue
+                    if r_status != "active":
+                        continue
+                    new_meta = (
+                        dict(r.get("metadata") or {})
+                        if isinstance(r.get("metadata"), Mapping)
+                        else {}
+                    )
+                    new_meta["paused_by_policy"] = True
+                    new_meta["tier"] = resolved_tier
+                    await auto_db.update_automation(
+                        auto_id,
+                        uid,
+                        status="paused",
+                        next_run_at=None,
+                        metadata=new_meta,
+                        conn=conn,
+                    )
+                    paused_ids_empty.append(auto_id)
+                if paused_ids_empty:
+                    from src.server.database import automation_executions as exec_db
+
+                    await exec_db.skip_unstarted_executions_for_automations(
+                        paused_ids_empty,
+                        reason="watchlist_policy",
+                        error_message="Skipped unstarted execution because tier policy has no enabled tracking tasks.",
+                        conn=conn,
+                    )
+                _, refreshed_company_empty = await _load_company_automations(
+                    uid, ws_id, conn=conn
+                )
+                if active_co_unit is not None and unit_id_for_specs:
+                    all_unit_after = await list_all_user_automations(uid, conn=conn)
+                    refreshed_company_empty = _merge_unit_managed_rows(
+                        refreshed_company_empty,
+                        candidates=all_unit_after,
+                        workspace_id=ws_id,
+                        unit=active_co_unit,
+                    )
+                visible_empty = (
+                    await _filter_rows_by_viewer_web_read(
+                        refreshed_company_empty,
+                        current_workspace_id=ws_id,
+                        viewer_user_id=effective_viewer,
+                        check_current_workspace=True,
+                    )
+                    if effective_viewer and is_coverage_units_enabled()
+                    else refreshed_company_empty
+                )
+                current_empty = _derive_status_and_details(
+                    workspace_id=ws_id,
+                    ticker=ticker,
+                    tier=resolved_tier,
+                    company_rows=visible_empty,
+                )
+                return {
+                    **current_empty,
+                    "skipped": True,
+                    "skip_reason": "empty_tier_policy",
+                }
+
+            from src.dalton.watchlist.pause_guards import (
+                build_locked_resume_reconciler,
+                can_override_user_pause_locked,
+            )
+
+            # r4 Decision 3: overriding paused_by_user requires explicit config_version authorization
+            # (override_pause_versions); missing version authorization defaults to refusing override.
+            has_unauthorized_user_pause = any(
+                isinstance(r, Mapping)
+                and isinstance(r.get("metadata"), Mapping)
+                and bool(r["metadata"].get("paused_by_user"))
+                and not can_override_user_pause_locked(
+                    r,
+                    override_user_pause=bool(force),
+                    override_pause_versions=override_pause_versions,
+                )
+                for r in company_rows
+            )
+            if respect_user_pause and raw_current.get("paused_by_user") and has_unauthorized_user_pause:
                 visible_rows = (
                     await _filter_rows_by_viewer_web_read(
                         company_rows,
@@ -1659,12 +1795,6 @@ async def enable_tracking(
                     "skip_reason": "paused_by_user",
                 }
 
-            specs = build_company_watch_specs(
-                ticker=ticker,
-                workspace_id=ws_id,
-                tier=resolved_tier,
-                unit_id=unit_id_for_specs,
-            )
             delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
             expected_names = {str(s["name"]) for s in specs}
             outer_ctx = get_current_history_context()
@@ -1689,6 +1819,12 @@ async def enable_tracking(
                 for r in company_rows
             )
 
+            locked_std_reconciler = build_locked_resume_reconciler(
+                override_user_pause=bool(force),
+                override_pause_versions=override_pause_versions,
+                skip_policy_pause=False,
+            )
+
             for spec in specs:
                 s_name = str(spec.get("name") or "")
                 existing_c = by_name_company.get(s_name)
@@ -1696,9 +1832,27 @@ async def enable_tracking(
                     continue
                 if existing_c and _replaced_by_tracker(existing_c):
                     continue
+                if existing_c:
+                    ex_meta = (
+                        existing_c.get("metadata")
+                        if isinstance(existing_c.get("metadata"), Mapping)
+                        else {}
+                    )
+                    if str(existing_c.get("status") or "").strip().lower() == "disabled":
+                        continue
+                    if bool(str(ex_meta.get("handoff_paused_reason") or "").strip()):
+                        continue
+                    if respect_user_pause and bool(ex_meta.get("paused_by_user")):
+                        if not can_override_user_pause_locked(
+                            existing_c,
+                            override_user_pause=bool(force),
+                            override_pause_versions=override_pause_versions,
+                        ):
+                            continue
                 spec_copy = dict(spec)
                 spec_meta = dict(spec_copy.get("metadata") or {})
                 spec_meta["paused_by_user"] = None
+                spec_meta["paused_by_policy"] = None
                 spec_meta["tier"] = resolved_tier
                 if str(spec_copy.get("name") or "") == delta_name:
                     spec_copy["cron_expression"] = delta_cron
@@ -1713,6 +1867,7 @@ async def enable_tracking(
                     actor_user_id=effective_actor,
                     action="resume" if was_paused else "update",
                     skip_if_unchanged=True,
+                    locked_row_reconciler=locked_std_reconciler,
                 ):
                     await schedule_dalton_automation_helper(
                         s_name,
@@ -1725,8 +1880,13 @@ async def enable_tracking(
                         conn=conn,
                     )
 
-            # Also resume paused non-standard unit-managed tasks (e.g. `dalton-brk.b-earn-*`
-            # or renamed `unit_id` tasks) via the shared schedule helper / lifecycle rules.
+            # Also resume paused non-standard unit-managed tasks via the shared schedule helper,
+            # ALWAYS skipping policy-paused rows (`paused_by_policy`) and verifying user pause under lock.
+            locked_nonstd_reconciler = build_locked_resume_reconciler(
+                override_user_pause=bool(force),
+                override_pause_versions=override_pause_versions,
+                skip_policy_pause=True,
+            )
             resume_refusals: list[dict[str, str]] = []
             for r in company_rows:
                 r_name = str(r.get("name") or "").strip()
@@ -1734,22 +1894,40 @@ async def enable_tracking(
                     continue
                 if _replaced_by_tracker(r):
                     continue
+                r_meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
+                if bool(str(r_meta.get("handoff_paused_reason") or "").strip()):
+                    continue
+                if bool(r_meta.get("paused_by_policy")):
+                    continue
+                if respect_user_pause and bool(r_meta.get("paused_by_user")):
+                    if not can_override_user_pause_locked(
+                        r,
+                        override_user_pause=bool(force),
+                        override_pause_versions=override_pause_versions,
+                    ):
+                        continue
                 if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
                     resume_spec: dict[str, Any] = {
                         "action": "resume",
                         "automation_id": str(r["automation_id"]),
                     }
-                    resume_res = await schedule_dalton_automation_helper(
-                        r_name,
-                        resume_spec,
-                        user_id=uid,
-                        workspace_id=ws_id,
-                        ticker=ticker,
-                        role="chief_of_staff",
-                        action="resume",
+                    with automation_history_context(
                         actor_user_id=effective_actor,
-                        conn=conn,
-                    )
+                        action="resume",
+                        skip_if_unchanged=True,
+                        locked_row_reconciler=locked_nonstd_reconciler,
+                    ):
+                        resume_res = await schedule_dalton_automation_helper(
+                            r_name,
+                            resume_spec,
+                            user_id=uid,
+                            workspace_id=ws_id,
+                            ticker=ticker,
+                            role="chief_of_staff",
+                            action="resume",
+                            actor_user_id=effective_actor,
+                            conn=conn,
+                        )
                     if not resume_res.get("ok"):
                         resume_refusals.append(
                             {
@@ -2018,6 +2196,9 @@ async def resync_delta_schedule(
 
     async with user_automations_lock(uid) as conn:
         resolved_tier = await resolve_default_tier(t_upper, tier, user_id=uid, conn=conn)
+        from src.dalton.watchlist.policies import get_default_tier_policy
+
+        tier_policy = get_default_tier_policy(resolved_tier)
         new_cron, new_tz = resolve_delta_schedule(resolved_tier)
 
         rows = await list_all_user_automations(
@@ -2056,8 +2237,10 @@ async def resync_delta_schedule(
 
         from src.server.services.automation_scheduler import AutomationScheduler
 
-        new_next_run_at = AutomationScheduler.calculate_first_run(new_cron, new_tz)
-        new_next_run_iso = _iso_or_none(new_next_run_at)
+        if tier_policy.delta_enabled:
+            new_next_run_at = AutomationScheduler.calculate_first_run(new_cron, new_tz)
+        else:
+            new_next_run_at = None
         conn_kw = {"conn": conn} if conn is not None else {}
 
         outer_ctx = get_current_history_context()
@@ -2069,9 +2252,10 @@ async def resync_delta_schedule(
             else uid
         )
         changes: list[dict[str, Any]] = []
+        paused_ids_for_skip: list[str] = []
         with automation_history_context(
             actor_user_id=effective_actor,
-            action="update",
+            action="pause" if not tier_policy.delta_enabled else "update",
             skip_if_unchanged=True,
         ):
             for row in open_rows:
@@ -2089,18 +2273,42 @@ async def resync_delta_schedule(
                 new_meta["ticker"] = t_upper
                 new_meta["tier"] = resolved_tier
 
+                update_kwargs: dict[str, Any] = {
+                    "cron_expression": new_cron,
+                    "timezone": new_tz,
+                    "metadata": new_meta,
+                }
+                if not tier_policy.delta_enabled:
+                    new_meta["paused_by_policy"] = True
+                    update_kwargs["status"] = "paused"
+                    update_kwargs["next_run_at"] = None
+                    paused_ids_for_skip.append(auto_id)
+                else:
+                    row_status = str(row.get("status") or "active").strip().lower()
+                    has_blocker = bool(
+                        new_meta.get("paused_by_user")
+                        or new_meta.get("handoff_paused_reason")
+                    )
+                    if row_status == "paused" and new_meta.get("paused_by_policy") and not has_blocker:
+                        new_meta.pop("paused_by_policy", None)
+                        update_kwargs["status"] = "active"
+                        update_kwargs["next_run_at"] = new_next_run_at
+                    elif row_status == "paused":
+                        # Item 8: paused automations ALWAYS have next_run_at=None
+                        update_kwargs["next_run_at"] = None
+                    else:
+                        new_meta.pop("paused_by_policy", None)
+                        update_kwargs["next_run_at"] = new_next_run_at
+
                 updated_row = await auto_db.update_automation(
                     auto_id,
                     uid,
-                    cron_expression=new_cron,
-                    timezone=new_tz,
-                    next_run_at=new_next_run_at,
-                    metadata=new_meta,
+                    **update_kwargs,
                     **conn_kw,
                 )
                 effective_row = updated_row if isinstance(updated_row, dict) else row
                 effective_status = str(
-                    effective_row.get("status") or row.get("status") or "active"
+                    effective_row.get("status") or update_kwargs.get("status") or row.get("status") or "active"
                 )
                 changes.append(
                     {
@@ -2115,9 +2323,19 @@ async def resync_delta_schedule(
                         "old_timezone": old_tz,
                         "new_timezone": new_tz,
                         "old_next_run_at": old_next_run,
-                        "new_next_run_at": new_next_run_iso,
+                        "new_next_run_at": _iso_or_none(update_kwargs.get("next_run_at")),
                     }
                 )
+
+        if paused_ids_for_skip and conn is not None:
+            from src.server.database import automation_executions as exec_db
+
+            await exec_db.skip_unstarted_executions_for_automations(
+                paused_ids_for_skip,
+                reason="watchlist_policy",
+                error_message="Skipped unstarted execution because tier policy disabled delta.",
+                conn=conn,
+            )
 
         primary = changes[0]
         return {
@@ -2150,26 +2368,16 @@ async def set_tier_and_resync(
     tickers: Sequence[str],
     tier: str,
 ) -> dict[str, Any]:
-    """Change tickers' coverage tier and move each changed company's delta task to the new schedule.
+    """Change tickers' coverage tier via the shared WatchlistMutationService (same-tx Outbox + reconciler)."""
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    The one entry point for a tier change (Chief of Staff's tool and the REST
-    route), so both keep the daily internal-source scan on its tier's cadence.
-    Only tickers the roster actually updated are resynced; a failed resync is
-    reported per ticker and leaves the tier change in place.
-    """
-    res = await set_user_coverage_tier(user_id, tickers, tier=tier)
-    resynced: list[dict[str, Any]] = []
-    for t in res.get("updated_tickers") or []:
-        try:
-            resynced.append(await resync_delta_schedule(user_id, t, tier=res.get("tier")))
-        except Exception as exc:
-            logger.warning(
-                "[DALTON_TRACKING] set_tier resync failed | ticker=%s error=%s",
-                t,
-                type(exc).__name__,
-            )
-            resynced.append({"ticker": t, "updated": False, "reason": "resync_failed"})
-    res["delta_schedule"] = resynced
+    res = await WatchlistMutationService().execute_mutation(
+        user_id,
+        action="set_tier",
+        tickers=list(tickers),
+        tier=tier,
+    )
+    res.setdefault("delta_schedule", [])
     return res
 
 

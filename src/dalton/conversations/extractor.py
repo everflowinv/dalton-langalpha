@@ -47,10 +47,7 @@ DEFAULT_SEGMENT_DEADLINE_S: float = 600.0
 PRIVATE_COMPANIES: frozenset[str] = frozenset(
     {
         "OPENAI",
-        "ANTHROPIC",
         "XAI",
-        "SPACEX",
-        "SPCX",
         "STRIPE",
         "DATABRICKS",
         "BYTEDANCE",
@@ -205,7 +202,7 @@ EXTRACTION_SYSTEM_INSTRUCTIONS = """你是 Dalton 投研团队的对话历史整
    - `cited_sources` 只填 `quote` 里实际出现的来源名称。
 4. **上市公司 (`tickers`) vs 未上市私企 (`entities`)**：
    - `tickers` 只放本卡 `quote` 正文里作为讨论对象（本卡主体）出现的上市公司股票代码（大写）；股东、客户、被比较方如果不是本卡的主体，不放进 `tickers`；信源机构（如 Gartner 对应 `IT`）不放；写明“剔除/未采用”的不放；没有别名映射的代码，只有代码本身出现在 `quote` 里时才保留，否则删除；`quote` 没点名公司时留空 `[]`。
-   - 未上市私企（如 `OpenAI`, `Anthropic`, `ByteDance`, `SpaceX`, `Stripe`, `Databricks`, `DeepSeek`, `Unitree`）放入 `entities`，**禁止**放入 `tickers`。
+   - 未上市私企（如 `OpenAI`, `ByteDance`, `Stripe`, `Databricks`, `DeepSeek`, `Unitree`）放入 `entities`，**禁止**放入 `tickers`。
 5. **结构化指标 (`figures`)**：
    - 当原话包含明确数值指标时，提取 `{metric, value, unit, period}`。
    - `value` 的数字必须出现在本卡 `quote` 里；“约、大约、左右、以上”保留在 `value` 字符串里（例如 `"约142"`、`"约95"`、`"10%左右"`、`"240以上"`），区间和上下限原样保留（可以用字符串，如 `">35"`、`"25-35"`）。
@@ -371,6 +368,35 @@ def _is_trading_channel_discussed_in_claim(
     return any(not _TRADING_CHANNEL_VERB_RE.search(s) for s in matched_sents)
 
 
+def _resolve_alias_to_canonical_ticker(
+    raw_token: str,
+    alias_map: dict[str, tuple[str, ...]] | None,
+) -> str | None:
+    """Resolve a company name / alias (e.g. ``Anthropic`` -> ``ANT``, ``SpaceX`` -> ``SPCX``)
+    back to its unique canonical ticker before ticker validation and deduplication."""
+    s = str(raw_token or "").strip()
+    if not s or not alias_map:
+        return None
+    upper_s = s.upper()
+    canon_s = canonicalize_ticker_key(upper_s)
+    if upper_s in alias_map or canon_s in alias_map:
+        return upper_s if upper_s in alias_map else canon_s
+    folded = s.casefold()
+    matched_keys: list[str] = []
+    for ticker_key, aliases in alias_map.items():
+        if str(ticker_key).strip().casefold() == folded:
+            return str(ticker_key).strip().upper()
+        for alias in aliases or ():
+            if str(alias or "").strip().casefold() == folded:
+                tk_upper = str(ticker_key).strip().upper()
+                if tk_upper not in matched_keys:
+                    matched_keys.append(tk_upper)
+                break
+    if len(matched_keys) == 1:
+        return matched_keys[0]
+    return None
+
+
 def normalize_tickers_and_entities(
     raw_tickers: list[Any] | None,
     raw_entities: list[Any] | None,
@@ -378,7 +404,7 @@ def normalize_tickers_and_entities(
     user_id: str | None = None,
     alias_map: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Route known private companies (OpenAI, Anthropic, SpaceX/SPCX, etc.) into `entities[]` and normalize tickers."""
+    """Route known private companies (OpenAI, Stripe, etc.) into `entities[]` and normalize tickers."""
     tickers: list[str] = []
     entities: list[str] = []
 
@@ -396,9 +422,7 @@ def normalize_tickers_and_entities(
         if _is_private_company_ticker(ts, user_id=user_id, alias_map=eff_alias_map):
             canon_t = canonicalize_ticker_key(upper_t)
             entity_label = ts
-            if upper_t == "SPCX":
-                entity_label = "SpaceX"
-            elif canon_t in eff_alias_map:
+            if canon_t in eff_alias_map:
                 for a in eff_alias_map[canon_t]:
                     if a.upper() != upper_t and not re.match(r"^\d", a):
                         entity_label = a
@@ -406,8 +430,9 @@ def normalize_tickers_and_entities(
             if entity_label not in entities and entity_label.upper() not in {x.upper() for x in entities}:
                 entities.append(entity_label)
         else:
-            if upper_t not in tickers:
-                tickers.append(upper_t)
+            resolved = _resolve_alias_to_canonical_ticker(ts, eff_alias_map) or upper_t
+            if resolved not in tickers:
+                tickers.append(resolved)
 
     return tickers, entities
 
@@ -632,6 +657,7 @@ SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "AAPL": ("Apple",),
     "MSFT": ("Microsoft", "微软"),
     "SPCX": ("SpaceX",),
+    "ANT": ("Anthropic",),
     "META": ("Meta Platforms", "Meta"),
     "TSLA": ("Tesla",),
     "0100.HK": ("Minimax", "MiniMax"),
@@ -2727,9 +2753,10 @@ def _validate_tickers_against_quote_detailed(
     dropped_channel = 0
     seen_priv: set[str] = set()
     for raw_t in tickers or []:
-        t = str(raw_t or "").strip().upper()
-        if not t:
+        raw_str = str(raw_t or "").strip()
+        if not raw_str:
             continue
+        t = _resolve_alias_to_canonical_ticker(raw_str, eff_alias_map) or raw_str.upper()
         canon_t = canonicalize_ticker_key(t)
 
         if _is_private_company_ticker(t, user_id=user_id, alias_map=eff_alias_map):

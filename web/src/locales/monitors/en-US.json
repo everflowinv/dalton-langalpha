@@ -59,7 +59,35 @@
     "publicConfirmTitle": "Confirm public access?",
     "publicConfirmMessage": "Anyone with the link on the internet can view this monitor and its realtime data. Continue?",
     "publicConfirmButton": "Publish publicly",
-    "publishedToast": "Published to Monitors"
+    "publishedToast": "Published to Monitors",
+    "sharedDocumentToast": "Document sharing updated"
+  },
+  "sharedDocuments": {
+    "title": "Shared documents",
+    "sharedByMe": "Shared by me",
+    "sharedWithMe": "Shared with me",
+    "sharedBy": "Shared by {{owner}}",
+    "updatedAt": "Updated: {{time}}",
+    "openLink": "Open",
+    "stopSharing": "Stop sharing",
+    "stopSharingConfirmTitle": "Stop sharing this document?",
+    "stopSharingConfirmMessage": "“{{name}}” will switch back to private access for you only. Continue?",
+    "stopSharingConfirmButton": "Stop sharing",
+    "stopSharingSuccess": "Sharing stopped",
+    "stopSharingFailed": "Failed to stop sharing. Please try again.",
+    "visibility": {
+      "members": "Selected colleagues",
+      "company": "Team",
+      "public": "Public link"
+    }
+  },
+  "markdown": {
+    "viewRaw": "View raw",
+    "viewRendered": "View rendered",
+    "download": "Download",
+    "downloadFailed": "Failed to download file",
+    "linkUnavailable": "Restricted or missing",
+    "backToDocument": "Back to {{name}}"
   },
   "demo": {
     "title": "Realtime Monitor Demo",

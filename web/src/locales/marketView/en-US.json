@@ -261,5 +261,94 @@
     "q6": "Identify any chart patterns forming on {{symbol}}",
     "q7": "How is {{symbol}} performing relative to its 52-week range?",
     "q8": "What's the MACD crossover status for {{symbol}}?"
+  },
+  "watchlist": {
+    "title": "Watchlist",
+    "backToWatchlist": "Watchlist",
+    "searchPlaceholder": "Search ticker, name, or tag…",
+    "groupByTier": "Group by tier",
+    "holdingsOnly": "Holdings only",
+    "columnPicker": "Columns",
+    "columnPickerTitle": "Visible columns",
+    "tierPoliciesAction": "Tier Policies",
+    "resetColumns": "Reset",
+    "addAction": "Add Ticker",
+    "toggleChat": "Toggle assistant panel",
+    "chatDrawerTitle": "Assistant",
+    "chatPlaceholder": "Ask about your watchlist metrics, rankings, or tier changes…",
+    "loading": "Loading watchlist…",
+    "loadError": "Failed to load watchlist",
+    "emptyState": "Your personal watchlist is empty. Click \"Add Ticker\" to get started.",
+    "emptyFilterState": "No companies match the active filter.",
+    "unlisted": "Unlisted",
+    "holdingBadge": "Held",
+    "openWorkspace": "Open research workspace",
+    "noWorkspaceBadge": "No workspace",
+    "submitting": "Submitting…",
+    "pendingReconcileBanner": "{{count}} background task sync job(s) pending recovery",
+    "retryReconcile": "Sync now",
+    "reconcileTriggered": "Background task reconciliation triggered",
+    "changeTierAria": "Change tier for {{symbol}}",
+    "removeAria": "Remove {{symbol}} from watchlist",
+    "tiers": {
+      "all": "All",
+      "core": "Core",
+      "watch": "Watch",
+      "radar": "Radar"
+    },
+    "columns": {
+      "symbolName": "Company / Ticker",
+      "tier": "Tier",
+      "price": "Price",
+      "chg_1d": "1D",
+      "chg_1w": "1W",
+      "chg_1m": "1M",
+      "chg_3m": "3M",
+      "chg_ytd": "YTD",
+      "chg_1y": "1Y",
+      "pe_fy1": "FY1 P/E",
+      "pe_fy2": "FY2 P/E",
+      "eps_growth_fy2": "FY2 EPS Gr%",
+      "range_52w": "52W Pos",
+      "rsi_14d": "14D RSI",
+      "rsi_30d": "30D RSI",
+      "market_cap": "Mkt Cap",
+      "next_earnings": "Next Earnings",
+      "actions": "Actions"
+    },
+    "valuation": {
+      "fyEnd": "FY end {{date}}",
+      "source": "Source {{provider}}",
+      "analysts": "{{count}} analysts",
+      "lossTooltip": "Consensus EPS ≤ 0 (Not Meaningful)",
+      "noCoverageTooltip": "No analyst consensus coverage",
+      "unitUnverifiedTooltip": "ADR share conversion ratio unverified",
+      "staleTooltip": "Showing cached estimate; refreshing in background",
+      "staleBadge": "Stale",
+      "rateLimitedTooltip": "Upstream rate limited (429); retrying",
+      "rateLimitedLabel": "Retry"
+    },
+    "addModal": {
+      "title": "Add to Watchlist",
+      "tickersLabel": "Ticker symbols (comma or space separated)",
+      "tickersPlaceholder": "e.g. NVDA, TSM, 0700.HK",
+      "tierLabel": "Target tier",
+      "submit": "Add"
+    },
+    "confirmModal": {
+      "title": "Confirm Watchlist Change",
+      "confirm": "Confirm",
+      "affectedWorkspaces": "Will update managed automations across {{count}} workspace(s)",
+      "removeAction": "Remove from list"
+    },
+    "errors": {
+      "previewFailed": "Failed to preview change",
+      "mutateFailed": "Failed to save change",
+      "scopeChanged": "Watchlist state changed. Please retry."
+    },
+    "quickQueries": {
+      "lowestRsi": "Find the 5 stocks in my watchlist with the lowest 14D RSI",
+      "upcomingEarnings": "List watchlist companies reporting earnings in the next two weeks"
+    }
   }
 }

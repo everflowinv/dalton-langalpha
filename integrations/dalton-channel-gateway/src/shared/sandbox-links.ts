@@ -556,6 +556,129 @@ function findClosingBacktickRun(
   return -1;
 }
 
+interface CodeRange {
+  start: number;
+  end: number;
+}
+
+function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
+  if (ranges.length <= 1) return ranges;
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: CodeRange[] = [ranges[0]!];
+  for (let idx = 1; idx < ranges.length; idx += 1) {
+    const cur = ranges[idx]!;
+    const prev = merged[merged.length - 1]!;
+    if (cur.start <= prev.end) {
+      if (cur.end > prev.end) {
+        prev.end = cur.end;
+      }
+    } else {
+      merged.push({ start: cur.start, end: cur.end });
+    }
+  }
+  return merged;
+}
+
+/**
+ * Collects Markdown code zones from the CommonMark + GFM table AST BEFORE reference
+ * definition / link collection strictly within Markdown block boundaries:
+ * - `allCodeRanges` covers every `code` and `inlineCode` node (fenced, indented,
+ *   list-nested, quoted, unterminated code blocks, and single-line or same-paragraph
+ *   multiline backtick spans) without ever pairing stray backticks across paragraph,
+ *   heading, list-item, blockquote, or table-cell boundaries.
+ * - `protectedCodeRanges` excludes single-line inline code spans that serve purely as
+ *   a Markdown link label (`[`foo`](dest)`) so the spaced-destination link fallback can
+ *   still rewrite the outer link, while the fallback still reuses `allCodeRanges` to
+ *   keep the inline code verbatim if the outer `[...](` turns out not to be a link.
+ */
+function collectAstCodeRanges(
+  text: string,
+  tree: MdastNode,
+): { protectedCodeRanges: CodeRange[]; allCodeRanges: CodeRange[] } {
+  const protectedRanges: CodeRange[] = [];
+  const allRanges: CodeRange[] = [];
+  const len = text.length;
+
+  const isSingleLineSpacedLinkLabel = (start: number, end: number): boolean =>
+    !text.slice(start, end).includes("\n") &&
+    start > 0 &&
+    text[start - 1] === "[" &&
+    end + 1 < len &&
+    text[end] === "]" &&
+    text[end + 1] === "(";
+
+  const collectAstCode = (node: MdastNode): void => {
+    if (node.type === "code") {
+      const offsets = getNodeOffsets(node);
+      if (offsets) {
+        const range = { start: offsets.start, end: offsets.end };
+        allRanges.push(range);
+        protectedRanges.push(range);
+      }
+      return;
+    }
+    if (node.type === "inlineCode") {
+      const offsets = getNodeOffsets(node);
+      if (offsets) {
+        const range = { start: offsets.start, end: offsets.end };
+        allRanges.push(range);
+        if (!isSingleLineSpacedLinkLabel(offsets.start, offsets.end)) {
+          protectedRanges.push(range);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        collectAstCode(child);
+      }
+    }
+  };
+
+  collectAstCode(tree);
+  return {
+    protectedCodeRanges: mergeSortedCodeRanges(protectedRanges),
+    allCodeRanges: mergeSortedCodeRanges(allRanges),
+  };
+}
+
+function firstCodeRangeIndexEndingAfter(
+  offset: number,
+  ranges: readonly CodeRange[],
+): number {
+  let lo = 0;
+  let hi = ranges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid]!.end <= offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+function startsInsideCodeRange(
+  start: number,
+  ranges: readonly CodeRange[],
+): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid]!;
+    if (r.end <= start) {
+      lo = mid + 1;
+    } else if (r.start > start) {
+      hi = mid - 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
 function findMatchingBracketClose(
   text: string,
   bracketOpen: number,
@@ -829,59 +952,63 @@ function rewritePlainProse(prose: string): string {
 }
 
 function rewriteUnprotectedGap(
-  gap: string,
+  text: string,
+  gapStart: number,
+  gapEnd: number,
+  astCodeRanges: readonly CodeRange[],
   publicWebBaseUrl: string | null,
   normalizedThreadId: string | null,
   normalizedWorkspaceId: string | null = null,
 ): string {
-  if (!gap) return gap;
+  if (gapEnd <= gapStart) return "";
   const out: string[] = [];
-  let proseStart = 0;
-  let i = 0;
+  let proseStart = gapStart;
+  let i = gapStart;
   let currentLineEnd = -1;
   let nextCloseBracket = -1;
+  let codeIdx = firstCodeRangeIndexEndingAfter(gapStart, astCodeRanges);
 
   const flushProse = (until: number): void => {
     if (until > proseStart) {
-      out.push(rewritePlainProse(gap.slice(proseStart, until)));
+      out.push(rewritePlainProse(text.slice(proseStart, until)));
     }
   };
 
-  while (i < gap.length) {
-    const ch = gap[i]!;
-
-    // Inline code span: preserve verbatim
-    if (ch === "`") {
-      let run = 0;
-      while (i + run < gap.length && gap[i + run] === "`") {
-        run += 1;
-      }
-      const close = findClosingBacktickRun(gap, i + run, run);
-      if (close !== -1) {
-        flushProse(i);
-        out.push(gap.slice(i, close + run));
-        i = close + run;
-        proseStart = i;
-        continue;
-      }
-      i += run;
+  while (i < gapEnd) {
+    // Reuse AST code ranges verbatim instead of re-pairing backticks across blocks/paragraphs.
+    while (codeIdx < astCodeRanges.length && astCodeRanges[codeIdx]!.end <= i) {
+      codeIdx += 1;
+    }
+    const activeCode =
+      codeIdx < astCodeRanges.length && astCodeRanges[codeIdx]!.start <= i
+        ? astCodeRanges[codeIdx]!
+        : null;
+    if (activeCode) {
+      const codeEnd = Math.min(activeCode.end, gapEnd);
+      flushProse(i);
+      out.push(text.slice(i, codeEnd));
+      i = codeEnd;
+      proseStart = i;
       continue;
     }
+
+    const ch = text[i]!;
 
     // Spaced-destination markdown link/image fallback
     if (
       ch === "[" ||
-      (ch === "!" && i + 1 < gap.length && gap[i + 1] === "[")
+      (ch === "!" && i + 1 < gapEnd && text[i + 1] === "[")
     ) {
       if (currentLineEnd < i) {
-        const nl = gap.indexOf("\n", i);
-        currentLineEnd = nl === -1 ? gap.length : nl;
+        const nl = text.indexOf("\n", i);
+        currentLineEnd = nl === -1 || nl > gapEnd ? gapEnd : nl;
       }
       if (nextCloseBracket < i) {
-        nextCloseBracket = gap.indexOf("]", i);
+        const cb = text.indexOf("]", i);
+        nextCloseBracket = cb === -1 || cb >= gapEnd ? -1 : cb;
       }
       if (nextCloseBracket !== -1 && nextCloseBracket < currentLineEnd) {
-        const parsed = parseSpacedMarkdownLinkAt(gap, i, currentLineEnd);
+        const parsed = parseSpacedMarkdownLinkAt(text, i, currentLineEnd);
         if (parsed) {
           const classified = classifyLinkDestination(parsed.dest);
           flushProse(i);
@@ -898,7 +1025,7 @@ function rewriteUnprotectedGap(
               ),
             );
           } else {
-            out.push(gap.slice(i, parsed.end));
+            out.push(text.slice(i, parsed.end));
           }
           i = parsed.end;
           proseStart = i;
@@ -910,7 +1037,7 @@ function rewriteUnprotectedGap(
     i += 1;
   }
 
-  flushProse(gap.length);
+  flushProse(gapEnd);
   return out.join("");
 }
 
@@ -1014,7 +1141,12 @@ export function rewriteSandboxLinks(
 
   const tree = parseChannelMarkdown(text);
 
-  // Pass 1: collect all reference link definitions and count their references.
+  // Pass 0 (BT3): identify all code zones (fenced blocks, indented code, inline and multiline backtick spans)
+  // BEFORE collecting reference definitions so `[x]: /home/workspace/...` inside code zones is never parsed
+  // as an active definition or rewritten.
+  const { protectedCodeRanges, allCodeRanges } = collectAstCodeRanges(text, tree);
+
+  // Pass 1: collect all reference link definitions and count their references (excluding code zones).
   const definitionsById = new Map<string, DefinitionInfo>();
   const collectDefinitions = (node: MdastNode): void => {
     if (node.type === "code" || node.type === "inlineCode") {
@@ -1022,6 +1154,9 @@ export function rewriteSandboxLinks(
     }
     if (node.type === "definition") {
       const offsets = getNodeOffsets(node);
+      if (offsets && startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const id = (node.identifier ?? "").toLowerCase();
       if (offsets && id && !definitionsById.has(id)) {
         const extracted = extractRawBracketLabel(
@@ -1058,6 +1193,10 @@ export function rewriteSandboxLinks(
         return;
       }
       if (node.type === "linkReference" || node.type === "imageReference") {
+        const offsets = getNodeOffsets(node);
+        if (offsets && startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+          return;
+        }
         const id = (node.identifier ?? "").toLowerCase();
         const def = definitionsById.get(id);
         if (def) {
@@ -1074,7 +1213,11 @@ export function rewriteSandboxLinks(
   }
 
   // Pass 2: walk AST top-down and record non-overlapping edits and protected ranges.
-  const actions: TextSegmentAction[] = [];
+  const actions: TextSegmentAction[] = protectedCodeRanges.map((r) => ({
+    start: r.start,
+    end: r.end,
+    kind: "protect" as const,
+  }));
 
   const visit = (node: MdastNode, insideOuterLink: boolean): void => {
     const offsets = getNodeOffsets(node);
@@ -1104,6 +1247,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "definition") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const id = (node.identifier ?? "").toLowerCase();
       const info = definitionsById.get(id);
       if (!info || info.start !== offsets.start) {
@@ -1185,6 +1331,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "linkReference" || node.type === "imageReference") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const isImage = node.type === "imageReference";
       const id = (node.identifier ?? "").toLowerCase();
       const info = definitionsById.get(id);
@@ -1256,6 +1405,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "link") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const url = typeof node.url === "string" ? node.url : "";
       const classification = classifyLinkDestination(url);
       const isAutolink =
@@ -1335,6 +1487,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "image") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const url = typeof node.url === "string" ? node.url : "";
       const classification = classifyLinkDestination(url);
       if (classification.kind === "keep") {
@@ -1412,7 +1567,10 @@ export function rewriteSandboxLinks(
     if (action.start > cursor) {
       out.push(
         rewriteUnprotectedGap(
-          text.slice(cursor, action.start),
+          text,
+          cursor,
+          action.start,
+          allCodeRanges,
           publicWebBaseUrl,
           normalizedThreadId,
           normalizedWorkspaceId,
@@ -1430,7 +1588,10 @@ export function rewriteSandboxLinks(
   if (cursor < text.length) {
     out.push(
       rewriteUnprotectedGap(
-        text.slice(cursor),
+        text,
+        cursor,
+        text.length,
+        allCodeRanges,
         publicWebBaseUrl,
         normalizedThreadId,
         normalizedWorkspaceId,

@@ -515,7 +515,7 @@ def transfer_timeout_s(total_bytes: int) -> int:
 def exclusion_spec(
     max_file_bytes: int | None, max_history_bytes: int = GIT_HISTORY_MAX_BYTES
 ) -> dict[str, Any]:
-    return {
+    spec = {
         "exclude_dir_names": sorted(EXCLUDE_DIR_NAMES),
         "exclude_rel_dirs": list(EXCLUDE_REL_DIRS),
         "exclude_rel_dir_prefixes": list(EXCLUDE_REL_DIR_PREFIXES),
@@ -533,6 +533,9 @@ def exclusion_spec(
         "max_whole_dir_bytes": max_history_bytes,
         "max_file_bytes": max_file_bytes,
     }
+    # DALTON-HOOK(workspace-file-exclusions): append optional Dalton exclusions when configured
+    from src.dalton.storage_config import apply_wsfiles_exclusions
+    return apply_wsfiles_exclusions(spec)
 
 
 @lru_cache(maxsize=1)
@@ -990,9 +993,17 @@ async def pull_direct(
     # DALTON-HOOK(chat-large-upload): forward sweep_orphans=False to sandbox transfer runtime
     if not sweep_orphans:
         spec["sweep_orphans"] = False
-    out = await run_transfer_op(
-        sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
-    )
+        out = await run_transfer_op(
+            sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
+        )
+    else:
+        # DALTON-HOOK(relay-staging-race): serialize orphan-sweeping pulls against concurrent relay staging/placement on the same root
+        from src.dalton.services.relay_staging_guard import relay_transfer_lock
+
+        async with relay_transfer_lock(sandbox, layout.workspace):
+            out = await run_transfer_op(
+                sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
+            )
     return out.get("results", {})
 
 

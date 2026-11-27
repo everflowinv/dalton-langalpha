@@ -10,6 +10,10 @@ import { WeixinChannelAdapter } from "../src/channels/weixin/index.js";
 import type { GatewayConfig } from "../src/config.js";
 import { createGatewayApp, type GatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
+import {
+  createIsolatedPostgresDatabase,
+  type IsolatedPostgresDatabase,
+} from "./pg-isolation.js";
 
 const EXPLICIT_BACKEND_URL = (
   process.env.GATEWAY_REAL_BACKEND_URL ?? ""
@@ -73,6 +77,7 @@ describe.skipIf(!SHOULD_RUN)(
       "u-internal-1";
     let runPrefix = `wx_real_${Date.now()}`;
     let spawnedHarness: ChildProcess | null = null;
+    let isolatedDb: IsolatedPostgresDatabase | null = null;
     let backendClient: HttpBackendClient | null = null;
     let gatewayApp: GatewayApp | null = null;
     let weixinAdapter: WeixinChannelAdapter | null = null;
@@ -170,6 +175,12 @@ describe.skipIf(!SHOULD_RUN)(
         const pythonBin =
           process.env.DALTON_TEST_PYTHON_BIN?.trim() ||
           (existsSync(venvPython) ? venvPython : "python3");
+        isolatedDb = await createIsolatedPostgresDatabase({
+          baseDsn: TEST_DB_DSN,
+          tag: "weixin_real",
+          pythonBin,
+          repoRoot,
+        });
         const proc = spawn(
           pythonBin,
           [
@@ -180,7 +191,9 @@ describe.skipIf(!SHOULD_RUN)(
             cwd: repoRoot,
             env: {
               ...process.env,
-              DALTON_CHANNEL_GATEWAY_TEST_DSN: TEST_DB_DSN,
+              DALTON_CHANNEL_GATEWAY_TEST_DSN: isolatedDb.dsn,
+              DALTON_TEST_DB_DSN: isolatedDb.dsn,
+              TEST_DATABASE_URL: isolatedDb.dsn,
               PYTHONPATH: process.env.PYTHONPATH
                 ? `${repoRoot}${delimiter}${process.env.PYTHONPATH}`
                 : repoRoot,
@@ -319,6 +332,11 @@ describe.skipIf(!SHOULD_RUN)(
             proc.kill("SIGTERM");
           }
         });
+      }
+      if (isolatedDb) {
+        const toDrop = isolatedDb;
+        isolatedDb = null;
+        await toDrop.drop();
       }
     }, 30_000);
 

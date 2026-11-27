@@ -157,17 +157,36 @@ async def run_auth_db_startup_hook(
 ) -> bool:
     """Single post-DB-open startup hook called from ``src/server/app/setup.py``.
 
-    1. Validates ``DALTON_AUTH_MODE`` across ALL ``HOST_MODE`` values (including rejecting
+    Also runs main object-storage startup checks:
+    - Standalone Core S3-only provider validation (``validate_core_storage_provider``)
+    - Warning-only main-bucket reference advisory check when main storage is disabled
+      (never blocks startup; strict verification runs manually via
+      ``python -m src.dalton.storage_refs check --strict`` before shutting down the main bucket).
+
+    1. Validates main-storage provider constraints (Core profile) and logs a warning-only
+       advisory if main storage is disabled while main-bucket references exist.
+    2. Validates ``DALTON_AUTH_MODE`` across ALL ``HOST_MODE`` values (including rejecting
        ``HOST_MODE=platform`` + ``DALTON_AUTH_MODE=local`` and missing local transcription secret).
-    2. When ``DALTON_AUTH_MODE == "local"``, seeds ``dalton_bootstrap_tokens`` from
+    3. When ``DALTON_AUTH_MODE == "local"``, seeds ``dalton_bootstrap_tokens`` from
        ``BOOTSTRAP_SETUP_TOKEN`` at server startup so the 24h TTL begins on boot.
        Any DB failure during startup seeding fails server startup loudly instead of
        allowing a later request to lazily restart the 24h window.
-    3. Returns True iff ``local-dev-user`` should be auto-provisioned (False in ``local`` mode
+    4. Returns True iff ``local-dev-user`` should be auto-provisioned (False in ``local`` mode
        or non-``oss`` ``HOST_MODE``).
     """
     log = target_logger or logger
+    from src.dalton.storage_config import validate_core_storage_provider
+    from src.dalton.storage_refs import warn_main_bucket_references_on_startup
+
+    validate_core_storage_provider()
     validate_dalton_auth_config()
+    try:
+        await warn_main_bucket_references_on_startup(target_logger=log)
+    except Exception as exc:
+        log.warning(
+            "Main-storage startup advisory check raised %s; continuing startup.",
+            type(exc).__name__,
+        )
 
     if is_dalton_local_auth_enabled():
         try:

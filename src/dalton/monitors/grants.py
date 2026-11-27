@@ -13,11 +13,17 @@ __all__ = [
     "MONITOR_GRANT_ROUTE",
     "MonitorGrant",
     "MonitorGrantError",
+    "SharedDocumentGrant",
     "VerifiedMonitorGrant",
+    "VerifiedSharedDocumentGrant",
     "data_prefix",
+    "doc_frame_prefix",
     "frame_prefix",
+    "is_shared_document_grant",
     "mint_monitor_grant",
+    "mint_shared_document_grant",
     "verify_monitor_grant",
+    "verify_shared_document_grant",
 ]
 
 DEFAULT_TTL_SECONDS = 12 * 3600
@@ -39,6 +45,14 @@ _MONITOR_CODEC = GrantCodec(
     claim_patterns=(_MONITOR_ID, _B64_USER, COUNT),
     error=MonitorGrantError,
     label="monitor grant",
+)
+
+_SHARED_DOC_CODEC = GrantCodec(
+    key_name="monitor_grant",
+    version="d1",
+    claim_patterns=(_MONITOR_ID, _B64_USER, COUNT),
+    error=MonitorGrantError,
+    label="shared document grant",
 )
 
 
@@ -120,3 +134,71 @@ def frame_prefix(grant: MonitorGrant | str) -> str:
 
 def data_prefix(grant: MonitorGrant | str) -> str:
     return f"{frame_prefix(grant)}data"
+
+
+@dataclass(frozen=True)
+class SharedDocumentGrant:
+    token: str
+    artifact_id: str
+    user_id: str
+    acl_revision: int
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class VerifiedSharedDocumentGrant:
+    artifact_id: str
+    user_id: str
+    acl_revision: int
+    expires_at: int
+
+
+def is_shared_document_grant(token: str) -> bool:
+    return _SHARED_DOC_CODEC.claims_token(token)
+
+
+async def mint_shared_document_grant(
+    artifact_id: str,
+    user_id: str,
+    acl_revision: int,
+    *,
+    ttl: int = DEFAULT_TTL_SECONDS,
+    now: int | None = None,
+) -> SharedDocumentGrant:
+    """Mint a 12h grant bound to ``(artifact_id, user_id, acl_revision, exp)``."""
+    encoded_user = _encode_user_id(user_id)
+    token, expires_at = await _SHARED_DOC_CODEC.mint(
+        (artifact_id, encoded_user, str(acl_revision)),
+        ttl=ttl,
+        now=now,
+    )
+    return SharedDocumentGrant(
+        token=token,
+        artifact_id=artifact_id,
+        user_id=user_id,
+        acl_revision=acl_revision,
+        expires_at=expires_at,
+    )
+
+
+async def verify_shared_document_grant(
+    token: str, *, now: int | None = None
+) -> VerifiedSharedDocumentGrant:
+    """Verify a shared-document grant's signature, expiry, and claim format."""
+    (artifact_id, encoded_user, acl_rev_str), expires_at = await _SHARED_DOC_CODEC.verify(
+        token, now=now
+    )
+    user_id = _decode_user_id(encoded_user)
+    if not user_id:
+        raise MonitorGrantError("empty user claim")
+    return VerifiedSharedDocumentGrant(
+        artifact_id=artifact_id,
+        user_id=user_id,
+        acl_revision=int(acl_rev_str),
+        expires_at=expires_at,
+    )
+
+
+def doc_frame_prefix(grant: SharedDocumentGrant | str) -> str:
+    token = grant if isinstance(grant, str) else grant.token
+    return f"{MONITOR_GRANT_ROUTE}{token}/"

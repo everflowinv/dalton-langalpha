@@ -54,6 +54,24 @@ def _require_dalton_enabled() -> None:
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
+def _enforce_dev_fallback_ticket_loopback(request: Request) -> None:
+    """Restrict dev-fallback transcription tickets to direct loopback non-proxied requests.
+
+    Enforced regardless of whether ``LANGALPHA_OWNER_SECRET`` is configured: if the
+    ticket signing key is the predictable ``dalton-local-dev-transcription-ticket-seed:*``
+    fallback, any remote or reverse-proxied request is refused with HTTP 401.
+    """
+    from src.dalton.auth.dispatch import is_trusted_local_loopback_request
+    from src.dalton.settings import is_dalton_transcription_ticket_using_dev_fallback
+
+    if is_dalton_transcription_ticket_using_dev_fallback():
+        if not is_trusted_local_loopback_request(request.scope):
+            raise HTTPException(
+                status_code=401,
+                detail="Development fallback transcription tickets require a direct loopback request",
+            )
+
+
 async def _transcription_caller_gate(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
@@ -70,6 +88,7 @@ async def _transcription_caller_gate(
                 status_code=403,
                 detail="Task ticket cannot query aggregate usage reports",
             )
+        _enforce_dev_fallback_ticket_loopback(request)
         claims = verify_transcription_ticket(raw_ticket)
         ticket_uid = str(claims["user_id"])
         reject_company_system_auth(ticket_uid)
@@ -155,6 +174,7 @@ async def _resolve_caller_and_ticket(
 
     has_ticket, raw_ticket = _extract_ticket_from_request(request, credentials)
     if has_ticket:
+        _enforce_dev_fallback_ticket_loopback(request)
         claims = verify_transcription_ticket(
             raw_ticket,
             required_op=required_op,

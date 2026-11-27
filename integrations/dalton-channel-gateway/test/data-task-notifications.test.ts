@@ -3330,4 +3330,670 @@ describe("automation report plain text", () => {
     expect(adapter.sentTexts).toEqual([]);
     expect(adapter.sentCards).toEqual([]);
   });
+
+  it("normalizes feishu_card and falls back once on 200621 under the same delivery_key without duplicate progress rows", async () => {
+    const { DataTaskNotificationService } = await import(
+      "../src/data-task-notifications.js"
+    );
+    let attempts = 0;
+    const { client, sentMessages } = createFakeOutboundLarkClient({
+      onMessageCreate: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_fb_once" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client,
+    });
+    const deliveryKey = "data-task-card-200621-key-1";
+    const cardPlan: DataTaskAuthorizePlanResponse = {
+      authorized: true,
+      status: "authorized",
+      run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
+      job_key: "dalton-ant-tracker",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: PLAIN_FEISHU_RECIPIENT,
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: PLAIN_FEISHU_RECIPIENT,
+      items: [
+        {
+          item_index: 0,
+          kind: "feishu_card",
+          delivery_key: deliveryKey,
+          card: {
+            schema: "2.0",
+            header: {
+              title: "ANT 多空跟踪",
+              text_tag_list: [
+                {
+                  text: { tag: "plain_text", content: "ANT" },
+                  color: "purple",
+                },
+              ],
+            },
+            body: {
+              elements: [
+                { tag: "text", content: "要点一" },
+                { tag: "custom_broken", bad: 1 },
+              ],
+            },
+          },
+          images: [],
+        },
+      ],
+    };
+
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(cardPlan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue(
+      claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT),
+    );
+    const service = new DataTaskNotificationService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      mode: "outgoing",
+    });
+
+    const result = await service.handleDataTaskNotification({
+      run_id: cardPlan.run_id,
+      target: "feishu:@me",
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.data.ok).toBe(true);
+    expect(result.data.status).toBe("sent");
+    expect(result.data.items_sent).toBe(1);
+    expect(result.data.items[0]?.delivery_key).toBe(deliveryKey);
+    expect(result.data.items[0]?.platform_message_ids).toEqual(["om_fb_once"]);
+
+    // Claimed once and recorded once under the same delivery_key
+    expect(backend.authorizeAndClaimDelivery).toHaveBeenCalledTimes(1);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledTimes(1);
+    expect(
+      vi.mocked(backend.updateDeliveryProgress).mock.calls[0]?.[0],
+    ).toMatchObject({
+      delivery_key: deliveryKey,
+      status: "sent",
+      platform_message_ids: ["om_fb_once"],
+    });
+
+    // Attempt 1 sent the normalized card; Attempt 2 sent the minimal markdown fallback
+    expect(sentMessages).toHaveLength(2);
+    const firstCard = JSON.parse(sentMessages[0]!.content);
+    expect(firstCard.header.title).toEqual({
+      tag: "plain_text",
+      content: "ANT 多空跟踪",
+    });
+    expect(firstCard.header.text_tag_list[0]).toEqual({
+      tag: "text_tag",
+      text: { tag: "plain_text", content: "ANT" },
+      color: "purple",
+    });
+    expect(firstCard.body.elements[0]).toEqual({
+      tag: "markdown",
+      content: "要点一",
+    });
+
+    const fallbackCard = JSON.parse(sentMessages[1]!.content);
+    expect(fallbackCard.header).toBeUndefined();
+    expect(fallbackCard.body.elements).toHaveLength(1);
+    expect(fallbackCard.body.elements[0].tag).toBe("markdown");
+    expect(fallbackCard.body.elements[0].content).toContain("**ANT 多空跟踪**");
+    expect(fallbackCard.body.elements[0].content).toContain("要点一");
+  });
+
+  it("marks embedded feishu_card images failed and rewrites plain_text fallback links on 200621", async () => {
+    const { DataTaskNotificationService } = await import(
+      "../src/data-task-notifications.js"
+    );
+    const pngBytes = makeSyntheticPng("card-img-fb");
+    const pngSha = sha256Hex(pngBytes);
+    let attempts = 0;
+    const { client, sentMessages } = createFakeOutboundLarkClient({
+      onMessageCreate: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_fb_img_dropped" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client,
+    });
+    const deliveryKey = "data-task-card-200621-img-key-1";
+    const cardPlan: DataTaskAuthorizePlanResponse = {
+      authorized: true,
+      status: "authorized",
+      run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7",
+      thread_id: "thread-dt-fb-1",
+      workspace_id: "ws-dt-fb-1",
+      job_key: "dalton-ant-tracker",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: PLAIN_FEISHU_RECIPIENT,
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: PLAIN_FEISHU_RECIPIENT,
+      items: [
+        {
+          item_index: 0,
+          kind: "feishu_card",
+          delivery_key: deliveryKey,
+          card: {
+            schema: "2.0",
+            header: {
+              title: {
+                tag: "plain_text",
+                content:
+                  "报表 [预览](http://localhost:3000/app) /home/workspace/summary.md",
+              },
+            },
+            body: {
+              elements: [
+                { tag: "__img__", path: "chart_1" },
+                {
+                  tag: "div",
+                  text: {
+                    tag: "plain_text",
+                    content:
+                      "本地地址 http://127.0.0.1:5173/view 和 [文件](/home/workspace/raw.csv)",
+                  },
+                },
+                { tag: "custom_broken", bad: 1 },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "art-img-1",
+              filename: "chart_1.png",
+              mime_type: "image/png",
+              size_bytes: pngBytes.byteLength,
+              sha256: pngSha,
+              placeholder: "chart_1",
+            },
+          ],
+        },
+      ],
+    };
+
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(cardPlan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue(
+      claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT),
+    );
+    vi.mocked(backend.downloadDataTaskRunArtifact!).mockResolvedValue({
+      content: pngBytes,
+      mimeType: "image/png",
+      filename: "chart_1.png",
+      sha256Header: pngSha,
+    });
+
+    const service = new DataTaskNotificationService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      mode: "outgoing",
+      webBaseUrl: "https://app.example.com",
+    });
+
+    const result = await service.handleDataTaskNotification({
+      run_id: cardPlan.run_id,
+      target: "feishu:@me",
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.data.ok).toBe(false);
+    expect(result.data.code).toBe("partial");
+    expect(result.data.items[0]).toMatchObject({
+      delivery_key: deliveryKey,
+      status: "partial",
+      platform_message_ids: ["om_fb_img_dropped"],
+    });
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: deliveryKey,
+        status: "partial",
+        error_code: "file_not_sent",
+        platform_message_ids: ["om_fb_img_dropped"],
+        files_status: [
+          {
+            path: "chart_1.png",
+            status: "failed",
+            reason: "feishu_card_200621_markdown_fallback",
+          },
+        ],
+      }),
+      { platform: "feishu" },
+    );
+
+    expect(sentMessages).toHaveLength(2);
+    const fallbackContent = JSON.parse(sentMessages[1]!.content).body.elements[0]
+      .content as string;
+    expect(fallbackContent).not.toContain("http://localhost:3000");
+    expect(fallbackContent).not.toContain("http://127.0.0.1:5173");
+    expect(fallbackContent).not.toContain("/home/workspace/");
+    expect(fallbackContent).not.toContain("[预览](");
+    expect(fallbackContent).not.toContain("[文件](");
+    expect(fallbackContent).toContain("localhost:3000/app");
+    expect(fallbackContent).toContain("127.0.0.1:5173/view");
+  });
+
+  it("continues delivering subsequent cards after a 200621 partial fallback and skips resending the partial item on retry", async () => {
+    const { DataTaskNotificationService } = await import(
+      "../src/data-task-notifications.js"
+    );
+    const png0 = makeSyntheticPng("multi-card-0");
+    const png1 = makeSyntheticPng("multi-card-1");
+    const png2 = makeSyntheticPng("multi-card-2");
+    const sha0 = sha256Hex(png0);
+    const sha1 = sha256Hex(png1);
+    const sha2 = sha256Hex(png2);
+
+    const makeThreeCardPlan = (runId: string): DataTaskAuthorizePlanResponse => ({
+      authorized: true,
+      status: "authorized",
+      run_id: runId,
+      thread_id: "thread-dt-multi-1",
+      workspace_id: "ws-dt-multi-1",
+      job_key: "dalton-ant-tracker",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: PLAIN_FEISHU_RECIPIENT,
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: PLAIN_FEISHU_RECIPIENT,
+      items: [
+        {
+          item_index: 0,
+          kind: "feishu_card",
+          delivery_key: `${runId}:item:0`,
+          card: {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "卡片一（含图兜底）" } },
+            body: {
+              elements: [
+                { tag: "__img__", path: "card0_img" },
+                { tag: "text", content: "纯文本不变成链接 [外链](https://evil.example/a)" },
+                { tag: "custom_broken", bad: true },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "art-multi-0",
+              filename: "card0.png",
+              mime_type: "image/png",
+              size_bytes: png0.byteLength,
+              sha256: sha0,
+              placeholder: "card0_img",
+            },
+          ],
+        },
+        {
+          item_index: 1,
+          kind: "feishu_card",
+          delivery_key: `${runId}:item:1`,
+          card: {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "卡片二（正常发送）" } },
+            body: {
+              elements: [
+                { tag: "__img__", path: "card1_img" },
+                { tag: "markdown", content: "第二张卡片正文" },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "art-multi-1",
+              filename: "card1.png",
+              mime_type: "image/png",
+              size_bytes: png1.byteLength,
+              sha256: sha1,
+              placeholder: "card1_img",
+            },
+          ],
+        },
+        {
+          item_index: 2,
+          kind: "feishu_card",
+          delivery_key: `${runId}:item:2`,
+          card: {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "卡片三（正常发送）" } },
+            body: {
+              elements: [
+                { tag: "__img__", path: "card2_img" },
+                { tag: "markdown", content: "第三张卡片正文" },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "art-multi-2",
+              filename: "card2.png",
+              mime_type: "image/png",
+              size_bytes: png2.byteLength,
+              sha256: sha2,
+              placeholder: "card2_img",
+            },
+          ],
+        },
+      ],
+    });
+
+    // Part A: 3 cards — card 0 triggers 200621 fallback (partial), cards 1 and 2 still send normally;
+    // retry skips card 0 (already partial) and never resends it.
+    const runIdA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8";
+    let card0CreateCalls = 0;
+    const ledgerA = new Map<
+      string,
+      { status: string; first_response_json?: Record<string, unknown> }
+    >();
+    const { client: clientA, sentMessages: sentA } = createFakeOutboundLarkClient({
+      onMessageCreate: async (req) => {
+        const parsed = JSON.parse(req.content) as Record<string, unknown>;
+        const raw = req.content;
+        if (raw.includes("custom_broken")) {
+          card0CreateCalls += 1;
+          return { code: 200621, msg: "parse card json err" };
+        }
+        if (parsed.header === undefined && raw.includes("卡片一（含图兜底）")) {
+          card0CreateCalls += 1;
+          return { code: 0, data: { message_id: "om_multi_card0_fb" } };
+        }
+        if (raw.includes("卡片二（正常发送）")) {
+          return { code: 0, data: { message_id: "om_multi_card1_ok" } };
+        }
+        return { code: 0, data: { message_id: "om_multi_card2_ok" } };
+      },
+    });
+    const adapterA = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client: clientA,
+    });
+    const backendA = createMockBackend();
+    vi.mocked(backendA.authorizeDataTaskNotificationPlan).mockImplementation(
+      async () => structuredClone(makeThreeCardPlan(runIdA)),
+    );
+    vi.mocked(backendA.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      const existing = ledgerA.get(req.delivery_key);
+      if (existing && (existing.status === "sent" || existing.status === "partial")) {
+        return {
+          claim_status: "already_completed",
+          status: existing.status,
+          first_response_json: existing.first_response_json ?? null,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          is_current: false,
+        };
+      }
+      ledgerA.set(req.delivery_key, { status: "in_flight" });
+      return claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT);
+    });
+    vi.mocked(backendA.updateDeliveryProgress).mockImplementation(async (req) => {
+      if (req.status) {
+        ledgerA.set(req.delivery_key, {
+          status: req.status,
+          first_response_json: req.first_response_json as
+            | Record<string, unknown>
+            | undefined,
+        });
+      }
+      return {
+        ok: true,
+        delivery_key: req.delivery_key,
+        status: req.status ?? "in_flight",
+        sent_to_current_count: 0,
+      };
+    });
+    vi.mocked(backendA.downloadDataTaskRunArtifact!).mockImplementation(
+      async (_runId, artId) => {
+        const map: Record<string, { buf: Buffer; sha: string; name: string }> = {
+          "art-multi-0": { buf: png0, sha: sha0, name: "card0.png" },
+          "art-multi-1": { buf: png1, sha: sha1, name: "card1.png" },
+          "art-multi-2": { buf: png2, sha: sha2, name: "card2.png" },
+        };
+        const entry = map[artId]!;
+        return {
+          content: entry.buf,
+          mimeType: "image/png",
+          filename: entry.name,
+          sha256Header: entry.sha,
+        };
+      },
+    );
+
+    const serviceA = new DataTaskNotificationService({
+      backend: backendA,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapterA]]),
+      mode: "outgoing",
+      webBaseUrl: "https://app.example.com",
+    });
+
+    const firstRes = await serviceA.handleDataTaskNotification({
+      run_id: runIdA,
+      target: "feishu:@me",
+    });
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.data.ok).toBe(false);
+    expect(firstRes.data.status).toBe("unknown");
+    expect(firstRes.data.code).toBe("partial");
+    expect(firstRes.data.items_total).toBe(3);
+    expect(firstRes.data.items_sent).toBe(2);
+    expect(firstRes.data.items).toEqual([
+      expect.objectContaining({
+        item_index: 0,
+        delivery_key: `${runIdA}:item:0`,
+        status: "partial",
+        duplicate: false,
+        platform_message_ids: ["om_multi_card0_fb"],
+        code: "partial",
+      }),
+      expect.objectContaining({
+        item_index: 1,
+        delivery_key: `${runIdA}:item:1`,
+        status: "sent",
+        duplicate: false,
+        platform_message_ids: ["om_multi_card1_ok"],
+        code: null,
+      }),
+      expect.objectContaining({
+        item_index: 2,
+        delivery_key: `${runIdA}:item:2`,
+        status: "sent",
+        duplicate: false,
+        platform_message_ids: ["om_multi_card2_ok"],
+        code: null,
+      }),
+    ]);
+    // Card 0 sent original (200621) + fallback (ok), then Card 1 and Card 2 both sent
+    expect(card0CreateCalls).toBe(2);
+    expect(sentA).toHaveLength(4);
+    const card0FallbackMd = JSON.parse(sentA[1]!.content).body.elements[0]
+      .content as string;
+    expect(card0FallbackMd).not.toContain("[外链](https://evil.example/a)");
+    expect(card0FallbackMd).toContain("\\[外链\\]\\(https://evil.example/a\\)");
+
+    // Retry of the same batch: card 0 (already partial) and cards 1-2 (already sent) are skipped without resending
+    const retryRes = await serviceA.handleDataTaskNotification({
+      run_id: runIdA,
+      target: "feishu:@me",
+    });
+    expect(retryRes.status).toBe(200);
+    expect(retryRes.data.ok).toBe(false);
+    expect(retryRes.data.status).toBe("unknown");
+    expect(retryRes.data.code).toBe("partial");
+    expect(retryRes.data.items_total).toBe(3);
+    expect(retryRes.data.items_sent).toBe(2);
+    expect(retryRes.data.items[0]).toMatchObject({
+      item_index: 0,
+      status: "partial",
+      duplicate: true,
+      platform_message_ids: ["om_multi_card0_fb"],
+    });
+    expect(sentA).toHaveLength(4);
+    expect(card0CreateCalls).toBe(2);
+
+    // Part B: 3 cards — card 0 falls back (partial), card 1 fails transiently on attempt 1;
+    // on retry, card 0 is skipped (already partial, no resend), and cards 1 & 2 are delivered.
+    const runIdB = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9";
+    let card1Attempt = 0;
+    const ledgerB = new Map<
+      string,
+      { status: string; first_response_json?: Record<string, unknown> }
+    >();
+    const { client: clientB, sentMessages: sentB } = createFakeOutboundLarkClient({
+      onMessageCreate: async (req) => {
+        const raw = req.content;
+        if (raw.includes("custom_broken")) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        if (raw.includes("卡片一（含图兜底）")) {
+          return { code: 0, data: { message_id: "om_multi_b_card0_fb" } };
+        }
+        if (raw.includes("卡片二（正常发送）")) {
+          card1Attempt += 1;
+          if (card1Attempt === 1) {
+            return { code: 230001, msg: "temporary failure" };
+          }
+          return { code: 0, data: { message_id: "om_multi_b_card1_ok" } };
+        }
+        return { code: 0, data: { message_id: "om_multi_b_card2_ok" } };
+      },
+    });
+    const adapterB = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client: clientB,
+    });
+    const backendB = createMockBackend();
+    vi.mocked(backendB.authorizeDataTaskNotificationPlan).mockImplementation(
+      async () => structuredClone(makeThreeCardPlan(runIdB)),
+    );
+    vi.mocked(backendB.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      const existing = ledgerB.get(req.delivery_key);
+      if (existing && (existing.status === "sent" || existing.status === "partial")) {
+        return {
+          claim_status: "already_completed",
+          status: existing.status,
+          first_response_json: existing.first_response_json ?? null,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          is_current: false,
+        };
+      }
+      ledgerB.set(req.delivery_key, { status: "in_flight" });
+      return claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT);
+    });
+    vi.mocked(backendB.updateDeliveryProgress).mockImplementation(async (req) => {
+      if (req.status) {
+        ledgerB.set(req.delivery_key, {
+          status: req.status,
+          first_response_json: req.first_response_json as
+            | Record<string, unknown>
+            | undefined,
+        });
+      }
+      return {
+        ok: true,
+        delivery_key: req.delivery_key,
+        status: req.status ?? "in_flight",
+        sent_to_current_count: 0,
+      };
+    });
+    vi.mocked(backendB.downloadDataTaskRunArtifact!).mockImplementation(
+      async (_runId, artId) => {
+        const map: Record<string, { buf: Buffer; sha: string; name: string }> = {
+          "art-multi-0": { buf: png0, sha: sha0, name: "card0.png" },
+          "art-multi-1": { buf: png1, sha: sha1, name: "card1.png" },
+          "art-multi-2": { buf: png2, sha: sha2, name: "card2.png" },
+        };
+        const entry = map[artId]!;
+        return {
+          content: entry.buf,
+          mimeType: "image/png",
+          filename: entry.name,
+          sha256Header: entry.sha,
+        };
+      },
+    );
+
+    const serviceB = new DataTaskNotificationService({
+      backend: backendB,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapterB]]),
+      mode: "outgoing",
+      webBaseUrl: "https://app.example.com",
+    });
+
+    const bAttempt1 = await serviceB.handleDataTaskNotification({
+      run_id: runIdB,
+      target: "feishu:@me",
+    });
+    expect(bAttempt1.data.status).toBe("failed");
+    expect(bAttempt1.data.items).toHaveLength(2);
+    expect(bAttempt1.data.items[0]).toMatchObject({
+      item_index: 0,
+      status: "partial",
+      platform_message_ids: ["om_multi_b_card0_fb"],
+    });
+    expect(bAttempt1.data.items[1]).toMatchObject({
+      item_index: 1,
+      status: "failed",
+    });
+    const sentBeforeRetry = sentB.length;
+
+    const bAttempt2 = await serviceB.handleDataTaskNotification({
+      run_id: runIdB,
+      target: "feishu:@me",
+    });
+    expect(bAttempt2.data.status).toBe("unknown");
+    expect(bAttempt2.data.code).toBe("partial");
+    expect(bAttempt2.data.items_total).toBe(3);
+    expect(bAttempt2.data.items_sent).toBe(2);
+    expect(bAttempt2.data.items).toEqual([
+      expect.objectContaining({
+        item_index: 0,
+        status: "partial",
+        duplicate: true,
+        platform_message_ids: ["om_multi_b_card0_fb"],
+      }),
+      expect.objectContaining({
+        item_index: 1,
+        status: "sent",
+        duplicate: false,
+        platform_message_ids: ["om_multi_b_card1_ok"],
+      }),
+      expect.objectContaining({
+        item_index: 2,
+        status: "sent",
+        duplicate: false,
+        platform_message_ids: ["om_multi_b_card2_ok"],
+      }),
+    ]);
+    // Only cards 1 and 2 were sent on retry; card 0 was NOT resent
+    expect(sentB.length - sentBeforeRetry).toBe(2);
+  });
 });

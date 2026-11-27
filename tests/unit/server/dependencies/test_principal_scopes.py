@@ -156,13 +156,17 @@ def _computer_cli_tokens_on(monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def client():
+async def client(monkeypatch):
+    # DALTON-HOOK(share-redaction): pin unkeyed single-user OSS mode on trusted loopback host
+    monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+    monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+    monkeypatch.delenv("LANGALPHA_DESKTOP_APP", raising=False)
     with (
         patch.object(api, "HOST_MODE", "oss"),
         patch.object(api, "_SERVICE_TOKEN", SERVICE_SECRET),
     ):
         async with AsyncClient(
-            transport=ASGITransport(app=_build_app()), base_url="http://test"
+            transport=ASGITransport(app=_build_app()), base_url="http://127.0.0.1"
         ) as c:
             yield c
 
@@ -246,6 +250,32 @@ async def test_a_wrong_service_token_is_refused(client):
     resp = await client.get("/open", headers={"X-Service-Token": "not-the-secret"})
 
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_unkeyed_oss_remote_host_and_proxied_request_are_refused(monkeypatch, world):
+    # DALTON-HOOK(share-redaction): unkeyed OSS must refuse non-loopback Host and proxied requests
+    monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+    monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+    monkeypatch.delenv("LANGALPHA_DESKTOP_APP", raising=False)
+    with (
+        patch.object(api, "HOST_MODE", "oss"),
+        patch.object(api, "_SERVICE_TOKEN", SERVICE_SECRET),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=_build_app()), base_url="http://test"
+        ) as remote_client:
+            resp_remote = await remote_client.get(f"/c/{OTHER_COMPUTER}")
+            assert resp_remote.status_code == 401
+
+        async with AsyncClient(
+            transport=ASGITransport(app=_build_app()), base_url="http://127.0.0.1"
+        ) as loopback_client:
+            resp_proxied = await loopback_client.get(
+                f"/c/{OTHER_COMPUTER}",
+                headers={"X-Forwarded-For": "203.0.113.9"},
+            )
+            assert resp_proxied.status_code == 401
 
 
 # -- scopes ----------------------------------------------------------------------

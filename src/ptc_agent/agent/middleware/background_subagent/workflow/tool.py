@@ -243,6 +243,8 @@ def create_run_workflow_tool(
     store: Any | None = None,
     user_id: str | None = None,
     prebuilt_workflows: PrebuiltWorkflowRegistry | None = None,
+    # DALTON-HOOK(workflow-discovered-tools): workspace MCP registry for server-side discovery.
+    mcp_registry: Any | None = None,
 ) -> BaseTool:
     mw = dispatcher.middleware
     registry = dispatcher.registry
@@ -605,6 +607,19 @@ def create_run_workflow_tool(
                 )
             except CompanyRoutingRefused as error:
                 raise _Refused(str(error)) from error
+        # DALTON-HOOK(workflow-discovered-tools): when legacy researchdata_bridge
+        # is disabled, build minimal discovered tools from server-side MCP registry
+        # (overwriting caller params) and record the internal-memory decision in
+        # args.json so workflow.js and dalton_check_done stay consistent.
+        if isinstance(params, dict):
+            from src.dalton.content_assembly import resolve_launch_discovered_mcp_servers
+
+            params = await resolve_launch_discovered_mcp_servers(
+                backend,
+                meta.name,
+                params,
+                mcp_registry=mcp_registry,
+            )
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None
@@ -684,29 +699,81 @@ def create_run_workflow_tool(
                     )
                 except ResumeRefused as error:
                     raise _Refused(str(error)) from error
+
+            # DALTON-HOOK(workflow-discovered-tools): bind the server-computed
+            # internal-memory decision for `topic-research` ONLY to
+            # `(short_thread_id, run_task.task_id)` with an HMAC before
+            # snapshotting `args.json`, and refuse launch (aborting the admitted
+            # run) when `args.json` cannot be persisted. Kept inside the
+            # post-admission `try` so `CancelledError` during snapshot writes
+            # also runs terminal cleanup before propagating.
+            if isinstance(params, dict) and meta.name == "topic-research":
+                from src.dalton.content_assembly import (
+                    sign_topic_research_internal_memory_decision,
+                )
+
+                params = sign_topic_research_internal_memory_decision(
+                    params,
+                    short_thread_id=short_thread_id,
+                    run_id=run_task.task_id,
+                    workflow_name=meta.name,
+                )
+
+            artifacts = {
+                "workflow.js": script,
+                "args.json": json.dumps(params, ensure_ascii=False, default=str),
+            }
+            for filename, content in artifacts.items():
+                # DALTON-HOOK(workflow-discovered-tools): fail closed if `args.json`
+                # fails to persist (exception or explicit False / ok=False) on
+                # `topic-research` runs that depend on the launch decision snapshot.
+                args_snapshot_required = (
+                    filename == "args.json" and meta.name == "topic-research"
+                )
+                try:
+                    write_res = await backend.awrite_text(f"{base_rel}/{filename}", content)
+                    if args_snapshot_required and (
+                        write_res is False
+                        or (hasattr(write_res, "ok") and write_res.ok is False)
+                    ):
+                        raise OSError(
+                            f"snapshot write returned failure for {base_rel}/{filename}"
+                        )
+                except Exception as snap_error:
+                    logger.warning(
+                        "Failed to snapshot workflow artifact",
+                        path=f"{base_rel}/{filename}",
+                        exc_info=True,
+                    )
+                    if args_snapshot_required:
+                        raise _Refused(
+                            f"failed to snapshot launch args ({base_rel}/args.json) — refusing to start {meta.name}.",
+                            failure="SnapshotWriteError",
+                        ) from snap_error
         except BaseException as launch_error:
             if admitted:
                 # The row is in the ledger and the namespace fence is held —
-                # the post-INSERT arm settles it as a terminal error and
-                # releases both; discard_unstarted refuses settled runs.
-                await mw._abort_admitted_run(run_task, launch_error)
+                # settle it through the owner terminal pipeline and release
+                # both; discard_unstarted refuses settled runs.
+                if isinstance(launch_error, asyncio.CancelledError):
+                    if not run_task.completed:
+                        run_task.mark_cancelled("Cancelled before spawn")
+                    # A second cancel must not cut the ledger/namespace settle short.
+                    await asyncio.shield(mw._finalize_cancelled_before_spawn(run_task))
+                else:
+                    if not run_task.completed:
+                        run_task.mark_never_started(
+                            f"setup failed before spawn: {launch_error}"
+                        )
+                    await mw._abort_admitted_run(run_task, launch_error)
             else:
+                if (
+                    isinstance(launch_error, asyncio.CancelledError)
+                    and not run_task.completed
+                ):
+                    run_task.mark_never_started("cancelled before admission")
                 await registry.discard_unstarted(launch_tool_call_id)
             raise
-
-        artifacts = {
-            "workflow.js": script,
-            "args.json": json.dumps(params, ensure_ascii=False, default=str),
-        }
-        for filename, content in artifacts.items():
-            try:
-                await backend.awrite_text(f"{base_rel}/{filename}", content)
-            except Exception:
-                logger.warning(
-                    "Failed to snapshot workflow artifact",
-                    path=f"{base_rel}/{filename}",
-                    exc_info=True,
-                )
 
         spec = WorkflowRunSpec(
             run_task=run_task,

@@ -6260,3 +6260,776 @@ describe("Feishu card envelope constants parity with Python", () => {
     expect(() => assertFeishuCardWithinEnvelope(sentCard)).not.toThrow();
   });
 });
+
+describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
+  it("normalizes production 200621 failure samples (ANT missing text_tag tag & X daily tag:text) without mutating input", async () => {
+    const { normalizeFeishuCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    // 1. 2026-11-27 dalton-ant-tracker: header.text_tag_list[0] missing tag
+    const antCard = {
+      schema: "2.0",
+      header: {
+        title: { tag: "plain_text", content: "ANT 多空跟踪" },
+        template: "blue",
+        text_tag_list: [
+          {
+            text: { tag: "plain_text", content: "ANT" },
+            color: "purple",
+          },
+        ],
+      },
+      body: {
+        elements: [{ tag: "markdown", content: "多空观察要点" }],
+      },
+    };
+    const antBefore = structuredClone(antCard);
+    const antRes = normalizeFeishuCard(antCard);
+    expect(antCard).toEqual(antBefore);
+    expect(antRes.normalizedPaths).toEqual(["header.text_tag_list[0].tag"]);
+    expect((antRes.card.header as Record<string, unknown>).text_tag_list).toEqual([
+      {
+        tag: "text_tag",
+        text: { tag: "plain_text", content: "ANT" },
+        color: "purple",
+      },
+    ]);
+    // Idempotent
+    expect(normalizeFeishuCard(antRes.card).normalizedPaths).toEqual([]);
+
+    // 2. 2026-11-26 X accounts daily: body elements with tag: "text"
+    const xDailyCard = {
+      schema: "2.0",
+      header: {
+        title: { tag: "plain_text", content: "X 账号日报" },
+      },
+      body: {
+        elements: [
+          { tag: "text", content: "今日要点汇总" },
+          { tag: "text", text: { tag: "plain_text", content: "来自 text.content" } },
+          { tag: "markdown", content: "已有正常块" },
+        ],
+      },
+    };
+    const xBefore = structuredClone(xDailyCard);
+    const xRes = normalizeFeishuCard(xDailyCard);
+    expect(xDailyCard).toEqual(xBefore);
+    expect(xRes.normalizedPaths).toEqual([
+      "body.elements[0]",
+      "body.elements[1]",
+    ]);
+    expect((xRes.card.body as Record<string, unknown>).elements).toEqual([
+      { tag: "markdown", content: "今日要点汇总" },
+      { tag: "markdown", content: "来自 text.content" },
+      { tag: "markdown", content: "已有正常块" },
+    ]);
+  });
+
+  it("normalizes text_tag strings, header title/subtitle strings, plain_text/lark_md body elements, nested containers, and preserves unknown elements", async () => {
+    const { normalizeFeishuCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    const card = {
+      schema: "2.0",
+      header: {
+        title: "主标题字符串",
+        subtitle: "副标题字符串",
+        text_tag_list: [
+          { tag: "text_tag", text: "标签A", color: "blue" },
+          { text: "标签B", color: "green" },
+          "标签C",
+        ],
+      },
+      body: {
+        elements: [
+          { tag: "plain_text", content: "纯文本块" },
+          { tag: "lark_md", content: "**旧版 markdown**" },
+          { tag: "div", text: { tag: "lark_md", content: "保留 div.text" } },
+          { tag: "note", elements: [{ tag: "plain_text", content: "保留 note" }] },
+          {
+            tag: "column_set",
+            columns: [
+              {
+                tag: "column",
+                elements: [{ tag: "text", content: "列内文本" }],
+              },
+            ],
+          },
+          {
+            tag: "collapsible_panel",
+            elements: [{ tag: "plain_text", content: "折叠面板文本" }],
+          },
+          { tag: "custom_unknown_widget", payload: { k: 1 } },
+        ],
+      },
+    };
+
+    const { card: norm, normalizedPaths } = normalizeFeishuCard(card);
+    expect(normalizedPaths).toEqual([
+      "header.title",
+      "header.subtitle",
+      "header.text_tag_list[0].text",
+      "header.text_tag_list[1].tag",
+      "header.text_tag_list[1].text",
+      "header.text_tag_list[2]",
+      "body.elements[0]",
+      "body.elements[1]",
+      "body.elements[4].columns[0].elements[0]",
+      "body.elements[5].elements[0]",
+    ]);
+
+    const header = norm.header as Record<string, unknown>;
+    expect(header.title).toEqual({ tag: "plain_text", content: "主标题字符串" });
+    expect(header.subtitle).toEqual({ tag: "plain_text", content: "副标题字符串" });
+    expect(header.text_tag_list).toEqual([
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签A" }, color: "blue" },
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签B" }, color: "green" },
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签C" } },
+    ]);
+
+    const elements = (norm.body as Record<string, unknown>).elements as Array<
+      Record<string, unknown>
+    >;
+    expect(elements[0]).toEqual({ tag: "markdown", content: "纯文本块" });
+    expect(elements[1]).toEqual({ tag: "markdown", content: "**旧版 markdown**" });
+    expect(elements[2]).toEqual({
+      tag: "div",
+      text: { tag: "lark_md", content: "保留 div.text" },
+    });
+    expect(elements[3]).toEqual({
+      tag: "note",
+      elements: [{ tag: "plain_text", content: "保留 note" }],
+    });
+    expect(
+      ((elements[4].columns as Array<Record<string, unknown>>)[0].elements as unknown[])[0],
+    ).toEqual({ tag: "markdown", content: "列内文本" });
+    expect((elements[5].elements as unknown[])[0]).toEqual({
+      tag: "markdown",
+      content: "折叠面板文本",
+    });
+    expect(elements[6]).toEqual({ tag: "custom_unknown_widget", payload: { k: 1 } });
+  });
+
+  it("strips decorative inline code backticks on numbers, tickers, and periods while preserving paths, commands, snake_case, and code blocks", async () => {
+    const { normalizeFeishuCard, normalizeFeishuMarkdownInlineCode } =
+      await import("../src/channels/feishu/card-normalize.js");
+
+    // Shared sample matrix mirrored identically in tests/unit/dalton/test_card_normalize.py
+    const samples: Array<[string, string]> = [
+      // Numbers / amounts / percentages / multiples / ranges -> stripped
+      [
+        "营收 `16,956.0`（`+46.7%` / `-11.9%`），估值 `3.2x`，目标价 `150.0`。",
+        "营收 16,956.0（+46.7% / -11.9%），估值 3.2x，目标价 150.0。",
+      ],
+      [
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
+      ],
+      [
+        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`15%~18%`、`15% ~ 18%`、`15%～18%`、`2.5x~3.5x`、`120亿至130亿美元`。",
+        "区间 15%–18%、15% 至 18%、10-20、15%至18%、15%至18%、15%至18%、2.5x至3.5x、120亿至130亿美元。",
+      ],
+      // Stock tickers -> stripped
+      [
+        "标的 `ANT`、`NVDA`、`V`、`GOOGL`、`0700.HK`、`601100.SS`、`600519.SH`、`300750.SZ`、`2330.TW`、`005930.KS`、`9984.T`、`ASML.AS`、`BRK.B`。",
+        "标的 ANT、NVDA、V、GOOGL、0700.HK、601100.SS、600519.SH、300750.SZ、2330.TW、005930.KS、9984.T、ASML.AS、BRK.B。",
+      ],
+      // Periods -> stripped
+      [
+        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2025Q1~2026Q3`、`2026-11-27`。",
+        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2025Q1至2026Q3、2026-11-27。",
+      ],
+      // Paths, commands, snake_case & technical identifiers -> preserved
+      [
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+      ],
+      [
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+      ],
+      [
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+      ],
+      [
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+      ],
+      // Mixed prose + fenced code blocks + multi-backtick + escaped backticks
+      [
+        "摘要：`ANT` 在 `2026Q3` 营收 `16,956.0`（`+46.7%`），字段 `revenue_yoy_pct`。\n" +
+          "```python\n" +
+          "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n" +
+          "```\n" +
+          "~~~text\n" +
+          "`0700.HK` `FY26E`\n" +
+          "~~~\n" +
+          "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 `601100.SS` 去反引号。",
+        "摘要：ANT 在 2026Q3 营收 16,956.0（+46.7%），字段 `revenue_yoy_pct`。\n" +
+          "```python\n" +
+          "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n" +
+          "```\n" +
+          "~~~text\n" +
+          "`0700.HK` `FY26E`\n" +
+          "~~~\n" +
+          "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 601100.SS 去反引号。",
+      ],
+      // Indented code blocks (4 spaces / tab, after blank line / heading / blockquote / list) -> preserved;
+      // lazy paragraph continuation & list continuation -> stripped as prose inline code.
+      [
+        "正文 `ANT` 增速 `15%~18%`。\n\n" +
+          "    const ticker = `ANT`;\n" +
+          "    const range = `15%~18%`;\n\n" +
+          "\tconst tabTicker = `0700.HK`;\n\n" +
+          "# 标题 `2026Q3`\n" +
+          "    const afterHeading = `3.2x`;\n\n" +
+          ">     const quotedCode = `NVDA`;\n\n" +
+          "- 列表项 `16,956.0`\n" +
+          "    列表续行 `+46.7%`\n\n" +
+          "      const listCode = `FY26E`;\n\n" +
+          "段落首行\n" +
+          "    段落续行 `150.0`",
+        "正文 ANT 增速 15%至18%。\n\n" +
+          "    const ticker = `ANT`;\n" +
+          "    const range = `15%~18%`;\n\n" +
+          "\tconst tabTicker = `0700.HK`;\n\n" +
+          "# 标题 2026Q3\n" +
+          "    const afterHeading = `3.2x`;\n\n" +
+          ">     const quotedCode = `NVDA`;\n\n" +
+          "- 列表项 16,956.0\n" +
+          "    列表续行 +46.7%\n\n" +
+          "      const listCode = `FY26E`;\n\n" +
+          "段落首行\n" +
+          "    段落续行 150.0",
+      ],
+    ];
+
+    for (const [raw, expected] of samples) {
+      expect(normalizeFeishuMarkdownInlineCode(raw)).toBe(expected);
+    }
+
+    const card = {
+      schema: "2.0",
+      header: {
+        title: { tag: "plain_text", content: "AI 应用周报 — 2026-11-27" },
+      },
+      body: {
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              "**`ANT`** `2026Q3` 收入 `16,956.0`（`+46.7%`），" +
+              "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n" +
+              "```bash\n" +
+              "echo `16,956.0` `ANT`\n" +
+              "```",
+          },
+          {
+            tag: "column_set",
+            columns: [
+              {
+                tag: "column",
+                elements: [
+                  {
+                    tag: "markdown",
+                    content: "港股 `0700.HK` 估值 `3.2x`（`FY26E`）",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            tag: "text",
+            content: "A 股 `601100.SS` 同比 `-11.9%`（`4Q27E`），命令 `pytest -q`",
+          },
+          {
+            tag: "markdown",
+            content: "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动",
+          },
+        ],
+      },
+    };
+    const before = structuredClone(card);
+    const { card: norm, normalizedPaths } = normalizeFeishuCard(card);
+
+    expect(card).toEqual(before);
+    expect(normalizedPaths).toEqual([
+      "body.elements[0].content",
+      "body.elements[1].columns[0].elements[0].content",
+      "body.elements[2]",
+    ]);
+    expect(
+      normalizedPaths.every((p) => !p.includes("16,956.0") && !p.includes("ANT")),
+    ).toBe(true);
+
+    const elems = (norm.body as Record<string, unknown>).elements as Array<
+      Record<string, unknown>
+    >;
+    expect(elems[0].content).toBe(
+      "**ANT** 2026Q3 收入 16,956.0（+46.7%），" +
+        "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n" +
+        "```bash\n" +
+        "echo `16,956.0` `ANT`\n" +
+        "```",
+    );
+    expect(
+      ((elems[1].columns as Array<Record<string, unknown>>)[0].elements as Array<
+        Record<string, unknown>
+      >)[0].content,
+    ).toBe("港股 0700.HK 估值 3.2x（FY26E）");
+    expect(elems[2]).toEqual({
+      tag: "markdown",
+      content: "A 股 601100.SS 同比 -11.9%（4Q27E），命令 `pytest -q`",
+    });
+    expect(elems[3].content).toBe(
+      "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动",
+    );
+
+    // Idempotent on second pass
+    const second = normalizeFeishuCard(norm);
+    expect(second.card).toEqual(norm);
+    expect(second.normalizedPaths).toEqual([]);
+  });
+
+  it("sendCardFeishu normalizes before send and logs normalized field paths without body content", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient();
+    const infoLines: string[] = [];
+    const logger = createSubsystemLogger("feishu/test", {
+      sink: {
+        info: (line) => infoLines.push(line),
+        warn: () => {},
+        error: () => {},
+      },
+    });
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_norm_test",
+      logger,
+      card: {
+        schema: "2.0",
+        header: {
+          title: "ANT 敏感标题_DO_NOT_LOG",
+          text_tag_list: [{ text: "ANT", color: "purple" }],
+        },
+        body: {
+          elements: [{ tag: "text", content: "SECRET_CARD_BODY_CONTENT" }],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_created_1");
+    expect(calls.messageCreate).toHaveLength(1);
+    const sent = JSON.parse(calls.messageCreate[0].data.content);
+    expect(sent.header.title).toEqual({
+      tag: "plain_text",
+      content: "ANT 敏感标题_DO_NOT_LOG",
+    });
+    expect(sent.header.text_tag_list).toEqual([
+      {
+        tag: "text_tag",
+        text: { tag: "plain_text", content: "ANT" },
+        color: "purple",
+      },
+    ]);
+    expect(sent.body.elements).toEqual([
+      { tag: "markdown", content: "SECRET_CARD_BODY_CONTENT" },
+    ]);
+
+    expect(infoLines).toHaveLength(1);
+    expect(infoLines[0]).toContain("feishu_card_normalized");
+    expect(infoLines[0]).toContain("header.title");
+    expect(infoLines[0]).toContain("header.text_tag_list[0].tag");
+    expect(infoLines[0]).toContain("header.text_tag_list[0].text");
+    expect(infoLines[0]).toContain("body.elements[0]");
+    expect(infoLines[0]).not.toContain("SECRET_CARD_BODY_CONTENT");
+    expect(infoLines[0]).not.toContain("DO_NOT_LOG");
+  });
+
+  it("sendCardFeishu strips numeric inline code backticks at send time while keeping code identifiers", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient();
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_inline_strip",
+      card: {
+        schema: "2.0",
+        header: {
+          title: { tag: "plain_text", content: "AI 金融日报" },
+        },
+        body: {
+          elements: [
+            {
+              tag: "markdown",
+              content:
+                "营收 `16,956.0`，增速 `15%~18%`，金额 `$150.0`，字段 `revenue_yoy_pct`。",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_created_1");
+    expect(calls.messageCreate).toHaveLength(1);
+    const sent = JSON.parse(calls.messageCreate[0].data.content);
+    expect(sent.body.elements[0].content).toBe(
+      "营收 16,956.0，增速 15%至18%，金额 `$150.0`，字段 `revenue_yoy_pct`。",
+    );
+  });
+
+  it("sendCardFeishu falls back once to minimal markdown-only card on 200621 and succeeds", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    let attempt = 0;
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return { code: 200621, msg: "parse card json err: unsupported field" };
+        }
+        return { code: 0, data: { message_id: "om_fallback_ok" } };
+      },
+    });
+    const warnLines: string[] = [];
+    const logger = createSubsystemLogger("feishu/test", {
+      sink: {
+        info: () => {},
+        warn: (line) => warnLines.push(line),
+        error: () => {},
+      },
+    });
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_fallback_ok",
+      logger,
+      card: {
+        schema: "2.0",
+        header: {
+          title: { tag: "plain_text", content: "ANT 多空跟踪" },
+          subtitle: { tag: "plain_text", content: "2026-11-27" },
+          template: "invalid_color_triggering_200621",
+        },
+        body: {
+          elements: [
+            { tag: "markdown", content: "第一段重点内容" },
+            { tag: "custom_broken_widget", bad: true },
+            { tag: "markdown", content: "第二段结论" },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_fallback_ok");
+    expect(calls.messageCreate).toHaveLength(2);
+    const fallbackCard = JSON.parse(calls.messageCreate[1].data.content);
+    expect(fallbackCard.schema).toBe("2.0");
+    expect(fallbackCard.header).toBeUndefined();
+    expect(fallbackCard.body.elements).toHaveLength(1);
+    expect(fallbackCard.body.elements[0].tag).toBe("markdown");
+    expect(fallbackCard.body.elements[0].content).toContain("**ANT 多空跟踪**");
+    expect(fallbackCard.body.elements[0].content).toContain("2026-11-27");
+    expect(fallbackCard.body.elements[0].content).toContain("第一段重点内容");
+    expect(fallbackCard.body.elements[0].content).toContain("第二段结论");
+    expect(warnLines).toHaveLength(1);
+    expect(warnLines[0]).toContain("feishu_card_200621_fallback");
+    expect(warnLines[0]).not.toContain("第一段重点内容");
+  });
+
+  it("sendCardFeishu sends 200621 fallback at most once when fallback also fails with 200621", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 200621,
+        msg: "parse card json err",
+      }),
+    });
+
+    await expect(
+      sendCardFeishu(client, {
+        to: "chat:oc_fallback_fail",
+        card: {
+          schema: "2.0",
+          body: { elements: [{ tag: "markdown", content: "内容" }] },
+        },
+      }),
+    ).rejects.toThrow(ChannelDeliveryError);
+
+    expect(calls.messageCreate).toHaveLength(2);
+  });
+
+  it("sendCardFeishu does not trigger 200621 fallback on non-200621 errors and handles thrown 200621 HTTP errors", async () => {
+    const { sendCardFeishu, sendStructuredCardFeishu } = await import(
+      "../src/channels/feishu/send.js"
+    );
+
+    // Non-200621 error -> no fallback (only 1 call)
+    const non200621 = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 230001,
+        msg: "no permission",
+      }),
+    });
+    await expect(
+      sendCardFeishu(non200621.client, {
+        to: "chat:oc_perm_denied",
+        card: {
+          schema: "2.0",
+          body: { elements: [{ tag: "markdown", content: "内容" }] },
+        },
+      }),
+    ).rejects.toThrow(ChannelDeliveryError);
+    expect(non200621.calls.messageCreate).toHaveLength(1);
+
+    // Thrown Axios-like 200621 error via sendStructuredCardFeishu -> falls back once
+    let structuredAttempt = 0;
+    const thrown200621 = createFakeLarkClient({
+      onMessageCreate: async () => {
+        structuredAttempt += 1;
+        if (structuredAttempt === 1) {
+          throw {
+            response: {
+              status: 400,
+              data: { code: 200621, msg: "parse card json err" },
+            },
+          };
+        }
+        return { code: 0, data: { message_id: "om_structured_fb" } };
+      },
+    });
+    const res = await sendStructuredCardFeishu(thrown200621.client, {
+      to: "chat:oc_structured_fb",
+      title: "结构化卡片",
+      text: "```ts\nconst x = 1;\n```",
+    });
+    expect(res.messageId).toBe("om_structured_fb");
+    expect(thrown200621.calls.messageCreate).toHaveLength(2);
+    const fbCard = JSON.parse(thrown200621.calls.messageCreate[1].data.content);
+    expect(fbCard.header).toBeUndefined();
+    expect(fbCard.body.elements).toHaveLength(1);
+    expect(fbCard.body.elements[0].tag).toBe("markdown");
+    expect(fbCard.body.elements[0].content).toContain("**结构化卡片**");
+    expect(res.usedMarkdownFallback).toBe(true);
+  });
+
+  it("buildMinimalMarkdownFallbackCard escapes plain_text markdown syntax, preserves verified button links, and rewrites sandbox/local URLs", async () => {
+    const { buildMinimalMarkdownFallbackCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    const fallback = buildMinimalMarkdownFallbackCard(
+      {
+        schema: "2.0",
+        header: {
+          title: {
+            tag: "plain_text",
+            content:
+              "标题 [点击](/home/workspace/a.pdf) 和 http://localhost:3000/preview",
+          },
+          subtitle: {
+            tag: "plain_text",
+            content: "**非加粗** 与 <font color='red'>字</font>",
+          },
+        },
+        body: {
+          elements: [
+            {
+              tag: "div",
+              text: {
+                tag: "plain_text",
+                content:
+                  "纯文本 [本地](http://127.0.0.1:5173/app) 与 file:///home/workspace/dir/data.csv",
+              },
+            },
+            {
+              tag: "markdown",
+              content: "报告链接：[Q3 财报](/home/workspace/reports/q3.pdf)",
+            },
+            {
+              tag: "button",
+              text: { tag: "plain_text", content: "打开网页交互版" },
+              behaviors: [
+                {
+                  type: "open_url",
+                  default_url:
+                    "https://dalton.example.com/chat/t/t-1?chart=NVDA%3A1day&layer=l-1",
+                },
+              ],
+            },
+            {
+              tag: "button",
+              text: { tag: "plain_text", content: "本地按钮" },
+              behaviors: [
+                {
+                  type: "open_url",
+                  default_url: "http://localhost:5173/internal",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        webBaseUrl: "https://dalton.example.com",
+        threadId: "t-1",
+        workspaceId: "ws-1",
+      },
+    );
+
+    expect(fallback.body.elements).toHaveLength(1);
+    const md = fallback.body.elements[0]!.content!;
+    // Plain text markdown syntax escaped; no unrewritten localhost or sandbox paths
+    expect(md).not.toContain("http://localhost:3000");
+    expect(md).not.toContain("http://127.0.0.1:5173");
+    expect(md).not.toContain("http://localhost:5173");
+    expect(md).not.toContain("/home/workspace/a.pdf");
+    expect(md).not.toContain("file:///home/workspace/");
+    expect(md).toContain("\\[点击\\]\\(a.pdf\\)");
+    expect(md).toContain("localhost:3000/preview");
+    expect(md).toContain("\\*\\*非加粗\\*\\*");
+    expect(md).toContain("&lt;font color='red'&gt;字&lt;/font&gt;");
+    expect(md).toContain("127.0.0.1:5173/app");
+    expect(md).toContain("dir/data.csv");
+    // Markdown link rewritten to public web deep link
+    expect(md).toContain(
+      "[Q3 财报](https://dalton.example.com/chat/t/t-1?file=%2Fhome%2Fworkspace%2Freports%2Fq3.pdf)",
+    );
+    // Verified public button link preserved in fallback markdown; local button dropped
+    expect(md).toContain(
+      "[打开网页交互版](https://dalton.example.com/chat/t/t-1?chart=NVDA%3A1day&layer=l-1)",
+    );
+    expect(md).not.toContain("本地按钮");
+  });
+
+  it("sendCardFeishu sends 200621 fallback once on the actual failing route without re-iterating withdrawn reply anchors", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+
+    // Case 1: primary anchor withdrawn (230011) -> backup anchor returns 200621 ->
+    // fallback goes ONLY to backup anchor (never retries withdrawn primary).
+    const replyCalls: Array<{ messageId: string; replyInThread?: boolean }> = [];
+    let backupAttempt = 0;
+    const case1 = createFakeLarkClient({
+      onMessageReply: async (req) => {
+        replyCalls.push({
+          messageId: req.path.message_id,
+          replyInThread: req.data.reply_in_thread,
+        });
+        if (req.path.message_id === "om_withdrawn") {
+          return { code: 230011, msg: "message withdrawn" };
+        }
+        backupAttempt += 1;
+        if (backupAttempt === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_backup_fb_ok" } };
+      },
+    });
+
+    const res1 = await sendCardFeishu(case1.client, {
+      to: "chat:oc_topic_chat",
+      replyToMessageId: "om_withdrawn",
+      fallbackReplyToMessageIds: ["om_backup"],
+      replyInThread: true,
+      allowDirectFallback: false,
+      card: {
+        schema: "2.0",
+        body: { elements: [{ tag: "markdown", content: "话题卡内容" }] },
+      },
+    });
+
+    expect(res1.messageId).toBe("om_backup_fb_ok");
+    expect(res1.usedMarkdownFallback).toBe(true);
+    expect(replyCalls).toEqual([
+      { messageId: "om_withdrawn", replyInThread: true },
+      { messageId: "om_backup", replyInThread: true },
+      { messageId: "om_backup", replyInThread: true },
+    ]);
+    expect(case1.calls.messageCreate).toHaveLength(0);
+
+    // Case 2: reply anchor withdrawn (230011) -> direct create returns 200621 ->
+    // fallback goes ONLY to direct create (never retries withdrawn anchor).
+    const replyCalls2: string[] = [];
+    let createAttempt2 = 0;
+    const case2 = createFakeLarkClient({
+      onMessageReply: async (req) => {
+        replyCalls2.push(req.path.message_id);
+        return { code: 230011, msg: "message withdrawn" };
+      },
+      onMessageCreate: async () => {
+        createAttempt2 += 1;
+        if (createAttempt2 === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_direct_fb_ok" } };
+      },
+    });
+
+    const res2 = await sendCardFeishu(case2.client, {
+      to: "chat:oc_direct_chat",
+      replyToMessageId: "om_withdrawn_2",
+      allowDirectFallback: true,
+      card: {
+        schema: "2.0",
+        body: { elements: [{ tag: "markdown", content: "直发兜底内容" }] },
+      },
+    });
+
+    expect(res2.messageId).toBe("om_direct_fb_ok");
+    expect(res2.usedMarkdownFallback).toBe(true);
+    expect(replyCalls2).toEqual(["om_withdrawn_2"]);
+    expect(case2.calls.messageCreate).toHaveLength(2);
+  });
+
+  it("FeishuChannelAdapter.sendCard keeps tag:text link syntax escaped on 200621 fallback and preserves markdown code spans", async () => {
+    let attempt = 0;
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_sendcard_text_escaped" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client,
+    });
+
+    const res = await adapter.sendCard({
+      targetAddress: "feishu:oc_sendcard_escape",
+      card: {
+        schema: "2.0",
+        body: {
+          elements: [
+            {
+              tag: "text",
+              content: "纯文本链接 [点击](https://evil.example/phish) <font color='red'>红</font>",
+            },
+            {
+              tag: "markdown",
+              content: "代码片段 `\\<ANT\\>` 保持原样",
+            },
+            { tag: "custom_broken", bad: true },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_sendcard_text_escaped");
+    expect(res.usedMarkdownFallback).toBe(true);
+    expect(res.markdownFallbackLinkCount).toBe(0);
+    expect(calls.messageCreate).toHaveLength(2);
+
+    const fallbackCard = JSON.parse(calls.messageCreate[1]!.data.content);
+    const md = fallbackCard.body.elements[0].content as string;
+    expect(md).not.toContain("[点击](https://evil.example/phish)");
+    expect(md).toContain("\\[点击\\]\\(https://evil.example/phish\\)");
+    expect(md).toContain("&lt;font color='red'&gt;红&lt;/font&gt;");
+    expect(md).toContain("`\\<ANT\\>`");
+    expect(md).not.toContain("`&lt;ANT&gt;`");
+  });
+});

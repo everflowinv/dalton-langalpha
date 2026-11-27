@@ -229,6 +229,7 @@ def test_open_multipart_upload_prefixes_key_and_returns_upload_id(
         Bucket="asr-bucket",
         Key="asr-audio/transcriptions/ws-1/call.m4a",
         ContentType="audio/mp4",
+        ACL="private",
     )
 
 

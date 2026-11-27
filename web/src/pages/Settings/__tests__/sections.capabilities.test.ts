@@ -66,6 +66,10 @@ describe('Settings sections & search capability gating', () => {
     // Core settings remain searchable.
     expect(coreAnchors.has('dalton-providers')).toBe(true);
     expect(coreAnchors.has('dalton-budget')).toBe(true);
+    // DALTON-HOOK(watchlist): Personal tier monitoring policies are always visible in Coverage, while team coverage units require colleague_sharing
+    expect(sectionShown('coverage', { ...coreAdminCtx, coverageUnitsEnabled: false })).toBe(true);
+    expect(coreAnchors.has('dalton-tier-policies')).toBe(true);
+    expect(coreAnchors.has('dalton-coverage')).toBe(false);
   });
 
   it('returns zero proprietary keyword hits from Core settings search', () => {

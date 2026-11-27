@@ -17,6 +17,7 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { isDaltonAuth } from '@/config/daltonAuth';
 // DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
+import { attachComposerModelPickSeq, buildWidgetPromptModelOptions } from '@/lib/dalton/threadModelDalton';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
 import { useAllModels } from '@/hooks/useAllModels';
@@ -124,6 +125,8 @@ interface MarketChatPanelProps {
   onReturnToChat?: () => void;
   /** Switch the live chart to a symbol+timeframe (so a chip can jump to it). */
   onJumpToChart?: (symbol: string, timeframe: string) => void;
+  /** DALTON-HOOK(watchlist): optional personal watchlist snapshot attached only in private sessions. */
+  watchlistContext?: string | null;
 }
 
 function PanelLoading(): React.ReactElement {
@@ -292,6 +295,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     placeholder,
     onReturnToChat,
     onJumpToChart,
+    watchlistContext,
     activeWorkspaceId,
     initialThreadId,
     onSelectThread,
@@ -405,7 +409,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       : 'market_view';
   }, [symbol]);
 
-  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
+  // DALTON-HOOK(antigravity-series): attach active manual modelPickSeq when reading composer options for HITL resumes
+  const threadModelSeqRef = useRef<{ sendModel: string | null; sendModelSeq: number | null }>({ sendModel: null, sendModelSeq: null });
+  const readComposerOptions = useCallback(() => attachComposerModelPickSeq(chatInputRef.current?.getModelOptions?.(), threadModelSeqRef.current), []);
   const chat = useChatMessages(activeWorkspaceId, initialThreadId, {
     onPreviewUrl: handlePreview,
     platform: platformValue,
@@ -436,6 +442,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): personal watchlist confirmation card handlers
+    handleApproveWatchlistAction,
+    handleRejectWatchlistAction,
     handleResumeCreditPause,
     handleApproveToolCall,
     handleRejectToolCall,
@@ -470,21 +479,23 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff's turn may start on another Default than the account's.
-  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) and activeTurnModel like ChatView so shared threads skip 403 PATCH and queued sends never clear a newer unsent pick; non-Dalton keeps origin/dalton/main behavior
+  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home), activeTurnModel, and createdThreadId like ChatView
   const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
   const threadModel = useThreadModel({
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
-    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel } : {}),
+    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel, createdThreadId: chat.createdThreadId } : {}),
   });
+  threadModelSeqRef.current = threadModel;
   const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
   const threadTuning = useThreadTuning({
     threadId,
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+    ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
@@ -556,7 +567,13 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     ({ message, files, commands, modelOptions }: ComposerSend) => {
       const slashCommands = commands as SlashCommandLike[];
       const send = buildMarketSendContexts(symbol, interval, message, collectViews());
-      const contexts: Record<string, unknown>[] = [send.skill];
+      const contexts: Record<string, unknown>[] = symbol ? [send.skill] : [];
+      // DALTON-HOOK(watchlist): auto-attach personal watchlist_context ONLY in private unshared sessions
+      const cachedThreads = queryClient.getQueryData<{ threads?: Array<{ thread_id: string; is_shared?: boolean }> }>(queryKeys.threads.byWorkspace(activeWorkspaceId));
+      const activeThreadShared = Boolean(threadId && threadId !== '__default__' && cachedThreads?.threads?.find((th) => th.thread_id === threadId)?.is_shared);
+      if (watchlistContext && !teamReadOnly.isColleague && !activeThreadShared && (scope === 'all' || !(activeWorkspace as { is_shared?: boolean } | null)?.is_shared)) {
+        contexts.push({ type: 'watchlist_context', content: watchlistContext });
+      }
 
       // Skill contexts from typed slash commands (mirrors ChatView). Skip a
       // second chart-annotation context — it's always injected above.
@@ -625,7 +642,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq, watchlistContext, teamReadOnly.isColleague, scope, activeWorkspace],
   );
 
   // DALTON-HOOK(chat-attachment-count): reject capturing a new chart screenshot when already at MAX_FILES
@@ -737,6 +754,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
   const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
+  // DALTON-HOOK(watchlist): stable watchlist confirmation handlers
+  const stableApproveWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    handleApproveWatchlistAction?.(proposalData));
+  const stableRejectWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    handleRejectWatchlistAction?.(proposalData));
   const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
   const stableApproveToolCall = useStableHandler(handleApproveToolCall);
   const stableRejectToolCall = useStableHandler(handleRejectToolCall);
@@ -769,8 +791,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
   const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
+  // DALTON-HOOK(antigravity-series): forward only model and modelPickSeq on Dalton widget prompts
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
-    handleSendMessage(text, null, null, {});
+    const opts = buildWidgetPromptModelOptions(chatInputRef.current?.getModelOptions?.()?.model, threadModel);
+    handleSendMessage(text, null, null, opts);
   });
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
@@ -793,6 +817,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onRejectPTCAgent: stableRejectPTCAgent,
     onApproveSecretaryAction: stableApproveSecretaryAction,
     onRejectSecretaryAction: stableRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): expose watchlist confirmation handlers on MarketChatPanel
+    onApproveWatchlistAction: stableApproveWatchlistAction,
+    onRejectWatchlistAction: stableRejectWatchlistAction,
     onResumeCreditPause: stableResumeCreditPause,
     onApproveToolCall: stableApproveToolCall,
     onRejectToolCall: stableRejectToolCall,
@@ -812,7 +839,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
+    stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction, // DALTON-HOOK(watchlist)
+    stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
     stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, reportThreadId, // DALTON-HOOK(external-share-guard)
   ]);
@@ -1057,6 +1085,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onScopeChange={onScopeChange}
         model={threadModel.model}
         sendModel={threadModel.sendModel}
+        // DALTON-HOOK(antigravity-series): pass sendModelSeq so real ChatInput.getModelOptions() carries modelPickSeq
+        sendModelSeq={threadModel.sendModelSeq}
         // DALTON-HOOK(antigravity-series): clear local effort when switching to an Antigravity variant (aligned with ChatView)
         onPickModel={handlePickThreadModel}
         subagentsAllowed={threadSubagents.allowed}

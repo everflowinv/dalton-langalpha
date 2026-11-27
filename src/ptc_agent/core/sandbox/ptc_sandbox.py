@@ -47,6 +47,7 @@ from ptc_agent.core.sandbox.runtime import (
     RuntimeState,
     SandboxFailureKind,
     SandboxGoneError,
+    SandboxProvider,  # DALTON-HOOK(stop-backup-attach): allow passing an already-opened provider
     SandboxRuntime,
     SandboxTransientError,
 )
@@ -88,6 +89,9 @@ class PTCSandbox:
         self, config: CoreConfig, mcp_registry: MCPRegistry | None = None,
         *, resource_tier: str | None = None,
         host_unavailable_policy: HostUnavailablePolicy | None = None,
+        # DALTON-HOOK(stop-backup-attach): reuse an existing provider and optionally disable generic reconnect on temporary stop-backup attach
+        provider: SandboxProvider | None = None,
+        allow_reconnect: bool = True,
     ) -> None:
         """``mcp_registry`` may be None when reconnecting to an existing sandbox.
 
@@ -99,7 +103,9 @@ class PTCSandbox:
         self.mcp_registry = mcp_registry
 
         # Provider-based sandbox management
-        self.provider = create_provider(config)
+        # DALTON-HOOK(stop-backup-attach): avoid opening a second provider client when one is supplied
+        self.provider = provider if provider is not None else create_provider(config)
+        self._allow_reconnect = allow_reconnect
         self.runtime: SandboxRuntime | None = None
         self.sandbox_id: str | None = None
         self.tool_generator = ToolFunctionGenerator()
@@ -997,7 +1003,9 @@ class PTCSandbox:
         total_timeout: float = 120.0,
         **kwargs: Any,
     ) -> Any:
-        on_transient = self._ensure_sandbox_connected if allow_reconnect else None
+        # DALTON-HOOK(stop-backup-attach): temporary stop-backup sandbox uses existing connection only (no generic reconnect)
+        effective_reconnect = allow_reconnect and self._allow_reconnect
+        on_transient = self._ensure_sandbox_connected if effective_reconnect else None
         try:
             result = await async_retry_with_backoff(
                 func,
@@ -1005,7 +1013,7 @@ class PTCSandbox:
                 retry_policy=retry_policy,
                 is_transient=self.provider.is_transient_error,
                 on_transient=on_transient,
-                rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
+                rebind=self._make_rebinder(self.runtime) if effective_reconnect else None,
                 retries=retries,
                 initial_delay_s=initial_delay_s,
                 total_timeout=total_timeout,

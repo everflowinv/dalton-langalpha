@@ -9,9 +9,9 @@
 #   3. Create/update .env (strictly mode 0600) from .env.core.example, configuring
 #      DOMAIN, authentication mode, edge TLS mode, trusted proxy settings, and
 #      COMPOSE_FILE:
-#        - Loopback HTTP (default)  -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
-#        - Loopback internal CA     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
-#        - Loopback custom cert     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
+#        - Loopback HTTP (default)  -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
+#        - Loopback internal CA     -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
+#        - Loopback custom cert     -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
 #        - Public / LAN domain      -> DALTON_AUTH_MODE=local & VITE_DALTON_AUTH=local,
 #                                      auto / internal / custom TLS on TCP 80 & 443
 #   4. Generate all required secrets with `openssl rand -hex 32` without overwriting
@@ -720,8 +720,9 @@ count_env_key_assignments() {
 remove_env_key_all() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || return 0
-  local env_dir tmp
+  local env_dir tmp orig_mode="600"
   env_dir="$(dirname "$ENV_FILE")"
+  orig_mode="$(get_file_mode "$ENV_FILE")"
   tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
   chmod 600 "$tmp"
   awk -v k="$key" '
@@ -740,12 +741,16 @@ remove_env_key_all() {
       print $0
     }
   ' "$ENV_FILE" > "$tmp"
-  chmod 600 "$tmp"
+  chmod "$orig_mode" "$tmp"
   mv "$tmp" "$ENV_FILE"
 }
 
 append_env_key_unique() {
   local key="$1" val="$2"
+  local orig_mode="600"
+  if [[ -f "$ENV_FILE" ]]; then
+    orig_mode="$(get_file_mode "$ENV_FILE")"
+  fi
   remove_env_key_all "$key"
   local env_dir tmp
   env_dir="$(dirname "$ENV_FILE")"
@@ -755,7 +760,7 @@ append_env_key_unique() {
     cat "$ENV_FILE" > "$tmp"
   fi
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
-  chmod 600 "$tmp"
+  chmod "$orig_mode" "$tmp"
   mv "$tmp" "$ENV_FILE"
 }
 
@@ -993,7 +998,9 @@ main() {
 
   printf "\n== Configuring %s ==\n" "$ENV_FILE"
   mkdir -p "$(dirname "$ENV_FILE")"
+  local fresh_install=0
   if [[ ! -f "$ENV_FILE" ]]; then
+    fresh_install=1
     local seed_tmp
     seed_tmp="$(mktemp "$(dirname "$ENV_FILE")/.env.seed.XXXXXX")"
     chmod 600 "$seed_tmp"
@@ -1031,9 +1038,14 @@ main() {
   fi
 
   if is_loopback_domain "$domain"; then
-    write_env_key "DOMAIN" "$domain"
-    set_env_if_empty "DALTON_AUTH_MODE" "oss" || true
-    set_env_if_empty "DALTON_ALLOW_DEV_OSS_AUTH" "1" || true
+    local existing_auth_mode
+    existing_auth_mode="$(get_env_value_any "DALTON_AUTH_MODE")"
+    if [[ "$fresh_install" -eq 1 || -z "$existing_auth_mode" ]]; then
+      # Fresh Compose install behind Caddy defaults to local auth so owner requests work through edge
+      configure_public_domain_local_auth "$domain"
+    else
+      write_env_key "DOMAIN" "$domain"
+    fi
     validate_domain_for_auth "$domain"
   else
     configure_public_domain_local_auth "$domain"
@@ -1308,8 +1320,17 @@ main() {
   fi
   local compose_build_cmd="env -u VITE_DALTON_AUTH ${compose_base_cmd} build"
   local compose_start_cmd="${compose_base_cmd} up -d"
-  local vite_auth
+  local vite_auth auth_mode_cur owner_secret_cur
   vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
+  auth_mode_cur="$(get_env_value_any "DALTON_AUTH_MODE")"
+  owner_secret_cur="$(get_env_value_any "LANGALPHA_OWNER_SECRET")"
+
+  if [[ "${auth_mode_cur:-}" == "oss" && -z "${owner_secret_cur:-}" ]]; then
+    warn "Unkeyed DALTON_AUTH_MODE=oss behind the Compose Caddy 'edge' proxy rejects owner API & WebSocket requests with HTTP 401."
+    warn "Switch to local auth in .env: set DALTON_AUTH_MODE=local and VITE_DALTON_AUTH=local, remove DALTON_ALLOW_DEV_OSS_AUTH, then rebuild:"
+    warn "  env -u VITE_DALTON_AUTH ${compose_base_cmd} build backend edge && ${compose_start_cmd}"
+    warn "Then open ${public_url}/setup/admin with BOOTSTRAP_SETUP_TOKEN to create your admin account."
+  fi
 
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then

@@ -88,6 +88,8 @@ ALLOWED_HOOKS=(
   "dalton-patch-tool-calls"
   "fake-ip-allow"
   "coverage-tracking"
+  # Personal Watchlist: three-tier confirmation snapshots, checkpoint resume checks, and UI hooks
+  "watchlist"
   # LaneC: sector-layer visualization — the sidebar coverage tree, the
   # workspace-row sector/member chips, and the gallery affiliation bar all
   # read the coverage-units listing (lib/dalton/coverage.ts derivation).
@@ -99,6 +101,7 @@ ALLOWED_HOOKS=(
   "reviewer-contract"
   "workflow-as-of-default"
   "workflow-subject-kind"
+  "workflow-discovered-tools"
   "subagent-model-pin"
   "html-md-canonical"
   # One user-visible-text rule in the main agent's output guidelines and in
@@ -524,6 +527,57 @@ ALLOWED_HOOKS=(
   # PostgreSQL transaction advisory locks across messaging, automations, wakeups,
   # report-back, START before_commit, and subagent_runs.
   "maintenance-gate"
+  # BY4 prod audit fix: clear ambient ProjectContext before relayed staging uploads so path
+  # folding cannot redirect .wsfiles-relay-* into another workspace, and disable orphan sweep
+  # in unlocked _restamp_dirs (src/server/services/persistence/restore.py).
+  "by4-relay-staging-guard"
+  # Sync plugin-local sec_issuer_map.json beside dalton_sec_mcp_server.py in core sandboxes
+  # (manifest hashing, upload batch, and prune allowlist in src/ptc_agent/core/sandbox/assets.py).
+  "sec-issuer-map"
+  # Frontend fix bundle 4 (BU4): the Drive guidance an operator and a user read.
+  # langalpha-doc drive.md names the administrator's deployment switch
+  # (features.drive.enabled) before the user's own, since the first hides the
+  # second while off; and the multipart-cleanup startup warning (setup.py)
+  # names MinIO's stale_uploads_expiry beside the lifecycle rule MinIO lacks.
+  "drive-guidance"
+  # Frontend fix bundle 4 (BA4): closing the New workspace dialog puts focus back
+  # on the control that opened it. The click handler hands the dialog its own
+  # control (CreateWorkspaceHost.openDialog, AppSidebar, CommandPalette,
+  # useLocalSources, WorkspaceGallery and its GalleryActions / GalleryEmptyState
+  # prop types), and the dialog ranks that over its two guesses
+  # (CreateWorkspaceModal): Safari leaves focus where a click found it, and Voice
+  # Control, a virtual cursor and a script's click() give neither.
+  "dialog-focus-return"
+  # Frontend fix bundle 4 (AE2): a machine that finishes being prepared while
+  # Settings is open is announced when its status frame arrives. Settings mounts
+  # a page-level ComputersDialogHost with no status fan-out above it (ChatAgent
+  # brings its own), and the list polls only a spec change, so the outcome waited
+  # for the next list read. The host takes `statusFanout` for that
+  # (ComputersDialogHost, Settings.tsx).
+  "page-host-status-fanout"
+  # BY4: stop-path temporary running-only sandbox attach for session-less workers,
+  # plus skipped workspace count in stop result and logs (stop_backup.py, _lifecycle.py,
+  # _machine_backup.py, ptc_sandbox.py).
+  "stop-backup-attach"
+  # BY4: protect .wsfiles-relay-* staging files against concurrent orphan sweeps and
+  # ambient ProjectContext path folding (relay_staging_guard.py, restore.py, transfer.py).
+  "relay-staging-race"
+  # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
+  # (standalone script copied into sandboxes; cannot import src.dalton).
+  "by4-relay-guard"
+  # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
+  # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
+  "share-redaction"
+  # HF2: surface-aware safety-refusal exhaustion notice delegated to
+  # src/dalton/middleware/refusal_fallback.py (empty_call_retry.py).
+  "refusal-handling"
+  # workspace-file-storage (Batch 1)
+  "company-system-blob-key"
+  "backfill-readback-verify"
+  "workspace-file-streaming"
+  "workspace-file-write-mode"
+  "workspace-file-exclusions"
+  "workspace-file-download-ticket"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -641,6 +695,8 @@ AUDIT_EXEMPT_FILES = {
     "web/src/locales/memoPanel/zh-CN.json",
     "web/src/locales/plugins/en-US.json",
     "web/src/locales/plugins/zh-CN.json",
+    "web/src/locales/publish/en-US.json",
+    "web/src/locales/publish/zh-CN.json",
     "web/src/locales/settings/en-US.json",
     "web/src/locales/settings/zh-CN.json",
     "web/src/locales/setup/en-US.json",

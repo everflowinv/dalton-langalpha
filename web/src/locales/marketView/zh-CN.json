@@ -260,5 +260,94 @@
     "q6": "{{symbol}} 上有哪些正在形成的图表形态？",
     "q7": "{{symbol}} 相对 52 周区间表现如何？",
     "q8": "{{symbol}} 的 MACD 交叉状态如何？"
+  },
+  "watchlist": {
+    "title": "关注列表",
+    "backToWatchlist": "关注列表",
+    "searchPlaceholder": "搜索代码、名称或标签…",
+    "groupByTier": "按档分组",
+    "holdingsOnly": "仅看持仓",
+    "columnPicker": "列配置",
+    "columnPickerTitle": "显示列",
+    "tierPoliciesAction": "各档策略",
+    "resetColumns": "恢复默认",
+    "addAction": "添加关注",
+    "toggleChat": "切换右侧对话助手",
+    "chatDrawerTitle": "对话助手",
+    "chatPlaceholder": "询问当前关注列表统计、排序或调整分档…",
+    "loading": "正在加载关注列表…",
+    "loadError": "加载关注列表失败",
+    "emptyState": "个人关注列表为空，点击「添加关注」加入第一只公司。",
+    "emptyFilterState": "当前筛选条件下暂无匹配标的。",
+    "unlisted": "未上市",
+    "holdingBadge": "持仓",
+    "openWorkspace": "打开研究工作区",
+    "noWorkspaceBadge": "待建工作区",
+    "submitting": "提交中…",
+    "pendingReconcileBanner": "有 {{count}} 条后台任务同步待补齐",
+    "retryReconcile": "立即补齐",
+    "reconcileTriggered": "已触发任务同步补齐",
+    "changeTierAria": "调整 {{symbol}} 分档",
+    "removeAria": "从关注列表移除 {{symbol}}",
+    "tiers": {
+      "all": "全部",
+      "core": "核心",
+      "watch": "跟踪",
+      "radar": "雷达"
+    },
+    "columns": {
+      "symbolName": "公司 / 代码",
+      "tier": "分档",
+      "price": "最新价",
+      "chg_1d": "1D",
+      "chg_1w": "1W",
+      "chg_1m": "1M",
+      "chg_3m": "3M",
+      "chg_ytd": "YTD",
+      "chg_1y": "1Y",
+      "pe_fy1": "FY1 P/E",
+      "pe_fy2": "FY2 P/E",
+      "eps_growth_fy2": "FY2 EPS 增速",
+      "range_52w": "52W 位置",
+      "rsi_14d": "14D RSI",
+      "rsi_30d": "30D RSI",
+      "market_cap": "市值",
+      "next_earnings": "下次财报",
+      "actions": "操作"
+    },
+    "valuation": {
+      "fyEnd": "财年截止 {{date}}",
+      "source": "来源 {{provider}}",
+      "analysts": "{{count}} 位分析师",
+      "lossTooltip": "一致预期 EPS ≤ 0（亏损，市盈率无意义）",
+      "noCoverageTooltip": "暂无一致预期覆盖",
+      "unitUnverifiedTooltip": "待核对存托凭证换算比例",
+      "staleTooltip": "缓存数据已过期，正在后台刷新",
+      "staleBadge": "旧",
+      "rateLimitedTooltip": "上游数据限流（429），正在重试",
+      "rateLimitedLabel": "重试中"
+    },
+    "addModal": {
+      "title": "添加到关注列表",
+      "tickersLabel": "股票代码（逗号或空格分隔）",
+      "tickersPlaceholder": "如 NVDA, TSM, 0700.HK",
+      "tierLabel": "目标分档",
+      "submit": "添加"
+    },
+    "confirmModal": {
+      "title": "确认修改关注列表",
+      "confirm": "确认执行",
+      "affectedWorkspaces": "将同步更新 {{count}} 个研究工作区的受管任务",
+      "removeAction": "从名单移除"
+    },
+    "errors": {
+      "previewFailed": "预览失败，请稍后重试",
+      "mutateFailed": "保存失败，请稍后重试",
+      "scopeChanged": "情况已变化，请重新发起"
+    },
+    "quickQueries": {
+      "lowestRsi": "找出当前关注列表中 14D RSI 最低的 5 只股票",
+      "upcomingEarnings": "按时间列出接下来两周有财报的关注公司"
+    }
   }
 }

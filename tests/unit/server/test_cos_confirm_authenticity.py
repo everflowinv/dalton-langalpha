@@ -911,3 +911,233 @@ async def test_rejecting_expired_card_without_snapshot_preserves_reject_verdict(
     app_answer = settled_approve.hitl_response[INTERRUPT_ID]
     assert app_answer.decisions[0].type == "approve"
     assert app_answer.scope_changed is True
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_resume_guard_report_delivery_blocks_pat_oauth_computer_and_other_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AD5 r2: dalton_report_delivery_set is enforced by _verify_web_confirm_resume:
+    PAT/OAuth/computer/service tokens, channel callers, and non-initiators are rejected 403;
+    session initiator must supply the matching confirm_token (explicit reject still allowed)."""
+    from src.dalton.services.report_delivery import compute_report_delivery_confirm_token
+
+    auto_id = "33333333-3333-3333-3333-333333333333"
+    report_targets = ["feishu:chat:oc_group_1"]
+    valid_token = compute_report_delivery_confirm_token(
+        action="set",
+        caller_user_id=OWNER_ID,
+        automation_id=auto_id,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=report_targets,
+        text_targets=None,
+        failure_targets=[],
+    )
+    action_req = {
+        "type": "dalton_report_delivery_set",
+        "action": "set",
+        "automation_id": auto_id,
+        "automation_name": "Daily Filing",
+        "config_version": 3,
+        "profile": "daily-filing-alert",
+        "report_targets": report_targets,
+        "text_targets": None,
+        "failure_targets": [],
+        "confirm_token": valid_token,
+    }
+    intr = SimpleNamespace(id="intr-rd-1", value={"action_requests": [action_req]})
+    cp_tuple = SimpleNamespace(
+        config={"configurable": {"checkpoint_id": "cp-rd-1"}},
+        checkpoint={"channel_values": {}},
+        pending_writes=[("task-1", "__interrupt__", (intr,))],
+    )
+    _setup_checkpointer(monkeypatch, cp_tuple)
+
+    raw_req = _make_raw_request(headers={"sec-fetch-site": "same-origin"})
+    thread_meta = {"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID}
+
+    def _rd_resume(decision_type: str = "approve", token: str | None = valid_token, **extra: Any) -> ChatRequest:
+        dec = HITLDecision(type=decision_type, confirm_token=token)  # type: ignore[arg-type]
+        return ChatRequest(
+            messages=[],
+            hitl_response={"intr-rd-1": HITLResponse(decisions=[dec])},
+            **extra,
+        )
+
+    with (
+        patch("src.dalton.settings.get_dalton_auth_mode", return_value="local"),
+        patch("src.dalton.auth.is_dalton_supabase_auth_enabled", return_value=False),
+    ):
+        # 1. PAT / OAuth / computer / service tokens with valid confirm_token are ALL refused 403.
+        for bad_auth in ("pat", "oauth", "computer", "service"):
+            with pytest.raises(HTTPException) as exc:
+                await settle_resume_request(
+                    THREAD_ID,
+                    _rd_resume("approve", valid_token),
+                    principal=Principal(user_id=OWNER_ID, auth=bad_auth),  # type: ignore[arg-type]
+                    raw_request=raw_req,
+                    thread_meta=thread_meta,
+                )
+            assert exc.value.status_code == 403
+            assert exc.value.detail["code"] == "web_session_required"
+
+        # 2. Channel surface (platform) refused 403.
+        with pytest.raises(HTTPException) as exc_ch:
+            await settle_resume_request(
+                THREAD_ID,
+                _rd_resume("approve", valid_token, platform="feishu"),
+                principal=Principal(user_id=OWNER_ID, auth="session"),
+                raw_request=raw_req,
+                thread_meta=thread_meta,
+            )
+        assert exc_ch.value.status_code == 403
+        assert exc_ch.value.detail["code"] == "web_session_required"
+
+        # 3. Non-initiator web session refused 403.
+        with pytest.raises(HTTPException) as exc_other:
+            await settle_resume_request(
+                THREAD_ID,
+                _rd_resume("approve", valid_token),
+                principal=Principal(user_id=OTHER_ID, auth="session"),
+                raw_request=raw_req,
+                thread_meta=thread_meta,
+            )
+        assert exc_other.value.status_code == 403
+        assert exc_other.value.detail["code"] == "confirm_initiator_mismatch"
+
+        # 4. Initiator web session with wrong/missing confirm_token refused 403.
+        for bad_tok in (None, "wrong-token"):
+            with pytest.raises(HTTPException) as exc_tok:
+                await settle_resume_request(
+                    THREAD_ID,
+                    _rd_resume("approve", bad_tok),
+                    principal=Principal(user_id=OWNER_ID, auth="session"),
+                    raw_request=raw_req,
+                    thread_meta=thread_meta,
+                )
+            assert exc_tok.value.status_code == 403
+            assert exc_tok.value.detail["code"] == "confirm_token_mismatch"
+
+        # 5. Initiator web session with matching confirm_token succeeds.
+        settled_ok = await settle_resume_request(
+            THREAD_ID,
+            _rd_resume("approve", valid_token),
+            principal=Principal(user_id=OWNER_ID, auth="session"),
+            raw_request=raw_req,
+            thread_meta=thread_meta,
+        )
+        assert settled_ok.hitl_response is not None
+        assert settled_ok.hitl_response["intr-rd-1"].decisions[0].confirm_token == valid_token
+
+        # 6. Initiator web session explicit reject succeeds without token.
+        settled_rej = await settle_resume_request(
+            THREAD_ID,
+            _rd_resume("reject", None),
+            principal=Principal(user_id=OWNER_ID, auth="session"),
+            raw_request=raw_req,
+            thread_meta=thread_meta,
+        )
+        assert settled_rej.hitl_response is not None
+        assert settled_rej.hitl_response["intr-rd-1"].decisions[0].type == "reject"
+
+
+@pytest.mark.asyncio
+async def test_ad5_r3_passwordless_oss_rejects_report_delivery_approval_and_delegates_to_dalton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AD5 r3: passwordless OSS fallback (no LANGALPHA_OWNER_SECRET) refuses AD5 HITL approval
+    with a message prompting the admin to enable login; owner-secret HMAC passes; AD5 token logic
+    lives in src.dalton rather than inline in checkpoint_handler."""
+    from src.dalton.services.report_delivery import compute_report_delivery_confirm_token
+
+    assert not hasattr(checkpoint_handler, "_verify_report_delivery_interrupt_answer")
+    assert not hasattr(checkpoint_handler, "_extract_answer_confirm_token")
+
+    auto_id = "33333333-3333-3333-3333-333333333333"
+    report_targets = ["feishu:chat:oc_group_1"]
+    valid_token = compute_report_delivery_confirm_token(
+        action="set",
+        caller_user_id=OWNER_ID,
+        automation_id=auto_id,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=report_targets,
+        text_targets=None,
+        failure_targets=[],
+    )
+    action_req = {
+        "type": "dalton_report_delivery_set",
+        "action": "set",
+        "automation_id": auto_id,
+        "automation_name": "Daily Filing",
+        "config_version": 3,
+        "profile": "daily-filing-alert",
+        "report_targets": report_targets,
+        "text_targets": None,
+        "failure_targets": [],
+        "confirm_token": valid_token,
+    }
+    intr = SimpleNamespace(id="intr-rd-oss", value={"action_requests": [action_req]})
+    cp_tuple = SimpleNamespace(
+        config={"configurable": {"checkpoint_id": "cp-rd-oss"}},
+        checkpoint={"channel_values": {}},
+        pending_writes=[("task-1", "__interrupt__", (intr,))],
+    )
+    _setup_checkpointer(monkeypatch, cp_tuple)
+    _set_auth_mode(monkeypatch, "oss")
+    monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+
+    thread_meta = {"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID}
+    approve_req = ChatRequest(
+        messages=[],
+        hitl_response={
+            "intr-rd-oss": HITLResponse(
+                decisions=[HITLDecision(type="approve", confirm_token=valid_token)]  # type: ignore[arg-type]
+            )
+        },
+    )
+    reject_req = ChatRequest(
+        messages=[],
+        hitl_response={
+            "intr-rd-oss": HITLResponse(decisions=[HITLDecision(type="reject")])
+        },
+    )
+
+    # Passwordless OSS fallback (no LANGALPHA_OWNER_SECRET) -> ALWAYS refused 403 on approve.
+    with pytest.raises(HTTPException) as exc_oss:
+        await settle_resume_request(
+            THREAD_ID,
+            approve_req,
+            principal=Principal(user_id=OWNER_ID, auth="session"),
+            raw_request=_make_raw_request(headers={"sec-fetch-site": "same-origin"}),
+            thread_meta=thread_meta,
+        )
+    assert exc_oss.value.status_code == 403
+    assert exc_oss.value.detail["code"] == "web_session_required"
+    assert "启用登录" in exc_oss.value.detail["message"]
+
+    # Explicit reject still succeeds so a pending card can be dismissed cleanly.
+    settled_rej = await settle_resume_request(
+        THREAD_ID,
+        reject_req,
+        principal=Principal(user_id=OWNER_ID, auth="session"),
+        raw_request=_make_raw_request(headers={"sec-fetch-site": "same-origin"}),
+        thread_meta=thread_meta,
+    )
+    assert settled_rej.hitl_response is not None
+    assert settled_rej.hitl_response["intr-rd-oss"].decisions[0].type == "reject"
+
+    # Desktop app with LANGALPHA_OWNER_SECRET + valid x-langalpha-owner HMAC header succeeds.
+    monkeypatch.setenv("LANGALPHA_OWNER_SECRET", "desktop-owner-secret-123")
+    settled_desktop = await settle_resume_request(
+        THREAD_ID,
+        approve_req,
+        principal=Principal(user_id=OWNER_ID, auth="session"),
+        raw_request=_make_raw_request(
+            headers={"x-langalpha-owner": "desktop-owner-secret-123"}
+        ),
+        thread_meta=thread_meta,
+    )
+    assert settled_desktop.hitl_response is not None
+    assert settled_desktop.hitl_response["intr-rd-oss"].decisions[0].confirm_token == valid_token

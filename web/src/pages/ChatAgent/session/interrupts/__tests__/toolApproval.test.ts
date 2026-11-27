@@ -222,6 +222,14 @@ describe('live projection', () => {
         click: { approved: true as const },
         expectedDecision: { type: 'approve', confirm_token: 'tok-test-789' },
       },
+      {
+        type: 'dalton_report_delivery_set',
+        name: '确认报告投递配置',
+        args: { 任务: 'Chao Daily Filing', 报告目标: ['Research Group 1'] },
+        confirm_token: 'tok-report-delivery-999',
+        click: { approved: true as const },
+        expectedDecision: { type: 'approve', confirm_token: 'tok-report-delivery-999' },
+      },
     ];
 
     for (const item of cases) {

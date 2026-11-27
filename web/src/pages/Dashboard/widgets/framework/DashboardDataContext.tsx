@@ -2,6 +2,8 @@ import { createContext, useContext, useMemo, useCallback, useState } from 'react
 import type { ReactNode } from 'react';
 import { useDashboardData } from '../../hooks/useDashboardData';
 import { useWatchlistData } from '../../hooks/useWatchlistData';
+// DALTON-HOOK(watchlist): expose personal coverage watchlist data (capped at 50 live quotes) on Dashboard context
+import { useCoverageWatchlistData } from '../../hooks/useCoverageWatchlistData';
 import { usePortfolioData } from '../../hooks/usePortfolioData';
 import { useTickerNews } from '../../hooks/useTickerNews';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
@@ -15,6 +17,7 @@ export interface DeleteConfirmState {
 
 type DashboardData = ReturnType<typeof useDashboardData>;
 type WatchlistData = ReturnType<typeof useWatchlistData>;
+type CoverageWatchlistData = ReturnType<typeof useCoverageWatchlistData>;
 type PortfolioData = ReturnType<typeof usePortfolioData>;
 type TickerNews = ReturnType<typeof useTickerNews>;
 
@@ -57,6 +60,8 @@ interface ModalActions {
 
 export interface DashboardDataContextValue {
   dashboard: DashboardData;
+  // DALTON-HOOK(watchlist): personal three-tier watchlist data for the PortfolioWatchlistWidget coverage tab
+  coverage?: CoverageWatchlistData;
   watchlist: WatchlistData;
   portfolio: PortfolioData;
   portfolioNews: TickerNews;
@@ -77,6 +82,8 @@ const Ctx = createContext<DashboardDataContextValue | null>(null);
 
 export function DashboardDataProvider({ children }: { children: ReactNode }) {
   const dashboard = useDashboardData();
+  // DALTON-HOOK(watchlist): load personal coverage watchlist (<=50 live quotes)
+  const coverage = useCoverageWatchlistData();
   const watchlist = useWatchlistData();
   const portfolio = usePortfolioData();
   const portfolioNews = useTickerNews(portfolio.rows, 'portfolio', 'tickertick');
@@ -168,6 +175,7 @@ export function DashboardDataProvider({ children }: { children: ReactNode }) {
   const value = useMemo<DashboardDataContextValue>(
     () => ({
       dashboard,
+      coverage,
       watchlist,
       portfolio,
       portfolioNews,
@@ -178,6 +186,7 @@ export function DashboardDataProvider({ children }: { children: ReactNode }) {
     }),
     [
       dashboard,
+      coverage,
       watchlist,
       portfolio,
       portfolioNews,

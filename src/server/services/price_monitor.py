@@ -675,6 +675,8 @@ class PriceMonitorService:
         # every thread once one named none.
         self._targets_reload_threads: set[str] = set()
         self._targets_full_reload = False
+        # DALTON-HOOK(watchlist): track pending price-automation reload requests
+        self._automations_reload_requested = False
 
     @property
     def _monitored_listings(self) -> set[Listing]:
@@ -1094,6 +1096,12 @@ class PriceMonitorService:
             self._targets_reload_threads.add(thread)
         self._targets_reload_requested.set()
 
+    # DALTON-HOOK(watchlist): allow local & cross-process nudges to reload price automations promptly
+    def request_automations_reload(self) -> None:
+        """Ask for a prompt debounced reload of active price automations."""
+        self._automations_reload_requested = True
+        self._targets_reload_requested.set()
+
     async def _target_reload_loop(self) -> None:
         """Coalesce a burst of change nudges, several targets set in one turn,
         into one re-read of the threads they name."""
@@ -1102,13 +1110,22 @@ class PriceMonitorService:
             await asyncio.sleep(_TARGET_RELOAD_DEBOUNCE)
             self._targets_reload_requested.clear()
             full, threads = self._targets_full_reload, self._targets_reload_threads
+            reload_autos = self._automations_reload_requested
             self._targets_full_reload, self._targets_reload_threads = False, set()
+            self._automations_reload_requested = False
             if self._shutdown_event.is_set():
                 return
-            try:
-                await self._load_targets(None if full else threads)
-            except Exception:
-                logger.error("[PriceMonitor] Target reload failed", exc_info=True)
+            if full or threads:
+                try:
+                    await self._load_targets(None if full else threads)
+                except Exception:
+                    logger.error("[PriceMonitor] Target reload failed", exc_info=True)
+            # DALTON-HOOK(watchlist): reload active price automations when nudged
+            if reload_autos:
+                try:
+                    await self._load_automations()
+                except Exception:
+                    logger.error("[PriceMonitor] Automation reload failed", exc_info=True)
 
     async def _target_signal_loop(self) -> None:
         """Turn change nudges from any worker into a prompt reload here.
@@ -1134,7 +1151,10 @@ class PriceMonitorService:
                             ignore_subscribe_messages=True, timeout=_TARGET_SIGNAL_POLL
                         )
                         if msg and msg.get("type") == "message":
-                            self.request_targets_reload(msg.get("data"))
+                            # DALTON-HOOK(watchlist): route automation reload vs target reload signal
+                            from src.dalton.watchlist.privacy import dispatch_price_monitor_signal
+
+                            dispatch_price_monitor_signal(self, msg.get("data"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

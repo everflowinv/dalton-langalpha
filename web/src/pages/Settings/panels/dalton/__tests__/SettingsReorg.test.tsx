@@ -303,8 +303,12 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     expect(sectionShown('teamMembers', { callerTier: 'internal' })).toBe(true);
     expect(sectionShown('teamMembers', { callerTier: 'external' })).toBe(false);
     expect(sectionShown('teamChannels', { callerTier: null })).toBe(false);
-    expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: false })).toBe(false);
+    // Coverage section is always visible for personal tier policies; team coverage units card is gated inside by colleague_sharing + coverageUnitsEnabled.
+    expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: false })).toBe(true);
     expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: true })).toBe(true);
+    const covWithoutUnits = searchableSettings(false, { callerTier: 'internal', coverageUnitsEnabled: false }).map((s) => s.anchor);
+    expect(covWithoutUnits).toContain('dalton-tier-policies');
+    expect(covWithoutUnits).not.toContain('dalton-coverage');
 
     const internalSearch = searchableSettings(false, { callerTier: 'internal' }).map((s) => s.anchor);
     expect(internalSearch).not.toContain('dalton-providers');
@@ -426,7 +430,9 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     renderSettings('/settings?tab=teamMembers');
 
     const banner = await screen.findByTestId('settings-permission-denied');
-    expect(banner).toHaveTextContent(/Everflow 团队版|Everflow Team Edition/);
+    // The notice names the build's brand (SettingsAuthOnlyBrand.test.tsx pins
+    // that), so only its own words are matched here.
+    expect(banner).toHaveTextContent(/团队版提供|Team Edition/);
     expect(banner).not.toHaveTextContent(/Team member permission required|需要团队成员权限/);
     await waitFor(() => {
       expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=account');

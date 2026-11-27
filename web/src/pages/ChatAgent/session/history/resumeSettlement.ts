@@ -147,9 +147,10 @@ export function settleResumedInterrupts(
   }
 
   // --- DALTON-HOOK(cos-settings-tools): begin ---
-  // Settle create_workspace cards whose interrupt was already consumed by a
-  // resume turn so a reload while submitting shows "submitting" (never
-  // clickable pending buttons) until tool_call_result finalizes the outcome.
+  // Settle create_workspace and archive_workspace cards whose interrupt was
+  // already consumed by a resume turn so a reload while submitting shows
+  // "submitting" (never clickable pending buttons) until tool_call_result
+  // finalizes the outcome.
   {
     const resumedIds = event.metadata?.hitl_interrupt_ids as string[] | undefined;
     const hitlAnswers = event.metadata?.hitl_answers as Record<string, unknown> | undefined;
@@ -159,7 +160,13 @@ export function settleResumedInterrupts(
       for (const interruptId of resumedIds) {
         const idx = pendingHistoryInterrupts.findIndex(
           (p) =>
-            p.type === 'create_workspace'
+            (p.type === 'create_workspace'
+              || p.type === 'archive_workspace'
+              // DALTON-HOOK(watchlist): transition personal watchlist cards to submitting/rejected during mid-resume history replay
+              || p.type === 'watchlist_batch_add'
+              || p.type === 'watchlist_set_tier'
+              || p.type === 'watchlist_remove'
+              || p.type === 'watchlist_tier_policy')
             && p.interruptId === interruptId
             && !!p.toolCallId,
         );
@@ -167,10 +174,15 @@ export function settleResumedInterrupts(
         const [matched] = pendingHistoryInterrupts.splice(idx, 1);
         const answer = hitlAnswers ? hitlAnswers[interruptId] : undefined;
         const rejected = answer === null || (answer === undefined && !!content && !batched);
+        const targetBucket = matched.type === 'create_workspace'
+          ? 'workspaceProposals'
+          : matched.type === 'archive_workspace'
+            ? 'secretaryActionProposals'
+            : 'watchlistProposals';
         rt.setMessages((prev) =>
           setCardStatus(
             prev,
-            'workspaceProposals',
+            targetBucket,
             matched.proposalId!,
             rejected ? 'rejected' : 'submitting',
           ),

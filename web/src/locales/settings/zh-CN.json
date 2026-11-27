@@ -714,6 +714,73 @@
     "feishuGroupsDesc": "查看已添加 Dalton 机器人的飞书群聊及可推送状态。",
     "discordChannelsLabel": "Discord 频道",
     "discordChannelsDesc": "登记可接收自动化群报告的 Discord 服务器文字频道。",
+    "tierPoliciesLabel": "各档监控策略",
+    "tierPoliciesDesc": "独立配置核心、跟踪与雷达三档默认运行的盘中盯盘、论点增量、涨跌异动快评与财报写稿任务及频率。",
+    "tierPolicies": {
+      "tiers": {
+        "core": "核心 (Core)",
+        "watch": "跟踪 (Watch)",
+        "radar": "雷达 (Radar)"
+      },
+      "unsavedBadge": "未保存更改",
+      "effectiveScopeHint": "仅对本人已有研究工作区的公司生效；财报日历对三档全部上市股票生效。",
+      "customCronOption": "自定义（高级 Cron）",
+      "advancedCron": "高级 Cron",
+      "saveChanges": "保存更改",
+      "saving": "保存中…",
+      "previewing": "正在校验并预览…",
+      "resetDefault": "恢复默认",
+      "saveSuccess": "各档监控策略已更新并同步至受影响工作区。",
+      "resetSuccess": "已恢复该档默认监控策略并同步至受影响工作区。",
+      "partialSaved": "策略已保存，部分工作区任务同步待补齐。",
+      "retryReconcile": "立即补齐",
+      "reconcileDone": "剩余工作区任务已全部补齐同步。",
+      "watch": {
+        "title": "盘中盯盘",
+        "desc": "按标的市场时区（美股纽约时间 / 中港股北京时间）定时巡检盘中动态。",
+        "presetLabel": "盘中盯盘频率预设",
+        "cronInputAria": "盘中盯盘 5 段 Cron 表达式",
+        "dstHint": "5 段标准 Cron（定时时间表达式），服务端按市场时区与夏令时校验相邻触发间隔 ≥ 30 分钟。"
+      },
+      "delta": {
+        "title": "论点增量（Thesis Delta）",
+        "desc": "定时梳理最新研究变化、新闻与一致预期修正并更新论点增量。",
+        "presetLabel": "论点增量频率预设",
+        "cronInputAria": "论点增量 5 段 Cron 表达式",
+        "timezoneAria": "论点增量生效时区",
+        "dstHint": "5 段标准 Cron，按所选时区及夏令时校验每日最多触发 1 次且相邻间隔 ≥ 23 小时。"
+      },
+      "move": {
+        "title": "涨跌异动快评",
+        "desc": "当日涨跌幅达到设定阈值时自动生成异动归因快评（24 小时冷却）。",
+        "thresholdAria": "异动涨跌幅阈值（百分比）"
+      },
+      "earnings": {
+        "title": "财报自动写稿",
+        "desc": "选择财报日历为该档公司自动排期的写稿阶段；全部取消时仅展示财报日期。",
+        "stages": {
+          "tm3": "T-3 财报前瞻",
+          "t0": "T0 财报快评",
+          "tp1": "T+1 电话会总结"
+        }
+      },
+      "confirmModal": {
+        "title": "确认更新分档监控策略",
+        "impactSummary": "覆盖该档 {{companies}} 家公司，将同步 {{workspaces}} 个已有研究工作区的受管任务。",
+        "overrideUserPause": "同时恢复我手动暂停的同类型任务",
+        "confirm": "确认保存",
+        "refreshPreview": "刷新预览"
+      },
+      "errors": {
+        "loadFailed": "加载各档监控策略失败",
+        "previewFailed": "策略校验或预览失败，请检查表达式后重试",
+        "saveFailed": "保存策略失败，请稍后重试",
+        "scopeChanged": "情况已变化，请重新发起",
+        "invalidWatchCron": "盘中盯盘 Cron 必须为 5 段标准表达式。",
+        "invalidDeltaCron": "论点增量 Cron 必须为 5 段标准表达式。",
+        "invalidThreshold": "异动涨跌幅阈值须介于 1.0% 至 30.0% 之间。"
+      }
+    },
     "coverageLabel": "覆盖结构管理",
     "coverageDesc": "登记行业或独立公司覆盖单元，将你的工作区绑定至对应单元。",
     "teamCatalogLabel": "团队模型目录",
@@ -1018,5 +1085,5 @@
     "goToTeamModels": "前往团队模型配置",
     "statusUnavailable": "团队凭据状态暂时读取不到，请稍后刷新"
   },
-  "daltonAuthOnly": "此页面仅在 Everflow 团队版提供"
+  "daltonAuthOnly": "此页面仅在 {{brand}} 团队版提供"
 }

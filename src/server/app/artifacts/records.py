@@ -341,6 +341,11 @@ async def update_artifact(
         # DALTON-HOOK(monitors): enabling keep_updated on a publicly shared
         # artifact auto-publishes public content and requires an active admin.
         await _require_admin_for_public_publish(x_user_id)
+    if body.keep_updated:
+        # DALTON-HOOK(monitors): refuse enabling legacy keep_updated once managed by shared documents
+        from src.dalton.monitors.shared_documents import refuse_keep_updated_if_managed_by_shared_document
+
+        await refuse_keep_updated_if_managed_by_shared_document(current.artifact_id, entry_path=current.path)
     if current.shared:
         # Each later version a kept-updated link cuts reaches its visitors.
         await refuse_link_change(access)

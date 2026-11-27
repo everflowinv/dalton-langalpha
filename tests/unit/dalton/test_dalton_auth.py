@@ -67,28 +67,40 @@ def _make_jwt(
     )
 
 
-def _make_request(headers: dict[str, str] | None = None) -> Request:
+def _make_request(
+    headers: dict[str, str] | None = None,
+    *,
+    client: tuple[str, int] | None = None,
+) -> Request:
     req = create_autospec(Request, instance=True)
     req.__len__.return_value = 1
     req.headers = Headers(headers or {})
-    req.scope = {
+    scope: dict[str, Any] = {
         "type": "http",
         "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()],
     }
+    if client is not None:
+        scope["client"] = client
+    req.scope = scope
     return req
 
 
 def _make_websocket(
     headers: dict[str, str] | None = None,
     query: dict[str, str] | None = None,
+    *,
+    client: tuple[str, int] | None = None,
 ) -> WebSocket:
     ws = create_autospec(WebSocket, instance=True)
     ws.headers = Headers(headers or {})
     ws.query_params = QueryParams(query or {})
-    ws.scope = {
+    scope: dict[str, Any] = {
         "type": "websocket",
         "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()],
     }
+    if client is not None:
+        scope["client"] = client
+    ws.scope = scope
     return ws
 
 
@@ -148,8 +160,12 @@ class TestSwitchOffPreservesOssBehavior:
         monkeypatch.setattr(jwt_bearer, "HOST_MODE", "oss")
         monkeypatch.setattr(api_utils, "HOST_MODE", "oss")
 
-        req = _make_request()
-        ws = _make_websocket()
+        req = _make_request(
+            headers={"Host": "localhost:8000"}, client=("127.0.0.1", 54321)
+        )
+        ws = _make_websocket(
+            headers={"Host": "localhost:8000"}, client=("127.0.0.1", 54322)
+        )
 
         assert await verify_jwt_token(request=req, credentials=None) == LOCAL_DEV_USER_ID
         auth_info = await get_current_auth_info(request=req, credentials=None)
@@ -157,6 +173,22 @@ class TestSwitchOffPreservesOssBehavior:
         assert await get_current_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
         assert await get_optional_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
         assert await authenticate_websocket(ws) == LOCAL_DEV_USER_ID
+
+        # Negative: remote/untrusted unkeyed OSS requests MUST still be rejected (401 / WS 1008)
+        remote_req = _make_request(
+            headers={"Host": "app.example.com"}, client=("203.0.113.10", 54321)
+        )
+        remote_ws = _make_websocket(
+            headers={"Host": "app.example.com"}, client=("203.0.113.10", 54322)
+        )
+        with pytest.raises(HTTPException) as exc_remote:
+            await verify_jwt_token(request=remote_req, credentials=None)
+        assert exc_remote.value.status_code == 401
+        with pytest.raises(HTTPException) as exc_remote_uid:
+            await get_current_user_id(request=remote_req, credentials=None)
+        assert exc_remote_uid.value.status_code == 401
+        with pytest.raises(WebSocketException):
+            await authenticate_websocket(remote_ws)
 
     @pytest.mark.asyncio
     async def test_auth_sync_preserves_legacy_email_migration_when_switch_off(
@@ -310,12 +342,22 @@ class TestSwitchOnDaltonSupabaseAuth:
             _owner_only(_make_request())
         assert exc_dalton_unset.value.status_code == 403
 
-        # Pure upstream OSS (Dalton disabled + oss auth mode) restores upstream self_hosted().
+        # Pure upstream OSS (Dalton disabled + oss auth mode) restores upstream self_hosted()
+        # for trusted loopback owners while rejecting remote/untrusted requests (401).
         monkeypatch.setenv("APP_ENV", "")
         monkeypatch.setenv("DALTON_ENABLED", "0")
         monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
         assert self_hosted() is True
-        _owner_only(_make_request())
+        _owner_only(
+            _make_request(headers={"Host": "localhost:8000"}, client=("127.0.0.1", 54321))
+        )
+        with pytest.raises(HTTPException) as exc_remote_oss:
+            _owner_only(
+                _make_request(
+                    headers={"Host": "app.example.com"}, client=("203.0.113.10", 54321)
+                )
+            )
+        assert exc_remote_oss.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_invalid_token_returns_401(

@@ -21,7 +21,6 @@ from src.dalton.autonomy.tracking import (
     resync_delta_schedule,
     set_tier_and_resync,
 )
-from src.dalton.coverage import set_user_coverage_tier
 from tests.unit.dalton.test_tracking import _install_fake_automation_store
 
 TRACKER_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -198,7 +197,12 @@ async def test_blank_marker_still_reenables_the_delta(
         ticker=TICKER,
         initial_rows=[delta],
     )
-    result = await enable_tracking(USER, WORKSPACE, force=True)
+    result = await enable_tracking(
+        USER,
+        WORKSPACE,
+        force=True,
+        override_pause_versions={"auto-delta": int(delta.get("config_version") or 1)},
+    )
     assert result["status"] == "enabled"
     assert "delta_replaced_by_tracker" not in result
     stored = _by_name(ctx["store"])["dalton-nvda-delta"]
@@ -292,32 +296,40 @@ async def test_set_tier_resync_skips_a_marked_delta(monkeypatch: pytest.MonkeyPa
     frozen = deepcopy(delta)
     updates_before = ctx["mock_update"].await_count
 
-    def _fake_set(user_id: str, tickers: Any, tier: str) -> dict[str, Any]:
-        assert user_id == USER
-        assert list(tickers) == [TICKER]
-        return {"ok": True, "updated_tickers": [TICKER], "tier": tier}
-
-    monkeypatch.setattr(
-        tracking_mod,
-        "set_user_coverage_tier",
-        create_autospec(set_user_coverage_tier, side_effect=_fake_set),
-    )
-    result = await set_tier_and_resync(USER, [TICKER], "core")
-    assert result["delta_schedule"] == [
-        {
-            "ok": True,
-            "updated": False,
-            "reason": "replaced_by_tracker",
-            "user_id": USER,
-            "ticker": TICKER,
-            "tier": "core",
-            "name": "dalton-nvda-delta",
-        }
-    ]
+    res_direct = await resync_delta_schedule(USER, TICKER, tier="core")
+    assert res_direct == {
+        "ok": True,
+        "updated": False,
+        "reason": "replaced_by_tracker",
+        "user_id": USER,
+        "ticker": TICKER,
+        "tier": "core",
+        "name": "dalton-nvda-delta",
+    }
     assert delta["status"] == frozen["status"]
     assert delta["cron_expression"] == frozen["cron_expression"]
     assert delta["metadata"] == frozen["metadata"]
     assert ctx["mock_update"].await_count == updates_before
+
+    # Item 5: set_tier_and_resync delegates to WatchlistMutationService
+    from src.dalton.watchlist import service as wl_service_mod
+
+    async def _fake_exec(self: Any, user_id: str, **kwargs: Any) -> dict[str, Any]:
+        _ = self
+        assert user_id == USER
+        assert kwargs["action"] == "set_tier"
+        assert list(kwargs["tickers"]) == [TICKER]
+        return {"ok": True, "updated_tickers": [TICKER], "tier": kwargs["tier"]}
+
+    monkeypatch.setattr(
+        wl_service_mod.WatchlistMutationService,
+        "execute_mutation",
+        create_autospec(wl_service_mod.WatchlistMutationService.execute_mutation, side_effect=_fake_exec),
+    )
+    result = await set_tier_and_resync(USER, [TICKER], "core")
+    assert result["ok"] is True
+    assert result["updated_tickers"] == [TICKER]
+    assert result["tier"] == "core"
 
 
 @pytest.mark.asyncio

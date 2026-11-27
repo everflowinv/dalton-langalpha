@@ -632,6 +632,73 @@
     "feishuGroupsDesc": "View Feishu group chats that include the Dalton bot and support team notifications.",
     "discordChannelsLabel": "Discord channels",
     "discordChannelsDesc": "Register Discord guild text channels to receive automated group reports.",
+    "tierPoliciesLabel": "Tier monitoring policies",
+    "tierPoliciesDesc": "Configure which background tasks (Intraday Watch, Thesis Delta, Price Move Alert, Earnings Brief) and schedules run for Core, Watch, and Radar tiers.",
+    "tierPolicies": {
+      "tiers": {
+        "core": "Core",
+        "watch": "Watch",
+        "radar": "Radar"
+      },
+      "unsavedBadge": "Unsaved changes",
+      "effectiveScopeHint": "Applies to your companies with existing research workspaces; earnings calendar applies to all listed symbols immediately.",
+      "customCronOption": "Custom (Advanced Cron)",
+      "advancedCron": "Advanced Cron",
+      "saveChanges": "Save changes",
+      "saving": "Saving…",
+      "previewing": "Validating & previewing…",
+      "resetDefault": "Reset to default",
+      "saveSuccess": "Tier monitoring policy saved and reconciled across affected workspaces.",
+      "resetSuccess": "Tier policy reset to default and reconciled across affected workspaces.",
+      "partialSaved": "Policy saved; some workspace task syncs are still pending.",
+      "retryReconcile": "Sync now",
+      "reconcileDone": "Remaining workspace task syncs completed.",
+      "watch": {
+        "title": "Intraday Watch",
+        "desc": "Periodic intraday checks running in each security's market timezone (New York / Shanghai).",
+        "presetLabel": "Intraday watch schedule preset",
+        "cronInputAria": "Intraday watch 5-field cron expression",
+        "dstHint": "Standard 5-field cron; server validates ≥ 30 min interval across market timezones including DST transitions."
+      },
+      "delta": {
+        "title": "Thesis Delta",
+        "desc": "Scheduled digest of thesis developments, news, and consensus revisions.",
+        "presetLabel": "Thesis delta schedule preset",
+        "cronInputAria": "Thesis delta 5-field cron expression",
+        "timezoneAria": "Thesis delta timezone",
+        "dstHint": "Standard 5-field cron; DST-aware validation enforces max 1 run/local day and ≥ 23 h interval."
+      },
+      "move": {
+        "title": "Price Move Alert",
+        "desc": "Trigger rapid attribution commentary when intraday move reaches the threshold (24 h cooldown).",
+        "thresholdAria": "Price move threshold percentage"
+      },
+      "earnings": {
+        "title": "Earnings Auto-Write",
+        "desc": "Select which earnings calendar stages auto-schedule reports; uncheck all for calendar dates only.",
+        "stages": {
+          "tm3": "T-3 Preview",
+          "t0": "T0 Flash Note",
+          "tp1": "T+1 Call Recap"
+        }
+      },
+      "confirmModal": {
+        "title": "Confirm tier monitoring policy",
+        "impactSummary": "Covers {{companies}} company(ies) in this tier and updates managed automations across {{workspaces}} workspace(s).",
+        "overrideUserPause": "Also resume tasks I previously paused manually",
+        "confirm": "Confirm & save",
+        "refreshPreview": "Refresh preview"
+      },
+      "errors": {
+        "loadFailed": "Failed to load tier monitoring policies",
+        "previewFailed": "Policy validation or preview failed",
+        "saveFailed": "Failed to save tier policy",
+        "scopeChanged": "State changed since preview. Please refresh and confirm again.",
+        "invalidWatchCron": "Intraday watch cron must be a 5-field expression.",
+        "invalidDeltaCron": "Thesis delta cron must be a 5-field expression.",
+        "invalidThreshold": "Price move threshold must be between 1.0% and 30.0%."
+      }
+    },
     "coverageLabel": "Coverage structure",
     "coverageDesc": "Register sector or company coverage units and bind your workspaces.",
     "teamCatalogLabel": "Team model catalog",
@@ -936,5 +1003,5 @@
     "goToTeamModels": "Go to team model settings",
     "statusUnavailable": "Could not load team credentials status right now. Refresh to try again."
   },
-  "daltonAuthOnly": "This page is only available in Everflow Team Edition."
+  "daltonAuthOnly": "This page is only available in {{brand}} Team Edition."
 }

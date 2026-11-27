@@ -2077,6 +2077,7 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     # #666 moved the file-share enable side onto the artifact routes; the
     # external-member gate travels with it (publish / keep_updated=True / left-out).
     from src.dalton import access_tiers as dalton_access_tiers
+    from src.dalton.monitors import shared_documents as shared_doc_service
     from src.server.app.artifacts import records as artifact_records_app
     from src.server.app.artifacts.models import (
         KeepUpdatedRequest,
@@ -2143,6 +2144,14 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         create_autospec(
             artifacts_db.get_artifact,
             side_effect=lambda aid, *, user_id: artifacts_by_id.get(aid),
+        ),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_shared_document_by_artifact_id",
+        create_autospec(
+            shared_doc_service.get_shared_document_by_artifact_id,
+            return_value=None,
         ),
     )
 

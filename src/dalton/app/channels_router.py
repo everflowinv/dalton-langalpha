@@ -6,13 +6,14 @@ Mounted under `/api/v1/dalton` via `src/dalton/app/router.py`.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,6 +40,7 @@ from src.dalton.database.channel_gateway import (
     recover_channel_state,
     register_and_resolve_inbound,
     register_automation_run,
+    resolve_authorized_automation_run_platforms,
     update_delivery_progress,
     update_inbound_progress,
     update_user_channel_settings,
@@ -46,8 +48,9 @@ from src.dalton.database.channel_gateway import (
 )
 from src.dalton.database import weixin_multi_account as wx_db
 from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
+from src.dalton import channel_action_tokens as cat_svc
 from src.dalton.settings import redact_weixin_secrets
-from src.server.utils.api import CurrentUserId
+from src.server.utils.api import CurrentUserId, ServiceUserId
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +236,7 @@ class PreflightSendRequest(BaseModel):
 
 class VerifyDmRecipientRequest(BaseModel):
     delivery_attempt: int | None = None
+    resolved_recipient_id: str | None = None
 
 
 class TopicsLookupRequest(BaseModel):
@@ -242,6 +246,9 @@ class TopicsLookupRequest(BaseModel):
     external_topic_id: str | None = None
     canonical_scope_key: str | None = None
     root_message_id: str | None = None
+    initiator_platform_user_id: str | None = None
+    pending_limit: int | None = Field(default=None, ge=1)
+    pending_offset: int = Field(default=0, ge=0)
 
 
 class InboundRegisterResolveRequest(BaseModel):
@@ -358,6 +365,11 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     source_scope_key: str | None = None
     source_generation: int | None = None
     activity_origin: str | None = "none"
+    requested_files: list[dict[str, Any]] | None = None
+    source_delivery_key: str | None = None
+    attempt_id: str | None = None
+    reclaim_stale_attempt_id: str | None = None
+    reclaim_stale_source_attempt_id: str | None = None
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -376,7 +388,101 @@ class DeliveryProgressRequest(BaseModel):
     confirmed_thread_address: str | None = None
     discord_body_phase: str | None = None
     delivery_attempt: int | None = None
+    claim_attempt_id: str | None = None
     bot_topic_registration: dict[str, Any] | None = None
+
+
+class ActionTokenMintRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    platform: str
+    dalton_user_id: str
+    initiator_platform_user_id: str
+    origin_chat_type: str
+    origin_chat_address: str
+    origin_scope_key: str
+    session_generation: int
+    thread_id: str
+    run_id: str
+    interrupt_id: str
+    interrupt_value: dict[str, Any]
+    pending_interrupt_count: int = 1
+    card_chat_type: str | None = None
+    card_delivery_address: str | None = None
+    prompt_summary: dict[str, Any] | None = None
+    approval_snapshots: dict[str, Any] | None = None
+
+
+class ActionTokenBindCardRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str | None = None
+    token_hash: str | None = None
+    phase: str = "confirm_bound"
+    platform: str | None = None
+    card_channel_id: str | None = None
+    card_message_id: str | None = None
+    send_reconcile_meta: dict[str, Any] | None = None
+
+
+class ActionTokenInspectGateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str
+    clicker_platform_user_id: str
+    channel_id: str
+    message_id: str
+
+
+class ActionTokenConsumeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str
+    decision: str
+    clicker_platform_user_id: str
+    platform: str | None = None
+    channel_id: str | None = None
+    message_id: str | None = None
+    reason: str | None = None
+    answer_text: str | None = None
+    option_index: int | None = None
+
+
+class InterruptResumeClaimTextRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    platform: str
+    message_id: str
+    dalton_user_id: str
+    scope_key: str
+    generation: int
+    thread_id: str
+    run_id: str
+    interrupt_id: str
+    resume_payload: dict[str, Any]
+
+
+class InterruptResumeAckRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    thread_id: str | None = None
+    run_id: str | None = None
+    interrupt_id: str | None = None
+    claim_id: str | None = None
+    outcome: str | None = None
+    settle_delivery: bool = False
+    error: str | None = None
+    card_results: list[dict[str, Any]] | None = None
+    late_card_results: list[dict[str, Any]] | None = None
+
+
+class InterruptRuntimeConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mode: str | None = None
+    interactive_actions_enabled: bool | None = None
+    interrupt_ledger_enabled: bool | None = None
+    bt2_link_recovery_enabled: bool | None = None
 
 
 class InboundProgressRequest(BaseModel):
@@ -809,6 +915,7 @@ async def internal_deliveries_verify_dm_recipient_endpoint(
         return await verify_dm_delivery_recipient(
             delivery_key=delivery_key,
             delivery_attempt=body.delivery_attempt,
+            resolved_recipient_id=body.resolved_recipient_id,
             gateway_epoch=raw_epoch,
             require_gateway_epoch=True,
         )
@@ -832,6 +939,9 @@ async def internal_topics_lookup_endpoint(
             external_topic_id=body.external_topic_id,
             canonical_scope_key=body.canonical_scope_key,
             root_message_id=body.root_message_id,
+            initiator_platform_user_id=body.initiator_platform_user_id,
+            pending_limit=body.pending_limit,
+            pending_offset=body.pending_offset,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
@@ -932,6 +1042,240 @@ async def internal_snapshots_download_endpoint(
                 "Content-Disposition": f"inline; filename*=UTF-8''{encoded_name}",
                 "Cache-Control": "no-store",
             },
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/threads/{thread_id}/runs/{run_id}/replay",
+)
+async def internal_thread_run_replay_endpoint(
+    thread_id: str,
+    run_id: str,
+    x_user_id: ServiceUserId,
+    execution_id: str | None = Query(default=None),
+    source: Literal["auto", "checkpoint"] = Query(default="auto"),
+) -> Any:
+    """Read-only SSE replay of a single target turn addressed directly by ``run_id``.
+
+    Enforces account admission via ``ServiceUserId``, platform sub-capability checks
+    resolved from authorized automation targets, and the same thread ownership /
+    shared-workspace read checks as ``GET /api/v1/threads/{thread_id}/messages/replay``.
+    Never writes back replay caches (``persist=False``).
+    """
+    from src.server.database.conversation.replay_rows import get_replay_thread_data
+    from src.server.database.pool import DATABASE_UNAVAILABLE
+    from src.server.database.shared_workspaces import is_holder
+    from src.server.services.history.replay import (
+        CheckpointReplayUnavailable,
+        finish_lines,
+        read_replay_page,
+    )
+    from src.server.services.shared_workspaces.access import thread_access
+    from src.server.services.shared_workspaces.viewer import name_turn_senders
+    from src.server.utils.api import database_unavailable
+
+    cleaned_run_id = str(run_id or "").strip()
+    if not cleaned_run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    try:
+        authorized_platforms = await resolve_authorized_automation_run_platforms(
+            thread_id=thread_id,
+            run_id=cleaned_run_id,
+            user_id=x_user_id,
+            execution_id=execution_id,
+        )
+        if not authorized_platforms:
+            raise HTTPException(
+                status_code=403,
+                detail="No authorized channel automation target for this run",
+            )
+        enabled_platform_found = False
+        last_cap_exc: HTTPException | None = None
+        for plat in authorized_platforms:
+            try:
+                require_channel_platform_capability(plat)
+                enabled_platform_found = True
+                break
+            except HTTPException as exc:
+                last_cap_exc = exc
+        if not enabled_platform_found:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    last_cap_exc.detail
+                    if last_cap_exc is not None
+                    else "Channel platform capability is disabled"
+                ),
+            )
+
+        rows = await get_replay_thread_data(thread_id)
+        if rows is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        if is_holder(rows.owner_id):
+            if rows.owner_id != x_user_id:
+                await thread_access(thread_id, x_user_id)
+            is_non_owner_reader = False
+        else:
+            from src.dalton.settings import is_dalton_multiuser_auth_enabled
+
+            is_non_owner_reader = False
+            if is_dalton_multiuser_auth_enabled():
+                from src.dalton.sharing import require_thread_access
+
+                await require_thread_access(
+                    thread_id,
+                    x_user_id,
+                    channel="web",
+                    need="read",
+                    owner_id=rows.owner_id,
+                    workspace_owner_id=rows.workspace_owner_id,
+                    workspace_id=rows.thread.get("workspace_id"),
+                )
+                is_non_owner_reader = rows.owner_id != x_user_id
+            elif rows.owner_id != x_user_id:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        responses_map = getattr(rows, "responses_by_turn", None)
+        target_turn_index: int | None = None
+        target_resp_row: dict[str, Any] | None = None
+        if isinstance(responses_map, dict):
+            for t_idx, resp_row in responses_map.items():
+                if not isinstance(resp_row, dict):
+                    continue
+                rid = str(
+                    resp_row.get("conversation_response_id")
+                    or resp_row.get("run_id")
+                    or ""
+                ).strip()
+                if rid == cleaned_run_id:
+                    target_turn_index = int(t_idx)
+                    target_resp_row = resp_row
+                    break
+
+        if target_turn_index is None or target_resp_row is None:
+            raise HTTPException(status_code=404, detail="Run not found in thread")
+
+        try:
+            page, resolved_source = await read_replay_page(
+                rows,
+                source=source,
+                before_turn=target_turn_index + 1,
+                limit=1,
+                persist=False,
+            )
+        except CheckpointReplayUnavailable as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Checkpoint replay unavailable: {exc}",
+            )
+
+        target_lines: list[Any] = []
+        matched_page_run = False
+        current_turn_index: int | None = None
+        current_run_id: str | None = None
+        for line in page.lines:
+            try:
+                payload = json.loads(line.data_json)
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                continue
+            raw_ti = payload.get("turn_index")
+            ev_ti: int | None = None
+            if isinstance(raw_ti, int) and not isinstance(raw_ti, bool):
+                ev_ti = raw_ti
+            elif isinstance(raw_ti, str) and raw_ti.strip().isdigit():
+                ev_ti = int(raw_ti.strip())
+            ev_rid = (
+                str(
+                    payload.get("response_id")
+                    or payload.get("run_id")
+                    or payload.get("report_run_id")
+                    or ""
+                ).strip()
+                or None
+            )
+            if line.event in ("user_message", "turn_separator", "turn_start"):
+                current_turn_index = ev_ti
+                current_run_id = ev_rid
+            eff_ti = ev_ti if ev_ti is not None else current_turn_index
+            eff_rid = ev_rid or current_run_id
+            # BW2: `read_replay_page(limit=1)` can include both a prior committed turn and
+            # a subsequent uncheckpointed target turn. Emit ONLY events for the target turn.
+            if eff_ti is not None and eff_ti != target_turn_index:
+                continue
+            if eff_rid is not None and eff_rid != cleaned_run_id:
+                continue
+            if eff_ti != target_turn_index and eff_rid != cleaned_run_id:
+                continue
+            if ev_rid == cleaned_run_id:
+                matched_page_run = True
+            target_lines.append(line)
+
+        await finish_lines(thread_id, target_lines)
+        if is_holder(rows.owner_id):
+            await name_turn_senders(thread_id, target_lines)
+
+        target_queries = [
+            q
+            for q in (getattr(rows, "queries", None) or ())
+            if isinstance(q, dict) and q.get("turn_index") == target_turn_index
+        ]
+
+        async def event_generator():
+            seq = 0
+            for line in target_lines:
+                seq += 1
+                yield f"id: {seq}\nevent: {line.event}\ndata: {line.data_json}\n\n"
+
+            done: dict[str, object] = {
+                "thread_id": thread_id,
+                "turn_index": target_turn_index,
+            }
+            if matched_page_run:
+                done["run_id"] = cleaned_run_id
+            if not is_non_owner_reader and has_capability(CapabilityId.CHANNEL_GATEWAY):
+                from src.dalton.channel_chart_snapshots import (
+                    resolve_replay_chart_snapshots_by_run,
+                )
+                from src.dalton.colleague_outbound_guard import (
+                    is_run_row_outbound_blocked,
+                )
+
+                blocked = is_run_row_outbound_blocked(target_resp_row)
+                done["outbound_blocked_by_run"] = {cleaned_run_id: blocked}
+                if not blocked:
+                    resp_meta = target_resp_row.get("metadata")
+                    if isinstance(resp_meta, dict):
+                        td = resp_meta.get("turn_deliverables")
+                        if isinstance(td, list) and td:
+                            done["turn_deliverables_by_run"] = {cleaned_run_id: td}
+                chart_snapshots_by_run = await resolve_replay_chart_snapshots_by_run(
+                    thread_id=thread_id,
+                    queries=target_queries,
+                    responses_by_turn={target_turn_index: target_resp_row},
+                )
+                if chart_snapshots_by_run:
+                    done["chart_snapshots_by_run"] = chart_snapshots_by_run
+
+            seq += 1
+            yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps(done, default=str)}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Replay-Source": resolved_source,
+            },
+        )
+    except DATABASE_UNAVAILABLE as exc:
+        raise database_unavailable(
+            f"replaying run {cleaned_run_id} in thread {thread_id}", logger, exc
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
@@ -1182,6 +1526,11 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             source_scope_key=body.source_scope_key,
             source_generation=body.source_generation,
             activity_origin=body.activity_origin,
+            requested_files=body.requested_files,
+            source_delivery_key=body.source_delivery_key,
+            attempt_id=body.attempt_id,
+            reclaim_stale_attempt_id=body.reclaim_stale_attempt_id,
+            reclaim_stale_source_attempt_id=body.reclaim_stale_source_attempt_id,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
@@ -1219,6 +1568,7 @@ async def internal_deliveries_progress_endpoint(
             confirmed_thread_address=body.confirmed_thread_address,
             discord_body_phase=body.discord_body_phase,
             delivery_attempt=body.delivery_attempt,
+            claim_attempt_id=body.claim_attempt_id,
             bot_topic_registration=body.bot_topic_registration,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
@@ -1321,15 +1671,235 @@ async def internal_recover_endpoint(
     mode: str = Query(default="startup"),
     thread_id: str | None = Query(default=None),
 ) -> Any:
-    """I-7 (4): Recover channel gateway state on `startup` or `watch_reconnect`."""
+    """I-7 (4): Recover channel gateway state on `startup`, `watch_reconnect`, or `interrupt_resumes`."""
     _resolve_optional_internal_user_id(request)
     try:
+        # Check enabled platform capabilities BEFORE parsing X-Gateway-Epoch (§3.1 #5)
+        if not cat_svc.get_enabled_channel_platforms():
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "channel_platforms_disabled",
+                    "message": "All channel platform capabilities are disabled.",
+                },
+            )
         epoch = _parse_gateway_epoch(request, required=False)
         return await recover_channel_state(
             mode=mode,
             thread_id=thread_id,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Channel Phase 2 Batch 3: Interactive Action Tokens & Interrupt Resumes
+# ---------------------------------------------------------------------------
+
+
+@channels_router.post(
+    "/internal/action-tokens/mint",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_mint_endpoint(
+    body: ActionTokenMintRequest,
+    request: Request,
+) -> Any:
+    """Classify an HITL interrupt (L0–L3 / credit_pause) and mint an opaque action token."""
+    _resolve_optional_internal_user_id(request, body.dalton_user_id)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.mint_channel_action_token(
+            platform=body.platform,
+            dalton_user_id=body.dalton_user_id,
+            initiator_platform_user_id=body.initiator_platform_user_id,
+            origin_chat_type=body.origin_chat_type,
+            origin_chat_address=body.origin_chat_address,
+            origin_scope_key=body.origin_scope_key,
+            session_generation=body.session_generation,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            interrupt_value=body.interrupt_value,
+            pending_interrupt_count=body.pending_interrupt_count,
+            card_chat_type=body.card_chat_type,
+            card_delivery_address=body.card_delivery_address,
+            prompt_summary=body.prompt_summary,
+            approval_snapshots=body.approval_snapshots,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/bind-card",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_bind_card_endpoint(
+    body: ActionTokenBindCardRequest,
+    request: Request,
+) -> Any:
+    """Persist pre-send `send_in_flight`, confirm card message binding, or record `send_failed` / `send_unknown`."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.bind_channel_action_card(
+            approval_nonce=body.approval_nonce,
+            token_hash=body.token_hash,
+            phase=body.phase,
+            platform=body.platform,
+            card_channel_id=body.card_channel_id,
+            card_message_id=body.card_message_id,
+            send_reconcile_meta=body.send_reconcile_meta,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/inspect-gate",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_inspect_gate_endpoint(
+    body: ActionTokenInspectGateRequest,
+    request: Request,
+) -> Any:
+    """Verify Discord group gate card click, write `gate_verified_at`, and mint ephemeral detail token."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.inspect_discord_gate_token(
+            approval_nonce=body.approval_nonce,
+            clicker_platform_user_id=body.clicker_platform_user_id,
+            channel_id=body.channel_id,
+            message_id=body.message_id,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/consume",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_consume_endpoint(
+    body: ActionTokenConsumeRequest,
+    request: Request,
+) -> Any:
+    """Verify channel card button click and atomically claim the interrupt resume slot."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.consume_channel_action_token(
+            approval_nonce=body.approval_nonce,
+            decision=body.decision,
+            clicker_platform_user_id=body.clicker_platform_user_id,
+            platform=body.platform,
+            channel_id=body.channel_id,
+            message_id=body.message_id,
+            reason=body.reason,
+            answer_text=body.answer_text,
+            option_index=body.option_index,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-resumes/claim-text",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_resumes_claim_text_endpoint(
+    body: InterruptResumeClaimTextRequest,
+    request: Request,
+) -> Any:
+    """Claim an `ask_user_question` or `credit_pause` interrupt via channel text reply."""
+    _resolve_optional_internal_user_id(request, body.dalton_user_id)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.claim_channel_text_interrupt_resume(
+            platform=body.platform,
+            message_id=body.message_id,
+            dalton_user_id=body.dalton_user_id,
+            scope_key=body.scope_key,
+            generation=body.generation,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            resume_payload=body.resume_payload,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-resumes/ack",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_resumes_ack_endpoint(
+    body: InterruptResumeAckRequest,
+    request: Request,
+) -> Any:
+    """Ack origin-channel dispatch/delivery settlement or per-card / late-card terminal patches."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.ack_channel_interrupt_resume(
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            claim_id=body.claim_id,
+            outcome=body.outcome,
+            settle_delivery=body.settle_delivery,
+            error=body.error,
+            card_results=body.card_results,
+            late_card_results=body.late_card_results,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-runtime-config",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_runtime_config_endpoint(
+    body: InterruptRuntimeConfigRequest,
+    request: Request,
+) -> Any:
+    """Update single-row 7b-0 runtime barrier config or enter three-switch production drain mode."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        cleaned_mode = str(body.mode or "").strip().lower()
+        if cleaned_mode == "enter_drain":
+            return await cat_svc.enter_interrupt_drain_mode()
+        if (
+            body.interrupt_ledger_enabled is not None
+            or body.bt2_link_recovery_enabled is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "drain_mode_required",
+                    "message": "Only interactive_actions_enabled may be changed outside mode='enter_drain'.",
+                },
+            )
+        return await cat_svc.set_interrupt_runtime_config(
+            interactive_actions_enabled=body.interactive_actions_enabled,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)

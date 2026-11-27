@@ -19,6 +19,8 @@ from src.dalton.access_tiers import get_user_tier as get_identity_tier
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage.models import (
     DEDICATED_COMPANY_KEYS,
+    TIER_ORDER,
+    VALID_TIERS,
     _ensure_json_obj,
     build_coverage_doc,
     company_to_row,
@@ -725,10 +727,10 @@ def _roster_rank_beats(
 ) -> bool:
     c_tier, c_updated, c_uid = challenger
     i_tier, i_updated, i_uid = incumbent
-    c_core = c_tier == "core"
-    i_core = i_tier == "core"
-    if c_core != i_core:
-        return c_core
+    c_rank = TIER_ORDER.get(str(c_tier or "").strip().lower(), 99)
+    i_rank = TIER_ORDER.get(str(i_tier or "").strip().lower(), 99)
+    if c_rank != i_rank:
+        return c_rank < i_rank
     if c_updated != i_updated:
         return c_updated > i_updated
     return c_uid < i_uid
@@ -782,6 +784,10 @@ async def get_company_coverage(*, conn: Any = None) -> dict[str, Any]:
     included_rows: list[Mapping[str, Any]] = []
     for row in rows:
         if not isinstance(row, Mapping):
+            continue
+        # Item 14: shared company coverage excludes radar / unknown tiers
+        row_tier = str(row.get("tier") or "").strip().lower()
+        if row_tier not in ("core", "watch"):
             continue
         uid = str(row.get("user_id") or "").strip()
         if not uid:
@@ -858,7 +864,7 @@ async def get_user_tier(
     if row is None:
         return None
     tier = str(row.get("tier") or "").strip().lower()
-    return tier if tier in ("core", "watch") else None
+    return tier if tier in VALID_TIERS else None
 
 
 def _extract_aliases_from_rows(
@@ -994,16 +1000,48 @@ async def render_coverage_yaml(user_id: str, *, conn: Any = None) -> str:
     """Render `coverage.yaml` YAML string for `user_id` from `dalton_coverage`."""
     doc = await get_user_coverage(user_id, conn=conn)
     doc.pop("units_unavailable", None)
+    try:
+        from src.dalton.watchlist.policies import get_user_tier_policies
+
+        policies = await get_user_tier_policies(user_id, conn=conn)
+        doc["tier_policies"] = {
+            t: p.to_dict() for t, p in policies.items()
+        }
+        tiers = doc.get("tiers")
+        if isinstance(tiers, dict) and "radar" not in tiers:
+            from src.dalton.coverage.models import DEFAULT_TIER_MEANINGS
+
+            radar_count = sum(
+                1 for c in (doc.get("companies") or [])
+                if str(c.get("tier") or "").lower() == "radar"
+            )
+            tiers["radar"] = {
+                "meaning": DEFAULT_TIER_MEANINGS["radar"],
+                "count": radar_count,
+            }
+    except Exception:
+        pass
     return dump_coverage_yaml(doc)
 
 
 async def render_company_coverage_yaml(*, conn: Any = None) -> str:
-    """Render the company-execution coverage union as YAML."""
+    """Render the shared Home company-execution coverage scope as YAML (tickers only; no personal tiers/tags/radar)."""
     doc = await get_company_coverage(conn=conn)
-    return dump_coverage_yaml(doc)
+    scope_companies = [
+        {"ticker": str(c.get("ticker") or "").strip().upper()}
+        for c in (doc.get("companies") or [])
+        if c.get("ticker")
+    ]
+    scope_doc: dict[str, Any] = {
+        "schema_version": doc.get("schema_version", 1),
+        "as_of": doc.get("as_of"),
+        "generated_at": doc.get("generated_at"),
+        "companies": scope_companies,
+    }
+    return dump_coverage_yaml(scope_doc)
 
 
-async def _resolve_home_sandbox_backend(user_id: str) -> Any:
+async def _resolve_home_sandbox_backend(user_id: str, *, conn: Any = None) -> Any:
     """Resolve a `SandboxBackend` for `user_id`'s Home workspace if reachable."""
     from ptc_agent.agent.backends.sandbox import SandboxBackend
     from ptc_agent.core.paths import SandboxLayout
@@ -1018,10 +1056,98 @@ async def _resolve_home_sandbox_backend(user_id: str) -> Any:
     )
     if not hasattr(session, "sandbox") or session.sandbox is None:
         raise RuntimeError(f"Sandbox session unavailable for Home workspace {home_ws_id}")
-    row = await get_workspace(str(home_ws_id)) or {}
+    row = await get_workspace(str(home_ws_id), conn=conn) or {}
     dir_name = row.get("dir_name")
     layout = SandboxLayout(session.sandbox.working_dir).for_workspace(dir_name)
     return SandboxBackend(session.sandbox, layout.workspace)
+
+
+_HOME_YAML_SYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_home_yaml_sync_lock(user_id: str) -> asyncio.Lock:
+    lock = _HOME_YAML_SYNC_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _HOME_YAML_SYNC_LOCKS[user_id] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _cross_worker_home_yaml_lock(user_id: str):
+    """Serialize Home YAML check->write->record across workers via PG session advisory lock.
+
+    Yields the lock-holding connection so callers reuse it for all DB operations inside the
+    critical section without checking out a second connection from the same pool.
+    If ``pg_advisory_unlock`` fails or returns False, closes/discards the connection rather
+    than returning a session that still holds the advisory lock to the pool.
+    Falls back to in-process asyncio lock cleanly when DB pool is closed (unit tests).
+    """
+    import inspect as _inspect
+
+    uid = str(user_id or "").strip()
+    async with _get_home_yaml_sync_lock(uid):
+        lock_key = f"dalton_home_yaml_sync:{uid}"
+        try:
+            async with coverage_db.get_db_connection() as lock_conn:
+                can_lock = callable(getattr(lock_conn, "cursor", None))
+                if not can_lock:
+                    yield None
+                    return
+                try:
+                    async with lock_conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT pg_advisory_lock(hashtext(%s))",
+                            (lock_key,),
+                        )
+                except Exception as exc:
+                    if _is_pool_not_open_error(exc) or not isinstance(exc, Exception):
+                        yield None
+                        return
+                    # Non-PG mock connection in unit tests: fall back to in-process lock
+                    if isinstance(exc, (TypeError, AttributeError)):
+                        yield None
+                        return
+                    raise
+                try:
+                    yield lock_conn
+                finally:
+                    unlocked = False
+                    try:
+                        async with lock_conn.cursor() as cur:
+                            await cur.execute(
+                                "SELECT pg_advisory_unlock(hashtext(%s))",
+                                (lock_key,),
+                            )
+                            fetchone_fn = getattr(cur, "fetchone", None)
+                            if callable(fetchone_fn):
+                                row = await fetchone_fn()
+                                unlocked = bool(row and row[0]) if row is not None else True
+                            else:
+                                unlocked = True
+                    except Exception as unlock_exc:
+                        logger.warning(
+                            "[DALTON_COVERAGE] pg_advisory_unlock failed for user=%s (%s); discarding connection",
+                            uid,
+                            type(unlock_exc).__name__,
+                        )
+                        unlocked = False
+                    if not unlocked:
+                        # Discard the connection so the pool never reuses a session still holding the advisory lock
+                        close_fn = getattr(lock_conn, "close", None)
+                        if callable(close_fn):
+                            try:
+                                close_res = close_fn()
+                                if _inspect.isawaitable(close_res):
+                                    await close_res
+                            except Exception:
+                                pass
+                return
+        except Exception as exc:
+            if _is_pool_not_open_error(exc) or isinstance(exc, (TypeError, AttributeError)):
+                yield None
+                return
+            raise
 
 
 async def sync_user_coverage_to_home(
@@ -1030,36 +1156,112 @@ async def sync_user_coverage_to_home(
     yaml_text: str | None = None,
     backend: Any = None,
     rel_path: str = "dalton/coverage.yaml",
+    roster_revision: int | None = None,
+    lease_check: Any = None,
 ) -> bool:
-    """Best-effort write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
+    """Cross-worker serialized, revision-guarded write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
 
+    Reuses the advisory-lock connection for all DB reads/writes inside the lock (safe with pool max_size=1).
+    When ``lease_check`` is provided, verifies lease ownership after acquiring the YAML lock and again
+    immediately before the actual write so an expired worker never overwrites Home YAML.
+    Refuses to overwrite Home YAML when ``roster_revision < last_yaml_synced_revision`` (including revision 0).
     Logs and returns False on failure without raising.
     """
     uid = str(user_id or "").strip()
     if not uid:
         return False
-    try:
-        rendered = yaml_text if yaml_text is not None else await render_coverage_yaml(uid)
-        eff_backend = backend or await _resolve_home_sandbox_backend(uid)
-        if hasattr(eff_backend, "awrite_text"):
-            wrote = await eff_backend.awrite_text(rel_path, rendered)
-            if wrote is False:
-                raise RuntimeError(f"awrite_text returned False for {rel_path}")
-        elif hasattr(eff_backend, "awrite"):
-            await eff_backend.awrite(rel_path, rendered)
-        elif hasattr(eff_backend, "write"):
-            eff_backend.write(rel_path, rendered)
-        else:
-            raise RuntimeError("Unsupported sandbox backend interface")
-        return True
-    except Exception as exc:
-        logger.info(
-            "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
-            rel_path,
-            uid,
-            exc,
+    from src.dalton.watchlist.policies import (
+        get_user_roster_state,
+        record_yaml_synced_revision,
+    )
+
+    is_personal_yaml = rel_path == "dalton/coverage.yaml"
+    eff_backend = backend
+    if eff_backend is None:
+        # Resolve Home workspace & sandbox backend BEFORE acquiring the YAML advisory lock
+        # so get_or_create_home_workspace / workspace_is_moving / get_session_for_workspace
+        # never check out a second DB connection while the lock connection is held (safe for pool max_size=1).
+        try:
+            eff_backend = await _resolve_home_sandbox_backend(uid)
+        except Exception as exc:
+            logger.info(
+                "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
+                rel_path,
+                uid,
+                exc,
+            )
+            return False
+
+    async with _cross_worker_home_yaml_lock(uid) as lock_conn:
+        sql_conn = (
+            lock_conn
+            if (lock_conn is not None and callable(getattr(lock_conn, "cursor", None)))
+            else None
         )
-        return False
+        try:
+            if lease_check is not None:
+                if not await lease_check(sql_conn):
+                    logger.info(
+                        "[DALTON_COVERAGE] aborting Home/%s publish for user=%s: lease lost after YAML lock",
+                        rel_path,
+                        uid,
+                    )
+                    return False
+
+            eff_revision = roster_revision
+            if yaml_text is None:
+                if is_personal_yaml and eff_revision is None:
+                    state_before = await get_user_roster_state(uid, conn=sql_conn)
+                    eff_revision = int(state_before.get("roster_revision") or 0)
+                rendered = await render_coverage_yaml(uid, conn=sql_conn)
+            else:
+                rendered = yaml_text
+
+            if is_personal_yaml and eff_revision is not None:
+                cur_state = await get_user_roster_state(uid, conn=sql_conn)
+                last_synced_rev = int(cur_state.get("last_yaml_synced_revision") or 0)
+                if int(eff_revision) < last_synced_rev:
+                    logger.info(
+                        "[DALTON_COVERAGE] skipping stale Home/%s publish for user=%s (rev=%s < synced=%s)",
+                        rel_path,
+                        uid,
+                        eff_revision,
+                        last_synced_rev,
+                    )
+                    return False
+
+            # Re-verify lease immediately before executing the actual sandbox write
+            if lease_check is not None:
+                if not await lease_check(sql_conn):
+                    logger.info(
+                        "[DALTON_COVERAGE] aborting Home/%s publish for user=%s: lease lost before write",
+                        rel_path,
+                        uid,
+                    )
+                    return False
+
+            if hasattr(eff_backend, "awrite_text"):
+                wrote = await eff_backend.awrite_text(rel_path, rendered)
+                if wrote is False:
+                    raise RuntimeError(f"awrite_text returned False for {rel_path}")
+            elif hasattr(eff_backend, "awrite"):
+                await eff_backend.awrite(rel_path, rendered)
+            elif hasattr(eff_backend, "write"):
+                eff_backend.write(rel_path, rendered)
+            else:
+                raise RuntimeError("Unsupported sandbox backend interface")
+
+            if is_personal_yaml and eff_revision is not None:
+                await record_yaml_synced_revision(uid, int(eff_revision), conn=sql_conn)
+            return True
+        except Exception as exc:
+            logger.info(
+                "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
+                rel_path,
+                uid,
+                exc,
+            )
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1556,6 +1758,7 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
     companies: list[dict[str, Any]] = []
     core_list: list[dict[str, Any]] = []
     watch_list: list[dict[str, Any]] = []
+    radar_list: list[dict[str, Any]] = []
     stale_list: list[dict[str, Any]] = []
 
     for r in rows:
@@ -1571,6 +1774,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         stale_group_labels = [sg["label"] for sg in stale_groups]
         comp_with_meta = {
             **comp,
+            "tags": list(r.get("tags") or comp.get("tags") or []),
+            "sort_order": int(r.get("sort_order") or 0),
+            "is_pinned": bool(r.get("is_pinned", False)),
+            "is_private": bool(r.get("is_private", False)),
+            "task_overrides": r.get("task_overrides"),
             "source": r.get("source"),
             "group_id": r.get("group_id") or (gids[0] if gids else None),
             "group_ids": gids,
@@ -1585,8 +1793,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         uid, companies, raw_rows=rows
     )
     for comp_with_meta in companies:
-        if comp_with_meta["tier"] == "core":
+        c_tier = str(comp_with_meta.get("tier") or "").strip().lower()
+        if c_tier == "core":
             core_list.append(comp_with_meta)
+        elif c_tier == "radar":
+            radar_list.append(comp_with_meta)
         else:
             watch_list.append(comp_with_meta)
         if comp_with_meta["group_stale"]:
@@ -1623,12 +1834,14 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         "counts": {
             "core": len(core_list),
             "watch": len(watch_list),
+            "radar": len(radar_list),
             "total": len(companies),
             "stale": len(stale_list),
             "groups": len(groups),
         },
         "core": core_list,
         "watch": watch_list,
+        "radar": radar_list,
         "stale": stale_list,
         "stale_tickers": [c["ticker"] for c in stale_list],
         "companies": companies,
@@ -1735,6 +1948,7 @@ async def add_user_coverage_tickers(
     conn: Any = None,
     ensure_automation: bool = True,
     sync_home: bool = True,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and add tickers to `user_id`'s coverage roster.
 
@@ -1749,6 +1963,29 @@ async def add_user_coverage_tickers(
         raise ValueError("user_id is required")
     norm_tier = normalize_tier(tier, default="watch")
     norm_source = normalize_source(source, default="chat")
+
+    if conn is None and group_id is None:
+        from src.dalton.watchlist.service import WatchlistMutationService
+
+        res = await WatchlistMutationService().execute_mutation(
+            uid,
+            action="add",
+            snapshot_id=snapshot_id,
+            tickers=list(tickers),
+            tier=norm_tier,
+            source=norm_source,
+            prevalidated=prevalidated,
+            sync_home=sync_home,
+        )
+        added_companies = list(res.get("added") or [])
+        units_unavailable = (
+            await _overlay_canonical_unit_workspaces(uid, added_companies)
+            if added_companies
+            else False
+        )
+        if units_unavailable:
+            res["units_unavailable"] = True
+        return res
 
     if prevalidated is not None:
         valid_items: list[dict[str, Any]] = []
@@ -1842,12 +2079,10 @@ async def add_user_coverage_tickers(
 async def remove_user_coverage_tickers(
     user_id: str,
     tickers: Sequence[str],
+    *,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Remove tickers from `user_id`'s coverage roster.
-
-    If a removed ticker has an existing company workspace under `user_id`,
-    notes that the workspace and its automations are not deleted.
-    """
+    """Remove tickers from `user_id`'s coverage roster via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
@@ -1864,32 +2099,14 @@ async def remove_user_coverage_tickers(
             "home_synced": False,
         }
 
-    ws_by_ticker = await _user_workspace_tickers(uid)
-    preserved_workspaces = [t for t in cleaned if t in ws_by_ticker]
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    removed = await coverage_db.delete_coverage_tickers(uid, cleaned)
-    invalidate_user_aliases_cache(uid)
-    not_found = [t for t in cleaned if t not in set(removed)]
-    if removed and await coverage_db.count_coverage_rows(uid) > 0:
-        await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-
-    notice: str | None = None
-    if preserved_workspaces:
-        notice = (
-            f"{', '.join(preserved_workspaces)} 已有公司 workspace，workspace 和自动任务不会被删除。"
-        )
-
-    return {
-        "ok": True,
-        "removed": removed,
-        "removed_tickers": removed,
-        "not_found": not_found,
-        "workspaces_preserved": preserved_workspaces,
-        "notice": notice,
-        "workspace_notice": notice,
-        "home_synced": home_synced,
-    }
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="remove",
+        tickers=cleaned,
+        snapshot_id=snapshot_id,
+    )
 
 
 async def set_user_coverage_tier(
@@ -2348,8 +2565,9 @@ async def add_coverage_group(
     criteria: Mapping[str, Any],
     default_tier: str = "watch",
     auto_refresh: bool = True,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a coverage rule group and upsert its resolved companies with `source='group'`."""
+    """Create a coverage rule group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
@@ -2358,79 +2576,39 @@ async def add_coverage_group(
         raise ValueError("label is required")
     norm_tier = normalize_tier(default_tier, default="watch")
 
-    preview = await preview_coverage_group(clean_label, criteria)
-    resolved_companies = preview.get("companies") or []
-    rejected_tickers = list(preview.get("not_found") or [])
-    prevalidated = {str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")}
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    now_utc = datetime.now(timezone.utc)
-    async with coverage_db.get_db_connection() as conn:
-        async with conn.transaction():
-            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
-            group_row = await coverage_db.insert_coverage_group(
-                uid,
-                label=clean_label,
-                criteria=dict(criteria),
-                default_tier=norm_tier,
-                auto_refresh=bool(auto_refresh),
-                last_resolved_at=now_utc,
-                conn=conn,
-            )
-            group_id = str(group_row["group_id"])
-            add_res = await add_user_coverage_tickers(
-                uid,
-                list(prevalidated.keys()),
-                tier=norm_tier,
-                source="group",
-                group_id=group_id,
-                prevalidated=prevalidated,
-                conn=conn,
-                ensure_automation=False,
-                sync_home=False,
-            )
-
-    invalidate_user_aliases_cache(uid)
-    automation_res: dict[str, Any] = {}
-    if prevalidated:
-        automation_res = await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-
-    group_out: dict[str, Any] = {
-        "ok": True,
-        "group": group_row,
-        "resolved_count": len(prevalidated),
-        "added_tickers": add_res.get("added_tickers", []),
-        "not_found": rejected_tickers,
-        "rejected": rejected_tickers,
-        "automation": automation_res or None,
-        "automation_created": automation_res.get("action") == "created",
-        "home_synced": home_synced,
-    }
-    if add_res.get("units_unavailable"):
-        group_out["units_unavailable"] = True
-    return group_out
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="add_group",
+        snapshot_id=snapshot_id,
+        label=clean_label,
+        criteria=criteria,
+        default_tier=norm_tier,
+        auto_refresh=auto_refresh,
+    )
 
 
 async def remove_coverage_group(
     user_id: str,
     group_id: str,
+    *,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Delete a coverage group and remove coverage entries added exclusively by that group."""
+    """Delete a coverage group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
         raise ValueError("user_id and group_id are required")
 
-    res = await coverage_db.delete_coverage_group_and_exclusive_members(uid, gid)
-    invalidate_user_aliases_cache(uid)
-    if await coverage_db.count_coverage_rows(uid) > 0:
-        await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-    return {
-        "ok": True,
-        **res,
-        "home_synced": home_synced,
-    }
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="remove_group",
+        snapshot_id=snapshot_id,
+        group_id=gid,
+    )
 
 
 async def resolve_coverage_group(
@@ -2439,118 +2617,26 @@ async def resolve_coverage_group(
     *,
     now: datetime | None = None,
     sync_home: bool = True,
+    snapshot_id: str | None = None,
+    allow_internal: bool = True,
 ) -> dict[str, Any]:
-    """Re-resolve an existing coverage group for `user_id` under a single advisory lock.
-
-    - Newly matching tickers not yet in the user's coverage are added with `default_tier` and `source='group'`.
-    - Existing tickers that also match this group have `group_id` added to their `extra.group_ids` without overwriting manual tier/source.
-    - Tickers in this group that no longer match are NOT deleted; instead `group_id` is added to their `extra.group_stale_ids` (tracked per group).
-    - Tickers in this group that match again have `group_id` removed from their `extra.group_stale_ids`.
-    """
+    """Re-resolve an existing coverage group via the unified WatchlistMutationService action."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
         raise ValueError("user_id and group_id are required")
 
-    group_row = await coverage_db.get_coverage_group(uid, gid)
-    if group_row is None:
-        raise ValueError(f"Coverage group {gid!r} not found")
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    label = str(group_row.get("label") or "")
-    criteria = group_row.get("criteria") or {}
-    default_tier = normalize_tier(group_row.get("default_tier"), default="watch")
-
-    preview = await preview_coverage_group(label, criteria)
-    resolved_companies = preview.get("companies") or []
-    rejected_tickers = list(preview.get("not_found") or [])
-    matched_by_ticker = {
-        str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")
-    }
-    matched_set = set(matched_by_ticker.keys())
-    resolved_ts = now or datetime.now(timezone.utc)
-
-    async with coverage_db.get_db_connection() as conn:
-        async with conn.transaction():
-            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
-            current_group = await coverage_db.get_coverage_group(uid, gid, conn=conn)
-            if current_group is None:
-                return {"status": "group_deleted", "ok": False, "group_id": gid}
-            default_tier = normalize_tier(
-                current_group.get("default_tier") or default_tier,
-                default="watch",
-            )
-            existing_rows = await coverage_db.list_coverage_rows(uid, conn=conn)
-            existing_by_ticker = {str(r["ticker"]).upper(): r for r in existing_rows}
-
-            new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
-            tickers_needing_membership = [
-                t
-                for t in matched_by_ticker
-                if t not in existing_by_ticker
-                or gid not in extract_row_group_ids(existing_by_ticker[t])
-            ]
-            stale_candidates = [
-                str(r["ticker"]).upper()
-                for r in existing_rows
-                if gid in extract_row_group_ids(r)
-                and str(r["ticker"]).upper() not in matched_set
-            ]
-            unstale_candidates = [
-                str(r["ticker"]).upper()
-                for r in existing_rows
-                if gid in extract_row_group_ids(r)
-                and str(r["ticker"]).upper() in matched_set
-                and gid in extract_row_stale_group_ids(r)
-            ]
-
-            add_res: dict[str, Any] = {}
-            if tickers_needing_membership:
-                add_res = await add_user_coverage_tickers(
-                    uid,
-                    tickers_needing_membership,
-                    tier=default_tier,
-                    source="group",
-                    group_id=gid,
-                    prevalidated={t: matched_by_ticker[t] for t in tickers_needing_membership},
-                    conn=conn,
-                    ensure_automation=False,
-                    sync_home=False,
-                )
-
-            marked_stale: list[str] = []
-            if stale_candidates:
-                marked_stale = await coverage_db.mark_coverage_rows_group_stale(
-                    uid, stale_candidates, group_id=gid, stale=True, conn=conn
-                )
-
-            if unstale_candidates:
-                await coverage_db.mark_coverage_rows_group_stale(
-                    uid, unstale_candidates, group_id=gid, stale=False, conn=conn
-                )
-
-            updated_group = await coverage_db.update_coverage_group_resolved(
-                uid, gid, last_resolved_at=resolved_ts, conn=conn
-            )
-
-    invalidate_user_aliases_cache(uid)
-
-    if matched_by_ticker or existing_rows:
-        await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
-
-    resolve_out: dict[str, Any] = {
-        "ok": True,
-        "group": updated_group or group_row,
-        "matched_tickers": list(matched_by_ticker.keys()),
-        "added_tickers": new_tickers,
-        "stale_tickers": marked_stale,
-        "not_found": rejected_tickers,
-        "rejected": rejected_tickers,
-        "home_synced": home_synced,
-    }
-    if add_res.get("units_unavailable"):
-        resolve_out["units_unavailable"] = True
-    return resolve_out
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="resolve_group",
+        group_id=gid,
+        snapshot_id=snapshot_id,
+        allow_internal=allow_internal,
+        now=now,
+        sync_home=sync_home,
+    )
 
 
 def _is_group_due_for_refresh(
@@ -2819,7 +2905,13 @@ async def query_user_earnings_calendar(
             }
         )
 
-    items.sort(key=lambda x: (str(x["date"]), 0 if x["tier"] == "core" else 1, str(x["symbol"])))
+    items.sort(
+        key=lambda x: (
+            str(x["date"]),
+            TIER_ORDER.get(str(x.get("tier") or "").lower(), 3),
+            str(x["symbol"]),
+        )
+    )
     pub_at = mirror_row.get("published_at")
     return {
         "data": items,
@@ -2927,6 +3019,7 @@ async def seed_user_coverage_from_yaml(
 
     core_count = sum(1 for r in rows if r["tier"] == "core")
     watch_count = sum(1 for r in rows if r["tier"] == "watch")
+    radar_count = sum(1 for r in rows if r["tier"] == "radar")
 
     if not apply:
         return {
@@ -2937,6 +3030,7 @@ async def seed_user_coverage_from_yaml(
             "planned_count": len(rows),
             "core_count": core_count,
             "watch_count": watch_count,
+            "radar_count": radar_count,
             "written_count": 0,
         }
 
@@ -2977,6 +3071,7 @@ async def seed_user_coverage_from_yaml(
         "planned_count": len(rows),
         "core_count": core_count,
         "watch_count": watch_count,
+        "radar_count": radar_count,
         "written_count": len(upserted),
         "automation": automation_res or None,
         "home_synced": home_synced,

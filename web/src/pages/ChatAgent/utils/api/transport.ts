@@ -12,8 +12,22 @@ import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from 
 import { noteIfSuspended } from '@/lib/accountSuspension';
 // DALTON-HOOK(team-model-catalog): observe X-Dalton-Catalog-Revision and catalog 400 errors on raw SSE fetch streams
 import { observeCatalogModelError, observeCatalogRevisionHeader } from '@/lib/dalton/catalogRevision';
+// DALTON-HOOK(antigravity-series): gate onRunIdResolved on unified stream run-admission predicate
+import { isStreamRunAdmissionEvent } from '@/lib/dalton/turnAdmission';
 
 export const baseURL = api.defaults.baseURL;
+
+// DALTON-HOOK(share-redaction): attach credentials:'include' on trusted-origin owner /messages/replay so cross-port OSS receives dalton_oss_media_session cookie
+function isTrustedOwnerReplayOrigin(fullUrl: string): boolean {
+  try {
+    const pageOrigin = typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null'
+      ? window.location.origin : 'http://localhost';
+    const target = new URL(fullUrl, pageOrigin).origin;
+    return target === pageOrigin || (!!baseURL && target === new URL(baseURL, pageOrigin).origin);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Bearer headers for this package's raw fetch() calls (SSE streams).
@@ -92,18 +106,29 @@ export async function streamFetch(
   const initialToken = bearerTokenOf(new Headers(opts.headers).get('Authorization'));
   const sentAs = initialToken ? authGeneration() : undefined;
   let res: Response;
+  const fullUrl = `${baseURL}${url}`;
+  // DALTON-HOOK(share-redaction): include credentials and cache:'no-store' on trusted-origin owner replay streams
+  const isTrustedOwnerReplay =
+    /\/api\/v1\/threads\/[^/]+\/messages\/replay(?:[?#]|$)/.test(url) && isTrustedOwnerReplayOrigin(fullUrl);
+  const fetchOpts: RequestInit = isTrustedOwnerReplay
+    ? {
+        ...opts,
+        ...(opts.credentials === undefined ? { credentials: 'include' } : {}),
+        ...(opts.cache === undefined ? { cache: 'no-store' } : {}),
+      }
+    : opts;
   try {
-    res = await fetch(`${baseURL}${url}`, opts);
+    res = await fetch(fullUrl, fetchOpts);
     // DALTON-HOOK(standalone-core): refresh once via cookie and retry SSE request on 401 in local auth mode
     if (isDaltonLocalAuth && res.status === 401) {
       const sameAccount = () => sameSession() && (sentAs === undefined || sentAs === authGeneration());
       if (sameAccount()) {
-        const hdrs = new Headers(opts.headers);
+        const hdrs = new Headers(fetchOpts.headers);
         const refused = bearerTokenOf(hdrs.get('Authorization'));
         const refreshed = await refreshAccessToken(refused);
         if (refreshed && sameAccount()) {
           hdrs.set('Authorization', `Bearer ${refreshed}`);
-          res = await fetch(`${baseURL}${url}`, { ...opts, headers: hdrs });
+          res = await fetch(fullUrl, { ...fetchOpts, headers: hdrs });
         }
       }
     }
@@ -291,7 +316,8 @@ export async function postSSEStream(
     let duplicate: Record<string, unknown> | null = null;
     const onEvent = (event: Record<string, unknown>) => {
       if (event.event === 'metadata' || event.event === 'steering_accepted') release();
-      if (event.event !== 'turn_held') {
+      // DALTON-HOOK(antigravity-series): gate onRunIdResolved on unified stream run-admission check (blocks refusal and unstarted retry/error frames without run_id)
+      if (isStreamRunAdmissionEvent(event)) {
         const runId = parseRunIdFromContentLocation(runLocation);
         if (runId && onRunIdResolved) onRunIdResolved(runId, parseThreadIdFromContentLocation(runLocation));
         runLocation = null;
@@ -339,6 +365,8 @@ function duplicateRequestError(frame: Record<string, unknown>): Error & { status
     errorInfo.retryable = frame.retryable;
     errorInfo.thread_id = frame.run_thread_id || frame.thread_id;
     if (frame.steered === true) errorInfo.steered = true;
+    // DALTON-HOOK(antigravity-series): preserve adopted run's llm_model from SSE duplicate_request frame
+    if (typeof frame.llm_model === 'string' && frame.llm_model) errorInfo.llm_model = frame.llm_model;
   }
   return Object.assign(new Error(message || 'HTTP error! status: 409'), { status: 409, errorInfo });
 }

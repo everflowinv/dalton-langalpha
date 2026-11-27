@@ -280,6 +280,7 @@ async def begin(
     attachment_id = str(uuid4())
     name = name.strip() or "file"
     mime_type = declared_type(mime_type, name)
+    # DALTON-HOOK(share-redaction): private-media/ key prefix & private ACL enforced via attachment_key + storage layer
     key = attachment_key(attachment_id, name) if is_storage_enabled() else None
 
     async def create(store_upload_id: str | None) -> ChatAttachmentRow:

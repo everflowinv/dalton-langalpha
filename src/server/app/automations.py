@@ -145,6 +145,9 @@ def _report_delivery_http_error(exc: Exception) -> HTTPException:
         "dm_not_bound",
         "feishu_not_bound",
         "owner_tier_forbidden",
+        "confirmation_required",
+        "confirmation_invalid",
+        "web_session_required",
     }:
         return HTTPException(status_code=403, detail=detail)
     if code in {"not_found", "forbidden_or_not_found"}:
@@ -168,44 +171,52 @@ async def create_automation(
     from src.dalton.settings import is_dalton_enabled
 
     dalton_enabled = is_dalton_enabled()
-    report_profile_change = None
+    report_profile_plan = None
     if dalton_enabled and isinstance(request.metadata, dict) and "report_profile" in request.metadata:
         from src.dalton.services.report_delivery import (
             ReportDeliveryError,
             execute_report_profile_rest_mutation,
-            validate_report_profile_change,
+            prepare_rest_report_profile_write,
         )
 
         try:
-            report_profile_change = await validate_report_profile_change(
-                user_id,
-                {
+            report_profile_plan = await prepare_rest_report_profile_write(
+                principal=principal,
+                http_request=http_request,
+                automation={
                     "user_id": user_id,
                     "name": request.name,
                     "instruction": request.instruction,
                     "metadata": {},
                 },
-                request.metadata.get("report_profile"),
-                via_rest=True,
+                new_profile=request.metadata.get("report_profile"),
                 action="create",
                 after_metadata=request.metadata,
+                body_confirmation_token=request.report_delivery_confirmation_token,
             )
         except ReportDeliveryError as exc:
             raise _report_delivery_http_error(exc) from None
     route_warning: str | None = None
     try:
-        if report_profile_change is not None:
+        if report_profile_plan is not None:
             # DALTON-HOOK(report-delivery): persist normalized after_metadata on create, matching update
             create_data = request.model_copy(
-                update={"metadata": report_profile_change.after_metadata}
+                update={"metadata": report_profile_plan.change.after_metadata}
             )
-            automation, route_warning = await execute_report_profile_rest_mutation(
-                change=report_profile_change,
-                actor_user_id=user_id,
-                mutate_fn=lambda db_conn: handler.create_automation(
-                    user_id=user_id, data=create_data, conn=db_conn
-                ),
-            )
+            try:
+                automation, route_warning = await execute_report_profile_rest_mutation(
+                    change=report_profile_plan.change,
+                    actor_user_id=user_id,
+                    confirmation_token=report_profile_plan.confirmation_token,
+                    confirmation_action=report_profile_plan.confirmation_action,
+                    confirmation_automation_id=report_profile_plan.confirmation_automation_id,
+                    confirmation_config_version=report_profile_plan.confirmation_config_version,
+                    mutate_fn=lambda db_conn: handler.create_automation(
+                        user_id=user_id, data=create_data, conn=db_conn
+                    ),
+                )
+            except ReportDeliveryError as exc:
+                raise _report_delivery_http_error(exc) from None
         else:
             automation = await handler.create_automation(user_id=user_id, data=request)
     except handler.DeliveryRefused as e:
@@ -566,15 +577,28 @@ async def update_automation(
     from src.dalton.settings import is_dalton_enabled
 
     dalton_enabled = is_dalton_enabled()
-    report_profile_change = None
+    report_profile_plan = None
     existing_is_company = False
+    unchanged_rp_observed_cv: int | None = None
     if dalton_enabled and request.metadata is not None:
         from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 
         existing_row = await auto_db.get_automation(agent_id, user_id)
         if existing_row is None:
             existing_row = await auto_db.get_automation(agent_id, COMPANY_SYSTEM_USER_ID)
-        if existing_row is not None:
+        if existing_row is None:
+            # Allow admins updating another user's automation to hit the same report_profile guard.
+            from src.dalton.services.report_delivery import _load_automation_for_actor, get_user_tier
+
+            if await get_user_tier(user_id) == "admin":
+                try:
+                    existing_row = await _load_automation_for_actor(agent_id, user_id, "admin")
+                except Exception:
+                    existing_row = None
+        if existing_row is None:
+            if "report_profile" in request.metadata:
+                raise_not_found("Automation")
+        else:
             existing_is_company = existing_row.get("scope") == "company" or is_company_system_user(
                 existing_row.get("user_id")
             )
@@ -587,58 +611,99 @@ async def update_automation(
             if has_rp and new_rp != old_rp:
                 from src.dalton.services.report_delivery import (
                     ReportDeliveryError,
-                    validate_report_profile_change,
+                    prepare_rest_report_profile_write,
                 )
 
                 target_view = dict(existing_row)
                 if request.instruction is not None:
                     target_view["instruction"] = request.instruction
                 try:
-                    report_profile_change = await validate_report_profile_change(
-                        user_id,
-                        target_view,
-                        new_rp,
-                        via_rest=True,
+                    report_profile_plan = await prepare_rest_report_profile_write(
+                        principal=principal,
+                        http_request=http_request,
+                        automation=target_view,
+                        new_profile=new_rp,
                         action="update",
                         after_metadata=request.metadata,
+                        body_confirmation_token=request.report_delivery_confirmation_token,
+                        expected_config_version=extract_expected_config_version(request),
                     )
                 except ReportDeliveryError as exc:
                     raise _report_delivery_http_error(exc) from None
+            elif has_rp:
+                # Bind the unlocked read version as a write condition so a concurrent
+                # clear/replace of report_profile cannot be overwritten without confirmation.
+                # An explicit expected_config_version MUST match the version at which
+                # report_profile was observed unchanged; otherwise fail closed with 409.
+                raw_cv = existing_row.get("config_version")
+                if isinstance(raw_cv, int) and not isinstance(raw_cv, bool):
+                    explicit_cv = extract_expected_config_version(request)
+                    if explicit_cv is not None and explicit_cv != raw_cv:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="任务配置版本已变更，请刷新后重试。",
+                        )
+                    unchanged_rp_observed_cv = raw_cv
     route_warning: str | None = None
     try:
         # DALTON-HOOK(company-automations): validate optional expected_config_version and propagate via context
         expected_cv = extract_expected_config_version(request)
+        if unchanged_rp_observed_cv is not None:
+            expected_cv = unchanged_rp_observed_cv
         fields = request.model_dump(exclude_none=True)
+        # DALTON-HOOK(report-delivery): never persist an explicit null report_profile key
+        if (
+            report_profile_plan is None
+            and isinstance(fields.get("metadata"), dict)
+            and "report_profile" in fields["metadata"]
+            and fields["metadata"].get("report_profile") is None
+        ):
+            cleaned_meta = dict(fields["metadata"])
+            cleaned_meta.pop("report_profile", None)
+            fields["metadata"] = cleaned_meta
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:
             fields["llm_model"] = None
         # DALTON-HOOK(automation-effort): allow explicit null reasoning_effort to clear effort override
         if "reasoning_effort" in request.model_fields_set and request.reasoning_effort is None:
             fields["reasoning_effort"] = None
-        if report_profile_change is not None:
-            # DALTON-HOOK(report-delivery): keep profile, route sync, audit history, and notify slot in one transaction
+        if report_profile_plan is not None:
+            # DALTON-HOOK(report-delivery): keep profile, one-time confirmation consume, route sync, audit history, and notify slot in one transaction
             from src.dalton.services.report_delivery import (
+                ReportDeliveryError,
                 execute_report_profile_rest_mutation,
             )
 
-            fields["metadata"] = report_profile_change.after_metadata
+            eff_expected_cv = (
+                expected_cv
+                if expected_cv is not None
+                else report_profile_plan.required_expected_config_version
+            )
+            fields["metadata"] = report_profile_plan.change.after_metadata
             if existing_is_company:
                 from src.dalton.services.company_agent_writes import update_company_agent
 
-                company_row, route_warning = await execute_report_profile_rest_mutation(
-                    change=report_profile_change,
-                    actor_user_id=user_id,
-                    expected_config_version=expected_cv,
-                    is_company=True,
-                    mutate_fn=lambda db_conn: update_company_agent(
-                        principal,
-                        agent_id,
-                        fields,
-                        request=request,
-                        expected_config_version=expected_cv,
-                        conn=db_conn,
-                    ),
-                )
+                try:
+                    company_row, route_warning = await execute_report_profile_rest_mutation(
+                        change=report_profile_plan.change,
+                        actor_user_id=user_id,
+                        expected_config_version=eff_expected_cv,
+                        is_company=True,
+                        confirmation_token=report_profile_plan.confirmation_token,
+                        confirmation_action=report_profile_plan.confirmation_action,
+                        confirmation_automation_id=report_profile_plan.confirmation_automation_id,
+                        confirmation_config_version=report_profile_plan.confirmation_config_version,
+                        mutate_fn=lambda db_conn: update_company_agent(
+                            principal,
+                            agent_id,
+                            fields,
+                            request=request,
+                            expected_config_version=eff_expected_cv,
+                            conn=db_conn,
+                        ),
+                    )
+                except ReportDeliveryError as exc:
+                    raise _report_delivery_http_error(exc) from None
                 if not company_row:
                     raise_not_found("Automation")
                 company_resp = _company_write_response(company_row)
@@ -649,17 +714,24 @@ async def update_automation(
                 )
                 company_resp.route_warning = route_warning
                 return company_resp
-            automation, route_warning = await execute_report_profile_rest_mutation(
-                change=report_profile_change,
-                actor_user_id=user_id,
-                expected_config_version=expected_cv,
-                mutate_fn=lambda db_conn: handler.update_automation(
-                    automation_id=agent_id,
-                    user_id=user_id,
-                    fields=fields,
-                    conn=db_conn,
-                ),
-            )
+            try:
+                automation, route_warning = await execute_report_profile_rest_mutation(
+                    change=report_profile_plan.change,
+                    actor_user_id=user_id,
+                    expected_config_version=eff_expected_cv,
+                    confirmation_token=report_profile_plan.confirmation_token,
+                    confirmation_action=report_profile_plan.confirmation_action,
+                    confirmation_automation_id=report_profile_plan.confirmation_automation_id,
+                    confirmation_config_version=report_profile_plan.confirmation_config_version,
+                    mutate_fn=lambda db_conn: handler.update_automation(
+                        automation_id=agent_id,
+                        user_id=user_id,
+                        fields=fields,
+                        conn=db_conn,
+                    ),
+                )
+            except ReportDeliveryError as exc:
+                raise _report_delivery_http_error(exc) from None
         else:
             with automation_history_context(
                 actor_user_id=user_id,

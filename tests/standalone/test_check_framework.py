@@ -270,6 +270,7 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/standalone/init.sh",
         "web/package.json",
         "docs-site/package.json",
+        "docs-site/src/content/docs/getting-started.md",
         "docs-site/src/content/docs/everflow/monitors.md",
         "tests/fakes/fake_openai_server.py",
         "tests/standalone/run_checks.sh",
@@ -348,6 +349,8 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/standalone/init.sh",
         "scripts/dalton/Dockerfile.dalton",
         "scripts/dalton/Dockerfile.postgres",
+        "docs-site/package.json",
+        "docs-site/src/content/docs/getting-started.md",
         ".release_git_sha",
     ):
         assert (out_dir / expected).exists(), f"Missing expected core file: {expected}"
@@ -371,6 +374,8 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "web/.env.dalton",
         "integrations/dalton-channel-gateway",
         "deploy/dalton",
+        "docs-site/src/content/docs/everflow",
+        "docs-site/src/content/docs/everflow/monitors.md",
     ):
         assert not (out_dir / excluded).exists(), f"Excluded path leaked: {excluded}"
 

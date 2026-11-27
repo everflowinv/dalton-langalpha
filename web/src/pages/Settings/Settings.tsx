@@ -141,7 +141,7 @@ function Settings() {
   useEffect(() => {
     if (!accessDenied && !disabledCoverage) return;
     const message = unauthorizedDaltonAuth
-      ? t('settings:daltonAuthOnly')
+      ? t('settings:daltonAuthOnly', { brand: BRAND_NAME }) // DALTON-HOOK(brand-name)
       : unauthorizedTier
         ? t(
             requestedMeta?.minTier === 'admin'
@@ -248,7 +248,8 @@ function Settings() {
       {/* The Computers panel, opened from the Computers section's rows, and
           Change spec, opened over Claude Code's view in Model access, so the
           user stays where they started while the computer changes. */}
-      <ComputersDialogHost overSheet planInPlace />
+      {/* DALTON-HOOK(page-host-status-fanout): Settings has no fan-out above its host, so the host hears machines out itself */}
+      <ComputersDialogHost overSheet planInPlace statusFanout />
     </div>
   );
 }

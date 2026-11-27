@@ -39,6 +39,10 @@ async def list_activity(
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cursor")
+    # DALTON-HOOK(share-redaction): redact titles by per-row custom_title flag & scrub details across all activity rows
+    from src.dalton.share_redaction import redact_activity_rows
+
+    rows = await redact_activity_rows(rows)
     return ActivityPage(
         items=[event_row_to_response(row) for row in rows],
         next_cursor=next_cursor,

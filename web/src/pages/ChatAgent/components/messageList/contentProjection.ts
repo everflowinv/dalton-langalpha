@@ -57,7 +57,8 @@ export interface ContentProjection {
 
 const RETAINED_TYPES = new Set<RenderBlock['type']>([
   'subagent_task', 'html_widget', 'user_question', 'create_workspace', 'start_question', 'ptc_agent',
-  'delete_workspace', 'stop_workspace', 'delete_thread', 'credit_pause', 'tool_approval', 'past_plan',
+  'delete_workspace', 'stop_workspace', 'delete_thread', 'archive_workspace', // DALTON-HOOK(cos-settings-tools)
+  'credit_pause', 'tool_approval', 'past_plan',
   // A chart's published layers are a thing the reader works with.
   'chart_layers',
 ]);
@@ -180,7 +181,8 @@ function hasText(content: string | undefined): content is string {
  *  leading into one is what it asks about. */
 const ASKS_USER = new Set([
   'user_question', 'tool_approval', 'create_workspace', 'start_question', 'ptc_agent',
-  'delete_workspace', 'stop_workspace', 'delete_thread', 'credit_pause',
+  'delete_workspace', 'stop_workspace', 'delete_thread', 'archive_workspace', // DALTON-HOOK(cos-settings-tools)
+  'credit_pause',
 ]);
 /** Calls that record the work rather than do it. An answer often ends on one,
  *  ticking the plan, so it says nothing about whether the turn went on. An

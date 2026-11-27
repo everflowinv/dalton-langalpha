@@ -37,6 +37,7 @@ from src.dalton.monitors.grants import (
     MonitorGrantError,
     data_prefix,
     frame_prefix,
+    is_shared_document_grant,
     mint_monitor_grant,
     verify_monitor_grant,
 )
@@ -47,6 +48,9 @@ from src.dalton.monitors.models import (
     PublishMonitorRequest,
     RepublishMonitorRequest,
     UpdateMonitorRequest,
+    entry_file_type_of,
+    is_html_entry_path,
+    is_monitor_panel_entry,
     is_valid_data_key,
     is_valid_slug,
 )
@@ -123,6 +127,8 @@ def _normalize_workspace_entry_path(workspace: dict[str, Any], raw_path: str) ->
             return candidate
     if not may_be_artifact(relative):
         raise HTTPException(status_code=400, detail="该文件不能发布为监控面板")
+    if not is_html_entry_path(relative):
+        raise HTTPException(status_code=400, detail="监控面板仅支持发布 HTML 网页文件")
     return relative
 
 
@@ -273,10 +279,27 @@ def _extract_publish_failure_message(exc: Exception) -> str:
     return str(exc)
 
 
+async def _get_superseded_shared_document(monitor: MonitorRecord) -> Any | None:
+    """Return the governing ``SharedDocumentRecord`` when a legacy non-HTML monitor was taken over."""
+    entry_path = getattr(monitor, "entry_path", None)
+    if (
+        getattr(monitor, "source_kind", None) != "workspace"
+        or not entry_path
+        or is_html_entry_path(entry_path)
+    ):
+        return None
+    from src.dalton.monitors import shared_documents
+
+    return await shared_documents.get_shared_document_by_artifact_id(
+        monitor.artifact_id
+    )
+
+
 async def _build_monitor_detail_payload(
     monitor: MonitorRecord,
     *,
     viewer_id: str,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     versions = await monitor_db.list_monitor_versions(
         monitor.monitor_id,
@@ -287,8 +310,9 @@ async def _build_monitor_detail_payload(
         monitor.monitor_id, viewer_id, monitor.acl_revision
     )
     tier = await get_user_tier(viewer_id)
+    can_manage = False if read_only else _can_manage_monitor(monitor, viewer_id, tier)
     return {
-        "monitor": serialize_monitor(monitor, can_manage=_can_manage_monitor(monitor, viewer_id, tier)),
+        "monitor": serialize_monitor(monitor, can_manage=can_manage),
         "versions": [
             {
                 "seq": v.seq,
@@ -311,7 +335,12 @@ async def _build_monitor_detail_payload(
 async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
     """Return trimmed read-only monitor detail for an anonymous viewer when ``visibility == 'public'``."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
+    if (
+        monitor is None
+        or monitor.visibility != "public"
+        or not is_monitor_capability_enabled(monitor)
+        or await _get_superseded_shared_document(monitor) is not None
+    ):
         raise HTTPException(status_code=404, detail="监控面板不存在")
     serialized = serialize_monitor(monitor, can_manage=False)
     for internal_key in (
@@ -345,6 +374,7 @@ def serialize_monitor(monitor: MonitorRecord, *, can_manage: bool = False) -> di
         "artifact_code": monitor.artifact_code,
         "workspace_id": monitor.workspace_id,
         "entry_path": monitor.entry_path,
+        "entry_file_type": entry_file_type_of(monitor.entry_path),
         "owner_user_id": monitor.owner_user_id,
         "owner_name": monitor.owner_name,
         "owner_email": monitor.owner_email,
@@ -376,6 +406,8 @@ async def list_monitors_for_user(user_id: str) -> list[dict[str, Any]]:
     rows = await monitor_db.list_all_monitors()
     visible: list[dict[str, Any]] = []
     for m in rows:
+        if not is_monitor_panel_entry(m):
+            continue
         if await can_view_monitor(m, user_id):
             visible.append(serialize_monitor(m, can_manage=_can_manage_monitor(m, user_id, tier)))
     return visible
@@ -402,6 +434,16 @@ async def get_monitor_detail(slug: str, *, viewer_id: str) -> dict[str, Any]:
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
     require_monitor_capability(monitor)
+    superseded = await _get_superseded_shared_document(monitor)
+    if superseded is not None:
+        if str(viewer_id or "").strip() != superseded.owner_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="该文档已由分享文档接管，无权通过旧监控入口查看",
+            )
+        return await _build_monitor_detail_payload(
+            monitor, viewer_id=viewer_id, read_only=True
+        )
     await require_monitor_view(monitor, viewer_id)
     return await _build_monitor_detail_payload(monitor, viewer_id=viewer_id)
 
@@ -411,6 +453,8 @@ async def get_monitor_by_artifact(
 ) -> dict[str, Any] | None:
     monitor = await monitor_db.get_monitor_by_artifact_id(artifact_id)
     if monitor is None or not is_monitor_capability_enabled(monitor):
+        return None
+    if await _get_superseded_shared_document(monitor) is not None:
         return None
     if str(viewer_id or "").strip() == monitor.owner_user_id:
         return serialize_monitor(monitor, can_manage=True)
@@ -424,7 +468,15 @@ async def mint_grant_for_monitor(slug: str, *, viewer_id: str) -> dict[str, Any]
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
     require_monitor_capability(monitor)
-    await require_monitor_view(monitor, viewer_id)
+    superseded = await _get_superseded_shared_document(monitor)
+    if superseded is not None:
+        if str(viewer_id or "").strip() != superseded.owner_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="该文档已由分享文档接管，无权领取旧监控读取授权",
+            )
+    else:
+        await require_monitor_view(monitor, viewer_id)
     grant = await mint_monitor_grant(
         monitor.monitor_id, viewer_id, monitor.acl_revision
     )
@@ -599,6 +651,11 @@ async def update_monitor_settings(
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
     require_monitor_capability(monitor)
+    if await _get_superseded_shared_document(monitor) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+        )
 
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
@@ -701,6 +758,11 @@ async def republish_workspace_monitor(
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
     require_monitor_capability(monitor)
+    if await _get_superseded_shared_document(monitor) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+        )
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
         raise_external_member_forbidden("无权重新发布此监控面板")
@@ -770,7 +832,12 @@ async def republish_workspace_monitor(
     except Exception as exc:
         from src.dalton.colleague_outbound_guard import WorkspaceAutoPublishPaused
 
-        if not isinstance(exc, WorkspaceAutoPublishPaused):
+        is_superseded = (
+            isinstance(exc, HTTPException)
+            and exc.status_code == 403
+            and "分享文档接管" in str(exc.detail or "")
+        )
+        if not isinstance(exc, WorkspaceAutoPublishPaused) and not is_superseded:
             await monitor_db.record_monitor_publish_failure(
                 monitor.monitor_id,
                 error_message=_extract_publish_failure_message(exc),
@@ -802,6 +869,11 @@ async def delete_monitor_by_slug(slug: str, *, caller_id: str) -> dict[str, Any]
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
     require_monitor_capability(monitor)
+    if await _get_superseded_shared_document(monitor) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+        )
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
         raise HTTPException(status_code=403, detail="无权删除此监控面板")
@@ -848,6 +920,8 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
             return
 
     for monitor in monitors:
+        if await _get_superseded_shared_document(monitor) is not None:
+            continue
         if sharing_auth_enabled:
             from src.dalton.colleague_outbound_guard import (
                 is_workspace_pending_outbound_confirm,
@@ -907,6 +981,13 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 verify_public_authority=_verify_user_is_admin,
                 check_pending_outbound_confirm=sharing_auth_enabled,
             )
+        except monitor_db.MonitorSupersededBySharedDocumentError:
+            logger.info(
+                "Skipping auto-update for workspace monitor %s (%s): superseded by shared document",
+                monitor.slug,
+                monitor.monitor_id,
+            )
+            continue
         except Exception as exc:
             logger.warning(
                 "Auto-updating workspace monitor %s (%s) failed: %s",
@@ -1295,6 +1376,72 @@ async def republish_data_job_monitor(
     }
 
 
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.is_file():
+            return None
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        return None
+
+
+def _enrich_monitor_publish_failure_message(
+    *,
+    job_key: str,
+    terminal_status: str,
+    failure_reason: str | None,
+    data_root: Path | None,
+) -> str:
+    """Enrich bare failure codes (e.g. ``exit_code_1``) with monitor state details
+    such as per-index actual data dates and missing-constituent failure reasons."""
+    raw = str(failure_reason or "").strip()
+    is_bare_exit = not raw or raw.startswith("exit_code_")
+    if job_key != "hk-momentum" or data_root is None:
+        return raw or terminal_status
+
+    st_dir = Path(data_root) / "state" / "monitor-feeds" / "hk_momentum"
+    meta = _read_json_if_exists(st_dir / "index_meta.json") or {}
+    status_doc = _read_json_if_exists(st_dir / "status.json") or {}
+
+    index_dates_raw = meta.get("index_dates")
+    date_parts: list[str] = []
+    if isinstance(index_dates_raw, dict):
+        for k, v in index_dates_raw.items():
+            if v is not None and str(v).strip():
+                date_parts.append(f"{k}={v}")
+    elif meta.get("last_date"):
+        date_parts.append(f"last_date={meta['last_date']}")
+
+    detail_parts: list[str] = []
+    if not is_bare_exit:
+        detail_parts.append(raw)
+    else:
+        meta_summary = str(meta.get("failure_summary") or "").strip()
+        if meta_summary:
+            return meta_summary
+        stale_reason = str(meta.get("stale_reason") or "").strip()
+        if stale_reason:
+            detail_parts.append(stale_reason)
+        overall = status_doc.get("overall") if isinstance(status_doc.get("overall"), dict) else {}
+        overall_reason = str(overall.get("reason") or "").strip()
+        if overall_reason and overall_reason not in detail_parts:
+            detail_parts.append(overall_reason)
+        missing_by_idx = meta.get("missing_held_by_index")
+        if isinstance(missing_by_idx, dict) and not detail_parts:
+            for idx_key, codes in missing_by_idx.items():
+                if isinstance(codes, list) and codes:
+                    preview = ", ".join(str(c) for c in codes[:5])
+                    detail_parts.append(
+                        f"{idx_key} 持有成分缺少必要价格 {len(codes)} 只 (如 {preview})"
+                    )
+
+    headline = "；".join(detail_parts) if detail_parts else (raw or terminal_status)
+    if date_parts and "数据日期:" not in headline:
+        return f"{headline} | 数据日期: {', '.join(date_parts)}"
+    return headline
+
+
 async def maybe_publish_data_job_monitor(
     *,
     job_key: str,
@@ -1329,10 +1476,16 @@ async def maybe_publish_data_job_monitor(
             for row in await monitor_db.list_monitors_by_data_job(job_key)
             if any(row.slug == b.slug for b in bindings)
         ]
+    enriched_error = _enrich_monitor_publish_failure_message(
+        job_key=job_key,
+        terminal_status=terminal_status,
+        failure_reason=failure_reason,
+        data_root=data_root,
+    )
     for existing in existing_rows:
         await monitor_db.record_monitor_publish_failure(
             existing.monitor_id,
-            error_message=failure_reason or terminal_status,
+            error_message=enriched_error,
         )
 
 
@@ -1369,6 +1522,15 @@ async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
 
     if monitor.acl_revision != verified.acl_revision:
         raise HTTPException(status_code=403, detail="监控面板权限已变更，授权已失效")
+
+    superseded = await _get_superseded_shared_document(monitor)
+    if superseded is not None:
+        if str(verified.user_id or "").strip() != superseded.owner_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="该文档已由分享文档接管，旧监控授权已失效",
+            )
+        return monitor, verified.user_id
 
     await require_monitor_view(monitor, verified.user_id)
     return monitor, verified.user_id
@@ -1430,6 +1592,16 @@ async def serve_monitor_file(
     head: bool = False,
 ) -> ServedArtifactFile:
     """Serve a published monitor version file under ``CSP: sandbox`` (opaque origin)."""
+    if is_shared_document_grant(grant_token):
+        from src.dalton.monitors import shared_documents
+
+        return await shared_documents.serve_shared_document_file(
+            grant_token,
+            seq,
+            path,
+            if_none_match=if_none_match,
+            head=head,
+        )
     monitor, _viewer_id = await _authorize_grant(grant_token)
 
     if not seq.isdigit() or int(seq) < 1 or not _valid_path(path):
@@ -1444,41 +1616,97 @@ async def serve_monitor_file(
     )
 
 
+def _resolve_public_entry_relative_path(entry_path: str, rel: str) -> str | None:
+    """Resolve *rel* against *entry_path*'s directory strictly within the version root.
+
+    Returns ``None`` if *rel* is empty, malformed, carries a URL scheme, or traverses
+    above the workspace root. Never falls back to a same-named file at workspace root.
+    """
+    raw = str(rel or "").strip()
+    if (
+        not raw
+        or len(raw) > 1024
+        or "\\" in raw
+        or "\x00" in raw
+        or raw.startswith("//")
+        or raw.startswith("__wsref__/")
+    ):
+        return None
+    first_seg = raw.split("/", 1)[0]
+    if ":" in first_seg:
+        return None
+
+    if raw.startswith("/"):
+        stack: list[str] = []
+    else:
+        entry_dir = posixpath.dirname(entry_path or "")
+        stack = [seg for seg in entry_dir.split("/") if seg]
+
+    for seg in raw.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if not stack:
+                return None
+            stack.pop()
+            continue
+        stack.append(seg)
+
+    if not stack:
+        return None
+    resolved = "/".join(stack)
+    return resolved if _valid_path(resolved) else None
+
+
 async def serve_public_monitor_file(
     slug: str,
     seq: str,
     path: str,
     *,
+    rel: str | None = None,
     if_none_match: str | None = None,
     head: bool = False,
 ) -> ServedArtifactFile:
     """Anonymously serve the current published version file when ``visibility == 'public'``."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
+    if (
+        monitor is None
+        or monitor.visibility != "public"
+        or not is_monitor_capability_enabled(monitor)
+        or await _get_superseded_shared_document(monitor) is not None
+    ):
         raise HTTPException(status_code=404, detail="File not found")
-    target_path = path or (monitor.entry_path or "")
     if (
         not seq.isdigit()
         or int(seq) < 1
         or monitor.published_seq <= 0
         or int(seq) != monitor.published_seq
-        or not target_path
-        or not _valid_path(target_path)
     ):
         raise HTTPException(status_code=404, detail="File not found")
-    try:
+
+    if rel is not None:
+        resolved = _resolve_public_entry_relative_path(monitor.entry_path or "", rel)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="File not found")
         return await _serve_monitor_version_file(
             monitor,
             int(seq),
-            target_path,
+            resolved,
             if_none_match=if_none_match,
             head=head,
         )
-    except HTTPException as exc:
-        entry_dir = posixpath.dirname(monitor.entry_path or "")
-        if exc.status_code == 404 and path and entry_dir:
-            nested = posixpath.normpath(f"{entry_dir}/{path}")
-            if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+
+    target_path = path or (monitor.entry_path or "")
+    if not target_path or not _valid_path(target_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    entry_dir = posixpath.dirname(monitor.entry_path or "")
+    prefer_nested = bool(
+        path and entry_dir and not path.startswith(f"{entry_dir}/")
+    )
+    if prefer_nested:
+        nested = posixpath.normpath(f"{entry_dir}/{path}")
+        if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+            try:
                 return await _serve_monitor_version_file(
                     monitor,
                     int(seq),
@@ -1486,7 +1714,16 @@ async def serve_public_monitor_file(
                     if_none_match=if_none_match,
                     head=head,
                 )
-        raise
+            except HTTPException as exc:
+                if exc.status_code != 404 or not is_html_entry_path(monitor.entry_path):
+                    raise
+    return await _serve_monitor_version_file(
+        monitor,
+        int(seq),
+        target_path,
+        if_none_match=if_none_match,
+        head=head,
+    )
 
 
 async def _read_monitor_data_response(
@@ -1549,7 +1786,12 @@ async def read_public_monitor_data(
     if not is_valid_data_key(data_key):
         raise HTTPException(status_code=400, detail="Invalid data key")
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
+    if (
+        monitor is None
+        or monitor.visibility != "public"
+        or not is_monitor_capability_enabled(monitor)
+        or await _get_superseded_shared_document(monitor) is not None
+    ):
         raise HTTPException(status_code=404, detail="Monitor not found")
     return await _read_monitor_data_response(
         monitor, data_key, if_none_match=if_none_match

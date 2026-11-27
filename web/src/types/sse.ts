@@ -539,11 +539,18 @@ export interface ActionRequest {
   duplicate_check_unavailable?: boolean;
   // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
   confirm_token?: string;
-  // DALTON-HOOK(cos-settings-tools): target computer snapshot fields on create_workspace action requests.
+  // DALTON-HOOK(cos-settings-tools): target computer snapshot fields on create_workspace and archive_workspace action requests.
   computer_id?: string | null;
   computer_name?: string | null;
   computer_is_own_machine?: boolean;
   bootstrap_cloud_primary?: boolean;
+  expected_workspaces?: Array<{
+    workspace_id: string;
+    name: string;
+    dir_name: string;
+    status: string;
+    is_stand_in?: boolean;
+  }>;
 }
 
 export interface InterruptEvent extends BaseSSEEvent {

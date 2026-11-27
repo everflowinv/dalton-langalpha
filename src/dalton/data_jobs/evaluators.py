@@ -493,16 +493,43 @@ def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
             failure_reason="oom_killed",
         )
     if ctx.exit_code != 0:
+        last_obj = extract_last_json_object(ctx.stdout)
+        if isinstance(last_obj, dict):
+            failure_summary = last_obj.get("failure_summary")
+            if isinstance(failure_summary, str) and failure_summary.strip():
+                return TaskEvaluationResult(
+                    ok=False,
+                    status="failed",
+                    failure_reason=failure_summary.strip(),
+                )
+            err_reason = (
+                last_obj.get("stale_reason")
+                or last_obj.get("reason")
+                or last_obj.get("error")
+            )
+            index_dates = last_obj.get("index_dates")
+            dates_suffix = ""
+            if isinstance(index_dates, dict) and index_dates:
+                parts = [
+                    f"{k}={v}"
+                    for k, v in index_dates.items()
+                    if v is not None and str(v).strip()
+                ]
+                if parts:
+                    dates_suffix = f" | 数据日期: {', '.join(parts)}"
+            if isinstance(err_reason, str) and err_reason.strip():
+                return TaskEvaluationResult(
+                    ok=False,
+                    status="failed",
+                    failure_reason=f"{err_reason.strip()}{dates_suffix}",
+                )
+            if dates_suffix:
+                return TaskEvaluationResult(
+                    ok=False,
+                    status="failed",
+                    failure_reason=f"exit_code_{ctx.exit_code}{dates_suffix}",
+                )
         if ctx.job_key in (T1_JOB_KEY, T29_JOB_KEY, "T1", "T29"):
-            last_obj = extract_last_json_object(ctx.stdout)
-            if isinstance(last_obj, dict):
-                err_reason = last_obj.get("reason") or last_obj.get("error")
-                if isinstance(err_reason, str) and err_reason.strip():
-                    return TaskEvaluationResult(
-                        ok=False,
-                        status="failed",
-                        failure_reason=err_reason.strip(),
-                    )
             if "openclaw_not_updated" in (ctx.stdout or ""):
                 return TaskEvaluationResult(
                     ok=False,

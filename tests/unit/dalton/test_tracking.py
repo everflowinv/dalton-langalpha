@@ -228,6 +228,25 @@ def _install_fake_automation_store(
     )
     monkeypatch.setattr(exec_db, "skip_unstarted_executions_for_automations", mock_skip_execs)
     monkeypatch.setattr(exec_db, "get_db_now", mock_get_db_now)
+    from src.dalton.database import coverage as cov_db
+    from src.dalton.watchlist import policies as wl_policies_mod
+
+    monkeypatch.setattr(
+        cov_db,
+        "get_coverage_row",
+        create_autospec(
+            cov_db.get_coverage_row,
+            return_value={"ticker": str(ticker).upper(), "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
+    )
 
     return {
         "store": store,
@@ -345,10 +364,22 @@ async def test_coverage_completion_does_not_reopen_after_user_pause_while_conver
     assert tool_cov_finish["paused_by_user"] is True
     assert all(r["status"] == "paused" for r in store)
 
-    # 2. Conversational enable (`source="user"`, the default) forces re-enable and clears `paused_by_user`
-    tool_user_enable = json.loads(
+    # 2. Conversational enable without version authorization refuses to override manual pause (r4 Decision 3);
+    #    with explicit `override_pause_versions` matching each row's `config_version`, it re-enables and clears `paused_by_user`.
+    tool_user_no_ver = json.loads(
         await analyst_tools["dalton_coverage_tracking"].ainvoke(
             {"action": "enable"},
+            config={"configurable": {"user_id": "user-1", "workspace_id": "ws-nvda"}},
+        )
+    )
+    assert tool_user_no_ver["status"] == "disabled"
+    assert tool_user_no_ver["paused_by_user"] is True
+    assert all(r["status"] == "paused" for r in store)
+
+    override_vers = {str(r["automation_id"]): int(r.get("config_version") or 1) for r in store}
+    tool_user_enable = json.loads(
+        await analyst_tools["dalton_coverage_tracking"].ainvoke(
+            {"action": "enable", "override_pause_versions": override_vers},
             config={"configurable": {"user_id": "user-1", "workspace_id": "ws-nvda"}},
         )
     )
@@ -962,7 +993,7 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     assert res_demoted_paused["old_cron_expression"] == "0 11 * * 2-6"
     assert res_demoted_paused["new_cron_expression"] == "0 11 * * 6"
     assert res_demoted_paused["new_timezone"] == "Asia/Shanghai"
-    assert res_demoted_paused["new_next_run_at"] is not None
+    assert res_demoted_paused["new_next_run_at"] is None
     assert res_demoted_paused["status"] == "paused"
     assert res_demoted_paused["paused_by_user"] is True
 
@@ -971,7 +1002,7 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     assert by_name["dalton-echo-delta"]["metadata"]["paused_by_user"] is True
     assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
     assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
-    assert by_name["dalton-echo-delta"]["next_run_at"] is not None
+    assert by_name["dalton-echo-delta"]["next_run_at"] is None
     assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
 
 
@@ -1265,7 +1296,14 @@ async def test_round9_enable_tracking_earnings_resume_refuses_expired_once_and_r
         initial_rows=initial_rows,
     )
 
-    res = await enable_tracking("user-1", "ws-nvda", force=True)
+    res = await enable_tracking(
+        "user-1",
+        "ws-nvda",
+        force=True,
+        override_pause_versions={
+            str(r["automation_id"]): int(r.get("config_version") or 1) for r in initial_rows
+        },
+    )
     assert res["status"] == "enabled"
     assert res["paused_by_user"] is False
     refusals = res.get("resume_refusals") or []
@@ -1467,7 +1505,14 @@ async def test_round10_enable_tracking_resumes_brk_b_dotted_earnings_and_renamed
         create_autospec(_REAL_GET_ACTIVE_UNIT, return_value=brk_unit),
     )
 
-    res = await enable_tracking("user-1", ws_brk, force=True)
+    res = await enable_tracking(
+        "user-1",
+        ws_brk,
+        force=True,
+        override_pause_versions={
+            str(r["automation_id"]): int(r.get("config_version") or 1) for r in initial_rows
+        },
+    )
     assert res["status"] == "enabled"
     assert not res.get("resume_refusals")
     by_id = {r["automation_id"]: r for r in ctx["store"]}
@@ -1616,6 +1661,25 @@ async def test_round10_resume_once_automation_never_readds_removed_paused_by_use
         _cu_db,
         "get_active_unit_by_workspace",
         create_autospec(_REAL_GET_ACTIVE_UNIT, return_value=None),
+    )
+    from src.dalton.database import coverage as cov_db_mod
+    from src.dalton.watchlist import policies as wl_policies_mod
+
+    monkeypatch.setattr(
+        cov_db_mod,
+        "get_coverage_row",
+        create_autospec(
+            cov_db_mod.get_coverage_row,
+            return_value={"ticker": "NVDA", "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
     )
 
     res = await schedule_dalton_automation_helper(

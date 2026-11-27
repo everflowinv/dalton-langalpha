@@ -201,6 +201,9 @@
         "claude-opus-5-5-oauth"
       ]
     },
+    "stop_backup_attach_timeout_s": 60.0,
+    "stop_backup_close_timeout_s": 10.0,
+    "stop_backup_total_timeout_s": 120.0,
     "timezone": "Asia/Shanghai",
     "weixin": {
       "allow_external": true,

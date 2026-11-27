@@ -135,13 +135,34 @@ def automation_history_context(
         if report_delivery_audit is not None
         else (parent.report_delivery_audit if parent is not None else None)
     )
+    parent_reconciler = parent.locked_row_reconciler if parent is not None else None
+    if parent_reconciler is not None and locked_row_reconciler is not None:
+        inner_reconciler = locked_row_reconciler
+
+        async def _composed_locked_reconciler(
+            locked_row: Mapping[str, Any],
+            effective_kwargs: dict[str, Any],
+            locked_conn: Any,
+        ) -> None:
+            await inner_reconciler(locked_row, effective_kwargs, locked_conn)
+            await parent_reconciler(locked_row, effective_kwargs, locked_conn)
+
+        eff_reconciler: (
+            Callable[[Mapping[str, Any], dict[str, Any], Any], Awaitable[None]] | None
+        ) = _composed_locked_reconciler
+    else:
+        eff_reconciler = (
+            locked_row_reconciler
+            if locked_row_reconciler is not None
+            else parent_reconciler
+        )
     ctx = AutomationHistoryContext(
         record_history=record_history,
         actor_user_id=eff_actor,
         action=eff_action,
         expected_config_version=eff_expected,
         skip_if_unchanged=eff_skip_unchanged,
-        locked_row_reconciler=locked_row_reconciler,
+        locked_row_reconciler=eff_reconciler,
         prelocked_pref_row=eff_prelocked_pref,
         report_delivery_audit=eff_report_audit,
     )

@@ -28,6 +28,7 @@ from src.dalton.monitors.models import (
     MonitorRecord,
     MonitorSourceKind,
     MonitorVisibility,
+    is_html_entry_path,
     is_valid_slug,
     slugify_candidate,
 )
@@ -84,6 +85,7 @@ _MONITOR_SELECT = """
         ) AS member_user_ids
       FROM dalton_monitors m
       JOIN share_links l ON l.artifact_id = m.artifact_id
+      JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'
       LEFT JOIN users u ON u.user_id = m.owner_user_id
 """
 
@@ -207,11 +209,45 @@ async def list_workspace_auto_update_monitors(workspace_id: str) -> list[Monitor
                 WHERE m.source_kind = 'workspace'
                   AND m.keep_updated = TRUE
                   AND l.workspace_id = %s::uuid
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM dalton_shared_documents d
+                       WHERE d.artifact_id = m.artifact_id
+                  )
                 ORDER BY m.slug
                 """,
                 (workspace_id,),
             )
             return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
+
+
+class MonitorSupersededBySharedDocumentError(HTTPException):
+    """Raised when a legacy non-HTML monitor mutation is rejected after shared-document takeover."""
+
+    def __init__(
+        self,
+        detail: str = "该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+    ) -> None:
+        super().__init__(status_code=403, detail=detail)
+
+
+async def _reject_if_superseded_by_shared_document_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Reject mutations on a legacy non-HTML monitor already taken over by ``dalton_shared_documents``."""
+    if not entry_path or is_html_entry_path(entry_path):
+        return
+    await cur.execute(
+        """
+        SELECT 1
+          FROM dalton_shared_documents
+         WHERE artifact_id = %s::uuid
+           FOR SHARE
+        """,
+        (artifact_id,),
+    )
+    if await cur.fetchone() is not None:
+        raise MonitorSupersededBySharedDocumentError()
 
 
 async def pick_available_slug(base_raw: str) -> str:
@@ -546,7 +582,7 @@ async def update_monitor_settings_tx(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await artifacts_records_db.lock_owned(
+                locked = await artifacts_records_db.lock_owned(
                     cur, user_id=owner_user_id, artifact_id=artifact_id
                 )
                 await cur.execute(
@@ -562,6 +598,10 @@ async def update_monitor_settings_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row["source_kind"] == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 cur_visibility: MonitorVisibility = row["visibility"]
                 was_public = cur_visibility == "public"
@@ -906,6 +946,10 @@ async def commit_monitor_publish_tx(
                     (artifact_id,),
                 )
                 existing = await cur.fetchone()
+                if source_kind == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 if is_company_system_user(monitor_owner_id) or source_kind == "data_job":
                     if share_public and verify_public_authority is not None:
                         await _call_with_optional_conn(
@@ -1322,6 +1366,10 @@ async def commit_monitor_version_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
                     from src.dalton.settings import is_dalton_sharing_auth_enabled
@@ -1498,15 +1546,33 @@ async def migrate_data_job_monitor_and_cut_tx(
     return loaded, result, False
 
 
+def _clip_publish_error(message: str | None, limit: int = 1000) -> str:
+    """Clip a monitor publish error to ``limit`` chars while preserving trailing ``| 数据日期: ...``."""
+    raw = (message or "Republish failed").strip()
+    if len(raw) <= limit:
+        return raw
+    marker = " | 数据日期: "
+    idx = raw.rfind(marker)
+    if idx != -1:
+        suffix = raw[idx:]
+        if len(suffix) < limit - 20:
+            body_budget = limit - len(suffix) - 1
+            return raw[:body_budget].rstrip() + "…" + suffix
+    return raw[:limit]
+
+
 async def record_monitor_publish_failure(
     monitor_id: str,
     *,
     error_message: str,
     run_id: str | None = None,
 ) -> MonitorRecord | None:
-    """Record the latest failure message/timestamp without marking ``run_id`` as processed."""
+    """Record the latest failure message/timestamp without marking ``run_id`` as processed.
+
+    Skips updating legacy workspace monitors already taken over by ``dalton_shared_documents``.
+    """
     _ = run_id
-    clipped = (error_message or "Republish failed").strip()[:1000]
+    clipped = _clip_publish_error(error_message, limit=1000)
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1515,6 +1581,14 @@ async def record_monitor_publish_failure(
                    SET last_publish_error = %s,
                        last_publish_failed_at = NOW()
                  WHERE monitor_id = %s::uuid
+                   AND NOT (
+                       source_kind = 'workspace'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM dalton_shared_documents d
+                            WHERE d.artifact_id = dalton_monitors.artifact_id
+                       )
+                   )
                 """,
                 (clipped, monitor_id),
             )
@@ -1539,7 +1613,7 @@ async def delete_monitor_tx(
                 )
                 await cur.execute(
                     """
-                    SELECT visibility, owner_user_id
+                    SELECT visibility, owner_user_id, source_kind
                       FROM dalton_monitors
                      WHERE monitor_id = %s::uuid
                        FOR UPDATE
@@ -1549,6 +1623,10 @@ async def delete_monitor_tx(
                 row = await cur.fetchone()
                 if row is None:
                     return False
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 from src.dalton.settings import is_dalton_local_auth_enabled
 
                 if (
@@ -1645,6 +1723,12 @@ async def _prune_monitor_versions_in_cur(
     return deleted_versions
 
 
+def _normalize_utc(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
 async def upsert_monitor_data(
     monitor_id: str,
     data_key: str,
@@ -1654,7 +1738,7 @@ async def upsert_monitor_data(
 ) -> MonitorDataEntry:
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    ts = as_of or datetime.now(UTC)
+    ts = _normalize_utc(as_of) if as_of is not None else datetime.now(UTC)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -1668,11 +1752,41 @@ async def upsert_monitor_data(
                        as_of = EXCLUDED.as_of,
                        sha256 = EXCLUDED.sha256,
                        updated_at = NOW()
+                 WHERE EXCLUDED.as_of > dalton_monitor_data.as_of
                 RETURNING monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
                 """,
                 (monitor_id, data_key, canonical, ts, digest),
             )
             row = await cur.fetchone()
+            if row is None:
+                await cur.execute(
+                    """
+                    SELECT monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
+                      FROM dalton_monitor_data
+                     WHERE monitor_id = %s::uuid AND data_key = %s
+                    """,
+                    (monitor_id, data_key),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Monitor data upsert produced no row",
+                    )
+                existing_as_of = _normalize_utc(existing["as_of"])
+                existing_sha = str(existing["sha256"])
+                if existing_as_of == ts and existing_sha == digest:
+                    # Idempotent replay of the exact same snapshot: keep original updated_at untouched.
+                    row = existing
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Rejected stale monitor snapshot for {data_key}: "
+                            f"incoming as_of={ts.isoformat()} is not newer than "
+                            f"stored as_of={existing_as_of.isoformat()}"
+                        ),
+                    )
     return MonitorDataEntry(
         monitor_id=str(row["monitor_id"]),
         data_key=str(row["data_key"]),

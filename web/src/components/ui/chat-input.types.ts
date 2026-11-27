@@ -95,6 +95,8 @@ export interface ThreadTuning {
 
 export interface ModelOptions {
   model: string | null;
+  // DALTON-HOOK(antigravity-series): sequence of the active manual model pick carried from composer
+  modelPickSeq?: number | null;
   /** This turn's level, as the composer shows it; null names none, and the
    *  server runs the thread's own, else Settings. */
   reasoningEffort: string | null;

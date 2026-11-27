@@ -320,6 +320,23 @@ class _Exclusions:
         self.tails = tuple(t.strip("/") for t in (spec.get("exclude_tails") or ()))
         self.name_patterns = tuple(spec.get("exclude_name_patterns") or ())
         self.same_as = _identities(spec.get("exclude_same_as") or ())
+        # DALTON-HOOK(workspace-file-exclusions): non-empty globs prune mirrored rows on next sync (§4)
+        self.rel_globs = tuple(p.strip("/") for p in (spec.get("exclude_rel_globs") or ()) if p and p.strip("/"))
+        self._prot: dict[str, bool] = {}
+
+    def _has_prot(self, path: str | None, rel: str) -> bool:
+        if not path or path in self._prot: return self._prot.get(path or "", False)
+        try:
+            with os.scandir(path) as it:
+                for c in it:
+                    if c.is_dir(follow_symlinks=False) and (c.name == ".git" or c.name in self.whole or f"{rel}/{c.name}" == "work/uploads" or (c.name not in self.dir_names and f"{rel}/{c.name}" not in self.rel_dirs and not f"{rel}/{c.name}".startswith(self.rel_dir_prefixes) and self._has_prot(c.path, f"{rel}/{c.name}"))):
+                        return self._prot.setdefault(path, True)
+        except FileNotFoundError as exc:
+            raise OSError(errno.EAGAIN, str(exc)) from exc
+        return self._prot.setdefault(path, False)
+
+    def _left_out_by_glob(self, rel: str, child: Any = None, *, is_dir: bool = False) -> bool:
+        return bool(self.rel_globs) and ".git" not in (ps := rel.split("/")) and rel != "work/uploads" and not rel.startswith("work/uploads/") and not (is_dir and rel == "work") and any(fnmatch.fnmatchcase("/".join(ps[: i + 1]), p) for i in range(len(ps)) for p in self.rel_globs) and not (is_dir and self._has_prot(getattr(child, "path", None), rel))
 
     def _left_out_by_copy(self, child: Any, rel: str) -> bool:
         full = self.tail_base + rel
@@ -370,6 +387,7 @@ class _Exclusions:
                 or rel in self.rel_files
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "symlink"
         if child.is_dir(follow_symlinks=False):
@@ -377,10 +395,11 @@ class _Exclusions:
                 name in self.dir_names
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel, child, is_dir=True)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "dir"
         if child.is_file(follow_symlinks=False):
-            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes)
+            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes) or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             return None if left_out else "file"
         # Sockets, fifos and devices are not files a backup can carry.
         return None
@@ -1667,10 +1686,48 @@ def _unlink_orphan_if_unlocked(path: str) -> None:
             os.close(fd)
 
 
+# --- DALTON-HOOK(by4-relay-guard): begin ---
+def _claim_staged_files(
+    root: str, pack_base: str, items: list[dict[str, Any]]
+) -> list[str]:
+    """Acquire exclusive flock ownership on every existing staged file claimed by ``items``."""
+    locked: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        local = item.get("file")
+        if not local:
+            continue
+        staged = (
+            _resolve_item(root, pack_base, local)
+            if item.get("kind") == "pack"
+            else _resolve_under_root(root, local)
+        )
+        if staged is None or staged in seen:
+            continue
+        seen.add(staged)
+        try:
+            _acquire_temp_ownership(staged)
+        except OSError:
+            continue
+        locked.append(staged)
+    return locked
+
+
+def _release_claimed_staged_files(locked: list[str]) -> None:
+    """Release any claimed staged-file flock not already released by placement/unlink."""
+    for claimed_path in locked:
+        _release_temp_ownership(claimed_path)
+# --- DALTON-HOOK(by4-relay-guard): end ---
+
+
 # DALTON-HOOK(chat-large-upload): allow incremental pulls to skip root-wide orphan sweeps
 def _sweep_orphan_staging(
-    root: str, items: list[dict[str, Any]], *, sweep_orphans: bool = True
-) -> None:
+    root: str,
+    items: list[dict[str, Any]],
+    *,
+    sweep_orphans: bool = True,
+    pack_base: str | None = None,
+) -> list[str]:
     """Remove root-level transient entries no item of this op claims.
 
     A relay upload the file API cut short, or a download the runtime died
@@ -1679,10 +1736,14 @@ def _sweep_orphan_staging(
     pass ``sweep_orphans=False`` and clean only their own temp files; full
     restores skip any transient file still locked by an active transfer.
     """
+    resolved_pack_base = pack_base if pack_base is not None else os.path.join(root, _PACK_DIR)
+    # DALTON-HOOK(by4-relay-guard): always acquire flock ownership on claimed staged files under the sweep lock
     if not sweep_orphans:
-        return
+        with _hold_sweep_lock(root, exclusive=False):
+            return _claim_staged_files(root, resolved_pack_base, items)
     claimed = {os.path.basename(i["file"]) for i in items if i.get("file")}
     with _hold_sweep_lock(root, exclusive=True):
+        locked = _claim_staged_files(root, resolved_pack_base, items)
         for name in os.listdir(root):
             if (
                 not name.startswith(_TEMP_PREFIX)
@@ -1698,6 +1759,7 @@ def _sweep_orphan_staging(
                 _rmtree_quiet(path)
             else:
                 _unlink_orphan_if_unlocked(path)
+        return locked
 
 
 def _place_staged(root: str, final: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -1958,7 +2020,10 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
     results: dict[str, dict[str, Any]] = {}
     # DALTON-HOOK(chat-large-upload): honor per-pull sweep_orphans flag
     sweep_orphans = bool(spec.get("sweep_orphans", True))
-    _sweep_orphan_staging(root, items, sweep_orphans=sweep_orphans)
+    # DALTON-HOOK(by4-relay-guard): hold flock ownership on claimed staged files until placement completes
+    locked_claimed = _sweep_orphan_staging(
+        root, items, sweep_orphans=sweep_orphans, pack_base=pack_base
+    )
     _inside.cache_clear()
 
     files: list[dict[str, Any]] = []
@@ -2019,16 +2084,20 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
 
     # Step 2: packs and files, in parallel. Packs are submitted first: each
     # is one download that fans out into many members, so it is the tail.
-    if files or packs:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pack_futures = [
-                pool.submit(_timed_pack, root, pack_base, p, timeout_s, budget)
-                for p in packs
-            ]
-            for item, res in zip(files, pool.map(lambda i: _timed(_pull_file, root, i, timeout_s, budget), files)):
-                results[item["path"]] = res
-            for fut in pack_futures:
-                results.update(fut.result())
+    # DALTON-HOOK(by4-relay-guard): release claimed staged-file flocks after file/pack placement
+    try:
+        if files or packs:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                pack_futures = [
+                    pool.submit(_timed_pack, root, pack_base, p, timeout_s, budget)
+                    for p in packs
+                ]
+                for item, res in zip(files, pool.map(lambda i: _timed(_pull_file, root, i, timeout_s, budget), files)):
+                    results[item["path"]] = res
+                for fut in pack_futures:
+                    results.update(fut.result())
+    finally:
+        _release_claimed_staged_files(locked_claimed)
 
     # Step 3: symlinks after files, so a link never shadows a file being written.
     for item in symlinks:

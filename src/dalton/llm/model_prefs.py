@@ -1458,7 +1458,7 @@ async def _validate_report_automation_route_entries(
                 auto,
                 candidate_profile,
                 via_rest=via_rest,
-                user_confirmed=user_confirmed,
+                confirmed=bool(user_confirmed),
                 action="route_update",
                 previous_groups_override=prev_route_groups if old_targets else None,
                 previous_dm_targets_override=prev_route_weixin_dms if old_targets else None,

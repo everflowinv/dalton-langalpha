@@ -25,26 +25,10 @@ import {
   formatPortfolioMoney,
   normalizePortfolioCurrency,
 } from '../../utils/portfolioSummary';
+import { RowExtraContextMenu } from '../../components/dalton/RowExtraContextMenu'; // DALTON-HOOK(watchlist)
+import { ExtendedHours } from '@/components/dalton/ExtendedHours'; // DALTON-HOOK(watchlist)
 
 type MarketStatusData = MarketStatusInput;
-/** The pre- or after-hours move under a row's change: `AH 199.10 ▲ 0.34%`. */
-function ExtendedHours({
-  label,
-  price,
-  pct,
-}: {
-  label: string;
-  price: string;
-  pct: number;
-}) {
-  return (
-    <span className="dash-ext">
-      <span className="term-label">{label}</span>
-      {price}
-      <TermChange value={pct} />
-    </span>
-  );
-}
 
 /** The watchlist's table: a row per symbol, its last price and the day's move. */
 export function WatchlistTable({ children }: { children: ReactNode }) {
@@ -87,9 +71,11 @@ interface WatchlistRowItemProps {
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
+  /** Optional extra context-menu items (DALTON-HOOK(watchlist)). */
+  extraMenuItems?: ReactNode;
 }
 
-export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: WatchlistRowItemProps) {
+export function WatchlistRowItem({ item, marketStatus, onDelete, attach, extraMenuItems }: WatchlistRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
@@ -153,6 +139,7 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
+          {extraMenuItems /* DALTON-HOOK(watchlist) */}
           <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.watchlist_item_id))}>
             <Trash2 className="h-3.5 w-3.5" />
             {t('dashboard:widgets.holdings.delete')}
@@ -161,7 +148,7 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
       </ContextMenu>
     );
   }
-  return row;
+  return <RowExtraContextMenu row={row} menuItems={extraMenuItems} />; // DALTON-HOOK(watchlist)
 }
 
 interface PortfolioRowItemProps {
@@ -172,6 +159,8 @@ interface PortfolioRowItemProps {
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
+  /** Optional extra context-menu items (DALTON-HOOK(watchlist)). */
+  extraMenuItems?: ReactNode;
 }
 
 export function PortfolioRowItem({
@@ -181,6 +170,7 @@ export function PortfolioRowItem({
   onEdit,
   onDelete,
   attach,
+  extraMenuItems,
 }: PortfolioRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -256,6 +246,7 @@ export function PortfolioRowItem({
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
+          {extraMenuItems /* DALTON-HOOK(watchlist) */}
           <ContextMenuItem onSelect={() => onEdit?.(item)}>
             <Pencil className="h-3.5 w-3.5" />
             {t('dashboard:widgets.holdings.edit')}
@@ -268,7 +259,7 @@ export function PortfolioRowItem({
       </ContextMenu>
     );
   }
-  return row;
+  return <RowExtraContextMenu row={row} menuItems={extraMenuItems} />; // DALTON-HOOK(watchlist)
 }
 
 interface HoldingsAddButtonProps {
@@ -366,7 +357,8 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
   );
 }
 
-const SKELETON_ROWS = { watchlist: 5, portfolio: 3 } as const;
+// DALTON-HOOK(watchlist): add 'coverage' skeleton row default alongside watchlist and portfolio
+const SKELETON_ROWS = { coverage: 5, watchlist: 5, portfolio: 3 } as const;
 const MAX_SKELETON_ROWS = 10;
 
 /** How many skeleton rows a list should show: as many as it held the last

@@ -2,25 +2,30 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentRoutesHandler } from "../src/agent-routes.js";
 import {
   BackendHttpError,
+  HttpBackendClient,
+  parseSseStream,
   type BackendClient,
   type ChartSnapshotItem,
   type ChartSnapshotsStatusResponse,
 } from "../src/backend-client.js";
-import type {
-  ChannelAdapter,
-  SendCardOptions,
-  SendCardResult,
-  SendFileOptions,
-  SendFileResult,
-  SendTextChunkOptions,
-  SendTextChunkResult,
-  SendTextWithFileOptions,
+import {
+  ChannelDeliveryError,
+  type ChannelAdapter,
+  type SendCardOptions,
+  type SendCardResult,
+  type SendFileOptions,
+  type SendFileResult,
+  type SendTextChunkOptions,
+  type SendTextChunkResult,
+  type SendTextWithFileOptions,
 } from "../src/channels/adapter.js";
+import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import {
   buildChartLayerDeepLink,
   buildDiscordLinkButtonRow,
   buildHtmlWidgetDeepLink,
   deliverTurnChartsAndWidgets,
+  extractRunChartsAndWidgetsFromReplay,
   FEISHU_CHART_IMAGE_MAX_BYTES,
   waitForChartSnapshotsReady,
 } from "../src/chart-snapshots.js";
@@ -2471,5 +2476,2182 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     expect(replayCallsUnfinished).toBe(1);
     expect(feishuUnfinished.sentTexts).toHaveLength(0);
     expect(feishuUnfinished.sentCards).toHaveLength(0);
+  });
+
+  it("BW2: reads target run directly by run_id beyond 500 turns and preserves pending finishing state when target run cannot be read", async () => {
+    const deepRunId = "run-auto-turn-1-of-600";
+    const execId = "exec-bw2-deep";
+
+    // 1) When replayThreadRun is available, target run at turn 1 (beyond 50 pages / 500 turns)
+    //    is read directly in 1 call without paginating replayThreadMessages, and charts are delivered.
+    const feishuDirect = makeMockAdapter("feishu");
+    const markFinishedCallsDirect: boolean[] = [];
+    const replayThreadMessagesSpy = vi.fn(async () => {
+      throw new Error("Should not paginate replayThreadMessages when replayThreadRun is available");
+    });
+    const replayThreadRunSpy = vi.fn(async (_uid: string, _tid: string, rid: string) => ({
+      status: 200,
+      isSse: true as const,
+      events: (async function* () {
+        yield {
+          event: "user_message",
+          data: JSON.stringify({ turn_index: 1, run_id: rid }),
+        };
+        yield {
+          event: "artifact",
+          data: JSON.stringify({
+            artifact_type: "chart_layer",
+            artifact_id: "layer-turn1-deep",
+            response_id: rid,
+            payload: {
+              chart_id: "NVDA:1day",
+              layer_id: "layer-turn1-deep",
+              title: "Deep Historical Chart",
+            },
+          }),
+        };
+        yield {
+          event: "replay_done",
+          data: JSON.stringify({
+            thread_id: THREAD_ID,
+            run_id: rid,
+            turn_index: 1,
+            outbound_blocked_by_run: { [rid]: false },
+          }),
+        };
+      })(),
+    }));
+
+    const directBackend = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCallsDirect.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: deepRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Deep Turn Brief",
+            finish_status: "completed",
+            final_text: "深度历史回合摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadMessages: replayThreadMessagesSpy,
+      replayThreadRun: replayThreadRunSpy,
+    });
+    const directAdapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuDirect]]);
+    const directDelivery = new DeliveryService({
+      backend: directBackend,
+      adapters: directAdapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const directRoutes = new AgentRoutesHandler({
+      backend: directBackend,
+      adapters: directAdapters,
+      deliveryService: directDelivery,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const directResp = await directRoutes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: deepRunId,
+      final_text: "深度历史回合摘要。",
+    });
+    expect(directResp.status).toBe(200);
+    expect(replayThreadRunSpy).toHaveBeenCalledTimes(1);
+    expect(replayThreadRunSpy).toHaveBeenCalledWith("user-alice", THREAD_ID, deepRunId, {
+      executionId: execId,
+    });
+    expect(replayThreadMessagesSpy).not.toHaveBeenCalled();
+    expect(JSON.stringify(feishuDirect.sentCards)).toContain("layer-turn1-deep");
+    expect(markFinishedCallsDirect).toEqual([false, true]);
+
+    // 2) When the target run cannot be read (e.g. 404 / unreachable or beyond fallback page cap),
+    //    executeAutomationRunFinish MUST keep pending recovery state (MUST NOT call mark_finished: true).
+    const feishuMissing = makeMockAdapter("feishu");
+    const markFinishedCallsMissing: boolean[] = [];
+    const missingBackend = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCallsMissing.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: "exec-bw2-missing",
+            status: "finishing" as const,
+            previous_status: "finishing" as const,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: deepRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Missing Run Brief",
+            finish_status: "completed",
+            final_text: "等待目标回合可读取。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 404,
+        isSse: false as const,
+        errorBody: { detail: "Run not found in thread" },
+      })),
+    });
+    const missingAdapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuMissing]]);
+    const missingDelivery = new DeliveryService({
+      backend: missingBackend,
+      adapters: missingAdapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const missingRoutes = new AgentRoutesHandler({
+      backend: missingBackend,
+      adapters: missingAdapters,
+      deliveryService: missingDelivery,
+      webBaseUrl: WEB_BASE,
+    });
+
+    await missingRoutes.executeAutomationRunFinish({
+      executionId: "exec-bw2-missing",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: deepRunId,
+      initialSnapshots: [],
+      outboundBlocked: false,
+      automationName: "Missing Run Brief",
+      finishStatus: "completed",
+      finalText: "等待目标回合可读取。",
+      targets: [
+        {
+          entry: "feishu:@me",
+          address: "feishu:@me",
+          name: "Feishu DM",
+          ok: true,
+          message: null,
+          agent_sent: false,
+        },
+      ],
+    });
+    expect(markFinishedCallsMissing).toEqual([]);
+  });
+
+  it("BW2: rejects truncated, replay_done-only, wrong-turn, and placeholder replays as found=false and returns retryable 503 on transient replay 503 while preserving summary idempotency", async () => {
+    const targetRunId = "run-bw2-strict-1";
+    const execId = "exec-bw2-503-retry";
+
+    // 1) Truncated stream (only target user_message, no replay_done) -> found: false, keeps finishing
+    // 2) replay_done-only with target run_id (no target turn events in page) -> found: false
+    // 3) Wrong turn's events + replay_done.run_id=targetRunId -> found: false
+    // 4) Placeholder replay (user_message + error(type=replay_unavailable) + replay_done) -> found: false
+    const invalidStreams: Array<{
+      name: string;
+      events: Array<{ event: string; data: Record<string, unknown> }>;
+    }> = [
+      {
+        name: "truncated_after_user_message",
+        events: [
+          { event: "user_message", data: { turn_index: 1, run_id: targetRunId } },
+        ],
+      },
+      {
+        name: "replay_done_only_with_run_id",
+        events: [
+          {
+            event: "replay_done",
+            data: { thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 },
+          },
+        ],
+      },
+      {
+        name: "wrong_turn_events_with_target_replay_done",
+        events: [
+          { event: "user_message", data: { turn_index: 2, run_id: "run-other-turn" } },
+          {
+            event: "message_chunk",
+            data: { turn_index: 2, response_id: "run-other-turn", content: "other" },
+          },
+          {
+            event: "replay_done",
+            data: { thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 },
+          },
+        ],
+      },
+      {
+        name: "placeholder_replay_unavailable",
+        events: [
+          { event: "user_message", data: { turn_index: 1, run_id: targetRunId } },
+          {
+            event: "error",
+            data: {
+              thread_id: THREAD_ID,
+              response_id: targetRunId,
+              type: "replay_unavailable",
+              error: "This response could not be loaded.",
+            },
+          },
+          {
+            event: "replay_done",
+            data: { thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 },
+          },
+        ],
+      },
+      {
+        name: "placeholder_stub_report_run_id_only",
+        events: [
+          { event: "user_message", data: { turn_index: 1, report_run_id: targetRunId } },
+          {
+            event: "replay_done",
+            data: { thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 },
+          },
+        ],
+      },
+      {
+        name: "placeholder_active_run_snapshot",
+        events: [
+          { event: "user_message", data: { turn_index: 1, run_id: targetRunId } },
+          {
+            event: "snapshot",
+            data: {
+              thread_id: THREAD_ID,
+              active_runs: [{ run_id: targetRunId, lane: "main" }],
+            },
+          },
+          {
+            event: "replay_done",
+            data: { thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 },
+          },
+        ],
+      },
+    ];
+
+    for (const tc of invalidStreams) {
+      const feishu = makeMockAdapter("feishu");
+      const markFinishedCalls: boolean[] = [];
+      const backend = makeMockBackend({
+        finishAutomationRun: vi.fn(async (_id, req) => {
+          markFinishedCalls.push(Boolean(req.mark_finished));
+          return {
+            status: 200,
+            data: {
+              execution_id: `exec-${tc.name}`,
+              status: "finishing" as const,
+              previous_status: "registered" as const,
+              user_id: "user-alice",
+              workspace_id: "ws-1",
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              chart_snapshots: [],
+              outbound_blocked: false,
+              automation_name: tc.name,
+              finish_status: "completed",
+              final_text: "摘要",
+              targets: [
+                {
+                  entry: "feishu:@me",
+                  address: "feishu:@me",
+                  name: "Feishu DM",
+                  ok: true,
+                  message: null,
+                  agent_sent: false,
+                },
+              ],
+            },
+          };
+        }),
+        replayThreadRun: vi.fn(async () => ({
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            for (const ev of tc.events) {
+              yield { event: ev.event, data: JSON.stringify(ev.data) };
+            }
+          })(),
+        })),
+      });
+      const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+      const delivery = new DeliveryService({ backend, adapters, webBaseUrl: WEB_BASE });
+      const routes = new AgentRoutesHandler({
+        backend,
+        adapters,
+        deliveryService: delivery,
+        webBaseUrl: WEB_BASE,
+      });
+
+      const res = await routes.handleFinishAutomationRun("user-alice", `exec-${tc.name}`, {
+        status: "completed",
+        thread_id: THREAD_ID,
+        run_id: targetRunId,
+        final_text: "摘要",
+      });
+      expect(res.status, tc.name).toBe(503);
+      expect(res.data.retryable, tc.name).toBe(true);
+      // Only claim (`mark_finished: false`) ran; `mark_finished: true` MUST NOT be called.
+      expect(markFinishedCalls, tc.name).toEqual([false]);
+    }
+
+    // 5) Transient 503 on /finish replay -> first /finish returns retryable 503 and sends summary ONCE
+    //    under idempotency key `automation:${execId}:feishu:@me:summary`; retry recovers replay 200 SSE,
+    //    deduplicates the summary delivery (no duplicate text), delivers charts, and settles `mark_finished: true`.
+    const feishuRetry = makeMockAdapter("feishu");
+    let replayAttempt = 0;
+    const markFinishedRetry: boolean[] = [];
+    const settledDeliveryKeys = new Set<string>();
+    const claimedSummaryKeys: string[] = [];
+
+    const retryBackend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (req.delivery_key.endsWith(":summary")) {
+          claimedSummaryKeys.push(req.delivery_key);
+        }
+        if (settledDeliveryKeys.has(req.delivery_key)) {
+          return {
+            claim_status: "already_completed" as const,
+            status: "sent" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: 1,
+            first_response_json: {
+              status: "sent",
+              code: null,
+              address: "feishu:@me",
+              current: false,
+              duplicate: true,
+              message: "already sent",
+              files: [],
+            },
+          };
+        }
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: false,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status === "sent") {
+          settledDeliveryKeys.add(req.delivery_key);
+        }
+        return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "sent", sent_to_current_count: 1 };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedRetry.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Retryable 503 Brief",
+            finish_status: "completed",
+            final_text: "定时任务摘要正文。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => {
+        replayAttempt += 1;
+        if (replayAttempt === 1) {
+          return {
+            status: 503,
+            isSse: false as const,
+            errorBody: { detail: "Database temporarily unavailable" },
+          };
+        }
+        return {
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            yield {
+              event: "user_message",
+              data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "chart_layer",
+                artifact_id: "layer-after-503",
+                response_id: targetRunId,
+                payload: {
+                  chart_id: "NVDA:1day",
+                  layer_id: "layer-after-503",
+                  title: "Recovered After 503",
+                },
+              }),
+            };
+            yield {
+              event: "replay_done",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: targetRunId,
+                turn_index: 1,
+                outbound_blocked_by_run: { [targetRunId]: false },
+              }),
+            };
+          })(),
+        };
+      }),
+    });
+
+    const retryAdapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuRetry]]);
+    const retryDelivery = new DeliveryService({
+      backend: retryBackend,
+      adapters: retryAdapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const retryRoutes = new AgentRoutesHandler({
+      backend: retryBackend,
+      adapters: retryAdapters,
+      deliveryService: retryDelivery,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const firstFinish = await retryRoutes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "定时任务摘要正文。",
+    });
+    expect(firstFinish.status).toBe(503);
+    expect(firstFinish.data.retryable).toBe(true);
+    expect(markFinishedRetry).toEqual([false]);
+    expect(feishuRetry.sentTexts).toHaveLength(1);
+    expect(feishuRetry.sentCards).toHaveLength(0);
+
+    const secondFinish = await retryRoutes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "定时任务摘要正文。",
+    });
+    expect(secondFinish.status).toBe(200);
+    expect(markFinishedRetry).toEqual([false, false, true]);
+    // Same idempotency key used on both attempts; summary was sent ONLY ONCE!
+    expect(claimedSummaryKeys).toEqual([
+      `automation:${execId}:feishu:@me:summary`,
+      `automation:${execId}:feishu:@me:summary`,
+    ]);
+    expect(feishuRetry.sentTexts).toHaveLength(1);
+    expect(JSON.stringify(feishuRetry.sentCards)).toContain("layer-after-503");
+  });
+
+  it("BW2: does NOT claim :charts key when replay returns 503 with non-empty chart_snapshots; delivers snapshots + replay widgets/layers together once replay succeeds", async () => {
+    const targetRunId = "run-bw2-nonempty-snaps-503";
+    const execId = "exec-bw2-nonempty-snaps-503";
+    const feishu = makeMockAdapter("feishu");
+    let replayAttempt = 0;
+    const claimedChartKeys: string[] = [];
+    const claimedSummaryKeys: string[] = [];
+    const settledKeys = new Set<string>();
+    const markFinishedCalls: boolean[] = [];
+
+    const initialSnapshots: ChartSnapshotItem[] = [
+      {
+        status: "ready",
+        chart_id: "NVDA:1day",
+        layer_id: "layer-snap-initial-1",
+        title: "Initial Ready Snapshot",
+        snapshot_key: SNAP_KEY,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (req.delivery_key.endsWith(":charts")) {
+          claimedChartKeys.push(req.delivery_key);
+        }
+        if (req.delivery_key.endsWith(":summary")) {
+          claimedSummaryKeys.push(req.delivery_key);
+        }
+        if (settledKeys.has(req.delivery_key)) {
+          return {
+            claim_status: "already_completed" as const,
+            status: "sent" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: 1,
+            first_response_json: {
+              status: "sent",
+              code: null,
+              address: "feishu:@me",
+              current: false,
+              duplicate: true,
+              message: "already sent",
+              files: [],
+            },
+          };
+        }
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: false,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status === "sent" || req.status === "partial") {
+          settledKeys.add(req.delivery_key);
+        }
+        return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "sent", sent_to_current_count: 1 };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCalls.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: initialSnapshots,
+            outbound_blocked: false,
+            automation_name: "Non-Empty Snapshots 503 Brief",
+            finish_status: "completed",
+            final_text: "含预设快照的定时摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => {
+        replayAttempt += 1;
+        if (replayAttempt === 1) {
+          return {
+            status: 503,
+            isSse: false as const,
+            errorBody: { detail: "Replay temporarily unavailable" },
+          };
+        }
+        return {
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            yield {
+              event: "user_message",
+              data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "chart_layer",
+                artifact_id: "layer-replay-only-2",
+                response_id: targetRunId,
+                payload: {
+                  chart_id: "AAPL:1day",
+                  layer_id: "layer-replay-only-2",
+                  title: "Replay Only Chart",
+                },
+              }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "html_widget",
+                artifact_id: "widget-replay-only-1",
+                response_id: targetRunId,
+                payload: { title: "Replay Only Widget" },
+              }),
+            };
+            yield {
+              event: "replay_done",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: targetRunId,
+                turn_index: 1,
+                outbound_blocked_by_run: { [targetRunId]: false },
+              }),
+            };
+          })(),
+        };
+      }),
+    });
+
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const deliveryService = new DeliveryService({ backend, adapters, webBaseUrl: WEB_BASE });
+    const routes = new AgentRoutesHandler({ backend, adapters, deliveryService, webBaseUrl: WEB_BASE });
+
+    // Attempt 1: replay returns 503 while chart_snapshots is NON-EMPTY ->
+    // summary is sent once, :charts key MUST NOT be claimed, zero chart/widget cards sent, returns 503.
+    const res1 = await routes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "含预设快照的定时摘要。",
+    });
+    expect(res1.status).toBe(503);
+    expect(res1.data.retryable).toBe(true);
+    expect(markFinishedCalls).toEqual([false]);
+    expect(claimedSummaryKeys).toEqual([`automation:${execId}:feishu:@me:summary`]);
+    expect(claimedChartKeys).toEqual([]);
+    expect(feishu.sentTexts).toHaveLength(1);
+    expect(feishu.sentCards).toHaveLength(0);
+
+    // Attempt 2: replay succeeds -> summary deduped (still 1 text), :charts claimed ONCE,
+    // delivering BOTH initial snapshot (layer-snap-initial-1) AND replay layer + html_widget together!
+    const res2 = await routes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "含预设快照的定时摘要。",
+    });
+    expect(res2.status).toBe(200);
+    expect(markFinishedCalls).toEqual([false, false, true]);
+    expect(claimedChartKeys).toEqual([`automation:${execId}:feishu:@me:charts`]);
+    expect(feishu.sentTexts).toHaveLength(1);
+    const cardsJson = JSON.stringify(feishu.sentCards);
+    expect(cardsJson).toContain("layer-snap-initial-1");
+    expect(cardsJson).toContain("layer-replay-only-2");
+    expect(cardsJson).toContain("widget-replay-only-1");
+  });
+
+  it("BW2: rejects raw SSE stream truncated before replay_done blank-line terminator, and settles permanent 403 refusal without 503 retry loop", async () => {
+    const targetRunId = "run-bw2-raw-sse-trunc";
+
+    const makeRawStream = (raw: string): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(raw));
+          controller.close();
+        },
+      });
+
+    // 1) Truncated raw SSE byte stream: `replay_done` lacks the blank-line frame terminator (`\n\n`)
+    const truncatedRaw = [
+      "id: 1",
+      "event: user_message",
+      `data: ${JSON.stringify({ turn_index: 1, run_id: targetRunId })}`,
+      "",
+      "id: 2",
+      "event: replay_done",
+      `data: ${JSON.stringify({ thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 })}`,
+      "", // single trailing newline only — NO blank line terminating the SSE frame!
+    ].join("\n");
+
+    const truncBackend = makeMockBackend({
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: parseSseStream(makeRawStream(truncatedRaw)),
+      })),
+    });
+    const truncRes = await extractRunChartsAndWidgetsFromReplay({
+      backend: truncBackend,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      targetRunId,
+      executionId: "exec-raw-trunc",
+    });
+    expect(truncRes.found).toBe(false);
+    expect(truncRes.retryable).toBe(true);
+
+    // Same payload WITH proper blank-line terminator (`\n\n`) is accepted as found=true
+    const completeBackend = makeMockBackend({
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: parseSseStream(makeRawStream(`${truncatedRaw}\n`)),
+      })),
+    });
+    const okRes = await extractRunChartsAndWidgetsFromReplay({
+      backend: completeBackend,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      targetRunId,
+      executionId: "exec-raw-ok",
+    });
+    expect(okRes.found).toBe(true);
+
+    // 2) Sole target platform disabled -> replay returns permanent 403 -> /finish MUST settle
+    //    according to target permissions (`mark_finished: true`, HTTP 200) instead of returning 503.
+    const exec403 = "exec-bw2-403-disabled";
+    const feishu403 = makeMockAdapter("feishu");
+    const markFinished403: boolean[] = [];
+    const claimedChartKeys403: string[] = [];
+    const backend403 = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (req.delivery_key.endsWith(":charts")) {
+          claimedChartKeys403.push(req.delivery_key);
+        }
+        return {
+          claim_status: "denied" as const,
+          status: "failed" as const,
+          code: "not_allowed" as const,
+          message: "Channel platform capability channel_feishu is disabled.",
+        };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinished403.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: exec403,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [
+              {
+                status: "ready",
+                chart_id: "NVDA:1day",
+                layer_id: "layer-403-1",
+                title: "Blocked Chart",
+                snapshot_key: SNAP_KEY,
+              },
+            ],
+            outbound_blocked: false,
+            automation_name: "Disabled Platform Brief",
+            finish_status: "completed",
+            final_text: "平台已关闭的摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 403,
+        isSse: false as const,
+        errorBody: { detail: "Channel platform capability is disabled" },
+      })),
+    });
+    const adapters403 = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu403]]);
+    const delivery403 = new DeliveryService({ backend: backend403, adapters: adapters403, webBaseUrl: WEB_BASE });
+    const routes403 = new AgentRoutesHandler({ backend: backend403, adapters: adapters403, deliveryService: delivery403, webBaseUrl: WEB_BASE });
+
+    const res403 = await routes403.handleFinishAutomationRun("user-alice", exec403, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "平台已关闭的摘要。",
+    });
+    expect(res403.status).toBe(200);
+    expect(markFinished403).toEqual([false, true]);
+    expect(claimedChartKeys403).toEqual([]);
+    expect(res403.data.targets).toHaveLength(1);
+    expect(res403.data.targets?.[0]?.reached).toBe(false);
+    expect(feishu403.sentTexts).toHaveLength(0);
+    expect(feishu403.sentCards).toHaveLength(0);
+  });
+
+  it("BW2: concurrent /finish calls acquire execution lock before I-8 and second caller seeing in-flight :charts returns retryable 503 without marking finished", async () => {
+    const targetRunId = "run-bw2-concurrent-finish";
+    const execId = "exec-bw2-concurrent-finish";
+
+    // Part A: Same gateway process — two concurrent `/finish` calls arrive BEFORE first I-8 returns.
+    // Call 1 acquires `activeFinishExecutors` synchronously before awaiting I-8; Call 2 hits the
+    // in-process lock, returns retryable 503, and NEVER writes `mark_finished: true`.
+    const feishuSameProc = makeMockAdapter("feishu");
+    let releaseFirstI8!: () => void;
+    const firstI8Started = new Promise<void>((resolve) => {
+      // resolved when first I-8 enters
+      (globalThis as Record<string, unknown>).__bw2Start = resolve;
+    });
+    const firstI8Gate = new Promise<void>((resolve) => {
+      releaseFirstI8 = resolve;
+    });
+    let i8CallCount = 0;
+    const markFinishedSameProc: boolean[] = [];
+    let dbStatusSameProc: "registered" | "finishing" | "finished" = "registered";
+
+    const backendSameProc = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        i8CallCount += 1;
+        const callIdx = i8CallCount;
+        markFinishedSameProc.push(Boolean(req.mark_finished));
+        if (callIdx === 1) {
+          (
+            (globalThis as Record<string, unknown>).__bw2Start as () => void
+          )();
+          await firstI8Gate;
+        }
+        const prev = dbStatusSameProc;
+        if (req.mark_finished) {
+          dbStatusSameProc = "finished";
+        } else if (dbStatusSameProc === "registered") {
+          dbStatusSameProc = "finishing";
+        }
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: dbStatusSameProc,
+            previous_status: prev,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Concurrent Same-Process Brief",
+            finish_status: "completed",
+            final_text: "同进程并发摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: (async function* () {
+          yield {
+            event: "user_message",
+            data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+          };
+          yield {
+            event: "artifact",
+            data: JSON.stringify({
+              artifact_type: "chart_layer",
+              artifact_id: "layer-concurrent-a",
+              response_id: targetRunId,
+              payload: {
+                chart_id: "NVDA:1day",
+                layer_id: "layer-concurrent-a",
+                title: "Concurrent Chart A",
+              },
+            }),
+          };
+          yield {
+            event: "replay_done",
+            data: JSON.stringify({
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              turn_index: 1,
+              outbound_blocked_by_run: { [targetRunId]: false },
+            }),
+          };
+        })(),
+      })),
+    });
+
+    const adaptersSameProc = new Map<ChannelPlatform, ChannelAdapter>([
+      ["feishu", feishuSameProc],
+    ]);
+    const deliverySameProc = new DeliveryService({
+      backend: backendSameProc,
+      adapters: adaptersSameProc,
+      webBaseUrl: WEB_BASE,
+    });
+    const routesSameProc = new AgentRoutesHandler({
+      backend: backendSameProc,
+      adapters: adaptersSameProc,
+      deliveryService: deliverySameProc,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const reqBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "同进程并发摘要。",
+    };
+    const p1 = routesSameProc.handleFinishAutomationRun("user-alice", execId, reqBody);
+    await firstI8Started;
+    // Second `/finish` arrives BEFORE first I-8 returns:
+    const res2SameProc = await routesSameProc.handleFinishAutomationRun(
+      "user-alice",
+      execId,
+      reqBody,
+    );
+    expect(res2SameProc.status).toBe(503);
+    expect(res2SameProc.data.retryable).toBe(true);
+    expect(dbStatusSameProc).toBe("finishing");
+    expect(markFinishedSameProc.filter(Boolean)).toHaveLength(0);
+
+    // Now release first I-8: Call 1 finishes charts and marks `finished` ONCE.
+    releaseFirstI8();
+    const res1SameProc = await p1;
+    expect(res1SameProc.status).toBe(200);
+    expect(dbStatusSameProc).toBe("finished");
+    expect(markFinishedSameProc.filter(Boolean)).toHaveLength(1);
+    expect(feishuSameProc.sentCards).toHaveLength(1);
+
+    // Part B: Two separate gateway instances (no shared `activeFinishExecutors`):
+    // Instance A holds `automation:${execId}:feishu:@me:charts` as `in_flight` while sending.
+    // Instance B arrives concurrently, sees `:charts` still `in_flight`, MUST return retryable 503,
+    // and MUST NOT call `mark_finished: true` (DB stays `finishing`).
+    const execIdCross = "exec-bw2-concurrent-cross-proc";
+    let releaseChartSend!: () => void;
+    let notifyChartSendStarted!: () => void;
+    const chartSendStarted = new Promise<void>((resolve) => {
+      notifyChartSendStarted = resolve;
+    });
+    const chartSendGate = new Promise<void>((resolve) => {
+      releaseChartSend = resolve;
+    });
+
+    const feishuA = makeMockAdapter("feishu");
+    const origSendCardA = feishuA.sendCard!.bind(feishuA);
+    feishuA.sendCard = vi.fn(async (opts) => {
+      notifyChartSendStarted();
+      await chartSendGate;
+      return origSendCardA(opts);
+    });
+    const feishuB = makeMockAdapter("feishu");
+
+    const deliveryStates = new Map<string, "in_flight" | "sent">();
+    let dbStatusCross: "registered" | "finishing" | "finished" = "registered";
+    const markFinishedByCaller: string[] = [];
+
+    const makeCrossBackend = (callerTag: string): BackendClient =>
+      makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async (req) => {
+          const st = deliveryStates.get(req.delivery_key);
+          if (st === "sent") {
+            return {
+              claim_status: "already_completed" as const,
+              status: "sent" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: false,
+              delivery_attempt: 1,
+              first_response_json: {
+                status: "sent",
+                code: null,
+                address: "feishu:@me",
+                current: false,
+                duplicate: true,
+                message: "already sent",
+                files: [],
+              },
+            };
+          }
+          if (st === "in_flight") {
+            return {
+              claim_status: "in_flight_or_unknown" as const,
+              status: "unknown" as const,
+              existing_status: "in_flight" as const,
+              code: "in_flight" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: false,
+              delivery_attempt: 1,
+            };
+          }
+          deliveryStates.set(req.delivery_key, "in_flight");
+          return {
+            claim_status: "claimed" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            recipient_id: "ou_alice",
+            dm_recipient_platform_user_id: "ou_alice",
+            is_current: false,
+            delivery_attempt: 1,
+          };
+        }),
+        updateDeliveryProgress: vi.fn(async (req) => {
+          if (req.status === "sent" || req.status === "partial") {
+            deliveryStates.set(req.delivery_key, "sent");
+          }
+          return {
+            ok: true,
+            delivery_key: req.delivery_key,
+            status: req.status ?? "sent",
+            sent_to_current_count: 1,
+          };
+        }),
+        finishAutomationRun: vi.fn(async (_id, req) => {
+          const prev = dbStatusCross;
+          if (req.mark_finished) {
+            markFinishedByCaller.push(callerTag);
+            // Mirror DB guard: never transition while `:charts` is `in_flight`, and only once.
+            const hasInFlightCharts = [...deliveryStates.entries()].some(
+              ([k, v]) =>
+                k.startsWith(`automation:${execIdCross}:`) &&
+                k.endsWith(":charts") &&
+                v === "in_flight",
+            );
+            if (!hasInFlightCharts && dbStatusCross !== "finished") {
+              dbStatusCross = "finished";
+            }
+          } else if (dbStatusCross === "registered") {
+            dbStatusCross = "finishing";
+          }
+          return {
+            status: 200,
+            data: {
+              execution_id: execIdCross,
+              status: dbStatusCross,
+              previous_status: prev,
+              user_id: "user-alice",
+              workspace_id: "ws-1",
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              chart_snapshots: [],
+              outbound_blocked: false,
+              automation_name: "Concurrent Cross-Process Brief",
+              finish_status: "completed",
+              final_text: "跨进程并发摘要。",
+              targets: [
+                {
+                  entry: "feishu:@me",
+                  address: "feishu:@me",
+                  name: "Feishu DM",
+                  ok: true,
+                  message: null,
+                  agent_sent: false,
+                },
+              ],
+            },
+          };
+        }),
+        replayThreadRun: vi.fn(async () => ({
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            yield {
+              event: "user_message",
+              data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "chart_layer",
+                artifact_id: "layer-concurrent-cross",
+                response_id: targetRunId,
+                payload: {
+                  chart_id: "NVDA:1day",
+                  layer_id: "layer-concurrent-cross",
+                  title: "Concurrent Cross Chart",
+                },
+              }),
+            };
+            yield {
+              event: "replay_done",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: targetRunId,
+                turn_index: 1,
+                outbound_blocked_by_run: { [targetRunId]: false },
+              }),
+            };
+          })(),
+        })),
+      });
+
+    const backendA = makeCrossBackend("A");
+    const backendB = makeCrossBackend("B");
+    const adaptersA = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuA]]);
+    const adaptersB = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuB]]);
+    const routesA = new AgentRoutesHandler({
+      backend: backendA,
+      adapters: adaptersA,
+      deliveryService: new DeliveryService({ backend: backendA, adapters: adaptersA, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+    const routesB = new AgentRoutesHandler({
+      backend: backendB,
+      adapters: adaptersB,
+      deliveryService: new DeliveryService({ backend: backendB, adapters: adaptersB, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const crossBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "跨进程并发摘要。",
+    };
+    const pA = routesA.handleFinishAutomationRun("user-alice", execIdCross, crossBody);
+    await chartSendStarted;
+
+    // While Instance A's `:charts` key is `in_flight`, Instance B runs `/finish`:
+    const resB = await routesB.handleFinishAutomationRun("user-alice", execIdCross, crossBody);
+    expect(resB.status).toBe(503);
+    expect(resB.data.retryable).toBe(true);
+    expect(dbStatusCross).toBe("finishing");
+    expect(markFinishedByCaller).toEqual([]);
+    expect(feishuB.sentCards).toHaveLength(0);
+
+    // Release Instance A's chart send -> Instance A finishes and writes `finished` ONCE.
+    releaseChartSend();
+    const resA = await pA;
+    expect(resA.status).toBe(200);
+    expect(dbStatusCross).toBe("finished");
+    expect(markFinishedByCaller).toEqual(["A"]);
+    expect(feishuA.sentCards).toHaveLength(1);
+    expect(feishuA.sentTexts).toHaveLength(1);
+  });
+
+  it("BW2: Weixin chart/widget delivery passes target platform to I-7 so HttpBackendClient attaches X-Gateway-Epoch and writes receipt under valid lease", async () => {
+    const weixin = makeMockAdapter("weixin");
+    const seenRequests: Array<{
+      url: string;
+      epoch: string | null;
+      body: Record<string, unknown> | null;
+    }> = [];
+    const onStaleGatewayEpoch = vi.fn();
+
+    const httpBackend = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: "test-svc-token",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        const headers = new Headers(init?.headers);
+        const epoch = headers.get("x-gateway-epoch");
+        const body =
+          typeof init?.body === "string"
+            ? (JSON.parse(init.body) as Record<string, unknown>)
+            : null;
+        seenRequests.push({ url, epoch, body });
+
+        if (url.endsWith("/internal/deliveries/authorize-and-claim")) {
+          if (epoch !== "7") {
+            return new Response(
+              JSON.stringify({ detail: "stale_gateway_epoch" }),
+              { status: 409, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              claim_status: "claimed",
+              delivery_key: body?.delivery_key,
+              delivery_attempt: 1,
+              platform: "weixin",
+              target_address: "weixin:@me",
+              recipient_id: "wx_user_1",
+              dm_recipient_platform_user_id: "wx_user_1",
+              is_current: true,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        if (url.endsWith("/preflight-send")) {
+          if (epoch !== "7") {
+            return new Response(
+              JSON.stringify({ detail: "stale_gateway_epoch" }),
+              { status: 409, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              authorized: true,
+              account_id: "wx-acct-1",
+              bot_token: "wx-bot-tok",
+              base_url: "https://ilink.example.com",
+              peer_id: "wx_user_1",
+              context_token: "ctx-tok-1",
+              bot_generation: 1,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        if (url.endsWith("/internal/deliveries/progress")) {
+          if (epoch !== "7") {
+            return new Response(
+              JSON.stringify({ detail: "stale_gateway_epoch" }),
+              { status: 409, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              delivery_key: body?.delivery_key,
+              status: body?.status ?? "sent",
+              sent_to_current_count: 1,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    httpBackend.setGatewayEpoch(7);
+    httpBackend.setOnStaleGatewayEpoch(onStaleGatewayEpoch);
+
+    const res = await deliverTurnChartsAndWidgets({
+      backend: httpBackend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["weixin", weixin]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-bw2-wx-epoch",
+      platform: "weixin",
+      targetAddress: "weixin:@me",
+      outboundBlocked: true,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-wx-1", title: "NVDA" }],
+      widgets: [{ artifactId: "widget-wx-1", title: "Widget" }],
+    });
+
+    expect(res.settled).toBe(true);
+    expect(res.delivered).toBe(true);
+    expect(res.inFlight).toBe(false);
+    expect(res.sentLinks).toBe(2);
+    expect(weixin.sentTexts).toHaveLength(2);
+    expect(onStaleGatewayEpoch).not.toHaveBeenCalled();
+
+    const progressReq = seenRequests.find((r) =>
+      r.url.endsWith("/internal/deliveries/progress"),
+    );
+    expect(progressReq).toBeDefined();
+    expect(progressReq?.epoch).toBe("7");
+    expect(progressReq?.body).toMatchObject({
+      delivery_key: "charts:run-bw2-wx-epoch",
+      status: "sent",
+      outcome: "sent",
+      sent_chunks: 2,
+      total_chunks: 2,
+      delivery_attempt: 1,
+    });
+    expect(Array.isArray(progressReq?.body?.platform_message_ids)).toBe(true);
+    expect((progressReq?.body?.platform_message_ids as string[]).length).toBe(2);
+  });
+
+  it("BW2: transient I-7 failure preserves pending receipt and retries I-7 with same delivery_attempt on next /finish without resending platform message", async () => {
+    const targetRunId = "run-bw2-i7-retry";
+    const execId = "exec-bw2-i7-retry";
+    const chartsKey = `automation:${execId}:feishu:@me:charts`;
+    const feishu = makeMockAdapter("feishu");
+
+    const deliveryStates = new Map<string, "in_flight" | "sent">();
+    const deliveryAttempts = new Map<string, number>();
+    let dbStatus: "registered" | "finishing" | "finished" = "registered";
+    let chartsI7Calls = 0;
+    const seenChartsI7Bodies: Array<Record<string, unknown>> = [];
+    const markFinishedCalls: Array<Record<string, unknown>> = [];
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const st = deliveryStates.get(req.delivery_key);
+        const attempt = deliveryAttempts.get(req.delivery_key) ?? 1;
+        if (st === "sent") {
+          return {
+            claim_status: "already_completed" as const,
+            status: "sent" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: attempt,
+            first_response_json: {
+              status: "sent",
+              code: null,
+              address: "feishu:@me",
+              current: false,
+              duplicate: true,
+              message: "already sent",
+              files: [],
+            },
+          };
+        }
+        if (st === "in_flight") {
+          return {
+            claim_status: "in_flight_or_unknown" as const,
+            status: "unknown" as const,
+            existing_status: "in_flight" as const,
+            code: "in_flight" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: attempt,
+          };
+        }
+        deliveryStates.set(req.delivery_key, "in_flight");
+        deliveryAttempts.set(req.delivery_key, 1);
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: false,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.delivery_key === chartsKey) {
+          chartsI7Calls += 1;
+          seenChartsI7Bodies.push({ ...req });
+          if (chartsI7Calls === 1) {
+            throw new BackendHttpError("I-7 transient 503", 503, {
+              detail: "temporary backend unavailable",
+            });
+          }
+        }
+        if (req.status === "sent" || req.status === "partial") {
+          deliveryStates.set(req.delivery_key, "sent");
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "sent",
+          sent_to_current_count: 1,
+        };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        const prev = dbStatus;
+        if (req.mark_finished) {
+          markFinishedCalls.push({ ...req });
+          if (deliveryStates.get(chartsKey) !== "in_flight") {
+            dbStatus = "finished";
+          }
+        } else if (dbStatus === "registered") {
+          dbStatus = "finishing";
+        }
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: dbStatus,
+            previous_status: prev,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "I-7 Retry Brief",
+            finish_status: "completed",
+            final_text: "",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: (async function* () {
+          yield {
+            event: "user_message",
+            data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+          };
+          yield {
+            event: "artifact",
+            data: JSON.stringify({
+              artifact_type: "chart_layer",
+              artifact_id: "layer-i7-retry",
+              response_id: targetRunId,
+              payload: {
+                chart_id: "NVDA:1day",
+                layer_id: "layer-i7-retry",
+                title: "Retry Chart",
+              },
+            }),
+          };
+          yield {
+            event: "replay_done",
+            data: JSON.stringify({
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              turn_index: 1,
+              outbound_blocked_by_run: { [targetRunId]: false },
+            }),
+          };
+        })(),
+      })),
+    });
+
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const routes = new AgentRoutesHandler({
+      backend,
+      adapters,
+      deliveryService: new DeliveryService({ backend, adapters, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const reqBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "",
+    };
+
+    // Attempt 1: chart card sent once, I-7 fails with 503 -> stays in_flight, no mark_finished, returns retryable 503.
+    const res1 = await routes.handleFinishAutomationRun("user-alice", execId, reqBody);
+    expect(res1.status).toBe(503);
+    expect(res1.data.retryable).toBe(true);
+    expect(feishu.sentCards).toHaveLength(1);
+    expect(deliveryStates.get(chartsKey)).toBe("in_flight");
+    expect(dbStatus).toBe("finishing");
+    expect(markFinishedCalls).toHaveLength(0);
+
+    // Attempt 2: retries I-7 with the exact same delivery_attempt and platform_message_ids,
+    // does NOT resend the Feishu card, settles DB to `finished` with `reached: true`.
+    const res2 = await routes.handleFinishAutomationRun("user-alice", execId, reqBody);
+    expect(res2.status).toBe(200);
+    expect(feishu.sentCards).toHaveLength(1);
+    expect(chartsI7Calls).toBe(2);
+    expect(seenChartsI7Bodies[1]).toEqual(seenChartsI7Bodies[0]);
+    expect(seenChartsI7Bodies[1]?.delivery_attempt).toBe(1);
+    expect(deliveryStates.get(chartsKey)).toBe("sent");
+    expect(dbStatus).toBe("finished");
+    expect(markFinishedCalls).toHaveLength(1);
+    expect(res2.data.targets).toEqual([
+      expect.objectContaining({
+        entry: "feishu:@me",
+        reached: true,
+        via: "fallback",
+        error: null,
+      }),
+    ]);
+  });
+
+  it("BW2: charts-only automation retry after I-7 already recorded sent restores reached=true from I-6 settled status", async () => {
+    const targetRunId = "run-bw2-charts-only-already-completed";
+    const execId = "exec-bw2-charts-only-already-completed";
+    const chartsKey = `automation:${execId}:feishu:@me:charts`;
+    const feishu = makeMockAdapter("feishu");
+
+    const deliveryStates = new Map<string, "in_flight" | "sent">();
+    let dbStatus: "registered" | "finishing" | "finished" = "registered";
+    let markFinishedAttempts = 0;
+    let persistedTargets: Array<Record<string, unknown>> | null = null;
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (deliveryStates.get(req.delivery_key) === "sent") {
+          return {
+            claim_status: "already_completed" as const,
+            status: "sent" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: 1,
+          };
+        }
+        deliveryStates.set(req.delivery_key, "in_flight");
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: false,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status === "sent" || req.status === "partial") {
+          deliveryStates.set(req.delivery_key, "sent");
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "sent",
+          sent_to_current_count: 1,
+        };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        const prev = dbStatus;
+        if (req.mark_finished) {
+          markFinishedAttempts += 1;
+          if (markFinishedAttempts === 1) {
+            throw new BackendHttpError("I-8 transient 503", 503, {
+              detail: "temporary backend unavailable",
+            });
+          }
+          dbStatus = "finished";
+          persistedTargets = (req.targets ?? []) as Array<Record<string, unknown>>;
+        } else if (dbStatus === "registered") {
+          dbStatus = "finishing";
+        }
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: dbStatus,
+            previous_status: prev,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Charts Only Brief",
+            finish_status: "completed",
+            final_text: "",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: (async function* () {
+          yield {
+            event: "user_message",
+            data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+          };
+          yield {
+            event: "artifact",
+            data: JSON.stringify({
+              artifact_type: "chart_layer",
+              artifact_id: "layer-charts-only",
+              response_id: targetRunId,
+              payload: {
+                chart_id: "NVDA:1day",
+                layer_id: "layer-charts-only",
+                title: "Charts Only",
+              },
+            }),
+          };
+          yield {
+            event: "replay_done",
+            data: JSON.stringify({
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              turn_index: 1,
+              outbound_blocked_by_run: { [targetRunId]: false },
+            }),
+          };
+        })(),
+      })),
+    });
+
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const routes = new AgentRoutesHandler({
+      backend,
+      adapters,
+      deliveryService: new DeliveryService({ backend, adapters, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const reqBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "",
+    };
+
+    // Attempt 1: chart sent + I-7 writes `sent`, then I-8 mark_finished fails transiently.
+    await expect(
+      routes.handleFinishAutomationRun("user-alice", execId, reqBody),
+    ).rejects.toThrow(/I-8 transient 503/);
+    expect(deliveryStates.get(chartsKey)).toBe("sent");
+    expect(dbStatus).toBe("finishing");
+    expect(feishu.sentCards).toHaveLength(1);
+
+    // Attempt 2: I-6 returns `already_completed` (`status: "sent"`) with 0 new sends ->
+    // MUST restore `reached: true, via: "fallback"` and persist it on I-8 instead of `reached: false`.
+    const res2 = await routes.handleFinishAutomationRun("user-alice", execId, reqBody);
+    expect(res2.status).toBe(200);
+    expect(feishu.sentCards).toHaveLength(1);
+    expect(dbStatus).toBe("finished");
+    expect(persistedTargets).toEqual([
+      expect.objectContaining({
+        entry: "feishu:@me",
+        reached: true,
+        via: "fallback",
+        error: null,
+      }),
+    ]);
+    expect(res2.data.targets).toEqual([
+      expect.objectContaining({
+        entry: "feishu:@me",
+        reached: true,
+        via: "fallback",
+        error: null,
+      }),
+    ]);
+  });
+
+  it("preserves unknown delivery outcome without resending link-only card when Feishu 200621 fallback times out", async () => {
+    let createCalls = 0;
+    const fakeLarkClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_snap_1" })),
+        },
+        message: {
+          create: vi.fn(async () => {
+            createCalls += 1;
+            if (createCalls === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            const timeoutErr = Object.assign(new Error("socket hang up"), {
+              code: "ETIMEDOUT",
+            });
+            throw timeoutErr;
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeLarkClient,
+    });
+    const sendCardSpy = vi.spyOn(feishu, "sendCard");
+
+    const backend = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const result = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-200621-timeout",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    // Must NOT resend a second link-only card after uncertain fallback outcome
+    expect(sendCardSpy).toHaveBeenCalledTimes(1);
+    expect(createCalls).toBe(2); // 1 initial (200621) + 1 fallback (ETIMEDOUT)
+    expect(result.settled).toBe(false);
+    expect(result.delivered).toBe(false);
+    expect(result.uncertain).toBe(true);
+    expect(result.sentImages).toBe(0);
+    expect(result.sentLinks).toBe(0);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-200621-timeout",
+        status: "unknown",
+        outcome: "unknown",
+        sent_chunks: 0,
+      }),
+      { platform: "feishu" },
+    );
+
+    // Confirmed undelivered error (`outcome: "failed"`) STILL degrades to link-only card
+    const adapterFailed = makeMockAdapter("feishu");
+    let failedAttempts = 0;
+    adapterFailed.sendCard = vi.fn(async (opts: SendCardOptions): Promise<SendCardResult> => {
+      failedAttempts += 1;
+      if (failedAttempts === 1) {
+        throw new ChannelDeliveryError("confirmed upload failure", {
+          outcome: "failed",
+          code: "unavailable",
+        });
+      }
+      adapterFailed.sentCards.push(opts);
+      return { messageId: "om_link_after_fail", resolvedAddress: opts.targetAddress };
+    });
+    const backend2 = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+    const degradedRes = await deliverTurnChartsAndWidgets({
+      backend: backend2,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapterFailed]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-confirmed-fail",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(failedAttempts).toBe(2);
+    expect(degradedRes.settled).toBe(true);
+    expect(degradedRes.sentImages).toBe(0);
+    expect(degradedRes.sentLinks).toBe(1);
+  });
+
+  it("accounts Feishu chart card 200621 markdown fallback accurately and embeds verified chart link", async () => {
+    const sentPayloads: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const fakeLarkClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_chart_fb_1" })),
+        },
+        message: {
+          create: vi.fn(async (req: { data?: { content?: string } }) => {
+            attempt += 1;
+            if (req.data?.content) {
+              sentPayloads.push(JSON.parse(req.data.content));
+            }
+            if (attempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_fb_ok" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeLarkClient,
+    });
+    const backend = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const expectedUrl = buildChartLayerDeepLink(
+      WEB_BASE,
+      THREAD_ID,
+      "NVDA:1day",
+      "layer-1",
+    )!;
+    const resWithLink = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-with-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    // Fallback card dropped the image, wrote the verified chart link into markdown,
+    // settled as `partial` with the messageId, and accounted as sentLinks=1 (not sentImages=1).
+    expect(resWithLink.settled).toBe(true);
+    expect(resWithLink.delivered).toBe(true);
+    expect(resWithLink.sentImages).toBe(0);
+    expect(resWithLink.sentLinks).toBe(1);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-with-link",
+        status: "partial",
+        outcome: "partial",
+        sent_chunks: 1,
+        platform_message_ids: ["om_chart_fb_ok"],
+      }),
+      { platform: "feishu" },
+    );
+    expect(sentPayloads).toHaveLength(2);
+    const fallbackEl = (
+      sentPayloads[1]!.body as { elements: Array<{ tag: string; content: string }> }
+    ).elements[0]!;
+    expect(fallbackEl.tag).toBe("markdown");
+    expect(fallbackEl.content).toContain(`(${expectedUrl})`);
+    expect(fallbackEl.content).toContain("打开网页交互版");
+
+    // Without a verified web URL, Feishu still returned a fallback messageId ->
+    // settle as `partial` with messageId preserved, sentImages=0, sentLinks=0,
+    // and replay must NOT re-claim or re-send the same delivery_key.
+    let noUrlAttempt = 0;
+    const noUrlClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_chart_fb_2" })),
+        },
+        message: {
+          create: vi.fn(async () => {
+            noUrlAttempt += 1;
+            if (noUrlAttempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_fb_nolink" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishuNoUrl = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: noUrlClient,
+    });
+    const noUrlLedger = new Map<string, string>();
+    const backendNoUrl = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = noUrlLedger.get(req.delivery_key);
+        if (existing === "sent" || existing === "partial") {
+          return {
+            claim_status: "already_completed" as const,
+            status: existing as "sent" | "partial",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+          };
+        }
+        noUrlLedger.set(req.delivery_key, "in_flight");
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status) {
+          noUrlLedger.set(req.delivery_key, req.status);
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "in_flight",
+          sent_to_current_count: 0,
+        };
+      }),
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const resNoLink = await deliverTurnChartsAndWidgets({
+      backend: backendNoUrl,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuNoUrl]]),
+      webBaseUrl: null,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-no-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(noUrlAttempt).toBe(2); // 1 initial (200621) + 1 fallback (ok)
+    expect(resNoLink.settled).toBe(true);
+    expect(resNoLink.delivered).toBe(false);
+    expect(resNoLink.sentImages).toBe(0);
+    expect(resNoLink.sentLinks).toBe(0);
+    expect(backendNoUrl.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-no-link",
+        status: "partial",
+        outcome: "partial",
+        sent_chunks: 0,
+        platform_message_ids: ["om_chart_fb_nolink"],
+      }),
+      { platform: "feishu" },
+    );
+
+    // Replay on the same delivery_key must see `already_completed` (`partial`) and NOT re-send
+    const replayNoLink = await deliverTurnChartsAndWidgets({
+      backend: backendNoUrl,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuNoUrl]]),
+      webBaseUrl: null,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-no-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(replayNoLink.settled).toBe(true);
+    expect(noUrlAttempt).toBe(2);
+  });
+
+  it("does not count sentLinks when app.localhost deep link is stripped during Feishu 200621 fallback and settles as partial", async () => {
+    const selfHostedBase = "http://app.localhost:3000";
+    // Chart deep-link builder generates a URL for app.localhost,
+    // which card-normalize strips as a local hostname during 200621 fallback.
+    const generatedUrl = buildChartLayerDeepLink(
+      selfHostedBase,
+      THREAD_ID,
+      "NVDA:1day",
+      "layer-1",
+    );
+    expect(generatedUrl).toContain("http://app.localhost:3000/");
+
+    const sentPayloads: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const fakeClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_app_localhost" })),
+        },
+        message: {
+          create: vi.fn(async (req: { data?: { content?: string } }) => {
+            attempt += 1;
+            if (req.data?.content) {
+              sentPayloads.push(JSON.parse(req.data.content));
+            }
+            if (attempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_app_localhost_fb" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeClient,
+    });
+    const ledger = new Map<string, string>();
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = ledger.get(req.delivery_key);
+        if (existing === "sent" || existing === "partial") {
+          return {
+            claim_status: "already_completed" as const,
+            status: existing as "sent" | "partial",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+          };
+        }
+        ledger.set(req.delivery_key, "in_flight");
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status) {
+          ledger.set(req.delivery_key, req.status);
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "in_flight",
+          sent_to_current_count: 0,
+        };
+      }),
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const res = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: selfHostedBase,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-app-localhost",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    expect(attempt).toBe(2);
+    expect(sentPayloads).toHaveLength(2);
+    expect(JSON.stringify(sentPayloads[0])).toContain("app.localhost:3000");
+    const fallbackMd = (
+      sentPayloads[1]!.body as { elements: Array<{ tag: string; content: string }> }
+    ).elements[0]!.content;
+    expect(fallbackMd).not.toContain("app.localhost");
+    expect(fallbackMd).not.toContain("打开网页交互版");
+
+    // Link was stripped during fallback -> sentLinks MUST be 0, settled as partial with messageId preserved
+    expect(res.settled).toBe(true);
+    expect(res.delivered).toBe(false);
+    expect(res.sentImages).toBe(0);
+    expect(res.sentLinks).toBe(0);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-app-localhost",
+        status: "partial",
+        outcome: "partial",
+        sent_chunks: 0,
+        platform_message_ids: ["om_chart_app_localhost_fb"],
+      }),
+      { platform: "feishu" },
+    );
+
+    // Replay must NOT re-claim or re-send
+    const replayRes = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: selfHostedBase,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-app-localhost",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(replayRes.settled).toBe(true);
+    expect(attempt).toBe(2);
   });
 });

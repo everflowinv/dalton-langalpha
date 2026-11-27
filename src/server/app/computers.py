@@ -64,6 +64,8 @@ from src.server.dependencies.usage_limits import (
 )
 from src.server.database.user import get_user
 from src.server.models.computer import (
+    # DALTON-HOOK(cos-settings-tools): archive confirmation snapshot payload
+    ArchiveRequest,
     CLAIMABLE_FOR_START,
     ComputerActionResponse,
     ComputerAlwaysOnRequest,
@@ -101,6 +103,8 @@ from src.server.services.computer_start_failure import (
     start_failure_from_row,
 )
 from src.server.services.computer_errors import (
+    ArchiveProviderError,  # DALTON-HOOK(cos-settings-tools)
+    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerBusyError,
     ComputerRemovalRefused,
     ComputerRepairRefused,
@@ -144,6 +148,7 @@ from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import (
     ComputerAddPrincipal,
     ComputerWritePrincipal,
+    ComputerEndPrincipal,  # DALTON-HOOK(cos-settings-tools)
     ComputerEndUserId,
     ComputerRemovePrincipal,
     ComputerWriteUserId,
@@ -225,6 +230,18 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         # another 422 for the same machine.
         if connect_failure(e) is not None:
             raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.warning(
+                "computer_action_sandbox_unreachable action=%s category=%s computer_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                computer_id,
+                type(e).__name__,
+            )
+            raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         raise
     except MachineBusyError as e:
         raise HTTPException(
@@ -232,6 +249,21 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         ) from None
     except ComputerBusyError as e:
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    except ComputerArchivingError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "computer_archiving", "message": str(e)},
+        ) from None
+    except ArchiveProviderError as e:
+        raise HTTPException(
+            status_code=e.http_status,
+            detail={
+                "code": e.category,
+                "message": e.user_message or "Sandbox provider reconciliation failed.",
+            },
+        ) from None
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     except ComputerNameTaken as e:
         # Names the holder, so a client words it in its own language.
         raise HTTPException(
@@ -269,6 +301,20 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
             raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.error(
+                "computer_action_failed action=%s category=%s computer_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                computer_id,
+                type(e).__name__,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to {action} computer"
+            ) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         logger.exception(f"Error {action} computer {computer_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to {action} computer")
 
@@ -1101,21 +1147,23 @@ async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
             computer_id=computer_id,
             status=(updated or {}).get("status") or "stopped",
             message="Computer stopped successfully",
+            # DALTON-HOOK(stop-backup-attach): pass through stop-backup skipped workspace count
+            backup_skipped_workspaces=(updated or {}).get("backup_skipped_workspaces"),
         )
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
 @router.post("/{computer_id}/archive", response_model=ComputerActionResponse)
-async def archive_computer(computer_id: str, x_user_id: ComputerEndUserId):
-    async with _computer_action_errors("archive", computer_id):
-        await _reached_computer(computer_id, x_user_id, manage=True)
-        with computer_cause("archive"):
-            updated = await _computer_manager().archive_computer(computer_id)
-        logger.info(f"Archived computer {computer_id}")
-        return ComputerActionResponse(
-            computer_id=computer_id,
-            status=(updated or {}).get("status") or "stopped",
-            message="Computer archived successfully",
-        )
+async def archive_computer(
+    computer_id: str,
+    request: Request,
+    principal: ComputerEndPrincipal,
+    body: Optional[ArchiveRequest] = None,
+):
+    from src.dalton.services.archive_http import execute_computer_archive_route
+
+    return await execute_computer_archive_route(computer_id, request, body, principal)
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 @router.post(

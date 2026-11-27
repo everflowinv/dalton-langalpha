@@ -164,6 +164,9 @@ const STABLE_CHAT_HELPERS = vi.hoisted(() => ({
   handleRejectPTCAgent: vi.fn(() => Promise.resolve()),
   handleApproveSecretaryAction: vi.fn(() => Promise.resolve()),
   handleRejectSecretaryAction: vi.fn(() => Promise.resolve()),
+  // DALTON-HOOK(watchlist): watchlist confirmation mock handlers
+  handleApproveWatchlistAction: vi.fn(() => Promise.resolve()),
+  handleRejectWatchlistAction: vi.fn(() => Promise.resolve()),
   handleResumeCreditPause: vi.fn(() => Promise.resolve()),
   handleApproveToolCall: vi.fn(() => Promise.resolve()),
   handleRejectToolCall: vi.fn(() => Promise.resolve()),
@@ -213,6 +216,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     isShared: true,
     threadModels: STABLE_CHAT_HELPERS.threadModels,
     activeTurnModel: null,
+    createdThreadId: null,
     marketWatch: null,
     handleSendMessage: mockSendMessage,
     stopWorkflow: STABLE_CHAT_HELPERS.stopWorkflow,
@@ -234,6 +238,9 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     handleRejectPTCAgent: STABLE_CHAT_HELPERS.handleRejectPTCAgent,
     handleApproveSecretaryAction: STABLE_CHAT_HELPERS.handleApproveSecretaryAction,
     handleRejectSecretaryAction: STABLE_CHAT_HELPERS.handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): expose mock watchlist confirmation handlers
+    handleApproveWatchlistAction: STABLE_CHAT_HELPERS.handleApproveWatchlistAction,
+    handleRejectWatchlistAction: STABLE_CHAT_HELPERS.handleRejectWatchlistAction,
     handleResumeCreditPause: STABLE_CHAT_HELPERS.handleResumeCreditPause,
     handleApproveToolCall: STABLE_CHAT_HELPERS.handleApproveToolCall,
     handleRejectToolCall: STABLE_CHAT_HELPERS.handleRejectToolCall,

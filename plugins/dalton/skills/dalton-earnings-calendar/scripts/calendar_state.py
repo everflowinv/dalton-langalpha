@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from typing import Any
 import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -32,7 +33,9 @@ MAX_MIRROR_BYTES = 1_048_576  # 1 MB
 CHAIN_BY_TIER = {
     "core": ["tm3", "t0", "tp1"],
     "watch": ["t0"],
+    "radar": [],
 }
+VALID_STAGES = ("tm3", "t0", "tp1")
 
 
 def _default_state_path() -> Path:
@@ -138,17 +141,29 @@ def _minimal_coverage_yaml_parse(text: str) -> dict:
     return {"companies": companies}
 
 
-def load_coverage(coverage_path: Path | None = None) -> dict[str, dict]:
+def load_coverage_doc(coverage_path: Path | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Return ``(companies_by_ticker, tier_policies_by_tier)`` from ``coverage.yaml``."""
     p = coverage_path or _default_coverage_path()
     if not p or not p.exists():
-        return {}
+        return {}, {}
     raw = _load_yaml_or_json(p)
     result: dict[str, dict] = {}
     for item in raw.get("companies") or []:
         if isinstance(item, dict) and item.get("ticker"):
             t = str(item["ticker"]).upper()
             result[t] = item
-    return result
+    raw_policies = raw.get("tier_policies")
+    policies: dict[str, dict] = {}
+    if isinstance(raw_policies, dict):
+        for tier_k, pol in raw_policies.items():
+            if isinstance(pol, dict):
+                policies[str(tier_k).strip().lower()] = pol
+    return result, policies
+
+
+def load_coverage(coverage_path: Path | None = None) -> dict[str, dict]:
+    companies, _ = load_coverage_doc(coverage_path)
+    return companies
 
 
 def load_ledger(state_path: Path, create: bool = False) -> dict:
@@ -220,11 +235,59 @@ def slug_ticker(ticker: str) -> str:
     return ticker.strip().lower().replace(".", "-")
 
 
-def default_automations_for(ticker: str, quarter: str, tier: str = "Core") -> dict[str, str]:
+def resolve_earnings_stages(
+    tier: str | None,
+    *,
+    tier_policies: dict[str, dict] | None = None,
+    task_overrides: dict | None = None,
+) -> list[str]:
+    """Resolve ordered earnings automation stages for ``tier``.
+
+    Order of precedence: per-company ``task_overrides.earnings_stages`` ->
+    user ``tier_policies[tier].earnings_stages`` -> ``CHAIN_BY_TIER``.
+    ``radar`` and any unknown tier default to the empty list ``[]``.
+    """
+    if isinstance(task_overrides, dict) and isinstance(task_overrides.get("earnings_stages"), list):
+        ov_set = {str(s or "").strip().lower() for s in task_overrides["earnings_stages"]}
+        return [s for s in VALID_STAGES if s in ov_set]
+    tier_key = str(tier or "").strip().lower()
+    if isinstance(tier_policies, dict):
+        pol = tier_policies.get(tier_key)
+        if isinstance(pol, dict) and isinstance(pol.get("earnings_stages"), list):
+            p_set = {str(s or "").strip().lower() for s in pol["earnings_stages"]}
+            return [s for s in VALID_STAGES if s in p_set]
+    return list(CHAIN_BY_TIER.get(tier_key, []))
+
+
+def default_automations_for_stages(
+    ticker: str,
+    quarter: str,
+    stages: list[str],
+) -> dict[str, str]:
+    if not stages:
+        return {}
     t_slug = slug_ticker(ticker)
     q_slug = quarter.strip().lower().replace(" ", "")
-    keys = CHAIN_BY_TIER.get(tier.lower(), ["tm3", "t0", "tp1"])
-    return {k: f"dalton-{t_slug}-earn-{q_slug}-{k}.json" for k in keys}
+    return {k: f"dalton-{t_slug}-earn-{q_slug}-{k}.json" for k in stages}
+
+
+def default_automations_for(
+    ticker: str,
+    quarter: str,
+    tier: str = "Core",
+    *,
+    workspace_id: str | None = "present",
+    tier_policies: dict[str, dict] | None = None,
+    task_overrides: dict | None = None,
+) -> dict[str, str]:
+    if not workspace_id:
+        return {}
+    keys = resolve_earnings_stages(
+        tier,
+        tier_policies=tier_policies,
+        task_overrides=task_overrides,
+    )
+    return default_automations_for_stages(ticker, quarter, keys)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -239,22 +302,27 @@ def cmd_list(args: argparse.Namespace) -> int:
     for t in all_tickers:
         cov = coverage.get(t, {})
         ent = entries.get(t, {})
-        tier = str(ent.get("tier") or cov.get("tier") or "Watch").capitalize()
+        if cov.get("is_private") and not ent:
+            continue
+        tier = str(cov.get("tier") or ent.get("tier") or "Watch").capitalize()
         grp = (cov.get("earnings") or {}).get("group") if isinstance(cov.get("earnings"), dict) else None
         status = ent.get("status", "pending")
         date_status = ent.get("date_status", "unannounced")
+        ws_obj = cov.get("workspace") if isinstance(cov.get("workspace"), dict) else {}
         ws_status = (
-            (cov.get("workspace") or {}).get("status")
-            if isinstance(cov.get("workspace"), dict)
-            else ("active" if ent.get("workspace_id") else "unknown")
+            ws_obj.get("status")
+            if ws_obj.get("status")
+            else ("active" if (ent.get("workspace_id") or ws_obj.get("workspace_id")) else "none")
         )
+        ws_id = ent.get("workspace_id") or ws_obj.get("workspace_id")
         row = {
             "ticker": t,
             "name": ent.get("name") or cov.get("name") or t,
             "tier": tier,
             "group": grp,
             "workspace_status": ws_status,
-            "workspace_id": ent.get("workspace_id"),
+            "workspace_id": ws_id,
+            "has_workspace": bool(ws_id),
             "status": status,
             "date_status": date_status,
             "quarter": ent.get("quarter"),
@@ -311,8 +379,120 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_live_stage_scope(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    tier_policies: dict[str, dict[str, Any]] | None,
+    workspace_id: str | None,
+) -> tuple[str | None, list[str]]:
+    """Single source of truth for ``check`` / ``mark`` / ``diff``: live coverage ONLY.
+
+    - Removed ticker (not in ``coverage``): returns ``(None, [])`` — never falls back to stale ledger tier.
+    - Shared Home ticker-only entry (in ``coverage`` without ``tier``): returns ``(None, [])``.
+    - Private company or missing ``workspace_id``: returns ``(live_tier, [])``.
+    """
+    sym = str(ticker or "").strip().upper()
+    if sym not in coverage:
+        return None, []
+    cov = coverage[sym]
+    live_tier_raw = str(cov.get("tier") or "").strip().lower()
+    live_tier = live_tier_raw or None
+    if not live_tier or bool(cov.get("is_private")) or not workspace_id:
+        return live_tier, []
+    stages = resolve_earnings_stages(
+        live_tier,
+        tier_policies=tier_policies,
+        task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+    )
+    return live_tier, stages
+
+
+def _normalize_workspace_id(ws_id: Any) -> str | None:
+    clean = str(ws_id or "").strip()
+    return clean or None
+
+
+def _entry_automations_for_workspace(
+    entry: dict[str, Any] | None,
+    workspace_id: str | None,
+) -> dict[str, str]:
+    """Return ledger automations ONLY when ``entry`` matches the live ``workspace_id``.
+
+    Automations recorded under an older/different workspace never count as created for a new workspace.
+    """
+    if not isinstance(entry, dict):
+        return {}
+    live_ws = _normalize_workspace_id(workspace_id)
+    entry_ws = _normalize_workspace_id(entry.get("workspace_id"))
+    if not live_ws or entry_ws != live_ws:
+        return {}
+    raw_autos = entry.get("automations")
+    if not isinstance(raw_autos, dict):
+        return {}
+    return {
+        str(k).strip().lower(): str(v)
+        for k, v in raw_autos.items()
+        if str(k).strip() and v
+    }
+
+
+def _resolve_live_workspace_id(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    entry: dict[str, Any] | None = None,
+    explicit_workspace_id: str | None = None,
+) -> str | None:
+    """Resolve the active workspace_id for ``check`` / ``mark`` / ``diff`` strictly from explicit arg or live coverage.
+
+    Never resurrects a stale ``entry.workspace_id`` from the ledger when live coverage has unbound
+    the workspace (``status: none|planned|deleted|unbound`` or missing ``workspace_id``) or removed the ticker.
+    """
+    _ = entry
+    if explicit_workspace_id is not None:
+        return _normalize_workspace_id(explicit_workspace_id)
+    sym = str(ticker or "").strip().upper()
+    cov = coverage.get(sym)
+    if not isinstance(cov, dict):
+        return None
+    ws_obj = cov.get("workspace")
+    if not isinstance(ws_obj, dict):
+        return None
+    ws_status = str(ws_obj.get("status") or "").strip().lower()
+    if ws_status in ("none", "planned", "deleted", "unbound"):
+        return None
+    return _normalize_workspace_id(ws_obj.get("workspace_id"))
+
+
+def _resolve_live_workspace_and_stages(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    tier_policies: dict[str, dict[str, Any]] | None,
+    entry: dict[str, Any] | None = None,
+    explicit_workspace_id: str | None = None,
+) -> tuple[str | None, str | None, list[str]]:
+    """Shared live-workspace + live-stage resolver for ``check``, ``mark``, and ``diff``."""
+    ws_id = _resolve_live_workspace_id(
+        ticker,
+        coverage=coverage,
+        entry=entry,
+        explicit_workspace_id=explicit_workspace_id,
+    )
+    live_tier, allowed_stages = _resolve_live_stage_scope(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        workspace_id=ws_id,
+    )
+    return ws_id, live_tier, allowed_stages
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
+    cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
+    coverage, tier_policies = load_coverage_doc(cov_path)
     ledger = load_ledger(state_path, create=False)
     ticker = args.ticker.upper()
     entry = ledger.get("entries", {}).get(ticker)
@@ -320,7 +500,14 @@ def cmd_check(args: argparse.Namespace) -> int:
     is_confirmed = bool(entry and entry.get("status") == "confirmed" and entry.get("date_status") == "confirmed")
     old_date = entry.get("date") if entry else None
     same_date = bool(is_confirmed and old_date == args.date)
-    has_autos = bool(entry and entry.get("automations"))
+    effective_ws_id, tier_val, expected_stages = _resolve_live_workspace_and_stages(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        entry=entry,
+    )
+    existing_autos = _entry_automations_for_workspace(entry, effective_ws_id)
+    has_autos = (not expected_stages) or all(stage in existing_autos for stage in expected_stages)
     recorded = bool(same_date and has_autos)
     date_changed = bool(is_confirmed and old_date and old_date != args.date)
 
@@ -328,6 +515,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     payload = {
         "ok": True,
         "ticker": ticker,
+        "tier": tier_val,
+        "workspace_id": effective_ws_id,
+        "allowed_stages": expected_stages,
         "query_date": args.date,
         "recorded": recorded,
         "date_changed": date_changed,
@@ -342,7 +532,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_mark(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
     cov_path = Path(args.coverage) if args.coverage else _default_coverage_path()
-    coverage = load_coverage(cov_path)
+    coverage, tier_policies = load_coverage_doc(cov_path)
     ledger = load_ledger(state_path, create=True)
 
     ticker = args.ticker.upper()
@@ -351,12 +541,20 @@ def cmd_mark(args: argparse.Namespace) -> int:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     name = args.name or existing.get("name") or cov.get("name") or ticker
-    tier = (args.tier or existing.get("tier") or cov.get("tier") or "Core").capitalize()
-    workspace_id = args.workspace_id if args.workspace_id is not None else existing.get("workspace_id")
+    # r5/r6: workspace and allowed stages ALWAYS follow the shared live-coverage resolver
+    workspace_id, live_tier, allowed_stages = _resolve_live_workspace_and_stages(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        entry=existing,
+        explicit_workspace_id=args.workspace_id,
+    )
+    tier = (live_tier or args.tier or existing.get("tier") or "radar").capitalize()
     fiscal_note = args.fiscal_note or existing.get("fiscal_note") or cov.get("note") or "FY=CY"
     history = list(existing.get("history") or [])
 
     status = args.status.lower()
+    filtered_out_stages: list[str] = []
     if status == "confirmed":
         if not args.date:
             raise ValueError("--date is required when --status=confirmed")
@@ -372,20 +570,54 @@ def cmd_mark(args: argparse.Namespace) -> int:
                     "reason": args.reason or "公司改期或更新披露日期",
                 }
             )
+        allowed_stage_set = set(allowed_stages)
+
         if args.automations_json:
-            automations = json.loads(args.automations_json)
-        elif any([args.tm3, args.t0, args.tp1]):
+            raw_autos = json.loads(args.automations_json)
+            if not isinstance(raw_autos, dict):
+                raise ValueError("--automations-json must decode to a JSON object")
             automations = {}
+            for k, v in raw_autos.items():
+                sk = str(k).strip().lower()
+                if sk in allowed_stage_set:
+                    automations[sk] = v
+                else:
+                    filtered_out_stages.append(sk)
+        elif any([args.tm3, args.t0, args.tp1]):
+            raw_cli = {}
             if args.tm3:
-                automations["tm3"] = args.tm3
+                raw_cli["tm3"] = args.tm3
             if args.t0:
-                automations["t0"] = args.t0
+                raw_cli["t0"] = args.t0
             if args.tp1:
-                automations["tp1"] = args.tp1
-        elif existing.get("automations") and existing.get("quarter") == args.quarter:
-            automations = existing["automations"]
+                raw_cli["tp1"] = args.tp1
+            automations = {}
+            for sk, v in raw_cli.items():
+                if sk in allowed_stage_set:
+                    automations[sk] = v
+                else:
+                    filtered_out_stages.append(sk)
+        elif (
+            existing.get("quarter") == args.quarter
+            and (reusable_autos := _entry_automations_for_workspace(existing, workspace_id))
+        ):
+            # r6/r7: reuse ledger automations ONLY when workspace_id matches live workspace_id
+            expected_defaults = default_automations_for_stages(
+                ticker,
+                args.quarter,
+                allowed_stages,
+            )
+            automations = {
+                stage: reusable_autos.get(stage) or default_fname
+                for stage, default_fname in expected_defaults.items()
+            }
         else:
-            automations = default_automations_for(ticker, args.quarter, tier=tier)
+            # r6/r7: derive default filenames strictly from live allowed_stages (empty -> {})
+            automations = default_automations_for_stages(
+                ticker,
+                args.quarter,
+                allowed_stages,
+            )
 
         new_entry = {
             "name": name,
@@ -450,6 +682,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
                 "status": new_entry["status"],
                 "date_status": new_entry["date_status"],
                 "date": new_entry.get("date") or new_entry.get("tentative_date"),
+                "filtered_out_stages": filtered_out_stages,
                 "state_path": str(state_path),
                 "entry": new_entry,
             },
@@ -539,14 +772,28 @@ def cmd_roll(args: argparse.Namespace) -> int:
     return 0
 
 
-def _verify_automation_file(auto_path: Path, expected_date: str, expected_tz: str = "America/New_York") -> dict:
-    """Read back an automation JSON file and verify active status & timezone-converted date."""
+def _verify_automation_file(
+    auto_path: Path,
+    expected_date: str,
+    expected_tz: str = "America/New_York",
+    expected_workspace_id: str | None = None,
+) -> dict:
+    """Read back an automation JSON file and verify active status, workspace_id & timezone-converted date."""
     if not auto_path.exists():
         return {"ok": False, "reason": "file_missing", "path": str(auto_path)}
     try:
         data = json.loads(auto_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"ok": False, "reason": f"json_parse_error: {exc}", "path": str(auto_path)}
+
+    file_ws = _normalize_workspace_id(data.get("workspace_id"))
+    exp_ws = _normalize_workspace_id(expected_workspace_id)
+    if exp_ws and file_ws and file_ws != exp_ws:
+        return {
+            "ok": False,
+            "reason": f"workspace_id_mismatch: expected {exp_ws}, got {file_ws}",
+            "path": str(auto_path),
+        }
 
     status = data.get("status")
     state_block = data.get("state") or {}
@@ -657,6 +904,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
     date_mismatch: list[dict] = []
     automation_issues: list[dict] = []
 
+    cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
+    coverage, tier_policies = load_coverage_doc(cov_path)
+
     for r in confirmed_scans:
         t = str(r["ticker"]).upper()
         scan_date = r.get("earnings_date")
@@ -682,11 +932,16 @@ def cmd_diff(args: argparse.Namespace) -> int:
             )
             continue
 
-        # Check automations presence when workspace_id is active/present
-        if ent.get("workspace_id"):
-            tier_key = str(ent.get("tier") or "Core").lower()
-            expected_keys = CHAIN_BY_TIER.get(tier_key, ["tm3", "t0", "tp1"])
-            autos = ent.get("automations") or {}
+        # Check automations presence using live coverage workspace + allowed stages
+        # (automations recorded under an older/different workspace never satisfy the live workspace)
+        effective_ws_id, _live_tier_diff, expected_keys = _resolve_live_workspace_and_stages(
+            t,
+            coverage=coverage,
+            tier_policies=tier_policies,
+            entry=ent,
+        )
+        if effective_ws_id:
+            autos = _entry_automations_for_workspace(ent, effective_ws_id)
             missing_keys = [k for k in expected_keys if not autos.get(k)]
             if missing_keys:
                 missing.append(
@@ -702,7 +957,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
                     auto_file = Path(args.automations_dir) / autos[k]
                     # Only t0 is guaranteed to have the same market date as scan_date
                     exp_d = scan_date if k == "t0" else ""
-                    v_res = _verify_automation_file(auto_file, expected_date=exp_d)
+                    v_res = _verify_automation_file(
+                        auto_file,
+                        expected_date=exp_d,
+                        expected_workspace_id=effective_ws_id,
+                    )
                     if not v_res["ok"]:
                         automation_issues.append({"ticker": t, "window": k, **v_res})
 
@@ -881,7 +1140,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp_list = sub.add_parser("list", help="List coverage and ledger status")
-    sp_list.add_argument("--tier", choices=["core", "watch", "Core", "Watch"], default=None)
+    sp_list.add_argument("--tier", choices=["core", "watch", "radar", "Core", "Watch", "Radar"], default=None)
     sp_list.add_argument("--group", default=None)
     sp_list.add_argument("--status", choices=["pending", "confirmed", "reported"], default=None)
     sp_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS)

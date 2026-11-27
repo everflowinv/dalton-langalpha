@@ -49,13 +49,15 @@ def _load_storage_setting(name: str, env_var: str, default: str) -> str:
     return os.getenv(env_var, default).lower()
 
 
-STORAGE_PROVIDER = _load_storage_setting("provider", "STORAGE_PROVIDER", "none")
+# DALTON-HOOK(standalone-core): resolve main storage provider and bucket via shared storage_config module
+from src.dalton.storage_config import resolve_storage_bucket as _resolve_storage_bucket
+from src.dalton.storage_config import resolve_storage_provider as _resolve_storage_provider
+
+STORAGE_PROVIDER = _resolve_storage_provider()
 
 
 def _configured_bucket(provider: str) -> str | None:
-    if provider == "oss":
-        return os.getenv("OSS_BUCKET_NAME")
-    return os.getenv("STORAGE_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME")
+    return _resolve_storage_bucket(provider) or None
 
 
 # A provider name alone is not a store. The checked-in config selects "s3"

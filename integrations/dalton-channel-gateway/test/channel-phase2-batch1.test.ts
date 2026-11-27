@@ -1514,4 +1514,60 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(recoveredCombined).toContain("overflow_4.pdf");
     expect(recoveredCombined).toContain("bin_1.pdf");
   });
+
+  it("BT1: Feishu unmentioned topic lookup passes initiator_platform_user_id and skips negative cache when truncated", async () => {
+    const lookupMock = vi.fn(async (_req: unknown) => ({
+      found: false,
+      status: null,
+      canonical_scope_key: null,
+      external_topic_id: null,
+      root_message_id: null,
+      first_reply_message_id: null,
+      initiator_platform_user_id: null,
+      initiator_dalton_user_id: null,
+      pending_candidates: [],
+      pending_candidates_has_more: true,
+      pending_candidates_truncated: true,
+    }));
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+    });
+    feishu.setBackendClient(makeMockBackend({ lookupBotTopic: lookupMock }));
+    const received: InboundChannelEvent[] = [];
+    feishu.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    const rawEvent = {
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: "om_trunc_1",
+        thread_id: "omt_trunc_topic",
+        chat_id: "oc_grp_trunc",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "追问 1" }),
+      },
+    };
+    await feishu.receiveRawEvent(rawEvent);
+    expect(lookupMock).toHaveBeenCalledTimes(1);
+    expect(lookupMock.mock.calls[0]?.[0]).toMatchObject({
+      platform: "feishu",
+      chat_address: "feishu:oc_grp_trunc",
+      match_mode: "inbound_followup",
+      external_topic_id: "omt_trunc_topic",
+      initiator_platform_user_id: "ou_alice",
+    });
+
+    // Because pending_candidates_truncated was true, topic MUST NOT be negatively cached;
+    // the next message retries lookup instead of being silently dropped from cache.
+    await feishu.receiveRawEvent({
+      ...rawEvent,
+      message: { ...rawEvent.message, message_id: "om_trunc_2" },
+    });
+    expect(lookupMock).toHaveBeenCalledTimes(2);
+    expect(received).toHaveLength(0);
+  });
 });

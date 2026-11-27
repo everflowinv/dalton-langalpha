@@ -474,6 +474,9 @@
       "createAnyway": "仍然新建",
       "ownerLabel": "所有者 {{owner}}",
       "leadLabel": "主分析师 {{lead}}"
+    },
+    "dedup": {
+      "unavailableTitle": "公司查重暂不可用"
     }
   },
   "computer": {
@@ -771,6 +774,20 @@
       "refreshAria": "刷新沙箱状态",
       "refresh": "刷新状态",
       "archive": "归档",
+      "archiveDialog": {
+        "title": "确认归档整台电脑",
+        "description": "归档会将整台电脑及其上的全部工作区移入冷存储。下次启动需要更长时间（约 1–5 分钟），归档期间不会占用计算资源。",
+        "computerLabel": "目标电脑：",
+        "affectedTitle": "同机受影响工作区（共 {{count}} 个）",
+        "loading": "正在获取同机工作区列表...",
+        "loadFailed": "获取同机工作区列表失败，请重试。",
+        "scopeChanged": "情况已变化，请重新发起",
+        "confirm": "确认归档",
+        "archiving": "归档中...",
+        "cancel": "取消",
+        "expandWorkspaces": "展开查看全部 {{count}} 个工作区",
+        "collapseWorkspaces": "收起工作区列表"
+      },
       "sandboxId": "沙箱 ID："
     },
     "ssh": {
@@ -1011,7 +1028,29 @@
     "identityFailed": "权限确认失败，请重试",
     "externalReadOnlyHint": "当前账号为外部成员，无法开启公开分享。",
     "externalStopOnlyHint": "当前账号为外部成员，可使用上方开关关闭现有公开链接。",
-    "updateFailed": "无法更改分享设置，请重试。"
+    "updateFailed": "无法更改分享设置，请重试。",
+    "redactedWidgetTitle": "交互组件已隐藏",
+    "redactedWidgetDescription": "当前分享仅包含对话文字，交互组件与工作区数据已省略",
+    "redactedImageLabel": "图片已隐藏",
+    "loadEarlierMessages": "加载更早的对话",
+    "boundaryLine": "分享内容包括模型回答的全部文字",
+    "boundaryAllHidden": "工具调用、思考过程、交互组件、图片与工作区文件均自动隐藏",
+    "boundaryWithFiles": "已允许访问工作区文件，交互组件、工具调用、图片与工作区文件将一并展示",
+    "boundarySummaryPrefix": "将自动隐藏本对话中的 {{items}}",
+    "boundaryCountWidgets_one": "{{count}} 个交互组件（显示通用占位）",
+    "boundaryCountWidgets_other": "{{count}} 个交互组件（显示通用占位）",
+    "boundaryCountToolCalls_one": "{{count}} 次工具调用与思考过程",
+    "boundaryCountToolCalls_other": "{{count}} 次工具调用与思考过程",
+    "boundaryCountImages_one": "{{count}} 张图片",
+    "boundaryCountImages_other": "{{count}} 张图片",
+    "boundaryCountAttachments_one": "{{count}} 个附件",
+    "boundaryCountAttachments_other": "{{count}} 个附件",
+    "boundaryListSeparator": "、",
+    "boundaryListLastTwo": "{{first}}及 {{second}}",
+    "boundaryListLastMany": "{{head}}及 {{last}}",
+    "previewVisitorView": "预览访客视角",
+    "previewMemberView": "预览成员视角",
+    "downloadNotPermitted": "当前分享未开放下载"
   },
   "shareLink": {
     "title": "分享 {{file}}",
@@ -1900,11 +1939,80 @@
         "approved": "对话已删除",
         "rejected": "已拒绝删除对话"
       },
+      "archiveWorkspace": {
+        "title": "归档电脑",
+        "approved": "已归档电脑 {{computer}}（含 {{count}} 个工作区）",
+        "rejected": "已取消归档",
+        "failed": "归档失败",
+        "failedWithReason": "归档失败：{{reason}}",
+        "scopeChanged": "情况已变化，请重新发起",
+        "computerLabel": "目标电脑：",
+        "affectedHint": "将归档该电脑上的全部 {{count}} 个工作区：",
+        "confirm": "确认归档",
+        "archiving": "归档中...",
+        "decline": "取消",
+        "expandWorkspaces": "展开查看全部 {{count}} 个工作区",
+        "collapseWorkspaces": "收起工作区列表"
+      },
       "workspaceLabel": "工作区：",
       "threadLabel": "对话：",
       "unknownId": "未知",
       "confirm": "确认",
       "decline": "拒绝"
+    },
+    "watchlistConfirm": {
+      "actions": {
+        "watchlist_batch_add": "批量添加到个人观察名单",
+        "watchlist_set_tier": "调整观察名单分档",
+        "watchlist_remove": "从观察名单移除标的",
+        "watchlist_tier_policy": "更新分档监控策略"
+      },
+      "tiers": {
+        "core": "核心",
+        "watch": "跟踪",
+        "radar": "雷达"
+      },
+      "tasks": {
+        "watch": "盘中盯盘",
+        "delta": "论点增量",
+        "move": "涨跌异动快评",
+        "earnings": "财报自动写稿"
+      },
+      "summary": {
+        "create": "新建 {{count}} 项任务",
+        "update": "改频 {{count}} 项任务",
+        "resume": "恢复 {{count}} 项任务",
+        "pause": "暂停 {{count}} 项任务"
+      },
+      "settled": {
+        "approved": "个人观察名单已更新",
+        "partial": "名单已更新（部分后台任务待补齐）",
+        "rejected": "已取消观察名单修改",
+        "failed": "观察名单修改失败",
+        "failedWithReason": "观察名单修改失败：{{reason}}",
+        "scopeChanged": "情况已变化，请重新发起"
+      },
+      "affectedCompanies": "受影响公司（{{count}}）",
+      "affectedWorkspaces": "受影响研究工作区与任务（{{count}}）",
+      "policyDiffTitle": "策略变更前后对比",
+      "policyOff": "关闭",
+      "confirm": "确认执行",
+      "submitting": "执行中…",
+      "decline": "取消",
+      "retryReconcile": "一键补齐同步",
+      "retrying": "补齐中…",
+      "retryRunningError": "同步任务正在后台运行，请稍后重试",
+      "retryPartialError": "仍有部分任务未完成同步，请稍后重试",
+      "retryFailedError": "补齐同步失败，请稍后重试",
+      "changeLabels": {
+        "create": "新建",
+        "update": "改频",
+        "resume": "恢复",
+        "pause": "暂停",
+        "preserveUserPause": "保留手动暂停",
+        "preserveTracker": "由多空跟踪接管",
+        "preserveHandoff": "保留交接暂停"
+      }
     },
     "userQuestion": {
       "answered": "已回答：{{answer}}",

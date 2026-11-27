@@ -516,6 +516,9 @@ def compute_all(
                     missing.add(c)
         return sorted(missing)
 
+    missing_held_by_index: dict[str, list[str]] = {}
+    index_dates: dict[str, str | None] = {}
+
     for key in idx_defs:
         lvl_full = build_index(px_ff, pd.Index(dates), rebal_pos, selections[key])
         if frozen_series_raw.get("dates") and frozen_series_raw.get(key):
@@ -526,9 +529,12 @@ def compute_all(
             )
             last_f_date = str(f_ser.index[-1])
             missing_held = _missing_held_for_key(key, last_f_date)
+            missing_held_by_index[key] = list(missing_held)
             if missing_held:
                 # NEVER reweight remaining constituents or append incomplete day!
                 series[key] = f_ser
+                valid_idx = f_ser.dropna().index
+                index_dates[key] = str(valid_idx[-1]) if len(valid_idx) else None
                 comp_reasons.append(
                     f"{key} 持有成分缺少必要价格 {len(missing_held)} 只 (如 {', '.join(missing_held[:5])})"
                 )
@@ -548,11 +554,14 @@ def compute_all(
                 )
         else:
             missing_held = _missing_held_for_key(key, None)
+            missing_held_by_index[key] = list(missing_held)
             if missing_held:
                 comp_reasons.append(
                     f"{key} 持有成分缺少必要价格 {len(missing_held)} 只 (如 {', '.join(missing_held[:5])})"
                 )
             series[key] = lvl_full
+        valid_idx = series[key].dropna().index
+        index_dates[key] = str(valid_idx[-1]) if len(valid_idx) else None
 
     common = series["smallcap"].index.intersection(series["nonggt"].index)
     out: dict[str, Any] = {"dates": list(common)}
@@ -614,6 +623,21 @@ def compute_all(
                 )
     else:
         out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in hsi_fetched] if hsi_fetched is not None else None
+
+    hsi_actual_date: str | None = None
+    if isinstance(out.get("hsi"), list) and out.get("dates"):
+        for d_val, h_val in zip(reversed(out["dates"]), reversed(out["hsi"])):
+            if h_val is not None:
+                hsi_actual_date = str(d_val)
+                break
+    if hsi_actual_date is None and raw_hsi_dates:
+        hsi_actual_date = str(max(raw_hsi_dates))
+    elif raw_hsi_dates and not hsi_reasons:
+        # If HSI has fresh raw data beyond common intersection, report its actual latest date.
+        latest_raw_hsi = str(max(raw_hsi_dates))
+        if latest_raw_hsi > hsi_actual_date:
+            hsi_actual_date = latest_raw_hsi
+    index_dates["hsi"] = hsi_actual_date
 
     history_stale_reasons: list[str] = comp_reasons + hsi_reasons
     history_stale = bool(history_stale_reasons)
@@ -694,6 +718,9 @@ def compute_all(
         "updated": now_hk().isoformat(timespec="seconds"),
         "base_date": out["dates"][0],
         "last_date": out["dates"][-1],
+        "index_dates": index_dates,
+        "missing_held_by_index": missing_held_by_index,
+        "failure_details": list(history_stale_reasons),
         "launch_date": launch_date,
         "last_rebalance_date": mes[-1],
         "rebalances": {k: rebal_info[k] for k in idx_defs},
