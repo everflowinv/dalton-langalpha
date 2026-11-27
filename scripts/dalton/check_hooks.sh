@@ -101,6 +101,7 @@ ALLOWED_HOOKS=(
   "reviewer-contract"
   "workflow-as-of-default"
   "workflow-subject-kind"
+  "workflow-discovered-tools"
   "subagent-model-pin"
   "html-md-canonical"
   # One user-visible-text rule in the main agent's output guidelines and in

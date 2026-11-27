@@ -1154,6 +1154,119 @@ async def _latest_run_dir(
     return best_dir
 
 
+def _parse_run_dir_identity(run_dir: str | None) -> tuple[str | None, str | None]:
+    """Extract ``(short_thread_id, run_id)`` from ``.agents/threads/<short>/workflows/<run_id>``."""
+    if not isinstance(run_dir, str) or not run_dir:
+        return None, None
+    parts = [p for p in run_dir.strip("/").split("/") if p]
+    for i, part in enumerate(parts):
+        if part == "threads" and i + 3 < len(parts) and parts[i + 2] == "workflows":
+            return parts[i + 1], parts[i + 3]
+    return None, None
+
+
+async def _verify_run_status_record(
+    backend: Any,
+    run_dir: str,
+    *,
+    workflow: str,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    allow_missing: bool = False,
+) -> bool:
+    """Verify via the server-written ``status.json`` run record that ``run_dir``
+    matches ``workflow`` and the resolved ``(short_thread_id, run_id)`` identity.
+
+    ``allow_missing`` accepts a run dir whose ``status.json`` was never written
+    (the driver's write is best effort); a present but mismatching record is
+    still rejected."""
+    dir_thread, dir_run = _parse_run_dir_identity(run_dir)
+    if not dir_thread or not dir_run:
+        return False
+    if run_id is not None and dir_run != str(run_id).strip():
+        return False
+    if thread_id is not None and dir_thread != str(thread_id)[:8]:
+        return False
+    status_text = await _read_text(backend, f"{run_dir}/status.json")
+    if not status_text:
+        return allow_missing
+    try:
+        status_doc = json.loads(status_text)
+    except ValueError:
+        return False
+    if not isinstance(status_doc, dict):
+        return False
+    if status_doc.get("name") != workflow:
+        return False
+    if status_doc.get("run_id") != dir_run:
+        return False
+    return True
+
+
+async def _load_run_args_with_dir(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+    *,
+    allow_missing_status: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the server-written ``args.json`` snapshot and its resolved run dir
+    after verifying workflow name and run identity against ``status.json``."""
+    dirs: list[str]
+    if run_id:
+        if thread_id:
+            dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
+        else:
+            matches = await _glob(backend, f".agents/threads/*/workflows/{run_id}/args.json")
+            dirs = [m.rsplit("/args.json", 1)[0] for m in (matches or [])]
+    else:
+        if not thread_id:
+            return None, None
+        try:
+            latest = await _latest_run_dir(backend, workflow, thread_id)
+        except _CannotVerify:
+            return None, None
+        dirs = [latest] if latest else []
+    verified_matches: list[tuple[dict[str, Any], str]] = []
+    for run_dir in dirs:
+        if not await _verify_run_status_record(
+            backend,
+            run_dir,
+            workflow=workflow,
+            run_id=run_id,
+            thread_id=thread_id,
+            allow_missing=allow_missing_status,
+        ):
+            continue
+        text = await _read_text(backend, f"{run_dir}/args.json")
+        if not text:
+            continue
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(doc, dict):
+            verified_matches.append((doc, run_dir))
+    if len(verified_matches) != 1:
+        return None, None
+    return verified_matches[0]
+
+
+async def _load_run_args(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> dict[str, Any] | None:
+    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable.
+
+    Used for argument inheritance (``as_of``), so a run whose ``status.json``
+    write failed still keeps its arguments; the internal-memory skip reads
+    through ``_load_run_args_with_dir`` with the strict status check."""
+    doc, _ = await _load_run_args_with_dir(
+        backend, workflow, run_id, thread_id, allow_missing_status=True
+    )
+    return doc
+
+
 async def _run_args_as_of(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> str | None:
@@ -1165,31 +1278,72 @@ async def _run_args_as_of(
     the run's artifacts are keyed on. An unreadable record inherits nothing;
     the missing-parameter check then names the gap honestly.
     """
-    dirs: list[str]
-    if run_id:
-        dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
-    else:
-        if not thread_id:
-            return None
-        try:
-            latest = await _latest_run_dir(backend, workflow, thread_id)
-        except _CannotVerify:
-            return None
-        dirs = [latest] if latest else []
-    for run_dir in dirs:
-        text = await _read_text(backend, f"{run_dir}/args.json")
-        if not text:
-            continue
-        try:
-            doc = json.loads(text)
-        except ValueError:
-            continue
-        if not isinstance(doc, dict):
-            continue
-        as_of = doc.get("as_of")
-        if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
-            return as_of.strip()
+    doc = await _load_run_args(backend, workflow, run_id, thread_id)
+    if not isinstance(doc, dict):
+        return None
+    as_of = doc.get("as_of")
+    if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
+        return as_of.strip()
     return None
+
+
+def _apply_run_internal_memory_decision(
+    contract: dict[str, Any],
+    run_args: dict[str, Any] | None,
+    *,
+    run_dir: str | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
+    """Align `topic-research` contract ONLY with a verified server-signed launch decision.
+
+    Never trusts unsigned or tampered `args.json` fields, never honors a skip when
+    legacy `researchdata_bridge` is enabled, and binds verification to the resolved
+    `(short_thread_id, run_id)` so a skip snapshot from another run cannot be replayed.
+    """
+    if contract.get("name") != "topic-research" or not isinstance(run_args, dict):
+        return contract
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+    from src.dalton.content_assembly import verify_topic_research_internal_memory_decision
+
+    active_caps = effective_capabilities()
+    if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
+        return contract
+
+    dir_thread, dir_run = _parse_run_dir_identity(run_dir)
+    if not dir_thread or not dir_run:
+        return contract
+    if thread_id and dir_thread != str(thread_id)[:8]:
+        return contract
+    if run_id and dir_run != str(run_id).strip():
+        return contract
+    verified = verify_topic_research_internal_memory_decision(
+        run_args.get("internal_memory_decision"),
+        short_thread_id=dir_thread,
+        run_id=dir_run,
+        workflow_name=str(contract.get("name") or ""),
+    )
+    if verified is None or verified["run"] is not False:
+        return contract
+
+    pruned = dict(contract)
+    new_stages = []
+    for stage in contract.get("stages") or []:
+        if isinstance(stage, dict) and isinstance(stage.get("artifacts"), list):
+            stage_copy = dict(stage)
+            stage_copy["artifacts"] = [
+                art
+                for art in stage["artifacts"]
+                if not (
+                    isinstance(art, dict)
+                    and str(art.get("path") or "").endswith("/internal-memory.md")
+                )
+            ]
+            new_stages.append(stage_copy)
+        else:
+            new_stages.append(stage)
+    pruned["stages"] = new_stages
+    return pruned
 
 
 async def _review_records_from_journals(
@@ -3790,6 +3944,22 @@ async def run_check_done(
 
     try:
         contract = load_contract(workflow)
+        run_args, resolved_run_dir = (
+            await _load_run_args_with_dir(backend, workflow, run_id, thread_id)
+            if backend is not None
+            else (None, None)
+        )
+        # Honor ONLY a verified server-signed internal-memory decision bound to
+        # this run's `(short_thread_id, run_id)` in `args.json`, so skipping
+        # internal-memory retrieval when no workspace connector was discovered
+        # passes check_done while forged/tampered decisions are rejected.
+        contract = _apply_run_internal_memory_decision(
+            contract,
+            run_args,
+            run_dir=resolved_run_dir,
+            run_id=run_id,
+            thread_id=thread_id,
+        )
         # The launch path resolves ``as_of`` to a concrete trading day before
         # the script runs; the closing check inherits that effective date from
         # the run's own ``args.json`` so the caller's original params (which
@@ -3802,7 +3972,14 @@ async def run_check_done(
                 and current.strip()
                 and current.strip() != "latest"
             ):
-                inherited = await _run_args_as_of(backend, workflow, run_id, thread_id)
+                inherited = (
+                    run_args.get("as_of").strip()
+                    if isinstance(run_args, dict)
+                    and isinstance(run_args.get("as_of"), str)
+                    and run_args.get("as_of").strip()
+                    and run_args.get("as_of").strip() != "latest"
+                    else None
+                )
                 if inherited:
                     params = {**params, "as_of": inherited}
         gap_params = missing_params(contract, params)
