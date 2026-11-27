@@ -157,8 +157,6 @@ async def pg_b3_env(
         },
         open=False,
     )
-    await local_pool.open()
-    await local_pool.wait()
 
     @asynccontextmanager
     async def _live_get_db_connection(existing_conn: Any = None):
@@ -191,7 +189,11 @@ async def pg_b3_env(
     monkeypatch.setattr(wx_db, "check_team_member_status_live", roster_mock)
 
     epoch: int | None = None
+    pool_opened = False
     try:
+        await local_pool.open()
+        await local_pool.wait()
+        pool_opened = True
         async with local_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT current_database() AS db")
@@ -318,79 +320,80 @@ async def pg_b3_env(
         except Exception:
             pass
         try:
-            async with local_pool.connection(timeout=10) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_action_tokens WHERE thread_id = %s::uuid OR dalton_user_id = %s",
-                        (tid, uid),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_interrupt_resumes WHERE thread_id = %s::uuid OR settled_by_user_id = %s",
-                        (tid, uid),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_deliveries WHERE user_id = %s OR delivery_key LIKE %s",
-                        (uid, f"%{prefix}%"),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_background_runs WHERE thread_id = %s::uuid OR dalton_user_id = %s",
-                        (tid, uid),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_thread_watches WHERE thread_id = %s::uuid OR dalton_user_id = %s",
-                        (tid, uid),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_inbound_events WHERE dalton_user_id = %s OR message_id LIKE %s",
-                        (uid, f"%{prefix}%"),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_session_generations WHERE dalton_user_id = %s",
-                        (uid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_weixin_audit_logs WHERE target_user_id = %s OR operator_user_id = %s",
-                        (uid, uid),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_weixin_accounts WHERE user_id = %s",
-                        (uid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_identities WHERE user_id = %s",
-                        (uid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_channel_user_settings WHERE user_id = %s",
-                        (uid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM conversation_responses WHERE conversation_thread_id = %s::uuid",
-                        (tid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM conversation_queries WHERE conversation_thread_id = %s::uuid",
-                        (tid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
-                        (tid,),
-                    )
-                    await cur.execute(
-                        "DELETE FROM workspaces WHERE workspace_id = %s::uuid",
-                        (ws_id,),
-                    )
-                    await cur.execute("DELETE FROM users WHERE user_id = %s", (uid,))
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_interrupt_runtime_config
-                        SET interactive_actions_enabled = TRUE,
-                            interrupt_ledger_enabled = TRUE,
-                            bt2_link_recovery_enabled = TRUE,
-                            updated_at = NOW()
-                        WHERE singleton_id = 1
-                        """
-                    )
+            if pool_opened:
+                async with local_pool.connection(timeout=10) as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_action_tokens WHERE thread_id = %s::uuid OR dalton_user_id = %s",
+                            (tid, uid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_interrupt_resumes WHERE thread_id = %s::uuid OR settled_by_user_id = %s",
+                            (tid, uid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_deliveries WHERE user_id = %s OR delivery_key LIKE %s",
+                            (uid, f"%{prefix}%"),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_background_runs WHERE thread_id = %s::uuid OR dalton_user_id = %s",
+                            (tid, uid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_thread_watches WHERE thread_id = %s::uuid OR dalton_user_id = %s",
+                            (tid, uid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_inbound_events WHERE dalton_user_id = %s OR message_id LIKE %s",
+                            (uid, f"%{prefix}%"),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_session_generations WHERE dalton_user_id = %s",
+                            (uid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_weixin_audit_logs WHERE target_user_id = %s OR operator_user_id = %s",
+                            (uid, uid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_weixin_accounts WHERE user_id = %s",
+                            (uid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                            (uid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_channel_user_settings WHERE user_id = %s",
+                            (uid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM conversation_responses WHERE conversation_thread_id = %s::uuid",
+                            (tid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM conversation_queries WHERE conversation_thread_id = %s::uuid",
+                            (tid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                            (tid,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM workspaces WHERE workspace_id = %s::uuid",
+                            (ws_id,),
+                        )
+                        await cur.execute("DELETE FROM users WHERE user_id = %s", (uid,))
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_interrupt_runtime_config
+                            SET interactive_actions_enabled = TRUE,
+                                interrupt_ledger_enabled = TRUE,
+                                bt2_link_recovery_enabled = TRUE,
+                                updated_at = NOW()
+                            WHERE singleton_id = 1
+                            """
+                        )
         finally:
             await local_pool.close()
 
@@ -1338,18 +1341,49 @@ async def test_pg_interleaving_05_recover_and_unbind_weixin_account(
         )
         wx_db._after_unbind_3a_lock_hook = None
 
+    assert rec_watch["mode"] == "watch_reconnect"
+    assert unbind_res["ok"] is True
+    assert unbind_res["deleted_account"] is True
+
+    # Verify BEFORE running any follow-up `startup` that the interleaved `watch_reconnect`
+    # itself backfilled the wakeup row in dalton_channel_background_runs, Weixin account was
+    # deleted, and both watch & background_run FKs are NULL (r4 Item 7)!
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt, MAX(weixin_account_id::text) AS wx_aid
+                FROM dalton_channel_background_runs
+                WHERE thread_id = %s::uuid AND run_id = %s
+                """,
+                (tid, bg_rid),
+            )
+            bg_row_pre_startup = await cur.fetchone()
+            assert bg_row_pre_startup is not None and int(bg_row_pre_startup["cnt"]) == 1, (
+                f"Expected interleaved watch_reconnect to backfill wakeup background_run row "
+                f"BEFORE startup for order={order}, got {bg_row_pre_startup!r}"
+            )
+            assert bg_row_pre_startup["wx_aid"] is None
+            await cur.execute(
+                "SELECT 1 FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
+                (aid,),
+            )
+            assert await cur.fetchone() is None
+            await cur.execute(
+                "SELECT weixin_account_id FROM dalton_channel_thread_watches WHERE thread_id = %s::uuid",
+                (tid,),
+            )
+            w_row_pre_startup = await cur.fetchone()
+            assert w_row_pre_startup is not None and w_row_pre_startup["weixin_account_id"] is None
+
     rec_start, rec_ir = await asyncio.gather(
         cg_db.recover_channel_state(mode="startup", gateway_epoch=epoch, require_gateway_epoch=True),
         cg_db.recover_channel_state(mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True),
     )
     assert rec_start["mode"] == "startup"
     assert rec_ir["mode"] == "interrupt_resumes"
-    assert rec_watch["mode"] == "watch_reconnect"
-    assert unbind_res["ok"] is True
-    assert unbind_res["deleted_account"] is True
 
-    # Verify backfill genuinely inserted the wakeup row in dalton_channel_background_runs,
-    # Weixin account was deleted, and both watch & background_run FKs are NULL!
+    # Confirm post-startup row count stays 1 and FKs remain NULL
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1361,21 +1395,8 @@ async def test_pg_interleaving_05_recover_and_unbind_weixin_account(
                 (tid, bg_rid),
             )
             bg_row = await cur.fetchone()
-            assert bg_row is not None and int(bg_row["cnt"]) == 1, (
-                f"Expected wakeup background_run row to be backfilled for order={order}, got {bg_row!r}"
-            )
+            assert bg_row is not None and int(bg_row["cnt"]) == 1
             assert bg_row["wx_aid"] is None
-            await cur.execute(
-                "SELECT 1 FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
-                (aid,),
-            )
-            assert await cur.fetchone() is None
-            await cur.execute(
-                "SELECT weixin_account_id FROM dalton_channel_thread_watches WHERE thread_id = %s::uuid",
-                (tid,),
-            )
-            w_row = await cur.fetchone()
-            assert w_row is not None and w_row["weixin_account_id"] is None
 
 
 @pytest.mark.asyncio
@@ -2315,3 +2336,262 @@ async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_d
     rem_after, bt2_after = await _run_repeatable_read_counts()
     assert rem_after == 0, f"Expected remaining_drain_items == 0 after drain, got {rem_after}"
     assert bt2_after == 0, f"Expected pending_link_recoveries == 0 after drain, got {bt2_after}"
+
+
+@pytest.mark.asyncio
+async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_zero(
+    pg_b3_env,
+) -> None:
+    """r4 Item 1 (real PG):
+    1) Pre-drain legacy ``deliverables-links:<run_id>`` fails terminally with ``not_allowed``
+       (``bt2_enrolled = FALSE``);
+    2) Enter 3-switch drain mode and verify §5.4 ``REPEATABLE READ`` counts are ``0 / 0``;
+    3) Replay the SAME ``deliverables-links:<run_id>`` using legacy-format I-6 (production
+       fields, no BT2 args) -> MUST return existing terminal state, leave the DB row and
+       ``delivery_attempt`` untouched, and keep ``pending_link_recoveries == 0``."""
+    pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
+    pfx = pg_b3_env["prefix"]
+    run_id = f"run-r4-drain-{pfx}"
+    parent_key = f"deliverables-links:{run_id}"
+    scope = f"dm:{pg_b3_env['feishu_puid']}"
+
+    await _seed_session_and_inbound(
+        pool,
+        platform="feishu",
+        message_id=f"{pfx}_r4_i1",
+        uid=uid,
+        scope_key=scope,
+        chat_address="feishu:@me",
+        tid=tid,
+        run_id=run_id,
+        interrupt_id=f"int-r4-i1-{pfx}",
+    )
+
+    # 1) Create pre-drain legacy parent and settle it as failed / not_allowed (like Feishu 403)
+    first_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key=parent_key,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id=run_id,
+        platform="feishu",
+        target="feishu:@me",
+        source_scope_key=scope,
+        source_generation=1,
+        activity_origin="conversation",
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+    )
+    assert first_claim["claim_status"] == "claimed"
+    assert first_claim["delivery_attempt"] == 1
+
+    await cg_db.update_delivery_progress(
+        delivery_key=parent_key,
+        status="failed",
+        error_code="not_allowed",
+        error_message="Feishu permission denied",
+        delivery_attempt=1,
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+    )
+
+    # 2) Close drain barrier and verify REPEATABLE READ count is 0
+    drain_res = await cat.enter_interrupt_drain_mode()
+    assert drain_res["bt2_link_recovery_enabled"] is False
+
+    async def _count_unsettled_bt2() -> int:
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    await cur.execute(
+                        """
+                        SELECT bt2_link_recovery_enabled
+                        FROM dalton_channel_interrupt_runtime_config
+                        WHERE singleton_id = 1
+                        FOR SHARE
+                        """
+                    )
+                    cfg = await cur.fetchone()
+                    assert cfg is not None and cfg["bt2_link_recovery_enabled"] is False
+                    await cur.execute(
+                        """
+                        SELECT count(*) AS cnt
+                        FROM dalton_channel_deliveries src
+                        WHERE src.user_id = %s
+                          AND src.delivery_key LIKE 'deliverables-links:%%'
+                          AND src.delivery_key NOT LIKE 'deliverables-links:%%:item:%%'
+                          AND (
+                              src.status IN ('in_flight', 'partial', 'unknown')
+                              OR (
+                                  src.status = 'failed'
+                                  AND COALESCE(src.error_code, '') NOT IN (
+                                      'not_allowed',
+                                      'max_attempts_exceeded',
+                                      'skipped_platform_disabled'
+                                  )
+                              )
+                          )
+                        """,
+                        (uid,),
+                    )
+                    row = await cur.fetchone()
+                    return int(row["cnt"])
+
+    assert await _count_unsettled_bt2() == 0
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT status, error_code, delivery_attempt, bt2_enrolled, updated_at
+                FROM dalton_channel_deliveries
+                WHERE delivery_key = %s
+                """,
+                (parent_key,),
+            )
+            before_row = dict(await cur.fetchone())
+            assert before_row["status"] == "failed"
+            assert before_row["error_code"] == "not_allowed"
+            assert before_row["delivery_attempt"] == 1
+            assert before_row["bt2_enrolled"] is False
+
+    # 3) Replay the SAME parent key in legacy format -> MUST NOT re-open or mutate!
+    replay_res = await cg_db.authorize_and_claim_delivery(
+        delivery_key=parent_key,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id=run_id,
+        platform="feishu",
+        target="feishu:@me",
+        source_scope_key=scope,
+        source_generation=1,
+        activity_origin="conversation",
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+    )
+    assert replay_res["claim_status"] == "already_completed"
+    assert replay_res["status"] == "failed"
+    assert replay_res["error_code"] == "not_allowed"
+    assert replay_res["delivery_attempt"] == 1
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT status, error_code, delivery_attempt, bt2_enrolled, updated_at
+                FROM dalton_channel_deliveries
+                WHERE delivery_key = %s
+                """,
+                (parent_key,),
+            )
+            after_row = dict(await cur.fetchone())
+    assert after_row == before_row
+    assert await _count_unsettled_bt2() == 0
+
+
+@pytest.mark.asyncio
+async def test_pg_r4_item5_watch_reconnect_skips_locked_watch_without_waiting(
+    pg_b3_env,
+) -> None:
+    """r4 Item 5 (real PG): while another transaction holds ``FOR UPDATE`` on a
+    ``dalton_channel_thread_watches`` row, ``recover_channel_state(mode='watch_reconnect')``
+    MUST return immediately without blocking (``FOR UPDATE SKIP LOCKED``), skipping that
+    watch; once the lock is released, a follow-up reconnect locks and backfills it."""
+    pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
+    scope = f"dm:{pg_b3_env['feishu_puid']}"
+    bg_rid = str(uuid4())
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_thread_watches (
+                    thread_id, dalton_user_id, platform, target_address,
+                    scope_key, generation, watch_active, last_seen_turn_index
+                )
+                VALUES (%s::uuid, %s, 'feishu', 'feishu:@me', %s, 1, TRUE, 0)
+                """,
+                (tid, uid, scope),
+            )
+            await cur.execute(
+                """
+                INSERT INTO conversation_queries (
+                    conversation_query_id, conversation_thread_id, turn_index, content, type, created_at
+                )
+                VALUES (%s::uuid, %s::uuid, 1, 'wakeup check', 'wakeup', NOW())
+                """,
+                (str(uuid4()), tid),
+            )
+            await cur.execute(
+                """
+                INSERT INTO conversation_responses (
+                    conversation_response_id, conversation_thread_id, turn_index, status, created_at
+                )
+                VALUES (%s::uuid, %s::uuid, 1, 'in_progress', NOW())
+                """,
+                (bg_rid, tid),
+            )
+
+    # Hold FOR UPDATE lock on the watch row on a dedicated connection
+    async with pool.connection() as lock_conn:
+        async with lock_conn.transaction():
+            async with lock_conn.cursor() as lock_cur:
+                await lock_cur.execute(
+                    "SELECT 1 FROM dalton_channel_thread_watches WHERE thread_id = %s::uuid FOR UPDATE",
+                    (tid,),
+                )
+                assert await lock_cur.fetchone() is not None
+
+                # watch_reconnect MUST NOT block on the locked watch row!
+                rec_while_locked = await asyncio.wait_for(
+                    cg_db.recover_channel_state(
+                        mode="watch_reconnect",
+                        thread_id=tid,
+                        gateway_epoch=epoch,
+                        require_gateway_epoch=True,
+                    ),
+                    timeout=3.0,
+                )
+                assert rec_while_locked["mode"] == "watch_reconnect"
+                assert rec_while_locked["thread_watches"] == []
+
+                # Verify the locked watch was NOT backfilled while held
+                async with pool.connection() as check_conn:
+                    async with check_conn.cursor() as check_cur:
+                        await check_cur.execute(
+                            """
+                            SELECT COUNT(*) AS cnt
+                            FROM dalton_channel_background_runs
+                            WHERE thread_id = %s::uuid AND run_id = %s
+                            """,
+                            (tid, bg_rid),
+                        )
+                        cnt_row = await check_cur.fetchone()
+                        assert cnt_row is not None and int(cnt_row["cnt"]) == 0
+
+    # Once the lock is released, follow-up watch_reconnect acquires the watch and backfills it
+    rec_after_unlock = await asyncio.wait_for(
+        cg_db.recover_channel_state(
+            mode="watch_reconnect",
+            thread_id=tid,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        ),
+        timeout=3.0,
+    )
+    assert rec_after_unlock["mode"] == "watch_reconnect"
+    assert any(str(w["thread_id"]) == tid for w in rec_after_unlock["thread_watches"])
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM dalton_channel_background_runs
+                WHERE thread_id = %s::uuid AND run_id = %s
+                """,
+                (tid, bg_rid),
+            )
+            cnt_after = await cur.fetchone()
+            assert cnt_after is not None and int(cnt_after["cnt"]) == 1

@@ -1154,6 +1154,40 @@ def _filter_unconfirmed_bt2_manifest(
     return out
 
 
+def _filter_confirmed_sent_or_linked_bt2_manifest(
+    manifest: Any,
+    files_status: Any,
+) -> list[dict[str, Any]]:
+    """Deduct items already confirmed as ``sent`` or ``linked`` in ``files_status``
+    (used when rebuilding a legacy parent's ``deliverable_manifest`` from ``requested_files``)."""
+    if not isinstance(manifest, list) or not manifest:
+        return []
+    confirmed_keys: set[tuple[str, str]] = set()
+    if isinstance(files_status, list):
+        for fs in files_status:
+            if not isinstance(fs, dict):
+                continue
+            st = str(fs.get("status") or "").strip().lower()
+            if st in ("sent", "linked"):
+                confirmed_keys.add(
+                    (
+                        str(fs.get("workspace_id") or "").strip(),
+                        _normalize_bt2_manifest_path(fs.get("path")),
+                    )
+                )
+    out: list[dict[str, Any]] = []
+    for item in manifest:
+        if not isinstance(item, dict):
+            continue
+        k = (
+            str(item.get("workspace_id") or "").strip(),
+            _normalize_bt2_manifest_path(item.get("path")),
+        )
+        if k not in confirmed_keys:
+            out.append(dict(item))
+    return out
+
+
 def _initial_pending_files_status(manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -1623,6 +1657,18 @@ async def verify_dm_delivery_recipient(
                         detail={
                             "code": "deliverable_recipient_denied",
                             "message": "Only BT2 :item: link deliveries may call verify-dm-recipient.",
+                        },
+                    )
+                if (
+                    delivery_attempt is None
+                    or isinstance(delivery_attempt, bool)
+                    or int(delivery_attempt) != current_attempt
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "delivery_attempt_mismatch",
+                            "message": "delivery_attempt is required and must match current attempt for BT2 link deliveries.",
                         },
                     )
                 auth_meta = row.get("authorized_target_meta")
@@ -9991,7 +10037,15 @@ async def _authorize_and_claim_bt2_links_delivery_once(
     if is_item:
         companion_key = parent_key
     elif source_delivery_key and str(source_delivery_key).strip():
-        companion_key = str(source_delivery_key).strip()
+        cleaned_src_key = str(source_delivery_key).strip()
+        if cleaned_key != derive_bt2_parent_links_key(cleaned_src_key):
+            return {
+                "claim_status": "denied",
+                "status": "failed",
+                "code": "not_allowed",
+                "message": "BT2 parent delivery_key does not match deterministic parent key for source_delivery_key.",
+            }
+        companion_key = cleaned_src_key
     else:
         suffix = cleaned_key[len("deliverables-links:") :]
         if suffix and not suffix.startswith(("tool:", "fallback:", "notice:", "automation:")):
@@ -10204,9 +10258,21 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                     await cat_mod._after_7b0_lock_hook("i6_bt2")
                 bt2_enabled_now = bool(rt_cfg["bt2_link_recovery_enabled"])
 
+                source_matches_parent = bool(
+                    source_row
+                    and cleaned_key
+                    == derive_bt2_parent_links_key(str(source_row.get("delivery_key") or ""))
+                )
+                if source_row is not None and not source_matches_parent:
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": "not_allowed",
+                        "message": "BT2 parent delivery_key does not match deterministic parent key for source_delivery_key.",
+                    }
                 enrolled_from_lineage = bool(
                     (existing and existing.get("bt2_enrolled"))
-                    or (source_row and source_row.get("bt2_enrolled"))
+                    or (source_matches_parent and source_row.get("bt2_enrolled"))
                     or (parent_row and parent_row.get("bt2_enrolled"))
                 )
                 if not bt2_enabled_now and not enrolled_from_lineage:
@@ -10273,7 +10339,17 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                     if existing is not None and isinstance(existing.get("deliverable_manifest"), list) and existing["deliverable_manifest"]:
                         manifest = list(existing["deliverable_manifest"])
                     elif requested_files:
-                        manifest = build_bt2_deliverable_manifest(requested_files, parent_key)
+                        raw_manifest = build_bt2_deliverable_manifest(requested_files, parent_key)
+                        if existing is not None:
+                            manifest = _filter_confirmed_sent_or_linked_bt2_manifest(
+                                raw_manifest, existing.get("files_status")
+                            )
+                            if source_row is not None:
+                                manifest = _filter_unconfirmed_bt2_manifest(
+                                    manifest, source_row.get("files_status")
+                                )
+                        else:
+                            manifest = raw_manifest
                 else:
                     if parent_row is None:
                         return {
@@ -10375,6 +10451,40 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                             "status": "failed",
                             "error_code": "max_attempts_exceeded",
                             "delivery_attempt": _delivery_attempt(existing),
+                        }
+                    if not is_item and requested_files and not manifest:
+                        # All requested files are already confirmed sent/linked on this legacy
+                        # parent (or its source row); settle parent as sent without re-queuing.
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_deliveries
+                            SET status = 'sent',
+                                error_code = NULL,
+                                error_message = NULL,
+                                updated_at = NOW()
+                            WHERE delivery_key = %s
+                            """,
+                            (cleaned_key,),
+                        )
+                        await _settle_bt2_turn_fallback_pending_in_tx(
+                            cur,
+                            run_id=existing.get("run_id") or run_id,
+                            settling_delivery_key=cleaned_key,
+                            is_item=False,
+                            parent_row=None,
+                            locked_inbounds=locked_inbounds,
+                            locked_bg_runs=locked_bg_runs,
+                            error_code=None,
+                        )
+                        return {
+                            "claim_status": "already_completed",
+                            "status": "sent",
+                            "platform": existing.get("platform"),
+                            "target_address": existing.get("target_address"),
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "deliverable_manifest": existing.get("deliverable_manifest") or [],
+                            "files_status": existing.get("files_status") or [],
+                            "authorized_target_meta": existing.get("authorized_target_meta"),
                         }
 
                 # Resolve authoritative metadata:
@@ -10757,7 +10867,13 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                         delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
                         bt2_enrolled = TRUE,
                         source_delivery_key = COALESCE(dalton_channel_deliveries.source_delivery_key, EXCLUDED.source_delivery_key),
-                        deliverable_manifest = COALESCE(dalton_channel_deliveries.deliverable_manifest, EXCLUDED.deliverable_manifest),
+                        deliverable_manifest = CASE
+                            WHEN dalton_channel_deliveries.deliverable_manifest IS NOT NULL
+                             AND jsonb_typeof(dalton_channel_deliveries.deliverable_manifest) = 'array'
+                             AND jsonb_array_length(dalton_channel_deliveries.deliverable_manifest) > 0
+                            THEN dalton_channel_deliveries.deliverable_manifest
+                            ELSE EXCLUDED.deliverable_manifest
+                        END,
                         authorized_target_meta = COALESCE(EXCLUDED.authorized_target_meta, dalton_channel_deliveries.authorized_target_meta),
                         dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
                         weixin_account_id = COALESCE(dalton_channel_deliveries.weixin_account_id, EXCLUDED.weixin_account_id),
@@ -11019,12 +11135,71 @@ async def authorize_and_claim_delivery(
                     if cat_mod._after_7b0_lock_hook is not None:
                         await cat_mod._after_7b0_lock_hook("i6_links_legacy")
                     legacy_links_7b0_checked = True
-                    if not bool(rt_cfg["bt2_link_recovery_enabled"]) and existing is None:
+                    if not bool(rt_cfg["bt2_link_recovery_enabled"]):
+                        if existing is None:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "bt2_drain_disabled",
+                                "message": "BT2 link recovery enrollment is disabled during drain mode.",
+                            }
+                        ex_st_bar = str(existing.get("status") or "").strip().lower()
+                        ex_err_bar = str(existing.get("error_code") or "").strip().lower()
+                        ex_is_cur_bar = bool(existing.get("is_current", False))
+                        ex_ct_bar = _delivery_confirmed_thread_address(existing)
+                        ex_bp_bar = _delivery_discord_body_phase(existing)
+                        if ex_st_bar in ("sent", "partial") or (
+                            ex_st_bar == "failed" and ex_err_bar in BT2_TERMINAL_FAILURE_CODES
+                        ):
+                            return {
+                                "claim_status": "already_completed",
+                                "status": ex_st_bar,
+                                "error_code": existing.get("error_code"),
+                                "error_message": existing.get("error_message"),
+                                "first_response_json": existing.get("first_response_json"),
+                                "platform": existing["platform"],
+                                "target_address": existing["target_address"],
+                                "confirmed_thread_address": ex_ct_bar,
+                                "discord_body_phase": ex_bp_bar,
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "thread_scope_key": existing.get("source_scope_key"),
+                                "is_current": ex_is_cur_bar,
+                            }
+                        if ex_st_bar in ("in_flight", "unknown"):
+                            return {
+                                "claim_status": "in_flight_or_unknown",
+                                "status": "unknown",
+                                "existing_status": ex_st_bar,
+                                "error_code": existing.get("error_code"),
+                                "sent_chunks": int(existing.get("sent_chunks") or 0),
+                                "code": "in_flight",
+                                "message": "An earlier attempt of this same call is still delivering it.",
+                                "platform": existing["platform"],
+                                "target_address": existing["target_address"],
+                                "confirmed_thread_address": ex_ct_bar,
+                                "discord_body_phase": ex_bp_bar,
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "thread_scope_key": existing.get("source_scope_key"),
+                                "files_status": existing.get("files_status") or [],
+                                "is_current": ex_is_cur_bar,
+                            }
                         return {
                             "claim_status": "denied",
-                            "status": "failed",
-                            "code": "bt2_drain_disabled",
-                            "message": "BT2 link recovery enrollment is disabled during drain mode.",
+                            "status": ex_st_bar or "failed",
+                            "code": existing.get("error_code") or "bt2_drain_disabled",
+                            "error_code": existing.get("error_code"),
+                            "error_message": existing.get("error_message"),
+                            "message": (
+                                existing.get("error_message")
+                                or "BT2 link recovery enrollment is disabled during drain mode."
+                            ),
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "confirmed_thread_address": ex_ct_bar,
+                            "discord_body_phase": ex_bp_bar,
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "thread_scope_key": existing.get("source_scope_key"),
+                            "is_current": ex_is_cur_bar,
                         }
                     return None
 
@@ -13152,7 +13327,13 @@ async def authorize_and_claim_delivery(
                             dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
                             bt2_enrolled = dalton_channel_deliveries.bt2_enrolled OR EXCLUDED.bt2_enrolled,
                             source_delivery_key = COALESCE(dalton_channel_deliveries.source_delivery_key, EXCLUDED.source_delivery_key),
-                            deliverable_manifest = COALESCE(dalton_channel_deliveries.deliverable_manifest, EXCLUDED.deliverable_manifest),
+                            deliverable_manifest = CASE
+                            WHEN dalton_channel_deliveries.deliverable_manifest IS NOT NULL
+                             AND jsonb_typeof(dalton_channel_deliveries.deliverable_manifest) = 'array'
+                             AND jsonb_array_length(dalton_channel_deliveries.deliverable_manifest) > 0
+                            THEN dalton_channel_deliveries.deliverable_manifest
+                            ELSE EXCLUDED.deliverable_manifest
+                        END,
                             authorized_target_meta = COALESCE(dalton_channel_deliveries.authorized_target_meta, EXCLUDED.authorized_target_meta),
                             files_status = CASE
                                 WHEN jsonb_array_length(COALESCE(dalton_channel_deliveries.files_status, '[]'::jsonb)) > 0
@@ -16971,7 +17152,7 @@ async def _recover_channel_state_once(
                     }
                 if cleaned_mode == "watch_reconnect":
                     # Strictly do NOT touch dalton_channel_deliveries in_flight rows!
-                    # Lock Order ⑥: 0b-2 -> 3a (weixin_accounts ASC FOR KEY SHARE) -> 7a (thread_watches ASC FOR UPDATE -> background_runs).
+                    # Lock Order ⑥: 0b-2 -> 3a (weixin_accounts ASC FOR KEY SHARE) -> 7a (thread_watches ASC FOR UPDATE SKIP LOCKED -> background_runs).
                     # Acquiring 3a BEFORE locking thread_watches eliminates ABBA deadlock with unbind_weixin_account
                     # when _backfill_watch_notification_runs_in_tx inserts into background_runs (FK -> weixin_accounts).
                     locked_wr_aids: list[str] = []
@@ -16999,7 +17180,7 @@ async def _recover_channel_state_once(
                                 WHERE thread_id = %s
                                   AND (weixin_account_id IS NULL OR weixin_account_id = ANY(%s::uuid[]))
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """,
                                 (norm_tid, locked_wr_aids),
                             )
@@ -17010,7 +17191,7 @@ async def _recover_channel_state_once(
                                 WHERE thread_id = %s
                                   AND weixin_account_id IS NULL
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """,
                                 (norm_tid,),
                             )
@@ -17021,7 +17202,7 @@ async def _recover_channel_state_once(
                                 WHERE thread_id = %s
                                   AND platform <> 'weixin'
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """,
                                 (norm_tid,),
                             )
@@ -17033,7 +17214,7 @@ async def _recover_channel_state_once(
                                 WHERE watch_active = TRUE
                                   AND (weixin_account_id IS NULL OR weixin_account_id = ANY(%s::uuid[]))
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """,
                                 (locked_wr_aids,),
                             )
@@ -17044,7 +17225,7 @@ async def _recover_channel_state_once(
                                 WHERE watch_active = TRUE
                                   AND weixin_account_id IS NULL
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """
                             )
                         else:
@@ -17054,7 +17235,7 @@ async def _recover_channel_state_once(
                                 WHERE watch_active = TRUE
                                   AND platform <> 'weixin'
                                 ORDER BY thread_id ASC
-                                FOR UPDATE
+                                FOR UPDATE SKIP LOCKED
                                 """
                             )
                     watches = [
@@ -17132,19 +17313,26 @@ async def _recover_channel_state_once(
                         for r in await cur.fetchall()
                         if _platform_enabled_for_recovery(r.get("platform"))
                     ]
-                    await cur.execute(
-                        """
-                        SELECT * FROM dalton_channel_thread_watches
-                        WHERE (%s::uuid IS NULL AND watch_active = TRUE)
-                           OR thread_id = %s
-                        """,
-                        (norm_tid, norm_tid),
-                    )
-                    updated_watches = [
-                        dict(r)
-                        for r in await cur.fetchall()
-                        if _platform_enabled_for_recovery(r.get("platform"))
-                    ]
+                    locked_watch_tids = {
+                        str(w["thread_id"]) for w in watches if w.get("thread_id")
+                    }
+                    if locked_watch_tids:
+                        await cur.execute(
+                            """
+                            SELECT * FROM dalton_channel_thread_watches
+                            WHERE (%s::uuid IS NULL AND watch_active = TRUE)
+                               OR thread_id = %s
+                            """,
+                            (norm_tid, norm_tid),
+                        )
+                        updated_watches = [
+                            dict(r)
+                            for r in await cur.fetchall()
+                            if str(r.get("thread_id") or "") in locked_watch_tids
+                            and _platform_enabled_for_recovery(r.get("platform"))
+                        ]
+                    else:
+                        updated_watches = []
                     await _enrich_recovery_scope_keys(cur, bg_runs, updated_watches)
                     watch_by_tid = {
                         str(w["thread_id"]): w

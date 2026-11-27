@@ -418,12 +418,16 @@ class _FakeCursorState:
 
         # --- thread watches ---
         if "FROM DALTON_CHANNEL_THREAD_WATCHES" in norm:
-            if "WHERE THREAD_ID = %S" in norm:
+            if "SELECT 1 FROM DALTON_CHANNEL_THREAD_WATCHES" in norm:
+                self._one = None
+                self._all = []
+            elif "WHERE THREAD_ID = %S" in norm:
                 row = self.db.thread_watches.get(str(p[0]))
                 if row:
                     d = dict(row)
                     d["weixin_account_id_text"] = d.get("weixin_account_id")
                     self._one = d
+                    self._all = [d]
             else:
                 self._all = [dict(v) for v in self.db.thread_watches.values() if v.get("watch_active")]
             return
@@ -1288,6 +1292,14 @@ class _FakeCursorState:
             return
 
         if "UPDATE DALTON_CHANNEL_DELIVERIES" in norm:
+            if "SET STATUS = 'SENT', ERROR_CODE = NULL, ERROR_MESSAGE = NULL" in norm:
+                row = self.db.deliveries.get(str(p[0]))
+                if row:
+                    row["status"] = "sent"
+                    row["error_code"] = None
+                    row["error_message"] = None
+                    self.rowcount = 1
+                return
             if "WHERE DELIVERY_KEY = %S AND STATUS = 'IN_FLIGHT'" in norm:
                 row = self.db.deliveries.get(str(p[0]))
                 if row and row["status"] == "in_flight":
@@ -4071,7 +4083,10 @@ async def test_r3_item3_i7_sent_to_current_count_lock_order_and_run_id_drift_ret
             db.deliveries["fallback:run-drift"]["run_id"] = "run-drift-new"
         return out
 
-    monkeypatch.setattr(cg_db, "_preread_i7_origin_rows", _drifting_preread)
+    drifting_preread_mock = create_autospec(
+        cg_db._preread_i7_origin_rows, side_effect=_drifting_preread
+    )
+    monkeypatch.setattr(cg_db, "_preread_i7_origin_rows", drifting_preread_mock)
     res_drift = await cg_db.update_delivery_progress(
         delivery_key="fallback:run-drift",
         status="sent",
@@ -4461,3 +4476,605 @@ async def test_r3_item6_mint_and_inspect_gate_lock_order_and_generation_mismatch
         if "FROM DALTON_CHANNEL_INTERRUPT_RUNTIME_CONFIG" in s and "FOR SHARE" in s
     )
     assert g_l2 < g_l6 < g_7b0
+
+
+# ===========================================================================
+# r4 UNIT TESTS: Items 1–5
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_r4_item1_barrier_closed_existing_legacy_parent_returns_existing_state_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 1: when ``bt2_link_recovery_enabled == False``, replaying an existing
+    legacy ``deliverables-links:`` parent (including ``failed/not_allowed``, non-terminal
+    ``failed``, and Weixin missing-source paths) MUST return its existing state with
+    ZERO DB writes and MUST NOT increment ``delivery_attempt`` or re-open to ``in_flight``."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.session_generations[("feishu", "dm:ou_alice", uid)] = {"generation": 1}
+    db.inbounds[("feishu", "om_r4_1")] = {
+        "platform": "feishu",
+        "message_id": "om_r4_1",
+        "dalton_user_id": uid,
+        "chat_type": "dm",
+        "chat_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice",
+        "session_generation": 1,
+        "thread_id": tid,
+        "run_id": "run-r4-term",
+        "status": "streaming",
+        "fallback_pending": True,
+        "raw_payload": {"platform_user_id": "ou_alice"},
+    }
+    db.inbounds[("feishu", "om_r4_2")] = {
+        "platform": "feishu",
+        "message_id": "om_r4_2",
+        "dalton_user_id": uid,
+        "chat_type": "dm",
+        "chat_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice",
+        "session_generation": 1,
+        "thread_id": tid,
+        "run_id": "run-r4-retry",
+        "status": "streaming",
+        "fallback_pending": True,
+        "raw_payload": {"platform_user_id": "ou_alice"},
+    }
+
+    db.runtime_config["bt2_link_recovery_enabled"] = False
+
+    # (a) Existing bt2_enrolled=False terminal failed/not_allowed row -> already_completed, zero writes
+    term_key = "deliverables-links:run-r4-term"
+    db.deliveries[term_key] = {
+        "delivery_key": term_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-term",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "failed",
+        "error_code": "not_allowed",
+        "error_message": "permission denied",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "files_status": [],
+        "bt2_enrolled": False,
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 1,
+        "activity_origin": "conversation",
+    }
+    db.sql_log.clear()
+    r_term = await cg_db.authorize_and_claim_delivery(
+        delivery_key=term_key,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id="run-r4-term",
+        platform="feishu",
+        target="feishu:@me",
+        source_scope_key="dm:ou_alice",
+        source_generation=1,
+        activity_origin="conversation",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_term["claim_status"] == "already_completed"
+    assert r_term["status"] == "failed"
+    assert r_term["error_code"] == "not_allowed"
+    assert r_term["delivery_attempt"] == 1
+    assert db.deliveries[term_key]["status"] == "failed"
+    assert db.deliveries[term_key]["error_code"] == "not_allowed"
+    assert db.deliveries[term_key]["delivery_attempt"] == 1
+    assert not any("INSERT INTO DALTON_CHANNEL_DELIVERIES" in s for s in db.sql_log)
+    assert not any("UPDATE DALTON_CHANNEL_DELIVERIES" in s for s in db.sql_log)
+
+    # (b) Existing bt2_enrolled=False non-terminal failed/timeout row -> denied (not re-opened), zero writes
+    retry_key = "deliverables-links:run-r4-retry"
+    db.deliveries[retry_key] = {
+        "delivery_key": retry_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-retry",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "failed",
+        "error_code": "timeout",
+        "error_message": "network timeout",
+        "delivery_attempt": 2,
+        "sent_chunks": 0,
+        "files_status": [],
+        "bt2_enrolled": False,
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 1,
+        "activity_origin": "conversation",
+    }
+    db.sql_log.clear()
+    r_retry = await cg_db.authorize_and_claim_delivery(
+        delivery_key=retry_key,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id="run-r4-retry",
+        platform="feishu",
+        target="feishu:@me",
+        source_scope_key="dm:ou_alice",
+        source_generation=1,
+        activity_origin="conversation",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_retry["claim_status"] == "denied"
+    assert r_retry["status"] == "failed"
+    assert r_retry["error_code"] == "timeout"
+    assert r_retry["delivery_attempt"] == 2
+    assert db.deliveries[retry_key]["status"] == "failed"
+    assert db.deliveries[retry_key]["error_code"] == "timeout"
+    assert db.deliveries[retry_key]["delivery_attempt"] == 2
+    assert not any("INSERT INTO DALTON_CHANNEL_DELIVERIES" in s for s in db.sql_log)
+
+    # (c) Weixin missing-source path with existing bt2_enrolled=False failed/not_allowed -> zero writes!
+    wx_key = "deliverables-links:run-r4-wx-nosrc"
+    db.deliveries[wx_key] = {
+        "delivery_key": wx_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-wx-nosrc",
+        "is_current": True,
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "status": "failed",
+        "error_code": "not_allowed",
+        "error_message": "wx denied",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "files_status": [],
+        "bt2_enrolled": False,
+    }
+    db.sql_log.clear()
+    r_wx = await cg_db.authorize_and_claim_delivery(
+        delivery_key=wx_key,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id="run-r4-wx-nosrc",
+        platform="weixin",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_wx["claim_status"] == "already_completed"
+    assert r_wx["status"] == "failed"
+    assert r_wx["error_code"] == "not_allowed"
+    assert r_wx["delivery_attempt"] == 1
+    assert db.deliveries[wx_key]["status"] == "failed"
+    assert db.deliveries[wx_key]["error_code"] == "not_allowed"
+    assert db.deliveries[wx_key]["delivery_attempt"] == 1
+    assert not any("INSERT INTO DALTON_CHANNEL_DELIVERIES" in s for s in db.sql_log)
+
+
+@pytest.mark.asyncio
+async def test_r4_item2_enrolled_source_cannot_authorize_mismatched_parent_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 2: an enrolled source row (``bt2_enrolled=True``) MUST ONLY authorize its
+    exact deterministic parent key ``derive_bt2_parent_links_key(source_delivery_key)``.
+    Any mismatched parent key is denied with ZERO DB writes (both barrier closed and open)."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.user_settings[uid] = {
+        "user_id": uid,
+        "apps": {
+            "feishu": {
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
+            }
+        },
+    }
+
+    tool_src = "tool:run-r4-i2:tc1"
+    tool_parent = cg_db.derive_bt2_parent_links_key(tool_src)
+    assert tool_parent == "deliverables-links:tool:run-r4-i2:tc1"
+    db.deliveries[tool_src] = {
+        "delivery_key": tool_src,
+        "kind": "agent_send",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-i2",
+        "is_current": False,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "sent",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "bt2_enrolled": True,
+        "deliverable_manifest": cg_db.build_bt2_deliverable_manifest(
+            [{"workspace_id": "ws1", "path": "a.pdf"}], tool_parent
+        ),
+        "files_status": [{"workspace_id": "ws1", "path": "a.pdf", "status": "pending"}],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": False,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+
+    dm_src = "deliverables:run-r4-i2-dm"
+    dm_parent = cg_db.derive_bt2_parent_links_key(dm_src)
+    assert dm_parent == "deliverables-links:run-r4-i2-dm"
+    db.deliveries[dm_src] = {
+        "delivery_key": dm_src,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-i2-dm",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "bt2_enrolled": True,
+        "deliverable_manifest": cg_db.build_bt2_deliverable_manifest(
+            [{"workspace_id": "ws1", "path": "b.pdf"}], dm_parent
+        ),
+        "files_status": [{"workspace_id": "ws1", "path": "b.pdf", "status": "pending"}],
+        "authorized_target_meta": {
+            "auth_mode": "current_conversation",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": True,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+
+    for barrier_enabled in (False, True):
+        db.runtime_config["bt2_link_recovery_enabled"] = barrier_enabled
+        for bad_parent, src_key in [
+            ("deliverables-links:tool:run-r4-i2:extra", tool_src),
+            ("deliverables-links:arbitrary-key", tool_src),
+            ("deliverables-links:deliverables:run-r4-i2-dm", dm_src),
+        ]:
+            db.sql_log.clear()
+            res = await cg_db.authorize_and_claim_delivery(
+                delivery_key=bad_parent,
+                kind="fallback",
+                source_delivery_key=src_key,
+                gateway_epoch=1,
+                require_gateway_epoch=True,
+            )
+            assert res["claim_status"] == "denied"
+            assert res["status"] == "failed"
+            assert bad_parent not in db.deliveries
+            assert not any("INSERT INTO DALTON_CHANNEL_DELIVERIES" in s for s in db.sql_log)
+
+    # Exact deterministic parent key IS still allowed even with barrier closed (enrolled lineage)!
+    db.runtime_config["bt2_link_recovery_enabled"] = False
+    ok_tool = await cg_db.authorize_and_claim_delivery(
+        delivery_key=tool_parent,
+        kind="fallback",
+        source_delivery_key=tool_src,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert ok_tool["claim_status"] == "claimed"
+    assert tool_parent in db.deliveries
+
+
+@pytest.mark.asyncio
+async def test_r4_item3_legacy_parent_partial_success_recovery_deducts_confirmed_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 3 (§3.5(2) rolling-upgrade legacy parent compatibility):
+    When an existing legacy parent (``unknown``, no ``deliverable_manifest``) recovers
+    from ``requested_files``, items already confirmed ``sent``/``linked`` in the parent's
+    own ``files_status`` are deducted from the rebuilt manifest so only remaining items
+    are queued and I-7 settles the parent cleanly to ``sent``."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.session_generations[("feishu", "dm:ou_alice", uid)] = {"generation": 1}
+
+    # (a) Partial success legacy parent: a.pdf already linked, b.pdf failed (retryable)
+    pkey = "deliverables-links:run-r4-leg-partial"
+    db.deliveries[pkey] = {
+        "delivery_key": pkey,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-leg-partial",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 1,
+        "bt2_enrolled": False,
+        "deliverable_manifest": None,
+        "files_status": [
+            {"workspace_id": "ws1", "path": "a.pdf", "status": "linked"},
+            {"workspace_id": "ws1", "path": "b.pdf", "status": "failed", "reason": "timeout"},
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "current_conversation",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": True,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+
+    p_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key=pkey,
+        kind="fallback",
+        requested_files=[
+            {"workspace_id": "ws1", "path": "a.pdf"},
+            {"workspace_id": "ws1", "path": "b.pdf"},
+        ],
+        attempt_id=str(uuid4()),
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert p_claim["claim_status"] == "claimed"
+    rebuilt_manifest = p_claim["deliverable_manifest"]
+    assert [m["path"] for m in rebuilt_manifest] == ["b.pdf"]
+    # Existing confirmed files_status is preserved on the parent row
+    assert any(
+        fs["path"] == "a.pdf" and fs["status"] == "linked"
+        for fs in db.deliveries[pkey]["files_status"]
+    )
+
+    # Claiming an :item: for already-confirmed a.pdf MUST be rejected (not in rebuilt manifest)
+    a_item_key = cg_db.build_bt2_deliverable_manifest(
+        [{"workspace_id": "ws1", "path": "a.pdf"}], pkey
+    )[0]["item_key"]
+    r_a = await cg_db.authorize_and_claim_delivery(
+        delivery_key=a_item_key,
+        kind="fallback",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_a["claim_status"] == "denied"
+    assert r_a["code"] == "bt2_parent_missing"
+
+    # Claim & settle the remaining b.pdf :item: child
+    b_item_key = rebuilt_manifest[0]["item_key"]
+    c_b = await cg_db.authorize_and_claim_delivery(
+        delivery_key=b_item_key,
+        kind="fallback",
+        attempt_id=str(uuid4()),
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert c_b["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=b_item_key,
+        status="sent",
+        sent_chunks=1,
+        platform_message_ids=["om_b_link"],
+        files_status=[{"workspace_id": "ws1", "path": "b.pdf", "status": "linked"}],
+        delivery_attempt=c_b["delivery_attempt"],
+        claim_attempt_id=c_b["claim_attempt_id"],
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+
+    # Parent I-7 settles cleanly to 'sent' (does NOT stall in 'partial' waiting for a.pdf!)
+    p_fin = await cg_db.update_delivery_progress(
+        delivery_key=pkey,
+        status="sent",
+        files_status=[
+            {"workspace_id": "ws1", "path": "a.pdf", "status": "linked"},
+            {"workspace_id": "ws1", "path": "b.pdf", "status": "linked"},
+        ],
+        delivery_attempt=p_claim["delivery_attempt"],
+        claim_attempt_id=p_claim["claim_attempt_id"],
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert p_fin["ok"] is True
+    assert db.deliveries[pkey]["status"] == "sent"
+
+    # (b) Legacy unknown parent where ALL requested_files are already confirmed sent/linked
+    pkey_all = "deliverables-links:run-r4-leg-all"
+    db.deliveries[pkey_all] = {
+        "delivery_key": pkey_all,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-r4-leg-all",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 1,
+        "bt2_enrolled": False,
+        "deliverable_manifest": None,
+        "files_status": [
+            {"workspace_id": "ws1", "path": "x.pdf", "status": "sent"},
+            {"workspace_id": "ws1", "path": "y.pdf", "status": "linked"},
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "current_conversation",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": True,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+    p_all = await cg_db.authorize_and_claim_delivery(
+        delivery_key=pkey_all,
+        kind="fallback",
+        requested_files=[
+            {"workspace_id": "ws1", "path": "x.pdf"},
+            {"workspace_id": "ws1", "path": "y.pdf"},
+        ],
+        attempt_id=str(uuid4()),
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert p_all["claim_status"] == "already_completed"
+    assert p_all["status"] == "sent"
+    assert db.deliveries[pkey_all]["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_r4_item4_feishu_bt2_dm_verify_requires_matching_delivery_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 4: ``verify_dm_delivery_recipient`` Branch B (BT2 ``:item:`` child key)
+    MUST require ``delivery_attempt`` and reject omitted or mismatched attempts with 409."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.user_settings[uid] = {
+        "user_id": uid,
+        "apps": {"feishu": {"agent_messages": {"enabled": True, "allowed": ["feishu:@me"]}}},
+    }
+
+    dk = "deliverables-links:tool:r4-att:c1:item:111122223333"
+    db.deliveries[dk] = {
+        "delivery_key": dk,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "r4-att",
+        "execution_id": None,
+        "is_current": False,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 2,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": False,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+
+    # Omitted delivery_attempt MUST be rejected with 409 delivery_attempt_mismatch
+    with pytest.raises(HTTPException) as exc_none:
+        await cg_db.verify_dm_delivery_recipient(
+            delivery_key=dk,
+            delivery_attempt=None,
+            resolved_recipient_id="ou_alice",
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+    assert exc_none.value.status_code == 409
+    assert exc_none.value.detail["code"] == "delivery_attempt_mismatch"
+
+    # Stale delivery_attempt MUST be rejected with 409 delivery_attempt_mismatch
+    with pytest.raises(HTTPException) as exc_stale:
+        await cg_db.verify_dm_delivery_recipient(
+            delivery_key=dk,
+            delivery_attempt=1,
+            resolved_recipient_id="ou_alice",
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+    assert exc_stale.value.status_code == 409
+    assert exc_stale.value.detail["code"] == "delivery_attempt_mismatch"
+
+    # Matching delivery_attempt=2 succeeds
+    ok = await cg_db.verify_dm_delivery_recipient(
+        delivery_key=dk,
+        delivery_attempt=2,
+        resolved_recipient_id="ou_alice",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert ok["authorized"] is True
+    assert ok["delivery_attempt"] == 2
+    assert ok["recipient_id"] == "ou_alice"
+
+
+@pytest.mark.asyncio
+async def test_r4_item5_watch_reconnect_uses_skip_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 5 (Lock Order ⑥): ``watch_reconnect`` MUST lock ``dalton_channel_thread_watches``
+    with ``FOR UPDATE SKIP LOCKED`` so a busy watch row never blocks reconnect."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.thread_watches[tid] = {
+        "thread_id": tid,
+        "dalton_user_id": uid,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "scope_key": "dm:ou_alice",
+        "generation": 1,
+        "watch_active": True,
+        "last_seen_turn_index": 0,
+        "weixin_account_id": None,
+    }
+
+    db.sql_log.clear()
+    res_single = await cg_db.recover_channel_state(
+        mode="watch_reconnect",
+        thread_id=tid,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_single["mode"] == "watch_reconnect"
+    watch_lock_sqls = [
+        s for s in db.sql_log
+        if "FROM DALTON_CHANNEL_THREAD_WATCHES" in s and "FOR UPDATE" in s
+    ]
+    assert watch_lock_sqls and all("FOR UPDATE SKIP LOCKED" in s for s in watch_lock_sqls)
+
+    db.sql_log.clear()
+    res_all = await cg_db.recover_channel_state(
+        mode="watch_reconnect",
+        thread_id=None,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_all["mode"] == "watch_reconnect"
+    watch_lock_sqls_all = [
+        s for s in db.sql_log
+        if "FROM DALTON_CHANNEL_THREAD_WATCHES" in s and "FOR UPDATE" in s
+    ]
+    assert watch_lock_sqls_all and all("FOR UPDATE SKIP LOCKED" in s for s in watch_lock_sqls_all)
