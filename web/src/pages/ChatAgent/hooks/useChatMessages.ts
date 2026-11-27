@@ -9,8 +9,18 @@ import type React from 'react';
 import { useState, useRef, useEffect, useCallback, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
-// DALTON-HOOK(antigravity-series): gate activeTurnModel tracking to Dalton builds
+// DALTON-HOOK(antigravity-series): gate activeTurnModel tracking and delegate HITL/duplicate admission guards to Dalton module
 import { isDaltonBuild } from '@/config/brand';
+import {
+  applyAdoptedDuplicateTurnModel,
+  createHitlResumeModelGuard,
+  createTurnModelTracker,
+  handleHitlResumeDisconnect,
+  markHitlBubbleUnadmitted,
+  type ActiveTurnModel,
+} from '@/lib/dalton/turnAdmission';
+// DALTON-HOOK(antigravity-series): created-thread detection for first-send model/tuning carry-over
+import { createdThreadIdFromSend } from '@/lib/dalton/threadTuningDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-identifiers)
 import { holdReload } from '@/lib/reloadHolds';
@@ -18,7 +28,7 @@ import { useHomeTimezone } from '@/hooks/useHomeTimezone';
 import { getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useUser } from '@/hooks/useUser';
-import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
+import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, getHandoffLiveness, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
 import { readWorkflowStatus } from '../utils/primedStatus';
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
 import { subscribeThreadCompactions } from '@/lib/threadLifecycle/feedClient';
@@ -242,8 +252,18 @@ export function useChatMessages(
     return workspaceId ? getStoredThreadId(workspaceId) : '__default__';
   });
   const [isLoading, setIsLoading] = useState(false);
-  // DALTON-HOOK(antigravity-series): track the exact model, pick sequence, and server admission status of the active turn so refused sends never clear a pick and queued sends never clear a newer unsent pick
-  const [activeTurnModel, setActiveTurnModel] = useState<{ model: string | null; pickSeq: number | null; admitted: boolean } | null>(null);
+  // DALTON-HOOK(antigravity-series): track active turn model, created thread id, & per-requestKey first-submitted pick in Dalton builds
+  const [activeTurnModel, setActiveTurnModel] = useState<ActiveTurnModel | null>(null);
+  const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+  const renderedThreadIdRef = useRef(threadId);
+  renderedThreadIdRef.current = threadId;
+  const turnModelTrackerRef = useRef(createTurnModelTracker());
+  const setThreadIdFromSend: React.Dispatch<React.SetStateAction<string>> = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(renderedThreadIdRef.current) : next;
+    const created = createdThreadIdFromSend(renderedThreadIdRef.current, resolved); // DALTON-HOOK(antigravity-series)
+    if (created) setCreatedThreadId(created);
+    setThreadId(resolved);
+  }, []);
   useEffect(() => {
     if (!isLoading) setActiveTurnModel(null);
   }, [isLoading]);
@@ -860,7 +880,8 @@ export function useChatMessages(
     setReloadTrigger,
     setHasActiveSubagents,
     pause,
-    setThreadId,
+    // DALTON-HOOK(antigravity-series): record server-created thread id when runtime transitions from __default__
+    setThreadId: setThreadIdFromSend,
     setTurnStatus,
     clearTurnStatus,
     // ref containers (stable identity, ref-current reads)
@@ -1020,6 +1041,8 @@ export function useChatMessages(
         if (currentThreadId && currentThreadId !== '__default__') {
           provenanceBuffer.clear();
         }
+        // DALTON-HOOK(antigravity-series): clear createdThreadId when navigation/workspace change switches threads
+        if (isDaltonBuild) setCreatedThreadId(null);
         setThreadId(newThreadId);
       }
 
@@ -1256,8 +1279,9 @@ export function useChatMessages(
     requestKeys.settle(requestKey, 'accepted'); // consumed by the accepted copy
     // A new chat's copy may have made the thread: the reload, the route and
     // the next send all read the state.
+    // DALTON-HOOK(antigravity-series): record createdThreadId when duplicate adoption transitions from __default__
+    setThreadIdFromSend(dupThreadId);
     threadIdRef.current = dupThreadId;
-    setThreadId(dupThreadId);
     latchRun(runId);
     // A settled copy has no stream to join, so the reconnect gives up and
     // reloads. The server holds that whole turn, so the reload has to replace
@@ -3128,7 +3152,8 @@ export function useChatMessages(
       sharedWithWorkspace,
       queryClient,
       threadIdRef,
-      setThreadId,
+      // DALTON-HOOK(antigravity-series): record createdThreadId when ensureThreadId mints the first thread
+      setThreadId: setThreadIdFromSend,
       wasStoppedRef,
       signal: abortController.signal,
     }).finally(releaseCreate);
@@ -3146,6 +3171,8 @@ export function useChatMessages(
     }
     const effectiveThreadId = created.threadId;
     const requestKey = keyNow ?? takeKey(effectiveThreadId);
+    // DALTON-HOOK(antigravity-series): retain first submitted model & pickSeq per requestKey for 409 duplicate adoption
+    turnModelTrackerRef.current.recordSubmission(requestKey, { model: model || null, pickSeq: modelPickSeq ?? null });
     // How the request ended for its comments, unless the server answered first.
     let ended: SendOutcome = 'dropped';
     let wasDisconnected = false;
@@ -3183,7 +3210,10 @@ export function useChatMessages(
         ) {
           notifyAccepted();
           // DALTON-HOOK(antigravity-series): mark this turn's model pick as consumed only once the server confirms this request started a run (not when merged as a steer into another run)
-          if (event.event !== 'steering_accepted') confirmActiveTurnModel();
+          if (event.event !== 'steering_accepted') {
+            turnModelTrackerRef.current.clearKey(requestKey);
+            confirmActiveTurnModel();
+          }
         }
         // Only a run of this send's own spends what the hint said, and its
         // closing frame says what the next send summarizes. A send refused or
@@ -3338,7 +3368,7 @@ export function useChatMessages(
             wasDisconnected = true;
             // DALTON-HOOK(composer-drafts): the adopted duplicate was already accepted server-side
             notifyAccepted();
-            if (adoptedDuplicate) confirmActiveTurnModel();
+            if (adoptedDuplicate) applyAdoptedDuplicateTurnModel(turnModelTrackerRef.current, requestKey, err, setActiveTurnModel);
             return true;
           }
           admission.unadmit();
@@ -3572,7 +3602,8 @@ export function useChatMessages(
     beginRun();
 
     // A resume is a turn of its own on the backend, with no user bubble.
-    const assistantMessage = createAssistantMessage(assistantMessageId, newestKnownTurn() + 1);
+    const turnBefore = newestKnownTurn();
+    const assistantMessage = createAssistantMessage(assistantMessageId, turnBefore + 1);
     setMessages((prev) => appendMessage(prev, assistantMessage));
     currentMessageRef.current = assistantMessageId;
 
@@ -3594,14 +3625,6 @@ export function useChatMessages(
 
     const wasInterruptedRef = { current: false };
     const processStreamFrame = createStreamEventProcessor(runtime, streamRouterDeps, assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
-    // Once the stream is open, a refusal arrives as a frame.
-    let refusalFrame: SSEEvent | null = null;
-    const processEvent = (event: SSEEvent) => {
-      // DALTON-HOOK(cos-settings-tools): capture scope_changed refusal frames as well as stale_fork
-      if (isStaleForkRefusal(event) || readScopeChangedMessage(event) !== null) refusalFrame = event;
-      processStreamFrame(event);
-    };
-
     // One request_key per resume (keyed by the interrupt answers), reused on
     // a retransmit after a lost response — see createRequestKeyTracker.
     const requestKey = requestKeys.take(
@@ -3613,10 +3636,26 @@ export function useChatMessages(
     // asked. With no composer mounted, the last send's.
     const resumeOpts: ModelOptions = readComposerOptions?.() ?? lastModelOptionsRef.current;
     const { model, reasoningEffort, fastMode } = resumeOpts;
-    // DALTON-HOOK(antigravity-series): record the resumed turn's model & pick sequence in Dalton builds, confirming only once onRunIdResolved proves admission
-    if (isDaltonBuild) {
-      setActiveTurnModel({ model: model || null, pickSeq: resumeOpts.modelPickSeq ?? null, admitted: false });
-    }
+    // Once the stream is open, a refusal arrives as a frame.
+    let refusalFrame: SSEEvent | null = null;
+    // DALTON-HOOK(antigravity-series): track HITL resume admission, START refusal frames, and first-submitted model per requestKey
+    const readRunLiveness = (runId: string) => (typeof getHandoffLiveness === 'function' ? getHandoffLiveness({ threads: [], runs: [runId], steers: [] }) : Promise.resolve({ runs: [] }));
+    const resumeModelGuard = createHitlResumeModelGuard({ requestKey, pick: { model: model || null, pickSeq: resumeOpts.modelPickSeq ?? null }, tracker: turnModelTrackerRef.current, setActiveTurnModel, getWorkflowStatus, getRunLiveness: readRunLiveness, threadId, turnIndexBefore: turnBefore });
+    const processEvent = (event: SSEEvent) => {
+      // DALTON-HOOK(cos-settings-tools): capture START admission refusal frames (stale_fork, scope_changed, running, workspace_moving, etc.)
+      if (resumeModelGuard.observeEvent(event, isSubagentEvent(event))) refusalFrame = event;
+      processStreamFrame(event);
+    };
+    const latchAdmittedRun = (runId: string) => {
+      requestKeys.settle(requestKey, 'accepted');
+      currentRunIdRef.current = runId;
+      // The backend opened a run, so the resume was admitted. Settled here
+      // rather than left to the `finally` because this is the first moment
+      // "Resumed" is true, and the wait is visible on the card.
+      admitted = true;
+      resumeModelGuard.onRunIdResolved();
+      settleResume(true);
+    };
     try {
       const result = await sendHitlResponse(hitlResponse, workspaceId, threadId, {
         onEvent: processEvent,
@@ -3628,18 +3667,7 @@ export function useChatMessages(
         // clear above and the metadata frame) would let
         // attemptReconnectAfterDisconnect fall back to the prior run's
         // TaskInfo and silently hang.
-        onRunIdResolved: (runId) => {
-          requestKeys.settle(requestKey, 'accepted');
-          currentRunIdRef.current = runId;
-          // The backend opened a run, so the resume was admitted. Settled here
-          // rather than left to the `finally` because this is the first moment
-          // "Resumed" is true, and the wait is visible on the card.
-          admitted = true;
-          if (isDaltonBuild) {
-            setActiveTurnModel((prev) => (prev && !prev.admitted ? { ...prev, admitted: true } : prev));
-          }
-          settleResume(true);
-        },
+        onRunIdResolved: latchAdmittedRun,
         signal: abortController.signal,
         requestKey,
       });
@@ -3660,6 +3688,8 @@ export function useChatMessages(
       if (recoverStaleAnswer(refusalFrame)) return;
       // DALTON-HOOK(cos-settings-tools): settle scope_changed stream refusal without restoring pending controls
       if (settleScopeChangedRefusal(refusalFrame)) return;
+      // DALTON-HOOK(antigravity-series): mark START refusal bubble unadmitted so retry keeps the right turn index
+      if (refusalFrame) { markHitlBubbleUnadmitted(setMessages, assistantMessageId, false); return; }
 
       // Ahead of the disconnect for the same reason as a send: the run a
       // retry notice names is over, and the drop after it is the server's. A
@@ -3672,14 +3702,12 @@ export function useChatMessages(
         return;
       }
 
-      if ((result?.disconnected || refs.retryNotice?.recovery === 'resend') && !notice) {
-        console.log('[HITL] Stream disconnected, attempting reconnect');
-        wasDisconnected = true;
-        // A dropped link, not a refusal: the run is live and reconnect owns it.
-        admitted = true;
-        attemptReconnectAfterDisconnect(assistantMessageId);
-        return;
-      }
+      // DALTON-HOOK(antigravity-series): delegate pre-first-frame disconnect, unstarted resend, or empty close verification to Dalton module
+      const disconnect = await handleHitlResumeDisconnect(resumeModelGuard, {
+        disconnected: result?.disconnected, isResendNotice: refs.retryNotice?.recovery === 'resend', hasRetryNotice: Boolean(notice),
+        contentLocation: result?.contentLocation, assistantMessageId, onConfirmedRun: latchAdmittedRun, setMessages, attemptReconnect: attemptReconnectAfterDisconnect,
+      });
+      if (disconnect) { if (disconnect !== 'unadmitted') ({ admitted, pauseGone, wasDisconnected } = disconnect); return; }
 
       // Mark message as complete (use live ref in case steering_delivered switched it)
       {
@@ -3700,6 +3728,8 @@ export function useChatMessages(
         wasDisconnected = true;
         // Accepted, just not by this attempt — the pause is genuinely answered.
         admitted = true;
+        // DALTON-HOOK(antigravity-series): confirm first-submitted/actual old run's model for requestKey
+        resumeModelGuard.onDuplicateAdopted(err);
         return;
       }
       if (recoverStaleAnswer(err)) return;
@@ -4056,6 +4086,8 @@ export function useChatMessages(
         : `fork|${threadId}|${checkpointId ?? ''}|${forkFromTurn ?? ''}|${message ?? ''}`,
       { key: request.requestKey, comments: request.artifactComments },
     );
+    // DALTON-HOOK(antigravity-series): retain first submitted model & pickSeq per requestKey for 409 duplicate adoption
+    turnModelTrackerRef.current.recordSubmission(requestKey, { model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null });
     // The message a reply answered when it is the one right above it, which a
     // refusal that needs the turn's input sent again gives back to the
     // composer. A request that carries its own text, or a reply to an answered
@@ -4125,7 +4157,10 @@ export function useChatMessages(
         ) {
           relayAccepted();
           // DALTON-HOOK(antigravity-series): mark checkpoint/fork/retry turn pick as consumed once the server starts its run
-          if (event.event !== 'steering_accepted') confirmCheckpointTurnModel();
+          if (event.event !== 'steering_accepted') {
+            turnModelTrackerRef.current.clearKey(requestKey);
+            confirmCheckpointTurnModel();
+          }
         }
         // As for a send: the hint goes once the run this request starts does.
         if (event.event === 'metadata' && !isSubagentEvent(event)) spendNextSummary();
@@ -4246,7 +4281,7 @@ export function useChatMessages(
         // DALTON-HOOK(composer-drafts): the adopted duplicate is the server
         // holding the resent copy — the original send's draft settles sent.
         relayAccepted();
-        if (adoptedCheckpointDuplicate) confirmCheckpointTurnModel();
+        if (adoptedCheckpointDuplicate) applyAdoptedDuplicateTurnModel(turnModelTrackerRef.current, requestKey, err, setActiveTurnModel);
         return;
       }
       if (recoverRefusedFork(err)) return;
@@ -4655,8 +4690,9 @@ export function useChatMessages(
     threadId,
     threadModels,
     isLoading,
-    // DALTON-HOOK(antigravity-series): expose activeTurnModel for Dalton turn-pick matching
+    // DALTON-HOOK(antigravity-series): expose activeTurnModel & createdThreadId for Dalton turn-pick & tuning handle binding
     activeTurnModel,
+    createdThreadId,
     marketWatch,
     hasActiveSubagents,
     awaitingReportBack,

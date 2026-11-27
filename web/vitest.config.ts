@@ -32,6 +32,7 @@ const FORKS_FILES = [
   'src/lib/__tests__/staleBuildPreBoot.test.ts',
   'src/lib/__tests__/localePreload.test.ts',
   'src/pages/ChatAgent/hooks/__tests__/useWarmWorkspaceSandbox.test.tsx',
+  'src/pages/ChatAgent/hooks/__tests__/useChatMessages.hitlResumeMode.test.ts',
 ];
 
 export default defineConfig({
