@@ -1609,3 +1609,219 @@ def test_prepare_automation_report_content_refuses_unsplittable_element_and_hand
     assert len(panel_prepared["cards"]) >= 2
     assert all(is_feishu_card_within_envelope(c) for c in panel_prepared["cards"])
 
+
+@pytest.mark.asyncio
+async def test_submit_automation_report_replays_legacy_ant_card_without_content_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-submitting a pre-normalization ANT card (missing text_tag tag) reuses the saved batch."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from uuid import uuid4
+    from src.dalton.notify.card_normalize import normalize_feishu_cards
+
+    legacy_ant_card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "ANT 多空跟踪 — 2026-11-27"},
+            "template": "blue",
+            "text_tag_list": [
+                {
+                    "text": {"tag": "plain_text", "content": "ANT"},
+                    "color": "purple",
+                }
+            ],
+        },
+        "body": {
+            "elements": [
+                {"tag": "text", "content": "多空核心变化摘要"},
+                {"tag": "markdown", "content": "已跟踪要点"},
+            ]
+        },
+    }
+    normalized_ant_cards, warnings = normalize_feishu_cards([legacy_ant_card])
+    assert warnings == [
+        "cards[0].header.text_tag_list[0].tag",
+        "cards[0].body.elements[0]",
+    ]
+
+    legacy_sha = reports.automation_report_content_sha256(
+        profile="market-digest-pm",
+        content_kind="cards",
+        cards=[legacy_ant_card],
+        failure_text=None,
+    )
+    normalized_sha = reports.automation_report_content_sha256(
+        profile="market-digest-pm",
+        content_kind="cards",
+        cards=normalized_ant_cards,
+        failure_text=None,
+    )
+    assert legacy_sha != normalized_sha
+
+    old_did = str(uuid4())
+    user_id = str(uuid4())
+    auto_id = str(uuid4())
+    first_exec_id = str(uuid4())
+    replay_exec_id = str(uuid4())
+    ws_id = str(uuid4())
+    th_id = str(uuid4())
+    rn_id = str(uuid4())
+    report_run_id = "ant-tracker:2026-11-27"
+    target = "feishu:chat:oc_antboard1234"
+    old_payload = {
+        "source": "automation_report",
+        "version": 1,
+        "profile": "market-digest-pm",
+        "report_run_id": report_run_id,
+        "content_kind": "cards",
+        "content_sha256": legacy_sha,
+        "first_execution_id": first_exec_id,
+        "owner_user_id": user_id,
+        "automation_id": auto_id,
+        "target_snapshot": [target],
+        "expected_item_count": 1,
+        "cards": [legacy_ant_card],
+    }
+    stored_rows: list[dict[str, Any]] = [
+        {
+            "delivery_id": old_did,
+            "execution_id": first_exec_id,
+            "automation_id": auto_id,
+            "user_id": user_id,
+            "channel": "feishu",
+            "target": target,
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "unavailable",
+            "payload_json": old_payload,
+        }
+    ]
+    executed_sql: list[str] = []
+
+    class _FakeCur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: object, params: Any = None) -> None:
+            norm = " ".join(str(sql).split())
+            executed_sql.append(norm)
+            if "FROM dalton_notify_deliveries" in norm and "payload_json->>'report_run_id' <>" in norm:
+                self._one = None
+            elif "FROM dalton_notify_deliveries" in norm:
+                self._rows = list(stored_rows)
+
+        async def fetchone(self):
+            return self._one
+
+        async def fetchall(self):
+            return list(self._rows)
+
+    class _FakeConn:
+        def cursor(self, **_kw):
+            return _FakeCur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_conn(_conn=None):
+        yield _FakeConn()
+
+    monkeypatch.setattr(reports, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        reports,
+        "lock_report_execution",
+        create_autospec(
+            reports.lock_report_execution,
+            return_value={
+                "automation_id": auto_id,
+                "user_id": user_id,
+                "workspace_id": ws_id,
+                "conversation_thread_id": th_id,
+                "conversation_response_id": rn_id,
+                "automation_execution_id": replay_exec_id,
+                "status": "running",
+                "delivery_config": {},
+                "metadata": {
+                    "report_profile": {
+                        "profile": "market-digest-pm",
+                        "report_targets": [target],
+                        "failure_targets": ["discord:user:424242424242424242"],
+                    }
+                },
+                "name": "ant-tracker",
+            },
+        ),
+    )
+
+    # Re-submit normalized ANT card under the same report_run_id -> reuses legacy batch
+    res = await reports.submit_automation_report(
+        execution_id=replay_exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id=report_run_id,
+        material="yes",
+        cards=normalized_ant_cards,
+    )
+    assert res["ok"] is True, res
+    assert res["created"] is False
+    assert res["execution_id"] == first_exec_id
+    assert res["content_sha256"] == legacy_sha
+    assert res["targets"] == [target]
+    assert len(stored_rows) == 1
+    assert stored_rows[0]["delivery_id"] == old_did
+    assert not any("DELETE FROM dalton_notify_deliveries" in sql for sql in executed_sql)
+    assert not any("INSERT INTO dalton_notify_deliveries" in sql for sql in executed_sql)
+
+    # Symmetric case: saved batch is already normalized, direct caller re-submits raw ANT card
+    stored_rows[0]["payload_json"] = {
+        **old_payload,
+        "content_sha256": normalized_sha,
+        "cards": normalized_ant_cards,
+    }
+    res_raw = await reports.submit_automation_report(
+        execution_id=replay_exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id=report_run_id,
+        material="yes",
+        cards=[legacy_ant_card],
+    )
+    assert res_raw["ok"] is True, res_raw
+    assert res_raw["created"] is False
+    assert res_raw["execution_id"] == first_exec_id
+
+    # Different body still returns content_conflict
+    different_card = {
+        **legacy_ant_card,
+        "body": {"elements": [{"tag": "markdown", "content": "完全不同的正文内容"}]},
+    }
+    conflict = await reports.submit_automation_report(
+        execution_id=replay_exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id=report_run_id,
+        material="yes",
+        cards=[different_card],
+    )
+    assert conflict["ok"] is False
+    assert conflict["code"] == "content_conflict"
+

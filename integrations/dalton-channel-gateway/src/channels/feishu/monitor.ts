@@ -1151,6 +1151,8 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
           allowDirectFallback: options.allowDirectFallback,
+          webBaseUrl: options.webBaseUrl,
+          threadId: options.threadId,
           logger: this.logger,
         })
       : await sendMessageFeishu(client, {
@@ -1375,11 +1377,15 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       card: normalizedCard,
       replyToMessageId: options.replyToMessageId,
       replyInThread: options.replyInThread,
+      webBaseUrl: options.webBaseUrl,
+      threadId: options.threadId,
+      workspaceId: options.workspaceId,
       logger: this.logger,
     });
     return {
       messageId: res.messageId,
       resolvedAddress: options.targetAddress,
+      ...(res.usedMarkdownFallback ? { usedMarkdownFallback: true } : {}),
     };
   }
 

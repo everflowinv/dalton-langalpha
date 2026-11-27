@@ -176,6 +176,10 @@ export interface SendCardOptions {
   replyToMessageId?: string | null;
   /** Feishu: reply in topic (`reply_in_thread: true`) for bot-owned group topics. */
   replyInThread?: boolean;
+  /** Optional public web base URL & thread/workspace context for sandbox link rewriting in fallback markdown. */
+  webBaseUrl?: string | null;
+  threadId?: string | null;
+  workspaceId?: string | null;
   /** Optional DM recipient re-verification called after image upload and before card dispatch. */
   verifyRecipientBeforeSend?: () => Promise<void>;
 }
@@ -183,6 +187,8 @@ export interface SendCardOptions {
 export interface SendCardResult {
   messageId: string;
   resolvedAddress?: string;
+  /** True when the card fell back to a minimal markdown-only card (e.g. Feishu 200621), stripping images and buttons. */
+  usedMarkdownFallback?: boolean;
 }
 
 export interface DownloadedAttachment {

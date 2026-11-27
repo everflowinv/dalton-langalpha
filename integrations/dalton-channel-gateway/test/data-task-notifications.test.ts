@@ -3452,4 +3452,147 @@ describe("automation report plain text", () => {
     expect(fallbackCard.body.elements[0].content).toContain("**ANT 多空跟踪**");
     expect(fallbackCard.body.elements[0].content).toContain("要点一");
   });
+
+  it("marks embedded feishu_card images failed and rewrites plain_text fallback links on 200621", async () => {
+    const { DataTaskNotificationService } = await import(
+      "../src/data-task-notifications.js"
+    );
+    const pngBytes = makeSyntheticPng("card-img-fb");
+    const pngSha = sha256Hex(pngBytes);
+    let attempts = 0;
+    const { client, sentMessages } = createFakeOutboundLarkClient({
+      onMessageCreate: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_fb_img_dropped" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client,
+    });
+    const deliveryKey = "data-task-card-200621-img-key-1";
+    const cardPlan: DataTaskAuthorizePlanResponse = {
+      authorized: true,
+      status: "authorized",
+      run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7",
+      thread_id: "thread-dt-fb-1",
+      workspace_id: "ws-dt-fb-1",
+      job_key: "dalton-ant-tracker",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: PLAIN_FEISHU_RECIPIENT,
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: PLAIN_FEISHU_RECIPIENT,
+      items: [
+        {
+          item_index: 0,
+          kind: "feishu_card",
+          delivery_key: deliveryKey,
+          card: {
+            schema: "2.0",
+            header: {
+              title: {
+                tag: "plain_text",
+                content:
+                  "报表 [预览](http://localhost:3000/app) /home/workspace/summary.md",
+              },
+            },
+            body: {
+              elements: [
+                { tag: "__img__", path: "chart_1" },
+                {
+                  tag: "div",
+                  text: {
+                    tag: "plain_text",
+                    content:
+                      "本地地址 http://127.0.0.1:5173/view 和 [文件](/home/workspace/raw.csv)",
+                  },
+                },
+                { tag: "custom_broken", bad: 1 },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "art-img-1",
+              filename: "chart_1.png",
+              mime_type: "image/png",
+              size_bytes: pngBytes.byteLength,
+              sha256: pngSha,
+              placeholder: "chart_1",
+            },
+          ],
+        },
+      ],
+    };
+
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(cardPlan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue(
+      claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT),
+    );
+    vi.mocked(backend.downloadDataTaskRunArtifact!).mockResolvedValue({
+      content: pngBytes,
+      mimeType: "image/png",
+      filename: "chart_1.png",
+      sha256Header: pngSha,
+    });
+
+    const service = new DataTaskNotificationService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      mode: "outgoing",
+      webBaseUrl: "https://app.example.com",
+    });
+
+    const result = await service.handleDataTaskNotification({
+      run_id: cardPlan.run_id,
+      target: "feishu:@me",
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.data.ok).toBe(false);
+    expect(result.data.code).toBe("partial");
+    expect(result.data.items[0]).toMatchObject({
+      delivery_key: deliveryKey,
+      status: "partial",
+      platform_message_ids: ["om_fb_img_dropped"],
+    });
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: deliveryKey,
+        status: "partial",
+        error_code: "file_not_sent",
+        platform_message_ids: ["om_fb_img_dropped"],
+        files_status: [
+          {
+            path: "chart_1.png",
+            status: "failed",
+            reason: "feishu_card_200621_markdown_fallback",
+          },
+        ],
+      }),
+      { platform: "feishu" },
+    );
+
+    expect(sentMessages).toHaveLength(2);
+    const fallbackContent = JSON.parse(sentMessages[1]!.content).body.elements[0]
+      .content as string;
+    expect(fallbackContent).not.toContain("http://localhost:3000");
+    expect(fallbackContent).not.toContain("http://127.0.0.1:5173");
+    expect(fallbackContent).not.toContain("/home/workspace/");
+    expect(fallbackContent).not.toContain("[预览](");
+    expect(fallbackContent).not.toContain("[文件](");
+    expect(fallbackContent).toContain("localhost:3000/app");
+    expect(fallbackContent).toContain("127.0.0.1:5173/view");
+  });
 });

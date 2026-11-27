@@ -535,7 +535,12 @@ export interface FeishuMessageSendResult {
   threadId?: string;
   repliedInThread?: boolean;
   usedDirectFallback?: boolean;
+  usedMarkdownFallback?: boolean;
 }
+
+type FeishuResolvedSendRoute =
+  | { kind: "reply"; messageId: string; replyInThread: boolean }
+  | { kind: "direct" };
 
 export function toFeishuMessageSendResult(
   response:
@@ -616,6 +621,7 @@ export async function sendReplyOrFallbackDirect(
     msgType: string;
     target: string;
     receiveIdType: "chat_id" | "open_id" | "user_id";
+    onAttemptRoute?: (route: FeishuResolvedSendRoute) => void;
   },
 ): Promise<{
   data?: { message_id?: string; thread_id?: string };
@@ -632,6 +638,7 @@ export async function sendReplyOrFallbackDirect(
     repliedInThread: boolean;
     usedDirectFallback: boolean;
   }> => {
+    params.onAttemptRoute?.({ kind: "direct" });
     try {
       const response = (await client.im.message.create({
         params: { receive_id_type: params.receiveIdType },
@@ -688,6 +695,11 @@ export async function sendReplyOrFallbackDirect(
       code?: number;
       msg?: string;
     };
+    params.onAttemptRoute?.({
+      kind: "reply",
+      messageId: candidateId,
+      replyInThread: Boolean(params.replyInThread),
+    });
     try {
       replyResponse = (await client.im.message.reply({
         path: { message_id: candidateId },
@@ -813,6 +825,9 @@ export async function sendCardFeishu(
     fallbackReplyToMessageIds?: string[];
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
+    webBaseUrl?: string | null;
+    threadId?: string | null;
+    workspaceId?: string | null;
     logger?: SubsystemLogger;
   },
 ): Promise<FeishuMessageSendResult> {
@@ -835,32 +850,65 @@ export async function sendCardFeishu(
 
   assertFeishuCardWithinEnvelope(normalizedCard, "Feishu outbound card");
 
-  const dispatchCard = (cardPayload: Record<string, unknown> | FeishuSchema2Card) =>
-    sendReplyOrFallbackDirect(client, {
+  let failedRoute: FeishuResolvedSendRoute | undefined;
+
+  try {
+    const response = await sendReplyOrFallbackDirect(client, {
       replyToMessageId,
       fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
       replyInThread,
       allowDirectFallback: params.allowDirectFallback,
-      content: JSON.stringify(cardPayload),
+      content: JSON.stringify(normalizedCard),
       msgType: "interactive",
       target,
       receiveIdType,
+      onAttemptRoute: (route) => {
+        failedRoute = route;
+      },
     });
-
-  try {
-    const response = await dispatchCard(normalizedCard);
     return toFeishuMessageSendResult(response, target);
   } catch (err) {
     if (!isFeishuCardParseError(err)) {
       throw err;
     }
-    const fallbackCard = buildMinimalMarkdownFallbackCard(normalizedCard);
+    const fallbackCard = buildMinimalMarkdownFallbackCard(
+      params.card as Record<string, unknown>,
+      {
+        webBaseUrl: params.webBaseUrl,
+        threadId: params.threadId,
+        workspaceId: params.workspaceId,
+      },
+    );
     log.warn("feishu_card_200621_fallback", {
       feishu_code: FEISHU_CARD_PARSE_ERROR_CODE,
       target_type: receiveIdType,
     });
-    const fallbackResponse = await dispatchCard(fallbackCard);
-    return toFeishuMessageSendResult(fallbackResponse, target);
+    const fallbackResponse =
+      failedRoute?.kind === "reply"
+        ? await sendReplyOrFallbackDirect(client, {
+            replyToMessageId: failedRoute.messageId,
+            fallbackReplyToMessageIds: [],
+            replyInThread: failedRoute.replyInThread,
+            allowDirectFallback: false,
+            content: JSON.stringify(fallbackCard),
+            msgType: "interactive",
+            target,
+            receiveIdType,
+          })
+        : await sendReplyOrFallbackDirect(client, {
+            replyToMessageId: undefined,
+            fallbackReplyToMessageIds: [],
+            replyInThread: false,
+            allowDirectFallback: true,
+            content: JSON.stringify(fallbackCard),
+            msgType: "interactive",
+            target,
+            receiveIdType,
+          });
+    return {
+      ...toFeishuMessageSendResult(fallbackResponse, target),
+      usedMarkdownFallback: true,
+    };
   }
 }
 
@@ -874,6 +922,9 @@ export async function sendStructuredCardFeishu(
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
     title?: string;
+    webBaseUrl?: string | null;
+    threadId?: string | null;
+    workspaceId?: string | null;
     logger?: SubsystemLogger;
   },
 ): Promise<FeishuMessageSendResult> {
@@ -885,6 +936,9 @@ export async function sendStructuredCardFeishu(
     fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
     replyInThread: params.replyInThread,
     allowDirectFallback: params.allowDirectFallback,
+    webBaseUrl: params.webBaseUrl,
+    threadId: params.threadId,
+    workspaceId: params.workspaceId,
     logger: params.logger,
   });
 }

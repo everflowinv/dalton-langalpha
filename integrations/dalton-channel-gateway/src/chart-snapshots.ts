@@ -20,7 +20,11 @@ import {
   type I6AuthorizeAndClaimResponse,
   type WeixinPreflightAuthorizedData,
 } from "./backend-client.js";
-import type { ChannelAdapter, SendCardImageInput } from "./channels/adapter.js";
+import {
+  ChannelDeliveryError,
+  type ChannelAdapter,
+  type SendCardImageInput,
+} from "./channels/adapter.js";
 import { buildFeishuChartSnapshotCard } from "./channels/feishu/format.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import type { ChannelPlatform } from "./types.js";
@@ -914,7 +918,7 @@ export interface PendingChartDeliveryReceipt {
   sentLinks: number;
   totalItems: number;
   platformMessageIds: string[];
-  finalStatus: "sent" | "partial" | "failed";
+  finalStatus: "sent" | "partial" | "failed" | "unknown";
   timedOutPending: boolean;
 }
 
@@ -974,6 +978,8 @@ export interface DeliverChartsAndWidgetsResult {
   delivered?: boolean;
   /** True when another worker holds an active `in_flight` claim or an I-7 receipt is still pending settlement. */
   inFlight?: boolean;
+  /** True when at least one outbound send ended with uncertain delivery outcome (`outcome: "unknown"`). */
+  uncertain?: boolean;
   sentImages: number;
   sentLinks: number;
   timedOutPending: boolean;
@@ -1141,6 +1147,9 @@ export async function deliverTurnChartsAndWidgets(
               platform_message_ids: pending.platformMessageIds,
               status: pending.finalStatus,
               outcome: pending.finalStatus,
+              ...(pending.finalStatus === "unknown"
+                ? { error_code: "unavailable" }
+                : {}),
               delivery_attempt: retryAttempt,
             },
             { platform: pending.platform },
@@ -1152,6 +1161,7 @@ export async function deliverTurnChartsAndWidgets(
             settled,
             delivered: settled && pending.sentImages + pending.sentLinks > 0,
             inFlight: false,
+            ...(pending.finalStatus === "unknown" ? { uncertain: true } : {}),
             sentImages: pending.sentImages,
             sentLinks: pending.sentLinks,
             timedOutPending: pending.timedOutPending,
@@ -1233,7 +1243,11 @@ export async function deliverTurnChartsAndWidgets(
   let sentImages = 0;
   let sentLinks = 0;
   let failures = 0;
+  let unknowns = 0;
   let chunkIndex = 0;
+
+  const isUncertainDeliveryError = (err: unknown): boolean =>
+    err instanceof ChannelDeliveryError && err.outcome === "unknown";
 
   const verifyDmRecipient = async (): Promise<void> => {
     if (
@@ -1254,13 +1268,14 @@ export async function deliverTurnChartsAndWidgets(
   const sendChartOrWidgetItem = async (opts: {
     title: string;
     chartId?: string;
+    workspaceId?: string | null;
     webUrl: string | null;
     imageBuffer?: Buffer | null;
     imageFilename?: string;
     imageMimeType?: string;
     isWidget?: boolean;
     fixedCopy?: boolean;
-  }): Promise<boolean> => {
+  }): Promise<"sent" | "failed" | "unknown"> => {
     const idx = chunkIndex++;
     const effectiveFixed = Boolean(opts.fixedCopy || opts.isWidget);
 
@@ -1297,9 +1312,20 @@ export async function deliverTurnChartsAndWidgets(
           images,
           replyToMessageId,
           replyInThread,
+          webBaseUrl: params.webBaseUrl ?? null,
+          threadId: params.threadId ?? null,
+          workspaceId: opts.workspaceId ?? null,
           verifyRecipientBeforeSend: hasImage && isDm ? verifyDmRecipient : undefined,
         });
         if (res.messageId) sentMessageIds.push(res.messageId);
+        if (res.usedMarkdownFallback) {
+          if (opts.webUrl) {
+            sentLinks += 1;
+            return true;
+          }
+          // Fallback stripped the image/buttons and there was no verified chart link.
+          return false;
+        }
         if (hasImage) sentImages += 1;
         else sentLinks += 1;
         return true;
@@ -1449,25 +1475,34 @@ export async function deliverTurnChartsAndWidgets(
     const wantsImage = Boolean(opts.imageBuffer) && !effectiveFixed;
     if (wantsImage) {
       try {
-        return await sendAttempt(true);
+        return (await sendAttempt(true)) ? "sent" : "failed";
       } catch (err) {
         if (isStaleGatewayEpochError(err)) throw err;
-        // Verification, preflight, or image send failure degrades cleanly to link-only message
+        if (isUncertainDeliveryError(err)) {
+          return "unknown";
+        }
+        // Only confirmed undelivered errors degrade cleanly to link-only message
         // (matching the download-403 fallback path).
         try {
-          return await sendAttempt(false);
+          return (await sendAttempt(false)) ? "sent" : "failed";
         } catch (fallbackErr) {
           if (isStaleGatewayEpochError(fallbackErr)) throw fallbackErr;
-          return false;
+          if (isUncertainDeliveryError(fallbackErr)) {
+            return "unknown";
+          }
+          return "failed";
         }
       }
     }
 
     try {
-      return await sendAttempt(false);
+      return (await sendAttempt(false)) ? "sent" : "failed";
     } catch (err) {
       if (isStaleGatewayEpochError(err)) throw err;
-      return false;
+      if (isUncertainDeliveryError(err)) {
+        return "unknown";
+      }
+      return "failed";
     }
   };
 
@@ -1519,9 +1554,10 @@ export async function deliverTurnChartsAndWidgets(
       }
     }
 
-    const ok = await sendChartOrWidgetItem({
+    const outcome = await sendChartOrWidgetItem({
       title,
       chartId: useFixedChartCopy ? undefined : chart.chartId,
+      workspaceId: chart.workspaceId ?? null,
       webUrl,
       imageBuffer: pngBuffer,
       imageFilename: filename,
@@ -1529,7 +1565,8 @@ export async function deliverTurnChartsAndWidgets(
       isWidget: false,
       fixedCopy: useFixedChartCopy,
     });
-    if (!ok) failures += 1;
+    if (outcome === "unknown") unknowns += 1;
+    else if (outcome === "failed") failures += 1;
   }
 
   for (const widget of uniqueWidgets) {
@@ -1539,18 +1576,25 @@ export async function deliverTurnChartsAndWidgets(
       widget.artifactId,
       widget.monitorSlug,
     );
-    const ok = await sendChartOrWidgetItem({
+    const outcome = await sendChartOrWidgetItem({
       title: "交互组件",
       webUrl,
       imageBuffer: null,
       isWidget: true,
       fixedCopy: true,
     });
-    if (!ok) failures += 1;
+    if (outcome === "unknown") unknowns += 1;
+    else if (outcome === "failed") failures += 1;
   }
 
-  const finalStatus: "sent" | "partial" | "failed" =
-    failures === 0 ? "sent" : sentImages + sentLinks > 0 ? "partial" : "failed";
+  const finalStatus: "sent" | "partial" | "failed" | "unknown" =
+    unknowns > 0
+      ? "unknown"
+      : failures === 0
+        ? "sent"
+        : sentImages + sentLinks > 0
+          ? "partial"
+          : "failed";
 
   try {
     await params.backend.updateDeliveryProgress(
@@ -1561,6 +1605,7 @@ export async function deliverTurnChartsAndWidgets(
         platform_message_ids: sentMessageIds,
         status: finalStatus,
         outcome: finalStatus,
+        ...(finalStatus === "unknown" ? { error_code: "unavailable" } : {}),
         delivery_attempt: deliveryAttempt,
       },
       { platform: params.platform },
@@ -1582,6 +1627,7 @@ export async function deliverTurnChartsAndWidgets(
       settled: false,
       delivered: false,
       inFlight: true,
+      ...(finalStatus === "unknown" ? { uncertain: true } : {}),
       sentImages,
       sentLinks,
       timedOutPending: waited.timedOut,
@@ -1593,6 +1639,7 @@ export async function deliverTurnChartsAndWidgets(
     settled,
     delivered: settled && sentImages + sentLinks > 0,
     inFlight: false,
+    ...(finalStatus === "unknown" ? { uncertain: true } : {}),
     sentImages,
     sentLinks,
     timedOutPending: waited.timedOut,

@@ -1886,12 +1886,25 @@ export class DataTaskNotificationService {
             recipientPlatformUserId,
             card: outboundCard,
             images: cardImages,
+            webBaseUrl: this.webBaseUrl,
+            threadId: plan.thread_id ?? null,
+            workspaceId: plan.workspace_id ?? null,
           });
+          const usedMarkdownFallback = sendRes.usedMarkdownFallback === true;
+          const droppedCardImages =
+            usedMarkdownFallback && item.images.length > 0;
           const filesStatus = item.images.map((img) => ({
             path: img.filename,
-            status: "sent" as const,
-            reason: null,
+            status: droppedCardImages ? ("failed" as const) : ("sent" as const),
+            reason: droppedCardImages
+              ? "feishu_card_200621_markdown_fallback"
+              : null,
           }));
+          const deliveryStatus = droppedCardImages
+            ? ("partial" as const)
+            : ("sent" as const);
+          const droppedImagesMsg =
+            "Feishu card fell back to minimal markdown on 200621; embedded card images were not delivered.";
           try {
             await this.recordValidatedDeliveryProgress(
               {
@@ -1900,9 +1913,15 @@ export class DataTaskNotificationService {
                 total_chunks: 1,
                 platform_message_ids: [sendRes.messageId],
                 files_status: filesStatus,
-                status: "sent",
+                status: deliveryStatus,
+                ...(droppedCardImages
+                  ? {
+                      error_code: "file_not_sent",
+                      error_message: droppedImagesMsg,
+                    }
+                  : {}),
                 first_response_json: {
-                  status: "sent",
+                  status: deliveryStatus,
                   platform_message_ids: [sendRes.messageId],
                 },
               },
@@ -1929,6 +1948,33 @@ export class DataTaskNotificationService {
                 status: "unknown",
                 code: "delivery_uncertain",
                 message: pMsg,
+                run_id: runId,
+                target,
+                platform,
+                items_total: planItems.length,
+                items_sent: itemsSent,
+                items: itemOutcomes,
+              },
+            };
+          }
+
+          if (droppedCardImages) {
+            itemOutcomes.push({
+              item_index: item.item_index,
+              delivery_key: item.delivery_key,
+              status: "partial",
+              duplicate: false,
+              platform_message_ids: [sendRes.messageId],
+              code: "partial",
+              message: droppedImagesMsg,
+            });
+            return {
+              status: 200,
+              data: {
+                ok: false,
+                status: "unknown",
+                code: "partial",
+                message: droppedImagesMsg,
                 run_id: runId,
                 target,
                 platform,

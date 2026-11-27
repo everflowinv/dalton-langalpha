@@ -6597,5 +6597,174 @@ describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
     expect(fbCard.body.elements).toHaveLength(1);
     expect(fbCard.body.elements[0].tag).toBe("markdown");
     expect(fbCard.body.elements[0].content).toContain("**结构化卡片**");
+    expect(res.usedMarkdownFallback).toBe(true);
+  });
+
+  it("buildMinimalMarkdownFallbackCard escapes plain_text markdown syntax, preserves verified button links, and rewrites sandbox/local URLs", async () => {
+    const { buildMinimalMarkdownFallbackCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    const fallback = buildMinimalMarkdownFallbackCard(
+      {
+        schema: "2.0",
+        header: {
+          title: {
+            tag: "plain_text",
+            content:
+              "标题 [点击](/home/workspace/a.pdf) 和 http://localhost:3000/preview",
+          },
+          subtitle: {
+            tag: "plain_text",
+            content: "**非加粗** 与 <font color='red'>字</font>",
+          },
+        },
+        body: {
+          elements: [
+            {
+              tag: "div",
+              text: {
+                tag: "plain_text",
+                content:
+                  "纯文本 [本地](http://127.0.0.1:5173/app) 与 file:///home/workspace/dir/data.csv",
+              },
+            },
+            {
+              tag: "markdown",
+              content: "报告链接：[Q3 财报](/home/workspace/reports/q3.pdf)",
+            },
+            {
+              tag: "button",
+              text: { tag: "plain_text", content: "打开网页交互版" },
+              behaviors: [
+                {
+                  type: "open_url",
+                  default_url:
+                    "https://dalton.example.com/chat/t/t-1?chart=NVDA%3A1day&layer=l-1",
+                },
+              ],
+            },
+            {
+              tag: "button",
+              text: { tag: "plain_text", content: "本地按钮" },
+              behaviors: [
+                {
+                  type: "open_url",
+                  default_url: "http://localhost:5173/internal",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        webBaseUrl: "https://dalton.example.com",
+        threadId: "t-1",
+        workspaceId: "ws-1",
+      },
+    );
+
+    expect(fallback.body.elements).toHaveLength(1);
+    const md = fallback.body.elements[0]!.content!;
+    // Plain text markdown syntax escaped; no unrewritten localhost or sandbox paths
+    expect(md).not.toContain("http://localhost:3000");
+    expect(md).not.toContain("http://127.0.0.1:5173");
+    expect(md).not.toContain("http://localhost:5173");
+    expect(md).not.toContain("/home/workspace/a.pdf");
+    expect(md).not.toContain("file:///home/workspace/");
+    expect(md).toContain("\\[点击\\]\\(a.pdf\\)");
+    expect(md).toContain("localhost:3000/preview");
+    expect(md).toContain("\\*\\*非加粗\\*\\*");
+    expect(md).toContain("&lt;font color='red'&gt;字&lt;/font&gt;");
+    expect(md).toContain("127.0.0.1:5173/app");
+    expect(md).toContain("dir/data.csv");
+    // Markdown link rewritten to public web deep link
+    expect(md).toContain(
+      "[Q3 财报](https://dalton.example.com/chat/t/t-1?file=%2Fhome%2Fworkspace%2Freports%2Fq3.pdf)",
+    );
+    // Verified public button link preserved in fallback markdown; local button dropped
+    expect(md).toContain(
+      "[打开网页交互版](https://dalton.example.com/chat/t/t-1?chart=NVDA%3A1day&layer=l-1)",
+    );
+    expect(md).not.toContain("本地按钮");
+  });
+
+  it("sendCardFeishu sends 200621 fallback once on the actual failing route without re-iterating withdrawn reply anchors", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+
+    // Case 1: primary anchor withdrawn (230011) -> backup anchor returns 200621 ->
+    // fallback goes ONLY to backup anchor (never retries withdrawn primary).
+    const replyCalls: Array<{ messageId: string; replyInThread?: boolean }> = [];
+    let backupAttempt = 0;
+    const case1 = createFakeLarkClient({
+      onMessageReply: async (req) => {
+        replyCalls.push({
+          messageId: req.path.message_id,
+          replyInThread: req.data.reply_in_thread,
+        });
+        if (req.path.message_id === "om_withdrawn") {
+          return { code: 230011, msg: "message withdrawn" };
+        }
+        backupAttempt += 1;
+        if (backupAttempt === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_backup_fb_ok" } };
+      },
+    });
+
+    const res1 = await sendCardFeishu(case1.client, {
+      to: "chat:oc_topic_chat",
+      replyToMessageId: "om_withdrawn",
+      fallbackReplyToMessageIds: ["om_backup"],
+      replyInThread: true,
+      allowDirectFallback: false,
+      card: {
+        schema: "2.0",
+        body: { elements: [{ tag: "markdown", content: "话题卡内容" }] },
+      },
+    });
+
+    expect(res1.messageId).toBe("om_backup_fb_ok");
+    expect(res1.usedMarkdownFallback).toBe(true);
+    expect(replyCalls).toEqual([
+      { messageId: "om_withdrawn", replyInThread: true },
+      { messageId: "om_backup", replyInThread: true },
+      { messageId: "om_backup", replyInThread: true },
+    ]);
+    expect(case1.calls.messageCreate).toHaveLength(0);
+
+    // Case 2: reply anchor withdrawn (230011) -> direct create returns 200621 ->
+    // fallback goes ONLY to direct create (never retries withdrawn anchor).
+    const replyCalls2: string[] = [];
+    let createAttempt2 = 0;
+    const case2 = createFakeLarkClient({
+      onMessageReply: async (req) => {
+        replyCalls2.push(req.path.message_id);
+        return { code: 230011, msg: "message withdrawn" };
+      },
+      onMessageCreate: async () => {
+        createAttempt2 += 1;
+        if (createAttempt2 === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_direct_fb_ok" } };
+      },
+    });
+
+    const res2 = await sendCardFeishu(case2.client, {
+      to: "chat:oc_direct_chat",
+      replyToMessageId: "om_withdrawn_2",
+      allowDirectFallback: true,
+      card: {
+        schema: "2.0",
+        body: { elements: [{ tag: "markdown", content: "直发兜底内容" }] },
+      },
+    });
+
+    expect(res2.messageId).toBe("om_direct_fb_ok");
+    expect(res2.usedMarkdownFallback).toBe(true);
+    expect(replyCalls2).toEqual(["om_withdrawn_2"]);
+    expect(case2.calls.messageCreate).toHaveLength(2);
   });
 });

@@ -8,16 +8,18 @@ import {
   type ChartSnapshotItem,
   type ChartSnapshotsStatusResponse,
 } from "../src/backend-client.js";
-import type {
-  ChannelAdapter,
-  SendCardOptions,
-  SendCardResult,
-  SendFileOptions,
-  SendFileResult,
-  SendTextChunkOptions,
-  SendTextChunkResult,
-  SendTextWithFileOptions,
+import {
+  ChannelDeliveryError,
+  type ChannelAdapter,
+  type SendCardOptions,
+  type SendCardResult,
+  type SendFileOptions,
+  type SendFileResult,
+  type SendTextChunkOptions,
+  type SendTextChunkResult,
+  type SendTextWithFileOptions,
 } from "../src/channels/adapter.js";
+import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import {
   buildChartLayerDeepLink,
   buildDiscordLinkButtonRow,
@@ -4143,5 +4145,281 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
         error: null,
       }),
     ]);
+  });
+
+  it("preserves unknown delivery outcome without resending link-only card when Feishu 200621 fallback times out", async () => {
+    let createCalls = 0;
+    const fakeLarkClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_snap_1" })),
+        },
+        message: {
+          create: vi.fn(async () => {
+            createCalls += 1;
+            if (createCalls === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            const timeoutErr = Object.assign(new Error("socket hang up"), {
+              code: "ETIMEDOUT",
+            });
+            throw timeoutErr;
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeLarkClient,
+    });
+    const sendCardSpy = vi.spyOn(feishu, "sendCard");
+
+    const backend = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const result = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-200621-timeout",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    // Must NOT resend a second link-only card after uncertain fallback outcome
+    expect(sendCardSpy).toHaveBeenCalledTimes(1);
+    expect(createCalls).toBe(2); // 1 initial (200621) + 1 fallback (ETIMEDOUT)
+    expect(result.settled).toBe(false);
+    expect(result.delivered).toBe(false);
+    expect(result.uncertain).toBe(true);
+    expect(result.sentImages).toBe(0);
+    expect(result.sentLinks).toBe(0);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-200621-timeout",
+        status: "unknown",
+        outcome: "unknown",
+        sent_chunks: 0,
+      }),
+      { platform: "feishu" },
+    );
+
+    // Confirmed undelivered error (`outcome: "failed"`) STILL degrades to link-only card
+    const adapterFailed = makeMockAdapter("feishu");
+    let failedAttempts = 0;
+    adapterFailed.sendCard = vi.fn(async (opts: SendCardOptions): Promise<SendCardResult> => {
+      failedAttempts += 1;
+      if (failedAttempts === 1) {
+        throw new ChannelDeliveryError("confirmed upload failure", {
+          outcome: "failed",
+          code: "unavailable",
+        });
+      }
+      adapterFailed.sentCards.push(opts);
+      return { messageId: "om_link_after_fail", resolvedAddress: opts.targetAddress };
+    });
+    const backend2 = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+    const degradedRes = await deliverTurnChartsAndWidgets({
+      backend: backend2,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapterFailed]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-confirmed-fail",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(failedAttempts).toBe(2);
+    expect(degradedRes.settled).toBe(true);
+    expect(degradedRes.sentImages).toBe(0);
+    expect(degradedRes.sentLinks).toBe(1);
+  });
+
+  it("accounts Feishu chart card 200621 markdown fallback accurately and embeds verified chart link", async () => {
+    const sentPayloads: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const fakeLarkClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_chart_fb_1" })),
+        },
+        message: {
+          create: vi.fn(async (req: { data?: { content?: string } }) => {
+            attempt += 1;
+            if (req.data?.content) {
+              sentPayloads.push(JSON.parse(req.data.content));
+            }
+            if (attempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_fb_ok" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeLarkClient,
+    });
+    const backend = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const expectedUrl = buildChartLayerDeepLink(
+      WEB_BASE,
+      THREAD_ID,
+      "NVDA:1day",
+      "layer-1",
+    )!;
+    const resWithLink = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-with-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    // Fallback card dropped the image, wrote the verified chart link into markdown,
+    // and accounted as sentLinks=1 (not sentImages=1).
+    expect(resWithLink.settled).toBe(true);
+    expect(resWithLink.delivered).toBe(true);
+    expect(resWithLink.sentImages).toBe(0);
+    expect(resWithLink.sentLinks).toBe(1);
+    expect(sentPayloads).toHaveLength(2);
+    const fallbackEl = (
+      sentPayloads[1]!.body as { elements: Array<{ tag: string; content: string }> }
+    ).elements[0]!;
+    expect(fallbackEl.tag).toBe("markdown");
+    expect(fallbackEl.content).toContain(`(${expectedUrl})`);
+    expect(fallbackEl.content).toContain("打开网页交互版");
+
+    // Without a verified web URL, fallback drops the image with no link -> sentImages=0, sentLinks=0, failed
+    let noUrlAttempt = 0;
+    const noUrlClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_chart_fb_2" })),
+        },
+        message: {
+          create: vi.fn(async () => {
+            noUrlAttempt += 1;
+            if (noUrlAttempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_fb_nolink" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishuNoUrl = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: noUrlClient,
+    });
+    const backendNoUrl = makeMockBackend({
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const resNoLink = await deliverTurnChartsAndWidgets({
+      backend: backendNoUrl,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuNoUrl]]),
+      webBaseUrl: null,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-no-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(noUrlAttempt).toBe(2); // No extra resend
+    expect(resNoLink.settled).toBe(false);
+    expect(resNoLink.sentImages).toBe(0);
+    expect(resNoLink.sentLinks).toBe(0);
+    expect(backendNoUrl.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-no-link",
+        status: "failed",
+        sent_chunks: 0,
+      }),
+      { platform: "feishu" },
+    );
   });
 });

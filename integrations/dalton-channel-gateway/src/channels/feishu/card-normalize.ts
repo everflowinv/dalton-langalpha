@@ -5,6 +5,7 @@
  * without mutating the caller's object or guessing unknown element schemas.
  */
 
+import { rewriteSandboxLinks } from "../../shared/sandbox-links.js";
 import {
   escapeFeishuCardMarkdownText,
   FEISHU_CARD_MAX_BYTES,
@@ -194,6 +195,115 @@ function readHeaderText(value: unknown): string {
   return "";
 }
 
+function isLocalHostname(rawHostname: string): boolean {
+  const host = rawHostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "");
+  if (!host) return true;
+  return (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "0.0.0.0" ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+  );
+}
+
+function toVerifiedPublicHttpUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== "string") {
+    return null;
+  }
+  const trimmed = rawUrl.trim();
+  if (!trimmed || !/^https?:\/\//i.test(trimmed)) {
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  if (isLocalHostname(parsed.hostname)) {
+    return null;
+  }
+  return parsed.href.replace(/\(/g, "%28").replace(/\)/g, "%29");
+}
+
+function readFirstUrlField(node: Record<string, unknown>): string | null {
+  for (const key of ["default_url", "url", "pc_url", "ios_url", "android_url"]) {
+    const verified = toVerifiedPublicHttpUrl(node[key]);
+    if (verified) {
+      return verified;
+    }
+  }
+  return null;
+}
+
+function extractButtonVerifiedOpenUrl(button: Record<string, unknown>): string | null {
+  if (Array.isArray(button.behaviors)) {
+    for (const behavior of button.behaviors) {
+      if (!isRecord(behavior)) {
+        continue;
+      }
+      const behaviorType =
+        typeof behavior.type === "string" ? behavior.type.trim().toLowerCase() : "";
+      if (behaviorType === "open_url") {
+        const verified = readFirstUrlField(behavior);
+        if (verified) {
+          return verified;
+        }
+      }
+    }
+  }
+  if (isRecord(button.multi_url)) {
+    const verified = readFirstUrlField(button.multi_url);
+    if (verified) {
+      return verified;
+    }
+  }
+  return toVerifiedPublicHttpUrl(button.url);
+}
+
+/**
+ * Escapes Markdown syntax in text sourced from Feishu `plain_text` fields so
+ * it cannot inject links, emphasis, code spans, or raw Feishu tags when
+ * concatenated into a minimal markdown-only fallback card, while keeping
+ * URLs/paths recognizable to `rewriteSandboxLinks`.
+ */
+export function escapePlainTextForFeishuMarkdown(text: string): string {
+  if (!text) {
+    return text;
+  }
+  let out = text
+    .replace(/\\/g, "\\\\")
+    .replace(/([`*~[\]()|!<>])/g, "\\$1")
+    .replace(/(?<![A-Za-z0-9/])_|_(?![A-Za-z0-9/])/g, "\\_");
+  out = out
+    .replace(/^([ \t]*)(#{1,6})(?=[ \t]|$)/gm, "$1\\$2")
+    .replace(/^([ \t]*)([-+])(?=[ \t])/gm, "$1\\$2")
+    .replace(/^([ \t]*\d+)\.(?=[ \t])/gm, "$1\\.");
+  return out;
+}
+
+function convertEscapedAnglesToEntities(text: string): string {
+  return text.replace(
+    /(^|[^\\])((?:\\\\)*)\\([<>])/g,
+    (_match, prefix: string, slashes: string, angle: string) =>
+      `${prefix}${slashes}${angle === "<" ? "&lt;" : "&gt;"}`,
+  );
+}
+
+function isMarkdownTextTag(node: Record<string, unknown>): boolean {
+  const tagLower = readTagLower(node);
+  return tagLower === "markdown" || tagLower === "lark_md";
+}
+
 function collectFallbackBlocksFromElements(
   elements: unknown[],
   blocks: string[],
@@ -204,10 +314,19 @@ function collectFallbackBlocksFromElements(
     }
     const tagLower = readTagLower(rawEl);
 
-    if (tagLower === "markdown" || TEXT_ELEMENT_TAGS.has(tagLower)) {
+    if (tagLower === "markdown" || tagLower === "lark_md") {
       const text = extractTextElementContent(rawEl).trim();
       if (text) {
         blocks.push(text);
+      }
+      continue;
+    }
+
+    if (tagLower === "plain_text" || tagLower === "text") {
+      const text = extractTextElementContent(rawEl).trim();
+      if (text) {
+        const isMd = isRecord(rawEl.text) && isMarkdownTextTag(rawEl.text);
+        blocks.push(isMd ? text : escapePlainTextForFeishuMarkdown(text));
       }
       continue;
     }
@@ -216,10 +335,14 @@ function collectFallbackBlocksFromElements(
       if (isRecord(rawEl.text) && typeof rawEl.text.content === "string") {
         const text = rawEl.text.content.trim();
         if (text) {
-          blocks.push(text);
+          blocks.push(
+            isMarkdownTextTag(rawEl.text)
+              ? text
+              : escapePlainTextForFeishuMarkdown(text),
+          );
         }
       } else if (typeof rawEl.text === "string" && rawEl.text.trim()) {
-        blocks.push(rawEl.text.trim());
+        blocks.push(escapePlainTextForFeishuMarkdown(rawEl.text.trim()));
       }
       if (Array.isArray(rawEl.fields)) {
         for (const field of rawEl.fields) {
@@ -229,7 +352,11 @@ function collectFallbackBlocksFromElements(
           if (isRecord(field.text) && typeof field.text.content === "string") {
             const text = field.text.content.trim();
             if (text) {
-              blocks.push(text);
+              blocks.push(
+                isMarkdownTextTag(field.text)
+                  ? text
+                  : escapePlainTextForFeishuMarkdown(text),
+              );
             }
           }
         }
@@ -243,13 +370,31 @@ function collectFallbackBlocksFromElements(
         if (isRecord(noteEl) && typeof noteEl.content === "string") {
           const text = noteEl.content.trim();
           if (text) {
-            noteParts.push(text);
+            noteParts.push(
+              isMarkdownTextTag(noteEl)
+                ? text
+                : escapePlainTextForFeishuMarkdown(text),
+            );
           }
         }
       }
       if (noteParts.length > 0) {
         blocks.push(noteParts.join(" "));
       }
+      continue;
+    }
+
+    if (tagLower === "button") {
+      const verifiedUrl = extractButtonVerifiedOpenUrl(rawEl);
+      if (verifiedUrl) {
+        const label = readHeaderText(rawEl.text) || "打开链接";
+        blocks.push(`[${escapePlainTextForFeishuMarkdown(label)}](${verifiedUrl})`);
+      }
+      continue;
+    }
+
+    if (tagLower === "action" && Array.isArray(rawEl.actions)) {
+      collectFallbackBlocksFromElements(rawEl.actions, blocks);
       continue;
     }
 
@@ -324,23 +469,40 @@ function fitMinimalCardWithinMaxBytes(
 
 /**
  * Builds a minimal Schema 2.0 card containing only a single `markdown` element
- * combining the original card's title, subtitle, and markdown/text blocks.
- * Used as a one-shot fallback when Feishu still rejects a card with 200621.
+ * combining the original card's title, subtitle, markdown/text blocks, and
+ * verified public `open_url` button links. Escapes Markdown syntax from
+ * `plain_text` fields and runs sandbox/local link rewriting across the final
+ * fallback body. Used as a one-shot fallback when Feishu still rejects a card
+ * with 200621.
  */
 export function buildMinimalMarkdownFallbackCard(
   card: Record<string, unknown>,
-  options?: { maxBytes?: number },
+  options?: {
+    maxBytes?: number;
+    webBaseUrl?: string | null;
+    threadId?: string | null;
+    workspaceId?: string | null;
+  },
 ): FeishuSchema2Card {
+  const webBaseUrl = options?.webBaseUrl ?? null;
+  const threadId = options?.threadId ?? null;
+  const workspaceId = options?.workspaceId ?? null;
   const parts: string[] = [];
 
   if (isRecord(card.header)) {
     const title = readHeaderText(card.header.title);
     if (title) {
-      parts.push(`**${title}**`);
+      const safeTitle = rewriteSandboxLinks(
+        escapePlainTextForFeishuMarkdown(title),
+        webBaseUrl,
+        threadId,
+        workspaceId,
+      );
+      parts.push(`**${safeTitle}**`);
     }
     const subtitle = readHeaderText(card.header.subtitle);
     if (subtitle) {
-      parts.push(subtitle);
+      parts.push(escapePlainTextForFeishuMarkdown(subtitle));
     }
   }
 
@@ -352,7 +514,15 @@ export function buildMinimalMarkdownFallbackCard(
   }
 
   const rawText = parts.length > 0 ? parts.join("\n\n") : FALLBACK_EMPTY_TEXT;
-  const escaped = escapeFeishuCardMarkdownText(rawText);
+  const rewritten = rewriteSandboxLinks(
+    rawText,
+    webBaseUrl,
+    threadId,
+    workspaceId,
+  );
+  const escaped = escapeFeishuCardMarkdownText(
+    convertEscapedAnglesToEntities(rewritten),
+  );
   return fitMinimalCardWithinMaxBytes(
     escaped,
     options?.maxBytes ?? FEISHU_CARD_MAX_BYTES,
