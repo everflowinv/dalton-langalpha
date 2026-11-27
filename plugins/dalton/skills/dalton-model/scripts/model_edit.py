@@ -296,7 +296,7 @@ def _preserve_calcpr_from_donor(target_path: Path, donor_path: Path) -> None:
         if tgt_calc is not None:
             tgt_wb.replace(tgt_calc, copy.deepcopy(donor_calc))
         else:
-            tgt_wb.append(copy.deepcopy(donor_calc))
+            model_xlsx_hooks._insert_wb_element_in_schema_order(tgt_wb, copy.deepcopy(donor_calc))
     payload["xl/workbook.xml"] = etree.tostring(tgt_wb, encoding="UTF-8", xml_declaration=True)
     tmp = target_path.with_name(target_path.name + ".cpr.tmp")
     with zipfile.ZipFile(tmp, "w") as zout:
@@ -413,11 +413,36 @@ def _find_downstream_formulas(
     return reached
 
 
+def _is_empty_cache_workbook(baseline_path: Path) -> bool:
+    """Inspect baseline OOXML directly (independent of any external fingerprint) to detect empty-cache templates."""
+    raw_states = model_xlsx_hooks.extract_raw_xml_cell_states(baseline_path)
+    formula_count = 0
+    cached_formula_count = 0
+    for cells in raw_states.values():
+        for meta in cells.values():
+            if not meta.get("has_formula"):
+                continue
+            formula_count += 1
+            if meta.get("has_v") and (not meta.get("v_is_empty") or meta.get("t") is not None):
+                cached_formula_count += 1
+    if formula_count > 0 and cached_formula_count == 0:
+        return True
+    if baseline_path.name == "default_model_template.xlsx" and cached_formula_count == 0:
+        return True
+    return False
+
+
 def _is_empty_cache_template(
     fp: dict[str, Any],
     baseline_path: Path | None = None,
 ) -> bool:
-    """Return True when the baseline workbook is an empty-cache template (e.g. default_model_template.xlsx)."""
+    """Return True when the baseline workbook is an empty-cache template (e.g. default_model_template.xlsx).
+
+    When ``baseline_path`` exists on disk, inspects the workbook OOXML directly so an external/stale
+    fingerprint can never mask an empty-cache template.
+    """
+    if baseline_path is not None and baseline_path.is_file():
+        return _is_empty_cache_workbook(baseline_path)
     formula_count = 0
     cached_formula_count = 0
     for sh_data in (fp.get("sheets") or {}).values():
@@ -589,12 +614,20 @@ def apply_edit_plan(
                 f"baseline sha256 mismatch: expected {want}, got {base_sha} ({base})"
             )
 
-    fp = fingerprint if fingerprint is not None else model_fingerprint.build_fingerprint(base, ticker=ticker)
+    if fingerprint is not None:
+        fp_sha = str(fingerprint.get("source_sha256") or "").strip().lower()
+        if not fp_sha or fp_sha != base_sha:
+            raise ValueError(
+                f"fingerprint source_sha256 mismatch: expected {base_sha}, got {fp_sha or '<missing>'} ({base})"
+            )
+        fp = fingerprint
+    else:
+        fp = model_fingerprint.build_fingerprint(base, ticker=ticker)
 
     is_template_build = (
         str(mode).strip().lower() == "build"
         or str(plan.get("mode") or "").strip().lower() == "build"
-        or _is_empty_cache_template(fp, base)
+        or _is_empty_cache_workbook(base)
     )
     if is_template_build and skip_recalc:
         raise ValueError(

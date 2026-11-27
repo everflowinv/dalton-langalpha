@@ -32,6 +32,41 @@ _CHART_REL_TYPE = f"{_OFFICE_REL_NS}/chart"
 _XML = etree.XMLParser(resolve_entities=False, no_network=True)
 
 
+_WB_CHILD_ORDER = (
+    "fileVersion",
+    "fileSharing",
+    "workbookPr",
+    "workbookProtection",
+    "bookViews",
+    "sheets",
+    "functionGroups",
+    "externalReferences",
+    "definedNames",
+    "calcPr",
+    "oleSize",
+    "customWorkbookViews",
+    "pivotCaches",
+    "smartTagPr",
+    "smartTagTypes",
+    "webPublishing",
+    "fileRecoveryPr",
+    "webPublishObjects",
+    "extLst",
+)
+
+
+def _insert_wb_element_in_schema_order(wb_root: Any, elem: Any) -> None:
+    """Insert a workbook child element (e.g. ``<calcPr>``) in ECMA-376 CT_Workbook order."""
+    local = etree.QName(elem.tag).localname
+    if local in _WB_CHILD_ORDER:
+        after_tags = set(_WB_CHILD_ORDER[_WB_CHILD_ORDER.index(local) + 1 :])
+        for idx, child in enumerate(list(wb_root)):
+            if isinstance(child.tag, str) and etree.QName(child.tag).localname in after_tags:
+                wb_root.insert(idx, elem)
+                return
+    wb_root.append(elem)
+
+
 def restore_preserved_calcpr(package: Any) -> None:
     """Restore ``xl/workbook.xml`` ``<calcPr>`` to its pre-insert ``fullCalcOnLoad`` state."""
     orig_bytes = package.original.get("xl/workbook.xml")
@@ -49,7 +84,7 @@ def restore_preserved_calcpr(package: Any) -> None:
 
     if cur_calc is None:
         cur_calc = etree.Element(f"{{{_SML}}}calcPr")
-        cur_wb.append(cur_calc)
+        _insert_wb_element_in_schema_order(cur_wb, cur_calc)
 
     orig_full = orig_calc.get("fullCalcOnLoad")
     if orig_full is None:
@@ -90,7 +125,7 @@ def execute_preserve_calcpr(insert_mod: Any, argv: list[str]) -> dict[str, Any]:
     else:
         if cur_calc is None:
             cur_calc = etree.Element(f"{{{_SML}}}calcPr")
-            wb_root.append(cur_calc)
+            _insert_wb_element_in_schema_order(wb_root, cur_calc)
             changed = True
         if orig_full is None:
             if "fullCalcOnLoad" in cur_calc.attrib:
@@ -179,7 +214,8 @@ def set_full_calc_on_load(xlsx_path: str | Path, enabled: bool) -> None:
     if calc is None:
         if not enabled:
             return
-        calc = etree.SubElement(wb_root, f"{{{_SML}}}calcPr")
+        calc = etree.Element(f"{{{_SML}}}calcPr")
+        _insert_wb_element_in_schema_order(wb_root, calc)
     if enabled:
         calc.set("fullCalcOnLoad", "1")
     elif "fullCalcOnLoad" in calc.attrib:
@@ -957,6 +993,60 @@ def _register_new_sheet_in_donor(
     return new_part
 
 
+def _extract_ws_rel_usages(
+    ws_root: Any,
+    rel_info_by_id: dict[str, tuple[str, str, str]],
+    payload: dict[str, bytes],
+    sheet_part: str,
+) -> dict[str, list[tuple[tuple[str, ...], str, str | None]]]:
+    """Return ``{rid: [(elem_path, attr_key, semantic_key), ...]}`` in worksheet XML document order."""
+    rel_ns_prefix = f"{{{_OFFICE_REL_NS}}}"
+    usages: dict[str, list[tuple[tuple[str, ...], str, str | None]]] = {}
+
+    def _semantic_key(elem_path: tuple[str, ...], el: Any, rid: str) -> str | None:
+        local = elem_path[-1] if elem_path else ""
+        if local == "hyperlink":
+            ref = (el.get("ref") or "").strip().upper()
+            return ref or None
+        if local in ("oleObject", "control"):
+            sid = (el.get("shapeId") or "").strip()
+            if sid:
+                return f"shapeId:{sid}"
+            nm = (el.get("name") or "").strip()
+            if nm:
+                return f"name:{nm}"
+            return None
+        if local == "tablePart":
+            info = rel_info_by_id.get(rid)
+            if info and info[2] != "external" and info[1]:
+                tgt_part = _resolve_rel_target(sheet_part, info[1])
+                raw_tbl = payload.get(tgt_part)
+                if raw_tbl:
+                    try:
+                        tbl_root = etree.fromstring(raw_tbl, _XML)
+                        tname = (tbl_root.get("name") or tbl_root.get("displayName") or "").strip()
+                        if tname:
+                            return f"table:{tname}"
+                    except etree.XMLSyntaxError:
+                        pass
+        return None
+
+    def _walk(node: Any, path: tuple[str, ...]) -> None:
+        for child in node:
+            if not isinstance(child.tag, str):
+                continue
+            local = etree.QName(child.tag).localname
+            cur_path = path + (local,)
+            for attr_k, attr_v in child.attrib.items():
+                if attr_k.startswith(rel_ns_prefix) and attr_v:
+                    sem = _semantic_key(cur_path, child, attr_v)
+                    usages.setdefault(attr_v, []).append((cur_path, attr_k, sem))
+            _walk(child, cur_path)
+
+    _walk(ws_root, ())
+    return usages
+
+
 def merge_edited_sheets_into_donor(
     donor_path: str | Path,
     edited_path: str | Path,
@@ -1048,17 +1138,21 @@ def merge_edited_sheets_into_donor(
 
         # Preserve donor's existing worksheet relationships, drawings, charts, and related parts verbatim!
         # NEVER overwrite donor's _rels with openpyxl's renumbered _rels (which collides with other sheets' drawings/charts).
+        # Pair existing-sheet internal relationships by the actual worksheet XML element referencing each r:id
+        # (<drawing>, <legacyDrawing>, <legacyDrawingHF>, <tableParts>/<tablePart>, etc.) rather than by rel-type order.
         # Only genuinely NEW parts (e.g. new sheet or newly added drawing/hyperlink/comment) are imported under freshly
         # allocated non-colliding paths with remapped relationships.
         d_rels_part = _worksheet_rels_path(d_part)
         ed_rels_part = _worksheet_rels_path(ed_part)
         d_rels_raw = None if is_new_sheet else donor_payload.get(d_rels_part)
         ed_rels_raw = edited_payload.get(ed_rels_part)
+        orig_sh_root = etree.fromstring(orig_donor_sh_bytes, _XML) if orig_donor_sh_bytes else None
 
         d_rels_root = etree.fromstring(d_rels_raw, _XML) if d_rels_raw else None
         donor_used_rids: set[str] = set()
         donor_ext_by_key: dict[tuple[str, str], str] = {}
-        donor_int_by_type: dict[str, list[str]] = {}
+        donor_rel_info: dict[str, tuple[str, str, str]] = {}
+        donor_int_order: list[tuple[str, str]] = []
         if d_rels_root is not None:
             for drel in d_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
                 did = drel.get("Id") or ""
@@ -1067,11 +1161,37 @@ def merge_edited_sheets_into_donor(
                 dmode = (drel.get("TargetMode") or "").lower()
                 if did:
                     donor_used_rids.add(did)
+                    donor_rel_info[did] = (dtype, dtgt, dmode)
                 if dmode == "external":
                     if did:
                         donor_ext_by_key.setdefault((dtype, dtgt), did)
                 elif did:
-                    donor_int_by_type.setdefault(dtype, []).append(did)
+                    donor_int_order.append((did, dtype))
+
+        donor_usages: dict[str, list[tuple[tuple[str, ...], str, str | None]]] = (
+            _extract_ws_rel_usages(orig_sh_root, donor_rel_info, donor_payload, d_part)
+            if (not is_new_sheet and orig_sh_root is not None)
+            else {}
+        )
+        donor_by_exact: dict[tuple[tuple[str, ...], str, str, str], list[str]] = {}
+        donor_by_elem: dict[tuple[tuple[str, ...], str, str], list[str]] = {}
+        for did, ulist in donor_usages.items():
+            dinfo = donor_rel_info.get(did)
+            if not dinfo or dinfo[2] == "external":
+                continue
+            dtype = dinfo[0]
+            for elem_path, attr_k, sem_key in ulist:
+                if sem_key is not None:
+                    lst_ex = donor_by_exact.setdefault((elem_path, attr_k, dtype, sem_key), [])
+                    if did not in lst_ex:
+                        lst_ex.append(did)
+                lst_el = donor_by_elem.setdefault((elem_path, attr_k, dtype), [])
+                if did not in lst_el:
+                    lst_el.append(did)
+        donor_unreferenced_by_type: dict[str, list[str]] = {}
+        for did, dtype in donor_int_order:
+            if did not in donor_usages:
+                donor_unreferenced_by_type.setdefault(dtype, []).append(did)
 
         def _alloc_rid() -> str:
             n = 1
@@ -1082,16 +1202,65 @@ def merge_edited_sheets_into_donor(
             return rid
 
         rid_map: dict[str, str] = {}
-        matched_int_cursor: dict[str, int] = {}
+        claimed_donor_rids: set[str] = set()
         donor_rels_changed = False
 
         if ed_rels_raw:
             ed_rels_root = etree.fromstring(ed_rels_raw, _XML)
+            ed_rels_list: list[tuple[str, str, str, str]] = []
+            ed_rel_info: dict[str, tuple[str, str, str]] = {}
             for erel in ed_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
                 eid = erel.get("Id") or ""
                 etype = erel.get("Type") or ""
                 etgt = erel.get("Target") or ""
                 emode = (erel.get("TargetMode") or "").lower()
+                ed_rels_list.append((eid, etype, etgt, emode))
+                if eid:
+                    ed_rel_info[eid] = (etype, etgt, emode)
+
+            ed_usages = _extract_ws_rel_usages(sh_root, ed_rel_info, edited_payload, ed_part)
+
+            # Match existing-sheet internal relationships by referencing element (never by rel-type order across elements)
+            if not is_new_sheet and d_rels_root is not None:
+                # Pass 1: exact semantic match (elem_path, attr_k, rel_type, semantic_key)
+                for eid, etype, _etgt, emode in ed_rels_list:
+                    if emode == "external" or not eid or eid in rid_map or eid not in ed_usages:
+                        continue
+                    for elem_path, attr_k, sem_key in ed_usages[eid]:
+                        if sem_key is None:
+                            continue
+                        for cand_did in donor_by_exact.get((elem_path, attr_k, etype, sem_key), ()):
+                            if cand_did not in claimed_donor_rids:
+                                rid_map[eid] = cand_did
+                                claimed_donor_rids.add(cand_did)
+                                break
+                        if eid in rid_map:
+                            break
+
+                # Pass 2: element-path match (elem_path, attr_k, rel_type) in worksheet document order
+                for eid, etype, _etgt, emode in ed_rels_list:
+                    if emode == "external" or not eid or eid in rid_map or eid not in ed_usages:
+                        continue
+                    for elem_path, attr_k, _sem_key in ed_usages[eid]:
+                        for cand_did in donor_by_elem.get((elem_path, attr_k, etype), ()):
+                            if cand_did not in claimed_donor_rids:
+                                rid_map[eid] = cand_did
+                                claimed_donor_rids.add(cand_did)
+                                break
+                        if eid in rid_map:
+                            break
+
+                # Pass 3: implicit/unreferenced internal relationships (e.g. comments, pivotTable) only match unreferenced donor rels
+                for eid, etype, _etgt, emode in ed_rels_list:
+                    if emode == "external" or not eid or eid in rid_map or eid in ed_usages:
+                        continue
+                    for cand_did in donor_unreferenced_by_type.get(etype, ()):
+                        if cand_did not in claimed_donor_rids:
+                            rid_map[eid] = cand_did
+                            claimed_donor_rids.add(cand_did)
+                            break
+
+            for eid, etype, etgt, emode in ed_rels_list:
                 if emode == "external":
                     existing_did = donor_ext_by_key.get((etype, etgt))
                     if existing_did:
@@ -1115,15 +1284,8 @@ def merge_edited_sheets_into_donor(
                         donor_rels_changed = True
                     continue
 
-                # Internal relationship: reuse donor's untouched relationship & part for existing sheets
-                if not is_new_sheet:
-                    d_list = donor_int_by_type.get(etype) or []
-                    cur_i = matched_int_cursor.get(etype, 0)
-                    if cur_i < len(d_list):
-                        matched_int_cursor[etype] = cur_i + 1
-                        if eid:
-                            rid_map[eid] = d_list[cur_i]
-                        continue
+                if eid and eid in rid_map:
+                    continue
 
                 # Genuinely new internal part -> import under a fresh non-colliding path & remap sub-rels
                 if not etgt:
@@ -1157,10 +1319,17 @@ def merge_edited_sheets_into_donor(
                     if attr_k.startswith(rel_ns_prefix) and attr_v in rid_map:
                         el.set(attr_k, rid_map[attr_v])
 
-        # If openpyxl dropped donor's <drawing> or <legacyDrawing> element on an existing sheet, restore it verbatim
-        if orig_donor_sh_bytes:
-            orig_sh_root = etree.fromstring(orig_donor_sh_bytes, _XML)
-            for tag_local in ("drawing", "legacyDrawing"):
+        # If openpyxl dropped donor's drawing/VML/media/control elements on an existing sheet, restore them verbatim
+        if orig_sh_root is not None:
+            for tag_local in (
+                "drawing",
+                "legacyDrawing",
+                "legacyDrawingHF",
+                "drawingHF",
+                "picture",
+                "oleObjects",
+                "controls",
+            ):
                 fq = f"{{{_SML}}}{tag_local}"
                 if sh_root.find(fq) is None:
                     for orig_el in orig_sh_root.findall(fq):
