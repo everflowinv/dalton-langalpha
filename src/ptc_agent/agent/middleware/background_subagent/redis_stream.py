@@ -81,6 +81,11 @@ def _open_spill_circuit(
     )
 
 
+    # DALTON-HOOK(redis-write-diag): record v2/timeout spill circuit openings without leaking raw keys
+    from src.dalton.observability.redis_diagnostics import record_subagent_spill_lost
+    record_subagent_spill_lost(task.task_id, phase=phase, exc=exc, seq=fields.get("seq"))
+
+
 def legacy_task_events_key(thread_id: str, task_id: str) -> str:
     return f"subagent:events:{thread_id}:{task_id}"
 
@@ -347,6 +352,11 @@ async def spill_task_records(
             )
 
 
+# DALTON-HOOK(redis-write-diag): track active subagent spill stream concurrency on worker
+from src.dalton.observability.redis_diagnostics import observe_subagent_spill
+
+
+@observe_subagent_spill
 async def _spill_one_locked(
     cache: Any,
     thread_id: str,
@@ -464,24 +474,29 @@ async def _spill_one_locked(
             }
             for attempt in (1, 2):
                 try:
-                    await asyncio.wait_for(
-                        # Same 2x MAXLEN backstop as the v1 leg: the quota
-                        # circuit above tears the run before FIFO trim
-                        # could touch the head (STREAM_CONTRACT_V2.md).
-                        cache.client.xadd(
-                            v2_key,
-                            v2_fields,
-                            maxlen=quota.maxlen,
-                            approximate=True,
-                        ),
-                        timeout=_SPILL_TIMEOUT_SECONDS,
-                    )
+                    # DALTON-HOOK(redis-write-diag): split v2 xadd wire latency & count retry recovery
+                    from src.dalton.observability.redis_diagnostics import record_stream_recovery, redis_v2_xadd_span
+                    with redis_v2_xadd_span(cache, v2_key, record_bytes, attempt=attempt, seq=seq):
+                        await asyncio.wait_for(
+                            # Same 2x MAXLEN backstop as the v1 leg: the quota
+                            # circuit above tears the run before FIFO trim
+                            # could touch the head (STREAM_CONTRACT_V2.md).
+                            cache.client.xadd(
+                                v2_key,
+                                v2_fields,
+                                maxlen=quota.maxlen,
+                                approximate=True,
+                            ),
+                            timeout=_SPILL_TIMEOUT_SECONDS,
+                        )
                     break
                 except asyncio.TimeoutError:
                     if (
                         await _stream_tail_seq(cache, v2_key, b"payload")
                         == seq
                     ):
+                        # DALTON-HOOK(redis-write-diag): count v2 timeout tail-probe recovery
+                        record_stream_recovery(v2_key, event_id=seq, attempt=attempt, how="v2_timeout_landed", payload_bytes=record_bytes)
                         logger.info(
                             "subagent_event_spill_recovered",
                             phase="v2_timeout_landed",
@@ -527,6 +542,8 @@ async def _spill_one_locked(
                             await _stream_tail_seq(cache, v2_key, b"payload")
                             == seq
                         ):
+                            # DALTON-HOOK(redis-write-diag): count v2 error tail-probe recovery
+                            record_stream_recovery(v2_key, event_id=seq, attempt=attempt, how="v2_error_landed", payload_bytes=record_bytes)
                             logger.info(
                                 "subagent_event_spill_recovered",
                                 phase="v2_error_landed",

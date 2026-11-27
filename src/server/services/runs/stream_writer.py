@@ -107,7 +107,10 @@ async def buffer_event(
 
     # Charged before the write, so a frame that would break the budget never
     # reaches Redis and the cap bounds what the stream holds.
-    breach = quota.charge(event_id, len(event.encode("utf-8")), label=str(key))
+    # DALTON-HOOK(redis-write-diag): tag large SSE frame encoding with heavy_task
+    from src.dalton.observability.redis_diagnostics import encode_stream_frame_with_heavy_task
+
+    breach = quota.charge(event_id, len(encode_stream_frame_with_heavy_task(event)), label=str(key))
     if breach == "events":
         raise StreamQuotaExceededError(
             f"transport_lost: stream quota exceeded for {key} "

@@ -2148,6 +2148,30 @@ def is_channel_bt2_link_recovery_enabled() -> bool:
     )
 
 
+def is_redis_diagnostics_enabled() -> bool:
+    """Runtime switch for Redis write-timeout diagnostics & sampling (``DALTON_REDIS_DIAG_ENABLED``).
+
+    Defaults to ``True`` so diagnostic telemetry is active unless explicitly disabled
+    via ``DALTON_REDIS_DIAG_ENABLED=0`` or YAML ``observability.redis_diagnostics_enabled: false``.
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical.
+    """
+    raw = os.getenv("DALTON_REDIS_DIAG_ENABLED")
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("0", "false", "no", "off"):
+            return False
+        if cleaned in ("1", "true", "yes", "on"):
+            return True
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    obs_cfg = raw_yaml.get("observability")
+    if isinstance(obs_cfg, Mapping) and isinstance(obs_cfg.get("redis_diagnostics_enabled"), bool):
+        return bool(obs_cfg["redis_diagnostics_enabled"])
+    return True
 
 
-
+def get_redis_diag_ops_dir() -> Path:
+    """Return directory for per-worker/server Redis diagnostics JSON files (default ``var/dalton/ops``)."""
+    raw = os.getenv("DALTON_REDIS_DIAG_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return REPO_ROOT / "var" / "dalton" / "ops"
