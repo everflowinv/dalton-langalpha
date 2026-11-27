@@ -2462,7 +2462,7 @@ def test_persist_recovery_bin_atomic_symlink_swap_and_failure_preserves_previous
         def _fail_swap(s: Path, d: Path) -> None:
             raise OSError("simulated atomic swap failure")
 
-        preflight._atomic_swap_paths = _fail_swap
+        preflight._atomic_swap_paths = create_autospec(orig_swap, side_effect=_fail_swap)
         with pytest.raises(OSError, match="simulated atomic swap failure"):
             preflight.publish_recovery_bin_atomic(
                 repo_root=repo,
@@ -2484,7 +2484,7 @@ def test_persist_recovery_bin_atomic_symlink_swap_and_failure_preserves_previous
         def _fail_fsync(fd: int) -> None:
             raise OSError("simulated fsync EIO")
 
-        os.fsync = _fail_fsync  # type: ignore[assignment]
+        os.fsync = create_autospec(orig_fsync, side_effect=_fail_fsync)  # type: ignore[assignment]
         with pytest.raises(OSError, match="simulated fsync EIO"):
             preflight.publish_recovery_bin_atomic(
                 repo_root=repo,
@@ -3551,7 +3551,7 @@ def test_render_stage_a_plists_rolls_back_on_mid_commit_failure(tmp_path: Path, 
             raise OSError("simulated mid-commit replace failure #2")
         real_replace(src, dst)
 
-    monkeypatch.setattr(os, "replace", _fail_on_second)
+    monkeypatch.setattr(os, "replace", create_autospec(real_replace, side_effect=_fail_on_second))
     with pytest.raises(OSError, match="simulated mid-commit replace failure #2"):
         bse.render_stage_a_plists_atomic(
             output_dir=out_fresh,
@@ -3583,7 +3583,7 @@ def test_render_stage_a_plists_rolls_back_on_mid_commit_failure(tmp_path: Path, 
             raise OSError("simulated mid-commit replace failure #3")
         real_replace(src, dst)
 
-    monkeypatch.setattr(os, "replace", _fail_on_third)
+    monkeypatch.setattr(os, "replace", create_autospec(real_replace, side_effect=_fail_on_third))
     with pytest.raises(OSError, match="simulated mid-commit replace failure #3"):
         bse.render_stage_a_plists_atomic(
             output_dir=out_existing,
@@ -3751,6 +3751,461 @@ def test_preflight_real_ephemeral_http_stub_end_to_end(tmp_path: Path) -> None:
     finally:
         ctx_a["cleanup"]()
         ctx_b["cleanup"]()
+
+
+# ---------------------------------------------------------------------------
+# r4: Codex 3 High regressions (recovery post-swap rollback, plist rollback
+# failure backup retention, legacy proxy launcher vars & Stage B admin token)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_recovery_bin_fsyncs_before_swap_and_rolls_back_on_post_swap_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex r4 High 1: fsync new tree & parent dir before swap; roll back on post-swap fsync failure (symlink & real dir)."""
+    import errno as _errno
+
+    repo = tmp_path.resolve() / "repo"
+    src_dir = repo / "scripts" / "dalton" / "ops" / "prod"
+    gp_lock_src = repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py"
+    src_dir.mkdir(parents=True)
+    gp_lock_src.parent.mkdir(parents=True)
+    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+        (src_dir / f).write_bytes((PROD_OPS / f).read_bytes())
+    gp_lock_src.write_bytes((SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes())
+
+    snapshots_root = repo / "var" / "dalton" / "cutover-snapshots"
+    rec_entry = snapshots_root / "recovery-bin"
+
+    # Initial healthy publish -> symlink to v1
+    preflight.publish_recovery_bin_atomic(
+        repo_root=repo,
+        src_dir=src_dir,
+        gp_lock_src=gp_lock_src,
+        source_commit="commit_v1",
+    )
+    assert rec_entry.is_symlink()
+    v1_target = os.readlink(rec_entry)
+    assert json.loads((rec_entry / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v1"
+
+    # Case 1: Existing symlink entry — verify pre-swap fsync order AND rollback when post-swap parent fsync fails
+    real_fsync_dir = preflight._fsync_dir
+    real_replace = os.replace
+    events: list[str] = []
+    swapped_symlink = {"done": False}
+
+    def _tracked_replace(src: Any, dst: Any) -> None:
+        dst_p = Path(dst)
+        if dst_p == rec_entry:
+            events.append("swap_symlink" if not swapped_symlink["done"] else "rollback_symlink")
+            swapped_symlink["done"] = True
+        real_replace(src, dst)
+
+    def _fail_post_swap_fsync_symlink(path: Path, *, strict: bool = False) -> None:
+        p = Path(path)
+        if p == snapshots_root:
+            if not swapped_symlink["done"]:
+                events.append("pre_swap_parent_fsync")
+                real_fsync_dir(p, strict=strict)
+                return
+            if strict:
+                events.append("post_swap_parent_fsync_fail")
+                raise OSError(_errno.EIO, "simulated post-swap parent fsync failure (symlink)")
+            events.append("rollback_parent_fsync")
+            real_fsync_dir(p, strict=strict)
+            return
+        if p.name.startswith(".recovery-bin.rel."):
+            events.append("new_tree_fsync")
+        real_fsync_dir(p, strict=strict)
+
+    monkeypatch.setattr(os, "replace", create_autospec(real_replace, side_effect=_tracked_replace))
+    monkeypatch.setattr(preflight, "_fsync_dir", create_autospec(real_fsync_dir, side_effect=_fail_post_swap_fsync_symlink))
+    with pytest.raises(OSError, match="simulated post-swap parent fsync failure \\(symlink\\)"):
+        preflight.publish_recovery_bin_atomic(
+            repo_root=repo,
+            src_dir=src_dir,
+            gp_lock_src=gp_lock_src,
+            source_commit="commit_v2_should_rollback",
+        )
+    monkeypatch.undo()
+
+    assert "new_tree_fsync" in events
+    assert "pre_swap_parent_fsync" in events
+    assert events.index("new_tree_fsync") < events.index("pre_swap_parent_fsync") < events.index("swap_symlink")
+    assert events.index("swap_symlink") < events.index("post_swap_parent_fsync_fail") < events.index("rollback_symlink")
+    assert rec_entry.is_symlink()
+    assert os.readlink(rec_entry) == v1_target
+    assert json.loads((rec_entry / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v1"
+    # New staged dir and rollback temp symlink cleaned up; only v1 release dir remains
+    rel_entries = [p.name for p in snapshots_root.iterdir() if p.name.startswith(".recovery-bin.")]
+    assert rel_entries == [v1_target]
+
+    # Case 2: Existing real-directory entry — verify pre-swap fsync order AND atomic swap-back on post-swap fsync failure
+    v1_dir = snapshots_root / v1_target
+    rec_entry.unlink()
+    shutil.move(str(v1_dir), str(rec_entry))
+    assert rec_entry.is_dir() and not rec_entry.is_symlink()
+
+    real_swap = preflight._atomic_swap_paths
+    events_dir: list[str] = []
+    swapped_real = {"count": 0}
+
+    def _tracked_swap(src: Path, dst: Path) -> None:
+        swapped_real["count"] += 1
+        events_dir.append("swap_real_dir" if swapped_real["count"] == 1 else "rollback_real_dir")
+        real_swap(src, dst)
+
+    def _fail_post_swap_fsync_real(path: Path, *, strict: bool = False) -> None:
+        p = Path(path)
+        if p == snapshots_root:
+            if swapped_real["count"] == 0:
+                events_dir.append("pre_swap_parent_fsync")
+                real_fsync_dir(p, strict=strict)
+                return
+            if strict:
+                events_dir.append("post_swap_parent_fsync_fail")
+                raise OSError(_errno.EIO, "simulated post-swap parent fsync failure (real_dir)")
+            events_dir.append("rollback_parent_fsync")
+            real_fsync_dir(p, strict=strict)
+            return
+        if p.name.startswith(".recovery-bin.rel."):
+            events_dir.append("new_tree_fsync")
+        real_fsync_dir(p, strict=strict)
+
+    monkeypatch.setattr(preflight, "_atomic_swap_paths", create_autospec(real_swap, side_effect=_tracked_swap))
+    monkeypatch.setattr(preflight, "_fsync_dir", create_autospec(real_fsync_dir, side_effect=_fail_post_swap_fsync_real))
+    with pytest.raises(OSError, match="simulated post-swap parent fsync failure \\(real_dir\\)"):
+        preflight.publish_recovery_bin_atomic(
+            repo_root=repo,
+            src_dir=src_dir,
+            gp_lock_src=gp_lock_src,
+            source_commit="commit_v3_real_dir_rollback",
+        )
+    monkeypatch.undo()
+
+    assert swapped_real["count"] == 2
+    assert events_dir.index("new_tree_fsync") < events_dir.index("pre_swap_parent_fsync") < events_dir.index("swap_real_dir")
+    assert events_dir.index("swap_real_dir") < events_dir.index("post_swap_parent_fsync_fail") < events_dir.index("rollback_real_dir")
+    assert rec_entry.is_dir() and not rec_entry.is_symlink()
+    assert json.loads((rec_entry / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v1"
+    assert [p.name for p in snapshots_root.iterdir() if p.name.startswith(".recovery-bin.")] == []
+
+
+def test_render_stage_a_plists_preserves_backups_and_reports_location_when_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex r4 High 2: mid-commit failure + rollback failure must NOT swallow OSError or delete backups."""
+    import errno as _errno
+
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    home = base / "home"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    real_py = VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)
+    (repo / ".venv" / "bin" / "python").symlink_to(real_py)
+    (repo / "scripts" / "dalton" / "launchd").mkdir(parents=True)
+    for tpl_name in (
+        "com.dalton.guidepoint-mcp-proxy.plist.template",
+        "com.dalton.researchdata-bridge.plist.template",
+        "com.dalton.research-host.plist.template",
+    ):
+        (repo / "scripts" / "dalton" / "launchd" / tpl_name).write_bytes(
+            (LAUNCHD_DIR / tpl_name).read_bytes()
+        )
+    cfg_dir = home / ".config" / "dalton"
+    cfg_dir.mkdir(parents=True)
+    bridge_env = cfg_dir / "researchdata-bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_PORT=8960\n", encoding="utf-8")
+    host_env = cfg_dir / "research-host.env"
+    host_env.write_text("DALTON_RESEARCH_HOST_TOKEN=t1\n", encoding="utf-8")
+
+    v1_contents = {
+        "com.dalton.researchdata-bridge.plist": b"<plist>v1-bridge-orig</plist>\n",
+        "com.dalton.research-host.plist": b"<plist>v1-host-orig</plist>\n",
+        "com.dalton.guidepoint-mcp-proxy.plist": b"<plist>v1-proxy-orig</plist>\n",
+    }
+
+    # Case 1: Output dir loses write permission after 1st commit -> 2nd commit fails with EACCES AND rollback fails with EACCES!
+    out_ro = base / "out_ro"
+    out_ro.mkdir()
+    for fname, raw in v1_contents.items():
+        (out_ro / fname).write_bytes(raw)
+
+    real_replace = os.replace
+    commit_count = {"n": 0}
+
+    def _chmod_ro_after_first(src: Any, dst: Any) -> None:
+        commit_count["n"] += 1
+        real_replace(src, dst)
+        if commit_count["n"] == 1:
+            os.chmod(out_ro, 0o555)
+
+    monkeypatch.setattr(os, "replace", create_autospec(real_replace, side_effect=_chmod_ro_after_first))
+    try:
+        with pytest.raises(bse.StageAPlistRollbackError) as exc_info:
+            bse.render_stage_a_plists_atomic(
+                output_dir=out_ro,
+                repo_root=repo,
+                home_dir=home,
+                bridge_env_path=bridge_env,
+                research_host_env_path=host_env,
+            )
+    finally:
+        os.chmod(out_ro, 0o755)
+        monkeypatch.undo()
+
+    err = exc_info.value
+    assert isinstance(err, OSError)
+    assert err.backup_dir.is_dir(), "backup_dir must be preserved when rollback fails"
+    assert str(err.backup_dir) in str(err)
+    bridge_dest = out_ro / "com.dalton.researchdata-bridge.plist"
+    assert bridge_dest in err.affected_files
+    assert str(bridge_dest) in str(err)
+    # Original v1 bytes preserved intact inside backup_dir for operator retry!
+    assert (err.backup_dir / "com.dalton.researchdata-bridge.plist").read_bytes() == v1_contents["com.dalton.researchdata-bridge.plist"]
+
+    # Case 2: Commit fails on 3rd replace; rollback fails on 2nd (host) but succeeds on 1st (bridge) -> backups preserved!
+    out_partial = base / "out_partial"
+    out_partial.mkdir()
+    for fname, raw in v1_contents.items():
+        (out_partial / fname).write_bytes(raw)
+
+    step = {"n": 0}
+
+    def _fail_commit3_and_rollback_host(src: Any, dst: Any) -> None:
+        step["n"] += 1
+        dst_p = Path(dst)
+        if step["n"] == 3:
+            raise OSError(_errno.EIO, "simulated commit #3 failure")
+        if step["n"] == 4 and dst_p.name == "com.dalton.research-host.plist":
+            raise OSError(_errno.EACCES, "simulated rollback failure on host plist")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", create_autospec(real_replace, side_effect=_fail_commit3_and_rollback_host))
+    with pytest.raises(bse.StageAPlistRollbackError) as exc_info2:
+        bse.render_stage_a_plists_atomic(
+            output_dir=out_partial,
+            repo_root=repo,
+            home_dir=home,
+            bridge_env_path=bridge_env,
+            research_host_env_path=host_env,
+        )
+    monkeypatch.undo()
+
+    err2 = exc_info2.value
+    assert err2.backup_dir.is_dir()
+    assert err2.affected_files == (out_partial / "com.dalton.research-host.plist",)
+    assert str(err2.backup_dir) in str(err2)
+    assert str(out_partial / "com.dalton.research-host.plist") in str(err2)
+    # Bridge was restored, proxy was never replaced, and host's v1 original is preserved in backup_dir!
+    assert (out_partial / "com.dalton.researchdata-bridge.plist").read_bytes() == v1_contents["com.dalton.researchdata-bridge.plist"]
+    assert (out_partial / "com.dalton.guidepoint-mcp-proxy.plist").read_bytes() == v1_contents["com.dalton.guidepoint-mcp-proxy.plist"]
+    assert (err2.backup_dir / "com.dalton.research-host.plist").read_bytes() == v1_contents["com.dalton.research-host.plist"]
+
+
+def test_legacy_proxy_launcher_vars_env_file_tokens_reject_undefined_and_stage_b_admin_token_expansion(
+    tmp_path: Path,
+) -> None:
+    """Codex r4 High 3: `${ENV_FILE}.tokens.json` matches bash launcher across render/post-check/preflight, rejects undefined vars, and Stage B reads expanded admin token."""
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    home = base / "home"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    real_py = VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)
+    (repo / ".venv" / "bin" / "python").symlink_to(real_py)
+    (repo / "scripts" / "dalton" / "launchd").mkdir(parents=True)
+    (repo / "scripts" / "dalton" / "bridge_subprocess_env.py").symlink_to(
+        SCRIPTS_DALTON / "bridge_subprocess_env.py"
+    )
+    for tpl_name in (
+        "com.dalton.guidepoint-mcp-proxy.plist.template",
+        "com.dalton.researchdata-bridge.plist.template",
+        "com.dalton.research-host.plist.template",
+    ):
+        (repo / "scripts" / "dalton" / "launchd" / tpl_name).write_bytes(
+            (LAUNCHD_DIR / tpl_name).read_bytes()
+        )
+
+    cfg_dir = home / ".config" / "dalton"
+    cfg_dir.mkdir(parents=True)
+    bridge_env = cfg_dir / "researchdata-bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_PORT=8960\n", encoding="utf-8")
+    host_env = cfg_dir / "research-host.env"
+    host_env.write_text("DALTON_RESEARCH_HOST_TOKEN=t1\n", encoding="utf-8")
+
+    live_res_home = base / "live_research"
+    (live_res_home / "config").mkdir(parents=True)
+    live_gp_env = live_res_home / "config" / "guidepoint_mcp.env"
+    expected_tokens = Path(f"{live_gp_env}.tokens.json")
+    expected_tokens.write_text(
+        '{"access_token":"a","refresh_token":"r","obtained_at":1,"expires_in":600}',
+        encoding="utf-8",
+    )
+    live_gp_env.write_text(
+        'GUIDEPOINT_TOKENS_FILE="${ENV_FILE}.tokens.json"\n'
+        'ADMIN_SEG="expanded_admin"\n'
+        'export GUIDEPOINT_PROXY_ADMIN_TOKEN="${ADMIN_SEG}_secret_99" # inline comment\n',
+        encoding="utf-8",
+    )
+
+    live_proxy_plist = home / "Library" / "LaunchAgents" / "com.dalton.guidepoint-mcp-proxy.plist"
+    live_proxy_plist.parent.mkdir(parents=True, exist_ok=True)
+    live_proxy_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.dalton.guidepoint-mcp-proxy",
+                "ProgramArguments": [
+                    "/bin/bash",
+                    str(repo / "scripts" / "dalton" / "research_runtime" / "scripts" / "guidepoint_mcp_proxy_run.sh"),
+                ],
+                "EnvironmentVariables": {
+                    "HOME": str(home),
+                    "DALTON_RESEARCH_HOME": str(live_res_home),
+                    "GUIDEPOINT_ENV_FILE": str(live_gp_env),
+                },
+            }
+        )
+    )
+
+    # 1. Cross-check real bash launcher expansion of `${ENV_FILE}.tokens.json` matches renderer & preflight
+    bash_probe = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            (
+                'set -euo pipefail; '
+                'RESEARCH_HOME="$DALTON_RESEARCH_HOME"; '
+                'ENV_FILE="${GUIDEPOINT_ENV_FILE:-$RESEARCH_HOME/config/guidepoint_mcp.env}"; '
+                'set -a; source "$ENV_FILE"; set +a; '
+                'printf "%s\\n%s\\n" "$GUIDEPOINT_TOKENS_FILE" "$GUIDEPOINT_PROXY_ADMIN_TOKEN"'
+            ),
+        ],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home),
+            "DALTON_RESEARCH_HOME": str(live_res_home),
+            "GUIDEPOINT_ENV_FILE": str(live_gp_env),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert bash_probe.returncode == 0, bash_probe.stderr
+    bash_tokens, bash_admin_tok = bash_probe.stdout.splitlines()
+    assert bash_tokens == str(expected_tokens)
+    assert bash_admin_tok == "expanded_admin_secret_99"
+
+    out_dir = base / "rendered_env_file"
+    bse.render_stage_a_plists_atomic(
+        output_dir=out_dir,
+        repo_root=repo,
+        home_dir=home,
+        bridge_env_path=bridge_env,
+        research_host_env_path=host_env,
+        existing_proxy_plist_path=live_proxy_plist,
+    )
+    p_data = plistlib.loads((out_dir / "com.dalton.guidepoint-mcp-proxy.plist").read_bytes())
+    h_data = plistlib.loads((out_dir / "com.dalton.research-host.plist").read_bytes())
+    assert p_data["EnvironmentVariables"]["GUIDEPOINT_TOKENS_FILE"] == bash_tokens
+    assert h_data["EnvironmentVariables"]["GUIDEPOINT_TOKENS_FILE"] == bash_tokens
+
+    cfg_check = preflight.PreflightConfig(
+        repo_root=repo,
+        home_dir=home,
+        plist_dir=out_dir,
+        backend_url="http://127.0.0.1:8000",
+        proxy_url="http://127.0.0.1:8943",
+        bridge_url="http://127.0.0.1:8960",
+        research_host_url="http://127.0.0.1:8951",
+        budgets_file=repo / "var/dalton/cutover-snapshots/research-host/timing-budgets.env",
+    )
+    eff_env, _, errs = preflight._resolve_legacy_proxy_effective_env(cfg_check)
+    assert errs == []
+    assert eff_env["GUIDEPOINT_TOKENS_FILE"] == bash_tokens
+    assert eff_env["GUIDEPOINT_PROXY_ADMIN_TOKEN"] == bash_admin_tok
+
+    # 2. Undefined / indeterminate variable references & relative paths -> MUST refuse rendering & fail preflight!
+    indeterminate_cases = [
+        'GUIDEPOINT_TOKENS_FILE="${UNDEFINED_DIR}/tokens.json"\n',
+        'GUIDEPOINT_TOKENS_FILE="$UNDEFINED_DIR/tokens.json"\n',
+        'GUIDEPOINT_TOKENS_FILE="${TMPDIR:-/tmp}/tokens.json"\n',
+        'GUIDEPOINT_TOKENS_FILE="${UNKNOWN_EXTERNAL_VAR:-/tmp}/tokens.json"\n',
+        'GUIDEPOINT_TOKENS_FILE="relative/tokens.json"\n',
+    ]
+    for idx, bad_text in enumerate(indeterminate_cases):
+        live_gp_env.write_text(bad_text, encoding="utf-8")
+        out_bad = base / f"out_indet_{idx}"
+        with pytest.raises(bse.EnvFileValidationError):
+            bse.render_stage_a_plists_atomic(
+                output_dir=out_bad,
+                repo_root=repo,
+                home_dir=home,
+                bridge_env_path=bridge_env,
+                research_host_env_path=host_env,
+                existing_proxy_plist_path=live_proxy_plist,
+            )
+        assert not out_bad.exists() or list(out_bad.iterdir()) == []
+        _, _, pre_errs = preflight._resolve_legacy_proxy_effective_env(cfg_check)
+        assert pre_errs, f"preflight must reject indeterminate env: {bad_text!r}"
+
+    # 3. Stage B preflight `/admin/drain` MUST read `GUIDEPOINT_PROXY_ADMIN_TOKEN` via shared shell-expanded resolver!
+    ctx = _setup_isolated_env(tmp_path / "stage_b_admin_expand", budgets=_make_valid_budgets_dict())
+    try:
+        gp_env = ctx["gp_env"]
+        tok_from_env_file = Path(f"{gp_env}.tokens.json")
+        tok_from_env_file.write_text(
+            '{"access_token":"a","refresh_token":"r","obtained_at":1,"expires_in":600}',
+            encoding="utf-8",
+        )
+        gp_env.write_text(
+            'GUIDEPOINT_TOKENS_FILE="${ENV_FILE}.tokens.json"\n'
+            'ADMIN_PREFIX="gp_admin"\n'
+            'export GUIDEPOINT_PROXY_ADMIN_TOKEN="${ADMIN_PREFIX}_tok_1"  # expanded admin token\n',
+            encoding="utf-8",
+        )
+        # Re-render Stage A plists against this env so proxy & archived host both point to `${ENV_FILE}.tokens.json`
+        rerender_dir = tmp_path / "rerender_b"
+        bse.render_stage_a_plists_atomic(
+            output_dir=rerender_dir,
+            repo_root=ctx["repo"],
+            home_dir=ctx["home"],
+            bridge_env_path=ctx["bridge_env"],
+            research_host_env_path=ctx["host_env"],
+            existing_proxy_plist_path=ctx["plist_dir"] / "com.dalton.guidepoint-mcp-proxy.plist",
+        )
+        shutil.copy2(
+            rerender_dir / "com.dalton.guidepoint-mcp-proxy.plist",
+            ctx["plist_dir"] / "com.dalton.guidepoint-mcp-proxy.plist",
+        )
+        shutil.copy2(
+            rerender_dir / "com.dalton.research-host.plist",
+            ctx["archived_host_plist"],
+        )
+
+        # Fake curl already enforces `Authorization: Bearer gp_admin_tok_1` on :8943/admin/drain!
+        res_b = _run_preflight_cli(ctx, "--switch", "--report-json")
+        assert res_b.returncode == 0, res_b.stdout + res_b.stderr
+        by_b = {c["check"]: c for c in json.loads(res_b.stdout)["checks"]}
+        assert by_b["live_services_health_and_drain"]["status"] == "ok"
+        assert by_b["two_sided_guidepoint_paths"]["status"] == "ok"
+        assert str(tok_from_env_file) in by_b["two_sided_guidepoint_paths"]["detail"]
+
+        # If GUIDEPOINT_PROXY_ADMIN_TOKEN references an undefined variable, Stage B fails closed!
+        gp_env.write_text(
+            'GUIDEPOINT_TOKENS_FILE="${ENV_FILE}.tokens.json"\n'
+            'GUIDEPOINT_PROXY_ADMIN_TOKEN="${UNDEF_ADMIN_VAR}"\n',
+            encoding="utf-8",
+        )
+        res_bad = _run_preflight_cli(ctx, "--switch", "--report-json")
+        assert res_bad.returncode != 0
+        by_bad = {c["check"]: c for c in json.loads(res_bad.stdout)["checks"]}
+        assert by_bad["live_services_health_and_drain"]["status"] == "fail"
+        assert "UNDEF_ADMIN_VAR" in by_bad["live_services_health_and_drain"]["detail"]
+    finally:
+        ctx["cleanup"]()
 
 
 # ---------------------------------------------------------------------------

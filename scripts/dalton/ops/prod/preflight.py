@@ -1720,9 +1720,10 @@ def _check_live_services_health_and_drain(cfg: PreflightConfig) -> dict[str, str
     bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
     bridge_admin_tok = str(bridge_vals.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
 
-    gp_env_file = _resolve_guidepoint_env_file(cfg)
-    gp_vals = _parse_simple_env_file(gp_env_file)
-    gp_admin_tok = str(gp_vals.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+    gp_eff_env, _gp_env_file, gp_env_errs = _resolve_legacy_proxy_effective_env(cfg)
+    if gp_env_errs:
+        errors.extend(gp_env_errs)
+    gp_admin_tok = str(gp_eff_env.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
 
     bridge_base = cfg.bridge_url.rstrip("/")
     proxy_base = cfg.proxy_url.rstrip("/")
@@ -2930,7 +2931,9 @@ def publish_recovery_bin_atomic(
 
     new_rel_dir = Path(tempfile.mkdtemp(prefix=".recovery-bin.rel.", dir=str(snapshots_root)))
     tmp_link = snapshots_root / f".recovery-bin.link.{os.getpid()}.{secrets.token_hex(4)}"
+    rollback_link: Path | None = None
     published = False
+    preserve_staged = False
     try:
         os.chmod(new_rel_dir, 0o700)
         for name, (sp, mode) in src_map.items():
@@ -2964,28 +2967,100 @@ def publish_recovery_bin_atomic(
         os.symlink(new_rel_dir.name, tmp_link)
         rec_entry = snapshots_root / "recovery-bin"
 
-        if rec_entry.is_symlink() or not rec_entry.exists():
-            prev_target = os.readlink(rec_entry) if rec_entry.is_symlink() else ""
+        entry_is_symlink = rec_entry.is_symlink()
+        entry_exists = rec_entry.exists()
+        prev_target = os.readlink(rec_entry) if entry_is_symlink else ""
+        if entry_is_symlink:
+            rollback_link = snapshots_root / f".recovery-bin.rollback.{os.getpid()}.{secrets.token_hex(4)}"
+            os.symlink(prev_target, rollback_link)
+
+        # Durably flush the staged release tree and parent directory entries BEFORE swapping `recovery-bin`.
+        _fsync_dir(snapshots_root, strict=True)
+
+        if entry_is_symlink:
+            assert rollback_link is not None
             os.replace(tmp_link, rec_entry)
-            published = True
-            _fsync_dir(snapshots_root, strict=True)
-            if prev_target and prev_target != new_rel_dir.name and prev_target.startswith(".recovery-bin.rel."):
-                shutil.rmtree(snapshots_root / prev_target, ignore_errors=True)
-        else:
-            # Atomic single-syscall migration from existing real directory to symlink!
-            _atomic_swap_paths(tmp_link, rec_entry)
-            published = True
-            _fsync_dir(snapshots_root, strict=True)
-            # tmp_link now points to the displaced old real directory; remove it cleanly.
-            shutil.rmtree(tmp_link, ignore_errors=True)
-        return rec_entry
-    except BaseException:
-        if not published:
             try:
-                if tmp_link.is_symlink() or tmp_link.is_file():
-                    tmp_link.unlink()
+                _fsync_dir(snapshots_root, strict=True)
+            except BaseException as post_exc:
+                try:
+                    os.replace(rollback_link, rec_entry)
+                except OSError as rb_exc:
+                    preserve_staged = True
+                    raise OSError(
+                        rb_exc.errno,
+                        (
+                            f"post-swap fsync failed ({post_exc}) and rollback of {rec_entry} "
+                            f"to {prev_target!r} failed ({rb_exc}); rollback symlink kept at {rollback_link}"
+                        ),
+                        str(rec_entry),
+                    ) from post_exc
+                _fsync_dir(snapshots_root, strict=False)
+                raise
+            published = True
+            try:
+                rollback_link.unlink(missing_ok=True)
             except OSError:
                 pass
+            if prev_target and prev_target != new_rel_dir.name and prev_target.startswith(".recovery-bin.rel."):
+                shutil.rmtree(snapshots_root / prev_target, ignore_errors=True)
+        elif not entry_exists:
+            os.replace(tmp_link, rec_entry)
+            try:
+                _fsync_dir(snapshots_root, strict=True)
+            except BaseException as post_exc:
+                try:
+                    rec_entry.unlink()
+                except OSError as rb_exc:
+                    preserve_staged = True
+                    raise OSError(
+                        rb_exc.errno,
+                        f"post-swap fsync failed ({post_exc}) and rollback unlink of {rec_entry} failed ({rb_exc})",
+                        str(rec_entry),
+                    ) from post_exc
+                _fsync_dir(snapshots_root, strict=False)
+                raise
+            published = True
+        else:
+            # Atomic single-syscall migration from existing real directory to symlink.
+            _atomic_swap_paths(tmp_link, rec_entry)
+            try:
+                _fsync_dir(snapshots_root, strict=True)
+            except BaseException as post_exc:
+                try:
+                    _atomic_swap_paths(tmp_link, rec_entry)
+                except OSError as rb_exc:
+                    preserve_staged = True
+                    raise OSError(
+                        rb_exc.errno,
+                        (
+                            f"post-swap fsync failed ({post_exc}) and rollback swap of {rec_entry} "
+                            f"failed ({rb_exc}); displaced previous entry kept at {tmp_link}"
+                        ),
+                        str(rec_entry),
+                    ) from post_exc
+                _fsync_dir(snapshots_root, strict=False)
+                raise
+            published = True
+            # tmp_link now points to the displaced old real entry; remove it cleanly.
+            if tmp_link.is_dir() and not tmp_link.is_symlink():
+                shutil.rmtree(tmp_link, ignore_errors=True)
+            else:
+                try:
+                    tmp_link.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return rec_entry
+    except BaseException:
+        if not published and not preserve_staged:
+            for link_path in (tmp_link, rollback_link):
+                if link_path is None:
+                    continue
+                try:
+                    if link_path.is_symlink() or link_path.is_file():
+                        link_path.unlink()
+                except OSError:
+                    pass
             shutil.rmtree(new_rel_dir, ignore_errors=True)
         raise
 

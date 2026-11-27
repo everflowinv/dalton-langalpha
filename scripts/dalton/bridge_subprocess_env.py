@@ -11,7 +11,8 @@ this module without third-party dependencies.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+import errno
 import json
 import os
 from pathlib import Path
@@ -2652,6 +2653,48 @@ def _resolve_abs_without_symlink_deref(path: Path) -> Path:
 _SHELL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHELL_ASSIGN_LINE_RE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _SHELL_UNQUOTED_META_CHARS: frozenset[str] = frozenset({";", "|", "&", "<", ">", "(", ")", "`"})
+_KNOWN_PROXY_OPTIONAL_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "DALTON_RESEARCH_HOME",
+        "DALTON_OCW_ROOT",
+        "GUIDEPOINT_ENV_FILE",
+        "GUIDEPOINT_PYTHON",
+        "GUIDEPOINT_PROXY_PORT",
+        "GUIDEPOINT_TOKENS_FILE",
+        "DALTON_GUIDEPOINT_TOKENS_FILE",
+        "DALTON_GUIDEPOINT_OWNERSHIP_FILE",
+        "DALTON_HOST_OWNERSHIP_FILE",
+        "GUIDEPOINT_PROXY_ADMIN_TOKEN",
+        "GUIDEPOINT_UPSTREAM_URL",
+        "GUIDEPOINT_TOKEN_URL",
+    }
+)
+
+
+class StageAPlistRollbackError(OSError):
+    """Raised when Stage A plist commit fails AND rollback cannot fully restore targets."""
+
+    def __init__(
+        self,
+        *,
+        backup_dir: Path,
+        affected_files: Sequence[Path],
+        commit_error: BaseException,
+        rollback_errors: Sequence[str],
+        err_no: int | None = None,
+    ) -> None:
+        self.backup_dir = backup_dir
+        self.affected_files = tuple(affected_files)
+        self.commit_error = commit_error
+        self.rollback_errors = tuple(rollback_errors)
+        affected_text = ", ".join(str(p) for p in self.affected_files) or "(directory fsync)"
+        rb_text = "; ".join(self.rollback_errors)
+        commit_desc = f"{type(commit_error).__name__}: {commit_error}"
+        msg = (
+            f"Stage A plist commit failed ({commit_desc}) AND rollback was incomplete "
+            f"for [{affected_text}] ({rb_text}); original backups preserved at {backup_dir}"
+        )
+        super().__init__(err_no if err_no is not None else errno.EIO, msg)
 
 
 def _expand_shell_dollar(
@@ -2666,7 +2709,8 @@ def _expand_shell_dollar(
     """Expand `$VAR`, `${VAR}`, `${VAR:-default}`, or `${VAR-default}` at `raw[idx] == '$'`.
 
     Rejects command substitution `$(...)`, arithmetic `$((...))`, unsupported parameter
-    operators, and special shell parameters so unparseable shell syntax fails closed.
+    operators, special shell parameters, and any undefined/indeterminate variable reference
+    so unparseable or runtime-dependent shell syntax fails closed.
     """
     n = len(raw)
     if idx + 1 >= n:
@@ -2735,7 +2779,16 @@ def _expand_shell_dollar(
                 reason=f"line {lineno}: empty '${{}}' parameter expansion",
             )
         if _SHELL_IDENT_RE.fullmatch(inner):
-            return str(env.get(inner, "")), pos + 1
+            if inner not in env:
+                raise EnvFileValidationError(
+                    path=path,
+                    key=key,
+                    reason=(
+                        f"line {lineno}: cannot deterministically resolve undefined/runtime "
+                        f"variable '${{{inner}}}' in sourced env file"
+                    ),
+                )
+            return str(env[inner]), pos + 1
         m_def = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(:-|-)([\s\S]*)$", inner)
         if not m_def:
             raise EnvFileValidationError(
@@ -2750,6 +2803,15 @@ def _expand_shell_dollar(
         else:
             if var_name in env:
                 return str(env[var_name]), pos + 1
+        if var_name not in env and var_name not in _KNOWN_PROXY_OPTIONAL_ENV_KEYS:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=(
+                    f"line {lineno}: cannot deterministically resolve unknown variable "
+                    f"'${{{var_name}{op}...}}' in sourced env file"
+                ),
+            )
         expanded_default = _parse_shell_rhs_value(
             default_expr,
             env,
@@ -2765,7 +2827,16 @@ def _expand_shell_dollar(
         while end < n and (raw[end].isalnum() or raw[end] == "_"):
             end += 1
         var_name = raw[idx + 1 : end]
-        return str(env.get(var_name, "")), end
+        if var_name not in env:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=(
+                    f"line {lineno}: cannot deterministically resolve undefined/runtime "
+                    f"variable '${var_name}' in sourced env file"
+                ),
+            )
+        return str(env[var_name]), end
 
     if nxt in ("'", '"', " ", "\t"):
         return "$", idx + 1
@@ -2958,8 +3029,8 @@ def parse_sourced_shell_env_strict(
     return assigned
 
 
-def _read_plist_env_vars_strict(plist_path: Path) -> dict[str, str]:
-    """Strictly read `EnvironmentVariables` from an existing launchd plist (fail closed on corruption)."""
+def _read_plist_launch_spec_strict(plist_path: Path) -> tuple[dict[str, str], list[str]]:
+    """Strictly read `EnvironmentVariables` and `ProgramArguments` from a launchd plist."""
     validate_safe_regular_file_target(plist_path, allow_missing=False)
     try:
         parsed = plistlib.loads(plist_path.read_bytes())
@@ -2972,14 +3043,100 @@ def _read_plist_env_vars_strict(plist_path: Path) -> dict[str, str]:
         raise EnvFileValidationError(path=plist_path, reason="plist root is not a dict")
     env_map = parsed.get("EnvironmentVariables")
     if env_map is None:
-        return {}
-    if not isinstance(env_map, Mapping):
+        env_vars: dict[str, str] = {}
+    elif not isinstance(env_map, Mapping):
         raise EnvFileValidationError(
             path=plist_path,
             key="EnvironmentVariables",
             reason="EnvironmentVariables is not a dict",
         )
-    return {str(k): str(v) for k, v in env_map.items() if isinstance(k, str) and v is not None}
+    else:
+        env_vars = {str(k): str(v) for k, v in env_map.items() if isinstance(k, str) and v is not None}
+
+    raw_args = parsed.get("ProgramArguments")
+    if raw_args is None:
+        prog_args: list[str] = []
+    elif not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
+        raise EnvFileValidationError(
+            path=plist_path,
+            key="ProgramArguments",
+            reason="ProgramArguments is not a list of strings",
+        )
+    else:
+        prog_args = list(raw_args)
+    return env_vars, prog_args
+
+
+def _read_plist_env_vars_strict(plist_path: Path) -> dict[str, str]:
+    """Strictly read `EnvironmentVariables` from an existing launchd plist (fail closed on corruption)."""
+    env_vars, _ = _read_plist_launch_spec_strict(plist_path)
+    return env_vars
+
+
+def _extract_launcher_script_dir(
+    program_args: Sequence[str],
+    *,
+    existing_plist_found: bool,
+    repo_abs: Path,
+) -> str | None:
+    """Resolve `SCRIPT_DIR` matching `guidepoint_mcp_proxy_run.sh` (`dirname ${BASH_SOURCE[0]}`)."""
+    if not existing_plist_found:
+        return str(repo_abs / "scripts" / "dalton" / "research_runtime" / "scripts")
+    if not program_args:
+        return None
+    idx = 0
+    if Path(program_args[0]).name == "env":
+        idx = 1
+        while idx < len(program_args):
+            tok = program_args[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok.startswith("-") or ("=" in tok and not tok.startswith("/")):
+                idx += 1
+                continue
+            break
+    if idx >= len(program_args):
+        return None
+    cmd = program_args[idx]
+    script_arg: str | None = None
+    if Path(cmd).name in ("bash", "sh", "zsh"):
+        j = idx + 1
+        while j < len(program_args):
+            tok = program_args[j]
+            if tok == "--":
+                j += 1
+                break
+            if tok == "-c" or tok.startswith("-c"):
+                return None
+            if tok in ("-o", "+o"):
+                j += 2
+                continue
+            if tok.startswith("-") or tok.startswith("+"):
+                j += 1
+                continue
+            break
+        if j < len(program_args):
+            script_arg = program_args[j]
+    else:
+        script_arg = cmd
+    if not script_arg:
+        return None
+    sp = Path(script_arg)
+    if not sp.is_absolute():
+        return None
+    return str(Path(os.path.abspath(str(sp))).parent)
+
+
+def _require_abs_proxy_path(raw: str, *, path: Path, key: str) -> Path:
+    p = Path(raw)
+    if not p.is_absolute():
+        raise EnvFileValidationError(
+            path=path,
+            key=key,
+            reason=f"resolved path {raw!r} is not absolute and cannot be deterministically resolved",
+        )
+    return Path(os.path.abspath(str(p)))
 
 
 def resolve_legacy_proxy_effective_paths(
@@ -2992,13 +3149,16 @@ def resolve_legacy_proxy_effective_paths(
 ) -> dict[str, Any]:
     """Resolve legacy `com.dalton.guidepoint-mcp-proxy` effective paths in real runtime order.
 
-    Single source of truth shared by Stage A rendering and `preflight.py`.
+    Single source of truth shared by Stage A rendering, post-render verification, and `preflight.py`.
     Actual launcher order (`guidepoint_mcp_proxy_run.sh` + `guidepoint_lock.py`):
       1. Inherit `EnvironmentVariables` from `com.dalton.guidepoint-mcp-proxy.plist`.
-      2. Resolve `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default)
-         and `ENV_FILE` (`GUIDEPOINT_ENV_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp.env`).
+      2. Initialize launcher shell variables before `source "$ENV_FILE"`:
+         - `SCRIPT_DIR` (directory of the launcher script)
+         - `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > `$HOME/Library/Application Support/Everflow/research`)
+         - `ENV_FILE` (`GUIDEPOINT_ENV_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp.env`)
+         - `PYTHON_BIN` (`GUIDEPOINT_PYTHON` > `/opt/homebrew/bin/python3.12`)
       3. `source "$ENV_FILE"` (overrides any keys inherited from the plist, with variable
-         expansion against plist + `HOME` + `RESEARCH_HOME` and inline `#` comments).
+         expansion against plist + launcher variables and fail-closed on undefined/unknown vars).
       4. Resolve paths via `guidepoint_lock.py` priority:
          - tokens: `GUIDEPOINT_TOKENS_FILE` > `DALTON_GUIDEPOINT_TOKENS_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp_tokens.json`
          - ownership: `DALTON_GUIDEPOINT_OWNERSHIP_FILE` > `DALTON_HOST_OWNERSHIP_FILE` > canonical repo journal.
@@ -3008,15 +3168,22 @@ def resolve_legacy_proxy_effective_paths(
     bvals = dict(bridge_env_vals or {})
 
     plist_env: dict[str, str] = {}
+    plist_prog_args: list[str] = []
     existing_plist_found = False
+    plist_src_path = existing_proxy_plist_path.expanduser() if existing_proxy_plist_path is not None else repo_abs
     if existing_proxy_plist_path is not None:
         p = existing_proxy_plist_path.expanduser()
         if p.exists() or p.is_symlink():
             existing_plist_found = True
-            plist_env = _read_plist_env_vars_strict(p)
+            plist_env, plist_prog_args = _read_plist_launch_spec_strict(p)
 
     eff_env: dict[str, str] = {"HOME": str(home_abs)}
     eff_env.update(plist_env)
+    launcher_home = _require_abs_proxy_path(
+        str(eff_env.get("HOME") or str(home_abs)),
+        path=plist_src_path,
+        key="HOME",
+    )
 
     # Match `guidepoint_mcp_proxy_run.sh`: when an existing plist is present, launcher only reads
     # plist env (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default); bridge_env_vals is only a
@@ -3033,22 +3200,40 @@ def resolve_legacy_proxy_effective_paths(
             or str(bvals.get("DALTON_RESEARCH_HOME") or "").strip()
         )
     research_home_abs = (
-        _resolve_abs_without_symlink_deref(Path(raw_rh))
+        _require_abs_proxy_path(raw_rh, path=plist_src_path, key="DALTON_RESEARCH_HOME")
         if raw_rh
-        else (home_abs / "Library" / "Application Support" / "Everflow" / "research")
+        else (launcher_home / "Library" / "Application Support" / "Everflow" / "research")
     )
-    eff_env["RESEARCH_HOME"] = str(research_home_abs)
 
     if guidepoint_env_path is not None:
         gp_env_abs = _resolve_abs_without_symlink_deref(guidepoint_env_path)
     elif str(eff_env.get("GUIDEPOINT_ENV_FILE") or "").strip():
-        gp_env_abs = _resolve_abs_without_symlink_deref(Path(str(eff_env["GUIDEPOINT_ENV_FILE"]).strip()))
+        gp_env_abs = _require_abs_proxy_path(
+            str(eff_env["GUIDEPOINT_ENV_FILE"]).strip(),
+            path=plist_src_path,
+            key="GUIDEPOINT_ENV_FILE",
+        )
     else:
         gp_env_abs = research_home_abs / "config" / "guidepoint_mcp.env"
 
+    python_bin_val = str(eff_env.get("GUIDEPOINT_PYTHON") or "").strip() or "/opt/homebrew/bin/python3.12"
+    script_dir_val = _extract_launcher_script_dir(
+        plist_prog_args,
+        existing_plist_found=existing_plist_found,
+        repo_abs=repo_abs,
+    )
+
+    # Launcher shell variables set in `guidepoint_mcp_proxy_run.sh` before `set -a; source "$ENV_FILE"`.
+    source_base_env = dict(eff_env)
+    source_base_env["RESEARCH_HOME"] = str(research_home_abs)
+    source_base_env["ENV_FILE"] = str(gp_env_abs)
+    source_base_env["PYTHON_BIN"] = python_bin_val
+    if script_dir_val is not None:
+        source_base_env["SCRIPT_DIR"] = script_dir_val
+
     sourced_vals: dict[str, str] = {}
     if gp_env_abs.exists() or gp_env_abs.is_symlink():
-        sourced_vals = parse_sourced_shell_env_strict(gp_env_abs, base_env=eff_env)
+        sourced_vals = parse_sourced_shell_env_strict(gp_env_abs, base_env=source_base_env)
         # `source "$ENV_FILE"` overwrites same-named plist variables!
         eff_env.update(sourced_vals)
 
@@ -3063,14 +3248,22 @@ def resolve_legacy_proxy_effective_paths(
         or str(eff_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
     )
     if final_tokens_raw:
-        tokens_abs = _resolve_abs_without_symlink_deref(Path(final_tokens_raw))
+        tokens_abs = _require_abs_proxy_path(
+            final_tokens_raw,
+            path=gp_env_abs if gp_env_abs.exists() else plist_src_path,
+            key="GUIDEPOINT_TOKENS_FILE",
+        )
     else:
         final_rh_raw = (
             str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
             or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
         )
         final_rh = (
-            _resolve_abs_without_symlink_deref(Path(final_rh_raw))
+            _require_abs_proxy_path(
+                final_rh_raw,
+                path=gp_env_abs if gp_env_abs.exists() else plist_src_path,
+                key="DALTON_RESEARCH_HOME",
+            )
             if final_rh_raw
             else research_home_abs
         )
@@ -3081,7 +3274,11 @@ def resolve_legacy_proxy_effective_paths(
         or str(eff_env.get("DALTON_HOST_OWNERSHIP_FILE") or "").strip()
     )
     ownership_abs = (
-        _resolve_abs_without_symlink_deref(Path(final_own_raw))
+        _require_abs_proxy_path(
+            final_own_raw,
+            path=gp_env_abs if gp_env_abs.exists() else plist_src_path,
+            key="DALTON_GUIDEPOINT_OWNERSHIP_FILE",
+        )
         if final_own_raw
         else (repo_abs / _DEFAULT_OWNERSHIP_REL_PATH)
     )
@@ -3103,27 +3300,33 @@ def resolve_legacy_proxy_effective_paths(
         "effective_env": eff_env,
         "sourced_vals": sourced_vals,
         "env_file_primary_tokens_override": (
-            str(_resolve_abs_without_symlink_deref(Path(sourced_primary_tokens)))
+            str(_require_abs_proxy_path(sourced_primary_tokens, path=gp_env_abs, key="GUIDEPOINT_TOKENS_FILE"))
             if sourced_primary_tokens
             else ""
         ),
         "env_file_tokens_override": (
-            str(_resolve_abs_without_symlink_deref(Path(sourced_tokens_raw)))
+            str(_require_abs_proxy_path(sourced_tokens_raw, path=gp_env_abs, key="GUIDEPOINT_TOKENS_FILE"))
             if sourced_tokens_raw
             else ""
         ),
         "env_file_ownership_override": (
-            str(_resolve_abs_without_symlink_deref(Path(sourced_ownership_raw)))
+            str(
+                _require_abs_proxy_path(
+                    sourced_ownership_raw,
+                    path=gp_env_abs,
+                    key="DALTON_GUIDEPOINT_OWNERSHIP_FILE",
+                )
+            )
             if sourced_ownership_raw
             else ""
         ),
         "plist_tokens_override": (
             str(
-                _resolve_abs_without_symlink_deref(
-                    Path(
-                        str(plist_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
-                        or str(plist_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
-                    )
+                _require_abs_proxy_path(
+                    str(plist_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+                    or str(plist_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip(),
+                    path=plist_src_path,
+                    key="GUIDEPOINT_TOKENS_FILE",
                 )
             )
             if (
@@ -3696,6 +3899,9 @@ def render_stage_a_plists_atomic(
         (stage_dir / proxy_dest.name, proxy_dest),
     ]
     payloads = [bridge_xml, host_xml, proxy_xml]
+    commit_started = False
+    commit_succeeded = False
+    rollback_succeeded = False
     try:
         for (staged_path, _dest), xml_text in zip(staged_pairs, payloads):
             fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -3722,15 +3928,23 @@ def render_stage_a_plists_atomic(
             plistlib.loads(staged_path.read_bytes())
 
         # Post-render runtime check: verify newly rendered proxy plist -> `source guidepoint_mcp.env`
-        # resolves to the exact expected `eff_tokens_abs` and `target_ownership_abs`.
+        # resolves directly from the rendered plist to the exact expected env/tokens/ownership paths.
         staged_proxy_path = stage_dir / proxy_dest.name
         post_proxy = resolve_legacy_proxy_effective_paths(
             repo_root=repo_abs,
             home_dir=home_abs,
             existing_proxy_plist_path=staged_proxy_path,
             bridge_env_vals=bridge_vals,
-            guidepoint_env_path=Path(live_proxy["guidepoint_env_file"]),
         )
+        if Path(post_proxy["guidepoint_env_file"]).resolve() != Path(live_proxy["guidepoint_env_file"]).resolve():
+            raise EnvFileValidationError(
+                path=staged_proxy_path,
+                key="GUIDEPOINT_ENV_FILE",
+                reason=(
+                    f"post-render proxy runtime env path {post_proxy['guidepoint_env_file']} "
+                    f"diverges from rendered {live_proxy['guidepoint_env_file']}"
+                ),
+            )
         if Path(post_proxy["tokens_file"]).resolve() != eff_tokens_abs.resolve():
             raise EnvFileValidationError(
                 path=Path(live_proxy["guidepoint_env_file"]),
@@ -3787,25 +4001,61 @@ def render_stage_a_plists_atomic(
         _fsync_directory(stage_dir, strict=True)
 
         # Phase 3: Commit all three validated files; roll back all committed files on ANY failure.
+        # If rollback encounters any OSError, preserve `backup_dir` intact and report all affected files.
         committed: list[tuple[Path, bool, Path | None]] = []
+        commit_started = True
         try:
             for staged_path, dest_path, existed, bkp_path in commit_plan:
                 os.replace(staged_path, dest_path)
                 committed.append((dest_path, existed, bkp_path))
             _fsync_directory(out_abs, strict=True)
-        except BaseException:
+            commit_succeeded = True
+        except BaseException as commit_exc:
+            if not committed:
+                rollback_succeeded = True
+                raise
+            affected_files: list[Path] = []
+            rollback_failures: list[str] = []
+            first_errno: int | None = None
             for dest_path, existed, bkp_path in reversed(committed):
                 try:
-                    if existed and bkp_path is not None and bkp_path.exists():
+                    if existed:
+                        if bkp_path is None or not bkp_path.exists():
+                            raise OSError(errno.ENOENT, "backup file missing", str(bkp_path))
                         os.replace(bkp_path, dest_path)
-                    elif not existed:
+                    else:
                         dest_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _fsync_directory(out_abs, strict=False)
+                except OSError as rb_exc:
+                    affected_files.append(dest_path)
+                    if first_errno is None and rb_exc.errno is not None:
+                        first_errno = rb_exc.errno
+                    rollback_failures.append(
+                        f"{dest_path} ({type(rb_exc).__name__}: errno={rb_exc.errno} {rb_exc.strerror or rb_exc})"
+                    )
+            if not rollback_failures:
+                try:
+                    _fsync_directory(out_abs, strict=True)
+                except OSError as fsync_rb_exc:
+                    if first_errno is None and fsync_rb_exc.errno is not None:
+                        first_errno = fsync_rb_exc.errno
+                    rollback_failures.append(
+                        f"fsync {out_abs} ({type(fsync_rb_exc).__name__}: errno={fsync_rb_exc.errno} "
+                        f"{fsync_rb_exc.strerror or fsync_rb_exc})"
+                    )
+            if rollback_failures:
+                _fsync_directory(out_abs, strict=False)
+                raise StageAPlistRollbackError(
+                    backup_dir=backup_dir,
+                    affected_files=affected_files,
+                    commit_error=commit_exc,
+                    rollback_errors=rollback_failures,
+                    err_no=first_errno,
+                ) from commit_exc
+            rollback_succeeded = True
             raise
     finally:
-        shutil.rmtree(stage_dir, ignore_errors=True)
+        if (not commit_started) or commit_succeeded or rollback_succeeded:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     return {
         "com.dalton.guidepoint-mcp-proxy": str(proxy_dest),
@@ -3973,6 +4223,9 @@ def _cmd_render_stage_a_plists(args: argparse.Namespace) -> int:
             ),
         )
     except EnvFileValidationError as exc:
+        print(f"[render_stage_a_plists] ERROR: {exc}", file=sys.stderr)
+        return 1
+    except StageAPlistRollbackError as exc:
         print(f"[render_stage_a_plists] ERROR: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
