@@ -7,6 +7,7 @@ with `DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH=<repo>/scripts/dalton/research_runti
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import os
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,9 @@ from .library_connectors import (
 # Everflow commercial connector bundle is configured.
 EXTRA_HOST_ENV_KEYS: frozenset[str] = frozenset(
     {
+        "DALTON_BRIDGE_ADMIN_TOKEN",
+        "DALTON_LEGACY_BRIDGE_MCP_URL",
+        "DALTON_BRIDGE_TOKEN",
         "DALTON_ALPHAENGINE_USAGE_FILE",
         "GUIDEPOINT_CLIENT_ID",
         "GUIDEPOINT_CLIENT_SECRET",
@@ -39,6 +43,11 @@ EXTRA_HOST_ENV_KEYS: frozenset[str] = frozenset(
         "DALTON_GUIDEPOINT_OWNERSHIP_FILE",
     }
 )
+
+
+def resolve_default_data_root(_environ: Mapping[str, str] | None = None) -> str:
+    """Default Everflow research data root when DALTON_RESEARCH_HOME is not explicitly set."""
+    return str(Path.home() / "Library" / "Application Support" / "Everflow" / "research")
 
 
 def register(
@@ -55,6 +64,9 @@ def register(
     data_root = Path(config.data_root)
     code_root = getattr(config, "code_root", None)
     cfg_env = getattr(config, "environ", None) or os.environ
+    bridge_admin_token = str(cfg_env.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
+    if bridge_admin_token:
+        registry.register_caller_admin_secret(bridge_admin_token)
     caps = (
         effective_capabilities(profile=getattr(config, "profile", None))
         if active_caps is None
@@ -113,10 +125,12 @@ def register(
             if raw_usage
             else getattr(config, "usage_file", None)
         )
+        legacy_bridge_mcp_url = str(cfg_env.get("DALTON_LEGACY_BRIDGE_MCP_URL") or "").strip()
+        legacy_bridge_token = str(cfg_env.get("DALTON_BRIDGE_TOKEN") or "").strip()
         register_alphaengine_bridge_proxy(
             registry,
-            bridge_mcp_url=str(getattr(config, "legacy_bridge_mcp_url", "") or ""),
-            bridge_token=str(getattr(config, "legacy_bridge_token", "") or ""),
+            bridge_mcp_url=legacy_bridge_mcp_url,
+            bridge_token=legacy_bridge_token,
             usage_file=usage_file,
         )
 

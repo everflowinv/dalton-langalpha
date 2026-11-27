@@ -75,11 +75,13 @@ class ConnectorRegistry:
     federated_sources: dict[str, FederatedSourceSpec] = field(default_factory=dict)
     federated_search_legs: dict[str, tuple[CapabilityId, FanoutProvider]] = field(default_factory=dict)
     federated_list_legs: dict[str, tuple[CapabilityId, FanoutProvider]] = field(default_factory=dict)
-    # Named alias groups for compatibility federated tools (e.g. `sales_mail` -> ('sales-notes', 'tmtb'))
+    # Named alias groups for optional federated tool bundles registered by extensions
     federated_aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    # Prefix-dispatched read handlers keyed by prefix (e.g. 'wiki', 'mail', ...)
+    # Prefix-dispatched read handlers keyed by document ID prefix (e.g. 'wiki')
     prefix_read_handlers: dict[str, tuple[CapabilityId | None, ReadHandler]] = field(default_factory=dict)
     prefix_to_source: dict[str, str] = field(default_factory=dict)
+    # Additional caller-identity verification secrets registered by host extensions
+    caller_admin_secrets: list[str] = field(default_factory=list)
     # Optional health probes and extra top-level health fields contributed by extra modules
     health_probes: dict[str, Callable[[], dict[str, Any]]] = field(default_factory=dict)
     health_fields: dict[str, tuple[CapabilityId | None, HealthFieldProvider]] = field(default_factory=dict)
@@ -162,6 +164,11 @@ class ConnectorRegistry:
     ) -> None:
         """Register an admin lock-acquisition callback for ``POST /admin/{connector_id}/acquire-lock``."""
         self.lock_handoff_handlers[str(connector_id).strip()] = (capability, acquire_fn)
+
+    def register_caller_admin_secret(self, secret: str) -> None:
+        cleaned = str(secret or "").strip()
+        if cleaned and cleaned not in self.caller_admin_secrets:
+            self.caller_admin_secrets.append(cleaned)
 
     def register_shutdown_hook(self, hook: Callable[[], Awaitable[None] | None]) -> None:
         self.shutdown_hooks.append(hook)

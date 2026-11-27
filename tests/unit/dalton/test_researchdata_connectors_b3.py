@@ -501,7 +501,7 @@ async def test_research_host_credential_isolation_and_wiki_ingest_idempotency(
         data_root=tmp_path / "wiki_root",
         mcp_token="host-sandbox-token-aaa",
         admin_token="admin-backend-token-bbb",
-        bridge_admin_token="hmac-caller-secret-ccc",
+        extra_caller_admin_secrets=("hmac-caller-secret-ccc",),
         profile=DeploymentProfile.CORE,
     )
     def _wiki_only_caps() -> frozenset[CapabilityId]:

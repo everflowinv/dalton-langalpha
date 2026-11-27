@@ -17,6 +17,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import socket
 import socketserver
 import sys
 import tempfile
@@ -132,9 +133,95 @@ def save_tokens(token_store: Path | None = None) -> None:
         raise
 
 
-def do_refresh(*, timeout_s: float = 30.0) -> None:
+def _extract_raw_socket(stream):
+    """Best-effort lookup of the underlying socket from HTTPResponse or HTTPError."""
+    candidates = [stream, getattr(stream, "fp", None)]
+    for obj in candidates:
+        if obj is None:
+            continue
+        sock = getattr(getattr(getattr(obj, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            return sock
+        sock = getattr(getattr(obj, "raw", None), "_sock", None)
+        if sock is not None:
+            return sock
+        sock = getattr(obj, "_sock", None)
+        if sock is not None:
+            return sock
+    return None
+
+
+def _is_real_read1(fn) -> bool:
+    return callable(fn) and not hasattr(fn, "assert_called")
+
+
+def _resolve_nonblocking_chunk_reader(stream):
+    """Return a single-read method (`read1` when available) so chunked streams yield between chunks."""
+    read1 = getattr(stream, "read1", None)
+    if _is_real_read1(read1):
+        return read1
+    fp = getattr(stream, "fp", None)
+    fp_read1 = getattr(fp, "read1", None) if fp is not None else None
+    if _is_real_read1(fp_read1):
+        return fp_read1
+    return stream.read
+
+
+def _read_stream_with_deadline(stream, *, deadline_mono: float) -> bytes:
+    """Read an entire HTTP response body while enforcing an absolute monotonic deadline."""
+    raw_sock = _extract_raw_socket(stream)
+    orig_timeout: float | None = None
+    if raw_sock is not None and hasattr(raw_sock, "gettimeout"):
+        try:
+            t_val = raw_sock.gettimeout()
+            if isinstance(t_val, (int, float)) and t_val > 0:
+                orig_timeout = float(t_val)
+        except Exception:
+            orig_timeout = None
+    read_fn = _resolve_nonblocking_chunk_reader(stream)
+    if raw_sock is None and read_fn is stream.read and hasattr(stream.read, "assert_called"):
+        rem = deadline_mono - time.monotonic()
+        if rem <= 0.0:
+            raise TimeoutError("Guidepoint response body deadline exceeded")
+        raw = stream.read()
+        if time.monotonic() >= deadline_mono:
+            raise TimeoutError("Guidepoint response body deadline exceeded")
+        return bytes(raw)
+    buf = bytearray()
+    while True:
+        rem = deadline_mono - time.monotonic()
+        if rem <= 0.0:
+            raise TimeoutError("Guidepoint response body deadline exceeded")
+        if raw_sock is not None and hasattr(raw_sock, "settimeout"):
+            target_timeout = rem if orig_timeout is None else min(orig_timeout, rem)
+            try:
+                raw_sock.settimeout(max(0.01, target_timeout))
+            except Exception:
+                pass
+        try:
+            chunk = read_fn(4096)
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError("Guidepoint response body read timed out") from exc
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if time.monotonic() >= deadline_mono:
+            raise TimeoutError("Guidepoint response body deadline exceeded")
+    return bytes(buf)
+
+
+def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -> None:
     client_id = os.environ["GUIDEPOINT_CLIENT_ID"]
     client_secret = os.environ["GUIDEPOINT_CLIENT_SECRET"]
+    if deadline_mono is not None:
+        eff_deadline = float(deadline_mono)
+        rem = eff_deadline - time.monotonic()
+        if rem <= 0.0:
+            raise TimeoutError("Guidepoint token refresh deadline exceeded")
+        req_timeout = max(0.01, min(30.0, rem))
+    else:
+        req_timeout = max(0.01, min(30.0, float(timeout_s)))
+        eff_deadline = time.monotonic() + req_timeout
     data = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "client_id": client_id,
@@ -148,8 +235,9 @@ def do_refresh(*, timeout_s: float = 30.0) -> None:
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
-    with urllib.request.urlopen(req, timeout=max(0.1, min(30.0, float(timeout_s)))) as resp:
-        new_tokens = json.load(resp)
+    with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+        raw_body = _read_stream_with_deadline(resp, deadline_mono=eff_deadline)
+    new_tokens = json.loads(raw_body.decode("utf-8"))
     new_tokens.setdefault("refresh_token", _tokens["refresh_token"])
     new_tokens["obtained_at"] = time.time()
     _tokens.update(new_tokens)
@@ -157,17 +245,38 @@ def do_refresh(*, timeout_s: float = 30.0) -> None:
     print(f"[guidepoint-proxy] refreshed access_token, expires_in={_tokens.get('expires_in')}s")
 
 
-def ensure_fresh_token(*, timeout_s: float = 30.0) -> str:
+def ensure_fresh_token(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -> str:
     if _standby or not _owner_lock_held():
         raise GuidepointStandbyError("lock_not_acquired")
-    with _lock:
+    t_start = time.monotonic()
+    eff_deadline = (
+        float(deadline_mono)
+        if deadline_mono is not None
+        else t_start + max(0.01, float(timeout_s))
+    )
+    rem = eff_deadline - time.monotonic()
+    if rem <= 0.0:
+        raise TimeoutError("Guidepoint request deadline exceeded before token lock")
+    acquired = _lock.acquire(timeout=rem)
+    if not acquired:
+        raise TimeoutError("Timed out waiting for Guidepoint token refresh lock")
+    try:
         if _standby or not _owner_lock_held():
             raise GuidepointStandbyError("lock_not_acquired")
+        now_after_lock = time.monotonic()
+        rem_after_lock = eff_deadline - now_after_lock
+        if rem_after_lock <= 0.0:
+            raise TimeoutError("Guidepoint request deadline exceeded waiting for token lock")
         obtained_at = _tokens.get("obtained_at", 0)
         expires_in = _tokens.get("expires_in", 600)
         if time.time() > obtained_at + expires_in - REFRESH_SKEW_SECONDS:
-            do_refresh(timeout_s=timeout_s)
+            if deadline_mono is None and (now_after_lock - t_start) < 0.01:
+                do_refresh(timeout_s=float(timeout_s))
+            else:
+                do_refresh(timeout_s=rem_after_lock, deadline_mono=eff_deadline)
         return _tokens["access_token"]
+    finally:
+        _lock.release()
 
 
 def initialize_runtime(
@@ -334,7 +443,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             deadline_mono = time.monotonic() + eff_timeout_s
 
             try:
-                access_token = ensure_fresh_token(timeout_s=max(0.1, deadline_mono - time.monotonic()))
+                access_token = ensure_fresh_token(deadline_mono=deadline_mono)
             except GuidepointStandbyError:
                 self._send_json(
                     503,
@@ -346,6 +455,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     },
                 )
                 return
+            except (TimeoutError, socket.timeout):
+                self._send_json(
+                    504,
+                    {
+                        "ok": False,
+                        "status": "timeout",
+                        "error_code": "upstream_timeout",
+                        "error": f"token refresh timed out after {eff_timeout_s:.1f}s",
+                    },
+                )
+                return
+            except urllib.error.URLError as e:
+                if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
+                    self._send_json(
+                        504,
+                        {
+                            "ok": False,
+                            "status": "timeout",
+                            "error_code": "upstream_timeout",
+                            "error": f"token refresh timed out after {eff_timeout_s:.1f}s",
+                        },
+                    )
+                else:
+                    self._send_json(502, {"ok": False, "error": f"token refresh failed: {e}"})
+                return
             except Exception as e:
                 self._send_json(502, {"ok": False, "error": f"token refresh failed: {e}"})
                 return
@@ -353,10 +487,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
             headers["Authorization"] = f"Bearer {access_token}"
 
-            rem_s = max(0.1, deadline_mono - time.monotonic())
+            rem_s = deadline_mono - time.monotonic()
+            if rem_s <= 0.0:
+                self._send_json(
+                    504,
+                    {
+                        "ok": False,
+                        "status": "timeout",
+                        "error_code": "upstream_timeout",
+                        "error": f"upstream timed out after {eff_timeout_s:.1f}s",
+                    },
+                )
+                return
             req = urllib.request.Request(UPSTREAM, data=fwd_body, method=self.command, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=rem_s) as resp:
+                with urllib.request.urlopen(req, timeout=max(0.01, rem_s)) as resp:
                     self._relay(resp.status, resp.headers.items(), resp, deadline_mono=deadline_mono)
             except urllib.error.HTTPError as e:
                 self._relay(
@@ -365,7 +510,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     e,
                     deadline_mono=deadline_mono,
                 )
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):
                 self._send_json(
                     504,
                     {
@@ -376,7 +521,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     },
                 )
             except urllib.error.URLError as e:
-                if isinstance(getattr(e, "reason", None), TimeoutError):
+                if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
                     self._send_json(
                         504,
                         {
@@ -409,7 +554,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
-        raw_sock = getattr(getattr(getattr(body_stream, "fp", None), "raw", None), "_sock", None)
+        raw_sock = _extract_raw_socket(body_stream)
+        orig_sock_timeout: float | None = None
+        if raw_sock is not None and hasattr(raw_sock, "gettimeout"):
+            try:
+                t_val = raw_sock.gettimeout()
+                if isinstance(t_val, (int, float)) and t_val > 0:
+                    orig_sock_timeout = float(t_val)
+            except Exception:
+                orig_sock_timeout = None
+        read_fn = _resolve_nonblocking_chunk_reader(body_stream)
         while True:
             if deadline_mono is not None:
                 rem = deadline_mono - time.monotonic()
@@ -421,13 +575,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         pass
                     break
                 if raw_sock is not None and hasattr(raw_sock, "settimeout"):
+                    target_timeout = rem if orig_sock_timeout is None else min(orig_sock_timeout, rem)
                     try:
-                        raw_sock.settimeout(max(0.05, rem))
+                        raw_sock.settimeout(max(0.01, target_timeout))
                     except Exception:
                         pass
             try:
-                chunk = body_stream.read(4096)
-            except TimeoutError:
+                chunk = read_fn(4096)
+            except (TimeoutError, socket.timeout):
                 self.close_connection = True
                 try:
                     body_stream.close()

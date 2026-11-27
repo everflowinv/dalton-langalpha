@@ -8333,6 +8333,38 @@ class ResearchDataBridge:
             caps_mod.is_research_source_enabled(cleaned, capabilities=active_caps)
         )
 
+    def _make_capability_disabled_response(
+        self,
+        req_id: Any,
+        tool_name: str,
+        route: str,
+        operation: str,
+        norm_params_view: dict[str, Any],
+        error_message: str,
+    ) -> dict[str, Any]:
+        err_disabled: dict[str, Any] = {
+            "_declared_sources": [],
+            "_sources": [],
+            "ok": False,
+            "status": "capability_disabled",
+            "error_code": "capability_disabled",
+            "http_status": 403,
+            "error": error_message,
+        }
+        _apply_error_and_empty_contract(
+            tool_name, route, operation, err_disabled, norm_params_view
+        )
+        return self._make_tool_result_response(
+            req_id, err_disabled, is_error=True
+        )
+
+    def _enabled_local_library_sources(self) -> list[str]:
+        return [
+            src
+            for src in ("company-wiki", "sales-notes", "tmtb", "funda-ai")
+            if not self._is_route_capability_disabled(src)
+        ]
+
     def _is_route_migrated(self, route: str) -> bool:
         caps_mod = _import_dalton_capabilities()
         if caps_mod is None:
@@ -13867,20 +13899,13 @@ class ResearchDataBridge:
                     req_id, err_migrated, is_error=True
                 )
             if route and self._is_route_capability_disabled(route):
-                err_disabled: dict[str, Any] = {
-                    "_declared_sources": [],
-                    "_sources": [],
-                    "ok": False,
-                    "status": "capability_disabled",
-                    "error_code": "capability_disabled",
-                    "http_status": 403,
-                    "error": f"Route '{route}' is disabled by deployment capability configuration.",
-                }
-                _apply_error_and_empty_contract(
-                    tool_name, route, operation, err_disabled, norm_params_view
-                )
-                return self._make_tool_result_response(
-                    req_id, err_disabled, is_error=True
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    f"Route '{route}' is disabled by deployment capability configuration.",
                 )
             if route and route in handoff:
                 err_payload: dict[str, Any] = {
@@ -14147,18 +14172,171 @@ class ResearchDataBridge:
         if tool_name == "catalog" and route:
             norm_params_view["route"] = route
 
+        _doc_prefix_to_source = {
+            "wiki": "company-wiki",
+            "mail": "sales-notes",
+            "digest": "sales-notes",
+            "tmtb": "tmtb",
+            "funda": "funda-ai",
+        }
+        local_enabled = True
+        ae_enabled = not self._is_route_capability_disabled("alphaengine")
+        gp_enabled = not self._is_route_capability_disabled("guidepoint")
+
+        if tool_name == "research" and route == "sales-mail":
+            enabled_sales_mail = [
+                s
+                for s in ("sales-notes", "tmtb")
+                if not self._is_route_capability_disabled(s)
+            ]
+            if not enabled_sales_mail:
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    "Route 'sales-mail' is disabled by deployment capability configuration.",
+                )
+            p_sm = call_args.get("params") if isinstance(call_args.get("params"), dict) else {}
+            if "sources" in p_sm and isinstance(p_sm.get("sources"), list):
+                disabled_explicit = [
+                    str(s).strip()
+                    for s in p_sm["sources"]
+                    if self._is_route_capability_disabled(str(s).strip())
+                ]
+                if disabled_explicit:
+                    return self._make_capability_disabled_response(
+                        req_id,
+                        tool_name,
+                        route,
+                        operation,
+                        norm_params_view,
+                        f"Requested source(s) {', '.join(disabled_explicit)} are disabled by deployment capability configuration.",
+                    )
+            if operation in INTERNAL_LIBRARY_READ_OPERATIONS:
+                doc_str = str(call_args.get("document") or "").strip()
+                prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                target_src = _doc_prefix_to_source.get(prefix, "sales-notes")
+                if self._is_route_capability_disabled(target_src):
+                    return self._make_capability_disabled_response(
+                        req_id,
+                        tool_name,
+                        route,
+                        operation,
+                        norm_params_view,
+                        f"Source '{target_src}' required for route 'sales-mail' read is disabled by deployment capability configuration.",
+                    )
+            else:
+                if p_sm.get("layer") == "digest" and "sales-notes" not in enabled_sales_mail:
+                    return self._make_capability_disabled_response(
+                        req_id,
+                        tool_name,
+                        route,
+                        operation,
+                        norm_params_view,
+                        "Source 'sales-notes' required for layer='digest' is disabled by deployment capability configuration.",
+                    )
+                if len(enabled_sales_mail) < 2 or operation == "list":
+                    pruned_sm_params = dict(p_sm)
+                    pruned_sm_params["sources"] = list(enabled_sales_mail)
+                    if "sales-notes" not in enabled_sales_mail and pruned_sm_params.get("layer", "all") != "raw":
+                        pruned_sm_params["layer"] = "raw"
+                    call_args["params"] = pruned_sm_params
+
+        if tool_name == "research" and route == "all":
+            enabled_local = self._enabled_local_library_sources()
+            local_enabled = bool(enabled_local)
+            p_all = call_args.get("params") if isinstance(call_args.get("params"), dict) else {}
+            if "sources" in p_all and isinstance(p_all.get("sources"), list):
+                disabled_explicit = [
+                    str(s).strip()
+                    for s in p_all["sources"]
+                    if self._is_route_capability_disabled(str(s).strip())
+                ]
+                if disabled_explicit:
+                    return self._make_capability_disabled_response(
+                        req_id,
+                        tool_name,
+                        route,
+                        operation,
+                        norm_params_view,
+                        f"Requested source(s) {', '.join(disabled_explicit)} are disabled by deployment capability configuration.",
+                    )
+            if operation in INTERNAL_LIBRARY_READ_OPERATIONS:
+                doc_str = str(call_args.get("document") or "").strip()
+                prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                if prefix in _doc_prefix_to_source:
+                    target_src = _doc_prefix_to_source[prefix]
+                    if self._is_route_capability_disabled(target_src):
+                        return self._make_capability_disabled_response(
+                            req_id,
+                            tool_name,
+                            route,
+                            operation,
+                            norm_params_view,
+                            f"Source '{target_src}' required to read '{doc_str}' is disabled by deployment capability configuration.",
+                        )
+                if not local_enabled:
+                    return self._make_capability_disabled_response(
+                        req_id,
+                        tool_name,
+                        route,
+                        operation,
+                        norm_params_view,
+                        "All local library sources are disabled for route 'all' read.",
+                    )
+            elif operation == "list" and not local_enabled:
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    "All local library sources are disabled for route 'all' list.",
+                )
+            if (
+                any(k in p_all for k in ("company", "sector", "tag", "no_decay", "indexed_since"))
+                and "company-wiki" not in enabled_local
+            ):
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    "Source 'company-wiki' required by wiki filters is disabled by deployment capability configuration.",
+                )
+            if p_all.get("layer") in ("digest", "all") and "sales-notes" not in enabled_local:
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    "Source 'sales-notes' required by layer filter is disabled by deployment capability configuration.",
+                )
+            if local_enabled and "sources" not in p_all and len(enabled_local) < 4:
+                pruned_all_params = dict(p_all)
+                pruned_all_params["sources"] = list(enabled_local)
+                call_args["params"] = pruned_all_params
+
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None
         ae_limit_clamped: list[int] | None = None
         gp_args: dict[str, Any] | None = None
         if do_fanout:
-            ae_args, ae_win_err = self._build_alphaengine_fanout_args(arguments)
-            ae_limit_clamped = (
-                list(self._last_ae_fanout_limit_clamped)
-                if getattr(self, "_last_ae_fanout_limit_clamped", None)
-                else None
-            )
-            gp_args, gp_win_err = self._build_guidepoint_fanout_args(arguments)
+            ae_win_err: dict[str, Any] | None = None
+            gp_win_err: dict[str, Any] | None = None
+            if ae_enabled:
+                ae_args, ae_win_err = self._build_alphaengine_fanout_args(arguments)
+                ae_limit_clamped = (
+                    list(self._last_ae_fanout_limit_clamped)
+                    if getattr(self, "_last_ae_fanout_limit_clamped", None)
+                    else None
+                )
+            if gp_enabled:
+                gp_args, gp_win_err = self._build_guidepoint_fanout_args(arguments)
             # A leg window the entry point's per-leg validation somehow let
             # through fails the whole call as a parameter error — the old code
             # dropped the error and sent the bad window upstream anyway.
@@ -14166,6 +14344,15 @@ class ResearchDataBridge:
             if fanout_win_err is not None:
                 return self._make_tool_result_response(
                     req_id, fanout_win_err, is_error=True
+                )
+            if not local_enabled and ae_args is None and gp_args is None:
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    "All sources for route 'all' are disabled by deployment capability configuration.",
                 )
         if tool_name == "research" and route == "all" and isinstance(call_args.get("params"), dict):
             # Guidepoint-only nested keys (`keywords`, `recency_bias`, `start_date`, `end_date`)
@@ -14310,7 +14497,7 @@ class ResearchDataBridge:
                             },
                         }
                     ]
-            elif ae_args is not None and gp_args is not None:
+            elif do_fanout and (ae_args is not None or gp_args is not None or not local_enabled):
                 # Each fan-out leg that reaches an upstream acquires a caller-attributed
                 # global slot via `acquire_call` so excess legs queue in their caller's
                 # own queue without occupying global slots or global wait positions.
@@ -14319,14 +14506,28 @@ class ResearchDataBridge:
                 ae_q_stats: dict[str, int] = {}
                 gp_q_stats: dict[str, int] = {}
                 rem_now = max(0.1, deadline_mono - time.monotonic())
-                ae_timeout = int(
-                    ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
+                ae_budget_s = (
+                    max(
+                        0.1,
+                        min(
+                            float(int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)),
+                            rem_now,
+                        ),
+                    )
+                    if ae_args is not None
+                    else 0.0
                 )
-                ae_budget_s = max(0.1, min(float(ae_timeout), rem_now))
-                gp_timeout = int(
-                    gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
+                gp_budget_s = (
+                    max(
+                        0.1,
+                        min(
+                            float(int(gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S)),
+                            rem_now,
+                        ),
+                    )
+                    if gp_args is not None
+                    else 0.0
                 )
-                gp_budget_s = max(0.1, min(float(gp_timeout), rem_now))
                 grace_s = float(getattr(self.cfg, "fanout_grace_s", 20.0))
                 grace_label = (
                     str(int(grace_s))
@@ -14361,47 +14562,57 @@ class ResearchDataBridge:
                             timeout_s=remaining_budget_s,
                         )
 
-                local_task = asyncio.create_task(_run_local_all())
-                ae_task = asyncio.create_task(
-                    self._run_alphaengine_fanout(
-                        req_id,
-                        ae_args,
-                        ae_budget_s,
-                        caller_identity=caller_identity,
-                        limit_clamped=ae_limit_clamped,
-                        cancel_ctx=fanout_ae_cancel_ctx,
-                        caller_key=caller_key,
-                        caller_display=caller_display,
-                        is_automation=is_automation,
-                        queue_stats=ae_q_stats,
-                    )
+                local_task: asyncio.Task[list[dict[str, Any]]] | None = (
+                    asyncio.create_task(_run_local_all()) if local_enabled else None
                 )
-                gp_task = asyncio.create_task(
-                    self._run_guidepoint_fanout(
-                        req_id,
-                        gp_args,
-                        gp_budget_s,
-                        deadline_mono=deadline_mono,
-                        caller_key=caller_key,
-                        caller_display=caller_display,
-                        is_automation=is_automation,
-                        queue_stats=gp_q_stats,
+                ae_task = (
+                    asyncio.create_task(
+                        self._run_alphaengine_fanout(
+                            req_id,
+                            ae_args,
+                            ae_budget_s,
+                            caller_identity=caller_identity,
+                            limit_clamped=ae_limit_clamped,
+                            cancel_ctx=fanout_ae_cancel_ctx,
+                            caller_key=caller_key,
+                            caller_display=caller_display,
+                            is_automation=is_automation,
+                            queue_stats=ae_q_stats,
+                        )
                     )
+                    if ae_args is not None
+                    else None
+                )
+                gp_task: asyncio.Task[dict[str, Any]] | None = (
+                    asyncio.create_task(
+                        self._run_guidepoint_fanout(
+                            req_id,
+                            gp_args,
+                            gp_budget_s,
+                            deadline_mono=deadline_mono,
+                            caller_key=caller_key,
+                            caller_display=caller_display,
+                            is_automation=is_automation,
+                            queue_stats=gp_q_stats,
+                        )
+                    )
+                    if gp_args is not None
+                    else None
+                )
+                active_fanout_tasks: tuple[asyncio.Task[Any], ...] = tuple(
+                    t for t in (local_task, ae_task, gp_task) if t is not None
                 )
                 try:
                     grace_deadline: float | None = None
                     grace_timed_out: set[asyncio.Task[Any]] = set()
                     deadline_timed_out: set[asyncio.Task[Any]] = set()
-                    pending_all: set[asyncio.Task[Any]] = {
-                        local_task,
-                        ae_task,
-                        gp_task,
-                    }
+                    pending_all: set[asyncio.Task[Any]] = set(active_fanout_tasks)
                     local_failed_early: BaseException | None = None
 
                     while pending_all:
                         if (
-                            local_task.done()
+                            local_task is not None
+                            and local_task.done()
                             and not local_task.cancelled()
                             and local_task.exception() is not None
                             and grace_deadline is None
@@ -14419,17 +14630,20 @@ class ResearchDataBridge:
                         # to start the grace countdown for any straggling leg.
                         if grace_deadline is None:
                             local_ok_done = (
-                                local_task.done()
+                                local_task is not None
+                                and local_task.done()
                                 and not local_task.cancelled()
                                 and local_task.exception() is None
                             )
                             ae_ok_done = (
-                                ae_task.done()
+                                ae_task is not None
+                                and ae_task.done()
                                 and not ae_task.cancelled()
                                 and ae_task.exception() is None
                             )
                             gp_non_skipped_done = (
-                                gp_task.done()
+                                gp_task is not None
+                                and gp_task.done()
                                 and not gp_task.cancelled()
                                 and gp_task.exception() is None
                                 and (gp_task.result() or {}).get("status")
@@ -14466,7 +14680,34 @@ class ResearchDataBridge:
                     if timed_out_tasks:
                         await _cancel_and_reap(tuple(timed_out_tasks))
 
-                    if local_task in timed_out_tasks:
+                    if local_task is None:
+                        pruned_local_payload: dict[str, Any] = {
+                            "ok": True,
+                            "status": "empty",
+                            "results": [],
+                            "result_count": 0,
+                            "source_status": {},
+                        }
+                        resps = [
+                            {
+                                "jsonrpc": "2.0",
+                                "id": req_id if req_id is not None else 1,
+                                "result": {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps(
+                                                pruned_local_payload,
+                                                ensure_ascii=False,
+                                            ),
+                                        }
+                                    ],
+                                    "structuredContent": dict(pruned_local_payload),
+                                    "isError": False,
+                                },
+                            }
+                        ]
+                    elif local_task in timed_out_tasks:
                         local_reason = (
                             f"local_all timed out after fanout grace {grace_label}s"
                             if local_task in grace_timed_out
@@ -14518,7 +14759,9 @@ class ResearchDataBridge:
                     else:
                         resps = local_task.result()
 
-                    if ae_task in timed_out_tasks:
+                    if ae_task is None:
+                        ae_outcome = None
+                    elif ae_task in timed_out_tasks:
                         ae_reason = (
                             f"alphaengine timed out after fanout grace {grace_label}s"
                             if ae_task in grace_timed_out
@@ -14553,7 +14796,9 @@ class ResearchDataBridge:
                     else:
                         ae_outcome = ae_task.result()
 
-                    if gp_task in timed_out_tasks:
+                    if gp_task is None:
+                        gp_outcome = None
+                    elif gp_task in timed_out_tasks:
                         gp_reason = (
                             f"guidepoint timed out after fanout grace {grace_label}s"
                             if gp_task in grace_timed_out
@@ -14588,9 +14833,11 @@ class ResearchDataBridge:
                         if pending_legs:
                             await asyncio.wait(pending_legs, timeout=0.05)
 
+                    online_legs = tuple(t for t in (ae_task, gp_task) if t is not None)
                     # Let online calls that are already completing (including SQLite thread hops)
                     # settle before cancelling genuinely hung legs.
-                    await _settle_legs((ae_task, gp_task))
+                    if online_legs:
+                        await _settle_legs(online_legs)
                     # Under tight per-caller caps (e.g. max_inflight_unsigned=1), a hung
                     # slot-holding leg starves a queued sibling that could still complete
                     # promptly; reap the hung slot holder first and give the queued leg a
@@ -14601,7 +14848,7 @@ class ResearchDataBridge:
                             (ae_task, ae_q_stats),
                             (gp_task, gp_q_stats),
                         )
-                        if not leg.done() and "queued_ms" in q_stats
+                        if leg is not None and not leg.done() and "queued_ms" in q_stats
                     )
                     queued_legs = tuple(
                         leg
@@ -14609,18 +14856,20 @@ class ResearchDataBridge:
                             (ae_task, ae_q_stats),
                             (gp_task, gp_q_stats),
                         )
-                        if not leg.done() and "queued_ms" not in q_stats
+                        if leg is not None and not leg.done() and "queued_ms" not in q_stats
                     )
                     if hung_slot_legs and queued_legs:
                         await _cancel_and_reap(hung_slot_legs)
                         await _settle_legs(queued_legs)
-                    if not ae_task.done():
-                        ae_task.cancel()
-                    if not gp_task.done():
-                        gp_task.cancel()
-                    raw_ae, raw_gp = await asyncio.gather(
-                        ae_task, gp_task, return_exceptions=True
+                    for leg in online_legs:
+                        if not leg.done():
+                            leg.cancel()
+                    gathered_online = (
+                        await asyncio.gather(*online_legs, return_exceptions=True)
+                        if online_legs
+                        else []
                     )
+                    raw_by_leg = dict(zip(online_legs, gathered_online))
                     local_st = "timeout" if is_local_timeout else "failed"
                     local_reason = (
                         f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
@@ -14631,33 +14880,41 @@ class ResearchDataBridge:
                             else type(local_exc).__name__
                         )
                     )
-                    ae_outcome = (
-                        raw_ae
-                        if isinstance(raw_ae, dict)
-                        else {
-                            "ok": False,
-                            "status": "canceled",
-                            "route": "alphaengine",
-                            "reason": f"canceled after local all {local_st}",
-                            "count": 0,
-                            "results": [],
-                            "raw_payload": None,
-                            "upstream_called": False,
-                        }
-                    )
-                    gp_outcome = (
-                        raw_gp
-                        if isinstance(raw_gp, dict)
-                        else {
-                            "ok": False,
-                            "status": "canceled",
-                            "route": "guidepoint",
-                            "reason": f"canceled after local all {local_st}",
-                            "count": 0,
-                            "results": [],
-                            "raw_payload": None,
-                        }
-                    )
+                    if ae_task is not None:
+                        raw_ae = raw_by_leg.get(ae_task)
+                        ae_outcome = (
+                            raw_ae
+                            if isinstance(raw_ae, dict)
+                            else {
+                                "ok": False,
+                                "status": "canceled",
+                                "route": "alphaengine",
+                                "reason": f"canceled after local all {local_st}",
+                                "count": 0,
+                                "results": [],
+                                "raw_payload": None,
+                                "upstream_called": False,
+                            }
+                        )
+                    else:
+                        ae_outcome = None
+                    if gp_task is not None:
+                        raw_gp = raw_by_leg.get(gp_task)
+                        gp_outcome = (
+                            raw_gp
+                            if isinstance(raw_gp, dict)
+                            else {
+                                "ok": False,
+                                "status": "canceled",
+                                "route": "guidepoint",
+                                "reason": f"canceled after local all {local_st}",
+                                "count": 0,
+                                "results": [],
+                                "raw_payload": None,
+                            }
+                        )
+                    else:
+                        gp_outcome = None
                     fallback_payload: dict[str, Any] = {
                         "ok": False,
                         "status": local_st,
@@ -14697,7 +14954,8 @@ class ResearchDataBridge:
                     # Whatever ends the fan-out (an error, a cancel mid-handler), no online
                     # subprocess outlives the call: cancel what is still running and reap it.
                     try:
-                        await _cancel_and_reap((local_task, ae_task, gp_task))
+                        if active_fanout_tasks:
+                            await _cancel_and_reap(active_fanout_tasks)
                     finally:
                         call_queue_stats["queued_ms"] = max(
                             int(local_q_stats.get("queued_ms") or 0),
@@ -15179,6 +15437,19 @@ class ResearchDataBridge:
                         declared = self._merge_guidepoint_into_all(
                             payload, declared, gp_outcome, gp_args
                         )
+                    if tool_name == "research" and route == "all" and not local_enabled:
+                        online_outcomes = [
+                            o for o in (ae_outcome, gp_outcome) if isinstance(o, dict)
+                        ]
+                        if online_outcomes and not any(bool(o.get("ok")) for o in online_outcomes):
+                            payload["ok"] = False
+                            payload["status"] = str(online_outcomes[0].get("status") or "failed")
+                            if not payload.get("error"):
+                                payload["error"] = str(
+                                    online_outcomes[0].get("reason")
+                                    or online_outcomes[0].get("error")
+                                    or "Enabled online sources failed"
+                                )
                     declared_count = len(declared)
 
                     # P0 fix1 6: extract status_code / code from any structured
@@ -25676,6 +25947,35 @@ def _make_market_digest_embedder(cfg: Any, prepare_cfg: Any) -> Any:
     return embedder
 
 
+def _extract_tool_call_http_status(reply: Any) -> tuple[int, str]:
+    """Derive HTTP status code/reason from a tools/call JSON-RPC reply when explicitly denied."""
+    if not isinstance(reply, dict):
+        return 200, "OK"
+    result_obj = reply.get("result")
+    if not isinstance(result_obj, dict):
+        return 200, "OK"
+    payload = result_obj.get("structuredContent")
+    if not isinstance(payload, dict):
+        for blk in result_obj.get("content") or []:
+            if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                try:
+                    cand = json.loads(blk["text"])
+                    if isinstance(cand, dict):
+                        payload = cand
+                        break
+                except ValueError:
+                    continue
+    if not isinstance(payload, dict):
+        return 200, "OK"
+    http_override = payload.get("http_status")
+    err_code = str(payload.get("error_code") or "").strip()
+    if http_override == 403 or err_code == "capability_disabled":
+        return 403, "Forbidden"
+    if http_override == 503:
+        return 503, "Service Unavailable"
+    return 200, "OK"
+
+
 def _run_market_digest_output(cfg: Any, action: str, body: Mapping[str, Any]) -> dict[str, Any]:
     root = getattr(cfg, "market_digest_state_root", None)
     prepare_path = getattr(cfg, "market_digest_prepare_config", None)
@@ -26170,7 +26470,8 @@ async def _handle_client(
                     caller_identity=caller_identity,
                     conn_id=conn_id,
                 )
-                await _send_http(writer, 200, "OK", reply)
+                http_code, http_reason = _extract_tool_call_http_status(reply)
+                await _send_http(writer, http_code, http_reason, reply)
                 return
 
             # Unsupported method (e.g. server/discover probe -> -32601 so client falls back to legacy initialize)

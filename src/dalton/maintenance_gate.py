@@ -278,6 +278,50 @@ async def enforce_maintenance_admission_for_automation(
     return st
 
 
+def is_maintenance_in_progress_response(status: int, payload: Any) -> bool:
+    """Return True iff an HTTP response represents a 503 ``maintenance_in_progress`` gate rejection."""
+    if int(status) != 503:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    detail = payload.get("detail")
+    candidates = [detail, payload] if isinstance(detail, Mapping) else [payload]
+    for obj in candidates:
+        for key in ("error_code", "status", "error"):
+            if str(obj.get(key) or "").strip() == "maintenance_in_progress":
+                return True
+    return False
+
+
+async def raise_maintenance_paused_from_response(
+    workspace_id: str | None = None,
+    *,
+    release_riders: Callable[[], Awaitable[Any]] | None = None,
+    state_file: Path | str | None = None,
+    context: str = "notification_turn",
+) -> None:
+    """Release any gathered wakeup riders and raise ``MaintenanceAdmissionPausedError`` after a 503 gate response."""
+    if release_riders is not None:
+        await release_riders()
+    st = read_maintenance_state(state_file)
+    if not st.paused:
+        st = MaintenanceAdmissionState(
+            version=st.version,
+            revision=st.revision,
+            paused=True,
+            pause_host_direct=st.pause_host_direct,
+            allow_workspace_ids=st.allow_workspace_ids,
+            reason=st.reason or "maintenance_in_progress",
+            operation=st.operation,
+            rehearsal_keep_paused_until=st.rehearsal_keep_paused_until,
+            updated_at=st.updated_at,
+            exists=st.exists,
+        )
+    raise MaintenanceAdmissionPausedError(
+        st, workspace_id=workspace_id, context=context
+    )
+
+
 async def enforce_maintenance_admission_for_wakeup(
     workspace_id: str | None,
     *,

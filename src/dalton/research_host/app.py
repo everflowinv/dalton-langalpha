@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import logging
 import os
@@ -46,6 +47,7 @@ logger = logging.getLogger("dalton-research-host")
 
 DEFAULT_RESEARCH_HOST: str = "127.0.0.1"
 DEFAULT_RESEARCH_PORT: int = 8951
+DEFAULT_DATA_ROOT: str = "/var/lib/dalton/wiki"
 DEFAULT_WIKI_PAUSE_TTL_S: float = 300.0
 MIN_WIKI_PAUSE_TTL_S: float = 0.05
 MAX_WIKI_PAUSE_TTL_S: float = 3600.0
@@ -55,6 +57,31 @@ def _parse_extra_modules(raw: str | None) -> list[str]:
     if not raw or not raw.strip():
         return []
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _resolve_extra_default_data_root(
+    extra_modules: list[str],
+    extra_python_paths: list[str],
+    environ: Mapping[str, str],
+) -> str:
+    """Allow an optional host extension module to supply a deployment-specific default data root."""
+    if not extra_modules:
+        return ""
+    for p in extra_python_paths:
+        if p and p not in sys.path:
+            sys.path.insert(0, p)
+    for mod_name in extra_modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:
+            logger.debug("Skipping default data root lookup for %s: %s", mod_name, exc)
+            continue
+        resolver = getattr(mod, "resolve_default_data_root", None)
+        if callable(resolver):
+            candidate = str(resolver(environ) or "").strip()
+            if candidate:
+                return candidate
+    return ""
 
 
 @dataclass
@@ -67,9 +94,7 @@ class ResearchHostConfig:
     port: int = DEFAULT_RESEARCH_PORT
     mcp_token: str = ""
     admin_token: str = ""
-    bridge_admin_token: str = ""
-    legacy_bridge_mcp_url: str = ""
-    legacy_bridge_token: str = ""
+    extra_caller_admin_secrets: tuple[str, ...] = ()
     usage_file: Path | None = None
     wiki_audit_file: Path | None = None
     fanout_grace_s: float = DEFAULT_FANOUT_GRACE_S
@@ -85,12 +110,11 @@ class ResearchHostConfig:
             app_env=env.get("APP_ENV", "") if environ is not None else None,
             dalton_profile=env.get("DALTON_PROFILE", "") if environ is not None else None,
         )
-        default_data = (
-            "/var/lib/dalton/wiki"
-            if active_profile is DeploymentProfile.CORE
-            else str(Path.home() / "Library" / "Application Support" / "Everflow" / "research")
-        )
-        raw_home = str(env.get("DALTON_RESEARCH_HOME") or env.get("DALTON_WIKI_DATA_DIR") or default_data).strip()
+        extra_modules = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_MODULES"))
+        extra_paths = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"))
+        raw_home = str(env.get("DALTON_RESEARCH_HOME") or env.get("DALTON_WIKI_DATA_DIR") or "").strip()
+        if not raw_home:
+            raw_home = _resolve_extra_default_data_root(extra_modules, extra_paths, env) or DEFAULT_DATA_ROOT
         raw_code = str(env.get("DALTON_RESEARCH_CODE") or "").strip()
         host = str(env.get("DALTON_RESEARCH_HOST_BIND") or DEFAULT_RESEARCH_HOST).strip() or DEFAULT_RESEARCH_HOST
         try:
@@ -99,16 +123,11 @@ class ResearchHostConfig:
             port = DEFAULT_RESEARCH_PORT
         mcp_token = str(env.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
         admin_token = str(env.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
-        bridge_admin_token = str(env.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
-        legacy_bridge_mcp_url = str(env.get("DALTON_LEGACY_BRIDGE_MCP_URL") or "").strip()
-        legacy_bridge_token = str(env.get("DALTON_BRIDGE_TOKEN") or "").strip()
         raw_audit = str(env.get("DALTON_WIKI_INGEST_AUDIT_FILE") or "").strip()
         try:
             grace_s = float(env.get("DALTON_RESEARCH_FANOUT_GRACE_S") or DEFAULT_FANOUT_GRACE_S)
         except ValueError:
             grace_s = DEFAULT_FANOUT_GRACE_S
-        extra_modules = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_MODULES"))
-        extra_paths = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"))
         return cls(
             data_root=Path(raw_home).expanduser().resolve(),
             code_root=Path(raw_code).expanduser().resolve() if raw_code else None,
@@ -116,9 +135,6 @@ class ResearchHostConfig:
             port=port,
             mcp_token=mcp_token,
             admin_token=admin_token,
-            bridge_admin_token=bridge_admin_token,
-            legacy_bridge_mcp_url=legacy_bridge_mcp_url,
-            legacy_bridge_token=legacy_bridge_token,
             usage_file=None,
             wiki_audit_file=Path(raw_audit).expanduser().resolve() if raw_audit else None,
             fanout_grace_s=max(0.05, grace_s),
@@ -289,7 +305,15 @@ class ResearchHostRuntime:
 
     def _caller_admin_secrets(self) -> tuple[str, ...]:
         return tuple(
-            s for s in (self.config.admin_token, self.config.bridge_admin_token) if s
+            dict.fromkeys(
+                s
+                for s in (
+                    self.config.admin_token,
+                    *self.config.extra_caller_admin_secrets,
+                    *self.registry.caller_admin_secrets,
+                )
+                if s
+            )
         )
 
     def _connector_enabled(self, route_id: str, active_caps: frozenset[CapabilityId]) -> bool:

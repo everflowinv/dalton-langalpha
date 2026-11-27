@@ -1643,11 +1643,16 @@ async def test_r2_item3_route_all_shared_deadline_cancels_all_three_legs_and_zer
     assert bridge.research_drain_status()["inflight"] == 0
 
 
+@pytest.mark.enable_socket
 def test_r2_item4_proxy_8943_relay_enforces_total_deadline_on_slow_chunked_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Item 4: :8943 proxy _relay checks deadline_mono on every chunk; 0.5s x 20 chunks with timeout=2 finishes < 3s and zeros _in_flight."""
+    """Item 4 / r3 Item 2: real HTTP chunked server (0.5s x 20 chunks ~10s) with timeout=2 finishes on time and zeros _in_flight."""
+    import http.client
+    import http.server
+    import threading
+
     _clean_cap_env(monkeypatch)
     gp_lock_mod = _load_script_module(
         "_test_r2_gp_lock_item4", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
@@ -1674,84 +1679,217 @@ def test_r2_item4_proxy_8943_relay_enforces_total_deadline_on_slow_chunked_body(
     monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
     monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
 
-    class _SlowChunkStream:
-        def __init__(self) -> None:
-            self.status = 200
-            self.headers = Message()
-            self.headers["Content-Type"] = "text/event-stream"
-            self.chunks_sent = 0
-            self.closed = False
+    chunks_sent = 0
+    upstream_stop = threading.Event()
+    upstream_done = threading.Event()
 
-        def read(self, _n: int = 4096) -> bytes:
-            if self.chunks_sent >= 20:
-                return b""
-            time.sleep(0.5)
-            self.chunks_sent += 1
-            return b"data: chunk\n\n"
+    req_body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search_library",
+                "arguments": {"query": "cloud", "size": 1, "timeout": 2},
+            },
+        }
+    ).encode("utf-8")
 
-        def close(self) -> None:
-            self.closed = True
+    # Probe whether loopback AF_INET connect is permitted (blocked in macOS sandbox, allowed outside)
+    loopback_tcp_ok = False
+    probe_srv: http.server.HTTPServer | None = None
+    try:
+        class _ProbeHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
 
-        def __enter__(self) -> "_SlowChunkStream":
-            return self
+            def log_message(self, _fmt: str, *_args: Any) -> None:
+                pass
 
-        def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> bool:
-            self.close()
-            return False
-
-    stream = _SlowChunkStream()
-
-    def _fake_urlopen(
-        url: Any,
-        data: Any = None,
-        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
-        *,
-        context: Any = None,
-    ) -> Any:
-        _ = (url, data, timeout, context)
-        return stream
+        probe_srv = http.server.HTTPServer(("127.0.0.1", 0), _ProbeHandler)
+        pt = threading.Thread(target=probe_srv.handle_request, daemon=True)
+        pt.start()
+        with proxy_mod.urllib.request.urlopen(
+            f"http://127.0.0.1:{probe_srv.server_address[1]}/", timeout=1.0
+        ) as pr:
+            loopback_tcp_ok = pr.status == 200
+        pt.join(timeout=1.0)
+    except Exception:
+        loopback_tcp_ok = False
+    finally:
+        if probe_srv is not None:
+            probe_srv.server_close()
 
     proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
     try:
-        monkeypatch.setattr(
-            proxy_mod.urllib.request,
-            "urlopen",
-            create_autospec(proxy_mod.urllib.request.urlopen, side_effect=_fake_urlopen),
-        )
-        req_body = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "search_library",
-                    "arguments": {"query": "cloud", "size": 1, "timeout": 2},
-                },
-            }
-        ).encode("utf-8")
-        hdrs = Message()
-        hdrs["Content-Type"] = "application/json"
-        hdrs["Content-Length"] = str(len(req_body))
+        if loopback_tcp_ok:
+            class _SlowUpstreamHandler(http.server.BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
 
-        handler = object.__new__(proxy_mod.ProxyHandler)
-        handler.command = "POST"
-        handler.path = "/mcp"
-        handler.headers = hdrs
-        handler.rfile = io.BytesIO(req_body)
-        handler.wfile = io.BytesIO()
-        handler.close_connection = False
-        handler.send_response = lambda _code: None
-        handler.send_header = lambda _k, _v: None
-        handler.end_headers = lambda: None
+                def do_POST(self) -> None:
+                    nonlocal chunks_sent
+                    clen = int(self.headers.get("Content-Length", 0) or 0)
+                    if clen:
+                        self.rfile.read(clen)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    try:
+                        for idx in range(20):
+                            if upstream_stop.wait(0.5):
+                                break
+                            chunk = f"data: chunk-{idx}\n\n".encode("utf-8")
+                            frame = f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n"
+                            self.wfile.write(frame)
+                            self.wfile.flush()
+                            chunks_sent += 1
+                        else:
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                    except OSError:
+                        pass
+                    finally:
+                        upstream_done.set()
 
-        t0 = time.monotonic()
-        handler._proxy()
-        elapsed = time.monotonic() - t0
-        assert elapsed < 3.0, f"Slow chunked relay exceeded 3s: {elapsed:.2f}s"
-        assert stream.closed is True
-        assert stream.chunks_sent < 10
-        assert proxy_mod.health_payload()["in_flight"] == 0
+                def log_message(self, _fmt: str, *_args: Any) -> None:
+                    pass
+
+            up_srv = proxy_mod.ThreadingHTTPServer(("127.0.0.1", 0), _SlowUpstreamHandler)
+            up_thread = threading.Thread(target=up_srv.serve_forever, daemon=True)
+            up_thread.start()
+            monkeypatch.setattr(proxy_mod, "UPSTREAM", f"http://127.0.0.1:{up_srv.server_address[1]}/mcp")
+            px_srv = proxy_mod.ThreadingHTTPServer(("127.0.0.1", 0), proxy_mod.ProxyHandler)
+            px_thread = threading.Thread(target=px_srv.serve_forever, daemon=True)
+            px_thread.start()
+            try:
+                http_req = proxy_mod.urllib.request.Request(
+                    f"http://127.0.0.1:{px_srv.server_address[1]}/mcp",
+                    data=req_body,
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                t0 = time.monotonic()
+                with proxy_mod.urllib.request.urlopen(http_req, timeout=5.0) as client_resp:
+                    received_bytes = client_resp.read()
+                elapsed = time.monotonic() - t0
+                assert elapsed < 3.2, f"Slow chunked relay exceeded total deadline: {elapsed:.2f}s"
+                assert chunks_sent < 10
+                assert b"data: chunk-0" in received_bytes
+                assert proxy_mod.health_payload()["in_flight"] == 0
+            finally:
+                upstream_stop.set()
+                px_srv.shutdown()
+                px_srv.server_close()
+                up_srv.shutdown()
+                up_srv.server_close()
+                px_thread.join(timeout=2.0)
+                up_thread.join(timeout=2.0)
+        else:
+            def _start_slow_chunked_http_response(timeout_s: float) -> http.client.HTTPResponse:
+                up_cli, up_srv = socket.socketpair()
+                up_cli.settimeout(timeout_s)
+
+                def _serve_chunks() -> None:
+                    nonlocal chunks_sent
+                    try:
+                        up_srv.sendall(
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: text/event-stream\r\n"
+                            b"Transfer-Encoding: chunked\r\n\r\n"
+                        )
+                        for idx in range(20):
+                            if upstream_stop.wait(0.5):
+                                break
+                            chunk = f"data: chunk-{idx}\n\n".encode("utf-8")
+                            frame = f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n"
+                            up_srv.sendall(frame)
+                            chunks_sent += 1
+                        else:
+                            up_srv.sendall(b"0\r\n\r\n")
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            up_srv.close()
+                        except OSError:
+                            pass
+                        upstream_done.set()
+
+                t = threading.Thread(target=_serve_chunks, daemon=True)
+                t.start()
+                resp = http.client.HTTPResponse(up_cli)
+                resp.begin()
+                return resp
+
+            def _fake_urlopen(
+                url: Any,
+                data: Any = None,
+                timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+                *,
+                context: Any = None,
+            ) -> Any:
+                _ = (url, data, context)
+                eff_t = float(timeout) if isinstance(timeout, (int, float)) else 2.0
+                return _start_slow_chunked_http_response(eff_t)
+
+            monkeypatch.setattr(
+                proxy_mod.urllib.request,
+                "urlopen",
+                create_autospec(proxy_mod.urllib.request.urlopen, side_effect=_fake_urlopen),
+            )
+            raw_http_req = (
+                b"POST /mcp HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:8943\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(req_body)}\r\n\r\n".encode("ascii")
+                + req_body
+            )
+            cli_sock, srv_sock = socket.socketpair()
+            cli_sock.settimeout(5.0)
+            cli_sock.sendall(raw_http_req)
+            cli_sock.shutdown(socket.SHUT_WR)
+
+            received = bytearray()
+
+            def _drain_client() -> None:
+                try:
+                    while True:
+                        part = cli_sock.recv(4096)
+                        if not part:
+                            break
+                        received.extend(part)
+                except OSError:
+                    pass
+                finally:
+                    cli_sock.close()
+
+            reader_t = threading.Thread(target=_drain_client, daemon=True)
+            reader_t.start()
+
+            t0 = time.monotonic()
+            try:
+                proxy_mod.ProxyHandler(srv_sock, ("127.0.0.1", 0), None)
+            finally:
+                try:
+                    srv_sock.close()
+                except OSError:
+                    pass
+            elapsed = time.monotonic() - t0
+            reader_t.join(timeout=2.0)
+            upstream_stop.set()
+            upstream_done.wait(timeout=2.0)
+
+            assert elapsed < 3.2, f"Slow chunked relay exceeded total deadline: {elapsed:.2f}s"
+            assert chunks_sent < 10, f"Relay kept reading past 2s deadline ({chunks_sent} chunks)"
+            assert received.startswith(b"HTTP/1.1 200")
+            assert b"data: chunk-0" in bytes(received)
+            assert proxy_mod.health_payload()["in_flight"] == 0
     finally:
+        upstream_stop.set()
         proxy_mod.release_owner_lock()
 
 
@@ -2261,3 +2399,777 @@ def test_r2_item13_maintenance_endpoints_return_503_when_service_token_unconfigu
         assert resp.status_code == 503
         detail = resp.json()["detail"]
         assert detail["error_code"] == "maintenance_probe_unconfigured"
+
+
+# ---------------------------------------------------------------------------
+# r3 convergence tests (Codex r2 remaining 4 items)
+# ---------------------------------------------------------------------------
+
+
+async def _send_real_bridge_mcp_request(
+    bridge_mod: Any,
+    bridge: Any,
+    *,
+    token: str,
+    rpc_body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Send a real HTTP/1.1 POST /mcp request over an OS socketpair into bridge_mod._handle_client."""
+    cli_sock, srv_sock = socket.socketpair()
+    cli_reader, cli_writer = await asyncio.open_connection(sock=cli_sock)
+    srv_reader, srv_writer = await asyncio.open_connection(sock=srv_sock)
+    server_task = asyncio.create_task(bridge_mod._handle_client(bridge, srv_reader, srv_writer))
+    try:
+        body_bytes = json.dumps(rpc_body, ensure_ascii=False).encode("utf-8")
+        raw_req = (
+            b"POST /mcp HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:8960\r\n"
+            + f"Authorization: Bearer {token}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body_bytes)}\r\n\r\n".encode("ascii")
+            + body_bytes
+        )
+        cli_writer.write(raw_req)
+        await cli_writer.drain()
+        raw_resp = await asyncio.wait_for(cli_reader.read(), timeout=5.0)
+    finally:
+        cli_writer.close()
+        await asyncio.gather(server_task, return_exceptions=True)
+
+    header_blob, _, resp_body = raw_resp.partition(b"\r\n\r\n")
+    status_line = header_blob.split(b"\r\n", 1)[0].decode("ascii")
+    status_code = int(status_line.split(" ", 2)[1])
+    return status_code, json.loads(resp_body.decode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_r3_item1_bridge_mcp_http_403_and_federated_capability_pruning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 1: real /mcp HTTP requests return 403 on disabled direct/explicit sources, and route=all / sales-mail prune disabled legs without invoking disabled connectors."""
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_r3_bridge_item1", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+    rl_mod = _load_script_module(
+        "_test_r3_research_library_item1", RESEARCH_RUNTIME_DIR / "scripts" / "research_library.py"
+    )
+
+    repo_env = tmp_path / "repo.env"
+    repo_env.write_text(
+        "\n".join(
+            [
+                "APP_ENV=dalton",
+                "DALTON_PROFILE=everflow",
+                "DALTON_CAP_SALES_NOTES=false",
+                "DALTON_CAP_GUIDEPOINT=false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_TOKEN=r3-mcp-tok\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+
+    cfg = bridge_mod.BridgeConfig()
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    stdio_calls: list[list[dict[str, Any]]] = []
+
+    async def _fake_stdio_rpc(
+        requests: list[dict[str, Any]], *, timeout_s: float = 30.0
+    ) -> list[dict[str, Any]]:
+        _ = timeout_s
+        stdio_calls.append(requests)
+        payload = {"ok": True, "status": "ok", "results": [], "source_status": {}}
+        return [
+            {
+                "jsonrpc": "2.0",
+                "id": requests[0].get("id", 1),
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "structuredContent": payload,
+                    "isError": False,
+                },
+            }
+        ]
+
+    ae_calls: list[dict[str, Any]] = []
+
+    async def _fake_ae_fanout(
+        req_id: Any,
+        ae_args: dict[str, Any],
+        timeout_s: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        _ = (req_id, timeout_s, kwargs)
+        ae_calls.append(dict(ae_args))
+        return {
+            "ok": True,
+            "status": "ok",
+            "route": "alphaengine",
+            "count": 0,
+            "results": [],
+            "raw_payload": {"ok": True, "results": []},
+            "upstream_called": True,
+        }
+
+    gp_mock = create_autospec(bridge._run_guidepoint_fanout, side_effect=AssertionError("Guidepoint must not be called"))
+    stdio_mock = create_autospec(bridge._run_stdio_rpc, side_effect=_fake_stdio_rpc)
+    ae_mock = create_autospec(bridge._run_alphaengine_fanout, side_effect=_fake_ae_fanout)
+    monkeypatch.setattr(bridge, "_run_guidepoint_fanout", gp_mock)
+    monkeypatch.setattr(bridge, "_run_stdio_rpc", stdio_mock)
+    monkeypatch.setattr(bridge, "_run_alphaengine_fanout", ae_mock)
+
+    # 1. Direct disabled route on real /mcp returns HTTP 403 matching JSON payload and calls no connector
+    code_direct, body_direct = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r3-mcp-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "research", "arguments": {"route": "sales-notes", "query": "NVDA"}},
+        },
+    )
+    assert code_direct == 403
+    direct_payload = json.loads(body_direct["result"]["content"][0]["text"])
+    assert direct_payload["error_code"] == "capability_disabled"
+    assert direct_payload["http_status"] == 403
+    assert stdio_mock.await_count == 0
+
+    # 2. Explicit disabled source in route=all params.sources returns HTTP 403 and invokes nothing
+    code_exp, body_exp = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r3-mcp-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {
+                    "route": "all",
+                    "operation": "search",
+                    "query": "NVDA",
+                    "params": {"sources": ["company-wiki", "sales-notes"]},
+                },
+            },
+        },
+    )
+    assert code_exp == 403
+    assert json.loads(body_exp["result"]["content"][0]["text"])["error_code"] == "capability_disabled"
+    assert stdio_mock.await_count == 0
+    assert ae_mock.await_count == 0
+    assert gp_mock.await_count == 0
+
+    # 3. route=all search prunes Guidepoint leg AND prunes local sources to enabled subset only
+    code_all, body_all = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r3-mcp-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "NVDA"},
+            },
+        },
+    )
+    assert code_all == 200
+    assert body_all["result"]["isError"] is False
+    assert gp_mock.await_count == 0
+    assert ae_mock.await_count == 1
+    assert stdio_mock.await_count == 1
+    local_sent_args = stdio_calls[-1][0]["params"]["arguments"]
+    assert local_sent_args["params"]["sources"] == ["company-wiki", "tmtb", "funda-ai"]
+    assert "sales-notes" not in local_sent_args["params"]["sources"]
+
+    # 4. route=sales-mail search prunes disabled sales-notes and only queries tmtb with layer=raw
+    code_sm, _body_sm = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r3-mcp-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {"route": "sales-mail", "operation": "search", "query": "META"},
+            },
+        },
+    )
+    assert code_sm == 200
+    sm_sent_args = stdio_calls[-1][0]["params"]["arguments"]
+    assert sm_sent_args["params"]["sources"] == ["tmtb"]
+    assert sm_sent_args["params"]["layer"] == "raw"
+
+    # 5. route=sales-mail read of mail:* (disabled sales-notes) returns HTTP 403
+    code_sm_read, body_sm_read = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r3-mcp-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {"route": "sales-mail", "operation": "read", "document": "mail:101"},
+            },
+        },
+    )
+    assert code_sm_read == 403
+    assert json.loads(body_sm_read["result"]["content"][0]["text"])["error_code"] == "capability_disabled"
+
+    # 6. research_library.validate_request prunes disabled sources when omitted and rejects explicit disabled sources
+    monkeypatch.setenv("DALTON_PROFILE", "everflow")
+    monkeypatch.setenv("DALTON_CAP_SALES_NOTES", "false")
+    _p_all, pruned_sources = rl_mod.validate_request("all", "search", query="NVDA")
+    assert pruned_sources == ["company-wiki", "tmtb", "funda-ai"]
+    with pytest.raises(ValueError, match="capability_disabled"):
+        rl_mod.validate_request("all", "search", query="NVDA", params={"sources": ["sales-notes"]})
+
+
+@pytest.mark.asyncio
+async def test_r3_item2_guidepoint_concurrent_refresh_lock_and_connector_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 2: concurrent refresh lock wait honors shared deadline on both :8943 proxy and host_connectors/guidepoint.py, and slow chunked connector response aborts on deadline with in_flight == 0."""
+    import threading
+
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r3_gp_lock_item2", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r3_gp_proxy_item2", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+    gp_conn_mod = _load_script_module(
+        "_test_r3_gp_conn_item2", RESEARCH_RUNTIME_DIR / "host_connectors" / "guidepoint.py"
+    )
+
+    # Part A: :8943 proxy concurrent refresh lock wait respects deadline_mono
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-old",
+                "refresh_token": "ref-old",
+                "obtained_at": 1.0,  # expired -> triggers refresh
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+    monkeypatch.setenv("GUIDEPOINT_CLIENT_ID", "cid-r3")
+    monkeypatch.setenv("GUIDEPOINT_CLIENT_SECRET", "csec-r3")
+
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+
+    def _slow_refresh_urlopen(
+        url: Any,
+        data: Any = None,
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+        *,
+        context: Any = None,
+    ) -> Any:
+        _ = (url, data, timeout, context)
+        refresh_entered.set()
+        release_refresh.wait(timeout=3.0)
+        return io.BytesIO(
+            json.dumps({"access_token": "tok-new", "refresh_token": "ref-new", "expires_in": 600}).encode("utf-8")
+        )
+
+    lock = gp_lock_mod.GuidepointOwnerLock(token_file, service_name="test-r3")
+    lock.acquire(timeout_s=2.0)
+    proxy_mod._owner_lock = lock
+    proxy_mod._standby = False
+    proxy_mod._draining = False
+    proxy_mod._in_flight = 0
+    proxy_mod.load_tokens(token_file)
+    try:
+        monkeypatch.setattr(
+            proxy_mod.urllib.request,
+            "urlopen",
+            create_autospec(proxy_mod.urllib.request.urlopen, side_effect=_slow_refresh_urlopen),
+        )
+        t1 = threading.Thread(
+            target=lambda: proxy_mod.ensure_fresh_token(deadline_mono=time.monotonic() + 5.0),
+            daemon=True,
+        )
+        t1.start()
+        assert refresh_entered.wait(timeout=2.0)
+
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError, match="lock"):
+            proxy_mod.ensure_fresh_token(deadline_mono=time.monotonic() + 0.35)
+        wait_elapsed = time.monotonic() - t0
+        assert wait_elapsed < 1.2, f"Proxy lock wait exceeded deadline: {wait_elapsed:.2f}s"
+    finally:
+        release_refresh.set()
+        t1.join(timeout=2.0)
+        proxy_mod.release_owner_lock()
+
+    # Part B: GuidepointTokenManager concurrent async lock wait respects deadline_mono
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_RESEARCH_HOST, ownership_file=journal_file)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-async-old",
+                "refresh_token": "ref-async-old",
+                "obtained_at": 1.0,
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    async_refresh_entered = asyncio.Event()
+    async_refresh_release = asyncio.Event()
+
+    async def _slow_async_refresh_handler(_request: httpx.Request) -> httpx.Response:
+        async_refresh_entered.set()
+        await asyncio.wait_for(async_refresh_release.wait(), timeout=3.0)
+        return httpx.Response(
+            200,
+            json={"access_token": "tok-async-new", "refresh_token": "ref-async-new", "expires_in": 600},
+        )
+
+    orig_async_client = httpx.AsyncClient
+
+    def _refresh_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(_slow_async_refresh_handler)
+        return orig_async_client(*args, **kwargs)
+
+    mgr = gp_conn_mod.GuidepointTokenManager(
+        token_file,
+        client_id="cid-async",
+        client_secret="csec-async",
+        ownership_file=journal_file,
+        http_client_factory=create_autospec(orig_async_client, side_effect=_refresh_client_factory),
+    )
+    assert mgr.initialize_from_ownership(timeout_s=2.0) is True
+    try:
+        task1 = asyncio.create_task(mgr.ensure_fresh_token(deadline_mono=time.monotonic() + 5.0))
+        await asyncio.wait_for(async_refresh_entered.wait(), timeout=2.0)
+        t0_async = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await mgr.ensure_fresh_token(deadline_mono=time.monotonic() + 0.35)
+        assert (time.monotonic() - t0_async) < 1.2
+        async_refresh_release.set()
+        assert await task1 == "tok-async-new"
+
+        # Part C: GuidepointConnector via ResearchHostRuntime aborts slow chunked stream (~10s) at 2s deadline and zeros in_flight
+        class _SlowChunkStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for idx in range(20):
+                    await asyncio.sleep(0.5)
+                    yield f"data: {{\"chunk\": {idx}}}\n\n".encode("utf-8")
+
+        async def _slow_gp_handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=_SlowChunkStream())
+
+        def _slow_gp_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            kwargs["transport"] = httpx.MockTransport(_slow_gp_handler)
+            return orig_async_client(*args, **kwargs)
+
+        conn = gp_conn_mod.GuidepointConnector(
+            mgr,
+            http_client_factory=create_autospec(orig_async_client, side_effect=_slow_gp_client_factory),
+        )
+        rt = ResearchHostRuntime(
+            ResearchHostConfig(
+                data_root=tmp_path / "rh_gp",
+                mcp_token="gp-mcp-tok",
+                admin_token="gp-adm-tok",
+                profile=DeploymentProfile.EVERFLOW,
+            ),
+            capabilities_provider=lambda: frozenset({CapabilityId.GUIDEPOINT}),
+        )
+        rt.registry.register_connector(conn)
+        app = create_app(runtime=rt)
+        async with orig_async_client(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8951"
+        ) as client:
+            t0_conn = time.monotonic()
+            resp = await client.post(
+                "/mcp/guidepoint",
+                headers={"Authorization": "Bearer gp-mcp-tok"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "search_library", "arguments": {"query": "AI", "timeout": 2}},
+                },
+            )
+            elapsed_conn = time.monotonic() - t0_conn
+        assert elapsed_conn < 3.2, f"GuidepointConnector exceeded 2s deadline: {elapsed_conn:.2f}s"
+        assert resp.status_code == 200
+        body = json.loads(resp.json()["result"]["content"][0]["text"])
+        assert body["status"] == "timeout"
+        assert body["error_code"] == "upstream_timeout"
+        assert rt.in_flight == 0
+    finally:
+        async_refresh_release.set()
+        mgr.release_owner_lock()
+
+
+@pytest.mark.asyncio
+async def test_r3_item3_real_wakeup_executor_effective_attempts_and_503_maintenance_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 3: real delivery.execute_wakeup with incrementing attempts does not exhaust on first transient timeout after 6 maintenance deferrals, and handles 503 maintenance_in_progress race via maintenance_gate deferral."""
+    from datetime import datetime, timezone
+    import aiohttp
+
+    from src.server.database import conversation as conv_db
+    from src.server.database import workspace as ws_db
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.database.wakeups import fire as fire_db
+    from src.server.database.wakeups import riders as riders_db
+    from src.server.services import features, hook_outbox
+    from src.server.services.report_back import notify_turn
+    from src.server.services.wakeups import delivery
+
+    state_file = tmp_path / "maintenance-admission.json"
+    monkeypatch.setenv("DALTON_MAINTENANCE_ADMISSION_FILE", str(state_file))
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "svc-tok-r3")
+    write_maintenance_state_atomic(
+        {
+            "version": 1,
+            "revision": 1,
+            "paused": True,
+            "pause_host_direct": True,
+            "allow_workspace_ids": [],
+            "reason": "maintenance_window",
+            "operation": "switch",
+            "rehearsal_keep_paused_until": None,
+            "updated_at": "2026-11-26T00:00:00+00:00",
+        },
+        state_file=state_file,
+    )
+
+    row: dict[str, Any] = {
+        "hook_outbox_id": "job-wake-real-1",
+        "hook_type": "wakeup",
+        "conversation_thread_id": "thr-wake-real-1",
+        "attempts": 0,
+        "created_at": datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc),
+        "payload": {
+            "wakeup_id": "wk-real-1",
+            "notice": "fire",
+            "seq": 1,
+            "user_id": "u-real-1",
+        },
+    }
+
+    def _claim_next() -> dict[str, Any]:
+        row["attempts"] += 1
+        return {**row, "payload": dict(row["payload"])}
+
+    async def _reschedule_impl(
+        job_id: str,
+        *,
+        attempts: int,
+        delay_seconds: float,
+        payload_patch: dict[str, Any] | None = None,
+    ) -> str:
+        assert job_id == row["hook_outbox_id"]
+        assert attempts == row["attempts"]
+        assert delay_seconds == 60.0
+        row["payload"]["reschedules"] = int(row["payload"].get("reschedules") or 0) + 1
+        if payload_patch:
+            row["payload"].update(payload_patch)
+        return "pending"
+
+    reschedule_mock = create_autospec(outbox_db.reschedule_claimed_job, side_effect=_reschedule_impl)
+    nack_mock = create_autospec(outbox_db.nack_outbox_job, return_value="pending")
+    ack_mock = create_autospec(outbox_db.ack_outbox_job, return_value=True)
+    exhaust_mock = create_autospec(outbox_db.exhaust_alert, return_value=True)
+    merge_mock = create_autospec(outbox_db.merge_job_payload, return_value=True)
+    release_riders_mock = create_autospec(riders_db.unfreeze_wakeup_riders, return_value=1)
+
+    monkeypatch.setattr(outbox_db, "reschedule_claimed_job", reschedule_mock)
+    monkeypatch.setattr(outbox_db, "nack_outbox_job", nack_mock)
+    monkeypatch.setattr(outbox_db, "ack_outbox_job", ack_mock)
+    monkeypatch.setattr(outbox_db, "exhaust_alert", exhaust_mock)
+    monkeypatch.setattr(outbox_db, "merge_job_payload", merge_mock)
+    monkeypatch.setattr(outbox_db, "extend_job_lease", create_autospec(outbox_db.extend_job_lease, return_value=True))
+    monkeypatch.setattr(tl_db, "get_latest_attempt", create_autospec(tl_db.get_latest_attempt, return_value=None))
+    monkeypatch.setattr(fire_db, "job_owed", create_autospec(fire_db.job_owed, return_value=True))
+    monkeypatch.setattr(fire_db, "mark_delivered", create_autospec(fire_db.mark_delivered, return_value=True))
+    monkeypatch.setattr(delivery, "showing_run", create_autospec(delivery.showing_run, return_value=None))
+    monkeypatch.setattr(
+        conv_db,
+        "get_thread_by_id",
+        create_autospec(
+            conv_db.get_thread_by_id,
+            return_value={"workspace_id": "ws-real-1", "archived_at": None},
+        ),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value={"workspace_id": "ws-real-1"}),
+    )
+    monkeypatch.setattr(features, "user_feature_enabled", create_autospec(features.user_feature_enabled, return_value=True))
+    monkeypatch.setattr(notify_turn, "park_while_thread_busy", create_autospec(notify_turn.park_while_thread_busy, return_value=False))
+    monkeypatch.setattr(notify_turn, "park_while_computer_away", create_autospec(notify_turn.park_while_computer_away, return_value=False))
+    monkeypatch.setattr(
+        riders_db,
+        "gather_wakeup_riders",
+        create_autospec(
+            riders_db.gather_wakeup_riders,
+            return_value=[{"hook_outbox_id": "rider-1", "created_at": row["created_at"], "payload": {"wakeup_id": "wk-r1", "notice": "fire", "seq": 1}}],
+        ),
+    )
+    monkeypatch.setattr(riders_db, "unfreeze_wakeup_riders", release_riders_mock)
+    monkeypatch.setattr(riders_db, "settle_wakeup_riders", create_autospec(riders_db.settle_wakeup_riders, return_value=["rider-1"]))
+    monkeypatch.setattr(delivery, "render_wake", create_autospec(delivery.render_wake, return_value=("<wakeup/>", [{"seq": 1}])))
+
+    post_outcomes: list[tuple[str, str | None]] = [("cap", None), ("dispatched", "run-recovered-1")]
+
+    async def _fake_post_notification_turn(**_kw: Any) -> tuple[str, str | None]:
+        return post_outcomes.pop(0)
+
+    post_mock = create_autospec(notify_turn.post_notification_turn, side_effect=_fake_post_notification_turn)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+    monkeypatch.setitem(hook_outbox._EXECUTORS, "wakeup", delivery.execute_wakeup)
+
+    drainer = hook_outbox.HookOutboxDrainer()
+
+    # Scenario 1: 6 consecutive paused claims increment attempts 1..6 and reschedules 1..6
+    for expected_attempt in range(1, 7):
+        claimed = _claim_next()
+        assert claimed["attempts"] == expected_attempt
+        await drainer._execute(claimed)
+
+    assert reschedule_mock.await_count == 6
+    assert row["payload"]["reschedules"] == 6
+    assert nack_mock.await_count == 0
+    assert exhaust_mock.await_count == 0
+    assert release_riders_mock.await_count == 6
+
+    # Resume maintenance; claim #7 has attempts=7, reschedules=6 => effective_attempts == 1 < MAX_ATTEMPTS
+    write_maintenance_state_atomic(
+        {
+            "version": 1,
+            "revision": 2,
+            "paused": False,
+            "pause_host_direct": False,
+            "allow_workspace_ids": [],
+            "reason": "resumed",
+            "operation": "switch",
+            "rehearsal_keep_paused_until": None,
+            "updated_at": "2026-11-26T00:05:00+00:00",
+        },
+        state_file=state_file,
+    )
+    claim_7 = _claim_next()
+    assert claim_7["attempts"] == 7
+    assert outbox_db.effective_attempts(claim_7["attempts"], claim_7["payload"]) == 1
+    await drainer._execute(claim_7)
+    # First transient timeout ("cap") MUST retry via nack, NOT exhaust!
+    assert exhaust_mock.await_count == 0
+    assert nack_mock.await_count == 1
+    assert ack_mock.await_count == 0
+
+    # Claim #8 succeeds and acks
+    claim_8 = _claim_next()
+    await drainer._execute(claim_8)
+    assert ack_mock.await_count == 1
+    assert exhaust_mock.await_count == 0
+
+    # Scenario 2: Gate closes AFTER entry check -> real post_notification_turn gets HTTP 503 maintenance_in_progress
+    # Restore real post_notification_turn on notify_turn module
+    monkeypatch.undo()
+    monkeypatch.setenv("DALTON_MAINTENANCE_ADMISSION_FILE", str(state_file))
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "svc-tok-r3")
+    monkeypatch.setattr(outbox_db, "reschedule_claimed_job", reschedule_mock)
+    monkeypatch.setattr(outbox_db, "nack_outbox_job", nack_mock)
+    monkeypatch.setattr(outbox_db, "ack_outbox_job", ack_mock)
+    monkeypatch.setattr(outbox_db, "exhaust_alert", exhaust_mock)
+    monkeypatch.setattr(outbox_db, "merge_job_payload", merge_mock)
+    monkeypatch.setattr(outbox_db, "extend_job_lease", create_autospec(outbox_db.extend_job_lease, return_value=True))
+    monkeypatch.setattr(tl_db, "get_latest_attempt", create_autospec(tl_db.get_latest_attempt, return_value=None))
+    monkeypatch.setattr(fire_db, "job_owed", create_autospec(fire_db.job_owed, return_value=True))
+    monkeypatch.setattr(delivery, "showing_run", create_autospec(delivery.showing_run, return_value=None))
+    monkeypatch.setattr(
+        conv_db,
+        "get_thread_by_id",
+        create_autospec(
+            conv_db.get_thread_by_id,
+            return_value={"workspace_id": "ws-real-1", "archived_at": None},
+        ),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value={"workspace_id": "ws-real-1"}),
+    )
+    monkeypatch.setattr(features, "user_feature_enabled", create_autospec(features.user_feature_enabled, return_value=True))
+    monkeypatch.setattr(notify_turn, "park_while_thread_busy", create_autospec(notify_turn.park_while_thread_busy, return_value=False))
+    monkeypatch.setattr(notify_turn, "park_while_computer_away", create_autospec(notify_turn.park_while_computer_away, return_value=False))
+    monkeypatch.setattr(
+        riders_db,
+        "gather_wakeup_riders",
+        create_autospec(
+            riders_db.gather_wakeup_riders,
+            return_value=[{"hook_outbox_id": "rider-2", "created_at": row["created_at"], "payload": {"wakeup_id": "wk-r2", "notice": "fire", "seq": 1}}],
+        ),
+    )
+    monkeypatch.setattr(riders_db, "unfreeze_wakeup_riders", release_riders_mock)
+    monkeypatch.setattr(delivery, "render_wake", create_autospec(delivery.render_wake, return_value=("<wakeup/>", [{"seq": 1}])))
+    monkeypatch.setitem(hook_outbox._EXECUTORS, "wakeup", delivery.execute_wakeup)
+
+    post_call_count = 0
+
+    class _Resp503:
+        status = 503
+
+        async def json(self) -> dict[str, Any]:
+            return {
+                "detail": {
+                    "ok": False,
+                    "status": "maintenance_in_progress",
+                    "error": "maintenance_in_progress",
+                    "error_code": "maintenance_in_progress",
+                }
+            }
+
+        async def __aenter__(self) -> "_Resp503":
+            return self
+
+        async def __aexit__(self, _et: Any, _ev: Any, _tb: Any) -> bool:
+            return False
+
+    class _FakeSession:
+        def post(self, *_args: Any, **_kwargs: Any) -> _Resp503:
+            nonlocal post_call_count
+            post_call_count += 1
+            return _Resp503()
+
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, _et: Any, _ev: Any, _tb: Any) -> bool:
+            return False
+
+    def _make_fake_session() -> _FakeSession:
+        return _FakeSession()
+
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        create_autospec(aiohttp.ClientSession, side_effect=_make_fake_session),
+    )
+
+    nack_before = nack_mock.await_count
+    reschedule_before = reschedule_mock.await_count
+    riders_before = release_riders_mock.await_count
+    claim_race = _claim_next()
+    await drainer._execute(claim_race)
+
+    assert post_call_count == 1, "503 maintenance_in_progress must defer immediately instead of 5xx retry loop"
+    assert reschedule_mock.await_count == reschedule_before + 1
+    assert nack_mock.await_count == nack_before
+    assert exhaust_mock.await_count == 0
+    assert merge_mock.await_count == 0
+    assert release_riders_mock.await_count == riders_before + 1
+
+
+def test_r3_item4_public_research_host_stripped_and_everflow_ext_provides_legacy_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 4: public research_host contains no Everflow default dir, legacy bridge URL/credentials, or sales_mail comments; Everflow host_connectors supplies them."""
+    import dataclasses
+    from src.dalton.research_host.__main__ import ALLOWED_HOST_ENV_KEYS
+    from src.dalton.research_host.connector_registry import ConnectorRegistry
+
+    _clean_cap_env(monkeypatch)
+
+    # 1. Public ResearchHostConfig has no legacy bridge fields and defaults to /var/lib/dalton/wiki
+    field_names = {f.name for f in dataclasses.fields(ResearchHostConfig)}
+    assert "bridge_admin_token" not in field_names
+    assert "legacy_bridge_mcp_url" not in field_names
+    assert "legacy_bridge_token" not in field_names
+    public_cfg = ResearchHostConfig.from_env({})
+    assert public_cfg.data_root == Path("/var/lib/dalton/wiki").resolve()
+
+    # 2. Public ALLOWED_HOST_ENV_KEYS has no legacy bridge credential/URL keys
+    for removed_key in (
+        "DALTON_BRIDGE_ADMIN_TOKEN",
+        "DALTON_LEGACY_BRIDGE_MCP_URL",
+        "DALTON_BRIDGE_TOKEN",
+    ):
+        assert removed_key not in ALLOWED_HOST_ENV_KEYS
+
+    # 3. Public source files contain no Everflow default dir, legacy bridge env keys, or sales_mail comment
+    app_src = (REPO_ROOT / "src" / "dalton" / "research_host" / "app.py").read_text(encoding="utf-8")
+    main_src = (REPO_ROOT / "src" / "dalton" / "research_host" / "__main__.py").read_text(encoding="utf-8")
+    reg_src = (REPO_ROOT / "src" / "dalton" / "research_host" / "connector_registry.py").read_text(encoding="utf-8")
+    assert "Everflow" not in app_src
+    assert "DALTON_LEGACY_BRIDGE_MCP_URL" not in app_src and "DALTON_LEGACY_BRIDGE_MCP_URL" not in main_src
+    assert "DALTON_BRIDGE_ADMIN_TOKEN" not in app_src and "DALTON_BRIDGE_ADMIN_TOKEN" not in main_src
+    assert "DALTON_BRIDGE_TOKEN" not in app_src and "DALTON_BRIDGE_TOKEN" not in main_src
+    assert "sales_mail" not in reg_src
+
+    # 4. Private host_connectors extension supplies Everflow default dir, legacy bridge keys, and caller secret registration
+    hc_cfg = ResearchHostConfig.from_env(
+        {
+            "DALTON_PROFILE": "everflow",
+            "DALTON_RESEARCH_HOST_EXTRA_MODULES": "host_connectors",
+            "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH": str(RESEARCH_RUNTIME_DIR),
+        }
+    )
+    assert hc_cfg.data_root == (Path.home() / "Library" / "Application Support" / "Everflow" / "research").resolve()
+
+    import host_connectors
+
+    for priv_key in (
+        "DALTON_BRIDGE_ADMIN_TOKEN",
+        "DALTON_LEGACY_BRIDGE_MCP_URL",
+        "DALTON_BRIDGE_TOKEN",
+    ):
+        assert priv_key in host_connectors.EXTRA_HOST_ENV_KEYS
+
+    reg = ConnectorRegistry()
+    ext_cfg = ResearchHostConfig(
+        data_root=tmp_path,
+        mcp_token="mcp-ef",
+        admin_token="adm-ef",
+        profile=DeploymentProfile.EVERFLOW,
+        environ={
+            "DALTON_BRIDGE_ADMIN_TOKEN": "bridge-adm-secret-r3",
+            "DALTON_LEGACY_BRIDGE_MCP_URL": "http://127.0.0.1:8960/mcp",
+            "DALTON_BRIDGE_TOKEN": "bridge-mcp-tok-r3",
+        },
+    )
+    host_connectors.register(reg, ext_cfg, active_caps=frozenset({CapabilityId.ALPHAENGINE}))
+    assert "bridge-adm-secret-r3" in reg.caller_admin_secrets
+    assert "alphaengine" in reg.federated_sources
+
+    # 5. Out-of-package release scan wordlist stays at zero hits across public source dirs
+    checker = _load_script_module(
+        "_test_r3_release_checker_item4",
+        SCRIPTS_DALTON_DIR / "ops" / "check_core_release_package.py",
+    )
+    report = checker.check_core_release_package(repo_root=REPO_ROOT)
+    assert report.public_source_hits == []

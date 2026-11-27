@@ -39,7 +39,28 @@ SOURCES = ('company-wiki', 'sales-notes', 'tmtb', 'funda-ai')
 KEY_SQL = "COALESCE(NULLIF(message_id,''),NULLIF(email_id,''),'row:' || id)"
 
 
-def validate_request(route, operation, query=None, document=None, params=None):
+def _enabled_library_sources(allowed_sources=None):
+    """Resolve enabled local library sources from explicit allowlist, env override, or Dalton capabilities."""
+    if allowed_sources is not None:
+        allowed = {str(s).strip() for s in allowed_sources if str(s).strip()}
+        return [s for s in SOURCES if s in allowed]
+    raw_env = os.environ.get("DALTON_ENABLED_LIBRARY_SOURCES")
+    if raw_env is not None:
+        allowed = {part.strip() for part in raw_env.split(",") if part.strip()}
+        return [s for s in SOURCES if s in allowed]
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+        if str(repo_root) not in sys.path and (repo_root / "src" / "dalton" / "capabilities.py").is_file():
+            sys.path.insert(0, str(repo_root))
+        from src.dalton.capabilities import effective_capabilities, is_research_source_enabled
+
+        active = effective_capabilities(environ=os.environ)
+        return [s for s in SOURCES if is_research_source_enabled(s, capabilities=active)]
+    except Exception:
+        return list(SOURCES)
+
+
+def validate_request(route, operation, query=None, document=None, params=None, allowed_sources=None):
     p = dict(params or {})
     allowed = {'company', 'sector', 'tag', 'sender', 'layer', 'sources',
                'search_mode', 'no_decay', 'offset', 'max_chars', 'media', 'indexed_since'}
@@ -65,9 +86,25 @@ def validate_request(route, operation, query=None, document=None, params=None):
         raise ValueError('layer 须为 raw、digest 或 all')
     if 'sender' in p and p.get('layer','raw') != 'raw':
         raise ValueError('sender 筛选仅用于原文层')
-    sources = p.get('sources', list(SOURCES)) if route == 'all' else [route]
-    if not isinstance(sources, list) or not sources or any(s not in SOURCES for s in sources):
-        raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+    enabled_sources = _enabled_library_sources(allowed_sources)
+    if route == 'all':
+        if 'sources' in p:
+            sources = p['sources']
+            if not isinstance(sources, list) or not sources or any(s not in SOURCES for s in sources):
+                raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+            disabled = [s for s in sources if s not in enabled_sources]
+            if disabled:
+                raise ValueError('capability_disabled: 已禁用来源 ' + ', '.join(disabled))
+        else:
+            sources = list(enabled_sources)
+            if not sources:
+                raise ValueError('capability_disabled: 所有本地资料来源均已禁用')
+    else:
+        if route not in SOURCES:
+            raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+        if route not in enabled_sources:
+            raise ValueError(f"capability_disabled: 来源 '{route}' 已禁用")
+        sources = [route]
     if 'sources' in p and route != 'all':
         raise ValueError('sources 仅用于 all')
     if operation not in ('search', 'read', 'list', 'topic'):

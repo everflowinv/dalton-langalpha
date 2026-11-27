@@ -205,13 +205,32 @@ class GuidepointTokenManager:
         *,
         now: float | None = None,
         timeout_s: float | None = None,
+        deadline_mono: float | None = None,
     ) -> str:
         """Return a valid access token; immediately fail closed with `GuidepointStandbyError` if standby."""
         if self._standby or not self.lock_held:
             raise GuidepointStandbyError("lock_not_acquired")
-        async with self._async_lock:
+        eff_deadline: float | None
+        if deadline_mono is not None:
+            eff_deadline = float(deadline_mono)
+        elif timeout_s is not None:
+            eff_deadline = time.monotonic() + max(0.01, float(timeout_s))
+        else:
+            eff_deadline = None
+
+        if eff_deadline is not None:
+            rem_lock = eff_deadline - time.monotonic()
+            if rem_lock <= 0.0:
+                raise asyncio.TimeoutError("Guidepoint request deadline exceeded before token lock")
+            await asyncio.wait_for(self._async_lock.acquire(), timeout=rem_lock)
+        else:
+            await self._async_lock.acquire()
+
+        try:
             if self._standby or not self.lock_held:
                 raise GuidepointStandbyError("lock_not_acquired")
+            if eff_deadline is not None and (eff_deadline - time.monotonic()) <= 0.0:
+                raise asyncio.TimeoutError("Guidepoint request deadline exceeded waiting for token lock")
             if not self._tokens:
                 self._load_tokens_unlocked()
             now_ts = time.time() if now is None else float(now)
@@ -223,7 +242,13 @@ class GuidepointTokenManager:
             if not self.client_id or not self.client_secret:
                 raise RuntimeError("GUIDEPOINT_CLIENT_ID and GUIDEPOINT_CLIENT_SECRET are required to refresh tokens")
 
-            refresh_timeout = min(30.0, max(0.1, float(timeout_s))) if timeout_s is not None else 30.0
+            if eff_deadline is not None:
+                rem_refresh = eff_deadline - time.monotonic()
+                if rem_refresh <= 0.0:
+                    raise asyncio.TimeoutError("Guidepoint request deadline exceeded before token refresh")
+                refresh_timeout = max(0.01, min(30.0, rem_refresh))
+            else:
+                refresh_timeout = 30.0
             async with self._http_client_factory(timeout=refresh_timeout, trust_env=False) as client:
                 resp = await asyncio.wait_for(
                     client.post(
@@ -247,6 +272,8 @@ class GuidepointTokenManager:
             self._tokens.update(refreshed)
             self._save_tokens_atomic_unlocked(self._tokens)
             return str(self._tokens["access_token"])
+        finally:
+            self._async_lock.release()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -372,7 +399,7 @@ class GuidepointConnector:
     ) -> dict[str, Any]:
         deadline_mono = time.monotonic() + max(0.1, float(timeout_s))
         access_token = await self.token_manager.ensure_fresh_token(
-            timeout_s=max(0.1, deadline_mono - time.monotonic())
+            deadline_mono=deadline_mono
         )
         rpc_body = {
             "jsonrpc": "2.0",
@@ -389,18 +416,22 @@ class GuidepointConnector:
             headers["Mcp-Session-Id"] = self._session_id
         if caller_key and caller_key != "anonymous":
             headers["X-Dalton-Caller-Key"] = caller_key
-        rem_s = max(0.1, deadline_mono - time.monotonic())
+        rem_s = deadline_mono - time.monotonic()
+        if rem_s <= 0.0:
+            raise asyncio.TimeoutError("Guidepoint deadline exceeded after token refresh")
         logger.debug("guidepoint.search_library caller=%s size=%s timeout=%.2fs", caller_key, gp_args.get("size"), rem_s)
-        async with self._http_client_factory(timeout=rem_s, trust_env=False) as client:
+        async with self._http_client_factory(timeout=max(0.01, rem_s), trust_env=False) as client:
             resp = await asyncio.wait_for(
                 client.post(self.upstream_url, json=rpc_body, headers=headers),
-                timeout=rem_s,
+                timeout=max(0.01, rem_s),
             )
             if resp.headers.get("mcp-session-id"):
                 self._session_id = resp.headers["mcp-session-id"].strip()
             # Streamable HTTP fallback: if upstream rejects missing/stale session (400/404), run initialize once
             if resp.status_code in (400, 404) and (deadline_mono - time.monotonic()) > 0.2:
-                init_rem = max(0.1, deadline_mono - time.monotonic())
+                init_rem = deadline_mono - time.monotonic()
+                if init_rem <= 0.0:
+                    raise asyncio.TimeoutError("Guidepoint deadline exceeded before session initialize")
                 init_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-session-id"}
                 init_resp = await asyncio.wait_for(
                     client.post(
@@ -417,15 +448,17 @@ class GuidepointConnector:
                         },
                         headers=init_headers,
                     ),
-                    timeout=init_rem,
+                    timeout=max(0.01, init_rem),
                 )
                 if init_resp.status_code == 200 and init_resp.headers.get("mcp-session-id"):
                     self._session_id = init_resp.headers["mcp-session-id"].strip()
                     headers["Mcp-Session-Id"] = self._session_id
-                    call_rem = max(0.1, deadline_mono - time.monotonic())
+                    call_rem = deadline_mono - time.monotonic()
+                    if call_rem <= 0.0:
+                        raise asyncio.TimeoutError("Guidepoint deadline exceeded after session initialize")
                     resp = await asyncio.wait_for(
                         client.post(self.upstream_url, json=rpc_body, headers=headers),
-                        timeout=call_rem,
+                        timeout=max(0.01, call_rem),
                     )
         resp.raise_for_status()
         raw_text = resp.text

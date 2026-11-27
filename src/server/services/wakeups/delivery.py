@@ -385,9 +385,10 @@ async def _deliver(wake: _Wake) -> _Exit:
     # Out of retries: this claim is the one more look a held job's release
     # bought it, or the last of its backoff, so a refusal holds it again
     # rather than starting another round.
+    # DALTON-HOOK(maintenance-gate): count maintenance reschedules out of wakeup retry budget via effective_attempts()
     spent = not plan_held and (
         bool(wake.payload.get("exhausted"))
-        or attempts - int(wake.payload.get("waited") or 0) >= MAX_ATTEMPTS
+        or outbox_db.effective_attempts(attempts, wake.payload) >= MAX_ATTEMPTS
     )
 
     for _ in range(_MAX_ROUNDS):
@@ -480,6 +481,15 @@ async def _deliver(wake: _Wake) -> _Exit:
             return "fence_lost"
         if outcome == "superseded":
             return "release"
+        # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress defers via maintenance_gate without burning attempts
+        if outcome == "maintenance":
+            from src.dalton.maintenance_gate import raise_maintenance_paused_from_response
+
+            await raise_maintenance_paused_from_response(
+                str(thread["workspace_id"]),
+                release_riders=lambda: _release_riders(wake),
+                context="wakeup_delivery",
+            )
         # DALTON-HOOK(colleague-dispatch): 403 colleague_access_revoked terminates the wakeup immediately instead of holding via exhaust_alert
         if outcome == "revoked":
             logger.info(
