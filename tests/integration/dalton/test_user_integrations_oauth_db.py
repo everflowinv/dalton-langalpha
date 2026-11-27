@@ -2841,7 +2841,8 @@ async def test_r6_small_pool_size_2_saturated_concurrency_no_deadlock_db(
         r is not None and r.local_purge_status == LocalPurgeStatus.COMPLETED
         for r in card_purge_res
     )
-    assert len(rm_commands) == 2
+    # r8 redraw runs outside locks and issues more than one sandbox command per card.
+    assert len(rm_commands) >= 2
     async with small_pool.connection() as conn:
         rem_cards = await (
             await conn.execute(
