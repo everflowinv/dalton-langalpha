@@ -199,7 +199,8 @@ async def store_blob_by_copy(user_id: str, sha256: str, src_key: str, size: int)
     return row[0]
 
 
-async def release_blob(user_id: str, sha256: str, stamp: datetime) -> bool:
+# DALTON-HOOK(personal-integrations): allow callers holding a pooled connection to reuse it
+async def release_blob(user_id: str, sha256: str, stamp: datetime, *, conn=None) -> bool:
     """Let go of a blob its writer registered and then had no use for (the
     save it was for was refused): condemn it now rather than wait out
     ``GC_GRACE_DAYS``; whether it was condemned.
@@ -212,8 +213,8 @@ async def release_blob(user_id: str, sha256: str, stamp: datetime) -> bool:
     has touched the row since (``last_referenced_at`` still ``stamp``) and
     nothing references it.
     """
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
+    async with get_db_connection(conn) as db_conn:  # DALTON-HOOK(personal-integrations)
+        async with db_conn.cursor() as cur:
             await cur.execute(
                 "UPDATE workspace_file_blobs b SET condemned_at = NOW()"
                 " WHERE b.user_id = %s AND b.sha256 = %s"

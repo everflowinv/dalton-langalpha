@@ -2584,111 +2584,162 @@ async def test_r5_feishu_binding_own_app_id_after_gateway_rotation_db(
 
 
 async def test_r6_small_pool_size_2_saturated_concurrency_no_deadlock_db(
-    gws_live_pool: Any,
+    gws_small_pool_2: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Real PG (Decision 2): with a tiny AsyncConnectionPool(min_size=1, max_size=2, timeout=5.0), concurrent refresh, disconnect, revoke, and health sweep NEVER deadlock or starve the pool."""
-    from psycopg_pool import AsyncConnectionPool
-
+    """Real PG (Decision 2 + Codex High #2): with a genuinely wired AsyncConnectionPool(min_size=1, max_size=2, timeout=5.0), concurrent refresh, disconnect, revoke, health sweep, AND two concurrent 2A purges with real transcript blobs NEVER deadlock or starve the pool."""
+    from src.dalton.services.purge_fence import save_stored_transcript_fenced
     from src.dalton.services.user_integrations_lifecycle import (
         begin_disconnect,
         finish_disconnect,
     )
-    from src.server.database import pool as pool_mod
+    from src.server.database import thread_transcripts as tt_db
+    from src.utils import storage as storage_mod
+    from tests.integration.dalton.test_user_integrations_purge_db import (
+        _seed_user_ws_thread,
+    )
 
-    _ = gws_live_pool
+    small_pool = gws_small_pool_2
+    assert small_pool.max_size == 2
+
     client_id = "222333444-pool2.apps.googleusercontent.com"
     _install_creds(google_client_id=client_id)
 
-    dsn = pool_mod._pool.conninfo  # type: ignore[union-attr]
-    small_pool = AsyncConnectionPool(
-        conninfo=dsn,
-        min_size=1,
-        max_size=2,
-        timeout=5.0,
-        open=False,
-    )
-    await small_pool.open(wait=True)
-    orig_pool = pool_mod._pool
-    try:
-        monkeypatch.setattr(pool_mod, "_pool", small_pool)
-        async with small_pool.connection() as conn:
-            await conn.execute(
-                "UPDATE dalton_integration_health_sweep_state SET sweep_gen = 0, inflight_until = NULL, last_started_at = NULL, last_completed_at = NULL"
-            )
-
-        uid_ref = "u-r6-pool2-ref"
-        uid_disc = "u-r6-pool2-disc"
-        await db.upsert_connection(
-            user_id=uid_ref,
-            provider="google",
-            service="calendar",
-            oauth_client_id=client_id,
-            provider_account_id="sub-pool2-ref",
-            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-            access_token="at-old-ref",
-            refresh_token="rt-old-ref",
-            expires_at=datetime.now(UTC) - timedelta(minutes=2),
+    async with small_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE dalton_integration_health_sweep_state SET sweep_gen = 0, inflight_until = NULL, last_started_at = NULL, last_completed_at = NULL"
         )
-        await db.upsert_connection(
-            user_id=uid_disc,
-            provider="google",
+
+    uid_ref = "u-r6-pool2-ref"
+    uid_disc = "u-r6-pool2-disc"
+    await db.upsert_connection(
+        user_id=uid_ref,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-pool2-ref",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-old-ref",
+        refresh_token="rt-old-ref",
+        expires_at=datetime.now(UTC) - timedelta(minutes=2),
+    )
+    await db.upsert_connection(
+        user_id=uid_disc,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-pool2-disc",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-old-disc",
+        refresh_token="rt-old-disc",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+
+    async def _fast_ref(**_k: Any) -> OAuthTokenResponse:
+        await asyncio.sleep(0.05)
+        return OAuthTokenResponse(
+            access_token="at-pool2-new",
+            refresh_token="rt-pool2-new",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        )
+
+    g_client.refresh_token.side_effect = _fast_ref
+    rev = create_autospec(RemoteRevoker, instance=True)
+    rev.revoke.return_value = RevokeOutcome.SUCCEEDED
+
+    async def _disconnect_and_revoke() -> Any:
+        pid = await begin_disconnect(uid_disc, "google", "calendar")
+        return await finish_disconnect(pid, revoker=rev)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            ensure_fresh_access_token(
+                uid_ref, "google", "calendar", google_client=g_client, waiter_poll_interval_seconds=0.05
+            ),
+            ensure_fresh_access_token(
+                uid_ref, "google", "calendar", google_client=g_client, waiter_poll_interval_seconds=0.05
+            ),
+            _disconnect_and_revoke(),
+            run_integration_health_sweep_once(force=True, google_client=g_client),
+        ),
+        timeout=10.0,
+    )
+    assert results[0].access_token == "at-pool2-new"
+    assert results[1].access_token == "at-pool2-new"
+    assert results[2] is not None
+    assert results[2].remote_revoke_status == RemoteRevokeStatus.SUCCEEDED
+    assert results[3].acquired is True
+
+    # Part 2 (Codex High #2): TWO concurrent 2A purges with real transcript blobs on max_size=2 pool!
+    # Both reach Layer 3b release_blob concurrently; reusing blob_conn prevents pool starvation/timeout.
+    monkeypatch.setattr(storage_mod, "upload_bytes", create_autospec(storage_mod.upload_bytes, return_value=True))
+    blob_users: list[tuple[str, str, str]] = []
+    for idx in (1, 2):
+        b_uid, _, b_tid = await _seed_user_ws_thread(small_pool, user_id=f"u-r7-pool2-blob-{idx}")
+        run_id = await _seed_turn(small_pool, thread_id=b_tid, turn_index=0, user_text=f"blob turn {idx}")
+        conn_row = await db.upsert_connection(
+            user_id=b_uid,
+            provider="feishu",
             service="calendar",
-            oauth_client_id=client_id,
-            provider_account_id="sub-pool2-disc",
-            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-            access_token="at-old-disc",
-            refresh_token="rt-old-disc",
+            oauth_client_id="cli_db_test_1",
+            provider_account_id=f"ou-blob-{idx}",
+            granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+            access_token=f"at-b-{idx}",
+            refresh_token=f"rt-b-{idx}",
             expires_at=datetime.now(UTC) + timedelta(hours=1),
         )
-
-        g_client = create_autospec(GoogleOAuthClient, instance=True)
-
-        async def _fast_ref(**_k: Any) -> OAuthTokenResponse:
-            await asyncio.sleep(0.05)
-            return OAuthTokenResponse(
-                access_token="at-pool2-new",
-                refresh_token="rt-pool2-new",
-                expires_in=3600,
-                expires_at=datetime.now(UTC) + timedelta(hours=1),
-                scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-            )
-
-        g_client.refresh_token.side_effect = _fast_ref
-        rev = create_autospec(RemoteRevoker, instance=True)
-        rev.revoke.return_value = RevokeOutcome.SUCCEEDED
-
-        async def _disconnect_and_revoke() -> Any:
-            pid = await begin_disconnect(uid_disc, "google", "calendar")
-            return await finish_disconnect(pid, revoker=rev)
-
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                ensure_fresh_access_token(
-                    uid_ref, "google", "calendar", google_client=g_client, waiter_poll_interval_seconds=0.05
-                ),
-                ensure_fresh_access_token(
-                    uid_ref, "google", "calendar", google_client=g_client, waiter_poll_interval_seconds=0.05
-                ),
-                _disconnect_and_revoke(),
-                run_integration_health_sweep_once(force=True, google_client=g_client),
-            ),
-            timeout=10.0,
+        await db.record_touch(
+            thread_id=b_tid,
+            response_id=run_id,
+            provider="feishu",
+            service="calendar",
+            auth_epoch=conn_row.auth_epoch,
+            turn_index=0,
+            user_id=b_uid,
+            provider_account_id=f"ou-blob-{idx}",
         )
-        assert results[0].access_token == "at-pool2-new"
-        assert results[1].access_token == "at-pool2-new"
-        assert results[2] is not None
-        assert results[2].remote_revoke_status == RemoteRevokeStatus.SUCCEEDED
-        assert results[3].acquired is True
-    finally:
-        monkeypatch.setattr(pool_mod, "_pool", orig_pool)
-        await small_pool.close()
+        payload = f"transcript-blob-content-{idx}".encode() * 200
+        sha = hashlib.sha256(payload).hexdigest()
+        tr = tt_db.StoredTranscript(
+            f"fp-blob-{idx}",
+            f"cp-blob-{idx}",
+            '{"segments": []}',
+            files={f"turn-000{idx}.jsonl": (sha, len(payload))},
+        )
+        saved = await save_stored_transcript_fenced(
+            b_tid, "", b_uid, tr, {sha: payload}, expected_purge_gen=0
+        )
+        assert saved is True
+        pid_b = await begin_disconnect(b_uid, "feishu", "calendar", remote_mode="local_only")
+        blob_users.append((b_uid, sha, pid_b))
+
+    purge_res = await asyncio.wait_for(
+        asyncio.gather(
+            finish_disconnect(blob_users[0][2], revoker=None),
+            finish_disconnect(blob_users[1][2], revoker=None),
+        ),
+        timeout=10.0,
+    )
+    assert all(r is not None and r.local_purge_status == LocalPurgeStatus.COMPLETED for r in purge_res)
+    async with small_pool.connection() as conn:
+        for b_uid, sha, _ in blob_users:
+            brow = await (
+                await conn.execute(
+                    "SELECT condemned_at FROM workspace_file_blobs WHERE user_id = %s AND sha256 = %s",
+                    (b_uid, sha),
+                )
+            ).fetchone()
+            assert brow is not None and brow[0] is not None
 
 
 async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
     gws_live_pool: Any,
 ) -> None:
-    """Real PG (Decision 3): when worker 1's health sweep lease expires during group 1 and worker 2 takes over, worker 1 detects sweep_gen loss before group 2 and stops immediately without processing group 2 or overwriting last_completed_at."""
+    """Real PG (Decision 3 + Item 6): when worker 1's health sweep lease expires during group 1 and worker 2 takes over, worker 1's stale refresh is discarded by CAS, and worker 1 detects sweep_gen loss before group 2 and stops immediately without processing group 2 or overwriting last_completed_at."""
     pool = gws_live_pool
     client_id = "333444555-sweep-takeover.apps.googleusercontent.com"
     _install_creds(google_client_id=client_id)
@@ -2756,9 +2807,20 @@ async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
     )
     try:
         await asyncio.wait_for(w1_entered.wait(), timeout=10.0)
-        # Wait for Worker 1's 1-second lease to expire in PostgreSQL
+        # Wait for Worker 1's 1-second sweep lease to expire in PostgreSQL AND expire the
+        # 25s refresh inflight lease on group 1 (in production 600s sweep lease >> 25s refresh
+        # lease, so by takeover time the stalled worker's refresh lease has already elapsed).
         await asyncio.sleep(1.3)
-        # Worker 2 takes over cleanly with a fresh sweep_gen!
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE dalton_user_integrations
+                SET refresh_inflight_until = clock_timestamp() - INTERVAL '1 second'
+                WHERE user_id IN ('u-r6-sw-1', 'u-r6-sw-2')
+                  AND refresh_inflight_until IS NOT NULL
+                """
+            )
+        # Worker 2 takes over cleanly with a fresh sweep_gen and refreshes both groups!
         rep_w2 = await asyncio.wait_for(
             run_integration_health_sweep_once(
                 force=True, lease_seconds=30, google_client=g_w2
@@ -2768,6 +2830,7 @@ async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
         assert rep_w2.acquired is True
         assert rep_w2.skipped_reason is None
         assert rep_w2.checked == 2
+        assert rep_w2.healthy == 2
 
         state_after_w2 = await db.read_health_sweep_state()
         assert state_after_w2 is not None
@@ -2775,7 +2838,8 @@ async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
         done_after_w2 = state_after_w2["last_completed_at"]
         assert done_after_w2 is not None
 
-        # Now release Worker 1 -> before starting group 2, Worker 1 detects lease loss and STOPS!
+        # Now release Worker 1 -> its stale group-1 refresh is discarded by CAS, and before
+        # starting group 2 Worker 1 detects sweep_gen loss and STOPS!
         w1_release.set()
         rep_w1 = await asyncio.wait_for(t1, timeout=10.0)
     finally:
@@ -2789,6 +2853,10 @@ async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
     assert rep_w1.skipped_reason == "lease_lost"
     assert rep_w1.checked == 1
     assert len(w1_calls) == 1
+    # Both connections retain Worker 2's fresh token (never overwritten by stale Worker 1's at-w1!)
+    for uid_sw in ("u-r6-sw-1", "u-r6-sw-2"):
+        sw_row = await db.get_connection(uid_sw, "google", "calendar", decrypt_tokens=True)
+        assert sw_row is not None and sw_row.access_token == "at-w2"
     state_final = await db.read_health_sweep_state()
     assert state_final is not None
     assert state_final["sweep_gen"] == gen_after_w2
@@ -3011,3 +3079,510 @@ async def test_r6_shared_google_refresh_disconnect_and_sibling_reauth_cas_discar
     assert mail_after is not None
     assert mail_after.access_token == "at-mail-fresh-reauth"
     assert mail_after.refresh_token == "rt-mail-fresh-reauth"
+
+
+# ---------------------------------------------------------------------------
+# Round 7 Review Fixes Real PostgreSQL Integration Tests
+# ---------------------------------------------------------------------------
+
+
+async def test_r7_shared_google_refresh_disconnect_commits_eligible_sibling_and_clears_lease_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Codex High #1): when calendar disconnects during shared Google refresh HTTP and mail STILL matches Step 1 CAS, Step 3 commits mail's refreshed tokens & generation AND clears calendar's inflight lease BEFORE raising IntegrationEpochRevokedError."""
+    from src.dalton.services.user_integrations_lifecycle import begin_disconnect
+    from src.dalton.services.user_integrations_oauth import IntegrationEpochRevokedError
+
+    _ = gws_live_pool
+    uid = "u-r7-sib-commit"
+    client_id = "666777888-r7cas.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_id)
+
+    for svc, scopes in (
+        ("calendar", " ".join(GOOGLE_CALENDAR_MIN_SCOPES)),
+        ("mail", " ".join(GOOGLE_GMAIL_MIN_SCOPES)),
+    ):
+        await db.upsert_connection(
+            user_id=uid,
+            provider="google",
+            service=svc,
+            oauth_client_id=client_id,
+            provider_account_id="sub-r7-sib-ok",
+            granted_scopes=scopes,
+            access_token="at-init-r7",
+            refresh_token="rt-init-r7",
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+
+    async def _slow_ref(**_k: Any) -> OAuthTokenResponse:
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=10.0)
+        return OAuthTokenResponse(
+            access_token="at-r7-committed-for-mail",
+            refresh_token="rt-r7-committed-for-mail",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join((*GOOGLE_CALENDAR_MIN_SCOPES, *GOOGLE_GMAIL_MIN_SCOPES)),
+        )
+
+    g_client.refresh_token.side_effect = _slow_ref
+
+    ref_task = asyncio.create_task(
+        ensure_fresh_access_token(uid, "google", "calendar", google_client=g_client)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
+        # Calendar disconnects during HTTP, while Mail stays untouched (still matches CAS!)
+        await begin_disconnect(uid, "google", "calendar", remote_mode="local_only")
+        release.set()
+        with pytest.raises(IntegrationEpochRevokedError):
+            await asyncio.wait_for(ref_task, timeout=10.0)
+    finally:
+        release.set()
+        if not ref_task.done():
+            ref_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ref_task
+
+    mail_after = await db.get_connection(uid, "google", "mail", decrypt_tokens=True)
+    cal_after = await db.get_connection(uid, "google", "calendar", decrypt_tokens=False)
+    assert mail_after is not None
+    assert mail_after.status == IntegrationStatus.CONNECTED
+    assert mail_after.token_generation == 2
+    assert mail_after.access_token == "at-r7-committed-for-mail"
+    assert mail_after.refresh_token == "rt-r7-committed-for-mail"
+    assert mail_after.refresh_inflight_gen is None
+    assert mail_after.refresh_inflight_until is None
+    assert cal_after is not None
+    assert cal_after.status == IntegrationStatus.DISCONNECT_PENDING
+    assert cal_after.refresh_inflight_gen is None
+    assert cal_after.refresh_inflight_until is None
+
+
+async def test_r7_calendar_disconnect_and_mail_confirmation_expiry_dual_conn_no_missed_revoke_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Codex High #3): dual-connection race between same-member calendar disconnect and mail confirmation expiry NEVER drops remote Google revocation."""
+    from src.dalton.services.user_integrations_lifecycle import begin_disconnect
+
+    pool = gws_live_pool
+    uid = "u-r7-dual-exp"
+    client_id = "777888999-r7exp.apps.googleusercontent.com"
+    proj = db.extract_google_project(client_id)
+    sub = "sub-r7-dual-exp"
+    _install_creds(google_client_id=client_id)
+
+    # Subcase A: mail confirmation expires while Conn 1 holds revoke_lock_key during calendar disconnect
+    # (having already seen the unexpired mail ticket -> skipped revoke) and Conn 2 runs expiry cleanup.
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id=sub,
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-cal-a",
+        refresh_token="rt-cal-a",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    mail_confirm_hash = hashlib.sha256(b"r7-mail-confirm-a").hexdigest()
+    await db.insert_pending_confirmation(
+        confirmation_hash=mail_confirm_hash,
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_id,
+        provider_account_id=sub,
+        provider_union_id=None,
+        provider_email="dual@example.com",
+        granted_scopes=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+        access_token="at-mail-a",
+        refresh_token="rt-mail-a-staged",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        intent="connect",
+        preferences={},
+        confirm_expires_at=datetime.now(UTC) + timedelta(milliseconds=350),
+    )
+
+    rkey = db.revoke_lock_key(proj, sub)
+    lock_acquired = asyncio.Event()
+    release_conn1 = asyncio.Event()
+
+    async def _conn1_disconnect_tx() -> None:
+        async with pool.connection() as c1, c1.transaction():
+            await c1.execute("SELECT pg_advisory_xact_lock(%s)", (rkey,))
+            # Calendar sees unexpired mail confirmation -> skips remote revoke
+            assert await db.has_active_or_pending_google_grant(
+                proj, sub, user_id=uid, exclude_service="calendar", conn=c1
+            )
+            await db.update_connection_status(
+                uid,
+                "google",
+                "calendar",
+                status=IntegrationStatus.DISCONNECT_PENDING,
+                clear_tokens=True,
+                conn=c1,
+            )
+            lock_acquired.set()
+            await asyncio.wait_for(release_conn1.wait(), timeout=10.0)
+
+    c1_task = asyncio.create_task(_conn1_disconnect_tx())
+    try:
+        await asyncio.wait_for(lock_acquired.wait(), timeout=10.0)
+        # Wait until mail confirmation is past confirm_expires_at while Conn 1 STILL holds revoke_lock_key
+        await asyncio.sleep(0.5)
+        # Conn 2 runs expiry cleanup -> MUST block on revoke_lock_key until Conn 1 commits!
+        c2_task = asyncio.create_task(db.delete_expired_oauth_states_and_confirmations())
+        await asyncio.sleep(0.1)
+        assert not c2_task.done()  # serialized by revoke_lock_key!
+        release_conn1.set()
+        await asyncio.wait_for(c1_task, timeout=10.0)
+        _, del_cnt = await asyncio.wait_for(c2_task, timeout=10.0)
+        assert del_cnt == 1
+    finally:
+        release_conn1.set()
+        if not c1_task.done():
+            c1_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await c1_task
+
+    # Conn 2 saw committed disconnect_pending calendar -> MUST have queued PENDING remote revoke!
+    async with pool.connection() as conn:
+        pending_cnt = await (
+            await conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  AND provider = 'google'
+                  AND provider_account_id = %s
+                  AND remote_revoke_status = 'pending'
+                """,
+                (uid, sub),
+            )
+        ).fetchone()
+    assert pending_cnt is not None and pending_cnt[0] == 1
+
+    # Subcase B: concurrent begin_disconnect(calendar) + delete_expired_oauth_states_and_confirmations()
+    # across two connections for a second account -> AT LEAST ONE side MUST enqueue PENDING revoke!
+    uid_b = "u-r7-dual-exp-b"
+    sub_b = "sub-r7-dual-exp-b"
+    await db.upsert_connection(
+        user_id=uid_b,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id=sub_b,
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-cal-b",
+        refresh_token="rt-cal-b",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.insert_pending_confirmation(
+        confirmation_hash=hashlib.sha256(b"r7-mail-confirm-b").hexdigest(),
+        user_id=uid_b,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_id,
+        provider_account_id=sub_b,
+        provider_union_id=None,
+        provider_email="dualb@example.com",
+        granted_scopes=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+        access_token="at-mail-b",
+        refresh_token="rt-mail-b-staged",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        intent="connect",
+        preferences={},
+        confirm_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    await asyncio.wait_for(
+        asyncio.gather(
+            begin_disconnect(uid_b, "google", "calendar"),
+            db.delete_expired_oauth_states_and_confirmations(),
+        ),
+        timeout=10.0,
+    )
+    async with pool.connection() as conn:
+        pending_b = await (
+            await conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  AND provider = 'google'
+                  AND provider_account_id = %s
+                  AND remote_revoke_status = 'pending'
+                """,
+                (uid_b, sub_b),
+            )
+        ).fetchone()
+    assert pending_b is not None and pending_b[0] >= 1
+
+
+async def test_r7_core_direct_callback_consumes_intent_before_draining_running_purge_db(
+    gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PG (Grok Med #1): when a prior 2A purge ledger is still running with an idle lock, core direct callback verifies & consumes the OAuth intent + exchange lease FIRST so draining a purge longer than exchange_lease_seconds still commits cleanly, whereas a voided intent aborts without running the purge."""
+    from src.dalton.services import user_integrations_lifecycle as lc_mod
+
+    _ = gws_live_pool
+    uid = LOCAL_DEV_USER_ID
+    client_id = "888999000-r7core.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_id)
+
+    # (a) Running purge ledger with idle lock that takes 1.3s (> exchange_lease_seconds=1)
+    old_purge = await db.insert_purge_ledger(
+        purge_id=str(uuid.uuid4()),
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-r7-old",
+        auth_epoch_upto=1,
+        trigger_reason=TriggerReason.USER_DISCONNECT,
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={},
+        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
+    )
+
+    real_finish = lc_mod.finish_disconnect_locked
+
+    async def _slow_finish_locked(pid: str, **kw: Any) -> Any:
+        await asyncio.sleep(1.3)
+        return await real_finish(pid, **kw)
+
+    monkeypatch.setattr(oauth_mod, "finish_disconnect_locked", _slow_finish_locked)
+
+    st = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss"
+    )
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+    g_client.exchange_code.return_value = OAuthTokenResponse(
+        access_token="at-r7-core-ok",
+        refresh_token="rt-r7-core-ok",
+        expires_in=3600,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        id_token="id.r7core",
+    )
+    g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+        sub="sub-r7-core-ok",
+        email="coreok@example.com",
+        email_verified=True,
+        aud=client_id,
+        iss="https://accounts.google.com",
+        exp=int(time.time()) + 3600,
+    )
+    rev = create_autospec(RemoteRevoker, instance=True)
+    rev.revoke.return_value = RevokeOutcome.SUCCEEDED
+
+    cb = await handle_oauth_callback(
+        provider="google",
+        code="c-r7-core",
+        state=st.state,
+        google_client=g_client,
+        revoker=rev,
+        exchange_lease_seconds=1,
+        exchange_timeout_seconds=10.0,
+    )
+    assert cb.status == "connected"
+    assert cb.connection is not None and cb.connection.provider_account_id == "sub-r7-core-ok"
+    rev.revoke.assert_not_awaited()
+    old_after = await db.get_purge_ledger(old_purge.purge_id)
+    assert old_after is not None and old_after.local_purge_status == LocalPurgeStatus.COMPLETED
+
+    # (b) Voided intent + running purge -> aborts IMMEDIATELY without draining the running purge
+    running_void_purge = await db.insert_purge_ledger(
+        purge_id=str(uuid.uuid4()),
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_id,
+        provider_account_id="sub-r7-void",
+        auth_epoch_upto=1,
+        trigger_reason=TriggerReason.USER_DISCONNECT,
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={},
+        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
+    )
+    st_void = await start_oauth_authorization(
+        user_id=uid, provider="google", service="mail", auth_mode="oss"
+    )
+
+    async def _void_during_exchange(**_k: Any) -> OAuthTokenResponse:
+        await db.void_oauth_states_for_user_provider(uid, "google", service="mail")
+        return OAuthTokenResponse(
+            access_token="at-void",
+            refresh_token="rt-void",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+            id_token="id.void",
+        )
+
+    g_void = create_autospec(GoogleOAuthClient, instance=True)
+    g_void.exchange_code.side_effect = _void_during_exchange
+    g_void.verify_id_token.return_value = GoogleIdTokenClaims(
+        sub="sub-r7-void-new",
+        email="void@example.com",
+        email_verified=True,
+        aud=client_id,
+        iss="https://accounts.google.com",
+        exp=int(time.time()) + 3600,
+    )
+    cb_void = await handle_oauth_callback(
+        provider="google",
+        code="c-void",
+        state=st_void.state,
+        google_client=g_void,
+        revoker=rev,
+    )
+    assert cb_void.status == "error"
+    assert cb_void.error_code == "connection_disconnected_during_callback"
+    still_running = await db.get_purge_ledger(running_void_purge.purge_id)
+    assert still_running is not None and still_running.local_purge_status == LocalPurgeStatus.RUNNING
+
+
+async def test_r7_purge_redis_outside_ledger_lock_and_attempt_gen_takeover_db(
+    gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PG (Grok Med #2 / Codex Med #1): 2A purge runs Redis cancel nudges & stream deletions strictly OUTSIDE try_purge_ledger_lock (zero PG advisory lock held), and durable local_purge_attempt_gen allows safe takeover after lease expiry without double-bumping thread generation."""
+    from src.dalton.integrations.lock_guard import (
+        advisory_lock_http_guard,
+        held_advisory_locks,
+    )
+    from src.dalton.services import integration_data_purge as purge_mod
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        finish_disconnect_locked,
+    )
+    from tests.integration.dalton.test_user_integrations_purge_db import (
+        _seed_user_ws_thread,
+    )
+
+    pool = gws_live_pool
+    uid, _, tid = await _seed_user_ws_thread(pool, user_id="u-r7-redis-purge")
+    run_id = await _seed_turn(pool, thread_id=tid, turn_index=0, user_text="redis purge turn")
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE conversation_responses SET status = 'in_progress' WHERE conversation_response_id = %s::uuid",
+            (run_id,),
+        )
+
+    conn_row = await db.upsert_connection(
+        user_id=uid,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-r7-redis",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-r7-r",
+        refresh_token="rt-r7-r",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.record_touch(
+        thread_id=tid,
+        response_id=run_id,
+        provider="feishu",
+        service="calendar",
+        auth_epoch=conn_row.auth_epoch,
+        turn_index=0,
+        user_id=uid,
+        provider_account_id="ou-r7-redis",
+    )
+    purge_id = await begin_disconnect(uid, "feishu", "calendar", remote_mode="local_only")
+    purge_lock_num = db.purge_lock_key(purge_id)
+
+    nudge_seen: list[bool] = []
+    redis_entered = asyncio.Event()
+    redis_release = asyncio.Event()
+    redis_calls: list[int] = []
+
+    async def _check_no_pg_ledger_lock() -> None:
+        assert held_advisory_locks() == ()
+        async with pool.connection() as conn:
+            row = await (
+                await conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND (
+                          (classid::bigint << 32) | (objid::bigint & x'ffffffff'::bigint)
+                      ) = %s
+                    """,
+                    (purge_lock_num,),
+                )
+            ).fetchone()
+        assert row is not None and row[0] == 0
+
+    async def _stub_nudge(t_id: str, r_id: str | None, **_kw: Any) -> None:
+        await _check_no_pg_ledger_lock()
+        nudge_seen.append(True)
+
+    async def _stub_del_redis(keys: list[str]) -> int:
+        await _check_no_pg_ledger_lock()
+        call_no = len(redis_calls) + 1
+        redis_calls.append(call_no)
+        if call_no == 1:
+            redis_entered.set()
+            await asyncio.wait_for(redis_release.wait(), timeout=10.0)
+        return len(keys)
+
+    monkeypatch.setattr(purge_mod, "publish_cancel_nudge", _stub_nudge)
+    monkeypatch.setattr(purge_mod, "_delete_redis_keys", _stub_del_redis)
+
+    with advisory_lock_http_guard(True):
+        w1_task = asyncio.create_task(finish_disconnect_locked(purge_id, revoker=None))
+        try:
+            await asyncio.wait_for(redis_entered.wait(), timeout=10.0)
+            assert len(nudge_seen) >= 1
+
+            # While Worker 1's durable lease is active, Worker 2 skips immediately
+            w2_skip = await asyncio.wait_for(finish_disconnect_locked(purge_id, revoker=None), timeout=10.0)
+            assert w2_skip is None
+
+            # Expire Worker 1's durable lease -> Worker 2 takes over cleanly (no advisory lock blocks it!)
+            async with pool.connection() as conn:
+                await conn.execute(
+                    "UPDATE dalton_integration_purge_ledger SET local_purge_inflight_until = clock_timestamp() - INTERVAL '1 second' WHERE purge_id = %s::uuid",
+                    (purge_id,),
+                )
+            w2_res = await asyncio.wait_for(finish_disconnect_locked(purge_id, revoker=None), timeout=10.0)
+            assert w2_res is not None
+            assert w2_res.local_purge_status == LocalPurgeStatus.COMPLETED
+
+            # Thread was unblocked with generation == 2 (1 from Phase 1 + 1 from Worker 2 commit)
+            async with pool.connection() as conn:
+                trow = await (
+                    await conn.execute(
+                        "SELECT personal_purge_in_progress, personal_purge_generation FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                        (tid,),
+                    )
+                ).fetchone()
+            assert trow == (False, 2)
+
+            # Release stale Worker 1 -> detects superseded local_purge_attempt_gen and does NOT double-bump!
+            redis_release.set()
+            await asyncio.wait_for(w1_task, timeout=10.0)
+        finally:
+            redis_release.set()
+            if not w1_task.done():
+                w1_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await w1_task
+
+    async with pool.connection() as conn:
+        trow_final = await (
+            await conn.execute(
+                "SELECT personal_purge_in_progress, personal_purge_generation FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+        ).fetchone()
+    assert trow_final == (False, 2)

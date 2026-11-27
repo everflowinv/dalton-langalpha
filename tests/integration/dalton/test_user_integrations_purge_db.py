@@ -127,22 +127,25 @@ def _dalton_alembic_cfg(test_db_uri: str) -> Config:
     return cfg
 
 
-@pytest_asyncio.fixture
-async def gws_live_pool(
-    dalton_schema,
-    cleanup_dalton_tables,
+@asynccontextmanager
+async def _open_wired_live_pool(
+    *,
     test_db_uri: str,
     monkeypatch,
+    min_size: int = 2,
+    max_size: int = 12,
+    checkout_timeout: float = 10.0,
 ):
-    """Open an isolated AsyncConnectionPool wired into all Dalton & server DB call sites."""
+    """Open an isolated AsyncConnectionPool with the given size and wire all Dalton & server DB call sites to it."""
     monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "test-byok-key-for-gws-r1-integration")
     monkeypatch.setenv("DALTON_ENABLED", "1")
     monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
 
     local_pool = AsyncConnectionPool(
         conninfo=test_db_uri,
-        min_size=2,
-        max_size=12,
+        min_size=min_size,
+        max_size=max_size,
+        timeout=checkout_timeout,
         configure=pool_mod._configure_postgres_connection,
         check=AsyncConnectionPool.check_connection,
         kwargs=dict(pool_mod._CONNECTION_KWARGS),
@@ -156,7 +159,7 @@ async def gws_live_pool(
         if conn is not None:
             yield conn
             return
-        async with local_pool.connection(timeout=10) as owned:
+        async with local_pool.connection(timeout=checkout_timeout) as owned:
             yield owned
 
     async def _live_open_session_connection():
@@ -266,6 +269,42 @@ async def gws_live_pool(
         finally:
             history_reader.CheckpointHistoryReader.reset_instance()
             await local_pool.close()
+
+
+@pytest_asyncio.fixture
+async def gws_live_pool(
+    dalton_schema,
+    cleanup_dalton_tables,
+    test_db_uri: str,
+    monkeypatch,
+):
+    """Open an isolated AsyncConnectionPool (max_size=12) wired into all Dalton & server DB call sites."""
+    async with _open_wired_live_pool(
+        test_db_uri=test_db_uri,
+        monkeypatch=monkeypatch,
+        min_size=2,
+        max_size=12,
+        checkout_timeout=10.0,
+    ) as local_pool:
+        yield local_pool
+
+
+@pytest_asyncio.fixture
+async def gws_small_pool_2(
+    dalton_schema,
+    cleanup_dalton_tables,
+    test_db_uri: str,
+    monkeypatch,
+):
+    """Open an isolated AsyncConnectionPool with real max_size=2 wired into ALL Dalton & server DB call sites."""
+    async with _open_wired_live_pool(
+        test_db_uri=test_db_uri,
+        monkeypatch=monkeypatch,
+        min_size=1,
+        max_size=2,
+        checkout_timeout=5.0,
+    ) as small_pool:
+        yield small_pool
 
 
 async def _seed_user_ws_thread(

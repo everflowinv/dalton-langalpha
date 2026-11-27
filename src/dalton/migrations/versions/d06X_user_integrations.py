@@ -297,6 +297,8 @@ def upgrade() -> None:
             local_purge_status        TEXT NOT NULL CHECK (
                 local_purge_status IN ('running', 'completed', 'not_required')
             ),
+            local_purge_attempt_gen   BIGINT NOT NULL DEFAULT 0,
+            local_purge_inflight_until TIMESTAMPTZ NULL,
             purged_max_turn_by_thread JSONB NOT NULL DEFAULT '{}'::jsonb,
             tracker_reconcile_needed  BOOLEAN NOT NULL DEFAULT FALSE,
             local_completed_at        TIMESTAMPTZ NULL,

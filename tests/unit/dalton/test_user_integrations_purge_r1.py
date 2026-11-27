@@ -968,7 +968,12 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
         disconnected_at=now,
         completed_at=None,
     )
-    fake_conn = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
+    fake_conn = _FakeConn(
+        _FakeCursor(
+            fetchone_seq=[{"local_purge_status": "running", "local_purge_attempt_gen": 1}],
+            fetchall_seq=[[]],
+        )
+    )
 
     @asynccontextmanager
     async def _get_conn(_conn=None):
@@ -981,6 +986,9 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
     with (
         patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
         patch.object(db, "get_purge_ledger", autospec=True, return_value=ledger),
+        patch.object(db, "claim_local_purge_attempt", autospec=True, return_value=1),
+        patch.object(db, "renew_local_purge_attempt", autospec=True, return_value=True),
+        patch.object(db, "release_local_purge_attempt", autospec=True, return_value=None),
         patch.object(purge_mod, "get_db_connection", _get_conn),
         patch.object(db, "delete_approvals_for_disconnect", autospec=True, return_value=0),
         patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
@@ -997,7 +1005,12 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
 
     register_tracker_purge_handler(_custom_handler)
     try:
-        fake_conn2 = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
+        fake_conn2 = _FakeConn(
+            _FakeCursor(
+                fetchone_seq=[{"local_purge_status": "running", "local_purge_attempt_gen": 1}],
+                fetchall_seq=[[]],
+            )
+        )
 
         @asynccontextmanager
         async def _get_conn2(_conn=None):
@@ -1006,6 +1019,9 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
         with (
             patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
             patch.object(db, "get_purge_ledger", autospec=True, return_value=ledger),
+            patch.object(db, "claim_local_purge_attempt", autospec=True, return_value=1),
+            patch.object(db, "renew_local_purge_attempt", autospec=True, return_value=True),
+            patch.object(db, "release_local_purge_attempt", autospec=True, return_value=None),
             patch.object(purge_mod, "get_db_connection", _get_conn2),
             patch.object(db, "delete_approvals_for_disconnect", autospec=True, return_value=0),
             patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
@@ -1518,6 +1534,9 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
     with (
         patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
         patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
+        patch.object(db, "claim_local_purge_attempt", create_autospec(db.claim_local_purge_attempt, return_value=1)),
+        patch.object(db, "renew_local_purge_attempt", create_autospec(db.renew_local_purge_attempt, return_value=True)),
+        patch.object(db, "release_local_purge_attempt", create_autospec(db.release_local_purge_attempt, return_value=None)),
         patch.object(purge_mod, "get_db_connection", _cp_missing_get_conn),
         patch.object(
             purge_mod.db_pool,
@@ -1829,6 +1848,9 @@ async def test_partial_failures_decode_and_same_db_missing_checkpoints():
         patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
         patch.object(purge_mod, "acquire_purge_thread_lock", autospec=True, side_effect=_thread_lock_ok),
         patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
+        patch.object(db, "claim_local_purge_attempt", create_autospec(db.claim_local_purge_attempt, return_value=1)),
+        patch.object(db, "renew_local_purge_attempt", create_autospec(db.renew_local_purge_attempt, return_value=True)),
+        patch.object(db, "release_local_purge_attempt", create_autospec(db.release_local_purge_attempt, return_value=None)),
         patch.object(purge_mod, "get_db_connection", _get_no_cp_conn),
         patch.object(
             purge_mod.db_pool,

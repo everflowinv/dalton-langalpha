@@ -228,6 +228,8 @@ class PurgeLedgerRow:
     revoke_token: str | None = field(default=None, repr=False, compare=False)
     revoke_attempt_gen: int = 0
     revoke_inflight_until: datetime | None = None
+    local_purge_attempt_gen: int = 0
+    local_purge_inflight_until: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +350,8 @@ def _row_to_purge_ledger(r: dict[str, Any]) -> PurgeLedgerRow:
         revoke_token=r.get("decrypted_revoke_token"),
         revoke_attempt_gen=int(r.get("revoke_attempt_gen") or 0),
         revoke_inflight_until=r.get("revoke_inflight_until"),
+        local_purge_attempt_gen=int(r.get("local_purge_attempt_gen") or 0),
+        local_purge_inflight_until=r.get("local_purge_inflight_until"),
     )
 
 
@@ -367,6 +371,7 @@ _INTEGRATION_META_COLS = """
 _PURGE_LEDGER_META_COLS = """
     purge_id, user_id, provider, service, oauth_client_id, provider_account_id,
     auth_epoch_upto, trigger_reason, local_purge_status,
+    local_purge_attempt_gen, local_purge_inflight_until,
     purged_max_turn_by_thread, tracker_reconcile_needed, local_completed_at,
     remote_revoke_status,
     (encrypted_revoke_token IS NOT NULL) AS has_revoke_token,
@@ -977,6 +982,87 @@ async def get_purge_ledger(
             )
             row = await cur.fetchone()
     return _row_to_purge_ledger(dict(row)) if row is not None else None
+
+
+async def claim_local_purge_attempt(
+    purge_id: str | UUID,
+    *,
+    lease_seconds: int = 300,
+    conn: Any = None,
+) -> int | None:
+    """Atomically claim a durable Scheme 2A local purge execution generation and lease.
+
+    Allows releasing any PostgreSQL advisory lock / dedicated session before Redis I/O
+    while preventing duplicate concurrent execution across workers. Returns the claimed
+    ``local_purge_attempt_gen``, or ``None`` if the ledger is not ``running`` or another
+    worker holds an unexpired lease.
+    """
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_integration_purge_ledger
+                SET local_purge_attempt_gen = local_purge_attempt_gen + 1,
+                    local_purge_inflight_until = clock_timestamp() + make_interval(secs => %s)
+                WHERE purge_id = %s::uuid
+                  AND local_purge_status = 'running'
+                  AND (
+                      local_purge_inflight_until IS NULL
+                      OR local_purge_inflight_until <= clock_timestamp()
+                  )
+                RETURNING local_purge_attempt_gen
+                """,
+                (max(1, int(lease_seconds)), str(purge_id)),
+            )
+            row = await cur.fetchone()
+    return int(row[0]) if row is not None else None
+
+
+async def renew_local_purge_attempt(
+    purge_id: str | UUID,
+    *,
+    expected_attempt_gen: int,
+    lease_seconds: int = 300,
+    conn: Any = None,
+) -> bool:
+    """Renew an active Scheme 2A local purge lease iff ``local_purge_attempt_gen`` still matches and has not expired."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_integration_purge_ledger
+                SET local_purge_inflight_until = clock_timestamp() + make_interval(secs => %s)
+                WHERE purge_id = %s::uuid
+                  AND local_purge_status = 'running'
+                  AND local_purge_attempt_gen = %s
+                  AND local_purge_inflight_until IS NOT NULL
+                  AND local_purge_inflight_until > clock_timestamp()
+                RETURNING local_purge_attempt_gen
+                """,
+                (max(1, int(lease_seconds)), str(purge_id), int(expected_attempt_gen)),
+            )
+            row = await cur.fetchone()
+    return row is not None
+
+
+async def release_local_purge_attempt(
+    purge_id: str | UUID,
+    *,
+    expected_attempt_gen: int,
+    conn: Any = None,
+) -> None:
+    """Clear ``local_purge_inflight_until`` on error/abort so retries can resume immediately."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_integration_purge_ledger
+                SET local_purge_inflight_until = NULL
+                WHERE purge_id = %s::uuid
+                  AND local_purge_attempt_gen = %s
+                """,
+                (str(purge_id), int(expected_attempt_gen)),
+            )
 
 
 async def list_running_local_purges(*, conn: Any = None) -> list[PurgeLedgerRow]:
@@ -2464,38 +2550,50 @@ async def delete_expired_oauth_states_and_confirmations(
             )
             states_deleted = int(cur.rowcount or 0)
 
-            # Pre-scan expired Google confirmations to acquire per-(project, sub) xact locks in ascending order
-            await cur.execute(
-                """
-                SELECT oauth_client_id, provider_account_id
-                FROM dalton_user_integration_pending_confirmations
-                WHERE provider = 'google'
-                  AND confirm_expires_at <= clock_timestamp()
-                """
-            )
-            pre_google = await cur.fetchall()
-            lock_keys = sorted(
-                {
-                    revoke_lock_key(
-                        extract_google_project(str(r["oauth_client_id"])),
-                        str(r["provider_account_id"]),
-                    )
-                    for r in pre_google
-                }
-            )
-            for rk in lock_keys:
-                await cur.execute("SELECT pg_advisory_xact_lock(%s)", (rk,))
+            # Snapshot ONE cutoff timestamp shared by pre-scan and DELETE so no Google
+            # confirmation expiring between pre-scan and DELETE can ever be deleted
+            # without first holding its per-(project, sub) revoke_lock_key.
+            await cur.execute("SELECT clock_timestamp() AS cutoff")
+            cutoff_row = await cur.fetchone()
+            cutoff = cutoff_row["cutoff"] if cutoff_row else None
 
             await cur.execute(
                 """
-                DELETE FROM dalton_user_integration_pending_confirmations
-                WHERE confirm_expires_at <= clock_timestamp()
-                RETURNING
-                    user_id, provider, service, oauth_client_id, provider_account_id,
-                    access_token, refresh_token, preferences
-                """
+                SELECT confirmation_hash, provider, oauth_client_id, provider_account_id
+                FROM dalton_user_integration_pending_confirmations
+                WHERE confirm_expires_at <= %s
+                """,
+                (cutoff,),
             )
-            expired_confirms = [dict(r) for r in await cur.fetchall()]
+            pre_expired = await cur.fetchall()
+            target_hashes = [str(r["confirmation_hash"]) for r in pre_expired]
+            expired_confirms: list[dict[str, Any]] = []
+            if target_hashes:
+                lock_keys = sorted(
+                    {
+                        revoke_lock_key(
+                            extract_google_project(str(r["oauth_client_id"])),
+                            str(r["provider_account_id"]),
+                        )
+                        for r in pre_expired
+                        if str(r.get("provider") or "") == "google"
+                    }
+                )
+                for rk in lock_keys:
+                    await cur.execute("SELECT pg_advisory_xact_lock(%s)", (rk,))
+
+                await cur.execute(
+                    """
+                    DELETE FROM dalton_user_integration_pending_confirmations
+                    WHERE confirmation_hash = ANY(%s::text[])
+                      AND confirm_expires_at <= %s
+                    RETURNING
+                        user_id, provider, service, oauth_client_id, provider_account_id,
+                        access_token, refresh_token, preferences
+                    """,
+                    (target_hashes, cutoff),
+                )
+                expired_confirms = [dict(r) for r in await cur.fetchall()]
         confirms_deleted = len(expired_confirms)
 
         # Enqueue unactivated expired Google tokens into the remote revoke ledger
@@ -2677,7 +2775,7 @@ async def update_health_sweep_state(
     if expected_sweep_gen is not None:
         where_parts.append("sweep_gen = %(expected_sweep_gen)s")
         params["expected_sweep_gen"] = int(expected_sweep_gen)
-    if renew_lease_seconds is not None:
+    if renew_lease_seconds is not None or (completed and expected_sweep_gen is not None):
         where_parts.append("inflight_until IS NOT NULL")
         where_parts.append("inflight_until > clock_timestamp()")
 

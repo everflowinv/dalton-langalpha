@@ -1596,7 +1596,11 @@ async def finish_disconnect_locked(
     deleted_connections = 0
     local_status = LocalPurgeStatus.RUNNING
     final_remote_status = RemoteRevokeStatus.NOT_APPLICABLE
+    claimed_attempt_gen: int | None = None
 
+    # Hold try_purge_ledger_lock ONLY for the short PG claim & connection-delete phase;
+    # release the dedicated PG session and advisory lock BEFORE running 2A purge (which
+    # performs Redis cancel nudges & stream deletions) or remote revocation HTTP (§4.2(3)).
     async with try_purge_ledger_lock(purge_id) as acquired:
         if not acquired:
             logger.debug(
@@ -1609,28 +1613,50 @@ async def finish_disconnect_locked(
             raise LookupError(f"Purge ledger {purge_id} not found")
 
         if ledger.local_purge_status == LocalPurgeStatus.RUNNING:
-            await _drain_refresh_locks(
-                user_id=ledger.user_id,
-                provider=ledger.provider,
-                service=ledger.service,
-                oauth_client_id=ledger.oauth_client_id,
-                provider_account_id=ledger.provider_account_id,
-            )
+            claimed_attempt_gen = await db.claim_local_purge_attempt(purge_id)
+            if claimed_attempt_gen is None:
+                logger.debug(
+                    "[integration-disconnect] purge_id=%s already claimed via active durable lease; skipping",
+                    purge_id,
+                )
+                return None
 
-            if ledger.trigger_reason != TriggerReason.ACCOUNT_SWITCH:
-                deleted_connections = await db.delete_connection_upto_epoch(
-                    ledger.user_id,
-                    ledger.provider,
-                    ledger.service,
-                    ledger.auth_epoch_upto,
+            try:
+                await _drain_refresh_locks(
+                    user_id=ledger.user_id,
+                    provider=ledger.provider,
+                    service=ledger.service,
+                    oauth_client_id=ledger.oauth_client_id,
+                    provider_account_id=ledger.provider_account_id,
                 )
 
-            await run_local_purge(
-                purge_id,
-                cancel_drain_timeout_s=cancel_drain_timeout_s,
-                _lock_held=True,
-            )
+                if ledger.trigger_reason != TriggerReason.ACCOUNT_SWITCH:
+                    deleted_connections = await db.delete_connection_upto_epoch(
+                        ledger.user_id,
+                        ledger.provider,
+                        ledger.service,
+                        ledger.auth_epoch_upto,
+                    )
+            except BaseException:
+                try:
+                    await db.release_local_purge_attempt(
+                        purge_id, expected_attempt_gen=claimed_attempt_gen
+                    )
+                except Exception:
+                    pass
+                raise
+        else:
+            local_status = ledger.local_purge_status
+            final_remote_status = ledger.remote_revoke_status
 
+    # Dedicated PG session and ledger advisory lock are now RELEASED.
+    if claimed_attempt_gen is not None:
+        await run_local_purge(
+            purge_id,
+            cancel_drain_timeout_s=cancel_drain_timeout_s,
+            _lock_held=True,
+            _claimed_attempt_gen=claimed_attempt_gen,
+        )
         refreshed = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
         assert refreshed is not None
         local_status = refreshed.local_purge_status

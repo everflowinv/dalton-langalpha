@@ -16,6 +16,8 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+import anyio
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from psycopg.rows import dict_row
@@ -41,7 +43,10 @@ from src.dalton.database.user_integrations import (
     purge_lock_key,
     purge_thread_lock_key,
 )
-from src.dalton.integrations.lock_guard import track_advisory_lock
+from src.dalton.integrations.lock_guard import (
+    assert_no_advisory_lock_held,
+    track_advisory_lock,
+)
 from src.llms.reasoning_payload import REASONING_KWARG_KEYS
 from src.server.database import pool as db_pool
 from src.server.database import session_lock
@@ -821,6 +826,7 @@ async def _cancel_and_drain_thread(
         await run_lifecycle.request_run_cancel(
             rid, thread_id=thread_id, by="suspension"
         )
+        assert_no_advisory_lock_held("purge.publish_cancel_nudge")
         await publish_cancel_nudge(thread_id, rid)
 
     suffix_task_ids: list[str] = []
@@ -834,6 +840,7 @@ async def _cancel_and_drain_thread(
             if trid:
                 await subagent_runs.request_task_run_cancel(trid, thread_id=thread_id)
             if tid_task:
+                assert_no_advisory_lock_held("purge.publish_cancel_nudge")
                 await publish_cancel_nudge(
                     thread_id, None, task_id=tid_task, task_run_id=trid or None
                 )
@@ -1700,28 +1707,42 @@ async def run_local_purge(
     *,
     cancel_drain_timeout_s: float = 120.0,
     _lock_held: bool = False,
+    _claimed_attempt_gen: int | None = None,
+    lease_seconds: int = 300,
 ) -> LocalPurgeReport:
     """Execute the 6-layer Scheme 2A local online purge for ``purge_id`` (idempotent & re-entrant).
 
-    Acquires per-ledger advisory lock ``advisory_key('dalton_integration_purge', purge_id)``
-    on an out-of-pool session unless ``_lock_held=True`` (when called via ``finish_disconnect_locked``).
-    Raises if any required layer fails so the ledger remains ``running`` and the thread
-    remains blocked until retried.
+    Coordinates via durable ``local_purge_attempt_gen`` + ``local_purge_inflight_until``
+    claims on ``dalton_integration_purge_ledger`` so no PostgreSQL advisory lock or
+    dedicated session connection is ever held across Redis cancel nudges or stream key
+    deletions. Raises if any required layer fails (and releases the durable lease for
+    immediate retry) while keeping ``local_purge_status = 'running'`` and threads blocked.
 
     Commits thread unblocking (``personal_purge_in_progress = FALSE`` only when no other
     running ledger still covers the thread + second ``personal_purge_generation`` bump +
     ``purged_at = NOW()`` + ``local_purge_status = 'completed'``) atomically in one
-    ``FOR UPDATE`` transaction.
+    ``FOR UPDATE`` transaction after re-verifying ``local_purge_attempt_gen``.
     """
+    claimed_gen = _claimed_attempt_gen
     if not _lock_held:
         async with try_purge_ledger_lock(purge_id) as acquired:
             if not acquired:
                 return LocalPurgeReport(purge_id=str(purge_id), skipped=True)
-            return await _run_local_purge_body(
-                purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+            ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
+            if ledger is None:
+                raise LookupError(f"Purge ledger {purge_id} not found")
+            if ledger.local_purge_status != LocalPurgeStatus.RUNNING:
+                return LocalPurgeReport(purge_id=str(purge_id), skipped=True)
+            claimed_gen = await db.claim_local_purge_attempt(
+                purge_id, lease_seconds=lease_seconds
             )
+            if claimed_gen is None:
+                return LocalPurgeReport(purge_id=str(purge_id), skipped=True)
     return await _run_local_purge_body(
-        purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+        purge_id,
+        cancel_drain_timeout_s=cancel_drain_timeout_s,
+        claimed_attempt_gen=claimed_gen,
+        lease_seconds=lease_seconds,
     )
 
 
@@ -2083,207 +2104,292 @@ async def _run_local_purge_body(
     purge_id: str,
     *,
     cancel_drain_timeout_s: float = 120.0,
+    claimed_attempt_gen: int | None = None,
+    lease_seconds: int = 300,
 ) -> LocalPurgeReport:
     report = LocalPurgeReport(purge_id=str(purge_id))
-    ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
-    if ledger is None:
-        raise LookupError(f"Purge ledger {purge_id} not found")
-    if ledger.local_purge_status != LocalPurgeStatus.RUNNING:
-        report.skipped = True
-        return report
+    completed_or_superseded = False
+    try:
+        ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
+        if ledger is None:
+            raise LookupError(f"Purge ledger {purge_id} not found")
+        if ledger.local_purge_status != LocalPurgeStatus.RUNNING:
+            completed_or_superseded = True
+            report.skipped = True
+            return report
 
-    thread_ranges = await _resolve_thread_ranges(ledger)
-    target_thread_ids = sorted(thread_ranges.keys())
-    report.threads_purged = list(target_thread_ids)
+        thread_ranges = await _resolve_thread_ranges(ledger)
+        target_thread_ids = sorted(thread_ranges.keys())
+        report.threads_purged = list(target_thread_ids)
 
-    # Step 0: Cancel and drain any in-flight runs on affected threads
-    for tid in target_thread_ids:
-        lo, hi = thread_ranges[tid]
-        await _cancel_and_drain_thread(
-            tid, min_turn=lo, max_turn=hi, timeout_s=cancel_drain_timeout_s
+        # Step 0: Cancel and drain any in-flight runs on affected threads.
+        # Runs strictly outside try_purge_ledger_lock so publish_cancel_nudge never
+        # holds a ledger advisory lock or dedicated PG session while waiting on Redis.
+        for tid in target_thread_ids:
+            lo, hi = thread_ranges[tid]
+            await _cancel_and_drain_thread(
+                tid, min_turn=lo, max_turn=hi, timeout_s=cancel_drain_timeout_s
+            )
+
+        # Collect per-thread suffix run_ids, task_ids, workspace_ids
+        all_suffix_run_ids: list[str] = []
+        thread_workspace_ids: dict[str, str | None] = {}
+        blobs_to_release: list[tuple[str, str]] = []
+        redis_keys_to_delete: list[str] = []
+
+        cp_pool = None
+        cp_serde = None
+        if target_thread_ids:
+            checkpointer = get_checkpointer()
+            cp_pool = getattr(checkpointer, "conn", None) if checkpointer is not None else None
+            cp_serde = getattr(checkpointer, "serde", None) if checkpointer is not None else None
+            if checkpointer is None or cp_serde is None:
+                raise RuntimeError(
+                    f"Checkpointer or serializer unavailable while purging purge_id={purge_id}"
+                )
+
+        for tid in target_thread_ids:
+            if claimed_attempt_gen is not None:
+                if not await db.renew_local_purge_attempt(
+                    purge_id,
+                    expected_attempt_gen=claimed_attempt_gen,
+                    lease_seconds=lease_seconds,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+            min_turn, max_turn = thread_ranges[tid]
+            async with acquire_purge_thread_lock(tid, timeout_s=cancel_drain_timeout_s):
+                await _purge_single_thread_layers(
+                    tid=tid,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    user_id=ledger.user_id,
+                    cp_pool=cp_pool,
+                    cp_serde=cp_serde,
+                    report=report,
+                    thread_workspace_ids=thread_workspace_ids,
+                    all_suffix_run_ids=all_suffix_run_ids,
+                    blobs_to_release=blobs_to_release,
+                    redis_keys_to_delete=redis_keys_to_delete,
+                )
+
+        # Layer 2c: Delete Redis event stream & meta keys strictly OUTSIDE all PG
+        # advisory locks and dedicated session connections (renewing durable lease first).
+        if redis_keys_to_delete:
+            if claimed_attempt_gen is not None:
+                if not await db.renew_local_purge_attempt(
+                    purge_id,
+                    expected_attempt_gen=claimed_attempt_gen,
+                    lease_seconds=lease_seconds,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+            assert_no_advisory_lock_held("purge.delete_redis_keys")
+            report.redis_keys_deleted = await _delete_redis_keys(redis_keys_to_delete)
+
+        # Layer 3b: Release now-unreferenced transcript blobs (reusing blob_conn so
+        # no second pooled connection is ever borrowed under tiny pool limits).
+        if blobs_to_release:
+            from src.server.database.workspace_file_blobs import release_blob
+
+            async with get_db_connection() as blob_conn:
+                for b_user_id, b_sha in set(blobs_to_release):
+                    try:
+                        async with blob_conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute(
+                                """
+                                SELECT last_referenced_at
+                                FROM workspace_file_blobs
+                                WHERE user_id = %s AND sha256 = %s AND condemned_at IS NULL
+                                """,
+                                (b_user_id, b_sha),
+                            )
+                            brow = await cur.fetchone()
+                        if brow and brow.get("last_referenced_at") is not None:
+                            await release_blob(
+                                b_user_id,
+                                b_sha,
+                                brow["last_referenced_at"],
+                                conn=blob_conn,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[purge] release_blob failed for user=%s sha=%s",
+                            b_user_id,
+                            b_sha,
+                            exc_info=True,
+                        )
+
+        # Layer 6a: Delete approvals for disconnected service + ALL services in suffix runs
+        report.approvals_deleted = await db.delete_approvals_for_disconnect(
+            user_id=ledger.user_id,
+            provider=ledger.provider,
+            service=ledger.service,
+            thread_run_ids=list(dict.fromkeys(all_suffix_run_ids)),
         )
 
-    # Collect per-thread suffix run_ids, task_ids, workspace_ids
-    all_suffix_run_ids: list[str] = []
-    thread_workspace_ids: dict[str, str | None] = {}
-    blobs_to_release: list[tuple[str, str]] = []
-    redis_keys_to_delete: list[str] = []
+        # Layer 6b: Tracker calendar extension point (Step 4) or reconcile flag
+        tracker_reconcile_needed = False
+        handler = get_tracker_purge_handler()
+        if handler is not None:
+            try:
+                handled = await handler(ledger)
+                tracker_reconcile_needed = not bool(handled)
+            except Exception:
+                logger.warning(
+                    "[purge] tracker purge handler raised for purge_id=%s; marking tracker_reconcile_needed",
+                    purge_id,
+                    exc_info=True,
+                )
+                tracker_reconcile_needed = True
+        else:
+            configured_owner = (os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID") or "").strip()
+            if (
+                configured_owner
+                and ledger.user_id == configured_owner
+                and ledger.provider == "google"
+                and ledger.service in ("calendar", None)
+            ):
+                tracker_reconcile_needed = True
+        report.tracker_reconcile_needed = tracker_reconcile_needed
 
-    cp_pool = None
-    cp_serde = None
-    if target_thread_ids:
-        checkpointer = get_checkpointer()
-        cp_pool = getattr(checkpointer, "conn", None) if checkpointer is not None else None
-        cp_serde = getattr(checkpointer, "serde", None) if checkpointer is not None else None
-        if checkpointer is None or cp_serde is None:
-            raise RuntimeError(
-                f"Checkpointer or serializer unavailable while purging purge_id={purge_id}"
-            )
-
-    for tid in target_thread_ids:
-        min_turn, max_turn = thread_ranges[tid]
-        async with acquire_purge_thread_lock(tid, timeout_s=cancel_drain_timeout_s):
-            await _purge_single_thread_layers(
-                tid=tid,
-                min_turn=min_turn,
-                max_turn=max_turn,
-                user_id=ledger.user_id,
-                cp_pool=cp_pool,
-                cp_serde=cp_serde,
-                report=report,
-                thread_workspace_ids=thread_workspace_ids,
-                all_suffix_run_ids=all_suffix_run_ids,
-                blobs_to_release=blobs_to_release,
-                redis_keys_to_delete=redis_keys_to_delete,
-            )
-
-    # Layer 2c: Delete Redis event stream & meta keys
-    report.redis_keys_deleted = await _delete_redis_keys(redis_keys_to_delete)
-
-    # Layer 3b: Release now-unreferenced transcript blobs
-    if blobs_to_release:
-        from src.server.database.workspace_file_blobs import release_blob
-
-        async with get_db_connection() as blob_conn:
-            for b_user_id, b_sha in set(blobs_to_release):
-                try:
-                    async with blob_conn.cursor(row_factory=dict_row) as cur:
+        # Final atomic commit: re-verify durable claim under short pg_advisory_xact_lock
+        # on ONE pooled connection, then unblock threads + SECOND generation increment +
+        # mark touches & ledger completed.
+        superseded_before_commit = False
+        async with get_db_connection() as conn, conn.transaction():
+            p_lock_key = purge_lock_key(purge_id)
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT pg_advisory_xact_lock(%s)", (p_lock_key,))
+                with track_advisory_lock("purge_ledger", p_lock_key):
+                    if claimed_attempt_gen is not None:
                         await cur.execute(
                             """
-                            SELECT last_referenced_at
-                            FROM workspace_file_blobs
-                            WHERE user_id = %s AND sha256 = %s AND condemned_at IS NULL
+                            SELECT local_purge_status, local_purge_attempt_gen
+                            FROM dalton_integration_purge_ledger
+                            WHERE purge_id = %s::uuid
+                            FOR UPDATE
                             """,
-                            (b_user_id, b_sha),
+                            (str(purge_id),),
                         )
-                        brow = await cur.fetchone()
-                    if brow and brow.get("last_referenced_at") is not None:
-                        await release_blob(b_user_id, b_sha, brow["last_referenced_at"])
-                except Exception:
-                    logger.warning(
-                        "[purge] release_blob failed for user=%s sha=%s",
-                        b_user_id,
-                        b_sha,
-                        exc_info=True,
-                    )
+                        lrow = await cur.fetchone()
+                        if (
+                            lrow is None
+                            or str(lrow["local_purge_status"]) != LocalPurgeStatus.RUNNING.value
+                            or int(lrow["local_purge_attempt_gen"]) != int(claimed_attempt_gen)
+                        ):
+                            superseded_before_commit = True
 
-    # Layer 6a: Delete approvals for disconnected service + ALL services in suffix runs
-    report.approvals_deleted = await db.delete_approvals_for_disconnect(
-        user_id=ledger.user_id,
-        provider=ledger.provider,
-        service=ledger.service,
-        thread_run_ids=list(dict.fromkeys(all_suffix_run_ids)),
-    )
+                    if not superseded_before_commit:
+                        if target_thread_ids:
+                            await cur.execute(
+                                """
+                                SELECT conversation_thread_id
+                                FROM conversation_threads
+                                WHERE conversation_thread_id = ANY(%s::uuid[])
+                                ORDER BY conversation_thread_id ASC
+                                FOR UPDATE
+                                """,
+                                (target_thread_ids,),
+                            )
+                            await cur.execute(
+                                """
+                                UPDATE conversation_threads t
+                                SET personal_purge_in_progress = EXISTS (
+                                        SELECT 1
+                                        FROM dalton_integration_purge_ledger l
+                                        WHERE l.local_purge_status = 'running'
+                                          AND l.purge_id <> %s::uuid
+                                          AND l.purged_max_turn_by_thread ? t.conversation_thread_id::text
+                                    ),
+                                    personal_purge_generation = personal_purge_generation + 1,
+                                    updated_at = NOW()
+                                WHERE t.conversation_thread_id = ANY(%s::uuid[])
+                                """,
+                                (str(purge_id), target_thread_ids),
+                            )
 
-    # Layer 6b: Tracker calendar extension point (Step 4) or reconcile flag
-    tracker_reconcile_needed = False
-    handler = get_tracker_purge_handler()
-    if handler is not None:
+                            service_filter = (
+                                "AND service = %(service)s" if ledger.service is not None else ""
+                            )
+                            await cur.execute(
+                                f"""
+                                UPDATE dalton_thread_integration_touches
+                                SET purged_at = NOW()
+                                WHERE thread_id = ANY(%(thread_ids)s::uuid[])
+                                  AND user_id = %(user_id)s
+                                  AND provider = %(provider)s
+                                  {service_filter}
+                                  AND auth_epoch <= %(auth_epoch_upto)s
+                                  AND purged_at IS NULL
+                                """,
+                                {
+                                    "thread_ids": target_thread_ids,
+                                    "user_id": ledger.user_id,
+                                    "provider": ledger.provider,
+                                    "service": ledger.service,
+                                    "auth_epoch_upto": ledger.auth_epoch_upto,
+                                },
+                            )
+
+                        attempt_clause = (
+                            "AND local_purge_attempt_gen = %(expected_attempt_gen)s"
+                            if claimed_attempt_gen is not None
+                            else ""
+                        )
+                        await cur.execute(
+                            f"""
+                            UPDATE dalton_integration_purge_ledger
+                            SET local_purge_status = 'completed',
+                                local_completed_at = NOW(),
+                                local_purge_inflight_until = NULL,
+                                tracker_reconcile_needed = tracker_reconcile_needed OR %(tracker_reconcile)s,
+                                completed_at = CASE
+                                    WHEN remote_revoke_status IN ('succeeded', 'superseded', 'not_applicable')
+                                    THEN COALESCE(completed_at, NOW())
+                                    ELSE completed_at
+                                END
+                            WHERE purge_id = %(purge_id)s::uuid
+                              AND local_purge_status = 'running'
+                              {attempt_clause}
+                            """,
+                            {
+                                "tracker_reconcile": tracker_reconcile_needed,
+                                "purge_id": str(purge_id),
+                                "expected_attempt_gen": claimed_attempt_gen,
+                            },
+                        )
+
+        completed_or_superseded = True
+        if superseded_before_commit:
+            report.skipped = True
+            return report
+
+        # Layer 3c: Schedule re-export of redacted transcripts AFTER commit unblocks threads
         try:
-            handled = await handler(ledger)
-            tracker_reconcile_needed = not bool(handled)
+            from src.server.services.transcripts import schedule_thread_export
+
+            for tid in target_thread_ids:
+                schedule_thread_export(tid, thread_workspace_ids.get(tid))
         except Exception:
             logger.warning(
-                "[purge] tracker purge handler raised for purge_id=%s; marking tracker_reconcile_needed",
+                "[purge] schedule_thread_export failed after commit for purge_id=%s",
                 purge_id,
                 exc_info=True,
             )
-            tracker_reconcile_needed = True
-    else:
-        configured_owner = (os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID") or "").strip()
-        if (
-            configured_owner
-            and ledger.user_id == configured_owner
-            and ledger.provider == "google"
-            and ledger.service in ("calendar", None)
-        ):
-            tracker_reconcile_needed = True
-    report.tracker_reconcile_needed = tracker_reconcile_needed
 
-    # Final atomic commit: unblock threads + SECOND generation increment + mark touches & ledger completed
-    async with get_db_connection() as conn, conn.transaction():
-        async with conn.cursor() as cur:
-            if target_thread_ids:
-                await cur.execute(
-                    """
-                    SELECT conversation_thread_id
-                    FROM conversation_threads
-                    WHERE conversation_thread_id = ANY(%s::uuid[])
-                    ORDER BY conversation_thread_id ASC
-                    FOR UPDATE
-                    """,
-                    (target_thread_ids,),
-                )
-                await cur.execute(
-                    """
-                    UPDATE conversation_threads t
-                    SET personal_purge_in_progress = EXISTS (
-                            SELECT 1
-                            FROM dalton_integration_purge_ledger l
-                            WHERE l.local_purge_status = 'running'
-                              AND l.purge_id <> %s::uuid
-                              AND l.purged_max_turn_by_thread ? t.conversation_thread_id::text
-                        ),
-                        personal_purge_generation = personal_purge_generation + 1,
-                        updated_at = NOW()
-                    WHERE t.conversation_thread_id = ANY(%s::uuid[])
-                    """,
-                    (str(purge_id), target_thread_ids),
-                )
-
-                service_filter = (
-                    "AND service = %(service)s" if ledger.service is not None else ""
-                )
-                await cur.execute(
-                    f"""
-                    UPDATE dalton_thread_integration_touches
-                    SET purged_at = NOW()
-                    WHERE thread_id = ANY(%(thread_ids)s::uuid[])
-                      AND user_id = %(user_id)s
-                      AND provider = %(provider)s
-                      {service_filter}
-                      AND auth_epoch <= %(auth_epoch_upto)s
-                      AND purged_at IS NULL
-                    """,
-                    {
-                        "thread_ids": target_thread_ids,
-                        "user_id": ledger.user_id,
-                        "provider": ledger.provider,
-                        "service": ledger.service,
-                        "auth_epoch_upto": ledger.auth_epoch_upto,
-                    },
-                )
-
-            await cur.execute(
-                """
-                UPDATE dalton_integration_purge_ledger
-                SET local_purge_status = 'completed',
-                    local_completed_at = NOW(),
-                    tracker_reconcile_needed = tracker_reconcile_needed OR %s,
-                    completed_at = CASE
-                        WHEN remote_revoke_status IN ('succeeded', 'superseded', 'not_applicable')
-                        THEN COALESCE(completed_at, NOW())
-                        ELSE completed_at
-                    END
-                WHERE purge_id = %s::uuid
-                """,
-                (tracker_reconcile_needed, str(purge_id)),
-            )
-
-    # Layer 3c: Schedule re-export of redacted transcripts AFTER commit unblocks threads
-    try:
-        from src.server.services.transcripts import schedule_thread_export
-
-        for tid in target_thread_ids:
-            schedule_thread_export(tid, thread_workspace_ids.get(tid))
-    except Exception:
-        logger.warning(
-            "[purge] schedule_thread_export failed after commit for purge_id=%s",
-            purge_id,
-            exc_info=True,
-        )
-
-    return report
+        return report
+    finally:
+        if not completed_or_superseded and claimed_attempt_gen is not None:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await db.release_local_purge_attempt(
+                        purge_id, expected_attempt_gen=claimed_attempt_gen
+                    )
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
