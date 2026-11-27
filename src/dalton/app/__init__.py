@@ -9,6 +9,7 @@ from src.dalton.app.chat_uploads import (
     sandbox_relay_router as _chat_uploads_sandbox_relay_router,
 )
 from src.dalton.app.oauth_native import router as _oauth_native_router
+from src.dalton.app.public_og import router as _public_og_router
 from src.dalton.app.router import router as _dalton_api_router
 from src.dalton.app.transcriptions import router as _transcriptions_router
 from src.dalton.app.watchlist import router as _watchlist_router
@@ -24,6 +25,7 @@ dalton_router = APIRouter()
 dalton_router.include_router(_dalton_api_router)
 dalton_router.include_router(_watchlist_router)
 dalton_router.include_router(_oauth_native_router)
+dalton_router.include_router(_public_og_router)
 dalton_router.include_router(_transcriptions_router)
 if is_core_profile():
     dalton_router.include_router(_chat_uploads_sandbox_relay_router)
