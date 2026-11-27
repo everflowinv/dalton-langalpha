@@ -5,9 +5,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { getQuoteBatcher } from '@/lib/quotes/quoteBatcher';
-import { deriveQuoteDisplay, type QuoteRow } from '@/lib/quotes';
+import { deriveQuoteDisplay, snapshotToStockPrice, writeQuoteFromWs, type QuoteRow, type WsQuoteFields } from '@/lib/quotes';
+import { extractSelectedPriceTradeTsMs, mergeRestQuoteRow, mergeWsQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
+import { getExtendedHoursInfo } from '@/lib/dalton/quotes/extendedHoursCore';
 import { resolveExtendedHoursDisplay } from '@/components/dalton/ExtendedHours';
 import {
+  mergeFullWatchlistMetricsResponse,
   mergeQuotesIntoWatchlistMetrics,
   mergeWatchlistMetricsResponse,
   usePersonalWatchlistMetrics,
@@ -594,5 +597,783 @@ describe('watchlist pending-only subset polling', () => {
     );
     expect(hkRes.session).toBe('regular');
     expect(hkRes.ext).toBeNull();
+  });
+
+  it('r5: applies unified selected-price trade-timestamp merge across REST QuoteBatcher, WS writeQuoteFromWs, and /metrics (ties keep /metrics)', async () => {
+    const T1 = 1_764_151_200_000;
+    const T2 = 1_764_151_260_000;
+    const T3 = 1_764_151_320_000;
+    const T4 = 1_764_151_380_000;
+
+    // 1. REST backfill in QuoteBatcher MUST NOT overwrite a newer WS quote in shared cache,
+    //    even when Ginlix REST carries a newer bid/ask `as_of` (T3 > T2) alongside an older `last_trade_at` (T1 < T2).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const batcher = getQuoteBatcher(qc);
+    qc.setQueryData(queryKeys.quote.detail('NVDA'), {
+      symbol: 'NVDA',
+      source: 'ginlix-data',
+      price: 140.0,
+      change: 5.0,
+      change_percent: 3.7,
+      previous_close: 135.0,
+      last_trade_price: 140.0,
+      last_trade_at: T1,
+      as_of: T1,
+      currency: 'USD',
+    });
+
+    // Newer WS tick lands at T2 with price 145.0
+    writeQuoteFromWs(qc, 'NVDA', {
+      price: 145.0,
+      change: 10.0,
+      changePercent: 7.41,
+      timestamp: T2,
+    });
+    expect(qc.getQueryData(queryKeys.quote.detail('NVDA'))).toMatchObject({
+      price: 145.0,
+      change_percent: 7.41,
+      live_tick_at: T2,
+    });
+
+    // Stale WS tick at T1 (< T2) MUST be ignored by the same unified rule
+    writeQuoteFromWs(qc, 'NVDA', {
+      price: 139.0,
+      change: 4.0,
+      changePercent: 2.96,
+      timestamp: T1,
+    });
+    expect(qc.getQueryData(queryKeys.quote.detail('NVDA'))).toMatchObject({
+      price: 145.0,
+      change_percent: 7.41,
+      live_tick_at: T2,
+    });
+
+    // Older REST backfill arrives with newer bid/ask `as_of = T3`, but `last_trade_at = T1 < T2`
+    const getSpy = vi.spyOn(api, 'get') as unknown as ReturnType<typeof vi.fn<typeof api.get>>;
+    getSpy.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            symbol: 'NVDA',
+            name: 'NVIDIA Corp',
+            source: 'ginlix-data',
+            price: 140.0,
+            change: 5.0,
+            change_percent: 3.7,
+            previous_close: 135.0,
+            last_trade_price: 140.0,
+            last_trade_at: T1,
+            as_of: T3,
+            currency: 'USD',
+          },
+        ],
+      },
+    } as Awaited<ReturnType<typeof api.get>>);
+
+    const req1 = batcher.request('NVDA');
+    await vi.advanceTimersByTimeAsync(60);
+    const mergedAfterOlderRest = await req1;
+    expect(mergedAfterOlderRest).toMatchObject({
+      name: 'NVIDIA Corp',
+      price: 145.0,
+      change_percent: 7.41,
+      live_tick_at: T2,
+    });
+    expect(qc.getQueryData(queryKeys.quote.detail('NVDA'))).toMatchObject({
+      name: 'NVIDIA Corp',
+      price: 145.0,
+      change_percent: 7.41,
+      live_tick_at: T2,
+    });
+
+    // Genuinely newer REST trade (`last_trade_at = T4 > T2`, matching `price === last_trade_price`) DOES update
+    getSpy.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            symbol: 'NVDA',
+            name: 'NVIDIA Corp',
+            source: 'ginlix-data',
+            price: 148.0,
+            change: 13.0,
+            change_percent: 9.63,
+            previous_close: 135.0,
+            last_trade_price: 148.0,
+            last_trade_at: T4,
+            as_of: T4,
+            currency: 'USD',
+          },
+        ],
+      },
+    } as Awaited<ReturnType<typeof api.get>>);
+
+    const req2 = batcher.request('NVDA');
+    await vi.advanceTimersByTimeAsync(60);
+    const mergedAfterNewerRest = await req2;
+    expect(mergedAfterNewerRest).toMatchObject({
+      price: 148.0,
+      change_percent: 9.63,
+      last_trade_at: T4,
+    });
+
+    // 2. `/metrics` merge with shared cache:
+    //    - NVDA: shared cache has WS trade at T2, `/metrics` has older trade at T1 -> WS wins
+    //    - AAPL: shared cache has Ginlix bid/ask `as_of = T3` but `last_trade_at = T1`, `/metrics` has T2 -> `/metrics` wins
+    //    - MSFT: equal trade timestamp T2 === T2 -> `/metrics` wins on tie!
+    //    - META: shared cache has Ginlix mismatched `price` (189.96) vs `last_trade_price` (190.50 at T3), `/metrics` has T2 -> `/metrics` wins!
+    const companies: PersonalWatchlistCompany[] = [
+      { ticker: 'NVDA', name: 'NVIDIA', tier: 'core', is_private: false },
+      { ticker: 'AAPL', name: 'Apple', tier: 'core', is_private: false },
+      { ticker: 'MSFT', name: 'Microsoft', tier: 'core', is_private: false },
+      { ticker: 'META', name: 'Meta', tier: 'core', is_private: false },
+    ];
+    const merged = mergeQuotesIntoWatchlistMetrics(
+      companies,
+      {
+        NVDA: makeRow('NVDA', { price: 140.0, price_source: 'snapshot', price_ts: T1, chg_1d: 3.7 }),
+        AAPL: makeRow('AAPL', { price: 212.0, price_source: 'snapshot', price_ts: T2, chg_1d: 2.1 }),
+        MSFT: makeRow('MSFT', { price: 420.0, price_source: 'snapshot', price_ts: T2, chg_1d: 1.5 }),
+        META: makeRow('META', { price: 510.0, price_source: 'snapshot', price_ts: T2, chg_1d: 0.9 }),
+      },
+      {
+        NVDA: { symbol: 'NVDA', price: 145.0, change_percent: 7.41, currency: 'USD', live_tick_at: T2 },
+        AAPL: {
+          symbol: 'AAPL',
+          source: 'ginlix-data',
+          price: 210.0,
+          change_percent: 1.1,
+          last_trade_price: 210.0,
+          last_trade_at: T1,
+          as_of: T3,
+          currency: 'USD',
+        },
+        MSFT: {
+          symbol: 'MSFT',
+          source: 'ginlix-data',
+          price: 419.5,
+          change_percent: 1.38,
+          last_trade_price: 419.5,
+          last_trade_at: T2,
+          as_of: T3,
+          currency: 'USD',
+        },
+        META: {
+          symbol: 'META',
+          source: 'ginlix-data',
+          price: 505.0,
+          change_percent: -0.2,
+          last_trade_price: 512.0,
+          last_trade_at: T3,
+          as_of: T3,
+          currency: 'USD',
+        },
+      },
+    );
+
+    expect(merged.NVDA?.price).toBe(145.0);
+    expect(merged.NVDA?.chg_1d).toBe(7.41);
+    expect(merged.AAPL?.price).toBe(212.0);
+    expect(merged.AAPL?.chg_1d).toBe(2.1);
+    expect(merged.MSFT?.price).toBe(420.0);
+    expect(merged.MSFT?.chg_1d).toBe(1.5);
+    expect(merged.META?.price).toBe(510.0);
+    expect(merged.META?.chg_1d).toBe(0.9);
+  });
+
+  it('r5: full refresh clears expired next_earnings to null while subset merge preserves unpolled rows', async () => {
+    const prev: WatchlistMetricsResponse = {
+      ok: true,
+      items: {
+        NVDA: makeRow('NVDA', { next_earnings: '2026-11-20', rsi_14d: 60 }),
+        AAPL: makeRow('AAPL', { next_earnings: '2026-12-20', rsi_14d: 55 }),
+      },
+      pending_symbols: ['NVDA'],
+      summary: {
+        total_count: 2,
+        listed_count: 2,
+        private_count: 0,
+        tier_counts: { core: 2, watch: 0, radar: 0 },
+        lowest_rsi_14d: [],
+        highest_rsi_14d: [],
+        top_gainers_1d: [],
+        top_losers_1d: [],
+        upcoming_earnings: [
+          { ticker: 'NVDA', date: '2026-11-20' },
+          { ticker: 'AAPL', date: '2026-12-20' },
+        ],
+      },
+      as_of: '2026-11-26T10:00:00Z',
+    };
+
+    // 1. Subset merge for NVDA only preserves unpolled AAPL.next_earnings
+    const afterSubset = mergeWatchlistMetricsResponse(
+      prev,
+      {
+        ok: true,
+        items: { NVDA: makeRow('NVDA', { next_earnings: null, rsi_14d: 61 }) },
+        pending_symbols: [],
+        as_of: '2026-11-26T10:00:03Z',
+      },
+      ['NVDA'],
+    );
+    expect(afterSubset.items.AAPL?.next_earnings).toBe('2026-12-20');
+    expect(afterSubset.items.NVDA?.next_earnings).toBe('2026-11-20');
+
+    // 2. Full refresh clears expired NVDA.next_earnings to null and removes it from summary.upcoming_earnings
+    const afterFull = mergeFullWatchlistMetricsResponse(prev, {
+      ok: true,
+      items: {
+        NVDA: makeRow('NVDA', { next_earnings: null, rsi_14d: 62 }),
+        AAPL: makeRow('AAPL', { next_earnings: '2026-12-20', rsi_14d: 56 }),
+      },
+      pending_symbols: [],
+      as_of: '2026-11-26T10:01:00Z',
+    });
+    expect(afterFull.items.NVDA?.next_earnings).toBeNull();
+    expect(afterFull.items.AAPL?.next_earnings).toBe('2026-12-20');
+    expect(afterFull.summary?.upcoming_earnings).toEqual([{ ticker: 'AAPL', date: '2026-12-20' }]);
+
+    // 3. End-to-end hook refetch clears expired next_earnings in React Query cache
+    const getSpy = vi.spyOn(api, 'get') as unknown as ReturnType<typeof vi.fn<typeof api.get>>;
+    getSpy
+      .mockResolvedValueOnce({ data: { ...prev, pending_symbols: [] } } as Awaited<ReturnType<typeof api.get>>)
+      .mockResolvedValueOnce({
+        data: {
+          ...prev,
+          pending_symbols: [],
+          items: {
+            NVDA: makeRow('NVDA', { next_earnings: null, rsi_14d: 62 }),
+            AAPL: makeRow('AAPL', { next_earnings: '2026-12-20', rsi_14d: 56 }),
+          },
+          as_of: '2026-11-26T10:01:00Z',
+        },
+      } as Awaited<ReturnType<typeof api.get>>);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(
+      () => usePersonalWatchlistMetrics(['NVDA', 'AAPL'], true),
+      { wrapper },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(result.current.data?.items.NVDA?.next_earnings).toBe('2026-11-20');
+
+    await act(async () => {
+      await result.current.refetch();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(result.current.data?.items.NVDA?.next_earnings).toBeNull();
+    expect(result.current.data?.items.AAPL?.next_earnings).toBe('2026-12-20');
+    expect(result.current.data?.summary?.upcoming_earnings).toEqual([{ ticker: 'AAPL', date: '2026-12-20' }]);
+    unmount();
+  });
+
+  it('r5: entering pre-market only uses current pre-market data and never carries over prior-session AH', () => {
+    const preStatus = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const staleAfterHoursQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: 317.28,
+      regular_close: 317.28,
+      previous_close: 320.76,
+      regular_trading_change: -3.48,
+      regular_trading_change_percent: -1.0849,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: 0.82,
+      late_trading_change_percent: 0.2584,
+      currency: 'USD',
+    };
+
+    const info = getExtendedHoursInfo(preStatus, staleAfterHoursQuote, { shortLabels: true });
+    expect(info.extType).toBeNull();
+    expect(info.extLabel).toBeNull();
+    expect(info.extPct).toBeNull();
+
+    const display = resolveExtendedHoursDisplay(staleAfterHoursQuote, preStatus, {
+      symbol: 'GOOG',
+      locale: 'en-US',
+    });
+    expect(display.session).toBe('pre');
+    expect(display.mainPrice).toBe(317.28);
+    expect(display.mainChangePct).toBeCloseTo(-1.0849, 4);
+    expect(display.ext).toBeNull();
+  });
+
+  it('r6: identifies Ginlix only by source so real REST rows with last_trade_at: null overwrite older cache and /metrics', async () => {
+    const T1 = 1_764_151_200_000;
+    const T2 = 1_764_151_260_000;
+
+    // 1. Real SnapshotData REST shape from FMP / Tushare / yfinance includes `last_trade_at: null`
+    //    and a newer `as_of: T2`. Must overwrite older cached REST row (`as_of: T1`).
+    for (const src of ['fmp', 'tushare', 'yfinance'] as const) {
+      const prev: QuoteRow = {
+        symbol: 'AAPL',
+        source: src,
+        price: 200.0,
+        change: 1.0,
+        change_percent: 0.5,
+        last_trade_at: null,
+        regular_as_of: null,
+        as_of: T1,
+        currency: 'USD',
+      };
+      const incoming: QuoteRow = {
+        symbol: 'AAPL',
+        source: src,
+        price: 204.5,
+        change: 5.5,
+        change_percent: 2.76,
+        last_trade_at: null,
+        regular_as_of: null,
+        as_of: T2,
+        currency: 'USD',
+      };
+      const mergedRest = mergeRestQuoteRow(prev, incoming);
+      expect(mergedRest.price, `${src} REST merge`).toBe(204.5);
+      expect(mergedRest.as_of, `${src} as_of`).toBe(T2);
+
+      // Same real REST row must also overwrite older `/metrics` price (price_ts = T1)
+      const mergedMetrics = mergeQuotesIntoWatchlistMetrics(
+        [{ ticker: 'AAPL', name: 'Apple', tier: 'core', is_private: false }],
+        {
+          AAPL: makeRow('AAPL', {
+            price: 200.0,
+            price_source: 'snapshot',
+            price_ts: T1,
+            chg_1d: 0.5,
+          }),
+        },
+        { AAPL: incoming },
+      );
+      expect(mergedMetrics.AAPL?.price, `${src} /metrics merge`).toBe(204.5);
+      expect(mergedMetrics.AAPL?.chg_1d, `${src} /metrics chg_1d`).toBe(2.76);
+    }
+  });
+
+  it('r6: preserves winning price provenance on REST merge and switches daily source to ws on WS update', async () => {
+    const T1 = 1_764_151_200_000;
+    const T2 = 1_764_151_260_000;
+    const T3 = 1_764_151_320_000;
+    const T4 = 1_764_151_380_000;
+    const T5 = 1_764_151_440_000;
+
+    // 1. Daily fallback -> WS update (source becomes 'ws') -> older REST: price MUST stay WS value
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const batcher = getQuoteBatcher(qc);
+    qc.setQueryData(queryKeys.quote.detail('NVDA'), {
+      symbol: 'NVDA',
+      source: 'daily',
+      price: 130.0,
+      change: 0.0,
+      change_percent: 0.0,
+      previous_close: 130.0,
+      as_of: T1,
+      currency: 'USD',
+    });
+
+    writeQuoteFromWs(qc, 'NVDA', {
+      price: 136.5,
+      change: 6.5,
+      changePercent: 5.0,
+      timestamp: T2,
+    });
+    expect(qc.getQueryData<QuoteRow>(queryKeys.quote.detail('NVDA'))).toMatchObject({
+      source: 'ws',
+      price: 136.5,
+      live_tick_at: T2,
+    });
+
+    const getSpy = vi.spyOn(api, 'get') as unknown as ReturnType<typeof vi.fn<typeof api.get>>;
+    getSpy.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            symbol: 'NVDA',
+            name: 'NVIDIA Corp',
+            source: 'fmp',
+            price: 132.0,
+            change: 2.0,
+            change_percent: 1.54,
+            previous_close: 130.0,
+            last_trade_at: null,
+            as_of: T1,
+            currency: 'USD',
+          },
+        ],
+      },
+    } as Awaited<ReturnType<typeof api.get>>);
+
+    const req = batcher.request('NVDA');
+    await vi.advanceTimersByTimeAsync(60);
+    const afterOlderRest = await req;
+    expect(afterOlderRest).toMatchObject({
+      name: 'NVIDIA Corp',
+      source: 'ws',
+      price: 136.5,
+      change_percent: 5.0,
+      live_tick_at: T2,
+    });
+
+    // 2. Non-WS newer price (FMP @ T3) -> older Ginlix REST (T1) -> second older Ginlix REST (T2):
+    //    price and FMP provenance survive BOTH merges without leaking Ginlix fields!
+    const newerFmp: QuoteRow = {
+      symbol: 'AAPL',
+      source: 'fmp',
+      tier: 'realtime',
+      price: 215.0,
+      change: 5.0,
+      change_percent: 2.38,
+      as_of: T3,
+      currency: 'USD',
+    };
+    const olderGinlix1: QuoteRow = {
+      symbol: 'AAPL',
+      name: 'Apple Inc.',
+      source: 'ginlix-data',
+      tier: 'delayed_15m',
+      price: 210.0,
+      change: 0.0,
+      change_percent: 0.0,
+      last_trade_at: T1,
+      last_trade_price: 210.0,
+      as_of: T4,
+      currency: 'USD',
+    };
+    const olderGinlix2: QuoteRow = {
+      symbol: 'AAPL',
+      name: 'Apple Inc.',
+      source: 'ginlix-data',
+      tier: 'delayed_15m',
+      price: 211.0,
+      change: 1.0,
+      change_percent: 0.48,
+      last_trade_at: T2,
+      last_trade_price: 211.0,
+      as_of: T5,
+      currency: 'USD',
+    };
+
+    const afterGinlix1 = mergeRestQuoteRow(newerFmp, olderGinlix1);
+    expect(afterGinlix1.price).toBe(215.0);
+    expect(afterGinlix1.source).toBe('fmp');
+    expect(afterGinlix1.as_of).toBe(T3);
+    expect(afterGinlix1.tier).toBe('realtime');
+    expect(afterGinlix1.name).toBe('Apple Inc.');
+    expect('last_trade_at' in afterGinlix1).toBe(false);
+    expect('last_trade_price' in afterGinlix1).toBe(false);
+
+    const afterGinlix2 = mergeRestQuoteRow(afterGinlix1, olderGinlix2);
+    expect(afterGinlix2.price).toBe(215.0);
+    expect(afterGinlix2.source).toBe('fmp');
+    expect(afterGinlix2.as_of).toBe(T3);
+    expect('last_trade_at' in afterGinlix2).toBe(false);
+  });
+
+  it('r6: pre-market REST replaces stale prior-session AH WS last_minute_close and unprinted pre-market uses prevClose + regular change', () => {
+    const T_reg = 1_764_104_400_000; // yesterday 16:00 ET
+    const T_ah = 1_764_115_200_000; // yesterday 19:00 ET
+    const T_pm = 1_764_162_000_000; // today 08:00 ET
+    const preStatus = { market: 'extended-hours', earlyHours: true, afterHours: false };
+
+    // Cached row after last night's AH WS print at 105 (regular close was 100)
+    const staleAhWsRow: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'ginlix-data',
+      price: 105,
+      regular_close: 100,
+      previous_close: 100,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.04,
+      late_trading_change: 5,
+      late_trading_change_percent: 5.0,
+      last_minute_close: 105,
+      live_tick_at: T_ah,
+      currency: 'USD',
+    };
+
+    // 1. This morning's pre-market REST prints 102 (regular close 100 at T_reg < T_ah, PM print at T_pm > T_ah)
+    const morningPmRest: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      regular_as_of: T_reg,
+      regular_only: false,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.04,
+      early_trading_change: 2,
+      early_trading_change_percent: 2.0,
+      last_minute_close: 102,
+      last_trade_at: T_pm,
+      as_of: T_pm,
+      currency: 'USD',
+    };
+
+    const mergedPm = mergeRestQuoteRow(staleAhWsRow, morningPmRest);
+    expect(mergedPm.last_minute_close).toBe(102);
+    const derivedPm = deriveQuoteDisplay(snapshotToStockPrice('GOOG', mergedPm), preStatus);
+    expect(derivedPm.session).toBe('pre');
+    expect(derivedPm.mainPrice).toBe(100);
+    expect(derivedPm.mainChange).toBe(2);
+    expect(derivedPm.mainChangePct).toBeCloseTo(2.04, 2);
+    expect(derivedPm.extPrice).toBe(102);
+    expect(derivedPm.extChangePct).toBeCloseTo(2.0, 2);
+
+    // 2. Entering pre-market with NO pre-market print yet (still holding last night's AH WS price 105):
+    //    mainPrice uses prevClose (100), 1D uses regular_trading_change_percent (2.04), NO ext sub-row!
+    const unprintedPre = deriveQuoteDisplay(snapshotToStockPrice('GOOG', staleAhWsRow), preStatus);
+    expect(unprintedPre.session).toBe('pre');
+    expect(unprintedPre.mainPrice).toBe(100);
+    expect(unprintedPre.mainChange).toBe(2);
+    expect(unprintedPre.mainChangePct).toBeCloseTo(2.04, 2);
+    expect(unprintedPre.extPrice).toBeNull();
+    expect(unprintedPre.extChange).toBeNull();
+    expect(unprintedPre.extChangePct).toBeNull();
+  });
+
+  it('r7 lead: intraday regular_only snapshot with regular_as_of still replaces an older WS print (102 -> 104)', () => {
+    const T_830 = 1_792_672_200_000; // 08:30 ET
+    const T_935 = 1_792_676_100_000; // 09:35 ET
+    const prev = {
+      symbol: 'GOOG',
+      source: 'ws',
+      price: 102,
+      as_of: T_830,
+      live_tick_at: T_830,
+      currency: 'USD',
+    } as QuoteRow;
+    const incoming = {
+      symbol: 'GOOG',
+      source: 'yahoo',
+      price: 104,
+      as_of: T_935,
+      regular_as_of: T_935,
+      regular_only: true,
+      currency: 'USD',
+    } as unknown as QuoteRow;
+    expect(mergeRestQuoteRow(prev, incoming).price).toBe(104);
+
+    // Untimed regular-only fallback (yesterday's close, no regular_as_of) still never overwrites the WS print.
+    const untimed = { ...incoming, price: 100, regular_as_of: undefined, as_of: undefined } as unknown as QuoteRow;
+    expect(mergeRestQuoteRow(prev, untimed).price).toBe(102);
+  });
+
+  it('r7 lead: FMP regular_only snapshot (regular_as_of = its print) compares by trade time in both directions', () => {
+    const T_830 = 1_792_672_200_000;
+    const T_935 = 1_792_676_100_000;
+    const ws102 = { symbol: 'GOOG', source: 'ws', price: 102, as_of: T_830, live_tick_at: T_830, currency: 'USD' } as QuoteRow;
+    const fmp104 = { symbol: 'GOOG', source: 'fmp', price: 104, as_of: T_935, regular_as_of: T_935, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
+    // REST direction: newer FMP print replaces the older WS print.
+    expect(mergeRestQuoteRow(ws102, fmp104).price).toBe(104);
+    // WS direction: a late 08:30 frame does not overwrite the cached 09:35 FMP print.
+    const afterLateWs = mergeWsQuoteRow(fmp104, 'GOOG', { price: 102, timestamp: T_830 } as WsQuoteFields);
+    expect(afterLateWs.price).toBe(104);
+  });
+
+  it('r7 lead: a WS print taking over a regular_only row clears regular_only', () => {
+    const T_close = 1_792_612_800_000; // 16:00 ET
+    const T_ah = 1_792_620_000_000; // 18:00 ET
+    const yahoo100 = { symbol: 'GOOG', source: 'yahoo', price: 100, as_of: T_close, regular_as_of: T_close, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
+    const merged = mergeWsQuoteRow(yahoo100, 'GOOG', { price: 105, timestamp: T_ah } as WsQuoteFields) as Record<string, unknown>;
+    expect(merged.price).toBe(105);
+    expect(merged.regular_only).toBeNull();
+  });
+
+  it('r7: REST regular_only Yahoo snapshot (8:31) and SnapshotData-serialized Yahoo PM row never overwrite 8:30 WS trade (102)', async () => {
+    const T_prev_close = 1_792_612_800_000; // yesterday 16:00 ET
+    const T_830 = 1_792_672_200_000; // today 08:30 ET
+    const T_831 = 1_792_672_260_000; // today 08:31 ET
+
+    // 1. 8:30 WS trade at 102, followed by 8:31 Yahoo regular_only snapshot (yesterday close 100):
+    //    regular_only snapshot must not participate in newer-trade comparison or overwrite WS 102.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const batcher = getQuoteBatcher(qc);
+    qc.setQueryData(queryKeys.quote.detail('GOOG'), {
+      symbol: 'GOOG',
+      source: 'ginlix-data',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      as_of: T_prev_close,
+      currency: 'USD',
+    });
+
+    writeQuoteFromWs(qc, 'GOOG', {
+      price: 102,
+      change: 2,
+      changePercent: 2.0,
+      timestamp: T_830,
+    });
+    expect(qc.getQueryData<QuoteRow>(queryKeys.quote.detail('GOOG'))).toMatchObject({
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+    });
+
+    const getSpy = vi.spyOn(api, 'get') as unknown as ReturnType<typeof vi.fn<typeof api.get>>;
+    getSpy.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            symbol: 'GOOG',
+            name: 'Alphabet Inc.',
+            source: 'yfinance',
+            price: 100,
+            regular_close: 100,
+            previous_close: 98,
+            change: 2,
+            change_percent: 2.0408,
+            regular_trading_change: 2,
+            regular_trading_change_percent: 2.0408,
+            early_trading_change: null,
+            early_trading_change_percent: null,
+            late_trading_change: null,
+            late_trading_change_percent: null,
+            last_trade_at: null,
+            last_minute_close: null,
+            as_of: T_831,
+            regular_as_of: null,
+            regular_only: true,
+            currency: 'USD',
+          },
+        ],
+      },
+    } as Awaited<ReturnType<typeof api.get>>);
+
+    const req = batcher.request('GOOG');
+    await vi.advanceTimersByTimeAsync(60);
+    const afterYahooRegular = await req;
+    expect(afterYahooRegular).toMatchObject({
+      name: 'Alphabet Inc.',
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+    });
+
+    // 2. SnapshotData-serialized Yahoo extended-hours pre-market row (8:31) keeps regular_only: false:
+    //    its price (yesterday's close 100) is timestamped by regular_as_of (yesterday 16:00), NOT 8:31 as_of,
+    //    so it never overwrites the 8:30 WS trade (102) with 100.
+    const serializedYahooPm: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      last_trade_price: 101,
+      last_minute_close: null,
+      last_trade_at: null,
+      early_trading_change: 1,
+      early_trading_change_percent: 1.0,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      as_of: T_831,
+      regular_as_of: T_prev_close,
+      regular_only: false,
+      market_status: 'early_trading',
+      currency: 'USD',
+    };
+    expect(extractSelectedPriceTradeTsMs(serializedYahooPm, serializedYahooPm.price)).toBe(T_prev_close);
+    const mergedWithYahooPm = mergeRestQuoteRow(afterYahooRegular, serializedYahooPm);
+    expect(mergedWithYahooPm.price).toBe(102);
+    expect(mergedWithYahooPm.live_tick_at).toBe(T_830);
+
+    // 3. Cached Yahoo regular_only snapshot (as_of = 8:31) does not block an incoming 8:30 WS trade (102).
+    const qc2 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc2.setQueryData(queryKeys.quote.detail('GOOG'), {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      as_of: T_831,
+      regular_only: true,
+      currency: 'USD',
+    });
+    writeQuoteFromWs(qc2, 'GOOG', {
+      price: 102,
+      change: 2,
+      changePercent: 2.0,
+      timestamp: T_830,
+    });
+    expect(qc2.getQueryData<QuoteRow>(queryKeys.quote.detail('GOOG'))).toMatchObject({
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+      regular_only: null,
+    });
+  });
+
+  it('r7: core-install Yahoo and FMP unprinted pre-market fallbacks use latest regular close (100) instead of prior-day previous_close (98)', () => {
+    const T_prev_close = 1_792_612_800_000;
+    const preStatus = { market: 'extended-hours', earlyHours: true, afterHours: false };
+
+    // Real Yahoo pre-market fallback shape from extended_hours.py (base_snap when no PM print yet):
+    // price = yesterday close (100), regular_close = 100, previous_close = day-before-yesterday close (98).
+    const yahooFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: null,
+      late_trading_change_percent: null,
+      last_trade_price: null,
+      last_minute_close: null,
+      last_trade_at: null,
+      market_status: null,
+      as_of: T_prev_close,
+      regular_as_of: T_prev_close,
+      regular_only: true,
+      currency: 'USD',
+    };
+
+    const derivedYahoo = deriveQuoteDisplay(snapshotToStockPrice('GOOG', yahooFallback), preStatus);
+    expect(derivedYahoo.session).toBe('pre');
+    expect(derivedYahoo.mainPrice).toBe(100);
+    expect(derivedYahoo.mainChange).toBe(2);
+    expect(derivedYahoo.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(derivedYahoo.extPrice).toBeNull();
+
+    const resolvedYahoo = resolveExtendedHoursDisplay(yahooFallback, preStatus, {
+      symbol: 'GOOG',
+      locale: 'en-US',
+    });
+    expect(resolvedYahoo.session).toBe('pre');
+    expect(resolvedYahoo.mainPrice).toBe(100);
+    expect(resolvedYahoo.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(resolvedYahoo.ext).toBeNull();
+
+    // FMP regular_only pre-market fallback (no regular_close / regular_trading_change fields):
+    const fmpFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'fmp',
+      price: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      early_trading_change_percent: null,
+      late_trading_change_percent: null,
+      market_status: null,
+      as_of: T_prev_close,
+      regular_only: true,
+      currency: 'USD',
+    };
+    const derivedFmp = deriveQuoteDisplay(snapshotToStockPrice('GOOG', fmpFallback), preStatus);
+    expect(derivedFmp.session).toBe('pre');
+    expect(derivedFmp.mainPrice).toBe(100);
+    expect(derivedFmp.mainChange).toBe(2);
+    expect(derivedFmp.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(derivedFmp.extPrice).toBeNull();
   });
 });

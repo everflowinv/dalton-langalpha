@@ -10,6 +10,7 @@ import {
   type QuoteRow,
   type useQuotes as useQuotesFn,
 } from '@/lib/quotes';
+import { mergeRestQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
 import { WatchlistRowItem } from '@/pages/Dashboard/widgets/definitions/_holdingsPrimitives';
 import type { WatchlistRow } from '@/pages/Dashboard/hooks/useWatchlistData';
 import {
@@ -818,9 +819,9 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
         holdingSymbols={new Set()}
         sortField="market_cap"
         sortDir="desc"
-        onSelectSymbol={vi.fn<(symbol: string) => void>()}
-        onRequestTierChange={vi.fn()}
-        onRequestRemove={vi.fn()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
       />,
     );
 
@@ -1227,5 +1228,392 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     } finally {
       Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: prevInnerWidth });
     }
+  });
+
+  it('r5: keeps missing 1D regular change as dash in pre-market and hides stale prior-session AH when entering pre-market, matching Dashboard', () => {
+    const preStatus: MarketStatusInput = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const company = { ticker: 'GOOG', name: 'Alphabet Inc.', tier: 'core' as const, is_private: false };
+
+    const buildDashboardRow = (quote: QuoteRow): WatchlistRow => {
+      const sp = snapshotToStockPrice(quote.symbol, quote);
+      return {
+        watchlist_item_id: `w-${quote.symbol}`,
+        ...sp,
+        previousClose: sp.previousClose ?? null,
+        earlyTradingChangePercent: sp.earlyTradingChangePercent ?? null,
+        lateTradingChangePercent: sp.lateTradingChangePercent ?? null,
+        currency: sp.currency ?? 'USD',
+        assetClass: 'equity',
+      };
+    };
+
+    // Case 1: Pre-market snapshot has PM price (`early_trading_change_percent`) but lacks regular_trading_change(_percent).
+    // Even if `/metrics` or unprinted quote carries chg_1d = 0 or 0.47, WatchlistFullTable MUST keep `—` just like Dashboard!
+    const preMissingRegularQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: null,
+      previous_close: 320.76,
+      change: 1.5,
+      change_percent: 0.4676,
+      regular_trading_change: null,
+      regular_trading_change_percent: null,
+      early_trading_change: 1.5,
+      early_trading_change_percent: 0.4676,
+      market_status: 'early_trading',
+      currency: 'USD',
+    };
+
+    const { container: dash1, unmount: unmountDash1 } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(preMissingRegularQuote)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mv1, unmount: unmountMv1 } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 320.76,
+            chg_1d: 0,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: preMissingRegularQuote }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dash1Cells = dash1.querySelectorAll('td');
+    const mv1Row = mv1.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mv1PriceCell = mv1Row.querySelectorAll('td')[1];
+    const mv1ChgCell = mv1Row.querySelectorAll('td')[2];
+
+    expect(dash1Cells[1].textContent).toBe('$320.76');
+    expect(mv1PriceCell.firstElementChild?.textContent).toBe('$320.76');
+    expect(dash1Cells[2].firstElementChild?.textContent).toBe('—');
+    expect(mv1ChgCell.textContent).toBe('—');
+    expect(mv1ChgCell.textContent).not.toContain('0.00%');
+    expect(dash1.querySelector('.dash-ext')?.textContent).toBe('PM$322.26+0.47%');
+    expect(mv1PriceCell.querySelector('.dash-ext')?.textContent).toBe('PM$322.26+0.47%');
+    unmountDash1();
+    unmountMv1();
+
+    // Case 2: Market has entered pre-market (`earlyHours: true`), cached quote only has stale prior-session AH.
+    // Neither Dashboard nor MarketView may show `AH`!
+    const staleAhInPreQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: 317.28,
+      regular_close: 317.28,
+      previous_close: 320.76,
+      change: -3.48,
+      change_percent: -1.0849,
+      regular_trading_change: -3.48,
+      regular_trading_change_percent: -1.0849,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: 0.82,
+      late_trading_change_percent: 0.2584,
+      currency: 'USD',
+    };
+
+    const { container: dash2, unmount: unmountDash2 } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(staleAhInPreQuote)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mv2, unmount: unmountMv2 } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 317.28,
+            chg_1d: -1.08,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: staleAhInPreQuote }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    expect(dash2.querySelector('.dash-ext')).toBeNull();
+    expect(mv2.querySelector('.dash-ext')).toBeNull();
+    unmountDash2();
+    unmountMv2();
+  });
+
+  it('r6: Dashboard WatchlistRowItem and MarketView WatchlistFullTable agree on pre-market after stale AH WS (with and without PM prints)', () => {
+    const T_reg = 1_764_104_400_000;
+    const T_ah = 1_764_115_200_000;
+    const T_pm = 1_764_162_000_000;
+    const preStatus: MarketStatusInput = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const company = { ticker: 'GOOG', name: 'Alphabet Inc.', tier: 'core' as const, is_private: false };
+
+    const buildDashboardRow = (quote: QuoteRow): WatchlistRow => {
+      const sp = snapshotToStockPrice(quote.symbol, quote);
+      return {
+        watchlist_item_id: `w-${quote.symbol}`,
+        ...sp,
+        previousClose: sp.previousClose ?? null,
+        earlyTradingChangePercent: sp.earlyTradingChangePercent ?? null,
+        lateTradingChangePercent: sp.lateTradingChangePercent ?? null,
+        currency: sp.currency ?? 'USD',
+        assetClass: 'equity',
+      };
+    };
+
+    // Cached last-night AH WS row: AH WS = 105, regular close = 100
+    const staleAhWs: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'ginlix-data',
+      price: 105,
+      regular_close: 100,
+      previous_close: 100,
+      change: 5,
+      change_percent: 5.0,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.04,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: 5,
+      late_trading_change_percent: 5.0,
+      last_minute_close: 105,
+      live_tick_at: T_ah,
+      currency: 'USD',
+    };
+
+    // Case 1: Morning PM REST prints 102 -> merged row displays main $100.00, 1D +2.04%, and PM $102.00 +2.00% on BOTH Dashboard and MarketView
+    const morningPmRest: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      regular_as_of: T_reg,
+      regular_only: false,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.04,
+      early_trading_change: 2,
+      early_trading_change_percent: 2.0,
+      last_minute_close: 102,
+      last_trade_at: T_pm,
+      as_of: T_pm,
+      currency: 'USD',
+    };
+    const mergedPmQuote = mergeRestQuoteRow(staleAhWs, morningPmRest);
+
+    const { container: dashPm, unmount: unmountDashPm } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(mergedPmQuote)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mvPm, unmount: unmountMvPm } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 105,
+            chg_1d: 5.0,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: mergedPmQuote }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dashPmCells = dashPm.querySelectorAll('td');
+    const mvPmRow = mvPm.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mvPmPriceCell = mvPmRow.querySelectorAll('td')[1];
+    const mvPmChgCell = mvPmRow.querySelectorAll('td')[2];
+
+    expect(dashPmCells[1].textContent).toBe('$100.00');
+    expect(mvPmPriceCell.firstElementChild?.textContent).toBe('$100.00');
+    expect(dashPmCells[2].firstElementChild?.textContent).toContain('2.04%');
+    expect(mvPmChgCell.textContent).toBe('+2.04%');
+    expect(dashPm.querySelector('.dash-ext')?.textContent).toBe('PM$102.00+2.00%');
+    expect(mvPmPriceCell.querySelector('.dash-ext')?.textContent).toBe('PM$102.00+2.00%');
+    unmountDashPm();
+    unmountMvPm();
+
+    // Case 2: Entering pre-market with NO PM trade yet (cached row still carries last-night AH WS 105):
+    //         BOTH Dashboard and MarketView show main $100.00, 1D +2.04%, and NO sub-row!
+    const { container: dashUnprinted, unmount: unmountDashUnprinted } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(staleAhWs)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mvUnprinted, unmount: unmountMvUnprinted } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 105,
+            chg_1d: 5.0,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: staleAhWs }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dashUnprintedCells = dashUnprinted.querySelectorAll('td');
+    const mvUnprintedRow = mvUnprinted.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mvUnprintedPriceCell = mvUnprintedRow.querySelectorAll('td')[1];
+    const mvUnprintedChgCell = mvUnprintedRow.querySelectorAll('td')[2];
+
+    expect(dashUnprintedCells[1].textContent).toBe('$100.00');
+    expect(mvUnprintedPriceCell.firstElementChild?.textContent).toBe('$100.00');
+    expect(dashUnprintedCells[2].firstElementChild?.textContent).toContain('2.04%');
+    expect(mvUnprintedChgCell.textContent).toBe('+2.04%');
+    expect(dashUnprinted.querySelector('.dash-ext')).toBeNull();
+    expect(mvUnprintedPriceCell.querySelector('.dash-ext')).toBeNull();
+    unmountDashUnprinted();
+    unmountMvUnprinted();
+  });
+
+  it('r7: Dashboard WatchlistRowItem and MarketView WatchlistFullTable agree on real Yahoo unprinted pre-market fallback ($100.00, +2.04%)', () => {
+    const T_reg = 1_792_612_800_000;
+    const preStatus: MarketStatusInput = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const company = { ticker: 'GOOG', name: 'Alphabet Inc.', tier: 'core' as const, is_private: false };
+
+    // Real core-install Yahoo pre-market fallback shape from extended_hours.py (`base_snap`):
+    // price = yesterday's close (100), regular_close = 100, previous_close = day-before-yesterday close (98).
+    const yahooPreFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: null,
+      late_trading_change_percent: null,
+      last_trade_price: null,
+      last_minute_close: null,
+      last_trade_at: null,
+      market_status: null,
+      as_of: T_reg,
+      regular_as_of: T_reg,
+      regular_only: true,
+      currency: 'USD',
+    };
+
+    const sp = snapshotToStockPrice('GOOG', yahooPreFallback);
+    const dashRow: WatchlistRow = {
+      watchlist_item_id: 'w-goog-yf-fb',
+      ...sp,
+      previousClose: sp.previousClose ?? null,
+      earlyTradingChangePercent: sp.earlyTradingChangePercent ?? null,
+      lateTradingChangePercent: sp.lateTradingChangePercent ?? null,
+      currency: sp.currency ?? 'USD',
+      assetClass: 'equity',
+    };
+
+    const { container: dashEl, unmount: unmountDash } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={dashRow} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mvEl, unmount: unmountMv } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 100,
+            chg_1d: 2.04,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: yahooPreFallback }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dashCells = dashEl.querySelectorAll('td');
+    const mvRow = mvEl.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mvPriceCell = mvRow.querySelectorAll('td')[1];
+    const mvChgCell = mvRow.querySelectorAll('td')[2];
+
+    expect(dashCells[1].textContent).toBe('$100.00');
+    expect(dashCells[1].textContent).not.toBe('$98.00');
+    expect(mvPriceCell.firstElementChild?.textContent).toBe('$100.00');
+    expect(dashCells[2].getAttribute('title')).toBe('+$2.00');
+    expect(dashCells[2].firstElementChild?.textContent).toContain('2.04%');
+    expect(mvChgCell.textContent).toBe('+2.04%');
+    expect(dashEl.querySelector('.dash-ext')).toBeNull();
+    expect(mvPriceCell.querySelector('.dash-ext')).toBeNull();
+    unmountDash();
+    unmountMv();
   });
 });

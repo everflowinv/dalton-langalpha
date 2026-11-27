@@ -59,6 +59,7 @@ export function snapshotToStockPrice(symbol: string, snap: QuoteRow | undefined 
       lastMinuteClose: snap.last_minute_close ?? null,
       lastTradePrice: snap.last_trade_price ?? null,
       liveTickAt: snap.live_tick_at ?? null,
+      regularOnly: snap.regular_only ?? null, // DALTON-HOOK(watchlist)
     };
   }
   return { symbol, price: 0, change: 0, changePercent: 0, isPositive: true, quoteAvailable: false, places: quotePlaces(symbol, {}) };
