@@ -236,6 +236,8 @@ async def list_threads(
                 gen_kwargs = {}
                 if owner_filter is not None:
                     gen_kwargs["owner_user_id"] = owner_filter
+                # DALTON-HOOK(personal-integrations): filter out other users' personal-integration private threads
+                gen_kwargs["viewer_user_id"] = x_user_id
                 threads, total = await get_workspace_threads(
                     workspace_id=workspace_id,
                     archived=archived,

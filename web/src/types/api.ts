@@ -1264,11 +1264,21 @@ export interface ChatMessageBody extends ArtifactCommentSendFields {
 
 /** One answer on a resume: the verdict, plus the user's own message if they
  *  typed one. */
+// DALTON-HOOK(personal-integrations): Google MCP elicitation response shape
+export interface ElicitationResponseEntry {
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, unknown>;
+}
+
 export interface HitlDecisionBody {
   type: string;
   message?: string;
   // DALTON-HOOK(notify-routes): echoed confirmation token for Dalton notify approvals.
   confirm_token?: string;
+  // DALTON-HOOK(personal-integrations): L2 confirmation receipt & Google MCP elicitation responses.
+  second_confirm_acknowledged?: boolean;
+  confirmed_payload_sha256?: string;
+  elicitation_responses?: Record<string, ElicitationResponseEntry>;
 }
 
 /**

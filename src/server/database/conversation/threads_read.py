@@ -160,6 +160,8 @@ async def get_workspace_threads(
     archived: bool = False,
     # DALTON-HOOK(colleague-dispatch): optional filter for caller-owned threads when workspace is hidden.
     owner_user_id: Optional[str] = None,
+    # DALTON-HOOK(personal-integrations): hide other users' personal-integration private threads.
+    viewer_user_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Get threads for a workspace with pagination.
 
@@ -195,6 +197,10 @@ async def get_workspace_threads(
     if owner_user_id:
         where_extra += " AND user_id = %s"
         extra_params.append(owner_user_id)
+    # DALTON-HOOK(personal-integrations): exclude other users' personal-integration private threads.
+    if viewer_user_id:
+        where_extra += " AND (COALESCE(user_id, (SELECT w2.user_id FROM workspaces w2 WHERE w2.workspace_id = conversation_threads.workspace_id)) = %s OR NOT COALESCE(has_personal_integration_data, FALSE))"
+        extra_params.append(viewer_user_id)
 
     try:
         async with pool.get_db_connection() as conn:
@@ -282,6 +288,9 @@ async def get_threads_for_user(
     if platform_prefix:
         where_extra = " AND t.platform LIKE %s ESCAPE '\\'"
         extra_params.append(f"{like_escape(platform_prefix)}%")
+    # DALTON-HOOK(personal-integrations): hide other users' personal-integration private threads.
+    where_extra += " AND (COALESCE(t.user_id, w.user_id) = %s OR NOT COALESCE(t.has_personal_integration_data, FALSE))"
+    extra_params.append(user_id)
 
     try:
         # DALTON-HOOK(colleague-dispatch): on Chief of Staff ('cos'), filter foreign workspaces in SQL before COUNT/LIMIT/OFFSET.
@@ -907,7 +916,9 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
                            t.metadata,
                            t.is_shared, t.msg_type, t.workspace_id,
                            t.llm_model, t.reasoning_effort, t.fast_mode,
-                           t.title, t.created_at
+                           t.title, t.created_at,
+                           -- DALTON-HOOK(personal-integrations): expose personal integration privacy flag
+                           COALESCE(t.has_personal_integration_data, FALSE) AS has_personal_integration_data
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE t.conversation_thread_id = %s

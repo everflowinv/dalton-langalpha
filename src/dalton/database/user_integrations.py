@@ -3187,3 +3187,358 @@ async def get_active_channel_gateway_feishu_app_id(
         return True, val or None
     except Exception:
         return False, None
+
+
+# ---------------------------------------------------------------------------
+# Step 3 additive CRUD helpers for dalton_integration_action_approvals (§5.2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ActionApprovalRow:
+    approval_id: str
+    caller_user_id: str
+    thread_id: str
+    run_id: str | None
+    interrupt_id: str | None
+    action_type: str
+    provider: str
+    service: str
+    provider_account_id: str
+    auth_epoch: int
+    token_generation: int
+    payload_sha256: str
+    input_requests_map: dict[str, Any] | None
+    idempotent_message_id: str | None
+    status: str
+    expires_at: datetime
+    consumed_at: datetime | None
+    created_at: datetime
+    has_elicitation_state: bool = False
+    elicitation_state: dict[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+
+def _row_to_action_approval(r: dict[str, Any]) -> ActionApprovalRow:
+    import json as _json
+
+    raw_state = r.get("decrypted_elicitation_state")
+    parsed_state: dict[str, Any] | None = None
+    if isinstance(raw_state, str) and raw_state:
+        try:
+            loaded = _json.loads(raw_state)
+            if isinstance(loaded, dict):
+                parsed_state = loaded
+        except ValueError:
+            parsed_state = None
+    elif isinstance(raw_state, dict):
+        parsed_state = dict(raw_state)
+
+    raw_map = r.get("input_requests_map")
+    input_map = dict(raw_map) if isinstance(raw_map, dict) else None
+    return ActionApprovalRow(
+        approval_id=str(r["approval_id"]),
+        caller_user_id=str(r["caller_user_id"]),
+        thread_id=str(r["thread_id"]),
+        run_id=str(r["run_id"]) if r.get("run_id") is not None else None,
+        interrupt_id=str(r["interrupt_id"]) if r.get("interrupt_id") is not None else None,
+        action_type=str(r["action_type"]),
+        provider=str(r["provider"]),
+        service=str(r["service"]),
+        provider_account_id=str(r["provider_account_id"]),
+        auth_epoch=int(r["auth_epoch"]),
+        token_generation=int(r["token_generation"]),
+        payload_sha256=str(r["payload_sha256"]),
+        input_requests_map=input_map,
+        idempotent_message_id=(
+            str(r["idempotent_message_id"])
+            if r.get("idempotent_message_id") is not None
+            else None
+        ),
+        status=str(r["status"]),
+        expires_at=r["expires_at"],
+        consumed_at=r.get("consumed_at"),
+        created_at=r["created_at"],
+        has_elicitation_state=bool(r.get("has_elicitation_state", parsed_state is not None)),
+        elicitation_state=parsed_state,
+    )
+
+
+async def create_action_approval(
+    *,
+    caller_user_id: str,
+    thread_id: str | UUID,
+    run_id: str | UUID | None,
+    action_type: str,
+    provider: str,
+    service: str,
+    provider_account_id: str,
+    auth_epoch: int,
+    token_generation: int,
+    payload_sha256: str,
+    expires_at: datetime,
+    approval_id: str | UUID | None = None,
+    interrupt_id: str | None = None,
+    input_requests_map: dict[str, Any] | None = None,
+    elicitation_state: dict[str, Any] | None = None,
+    idempotent_message_id: str | None = None,
+    conn: Any = None,
+) -> ActionApprovalRow:
+    """Persist a one-time write or Google MCP elicitation approval row (§5.2)."""
+    import json as _json
+
+    aid = str(approval_id or uuid4())
+    tid = str(thread_id)
+    rid = str(run_id) if run_id else None
+    enc_key = get_encryption_key() if elicitation_state is not None else None
+    state_json = (
+        _json.dumps(elicitation_state, ensure_ascii=False, separators=(",", ":"))
+        if elicitation_state is not None
+        else None
+    )
+
+    async def _run(db_conn: Any) -> ActionApprovalRow:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            if state_json is not None and enc_key is not None:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_integration_action_approvals (
+                        approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                        action_type, provider, service, provider_account_id,
+                        auth_epoch, token_generation, payload_sha256,
+                        input_requests_map, encrypted_elicitation_state,
+                        idempotent_message_id, status, expires_at
+                    )
+                    VALUES (
+                        %s::uuid, %s, %s::uuid, %s::uuid, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, pgp_sym_encrypt(%s, %s),
+                        %s, 'pending', %s
+                    )
+                    RETURNING approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                              action_type, provider, service, provider_account_id,
+                              auth_epoch, token_generation, payload_sha256,
+                              input_requests_map, idempotent_message_id, status,
+                              expires_at, consumed_at, created_at,
+                              (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    """,
+                    (
+                        aid,
+                        caller_user_id,
+                        tid,
+                        rid,
+                        interrupt_id,
+                        action_type,
+                        provider,
+                        service,
+                        provider_account_id,
+                        int(auth_epoch),
+                        int(token_generation),
+                        payload_sha256,
+                        Jsonb(input_requests_map) if input_requests_map is not None else None,
+                        state_json,
+                        enc_key,
+                        idempotent_message_id,
+                        expires_at,
+                    ),
+                )
+            else:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_integration_action_approvals (
+                        approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                        action_type, provider, service, provider_account_id,
+                        auth_epoch, token_generation, payload_sha256,
+                        input_requests_map, encrypted_elicitation_state,
+                        idempotent_message_id, status, expires_at
+                    )
+                    VALUES (
+                        %s::uuid, %s, %s::uuid, %s::uuid, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, NULL,
+                        %s, 'pending', %s
+                    )
+                    RETURNING approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                              action_type, provider, service, provider_account_id,
+                              auth_epoch, token_generation, payload_sha256,
+                              input_requests_map, idempotent_message_id, status,
+                              expires_at, consumed_at, created_at,
+                              (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    """,
+                    (
+                        aid,
+                        caller_user_id,
+                        tid,
+                        rid,
+                        interrupt_id,
+                        action_type,
+                        provider,
+                        service,
+                        provider_account_id,
+                        int(auth_epoch),
+                        int(token_generation),
+                        payload_sha256,
+                        Jsonb(input_requests_map) if input_requests_map is not None else None,
+                        idempotent_message_id,
+                        expires_at,
+                    ),
+                )
+            row = await cur.fetchone()
+            assert row is not None
+            return _row_to_action_approval(dict(row))
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)
+
+
+async def get_action_approval(
+    approval_id: str | UUID,
+    *,
+    decrypt_state: bool = False,
+    conn: Any = None,
+) -> ActionApprovalRow | None:
+    """Fetch one approval row by ``approval_id`` (optionally decrypting ``elicitation_state``)."""
+    aid = str(approval_id)
+    enc_key = get_encryption_key() if decrypt_state else None
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            if decrypt_state and enc_key is not None:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state,
+                           CASE WHEN encrypted_elicitation_state IS NOT NULL
+                                THEN pgp_sym_decrypt(encrypted_elicitation_state, %s)
+                                ELSE NULL END AS decrypted_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE approval_id = %s::uuid
+                    """,
+                    (enc_key, aid),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE approval_id = %s::uuid
+                    """,
+                    (aid,),
+                )
+            row = await cur.fetchone()
+    return _row_to_action_approval(dict(row)) if row is not None else None
+
+
+async def consume_action_approval(
+    approval_id: str | UUID,
+    caller_user_id: str,
+    *,
+    decrypt_state: bool = False,
+    conn: Any = None,
+) -> ActionApprovalRow | None:
+    """Atomically transition a pending unexpired approval to ``executing`` (one-time use)."""
+    aid = str(approval_id)
+    enc_key = get_encryption_key() if decrypt_state else None
+
+    async def _run(db_conn: Any) -> ActionApprovalRow | None:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            if decrypt_state and enc_key is not None:
+                await cur.execute(
+                    """
+                    UPDATE dalton_integration_action_approvals
+                    SET status = 'executing',
+                        consumed_at = NOW()
+                    WHERE approval_id = %s::uuid
+                      AND caller_user_id = %s
+                      AND status = 'pending'
+                      AND expires_at > clock_timestamp()
+                    RETURNING approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                              action_type, provider, service, provider_account_id,
+                              auth_epoch, token_generation, payload_sha256,
+                              input_requests_map, idempotent_message_id, status,
+                              expires_at, consumed_at, created_at,
+                              (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state,
+                              CASE WHEN encrypted_elicitation_state IS NOT NULL
+                                   THEN pgp_sym_decrypt(encrypted_elicitation_state, %s)
+                                   ELSE NULL END AS decrypted_elicitation_state
+                    """,
+                    (aid, caller_user_id, enc_key),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE dalton_integration_action_approvals
+                    SET status = 'executing',
+                        consumed_at = NOW()
+                    WHERE approval_id = %s::uuid
+                      AND caller_user_id = %s
+                      AND status = 'pending'
+                      AND expires_at > clock_timestamp()
+                    RETURNING approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                              action_type, provider, service, provider_account_id,
+                              auth_epoch, token_generation, payload_sha256,
+                              input_requests_map, idempotent_message_id, status,
+                              expires_at, consumed_at, created_at,
+                              (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    """,
+                    (aid, caller_user_id),
+                )
+            row = await cur.fetchone()
+        return _row_to_action_approval(dict(row)) if row is not None else None
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)
+
+
+async def mark_action_approval_status(
+    approval_id: str | UUID,
+    status: str,
+    *,
+    caller_user_id: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Update status on an approval row (e.g., ``succeeded``, ``rejected``, ``failed``, ``expired``)."""
+    aid = str(approval_id)
+
+    async def _run(db_conn: Any) -> bool:
+        async with db_conn.cursor() as cur:
+            if caller_user_id is not None:
+                await cur.execute(
+                    """
+                    UPDATE dalton_integration_action_approvals
+                    SET status = %s
+                    WHERE approval_id = %s::uuid
+                      AND caller_user_id = %s
+                    """,
+                    (status, aid, caller_user_id),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE dalton_integration_action_approvals
+                    SET status = %s
+                    WHERE approval_id = %s::uuid
+                    """,
+                    (status, aid),
+                )
+            return bool(cur.rowcount)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)

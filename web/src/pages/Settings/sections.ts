@@ -19,7 +19,11 @@ import { BRAND_NAME, isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(brand
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-reorg)
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(standalone-core): capability-aware section & search gating
-import { hasRequiredCapability, type CapabilityRequirement } from '@/hooks/useCapabilities';
+import {
+  hasRequiredCapability,
+  PERSONAL_INTEGRATION_CAPABILITIES, // DALTON-HOOK(personal-integrations)
+  type CapabilityRequirement,
+} from '@/hooks/useCapabilities';
 import { canDesktopSettings } from '@/lib/desktop';
 import { TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 // DALTON-HOOK(settings-section): shared visibility context and predicates from Dalton card modules
@@ -137,6 +141,7 @@ export function sectionShown(
   if (meta.minTier && !tierSatisfies(ctx?.callerTier, meta.minTier)) return false;
   if (meta.coverageUnitsOnly && ctx?.coverageUnitsEnabled !== true) return false;
   if (meta.capability && !hasRequiredCapability(ctx?.capabilities, meta.capability)) return false;
+  // DALTON-HOOK(personal-integrations): also show Integrations when any personal calendar/mail capability is enabled or historical connections exist
   if (
     section === 'integrations' &&
     !isPlatformMode &&
@@ -145,7 +150,9 @@ export function sectionShown(
       'channel_feishu',
       'channel_discord',
       'channel_weixin',
-    ])
+      ...PERSONAL_INTEGRATION_CAPABILITIES,
+    ]) &&
+    ctx?.hasPersonalIntegrations !== true
   ) {
     return false;
   }
@@ -291,6 +298,17 @@ export const SETTINGS = {
   billing: { section: 'budget', anchor: 'billing', labelKey: 'settings:planUsage.billing', descKey: 'settings:planUsage.billingDesc', visibleWhen: () => isPlatformMode },
   daltonBudget: { section: 'budget', anchor: 'dalton-budget', labelKey: 'settings:dalton.budgetLabel', descKey: 'settings:dalton.budgetDesc', keywords: '预算 每日预算 花费上限 USD 额度 调额 daily budget spending limit' },
 
+  // DALTON-HOOK(personal-integrations): personal calendar & mail OAuth connections card
+  daltonPersonalIntegrations: {
+    section: 'integrations',
+    anchor: 'dalton-personal-integrations',
+    labelKey: 'settings:dalton.personalIntegrationsLabel',
+    descKey: 'settings:dalton.personalIntegrationsDesc',
+    keywords: '个人日历 个人邮箱 外部账号连接 personal calendar mail',
+    visibleWhen: (ctx) =>
+      hasRequiredCapability(ctx?.capabilities, PERSONAL_INTEGRATION_CAPABILITIES)
+      || ctx?.hasPersonalIntegrations === true,
+  },
   // DALTON-HOOK(settings-section): personal messaging channels and push targets live together in Messaging & Channels
   // DALTON-HOOK(weixin-multi-account): include channel_weixin in notify targets capability gate
   daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings:dalton.notifyTargetsLabel', descKey: 'settings:dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 微信 自动推送 消息提醒 notify targets feishu discord weixin wechat 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord', 'channel_weixin'] },
@@ -468,6 +486,17 @@ export function settingSearchText(
       entry.anchor === 'dalton-notify-targets'
         ? `通知目标 自动推送 消息提醒 notify targets 推送总开关 总开关 推送开关 ${channelTokens.join(' ')}`.trim()
         : `账号绑定 绑定码 私聊 机器人 bind code account ${channelTokens.join(' ')}`.trim();
+  }
+  // DALTON-HOOK(personal-integrations): include provider search tokens only for enabled personal capabilities
+  if (entry.anchor === 'dalton-personal-integrations') {
+    const tokens = ['个人日历 个人邮箱 外部账号连接 personal calendar mail'];
+    if (hasRequiredCapability(ctx?.capabilities, ['google_calendar', 'google_gmail'])) {
+      tokens.push('Google google gmail 日历');
+    }
+    if (hasRequiredCapability(ctx?.capabilities, ['feishu_calendar', 'feishu_mail'])) {
+      tokens.push('飞书 feishu 飞书日历 飞书邮箱');
+    }
+    keywords = tokens.join(' ');
   }
   return [
     t(labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)

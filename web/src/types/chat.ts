@@ -408,6 +408,14 @@ export interface ToolApprovalState {
   reason?: string | null;
   // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
   confirmToken?: string;
+  // DALTON-HOOK(personal-integrations): personal integration L1/L2 & Google MCP elicitation metadata.
+  actionType?: string;
+  approvalId?: string;
+  payloadSha256?: string;
+  requiresSecondConfirm?: boolean;
+  riskLevel?: string;
+  inputRequests?: Record<string, unknown>;
+  webApprovalUrl?: string;
 }
 
 export interface UserQuestionState {

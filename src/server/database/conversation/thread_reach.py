@@ -188,9 +188,10 @@ async def set_shared(thread_id: str, user_id: str, shared: bool) -> SetResult:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    "SELECT created_by, workspace_shared_at, is_shared, share_permissions"
+                    "SELECT created_by, workspace_shared_at, is_shared, share_permissions,"
+                    " COALESCE(has_personal_integration_data, FALSE) AS has_personal_integration_data"
                     " FROM conversation_threads"
-                    " WHERE conversation_thread_id = %s FOR UPDATE",
+                    " WHERE conversation_thread_id = %s FOR UPDATE",  # DALTON-HOOK(personal-integrations)
                     (thread_id,),
                 )
                 row = await cur.fetchone()
@@ -198,6 +199,10 @@ async def set_shared(thread_id: str, user_id: str, shared: bool) -> SetResult:
                     return "missing", None, None
                 if row["created_by"] != user_id:
                     return "not_starter", None, None
+                # DALTON-HOOK(personal-integrations): block workspace sharing of personal-integration threads under FOR UPDATE
+                if shared and row.get("has_personal_integration_data"):
+                    from src.dalton.services.personal_integration_guard import PersonalIntegrationNotSharableError
+                    raise PersonalIntegrationNotSharableError()
                 if not shared and row["workspace_shared_at"] is not None:
                     await cur.execute(
                         f"SELECT {OTHERS_SENT_SQL} AS others FROM conversation_threads t"

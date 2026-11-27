@@ -589,6 +589,8 @@
     "budgetDesc": "View today's personal spend and adjust daily USD and per-workspace task limits.",
     "notifyTargetsLabel": "Push notifications & recipients",
     "notifyTargetsDesc": "Control the push switch for automated tasks and pick which linked accounts receive messages.",
+    "personalIntegrationsLabel": "Personal calendars & mail",
+    "personalIntegrationsDesc": "Connect your personal Google Calendar or Feishu Calendar to view events, check availability, and create or update events with confirmation in private chats.",
     "channelBindingsLabel": "Feishu & Discord account links",
     "channelBindingsDesc": "Link your own Feishu or Discord account. Generate a one-time code here and send the /bind command in a private DM to the Dalton bot—never in a group chat.",
     "channelBindingsLabelFeishu": "Feishu account link",

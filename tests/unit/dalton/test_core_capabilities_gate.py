@@ -665,11 +665,14 @@ class TestDaltonToolsRegistrationGate:
     ) -> None:
         """Item 11: individually disable each registered capability and verify its tools actually vanish."""
         for entry in DALTON_TOOL_REGISTRY:
-            if entry.capability is CORE_CAPABILITY:
+            if entry.capability is CORE_CAPABILITY and not entry.any_capabilities:
                 continue
             _enable_all_capabilities(monkeypatch)
-            cap = entry.capability
-            required_caps = cap if isinstance(cap, tuple) else (cap,)
+            if entry.any_capabilities:
+                required_caps = entry.any_capabilities
+            else:
+                cap = entry.capability
+                required_caps = cap if isinstance(cap, tuple) else (cap,)
             cap_label = "|".join(c.value for c in required_caps)
             for role in sorted(entry.roles):
                 mounted_on = {t.name for t in build_dalton_tools(role, None, user_tier="internal")}

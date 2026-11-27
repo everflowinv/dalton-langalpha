@@ -10,7 +10,12 @@
  */
 
 import type { MutableRefObject } from 'react';
-import type { HitlDecisionBody, HitlResponseBody, HitlResumeEntry } from '@/types/api';
+import type {
+  ElicitationResponseEntry, // DALTON-HOOK(personal-integrations)
+  HitlDecisionBody,
+  HitlResponseBody,
+  HitlResumeEntry,
+} from '@/types/api';
 import type {
   AssistantMessage, ChatMessage, CreditPauseStatus, ToolApprovalPosition, ToolApprovalState,
 } from '@/types/chat';
@@ -27,7 +32,14 @@ export interface ToolApprovalSlot {
 }
 
 /** One click on an approval card, before the board derives anything from it. */
-export interface ApprovalClick {
+// DALTON-HOOK(personal-integrations): extra fields for L2 second confirmation & Google MCP elicitation.
+export interface ToolApprovalDecisionExtra {
+  secondConfirmAcknowledged?: boolean;
+  confirmedPayloadSha256?: string;
+  elicitationResponses?: Record<string, ElicitationResponseEntry>;
+}
+
+export interface ApprovalClick extends ToolApprovalDecisionExtra {
   approved: boolean;
   /** The reject reason the user typed, if any. */
   message?: string;
@@ -208,12 +220,25 @@ function decisionOf(click: ApprovalClick): {
   reason: string | null;
   body: HitlDecisionBody;
 } {
-  if (click.approved) return { status: 'approved', reason: null, body: { type: 'approve' } };
+  // DALTON-HOOK(personal-integrations): serialize L2 confirmation & Google elicitation responses onto HitlDecisionBody.
+  const extra: Partial<HitlDecisionBody> = {};
+  if (click.secondConfirmAcknowledged !== undefined) {
+    extra.second_confirm_acknowledged = click.secondConfirmAcknowledged;
+  }
+  if (click.confirmedPayloadSha256) {
+    extra.confirmed_payload_sha256 = click.confirmedPayloadSha256;
+  }
+  if (click.elicitationResponses) {
+    extra.elicitation_responses = click.elicitationResponses;
+  }
+  if (click.approved) {
+    return { status: 'approved', reason: null, body: { type: 'approve', ...extra } };
+  }
   const reason = click.message?.trim() || null;
   return {
     status: 'rejected',
     reason,
-    body: reason ? { type: 'reject', message: reason } : { type: 'reject' },
+    body: reason ? { type: 'reject', message: reason, ...extra } : { type: 'reject', ...extra },
   };
 }
 

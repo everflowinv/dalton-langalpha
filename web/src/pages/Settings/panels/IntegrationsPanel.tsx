@@ -2,7 +2,11 @@ import { useTranslation } from 'react-i18next';
 import { Favicon } from '@/pages/ChatAgent/components/Favicon';
 import { MESSAGING_APPS, messagingAppDomain, messagingAppName } from '@/pages/ChatAgent/components/messaging/messageDelivery';
 import { isPlatformMode } from '@/config/hostMode';
-import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
+import {
+  PERSONAL_INTEGRATION_CAPABILITIES, // DALTON-HOOK(personal-integrations)
+  useCapabilities,
+} from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
+import { useHasPersonalIntegrations } from '@/lib/dalton/personalIntegrationsApi'; // DALTON-HOOK(personal-integrations)
 import { useLinkedChatApps } from '@/hooks/useLinkedChatApps';
 import { DaltonLoadingRow } from '@/components/dalton/primitives'; // DALTON-HOOK(standalone-core)
 import { ConsoleLink } from '../components/ConsoleLink';
@@ -13,6 +17,7 @@ import { SETTINGS } from '../sections';
 import { DaltonChannelBindingsCard } from './dalton/DaltonChannelBindingsCard';
 import { DaltonNotifyTargetsCard } from './dalton/DaltonNotifyTargetsCard';
 import { DaltonWeixinBindCard } from './dalton/DaltonWeixinBindCard';
+import { PersonalIntegrationsCard } from './dalton/PersonalIntegrationsCard'; // DALTON-HOOK(personal-integrations)
 
 /**
  * Integrations: each chat app with whether it is linked, and the way to set it
@@ -29,6 +34,10 @@ export function IntegrationsPanel() {
   const showNotifyTargets = hasCapability(['channel_feishu', 'channel_discord', 'channel_weixin']);
   const showChannelBindings = hasCapability(['channel_feishu', 'channel_discord']);
   const showWeixinBind = hasCapability('channel_weixin');
+  // DALTON-HOOK(personal-integrations): show personal calendar & mail card when any capability is enabled or historical connections exist
+  const hasPersonalIntegrations = useHasPersonalIntegrations(!capsLoading);
+  const showPersonalIntegrations =
+    hasCapability(PERSONAL_INTEGRATION_CAPABILITIES) || hasPersonalIntegrations;
   // iMessage depends on the deployment, so it shows once it is linked.
   const apps = MESSAGING_APPS.filter((app) => app !== 'imessage' || linked?.has(app));
   const chatApps = copy(SETTINGS.chatApps);
@@ -39,6 +48,8 @@ export function IntegrationsPanel() {
 
   return (
     <>
+      {/* DALTON-HOOK(personal-integrations): personal calendar & mail OAuth connections */}
+      {showPersonalIntegrations && <PersonalIntegrationsCard />}
       {/* DALTON-HOOK(settings-reorg): personal notify switches, channel bindings, and WeChat link */}
       {showNotifyTargets && <DaltonNotifyTargetsCard />}
       {showChannelBindings && <DaltonChannelBindingsCard />}

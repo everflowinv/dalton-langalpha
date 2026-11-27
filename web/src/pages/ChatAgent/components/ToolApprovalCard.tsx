@@ -9,13 +9,18 @@ import { OrderApprovalCard } from './mcp/OrderApprovalCard';
 import { useDirectToolVendorLabel } from './mcp/useDirectToolVendor';
 import { SettledStep } from './SettledStep';
 import { PublishApprovalCard } from './dalton/PublishApprovalCard'; // DALTON-HOOK(publish-card)
+// DALTON-HOOK(personal-integrations): dedicated L1/L2 & Google MCP elicitation approval card
+import { PersonalIntegrationApprovalCard } from './dalton/PersonalIntegrationApprovalCard';
+import { DALTON_INTEGRATION_APPROVAL_TYPES } from '../session/interrupts/toolApprovalCard';
+import type { ToolApprovalDecisionExtra } from '../session/interrupts/answerBoard';
 import { ResolveSwap } from './decisionCardMotion';
 import { humanizeKey } from '../utils/structuredResult';
 
 interface ToolApprovalCardProps {
   data: ToolApprovalState | null;
-  onApprove?: () => void;
-  onReject?: (message?: string) => void;
+  // DALTON-HOOK(personal-integrations): allow forwarding L2 receipt & Google elicitation responses
+  onApprove?: (extra?: ToolApprovalDecisionExtra) => void;
+  onReject?: (message?: string, extra?: ToolApprovalDecisionExtra) => void;
   /** The approved call has not answered yet. Only meaningful for an order,
    *  whose card waits for its receipt rather than settling on the click. */
   resultPending?: boolean;
@@ -60,6 +65,11 @@ function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost
   // DALTON-HOOK(publish-card): render dedicated publish receipt card for publish_report
   if (data.tool === 'publish_report') {
     return <PublishApprovalCard data={data} onApprove={onApprove} onReject={onReject} />;
+  }
+
+  // DALTON-HOOK(personal-integrations): render dedicated calendar/mail L1/L2 & Google MCP elicitation card
+  if (data.actionType && DALTON_INTEGRATION_APPROVAL_TYPES.has(data.actionType)) {
+    return <PersonalIntegrationApprovalCard data={data} onApprove={onApprove} onReject={onReject} />;
   }
 
   const { status, server, tool, args } = data;

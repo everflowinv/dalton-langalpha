@@ -671,6 +671,8 @@
     "budgetDesc": "查看今日个人费用消耗，设置每日美元上限与工作区单任务上限。",
     "notifyTargetsLabel": "消息推送与接收账号",
     "notifyTargetsDesc": "控制全部自动任务推送总开关，并勾选接收推送的已绑定账号。",
+    "personalIntegrationsLabel": "个人日历与邮箱连接",
+    "personalIntegrationsDesc": "授权连接你的个人 Google 日历或飞书日历，在私密对话中查询日程、查看空闲时段，并在确认后创建、修改或删除日程。",
     "channelBindingsLabel": "飞书与 Discord 账号绑定",
     "channelBindingsDesc": "绑定你自己的飞书或 Discord 账号。在这里生成一次性绑定码，再私聊发送 /bind 命令给 Dalton 机器人（请勿发到群聊）。",
     "channelBindingsLabelFeishu": "飞书账号绑定",

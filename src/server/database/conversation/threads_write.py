@@ -87,6 +87,8 @@ async def create_thread(
     user_id: Optional[str] = None,
     created_by: Optional[str] = None,
     shared_with_workspace: bool = False,
+    # DALTON-HOOK(personal-integrations): refuse shared_with_workspace=True when creating a personal-integration thread.
+    has_personal_integration_data: bool = False,
     conn=None,
 ) -> Dict[str, Any]:
     """
@@ -167,8 +169,15 @@ async def create_thread(
         columns.append("created_by")
         params.append(created_by)
         if shared_with_workspace:
+            # DALTON-HOOK(personal-integrations): refuse creating a shared thread carrying personal integration data
+            if has_personal_integration_data:
+                from src.dalton.services.personal_integration_guard import PersonalIntegrationNotSharableError
+                raise PersonalIntegrationNotSharableError()
             columns.extend(("workspace_shared_at", "workspace_shared_by"))
             params.extend((datetime.now(timezone.utc), created_by))
+    if has_personal_integration_data:  # DALTON-HOOK(personal-integrations)
+        columns.append("has_personal_integration_data")
+        params.append(True)
 
     col_str = ", ".join(columns)
     placeholders = ", ".join(expressions.get(c, "%s") for c in columns)
@@ -945,38 +954,43 @@ async def update_thread_sharing(
     """
     try:
         async with pool.get_db_connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                sets = ["is_shared = %s", "updated_at = NOW()"]
-                params: list = [is_shared]
-
+            async with conn.transaction():
+                # DALTON-HOOK(personal-integrations): atomically block public/org link sharing under FOR UPDATE when personal data is present
                 if is_shared:
-                    sets.append("share_token = COALESCE(share_token, %s)")
-                    params.append(mint_share_code())
+                    from src.dalton.services.personal_integration_guard import assert_thread_sharable_tx
+                    await assert_thread_sharable_tx(conn, conversation_thread_id)
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    sets = ["is_shared = %s", "updated_at = NOW()"]
+                    params: list = [is_shared]
 
-                if share_permissions is not None:
-                    sets.append("share_permissions = %s")
-                    params.append(Json(share_permissions))
+                    if is_shared:
+                        sets.append("share_token = COALESCE(share_token, %s)")
+                        params.append(mint_share_code())
 
-                if shared_at is not None:
-                    sets.append("shared_at = %s")
-                    params.append(shared_at)
+                    if share_permissions is not None:
+                        sets.append("share_permissions = %s")
+                        params.append(Json(share_permissions))
 
-                params.append(conversation_thread_id)
+                    if shared_at is not None:
+                        sets.append("shared_at = %s")
+                        params.append(shared_at)
 
-                await cur.execute(
-                    f"""
-                    UPDATE conversation_threads
-                    SET {", ".join(sets)}
-                    WHERE conversation_thread_id = %s
-                    RETURNING conversation_thread_id, workspace_id, share_token,
-                              is_shared, share_permissions, shared_at,
-                              current_status, msg_type, title, created_at, updated_at
-                    """,
-                    tuple(params),
-                )
+                    params.append(conversation_thread_id)
 
-                result = await cur.fetchone()
-                return dict(result) if result else None
+                    await cur.execute(
+                        f"""
+                        UPDATE conversation_threads
+                        SET {", ".join(sets)}
+                        WHERE conversation_thread_id = %s
+                        RETURNING conversation_thread_id, workspace_id, share_token,
+                                  is_shared, share_permissions, shared_at,
+                                  current_status, msg_type, title, created_at, updated_at
+                        """,
+                        tuple(params),
+                    )
+
+                    result = await cur.fetchone()
+                    return dict(result) if result else None
 
     except Exception as e:
         logger.error(f"Error updating thread sharing: {e}")

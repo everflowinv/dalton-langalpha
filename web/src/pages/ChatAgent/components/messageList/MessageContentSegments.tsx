@@ -630,8 +630,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               data={ta}
               resultPending={resultPending}
               resultLost={resultLost}
-              onApprove={answers && onApproveToolCall && interruptId ? () => onApproveToolCall(approvalId, interruptId, position, attemptId) : undefined}
-              onReject={answers && onRejectToolCall && interruptId ? (message?: string) => onRejectToolCall(approvalId, interruptId, position, message, attemptId) : undefined}
+              onApprove={answers && onApproveToolCall && interruptId ? (extra) => onApproveToolCall(approvalId, interruptId, position, attemptId, extra) : undefined}
+              onReject={answers && onRejectToolCall && interruptId ? (message?: string, extra?) => onRejectToolCall(approvalId, interruptId, position, message, attemptId, extra) : undefined}
             />
           );
         }

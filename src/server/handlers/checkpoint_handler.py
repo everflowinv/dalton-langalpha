@@ -287,6 +287,13 @@ WEB_CONFIRM_ACTION_TYPES: frozenset[str] = frozenset(
         "watchlist_set_tier",
         "watchlist_remove",
         "watchlist_tier_policy",
+        # DALTON-HOOK(personal-integrations): personal calendar/mail write & Google MCP elicitation confirmations
+        "dalton_google_mcp_elicitation",
+        "dalton_calendar_create_event",
+        "dalton_calendar_update_event",
+        "dalton_calendar_delete_event",
+        "dalton_mail_create_draft",
+        "dalton_mail_send",
     }
 )
 
@@ -533,9 +540,37 @@ async def _verify_web_confirm_resume(
         # An explicit decline on an expired or pre-upgrade card settles as
         # rejected rather than being rewritten to approve + scope_changed, so
         # live display and history replay agree.
+        action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
+        # DALTON-HOOK(personal-integrations): verify personal integration write & Google MCP elicitation resumes
+        if action_req.get("type") in {
+            "dalton_google_mcp_elicitation",
+            "dalton_calendar_create_event",
+            "dalton_calendar_update_event",
+            "dalton_calendar_delete_event",
+            "dalton_mail_create_draft",
+            "dalton_mail_send",
+        }:
+            from src.dalton.services.personal_integration_approval import (
+                verify_personal_integration_interrupt_resume,
+            )
+
+            ok = await verify_personal_integration_interrupt_resume(
+                thread_id=thread_id,
+                action_req=action_req,
+                answer=answers[iid],
+                principal=principal,
+                raw_request=raw_request,
+            )
+            if not ok:
+                if rewritten is None:
+                    rewritten = dict(answers)
+                rewritten[iid] = HITLResponse(
+                    decisions=[HITLDecision(type="approve")],
+                    scope_changed=True,
+                )
+            continue
         if _is_reject_answer(answers[iid]):
             continue
-        action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
         if action_req.get("type") == "dalton_report_delivery_set":
             # DALTON-HOOK(report-delivery): delegate AD5 session & confirm_token verification to src.dalton
             from src.dalton.services.report_delivery import (
