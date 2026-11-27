@@ -63,6 +63,31 @@ EXIT_CHECK_FAILED = 2
 _ERE_SPECIAL_RE = re.compile(r"([\\.^$*+?()[\]{}|])")
 _AVATAR_KEY_TAIL_RE = re.compile(r"^[^/?#]+\.[A-Za-z0-9]+$")
 _AVATAR_OBJECT_KEY_COLUMNS = ("avatar_object_key", "avatar_key")
+_RESPONSE_IMAGE_STRICT_TAIL_RE = re.compile(r"^(?:[^/?#]+/)?[0-9a-f]{12,64}/[^/?#]+$")
+_MARKDOWN_IMAGE_OR_LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)]+)\)")
+_HTML_IMG_SRC_RE = re.compile(
+    r"""<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))""",
+    re.IGNORECASE,
+)
+
+
+def _origin_from_split(parsed: Any) -> str | None:
+    """Return normalized ``scheme://host[:port]`` for an http(s) ``urlsplit`` result, or None."""
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    host_fmt = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    if port is not None and port != default_port:
+        return f"{scheme}://{host_fmt}:{port}"
+    return f"{scheme}://{host_fmt}"
 
 
 def _escape_ere(literal: str) -> str:
@@ -277,17 +302,293 @@ def _get_checkpoint_serde() -> Any:
     return _CHECKPOINT_SERDE
 
 
-def _captured_images_map_has_ref(captured: Any) -> bool:
-    """Return True iff a ``captured_images`` or ``image_capture.props.path_to_url`` map names response-images/."""
+def site_response_image_url_rules(
+    *, env: Mapping[str, str] | None = None
+) -> list[tuple[str | None, str]]:
+    """Return ``(origin_or_none, full_response_images_path_prefix)`` rules for this site/bucket.
+
+    Covers every URL base that this deployment's main bucket or site proxy can emit for
+    ``get_public_url("response-images/...")``:
+    - ``STORAGE_PUBLIC_URL_BASE`` / ``S3_PUBLIC_URL_BASE`` (absolute or site-relative ``/...``)
+    - ``PUBLIC_APP_URL`` + ``/storage``
+    - Configured S3 bucket (AWS default virtual host + ``STORAGE_ENDPOINT_URL`` /
+      ``S3_ENDPOINT_URL`` / ``STORAGE_BROWSER_ENDPOINT_URL`` in path and virtual-hosted styles)
+    - Configured OSS bucket (``OSS_BUCKET_NAME`` + ``OSS_ENDPOINT``)
+    """
+    em = os.environ if env is None else env
+    candidates: list[str] = []
+
+    for key in ("STORAGE_PUBLIC_URL_BASE", "S3_PUBLIC_URL_BASE"):
+        val = (em.get(key) or "").strip()
+        if val:
+            candidates.append(val)
+
+    public_app_url = (em.get("PUBLIC_APP_URL") or "").strip()
+    if public_app_url:
+        candidates.append(f"{public_app_url.rstrip('/')}/storage")
+
+    if "STORAGE_BUCKET_NAME" in em:
+        s3_bucket = (em.get("STORAGE_BUCKET_NAME") or "").strip()
+    else:
+        s3_bucket = (em.get("S3_BUCKET_NAME") or "").strip()
+    if s3_bucket:
+        region = (em.get("STORAGE_REGION") or em.get("S3_REGION") or "us-east-1").strip()
+        candidates.append(f"https://{s3_bucket}.s3.{region}.amazonaws.com")
+        for ep_raw in (
+            (em.get("STORAGE_ENDPOINT_URL") or "").strip()
+            or (em.get("S3_ENDPOINT_URL") or "").strip(),
+            (em.get("STORAGE_BROWSER_ENDPOINT_URL") or "").strip(),
+        ):
+            if not ep_raw:
+                continue
+            candidates.append(f"{ep_raw.rstrip('/')}/{s3_bucket}")
+            try:
+                ep = urlsplit(ep_raw.rstrip("/"))
+            except ValueError:
+                continue
+            ep_origin = _origin_from_split(ep)
+            if ep_origin is not None and ep.hostname and not ep.hostname.lower().startswith(
+                f"{s3_bucket.lower()}."
+            ):
+                ep_scheme, _, ep_hostport = ep_origin.partition("://")
+                candidates.append(f"{ep_scheme}://{s3_bucket}.{ep_hostport}{ep.path.rstrip('/')}")
+
+    oss_bucket = (em.get("OSS_BUCKET_NAME") or "").strip()
+    oss_endpoint = (em.get("OSS_ENDPOINT") or "").strip()
+    if oss_bucket and oss_endpoint:
+        if "://" in oss_endpoint:
+            try:
+                ep = urlsplit(oss_endpoint.rstrip("/"))
+            except ValueError:
+                ep = None
+            ep_origin = _origin_from_split(ep) if ep is not None else None
+            if ep is not None and ep_origin is not None:
+                ep_scheme, _, ep_hostport = ep_origin.partition("://")
+                candidates.append(f"{ep_scheme}://{oss_bucket}.{ep_hostport}{ep.path.rstrip('/')}")
+        else:
+            candidates.append(f"https://{oss_bucket}.{oss_endpoint.strip('/')}")
+
+    key_prefix = _normalize_storage_key_prefix(em)
+    rules: list[tuple[str | None, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+    for raw_base in candidates:
+        if raw_base.startswith("/") and not raw_base.startswith("//"):
+            base_path = raw_base.rstrip("/")
+            full_prefix = f"{base_path}/{key_prefix}response-images/"
+            pair: tuple[str | None, str] = (None, full_prefix)
+            if pair not in seen:
+                seen.add(pair)
+                rules.append(pair)
+            continue
+        try:
+            parsed = urlsplit(raw_base.rstrip("/"))
+        except ValueError:
+            continue
+        origin = _origin_from_split(parsed)
+        if origin is None:
+            continue
+        base_path = parsed.path.rstrip("/")
+        full_prefix = f"{base_path}/{key_prefix}response-images/"
+        pair = (origin, full_prefix)
+        if pair not in seen:
+            seen.add(pair)
+            rules.append(pair)
+    return rules
+
+
+def _is_valid_response_image_tail(tail: str, *, require_hash: bool) -> bool:
+    if not tail or tail.startswith("/"):
+        return False
+    segments = tail.split("/")
+    if any(not seg or seg in (".", "..") for seg in segments):
+        return False
+    if require_hash:
+        return bool(_RESPONSE_IMAGE_STRICT_TAIL_RE.match(tail))
+    return True
+
+
+def is_main_bucket_response_image_url(
+    url: str | None, *, env: Mapping[str, str] | None = None
+) -> bool:
+    """Return True iff ``url`` points to a main-bucket ``response-images/`` object.
+
+    Checks ONLY the parsed URL origin and path (never the query string or fragment):
+    - When site or main-bucket URL bases are configured in ``env``, requires a matching
+      origin (or site-relative path) AND matching object path prefix ending in
+      ``{key_prefix}response-images/``.
+    - When no site or main-bucket URL base is configured in ``env`` (e.g. an operator
+      already cleared ``STORAGE_*`` env vars before running ``check --strict``), falls back
+      to requiring the exact ``/{key_prefix}response-images/`` or
+      ``/storage/{key_prefix}response-images/`` object path prefix with a content-addressed
+      or legacy-batch hex key segment (``<hash>/<file>`` or ``<thread>/<hash>/<file>``).
+    - External URLs that merely contain ``response-images/`` in a query parameter never match.
+    - Malformed URLs return False without raising.
+    """
+    raw = (url or "").strip()
+    if not raw or "response-images/" not in raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    path = parsed.path or ""
+    if "response-images/" not in path:
+        return False
+
+    rules = site_response_image_url_rules(env=env)
+    if rules:
+        if parsed.scheme:
+            origin = _origin_from_split(parsed)
+            if origin is None:
+                return False
+            for rule_origin, full_prefix in rules:
+                if rule_origin == origin and path.startswith(full_prefix):
+                    if _is_valid_response_image_tail(
+                        path[len(full_prefix) :], require_hash=False
+                    ):
+                        return True
+            return False
+        if parsed.netloc or not path.startswith("/"):
+            return False
+        for _rule_origin, full_prefix in rules:
+            if path.startswith(full_prefix) and _is_valid_response_image_tail(
+                path[len(full_prefix) :], require_hash=False
+            ):
+                return True
+        return False
+
+    # Fallback when no site/main-bucket URL base is configured in env:
+    # still enforce valid http(s)/relative URL + exact root or /storage/ object prefix + hex key shape.
+    if parsed.scheme:
+        if _origin_from_split(parsed) is None:
+            return False
+    elif parsed.netloc or not path.startswith("/"):
+        return False
+    key_prefix = _normalize_storage_key_prefix(env)
+    for prefix in (f"/{key_prefix}response-images/", f"/storage/{key_prefix}response-images/"):
+        if path.startswith(prefix) and _is_valid_response_image_tail(
+            path[len(prefix) :], require_hash=True
+        ):
+            return True
+    return False
+
+
+def _captured_images_map_has_ref(
+    captured: Any, *, env: Mapping[str, str] | None = None
+) -> bool:
+    """Return True iff a ``captured_images``, ``path_to_url``, or ``images`` map names a main-bucket response image."""
     if not isinstance(captured, dict):
         return False
     return any(
-        bool(k) and isinstance(v, str) and "response-images/" in v
+        bool(k)
+        and isinstance(v, str)
+        and is_main_bucket_response_image_url(v, env=env)
         for k, v in captured.items()
     )
 
 
-def checkpoint_value_has_captured_images(value: Any) -> bool:
+def _extract_markdown_target_url(raw_target: str) -> str:
+    target = raw_target.strip()
+    if target.startswith("<"):
+        end = target.find(">")
+        if end > 1:
+            return target[1:end].strip()
+    return target.split(None, 1)[0] if target else ""
+
+
+def _text_has_main_bucket_response_image_url(
+    text: str, *, env: Mapping[str, str] | None = None
+) -> bool:
+    """Return True iff markdown embeds/links or HTML ``<img>`` tags in ``text`` reference a main-bucket response image."""
+    if not text or "response-images/" not in text:
+        return False
+    for match in _MARKDOWN_IMAGE_OR_LINK_RE.finditer(text):
+        target = _extract_markdown_target_url(match.group(3))
+        if is_main_bucket_response_image_url(target, env=env):
+            return True
+    for match in _HTML_IMG_SRC_RE.finditer(text):
+        src = match.group(1) or match.group(2) or match.group(3) or ""
+        if is_main_bucket_response_image_url(src, env=env):
+            return True
+    return False
+
+
+def _legacy_verbatim_has_response_image_ref(
+    verbatim: Any, *, env: Mapping[str, str] | None = None
+) -> bool:
+    """Return True iff ``replay_facts.legacy.verbatim`` plays back any main-bucket response image URL.
+
+    Matches ``src/server/services/history/replay/legacy.py:230-236``: joins streamed
+    ``message_chunk`` text pieces per ``(agent, id)`` before extracting markdown image/link
+    and HTML ``<img>`` URLs, and also checks any archived ``image_capture`` records.
+    """
+    if not isinstance(verbatim, list):
+        return False
+
+    grouped_texts: dict[tuple[Any, Any], list[str]] = {}
+    for stored in verbatim:
+        if not isinstance(stored, dict):
+            continue
+        event = stored.get("event")
+        data = stored.get("data")
+        if not isinstance(data, dict):
+            continue
+        if event == "message_chunk":
+            content_type = data.get("content_type")
+            content = data.get("content")
+            if content_type in ("text", None) and isinstance(content, str) and content:
+                grouped_texts.setdefault((data.get("agent"), data.get("id")), []).append(content)
+        elif event == "image_capture" or data.get("name") == "image_capture":
+            props = data.get("props")
+            if isinstance(props, dict) and _captured_images_map_has_ref(
+                props.get("path_to_url"), env=env
+            ):
+                return True
+            if _captured_images_map_has_ref(data.get("path_to_url"), env=env):
+                return True
+
+    for pieces in grouped_texts.values():
+        if _text_has_main_bucket_response_image_url("".join(pieces), env=env):
+            return True
+    return False
+
+
+def replay_facts_has_response_image_ref(
+    replay_facts: Any,
+    *,
+    include_legacy: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Structurally verify ``replay_facts`` for main-bucket response-image references.
+
+    Checks:
+    - ``replay_facts["images"]``
+    - (when ``include_legacy``) ``replay_facts["legacy"]["images"]`` and
+      ``replay_facts["legacy"]["verbatim"]``
+    """
+    facts = replay_facts
+    if isinstance(facts, str):
+        try:
+            facts = json.loads(facts)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(facts, dict):
+        return False
+    if _captured_images_map_has_ref(facts.get("images"), env=env):
+        return True
+    if include_legacy:
+        legacy_obj = facts.get("legacy")
+        if isinstance(legacy_obj, dict):
+            if _captured_images_map_has_ref(legacy_obj.get("images"), env=env):
+                return True
+            if _legacy_verbatim_has_response_image_ref(legacy_obj.get("verbatim"), env=env):
+                return True
+    return False
+
+
+def checkpoint_value_has_captured_images(
+    value: Any, *, env: Mapping[str, str] | None = None
+) -> bool:
     """Return True iff a deserialized ``messages`` checkpoint value has ``AIMessage.response_metadata.captured_images``.
 
     Matches ``ptc_agent.agent.middleware.image_capture.recorded_images`` and
@@ -298,16 +599,16 @@ def checkpoint_value_has_captured_images(value: Any) -> bool:
         return False
 
     if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
-        return checkpoint_value_has_captured_images(value.value)
+        return checkpoint_value_has_captured_images(value.value, env=env)
 
     if isinstance(value, (list, tuple)):
-        return any(checkpoint_value_has_captured_images(item) for item in value)
+        return any(checkpoint_value_has_captured_images(item, env=env) for item in value)
 
     msg_type = getattr(value, "type", None)
     if msg_type in ("ai", "AIMessageChunk") and hasattr(value, "response_metadata"):
         meta = getattr(value, "response_metadata", None)
         if isinstance(meta, dict):
-            return _captured_images_map_has_ref(meta.get("captured_images"))
+            return _captured_images_map_has_ref(meta.get("captured_images"), env=env)
         return False
 
     if isinstance(value, dict):
@@ -315,7 +616,7 @@ def checkpoint_value_has_captured_images(value: Any) -> bool:
             value.get("response_metadata"), dict
         ):
             return _captured_images_map_has_ref(
-                value["response_metadata"].get("captured_images")
+                value["response_metadata"].get("captured_images"), env=env
             )
         if (
             value.get("lc") == 1
@@ -327,12 +628,14 @@ def checkpoint_value_has_captured_images(value: Any) -> bool:
         ):
             meta = value["kwargs"].get("response_metadata")
             if isinstance(meta, dict):
-                return _captured_images_map_has_ref(meta.get("captured_images"))
+                return _captured_images_map_has_ref(meta.get("captured_images"), env=env)
 
     return False
 
 
-def checkpoint_value_has_image_capture_ui(value: Any) -> bool:
+def checkpoint_value_has_image_capture_ui(
+    value: Any, *, env: Mapping[str, str] | None = None
+) -> bool:
     """Return True iff a deserialized ``ui`` checkpoint value has a legacy ``image_capture`` record.
 
     Matches ``replay.turn._collect_image_url_map`` (``turn.py:31,232-240``).
@@ -341,15 +644,15 @@ def checkpoint_value_has_image_capture_ui(value: Any) -> bool:
         return False
 
     if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
-        return checkpoint_value_has_image_capture_ui(value.value)
+        return checkpoint_value_has_image_capture_ui(value.value, env=env)
 
     if isinstance(value, (list, tuple)):
-        return any(checkpoint_value_has_image_capture_ui(item) for item in value)
+        return any(checkpoint_value_has_image_capture_ui(item, env=env) for item in value)
 
     if isinstance(value, dict) and value.get("name") == "image_capture":
         props = value.get("props")
         if isinstance(props, dict):
-            return _captured_images_map_has_ref(props.get("path_to_url"))
+            return _captured_images_map_has_ref(props.get("path_to_url"), env=env)
 
     return False
 
@@ -377,6 +680,7 @@ def decode_and_check_checkpoint_ref(
     *,
     channel: str | None = None,
     serde: Any | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> bool:
     """Deserialize one candidate checkpoint row and verify widget ``data_ref`` or response-image refs.
 
@@ -404,15 +708,15 @@ def decode_and_check_checkpoint_ref(
     ser = serde if serde is not None else _get_checkpoint_serde()
     value = ser.loads_typed((blob_type, raw))
     if channel == "ui":
-        return checkpoint_value_has_image_capture_ui(value)
+        return checkpoint_value_has_image_capture_ui(value, env=env)
     if channel == "messages":
         return (has_data_ref and checkpoint_value_has_widget_data_ref(value)) or (
-            has_captured and checkpoint_value_has_captured_images(value)
+            has_captured and checkpoint_value_has_captured_images(value, env=env)
         )
     return (
         (has_data_ref and checkpoint_value_has_widget_data_ref(value))
-        or (has_captured and checkpoint_value_has_captured_images(value))
-        or (has_ui_capture and checkpoint_value_has_image_capture_ui(value))
+        or (has_captured and checkpoint_value_has_captured_images(value, env=env))
+        or (has_ui_capture and checkpoint_value_has_image_capture_ui(value, env=env))
     )
 
 
@@ -957,49 +1261,75 @@ STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
         where_summary="full-table batched scan: store memo namespaces with non-empty binary_ref.key",
         source_ref="migrations/versions/001_initial_schema.py:535-549; src/ptc_agent/agent/backends/langgraph_store.py:175-176; src/server/app/memo.py:566-575",
     ),
-    _build_batched_bool_spec(
+    StrictConsumerSpec(
         name="response_images_turns",
         table="public.conversation_responses",
-        table_ident="conversation_responses",
+        mode="response_images_turns",
         pk_columns=("conversation_response_id",),
-        hit_expr=(
-            "replay_facts IS NOT NULL AND ("
-            "(replay_facts ? 'images' "
-            "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
-            "AND replay_facts -> 'images' <> '{}'::jsonb "
-            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'images') AS kv "
-            "WHERE kv.value LIKE '%%response-images/%%')) "
-            "OR (replay_facts ? 'legacy' "
-            "AND jsonb_typeof(replay_facts -> 'legacy') = 'object' "
-            "AND (replay_facts -> 'legacy') ? 'images' "
+        batch_sql_first=(
+            "SELECT conversation_response_id, "
+            "CASE WHEN replay_facts IS NOT NULL AND ("
+            "(replay_facts ? 'images' AND jsonb_typeof(replay_facts -> 'images') = 'object' "
+            "AND position('response-images/' in (replay_facts -> 'images')::text) > 0) "
+            "OR (replay_facts ? 'legacy' AND jsonb_typeof(replay_facts -> 'legacy') = 'object' AND ("
+            "((replay_facts -> 'legacy') ? 'images' "
             "AND jsonb_typeof(replay_facts -> 'legacy' -> 'images') = 'object' "
-            "AND replay_facts -> 'legacy' -> 'images' <> '{}'::jsonb "
-            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'legacy' -> 'images') AS kv "
-            "WHERE kv.value LIKE '%%response-images/%%'))"
-            ")"
+            "AND position('response-images/' in (replay_facts -> 'legacy' -> 'images')::text) > 0) "
+            "OR ((replay_facts -> 'legacy') ? 'verbatim' "
+            "AND jsonb_typeof(replay_facts -> 'legacy' -> 'verbatim') = 'array')"
+            "))) THEN replay_facts ELSE NULL END AS cand_facts "
+            "FROM conversation_responses ORDER BY conversation_response_id ASC LIMIT %s"
+        ),
+        batch_sql_next=(
+            "SELECT conversation_response_id, "
+            "CASE WHEN replay_facts IS NOT NULL AND ("
+            "(replay_facts ? 'images' AND jsonb_typeof(replay_facts -> 'images') = 'object' "
+            "AND position('response-images/' in (replay_facts -> 'images')::text) > 0) "
+            "OR (replay_facts ? 'legacy' AND jsonb_typeof(replay_facts -> 'legacy') = 'object' AND ("
+            "((replay_facts -> 'legacy') ? 'images' "
+            "AND jsonb_typeof(replay_facts -> 'legacy' -> 'images') = 'object' "
+            "AND position('response-images/' in (replay_facts -> 'legacy' -> 'images')::text) > 0) "
+            "OR ((replay_facts -> 'legacy') ? 'verbatim' "
+            "AND jsonb_typeof(replay_facts -> 'legacy' -> 'verbatim') = 'array')"
+            "))) THEN replay_facts ELSE NULL END AS cand_facts "
+            "FROM conversation_responses WHERE conversation_response_id > %s "
+            "ORDER BY conversation_response_id ASC LIMIT %s"
         ),
         where_summary=(
-            "full-table batched scan: replay_facts->'images' or replay_facts->'legacy'->'images' "
-            "values referencing response-images/"
+            "full-table batched scan: replay_facts->'images', replay_facts->'legacy'->'images', "
+            "and replay_facts->'legacy'->'verbatim' structurally verified against site/main-bucket origin "
+            "and response-images/ object path prefix"
         ),
         source_ref=(
             "migrations/versions/065_replay_facts.py:25-28; src/server/services/history/replay/facts.py:48-49,181; "
-            "src/server/services/history/replay/legacy.py:97,228; src/ptc_agent/agent/middleware/image_capture.py:88-91"
+            "src/server/services/history/replay/legacy.py:97-99,217-237; src/ptc_agent/agent/middleware/image_capture.py:88-91"
         ),
     ),
-    _build_batched_bool_spec(
+    StrictConsumerSpec(
         name="response_images_subagents",
         table="public.subagent_runs",
-        table_ident="subagent_runs",
+        mode="response_images_subagents",
         pk_columns=("task_run_id",),
-        hit_expr=(
-            "replay_facts IS NOT NULL AND replay_facts ? 'images' "
+        batch_sql_first=(
+            "SELECT task_run_id, "
+            "CASE WHEN replay_facts IS NOT NULL AND replay_facts ? 'images' "
             "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
-            "AND replay_facts -> 'images' <> '{}'::jsonb "
-            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'images') AS kv "
-            "WHERE kv.value LIKE '%%response-images/%%')"
+            "AND position('response-images/' in (replay_facts -> 'images')::text) > 0 "
+            "THEN replay_facts ELSE NULL END AS cand_facts "
+            "FROM subagent_runs ORDER BY task_run_id ASC LIMIT %s"
         ),
-        where_summary="full-table batched scan: subagent_runs replay_facts->'images' referencing response-images/",
+        batch_sql_next=(
+            "SELECT task_run_id, "
+            "CASE WHEN replay_facts IS NOT NULL AND replay_facts ? 'images' "
+            "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
+            "AND position('response-images/' in (replay_facts -> 'images')::text) > 0 "
+            "THEN replay_facts ELSE NULL END AS cand_facts "
+            "FROM subagent_runs WHERE task_run_id > %s ORDER BY task_run_id ASC LIMIT %s"
+        ),
+        where_summary=(
+            "full-table batched scan: subagent_runs replay_facts->'images' structurally verified "
+            "against site/main-bucket origin and response-images/ object path prefix"
+        ),
         source_ref="migrations/versions/065_replay_facts.py:29-31; src/server/services/history/replay/facts.py:64-65; src/ptc_agent/agent/middleware/image_capture.py:88-91",
     ),
     _build_batched_bool_spec(
@@ -1230,6 +1560,60 @@ async def _run_strict_single_consumer(
                 elapsed_ms=(time.monotonic() - started) * 1000.0,
             )
 
+        if consumer.mode in ("response_images_turns", "response_images_subagents"):
+            include_legacy = consumer.mode == "response_images_turns"
+            cursor_id: Any = None
+            while True:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (batch_timeout,),
+                        )
+                        if cursor_id is None:
+                            await cur.execute(consumer.batch_sql_first, (batch_size,))
+                        else:
+                            await cur.execute(consumer.batch_sql_next, (cursor_id, batch_size))
+                        rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    _row_id, cand_facts = _extract_tuple(row, 2)
+                    scanned += 1
+                    if cand_facts is not None and replay_facts_has_response_image_ref(
+                        cand_facts, include_legacy=include_legacy, env=env
+                    ):
+                        hits += 1
+                        if stop_on_hit:
+                            _emit_progress(progress_stream, consumer, scanned, started, status="hit")
+                            return ConsumerCheckOutcome(
+                                name=consumer.name,
+                                table=consumer.table,
+                                has_references=True,
+                                hit_count=hits,
+                                scanned_rows=scanned,
+                                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            )
+                cursor_id = _extract_tuple(rows[-1], 1)[0]
+                _emit_progress(progress_stream, consumer, scanned, started)
+                if len(rows) < batch_size:
+                    break
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if hits else "clean",
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=hits > 0,
+                hit_count=hits,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
         if consumer.mode == "turn_slices":
             cursor_id: Any = None
             sql_first = (
@@ -1352,7 +1736,7 @@ async def _run_strict_single_consumer(
                         cand_channel = None
                     scanned += 1
                     if cand_blob is not None and decode_and_check_checkpoint_ref(
-                        cand_type, cand_blob, channel=cand_channel, serde=serde
+                        cand_type, cand_blob, channel=cand_channel, serde=serde, env=env
                     ):
                         hits += 1
                         if stop_on_hit:

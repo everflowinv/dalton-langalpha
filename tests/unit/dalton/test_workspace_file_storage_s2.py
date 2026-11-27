@@ -2932,11 +2932,12 @@ class TestStep2Round4Fixes:
             [{"id": "ui-other", "name": "model_fallback", "props": {"reason": "rate_limit"}}]
         )
 
-        # Also verify response_images_turns SQL covers replay_facts->'legacy'->'images'
+        # Also verify response_images_turns SQL covers replay_facts->'legacy'->'images' and 'verbatim'
         turns_spec = next(
             c for c in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS if c.name == "response_images_turns"
         )
         assert "replay_facts -> 'legacy' -> 'images'" in turns_spec.batch_sql_first
+        assert "replay_facts -> 'legacy' -> 'verbatim'" in turns_spec.batch_sql_first
 
         def _make_handler(
             *,
@@ -3332,3 +3333,321 @@ class TestStep2Round4Fixes:
             assert tok not in rec_msg.msg
             assert "?" not in rec_msg.msg
             assert expected_path in rec_msg.msg
+
+
+class TestStep2Round5Fixes:
+    """Targeted regression tests for Codex round-4 review fixes:
+    1. ``replay_facts.legacy.verbatim`` response-image scanning in ``check --strict``.
+    2. Origin (site / main bucket) + object-path-prefix verification for response-image URLs
+       (external URLs with ``response-images/`` only in query strings never trigger false positives).
+    """
+
+    def test_r5_response_image_url_checks_origin_and_object_path_prefix(self) -> None:
+        site_env = {
+            "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
+            "STORAGE_KEY_PREFIX": "prod",
+        }
+        # Valid site origin + configured prefix + response-images/ object key -> True
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://app.example.com/storage/prod/response-images/t1/0123456789abcdef/chart.png",
+                env=site_env,
+            )
+            is True
+        )
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://APP.EXAMPLE.COM:443/storage/prod/response-images/0123456789abcdef/chart.png?v=1",
+                env=site_env,
+            )
+            is True
+        )
+        # Site-relative URL matching configured path prefix -> True
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "/storage/prod/response-images/t1/0123456789abcdef/chart.png",
+                env=site_env,
+            )
+            is True
+        )
+
+        # External URL with response-images/ ONLY in query string -> False (both with env and env={})
+        ext_query_urls = [
+            "https://external.example.com/page?next=response-images/t1/0123456789abcdef/chart.png",
+            "https://external.example.com/view?img=https://app.example.com/storage/prod/response-images/t1/0123456789abcdef/chart.png",
+            "https://app.example.com/storage/prod/other?ref=response-images/t1/0123456789abcdef/chart.png",
+            "https://app.example.com/storage/prod/page#response-images/t1/0123456789abcdef/chart.png",
+        ]
+        for url in ext_query_urls:
+            assert storage_refs.is_main_bucket_response_image_url(url, env=site_env) is False
+            assert storage_refs.is_main_bucket_response_image_url(url, env={}) is False
+
+        # External origin even with matching path prefix -> False when site/bucket env is configured
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://other.example.com/storage/prod/response-images/t1/0123456789abcdef/chart.png",
+                env=site_env,
+            )
+            is False
+        )
+        # Same origin with wrong path prefix or missing/wrong STORAGE_KEY_PREFIX -> False
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://app.example.com/storage/response-images/t1/0123456789abcdef/chart.png",
+                env=site_env,
+            )
+            is False
+        )
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://app.example.com/other/prod/response-images/t1/0123456789abcdef/chart.png",
+                env=site_env,
+            )
+            is False
+        )
+        # Path traversal or empty object tail or malformed URL -> False
+        for bad_url in (
+            "https://app.example.com/storage/prod/response-images/",
+            "https://app.example.com/storage/prod/response-images/../secret.png",
+            "https://[invalid/storage/prod/response-images/t1/0123456789abcdef/chart.png",
+        ):
+            assert storage_refs.is_main_bucket_response_image_url(bad_url, env=site_env) is False
+
+        # Main-bucket S3 + MinIO endpoint origins
+        s3_env = {
+            "STORAGE_BUCKET_NAME": "dalton-main",
+            "STORAGE_REGION": "us-east-1",
+            "STORAGE_ENDPOINT_URL": "http://minio:9000",
+        }
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "http://minio:9000/dalton-main/response-images/t1/0123456789abcdef/a.png",
+                env=s3_env,
+            )
+            is True
+        )
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "https://dalton-main.s3.us-east-1.amazonaws.com/response-images/t1/0123456789abcdef/a.png",
+                env=s3_env,
+            )
+            is True
+        )
+        assert (
+            storage_refs.is_main_bucket_response_image_url(
+                "http://minio:9000/other-bucket/response-images/t1/0123456789abcdef/a.png",
+                env=s3_env,
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_r5_strict_audit_scans_legacy_verbatim_and_rejects_external_query_urls(
+        self,
+    ) -> None:
+        """``check --strict`` detects main-bucket images stored ONLY in
+        ``replay_facts.legacy.verbatim`` (including chunk-split URLs) while returning exit 0
+        when only external/query-string URLs appear across ``replay_facts``, ``subagent_runs``,
+        and checkpoint blobs/writes.
+        """
+        from langchain_core.messages import AIMessage
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+        serde = JsonPlusSerializer()
+        site_env = {"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"}
+
+        ext_query_url = (
+            "https://external.example.com/viewer?next=response-images/t1/0123456789abcdef/a.png"
+        )
+        foreign_origin_url = (
+            "https://other.example.com/storage/response-images/t1/0123456789abcdef/a.png"
+        )
+        real_site_url = (
+            "https://app.example.com/storage/response-images/t1/0123456789abcdef/chart.png"
+        )
+
+        # Checkpoint AIMessage & UI record holding ONLY external query-string / foreign-origin URLs
+        ext_ai = AIMessage(
+            id="ai-ext",
+            content="![x](charts/x.png)",
+            response_metadata={
+                "captured_images": {
+                    "charts/x.png": ext_query_url,
+                    "charts/y.png": foreign_origin_url,
+                }
+            },
+        )
+        ext_ai_type, ext_ai_blob = serde.dumps_typed([ext_ai])
+        ext_ui_type, ext_ui_blob = serde.dumps_typed(
+            [
+                {
+                    "id": "ui-ext",
+                    "name": "image_capture",
+                    "props": {"path_to_url": {"charts/x.png": ext_query_url}},
+                }
+            ]
+        )
+
+        def _make_handler(
+            *,
+            resp_rows: list[tuple[Any, Any]] | None = None,
+            sub_rows: list[tuple[Any, Any]] | None = None,
+            blob_rows: list[tuple[Any, ...]] | None = None,
+            write_rows: list[tuple[Any, ...]] | None = None,
+        ) -> Any:
+            r_rows = list(resp_rows or [])
+            s_rows = list(sub_rows or [])
+            b_rows = list(blob_rows or [])
+            w_rows = list(write_rows or [])
+
+            def _handler(sql: str, params: Any = None) -> Any:
+                if sql.startswith("SELECT set_config"):
+                    return ("30s",)
+                if sql.startswith("SELECT to_regclass"):
+                    return (params[0],)
+                if "FROM pg_attribute" in sql:
+                    return None
+                if sql.startswith("SELECT EXISTS"):
+                    return (False,)
+                if "FROM conversation_responses" in sql:
+                    limit = int(params[-1])
+                    if "WHERE conversation_response_id >" in sql:
+                        return [r for r in r_rows if r[0] > params[0]][:limit]
+                    return r_rows[:limit]
+                if "FROM subagent_runs" in sql:
+                    limit = int(params[-1])
+                    if "WHERE task_run_id >" in sql:
+                        return [r for r in s_rows if r[0] > params[0]][:limit]
+                    return s_rows[:limit]
+                if "FROM checkpoint_blobs" in sql:
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        return [r for r in b_rows if r[:4] > tuple(params[:-1])][:limit]
+                    return b_rows[:limit]
+                if "FROM checkpoint_writes" in sql:
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        return [r for r in w_rows if r[:5] > tuple(params[:-1])][:limit]
+                    return w_rows[:limit]
+                return []
+
+            return _handler
+
+        # Case 1: External query-string + foreign-origin URLs everywhere -> exit 0
+        clean_report = await storage_refs.run_strict_main_bucket_check(
+            conn=_FakeProbeConn(
+                _make_handler(
+                    resp_rows=[
+                        (
+                            "resp-1",
+                            {
+                                "images": {"a.png": ext_query_url},
+                                "legacy": {
+                                    "v": 3,
+                                    "images": {"b.png": foreign_origin_url},
+                                    "verbatim": [
+                                        {
+                                            "event": "message_chunk",
+                                            "data": {
+                                                "id": "lc-1",
+                                                "agent": "main",
+                                                "content_type": "text",
+                                                "content": (
+                                                    f"See [link]({ext_query_url}) and "
+                                                    f"![ext]({foreign_origin_url})"
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                },
+                            },
+                        )
+                    ],
+                    sub_rows=[("run-1", {"images": {"s.png": ext_query_url}})],
+                    blob_rows=[
+                        ("t-1", "", "messages", "v1", ext_ai_type, ext_ai_blob, "messages"),
+                        ("t-1", "", "ui", "v1", ext_ui_type, ext_ui_blob, "ui"),
+                    ],
+                    write_rows=[
+                        ("t-1", "", "cp1", "task1", 0, ext_ai_type, ext_ai_blob, "messages"),
+                    ],
+                )
+            ),
+            env=site_env,
+        )
+        assert clean_report.exit_code == storage_refs.EXIT_CLEAN
+        assert clean_report.confirmed_hits == []
+
+        # Case 2: Main-bucket response image ONLY in replay_facts.legacy.verbatim -> exit 1
+        verbatim_report = await storage_refs.run_strict_main_bucket_check(
+            conn=_FakeProbeConn(
+                _make_handler(
+                    resp_rows=[
+                        (
+                            "resp-verbatim",
+                            {
+                                "legacy": {
+                                    "v": 3,
+                                    "verbatim": [
+                                        {
+                                            "event": "message_chunk",
+                                            "data": {
+                                                "id": "lc-v1",
+                                                "agent": "main",
+                                                "content_type": "text",
+                                                "content": f"Here is the chart: ![rev]({real_site_url})",
+                                            },
+                                        }
+                                    ],
+                                }
+                            },
+                        )
+                    ]
+                )
+            ),
+            env=site_env,
+        )
+        assert verbatim_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+        assert verbatim_report.confirmed_hits == ["response_images_turns"]
+
+        # Case 3: Chunk-split URL across two message_chunk rows in legacy.verbatim -> exit 1
+        split_idx = real_site_url.index("response-images/") + 9
+        chunk_split_report = await storage_refs.run_strict_main_bucket_check(
+            conn=_FakeProbeConn(
+                _make_handler(
+                    resp_rows=[
+                        (
+                            "resp-split",
+                            {
+                                "legacy": {
+                                    "v": 3,
+                                    "verbatim": [
+                                        {
+                                            "event": "message_chunk",
+                                            "data": {
+                                                "id": "lc-split",
+                                                "agent": "main",
+                                                "content_type": "text",
+                                                "content": f"![chart]({real_site_url[:split_idx]}",
+                                            },
+                                        },
+                                        {
+                                            "event": "message_chunk",
+                                            "data": {
+                                                "id": "lc-split",
+                                                "agent": "main",
+                                                "content_type": "text",
+                                                "content": f"{real_site_url[split_idx:]})",
+                                            },
+                                        },
+                                    ],
+                                }
+                            },
+                        )
+                    ]
+                )
+            ),
+            env=site_env,
+        )
+        assert chunk_split_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+        assert chunk_split_report.confirmed_hits == ["response_images_turns"]

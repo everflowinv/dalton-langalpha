@@ -361,19 +361,22 @@ async def test_startup_warning_and_strict_check_real_pg(
 async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
     disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema
 ):
-    """Real PostgreSQL verification for round-4 fixes:
-    1. ``workspace_files`` startup UNION probe executes cleanly with both blob and pack rows.
-    2. ``check --strict`` detects response images stored ONLY in checkpoint ``captured_images``
-       and legacy ``image_capture`` UI records (exit 1), even with ``replay_facts`` empty.
+    """Real PostgreSQL verification for round-4 & round-5 fixes:
+    1. ``workspace_files`` startup UNION probe executes cleanly with valid blob-only and pack-only
+       pointer rows (honoring ``chk_workspace_files_one_pointer``).
+    2. ``check --strict`` detects response images stored ONLY in checkpoint ``captured_images``,
+       legacy ``image_capture`` UI records, and ``replay_facts.legacy.verbatim`` (exit 1),
+       while ignoring external URLs that merely contain ``response-images/`` in query strings (exit 0).
     3. Malformed ``users.avatar_url`` does not fail strict audit with exit 2.
     """
     uid: str | None = None
     ws_id: str | None = None
     f_blob_id = str(uuid.uuid4())
     f_pack_id = str(uuid.uuid4())
-    f_both_id = str(uuid.uuid4())
     thread_id = str(uuid.uuid4())
+    resp_id = str(uuid.uuid4())
     serde = JsonPlusSerializer()
+    site_env = {"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"}
 
     async with await psycopg.AsyncConnection.connect(
         test_db_uri, autocommit=True, row_factory=dict_row
@@ -392,26 +395,24 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                     )
                     await cur.execute("DELETE FROM workspace_file_blobs")
 
-                # 1. Startup UNION probe on real PG with blob-only, pack-only, and both-set rows
+                # 1. Startup UNION probe on real PG with two valid mutually-exclusive pointer rows
                 d1 = hashlib.sha256(b"blob-only").hexdigest()
                 d2 = hashlib.sha256(b"pack-only").hexdigest()
-                d3 = hashlib.sha256(b"both-set").hexdigest()
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
                         INSERT INTO workspace_files (
                             workspace_file_id, workspace_id, file_path, file_name,
-                            file_size, content_hash, blob_sha256, pack_sha256, is_binary, kind
+                            file_size, content_hash, blob_sha256, pack_sha256, pack_offset,
+                            is_binary, kind
                         )
                         VALUES
-                            (%s::uuid, %s::uuid, 'a.bin', 'a.bin', 9, %s, %s, NULL, TRUE, 'file'),
-                            (%s::uuid, %s::uuid, 'b.bin', 'b.bin', 9, %s, NULL, %s, TRUE, 'file'),
-                            (%s::uuid, %s::uuid, 'c.bin', 'c.bin', 8, %s, %s, %s, TRUE, 'file')
+                            (%s::uuid, %s::uuid, 'a.bin', 'a.bin', 9, %s, %s, NULL, NULL, TRUE, 'file'),
+                            (%s::uuid, %s::uuid, 'b.bin', 'b.bin', 9, %s, NULL, %s, 0, TRUE, 'file')
                         """,
                         (
                             f_blob_id, ws_id, d1, d1,
                             f_pack_id, ws_id, d2, d2,
-                            f_both_id, ws_id, d3, d3, d3,
                         ),
                     )
 
@@ -419,12 +420,12 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                 ws_out = next(o for o in outcomes if o.name == "workspace_files")
                 assert ws_out.error is None, f"workspace_files UNION probe failed: {ws_out.error}"
                 assert ws_out.has_references is True
-                assert ws_out.hit_count == 3
+                assert ws_out.hit_count == 2
 
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid, %s::uuid)",
-                        (f_blob_id, f_pack_id, f_both_id),
+                        "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid)",
+                        (f_blob_id, f_pack_id),
                     )
 
                 # 2. Malformed avatar_url does NOT make strict audit return exit 2
@@ -436,12 +437,122 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                 malformed_report = await storage_refs.run_strict_main_bucket_check(
                     conn=conn,
                     batch_size=50,
-                    env={"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"},
+                    env=site_env,
                 )
                 assert malformed_report.exit_code == storage_refs.EXIT_CLEAN
                 assert malformed_report.errors == []
 
-                # 3. Reference ONLY in checkpoint_blobs AIMessage.response_metadata.captured_images -> exit 1
+                # 3. External URL with response-images/ only in query string (checkpoint + verbatim) -> exit 0
+                ext_cap_msg = AIMessage(
+                    id="ai-pg-ext-query",
+                    content="See ![ext](charts/ext.png)",
+                    response_metadata={
+                        "captured_images": {
+                            "charts/ext.png": f"https://external.example.com/view?next=response-images/{thread_id}/0123456789abcdef/ext.png"
+                        }
+                    },
+                )
+                ext_type, ext_blob = serde.dumps_typed([ext_cap_msg])
+                ext_verbatim_facts = {
+                    "legacy": {
+                        "v": 3,
+                        "verbatim": [
+                            {
+                                "event": "message_chunk",
+                                "data": {
+                                    "id": "lc-ext-1",
+                                    "agent": "main",
+                                    "content_type": "text",
+                                    "content": (
+                                        f"![ext](https://external.example.com/page?img=response-images/{thread_id}/0123456789abcdef/ext.png) "
+                                        f"![other-origin](https://other.example.com/storage/response-images/{thread_id}/0123456789abcdef/other.png)"
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO conversation_threads (
+                            conversation_thread_id, workspace_id, thread_index,
+                            current_status, created_at, updated_at
+                        )
+                        VALUES (%s::uuid, %s::uuid, 1, 'completed', NOW(), NOW())
+                        """,
+                        (thread_id, ws_id),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO conversation_responses (
+                            conversation_response_id, conversation_thread_id,
+                            turn_index, status, replay_facts, created_at
+                        )
+                        VALUES (%s::uuid, %s::uuid, 1, 'completed', %s::jsonb, NOW())
+                        """,
+                        (resp_id, thread_id, json.dumps(ext_verbatim_facts)),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO checkpoint_blobs (
+                            thread_id, checkpoint_ns, channel, version, type, blob
+                        )
+                        VALUES (%s, '', 'messages', 'v-ext-1', %s, %s)
+                        """,
+                        (thread_id, ext_type, ext_blob),
+                    )
+                ext_report = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50, env=site_env
+                )
+                assert ext_report.exit_code == storage_refs.EXIT_CLEAN
+                assert ext_report.confirmed_hits == []
+
+                # 4. Reference ONLY in replay_facts.legacy.verbatim (site origin + object path) -> exit 1
+                real_verbatim_facts = {
+                    "legacy": {
+                        "v": 3,
+                        "verbatim": [
+                            {
+                                "event": "message_chunk",
+                                "data": {
+                                    "id": "lc-hit-1",
+                                    "agent": "main",
+                                    "content_type": "text",
+                                    "content": (
+                                        f"![chart](https://app.example.com/storage/response-images/{thread_id}/0123456789abcdef/chart.png)"
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
+                        (thread_id,),
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE conversation_responses
+                        SET replay_facts = %s::jsonb
+                        WHERE conversation_response_id = %s::uuid
+                        """,
+                        (json.dumps(real_verbatim_facts), resp_id),
+                    )
+                verbatim_report = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50, env=site_env
+                )
+                assert verbatim_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "response_images_turns" in verbatim_report.confirmed_hits
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE conversation_responses SET replay_facts = NULL WHERE conversation_response_id = %s::uuid",
+                        (resp_id,),
+                    )
+
+                # 5. Reference ONLY in checkpoint_blobs AIMessage.response_metadata.captured_images -> exit 1
                 cap_msg = AIMessage(
                     id="ai-pg-cap",
                     content="See ![plot](charts/plot.png)",
@@ -463,7 +574,7 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                         (thread_id, c_type, c_blob),
                     )
                 cap_report = await storage_refs.run_strict_main_bucket_check(
-                    conn=conn, batch_size=50
+                    conn=conn, batch_size=50, env=site_env
                 )
                 assert cap_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
                 assert "widgets_checkpoint_blobs" in cap_report.confirmed_hits
@@ -474,7 +585,7 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                         (thread_id,),
                     )
 
-                # 4. Reference ONLY in checkpoint_writes legacy image_capture UI record -> exit 1
+                # 6. Reference ONLY in checkpoint_writes legacy image_capture UI record -> exit 1
                 ui_type, ui_blob = serde.dumps_typed(
                     [
                         {
@@ -500,7 +611,7 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                         (thread_id, ui_type, ui_blob),
                     )
                 ui_report = await storage_refs.run_strict_main_bucket_check(
-                    conn=conn, batch_size=50
+                    conn=conn, batch_size=50, env=site_env
                 )
                 assert ui_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
                 assert "widgets_checkpoint_writes" in ui_report.confirmed_hits
@@ -515,8 +626,16 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                     (thread_id,),
                 )
                 await cur.execute(
-                    "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid, %s::uuid)",
-                    (f_blob_id, f_pack_id, f_both_id),
+                    "DELETE FROM conversation_responses WHERE conversation_response_id = %s::uuid",
+                    (resp_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                    (thread_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid)",
+                    (f_blob_id, f_pack_id),
                 )
                 if ws_id:
                     await cur.execute(
