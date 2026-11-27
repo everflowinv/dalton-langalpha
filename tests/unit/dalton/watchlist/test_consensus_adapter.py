@@ -2357,16 +2357,17 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
         today_fn=lambda: date(2026, 11, 26),
     )
     lse_val = await adapter_lse.get_valuation("LSE1.L", latest_price=2000.0, quote_currency="GBp")
-    assert lse_val["status"] == "ok"
+    # EPS units are merged per source (FY1 £1, FY2 200p -> £2), but a subunit-quoted
+    # price scale cannot be verified (snapshots may already be in pounds), so the
+    # valuation renders "—" instead of a P/E that may be 100x off.
+    assert lse_val["status"] == "unit_unverified"
     assert lse_val["estimate_currency"] == "GBP"
     assert lse_val["quote_currency"] == "GBP"
-    assert lse_val["fy1_end"] == "2026-12-31"
     assert lse_val["fy1_eps"] == 1.0
-    assert lse_val["fy2_end"] == "2027-12-31"
     assert lse_val["fy2_eps"] == 2.0
-    assert lse_val["pe_fy1"] == 20.0
-    assert lse_val["pe_fy2"] == 10.0
-    assert lse_val["eps_growth_fy2"] == 100.0
+    assert lse_val["pe_fy1"] is None
+    assert lse_val["pe_fy2"] is None
+    assert lse_val["eps_growth_fy2"] is None
     assert lse_val["provider"] == "yfinance+fmp"
 
     # 2. Other subunit quote pairs: ZAc/ZAR and ILA/ILS
@@ -2407,12 +2408,11 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
             latest_price=2000.0,
             quote_currency_override=sub_ccy,
         )
-        assert val_sub["status"] == "ok"
+        assert val_sub["status"] == "unit_unverified"
         assert val_sub["estimate_currency"] == maj_ccy
         assert val_sub["quote_currency"] == maj_ccy
-        assert val_sub["pe_fy1"] == 20.0
-        assert val_sub["pe_fy2"] == 10.0
-        assert val_sub["eps_growth_fy2"] == 100.0
+        assert merged_sub.fy1_eps == 1.0 and merged_sub.fy2_eps == 2.0  # Yahoo 200 subunits -> 2.0 major
+        assert val_sub["pe_fy1"] is None and val_sub["pe_fy2"] is None
 
     # 3. Indeterminate currency unit on FMP FY1 (missing reportedCurrency) -> FY1 displays `—` (unit_unverified), Yahoo FY2 stays valid!
     fmp_no_ccy = create_autospec(FMPClient, instance=True)
@@ -2422,13 +2422,13 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
     ]
     fmp_no_ccy.get_income_statement.return_value = [{"date": "2025-12-31"}]  # missing reportedCurrency
     fmp_no_ccy.get_profile.return_value = [
-        {"symbol": "LSE2.L", "currency": "GBp", "companyName": "London Unverified FY1", "isAdr": False}
+        {"symbol": "LSE2.L", "currency": "GBP", "companyName": "London Unverified FY1", "isAdr": False}
     ]
     adapter_unv = consensus_mod.WatchlistConsensusAdapter(
         fmp_client=fmp_no_ccy,
         today_fn=lambda: date(2026, 11, 26),
     )
-    unv_fy1 = await adapter_unv.get_valuation("LSE2.L", latest_price=2000.0, quote_currency="GBp")
+    unv_fy1 = await adapter_unv.get_valuation("LSE2.L", latest_price=20.0, quote_currency="GBP")
     assert unv_fy1["fy1_end"] == "2026-12-31"
     assert unv_fy1["fy1_eps"] is None
     assert unv_fy1["pe_fy1"] is None
@@ -2450,7 +2450,7 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
             fy1_end="2027-12-31",
             fy2_end=None,
             estimate_currency="USc",  # unknown subunit -> indeterminate unit
-            quote_currency="GBp",
+            quote_currency="GBP",
             analyst_count=10,
             provider="yfinance",
         ),
@@ -2461,7 +2461,7 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
             fy1_end="2026-12-31",
             fy2_end=None,
             estimate_currency="GBP",
-            quote_currency="GBp",
+            quote_currency="GBP",
             analyst_count=12,
             provider="fmp",
         ),
@@ -2472,8 +2472,8 @@ async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unkn
     val_primary_unv = consensus_mod._compute_valuation_from_record(
         merged_primary_unv,
         symbol="LSE3.L",
-        latest_price=2000.0,
-        quote_currency_override="GBp",
+        latest_price=20.0,
+        quote_currency_override="GBP",
     )
     assert val_primary_unv["pe_fy1"] == 20.0
     assert val_primary_unv["pe_fy1_status"] == "ok"

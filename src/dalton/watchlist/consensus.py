@@ -1959,6 +1959,17 @@ def _compute_valuation_from_record(
     # Never fall back to quote currency when estimate_currency is absent!
     est_ccy, est_scale = _normalize_currency(record.estimate_currency)
 
+    # Subunit-quoted listings (GBp/ZAc/ILA): upstream snapshots may already have
+    # converted the price to the major unit without saying so, so the price
+    # scale cannot be verified. Show "—" rather than a P/E that may be 100x off.
+    if q_scale != 1:
+        return _empty_payload(
+            "unit_unverified",
+            reason="报价以辅币单位计价，价格口径无法核实",
+            est_ccy=est_ccy,
+            q_ccy=q_ccy,
+        )
+
     if record.fy1_eps is None and record.fy2_eps is None:
         if is_rate_limited:
             return _empty_payload(
