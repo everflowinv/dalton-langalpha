@@ -560,6 +560,10 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # Personal calendar & mail integrations Batch 1 (r1): START/HTTP/Fork purge gates,
+  # FOR SHARE dual-generation writeback fences (replay, search, transcripts), closed-range
+  # search guard & truncate/fork clipping, startup purge resume, and callback query redaction.
+  "personal-integrations"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

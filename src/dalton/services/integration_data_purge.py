@@ -1,0 +1,1759 @@
+"""Scheme 2A online personal-integration data purger (6 layers) and startup resume (§4.5(2)).
+
+Re-entrant and idempotent: every layer can safely run again after a crash and
+resume from ``dalton_integration_purge_ledger WHERE local_purge_status = 'running'``.
+State lives exclusively in PostgreSQL; no process-local truth is kept.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
+import logging
+import os
+import time
+from typing import Any
+
+import anyio
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.serde.types import _DeltaSnapshot
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+from ptc_agent.agent.middleware.background_subagent.redis_stream import (
+    legacy_task_events_key,
+    run_stream_key,
+    task_meta_key,
+    task_stream_key,
+)
+from ptc_agent.agent.middleware.compaction.utils import (
+    COMPACTION_SUMMARY_KEY,
+    SIDECAR_KEY,
+    SUMMARIZED_KEY,
+)
+from src.dalton.database import user_integrations as db
+from src.dalton.database.user_integrations import (
+    LocalPurgeStatus,
+    PurgeLedgerRow,
+)
+from src.server.contracts.status import Stopper
+from src.server.database.pool import get_db_connection
+from src.server.database.runs import lifecycle as run_lifecycle
+from src.server.services import writer_guard
+from src.server.services.runs.cancel import publish_cancel_nudge
+from src.server.services.runs.stream_writer import stream_key, stream_meta_key
+from src.server.utils.checkpoint_helpers import get_checkpointer
+
+logger = logging.getLogger(__name__)
+
+PURGED_PLACEHOLDER = "[已因断开个人连接清除相关个人数据]"
+PURGED_TOOL_ARGS: dict[str, Any] = {"_purged": True}
+PURGED_TOOL_ARGS_JSON = '{"_purged": true}'
+
+TrackerPurgeHandler = Callable[[PurgeLedgerRow], Awaitable[bool]]
+
+# Extension point registered by Step 4 (earnings tracker calendar cleanup).
+_tracker_purge_handler: TrackerPurgeHandler | None = None
+
+
+def register_tracker_purge_handler(handler: TrackerPurgeHandler | None) -> None:
+    """Register (or clear with ``None``) the Step 4 tracker calendar purge handler."""
+    global _tracker_purge_handler
+    _tracker_purge_handler = handler
+
+
+def get_tracker_purge_handler() -> TrackerPurgeHandler | None:
+    return _tracker_purge_handler
+
+
+@dataclass
+class LocalPurgeReport:
+    purge_id: str
+    skipped: bool = False
+    threads_purged: list[str] = field(default_factory=list)
+    checkpoints_updated: int = 0
+    queries_redacted: int = 0
+    steerings_redacted: int = 0
+    outbox_rows_redacted: int = 0
+    redis_keys_deleted: int = 0
+    transcripts_deleted: int = 0
+    search_rows_cleared: int = 0
+    cards_deleted: int = 0
+    store_rows_deleted: int = 0
+    approvals_deleted: int = 0
+    tracker_reconcile_needed: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Pure Scheme 2A message / UI / interrupt redaction helpers (Layer 1)
+# ---------------------------------------------------------------------------
+
+
+def redact_tool_call_dict(tc: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite a LangChain ``tool_calls`` entry's args to ``{"_purged": True}``,
+    preserving ``id``, ``name``, and ``type`` for replay pairing.
+    """
+    out: dict[str, Any] = {
+        "name": tc.get("name", ""),
+        "args": dict(PURGED_TOOL_ARGS),
+        "id": tc.get("id"),
+        "type": tc.get("type", "tool_call"),
+    }
+    return out
+
+
+def redact_invalid_tool_call_dict(tc: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite an ``invalid_tool_calls`` entry's args, preserving ``id``, ``name``, ``type``."""
+    return {
+        "name": tc.get("name", ""),
+        "args": PURGED_TOOL_ARGS_JSON,
+        "id": tc.get("id"),
+        "error": None,
+        "type": tc.get("type", "invalid_tool_call"),
+    }
+
+
+def redact_additional_kwargs_tool_calls(raw_tcs: list[Any]) -> list[Any]:
+    """Rewrite OpenAI-style ``additional_kwargs['tool_calls']`` arguments."""
+    out: list[Any] = []
+    for item in raw_tcs:
+        if not isinstance(item, Mapping):
+            out.append(item)
+            continue
+        new_item: dict[str, Any] = {
+            k: v for k, v in item.items() if k in ("id", "type", "index")
+        }
+        fn = item.get("function")
+        if isinstance(fn, Mapping):
+            new_item["function"] = {
+                "name": fn.get("name", ""),
+                "arguments": PURGED_TOOL_ARGS_JSON,
+            }
+        elif "args" in item:
+            new_item["args"] = dict(PURGED_TOOL_ARGS)
+        out.append(new_item)
+    return out
+
+
+def redact_content_blocks(content: Any) -> Any:
+    """Redact string or multimodal/structured content blocks to ``PURGED_PLACEHOLDER``
+    while keeping tool-use block pairing metadata (``id``, ``name``, ``type``).
+    """
+    if isinstance(content, str):
+        return PURGED_PLACEHOLDER
+    if not isinstance(content, list):
+        return PURGED_PLACEHOLDER
+    out: list[Any] = []
+    for block in content:
+        if isinstance(block, str):
+            out.append(PURGED_PLACEHOLDER)
+            continue
+        if not isinstance(block, Mapping):
+            out.append(PURGED_PLACEHOLDER)
+            continue
+        btype = str(block.get("type") or "")
+        if btype in ("tool_use", "server_tool_use", "tool_call"):
+            cleaned: dict[str, Any] = {"type": btype}
+            if "id" in block:
+                cleaned["id"] = block["id"]
+            if "name" in block:
+                cleaned["name"] = block["name"]
+            if "args" in block and "input" not in block:
+                cleaned["args"] = dict(PURGED_TOOL_ARGS)
+            else:
+                cleaned["input"] = dict(PURGED_TOOL_ARGS)
+            out.append(cleaned)
+        elif btype in ("thinking", "reasoning", "redacted_thinking"):
+            cleaned = {"type": btype}
+            if "thinking" in block or btype == "thinking":
+                cleaned["thinking"] = PURGED_PLACEHOLDER
+            elif "reasoning" in block or btype == "reasoning":
+                cleaned["reasoning"] = PURGED_PLACEHOLDER
+            if "text" in block:
+                cleaned["text"] = PURGED_PLACEHOLDER
+            if "summary" in block:
+                cleaned["summary"] = [{"type": "summary_text", "text": PURGED_PLACEHOLDER}]
+            out.append(cleaned)
+        elif btype == "tool_result":
+            cleaned = {"type": btype, "content": PURGED_PLACEHOLDER}
+            if "tool_use_id" in block:
+                cleaned["tool_use_id"] = block["tool_use_id"]
+            out.append(cleaned)
+        else:
+            cleaned = {"type": btype or "text", "text": PURGED_PLACEHOLDER}
+            out.append(cleaned)
+    return out
+
+
+def _is_summary_msg(msg: Any) -> bool:
+    if isinstance(msg, BaseMessage):
+        ak = msg.additional_kwargs or {}
+        return ak.get("lc_source") == "summarization"
+    if isinstance(msg, Mapping):
+        ak = msg.get("additional_kwargs") or {}
+        return isinstance(ak, Mapping) and ak.get("lc_source") == "summarization"
+    return False
+
+
+def _summary_span_overlaps(msg: Any, min_turn: int, max_turn: int) -> bool:
+    """Return True if a compaction summary message covers any turn in ``[min_turn, max_turn]``."""
+    ak = (
+        (msg.additional_kwargs or {})
+        if isinstance(msg, BaseMessage)
+        else (msg.get("additional_kwargs") or {})
+        if isinstance(msg, Mapping)
+        else {}
+    )
+    stamp = ak.get(SUMMARIZED_KEY) if isinstance(ak, Mapping) else None
+    if not isinstance(stamp, Mapping):
+        return False
+    span = stamp.get("span")
+    if (
+        isinstance(span, (list, tuple))
+        and len(span) == 2
+        and isinstance(span[0], int)
+        and isinstance(span[1], int)
+    ):
+        return int(span[1]) >= min_turn and int(span[0]) <= max_turn
+    return False
+
+
+def _msg_id(msg: Any) -> str | None:
+    if isinstance(msg, BaseMessage):
+        return str(msg.id) if msg.id is not None else None
+    if isinstance(msg, Mapping):
+        raw = msg.get("id")
+        return str(raw) if raw is not None else None
+    return None
+
+
+def _context_summary_id(msg: Any) -> str | None:
+    rm = (
+        (msg.response_metadata or {})
+        if isinstance(msg, BaseMessage)
+        else (msg.get("response_metadata") or {})
+        if isinstance(msg, Mapping)
+        else {}
+    )
+    cs = rm.get(COMPACTION_SUMMARY_KEY) if isinstance(rm, Mapping) else None
+    if isinstance(cs, Mapping) and cs.get("summary_message_id"):
+        return str(cs["summary_message_id"])
+    return None
+
+
+def _redact_context_summary_dict(cs: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(cs)
+    out["summary_text"] = PURGED_PLACEHOLDER
+    out["summary_length"] = len(PURGED_PLACEHOLDER)
+    return out
+
+
+def redact_message(
+    msg: Any,
+    *,
+    in_suffix: bool,
+    affected_summary_ids: set[str],
+    min_turn: int,
+    max_turn: int,
+) -> tuple[Any, bool]:
+    """Redact one message according to Scheme 2A. Returns ``(new_msg, changed)``.
+
+    - If ``in_suffix`` is True, redacts full body, reasoning, tool_calls args,
+      steering_delivered, tool output, and any compaction summary fields.
+    - If ``in_suffix`` is False (pre-touch checkpoint), preserves pure research
+      messages verbatim EXCEPT compaction summaries that merged suffix turns
+      (copy 1: summary HumanMessage, copy 2: AIMessage.response_metadata.context_summary).
+    """
+    is_summary = _is_summary_msg(msg)
+    mid = _msg_id(msg)
+    summary_overlaps = is_summary and (
+        in_suffix
+        or (mid is not None and mid in affected_summary_ids)
+        or _summary_span_overlaps(msg, min_turn, max_turn)
+    )
+    cs_id = _context_summary_id(msg)
+    cs_affected = cs_id is not None and (in_suffix or cs_id in affected_summary_ids)
+
+    if not in_suffix and not summary_overlaps and not cs_affected:
+        return msg, False
+
+    if isinstance(msg, BaseMessage):
+        ak = dict(msg.additional_kwargs or {})
+        rm = dict(msg.response_metadata or {})
+
+        # Pre-touch AIMessage whose only overlap is a stamped context_summary
+        if not in_suffix and not summary_overlaps and cs_affected:
+            rm[COMPACTION_SUMMARY_KEY] = _redact_context_summary_dict(
+                rm[COMPACTION_SUMMARY_KEY]
+            )
+            return msg.model_copy(update={"response_metadata": rm}), True
+
+        # Summary HumanMessage (copy 1 of 3)
+        if summary_overlaps:
+            ak.pop(SIDECAR_KEY, None)
+            if isinstance(ak.get("summarize_complete"), Mapping):
+                sc = dict(ak["summarize_complete"])
+                sc["summary_length"] = len(PURGED_PLACEHOLDER)
+                ak["summarize_complete"] = sc
+            return (
+                msg.model_copy(
+                    update={"content": PURGED_PLACEHOLDER, "additional_kwargs": ak}
+                ),
+                True,
+            )
+
+        # Suffix messages
+        if isinstance(msg, HumanMessage):
+            if isinstance(ak.get("steering_delivered"), Mapping):
+                sd = dict(ak["steering_delivered"])
+                if "content" in sd:
+                    sd["content"] = PURGED_PLACEHOLDER
+                if "text" in sd:
+                    sd["text"] = PURGED_PLACEHOLDER
+                ak["steering_delivered"] = sd
+            return (
+                msg.model_copy(
+                    update={"content": PURGED_PLACEHOLDER, "additional_kwargs": ak}
+                ),
+                True,
+            )
+
+        if isinstance(msg, ToolMessage):
+            update: dict[str, Any] = {
+                "content": PURGED_PLACEHOLDER,
+                "additional_kwargs": ak,
+            }
+            if getattr(msg, "artifact", None) is not None:
+                update["artifact"] = None
+            return msg.model_copy(update=update), True
+
+        if isinstance(msg, AIMessage):
+            new_content = redact_content_blocks(msg.content)
+            new_tcs = [redact_tool_call_dict(tc) for tc in (msg.tool_calls or [])]
+            new_invalid = [
+                redact_invalid_tool_call_dict(tc)
+                for tc in (msg.invalid_tool_calls or [])
+            ]
+            if isinstance(ak.get("tool_calls"), list):
+                ak["tool_calls"] = redact_additional_kwargs_tool_calls(ak["tool_calls"])
+            if isinstance(ak.get("function_call"), Mapping):
+                ak["function_call"] = {
+                    "name": ak["function_call"].get("name", ""),
+                    "arguments": PURGED_TOOL_ARGS_JSON,
+                }
+            for rkey in ("reasoning_content", "reasoning", "thinking"):
+                if ak.get(rkey):
+                    ak[rkey] = PURGED_PLACEHOLDER
+            if isinstance(rm.get(COMPACTION_SUMMARY_KEY), Mapping):
+                rm[COMPACTION_SUMMARY_KEY] = _redact_context_summary_dict(
+                    rm[COMPACTION_SUMMARY_KEY]
+                )
+            return (
+                msg.model_copy(
+                    update={
+                        "content": new_content,
+                        "tool_calls": new_tcs,
+                        "invalid_tool_calls": new_invalid,
+                        "additional_kwargs": ak,
+                        "response_metadata": rm,
+                    }
+                ),
+                True,
+            )
+
+        # Fallback for any other BaseMessage subtype in suffix
+        return msg.model_copy(update={"content": PURGED_PLACEHOLDER}), True
+
+    # Dict-shaped serialized message fallback
+    if isinstance(msg, Mapping):
+        out = dict(msg)
+        ak = dict(out.get("additional_kwargs") or {})
+        rm = dict(out.get("response_metadata") or {})
+        if not in_suffix and not summary_overlaps and cs_affected:
+            rm[COMPACTION_SUMMARY_KEY] = _redact_context_summary_dict(
+                rm[COMPACTION_SUMMARY_KEY]
+            )
+            out["response_metadata"] = rm
+            return out, True
+        out["content"] = redact_content_blocks(out.get("content", ""))
+        if isinstance(out.get("tool_calls"), list):
+            out["tool_calls"] = [redact_tool_call_dict(tc) for tc in out["tool_calls"]]
+        if isinstance(out.get("invalid_tool_calls"), list):
+            out["invalid_tool_calls"] = [
+                redact_invalid_tool_call_dict(tc) for tc in out["invalid_tool_calls"]
+            ]
+        if isinstance(ak.get("tool_calls"), list):
+            ak["tool_calls"] = redact_additional_kwargs_tool_calls(ak["tool_calls"])
+        for rkey in ("reasoning_content", "reasoning", "thinking"):
+            if ak.get(rkey):
+                ak[rkey] = PURGED_PLACEHOLDER
+        if summary_overlaps:
+            ak.pop(SIDECAR_KEY, None)
+        if isinstance(rm.get(COMPACTION_SUMMARY_KEY), Mapping):
+            rm[COMPACTION_SUMMARY_KEY] = _redact_context_summary_dict(
+                rm[COMPACTION_SUMMARY_KEY]
+            )
+        out["additional_kwargs"] = ak
+        out["response_metadata"] = rm
+        return out, True
+
+    return msg, False
+
+
+def redact_ui_record(
+    record: Any,
+    *,
+    in_suffix: bool,
+    affected_summary_ids: set[str],
+) -> tuple[Any, bool]:
+    """Redact copy 3 of compaction summaries in checkpoint ``ui`` records
+    (``metadata.replaced_summary.summary_text`` and ``props.summary_text``).
+    """
+    if not isinstance(record, Mapping):
+        return record, False
+    metadata = record.get("metadata")
+    props = record.get("props")
+    meta_dict = dict(metadata) if isinstance(metadata, Mapping) else None
+    props_dict = dict(props) if isinstance(props, Mapping) else None
+
+    changed = False
+    replaced = meta_dict.get("replaced_summary") if meta_dict else None
+    if isinstance(replaced, Mapping):
+        rep_id = str(replaced.get("id") or "")
+        sum_id = str(meta_dict.get("summary_message_id") or "") if meta_dict else ""
+        if (
+            in_suffix
+            or (rep_id and rep_id in affected_summary_ids)
+            or (sum_id and sum_id in affected_summary_ids)
+        ):
+            new_rep = dict(replaced)
+            if "summary_text" in new_rep or new_rep.get("action") == "summarize":
+                new_rep["summary_text"] = PURGED_PLACEHOLDER
+                new_rep["summary_length"] = len(PURGED_PLACEHOLDER)
+                meta_dict["replaced_summary"] = new_rep  # type: ignore[index]
+                changed = True
+
+    if props_dict is not None and "summary_text" in props_dict:
+        sum_id = str(meta_dict.get("summary_message_id") or "") if meta_dict else ""
+        if in_suffix or (sum_id and sum_id in affected_summary_ids):
+            props_dict["summary_text"] = PURGED_PLACEHOLDER
+            if "summary_length" in props_dict:
+                props_dict["summary_length"] = len(PURGED_PLACEHOLDER)
+            changed = True
+
+    if not changed:
+        return record, False
+    out = dict(record)
+    if meta_dict is not None:
+        out["metadata"] = meta_dict
+    if props_dict is not None:
+        out["props"] = props_dict
+    return out, True
+
+
+def redact_interrupt_payload(value: Any) -> Any:
+    """Redact pending ``__interrupt__`` write payloads (keeping structural keys)."""
+    if isinstance(value, str):
+        return PURGED_PLACEHOLDER
+    if isinstance(value, list):
+        return [redact_interrupt_payload(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(redact_interrupt_payload(v) for v in value)
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k in ("id", "type", "name", "interrupt_id", "tool_call_id", "ns"):
+                out[k] = v
+            elif k in ("args", "arguments", "params", "input", "tool_args"):
+                out[k] = dict(PURGED_TOOL_ARGS)
+            else:
+                out[k] = redact_interrupt_payload(v)
+        return out
+    # LangGraph Interrupt dataclass/object with .value attribute
+    if hasattr(value, "value"):
+        try:
+            new_val = redact_interrupt_payload(value.value)
+            if hasattr(value, "model_copy"):
+                return value.model_copy(update={"value": new_val})
+            import dataclasses
+
+            if dataclasses.is_dataclass(value):
+                return dataclasses.replace(value, value=new_val)
+        except Exception:
+            return {"_purged": True, "text": PURGED_PLACEHOLDER}
+    return value
+
+
+def _collect_messages_from_value(value: Any) -> list[Any]:
+    if isinstance(value, _DeltaSnapshot):
+        return _collect_messages_from_value(value.value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, BaseMessage):
+        return [value]
+    return []
+
+
+def _redact_messages_container(
+    value: Any,
+    *,
+    pre_touch_msg_ids: set[str],
+    affected_summary_ids: set[str],
+    min_turn: int,
+    max_turn: int,
+    force_suffix: bool,
+) -> tuple[Any, bool]:
+    if isinstance(value, _DeltaSnapshot):
+        inner, changed = _redact_messages_container(
+            value.value,
+            pre_touch_msg_ids=pre_touch_msg_ids,
+            affected_summary_ids=affected_summary_ids,
+            min_turn=min_turn,
+            max_turn=max_turn,
+            force_suffix=force_suffix,
+        )
+        return (_DeltaSnapshot(inner), True) if changed else (value, False)
+    if isinstance(value, (list, tuple)):
+        any_changed = False
+        out: list[Any] = []
+        for item in value:
+            mid = _msg_id(item)
+            in_suffix = force_suffix or (mid is None or mid not in pre_touch_msg_ids)
+            redacted, ch = redact_message(
+                item,
+                in_suffix=in_suffix,
+                affected_summary_ids=affected_summary_ids,
+                min_turn=min_turn,
+                max_turn=max_turn,
+            )
+            if ch:
+                any_changed = True
+            out.append(redacted)
+        if not any_changed:
+            return value, False
+        return (tuple(out) if isinstance(value, tuple) else out), True
+    mid = _msg_id(value)
+    in_suffix = force_suffix or (mid is None or mid not in pre_touch_msg_ids)
+    return redact_message(
+        value,
+        in_suffix=in_suffix,
+        affected_summary_ids=affected_summary_ids,
+        min_turn=min_turn,
+        max_turn=max_turn,
+    )
+
+
+def _redact_ui_container(
+    value: Any,
+    *,
+    in_suffix: bool,
+    affected_summary_ids: set[str],
+) -> tuple[Any, bool]:
+    if isinstance(value, _DeltaSnapshot):
+        inner, changed = _redact_ui_container(
+            value.value,
+            in_suffix=in_suffix,
+            affected_summary_ids=affected_summary_ids,
+        )
+        return (_DeltaSnapshot(inner), True) if changed else (value, False)
+    if isinstance(value, list):
+        any_changed = False
+        out = []
+        for rec in value:
+            r2, ch = redact_ui_record(
+                rec, in_suffix=in_suffix, affected_summary_ids=affected_summary_ids
+            )
+            if ch:
+                any_changed = True
+            out.append(r2)
+        return (out, True) if any_changed else (value, False)
+    return redact_ui_record(
+        value, in_suffix=in_suffix, affected_summary_ids=affected_summary_ids
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 0: Cancel & drain in-flight runs on affected threads
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_and_drain_thread(
+    thread_id: str,
+    *,
+    min_turn: int,
+    max_turn: int,
+    timeout_s: float = 15.0,
+) -> None:
+    """Broadcast cancellation to live runs/subagents on ``thread_id`` and wait for WriterGuard drain."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id::text AS run_id
+                FROM conversation_responses
+                WHERE conversation_thread_id = %s::uuid
+                  AND status = 'in_progress'
+                """,
+                (thread_id,),
+            )
+            live_runs = [str(r["run_id"]) for r in await cur.fetchall()]
+
+            await cur.execute(
+                """
+                SELECT task_id, task_run_id::text AS task_run_id
+                FROM subagent_runs
+                WHERE thread_id = %s::uuid
+                  AND status IN ('in_progress', 'running')
+                """,
+                (thread_id,),
+            )
+            live_tasks = [dict(r) for r in await cur.fetchall()]
+
+    for rid in live_runs:
+        try:
+            await run_lifecycle.request_cancel(rid, thread_id=thread_id, by=Stopper.SYSTEM)
+        except Exception:
+            logger.debug("[purge] request_cancel failed for run=%s", rid, exc_info=True)
+        await publish_cancel_nudge(thread_id, rid)
+
+    for task in live_tasks:
+        tid_task = str(task.get("task_id") or "")
+        trid = str(task.get("task_run_id") or "") or None
+        if tid_task:
+            await publish_cancel_nudge(thread_id, None, task_id=tid_task, task_run_id=trid)
+
+    if not live_runs and not live_tasks:
+        return
+
+    # Drain active WriterGuard sessions by taking and immediately releasing exclusive T(thread)
+    tkey = writer_guard.thread_key(thread_id)
+    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    async with get_db_connection() as lock_conn:
+        while time.monotonic() < deadline:
+            cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (tkey,))
+            row = await cur.fetchone()
+            if row and row[0]:
+                with anyio.CancelScope(shield=True):
+                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (tkey,))
+                return
+            await asyncio.sleep(0.1)
+    logger.warning(
+        "[purge] timed out waiting for writer drain on thread=%s after %.1fs",
+        thread_id,
+        timeout_s,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Checkpoint pool redaction
+# ---------------------------------------------------------------------------
+
+
+def _resolve_checkpoint_turns(
+    checkpoints: list[dict[str, Any]],
+    run_turn_map: dict[str, int],
+) -> dict[str, int | None]:
+    """Assign each main-namespace ``checkpoint_id`` its ``turn_index`` via metadata & parent propagation."""
+    by_id = {str(c["checkpoint_id"]): c for c in checkpoints}
+    direct: dict[str, int | None] = {}
+    for cid, c in by_id.items():
+        meta = c.get("metadata") or {}
+        ti = meta.get("turn_index")
+        if isinstance(ti, int) and not isinstance(ti, bool):
+            direct[cid] = ti
+            continue
+        rid = meta.get("run_id")
+        if rid and str(rid) in run_turn_map:
+            direct[cid] = run_turn_map[str(rid)]
+            continue
+        direct[cid] = None
+
+    resolved: dict[str, int | None] = {}
+    for cid in by_id:
+        cur_id: str | None = cid
+        seen: set[str] = set()
+        found: int | None = None
+        while cur_id and cur_id not in seen:
+            seen.add(cur_id)
+            if cur_id in resolved:
+                found = resolved[cur_id]
+                break
+            if direct.get(cur_id) is not None:
+                found = direct[cur_id]
+                break
+            parent = by_id.get(cur_id, {}).get("parent_checkpoint_id")
+            cur_id = str(parent) if parent else None
+        resolved[cid] = found
+    return resolved
+
+
+async def _purge_thread_checkpoints(
+    cp_conn: Any,
+    serde: Any,
+    *,
+    thread_id: str,
+    min_turn: int,
+    max_turn: int,
+    run_turn_map: dict[str, int],
+    suffix_run_ids: set[str],
+    suffix_task_ids: set[str],
+) -> int:
+    """Layer 1 checkpoint redaction for one thread (main namespace + suffix task namespaces)."""
+    updated_count = 0
+    async with cp_conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+                   checkpoint, metadata
+            FROM checkpoints
+            WHERE thread_id = %s
+            ORDER BY checkpoint_ns ASC, checkpoint_id ASC
+            """,
+            (thread_id,),
+        )
+        all_cps = [dict(r) for r in await cur.fetchall()]
+        if not all_cps:
+            return 0
+
+        main_cps = [c for c in all_cps if str(c["checkpoint_ns"]) == ""]
+        cp_turns = _resolve_checkpoint_turns(main_cps, run_turn_map)
+
+        pre_touch_cp_ids: set[str] = set()
+        suffix_cp_ids: set[str] = set()
+        for c in main_cps:
+            cid = str(c["checkpoint_id"])
+            meta = c.get("metadata") or {}
+            rid = str(meta.get("run_id") or "")
+            ti = cp_turns.get(cid)
+            if rid in suffix_run_ids or (ti is not None and min_turn <= ti <= max_turn):
+                suffix_cp_ids.add(cid)
+            elif ti is not None and ti < min_turn:
+                pre_touch_cp_ids.add(cid)
+            else:
+                # Unresolved checkpoint: if min_turn == 0 treat as suffix; otherwise preserve unless summary overlaps
+                if min_turn == 0:
+                    suffix_cp_ids.add(cid)
+                else:
+                    pre_touch_cp_ids.add(cid)
+
+        # Determine which checkpoint_blobs versions are referenced by pre-touch vs suffix checkpoints
+        pre_blob_versions: set[tuple[str, str, str]] = set()
+        suffix_blob_versions: set[tuple[str, str, str]] = set()
+        all_referenced_versions: set[tuple[str, str, str]] = set()
+        suffix_task_namespaces = {f"task:{tid}" for tid in suffix_task_ids}
+
+        for c in all_cps:
+            ns = str(c["checkpoint_ns"])
+            cid = str(c["checkpoint_id"])
+            cp_obj = c.get("checkpoint") or {}
+            ch_vers = cp_obj.get("channel_versions") if isinstance(cp_obj, Mapping) else {}
+            if not isinstance(ch_vers, Mapping):
+                continue
+            is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
+            is_pre = ns == "" and cid in pre_touch_cp_ids
+            for ch, ver in ch_vers.items():
+                key = (ns, str(ch), str(ver))
+                all_referenced_versions.add(key)
+                if is_suf:
+                    suffix_blob_versions.add(key)
+                if is_pre:
+                    pre_blob_versions.add(key)
+
+        # Load writes & blobs for this thread
+        await cur.execute(
+            """
+            SELECT checkpoint_ns, checkpoint_id, task_id, idx, channel, type, blob
+            FROM checkpoint_writes
+            WHERE thread_id = %s
+              AND channel IN ('messages', 'ui', '__interrupt__')
+              AND blob IS NOT NULL
+            """,
+            (thread_id,),
+        )
+        writes = [dict(r) for r in await cur.fetchall()]
+
+        await cur.execute(
+            """
+            SELECT checkpoint_ns, channel, version, type, blob
+            FROM checkpoint_blobs
+            WHERE thread_id = %s
+              AND channel IN ('messages', 'ui')
+              AND blob IS NOT NULL
+            """,
+            (thread_id,),
+        )
+        blobs = [dict(r) for r in await cur.fetchall()]
+
+        # Pass 1: discover pre_touch_msg_ids and affected_summary_ids
+        pre_touch_msg_ids: set[str] = set()
+        affected_summary_ids: set[str] = set()
+
+        def _inspect_msgs(msgs: list[Any], *, is_pre: bool, is_suf: bool) -> None:
+            for m in msgs:
+                mid = _msg_id(m)
+                if _is_summary_msg(m):
+                    if is_suf or _summary_span_overlaps(m, min_turn, max_turn):
+                        if mid:
+                            affected_summary_ids.add(mid)
+                    elif is_pre and mid:
+                        pre_touch_msg_ids.add(mid)
+                else:
+                    if is_pre and not is_suf and mid:
+                        pre_touch_msg_ids.add(mid)
+
+        for w in writes:
+            if w["channel"] != "messages" or not w["type"] or w["type"] == "empty":
+                continue
+            ns = str(w["checkpoint_ns"])
+            cid = str(w["checkpoint_id"])
+            is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
+            is_pre = ns == "" and cid in pre_touch_cp_ids
+            try:
+                val = serde.loads_typed((w["type"], bytes(w["blob"])))
+            except Exception:
+                continue
+            _inspect_msgs(_collect_messages_from_value(val), is_pre=is_pre, is_suf=is_suf)
+
+        for b in blobs:
+            if b["channel"] != "messages" or not b["type"] or b["type"] == "empty":
+                continue
+            key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
+            is_suf = key in suffix_blob_versions
+            is_pre = key in pre_blob_versions
+            try:
+                val = serde.loads_typed((b["type"], bytes(b["blob"])))
+            except Exception:
+                continue
+            _inspect_msgs(_collect_messages_from_value(val), is_pre=is_pre, is_suf=is_suf)
+
+        # Pass 2: rewrite checkpoint_writes
+        for w in writes:
+            if not w["type"] or w["type"] == "empty":
+                continue
+            ns = str(w["checkpoint_ns"])
+            cid = str(w["checkpoint_id"])
+            ch = str(w["channel"])
+            is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
+            try:
+                val = serde.loads_typed((w["type"], bytes(w["blob"])))
+            except Exception:
+                continue
+
+            changed = False
+            new_val = val
+            if ch == "messages":
+                new_val, changed = _redact_messages_container(
+                    val,
+                    pre_touch_msg_ids=pre_touch_msg_ids,
+                    affected_summary_ids=affected_summary_ids,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    force_suffix=(ns in suffix_task_namespaces),
+                )
+            elif ch == "ui":
+                new_val, changed = _redact_ui_container(
+                    val, in_suffix=is_suf, affected_summary_ids=affected_summary_ids
+                )
+            elif ch == "__interrupt__" and is_suf:
+                new_val = redact_interrupt_payload(val)
+                changed = True
+
+            if changed:
+                new_type, new_blob = serde.dumps_typed(new_val)
+                await cur.execute(
+                    """
+                    UPDATE checkpoint_writes
+                    SET type = %s, blob = %s
+                    WHERE thread_id = %s
+                      AND checkpoint_ns = %s
+                      AND checkpoint_id = %s
+                      AND task_id = %s
+                      AND idx = %s
+                    """,
+                    (
+                        new_type,
+                        new_blob,
+                        thread_id,
+                        ns,
+                        cid,
+                        w["task_id"],
+                        w["idx"],
+                    ),
+                )
+                updated_count += 1
+
+        # Pass 3: rewrite checkpoint_blobs
+        for b in blobs:
+            if not b["type"] or b["type"] == "empty":
+                continue
+            ns = str(b["checkpoint_ns"])
+            ch = str(b["channel"])
+            ver = str(b["version"])
+            key = (ns, ch, ver)
+            is_suf = key in suffix_blob_versions
+            try:
+                val = serde.loads_typed((b["type"], bytes(b["blob"])))
+            except Exception:
+                continue
+
+            changed = False
+            new_val = val
+            if ch == "messages":
+                new_val, changed = _redact_messages_container(
+                    val,
+                    pre_touch_msg_ids=pre_touch_msg_ids,
+                    affected_summary_ids=affected_summary_ids,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    force_suffix=(ns in suffix_task_namespaces),
+                )
+            elif ch == "ui":
+                new_val, changed = _redact_ui_container(
+                    val, in_suffix=is_suf, affected_summary_ids=affected_summary_ids
+                )
+
+            if changed:
+                new_type, new_blob = serde.dumps_typed(new_val)
+                await cur.execute(
+                    """
+                    UPDATE checkpoint_blobs
+                    SET type = %s, blob = %s
+                    WHERE thread_id = %s
+                      AND checkpoint_ns = %s
+                      AND channel = %s
+                      AND version = %s
+                    """,
+                    (new_type, new_blob, thread_id, ns, ch, ver),
+                )
+                updated_count += 1
+
+        # Pass 4: delete unreferenced checkpoint_blobs & orphaned checkpoint_writes for this thread
+        await cur.execute(
+            """
+            DELETE FROM checkpoint_blobs b
+            WHERE b.thread_id = %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM checkpoints c
+                  CROSS JOIN LATERAL jsonb_each_text(c.checkpoint->'channel_versions') v
+                  WHERE c.thread_id = b.thread_id
+                    AND c.checkpoint_ns = b.checkpoint_ns
+                    AND v.key = b.channel
+                    AND v.value = b.version
+              )
+            """,
+            (thread_id,),
+        )
+        await cur.execute(
+            """
+            DELETE FROM checkpoint_writes w
+            WHERE w.thread_id = %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM checkpoints c
+                  WHERE c.thread_id = w.thread_id
+                    AND c.checkpoint_ns = w.checkpoint_ns
+                    AND c.checkpoint_id = w.checkpoint_id
+              )
+            """,
+            (thread_id,),
+        )
+
+    return updated_count
+
+
+def _redact_steering_inputs_list(items: Any) -> tuple[Any, bool]:
+    """Redact ``conversation_responses.metadata.steering_inputs`` entries."""
+    if not isinstance(items, list) or not items:
+        return items, False
+    out: list[Any] = []
+    changed = False
+    for entry in items:
+        if isinstance(entry, Mapping):
+            new_e = dict(entry)
+            for key in ("content", "text", "message"):
+                if key in new_e and new_e[key] != PURGED_PLACEHOLDER:
+                    new_e[key] = PURGED_PLACEHOLDER
+                    changed = True
+            out.append(new_e)
+        elif isinstance(entry, str) and entry != PURGED_PLACEHOLDER:
+            out.append(PURGED_PLACEHOLDER)
+            changed = True
+        else:
+            out.append(entry)
+    return out, changed
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 Redis key deletion helper
+# ---------------------------------------------------------------------------
+
+
+def collect_redis_keys_for_suffix(
+    thread_id: str,
+    suffix_run_ids: list[str],
+    suffix_task_ids: list[str],
+    suffix_task_run_ids: list[str],
+) -> list[str]:
+    """Build exact Redis stream & meta keys using existing upstream builders (no hardcoded strings)."""
+    keys: list[str] = []
+    for rid in suffix_run_ids:
+        keys.append(stream_key(thread_id, rid))
+        keys.append(stream_meta_key(thread_id, rid))
+    for task_id in suffix_task_ids:
+        keys.append(task_stream_key(thread_id, task_id))
+        keys.append(task_meta_key(thread_id, task_id))
+        keys.append(legacy_task_events_key(thread_id, task_id))
+    for task_run_id in suffix_task_run_ids:
+        keys.append(run_stream_key(thread_id, task_run_id))
+    return list(dict.fromkeys(keys))
+
+
+async def _delete_redis_keys(keys: list[str]) -> int:
+    if not keys:
+        return 0
+    try:
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        if not cache.enabled or not cache.client:
+            return 0
+        deleted = await cache.client.delete(*keys)
+        return int(deleted or 0)
+    except Exception:
+        logger.warning("[purge] Redis stream key cleanup failed", exc_info=True)
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: Conversation cards fallback & BaseStore memory cleanup
+# ---------------------------------------------------------------------------
+
+
+async def _purge_conversation_cards_for_thread(
+    conn: Any,
+    thread_id: str,
+    user_id: str,
+) -> int:
+    """Fallback scan ``dalton_conversation_cards`` for ``thread_id``; delete & re-render digests if found."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT to_regclass('public.dalton_conversation_cards') AS tbl")
+        tbl = await cur.fetchone()
+        if not tbl or not tbl.get("tbl"):
+            return 0
+
+        await cur.execute(
+            """
+            SELECT card_id, date_et, rendered_locations, tickers
+            FROM dalton_conversation_cards
+            WHERE session_id = %s
+               OR session_key LIKE %s
+            """,
+            (thread_id, f"%{thread_id}%"),
+        )
+        matched = [dict(r) for r in await cur.fetchall()]
+        if not matched:
+            return 0
+
+        card_ids = [str(r["card_id"]) for r in matched]
+        affected_dates = sorted(
+            {str(r["date_et"])[:10] for r in matched if r.get("date_et") is not None}
+        )
+        await cur.execute(
+            "DELETE FROM dalton_conversation_cards WHERE card_id = ANY(%s::text[])",
+            (card_ids,),
+        )
+        deleted_count = int(cur.rowcount or 0)
+
+        # Fetch remaining cards for affected dates so digests are re-rendered without deleted cards
+        remaining: list[dict[str, Any]] = []
+        if affected_dates:
+            await cur.execute(
+                """
+                SELECT card_id, source_type, agent, session_id, session_key, generation,
+                       channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
+                       speaker_role, tickers, entities, sectors, topic_label, type, claim,
+                       figures, quote, quote_event_id, cited_sources, confidence, status,
+                       supersedes, extractor_model, prompt_version, content_hash,
+                       search_text, rendered_locations, files_written_at, created_at
+                FROM dalton_conversation_cards
+                WHERE date_et::text = ANY(%s::text[])
+                """,
+                (affected_dates,),
+            )
+            remaining = [dict(r) for r in await cur.fetchall()]
+
+    # Append retracted stubs carrying deleted cards' historical rendered_locations so
+    # render_and_write_conversation_digests removes stale workspace markdown files.
+    retracted_stubs = [
+        {
+            "card_id": str(r["card_id"]),
+            "date_et": str(r["date_et"])[:10],
+            "status": "retracted",
+            "tickers": list(r.get("tickers") or []),
+            "rendered_locations": list(r.get("rendered_locations") or []),
+        }
+        for r in matched
+        if r.get("rendered_locations")
+    ]
+    try:
+        from src.dalton.conversations.render import (
+            render_and_write_conversation_digests,
+        )
+
+        await render_and_write_conversation_digests(
+            [*remaining, *retracted_stubs],
+            target_dates=affected_dates,
+            user_id=user_id,
+            conn=conn,
+        )
+    except Exception:
+        logger.warning(
+            "[purge] conversation digest re-render failed for thread=%s dates=%s",
+            thread_id,
+            affected_dates,
+            exc_info=True,
+        )
+    return deleted_count
+
+
+async def _purge_store_memories_for_thread(cp_conn: Any, thread_id: str) -> int:
+    """Delete LangGraph ``BaseStore`` memory rows referencing ``thread_id``."""
+    async with cp_conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT to_regclass('public.store') AS tbl")
+        tbl = await cur.fetchone()
+        if not tbl or not tbl.get("tbl"):
+            return 0
+        await cur.execute(
+            """
+            DELETE FROM store
+            WHERE (
+                prefix LIKE '%%.memory%%'
+                OR prefix LIKE 'memory%%'
+            ) AND (
+                key LIKE %s
+                OR value->>'thread_id' = %s
+                OR value->>'source_thread_id' = %s
+                OR value::text LIKE %s
+            )
+            """,
+            (f"%{thread_id}%", thread_id, thread_id, f"%{thread_id}%"),
+        )
+        return int(cur.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# Main 2A Purger entry point
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_thread_ranges(
+    ledger: PurgeLedgerRow,
+) -> dict[str, tuple[int, int]]:
+    """Compute ``{thread_id: (min_turn, max_turn)}`` from ledger snapshot + unpurged touches."""
+    ranges: dict[str, tuple[int, int]] = {}
+    for tid, val in (ledger.purged_max_turn_by_thread or {}).items():
+        if isinstance(val, Mapping) and "min_turn" in val and "max_turn" in val:
+            ranges[str(tid)] = (int(val["min_turn"]), int(val["max_turn"]))
+        elif isinstance(val, int):
+            ranges[str(tid)] = (0, int(val))
+
+    # Fill in min_turn from unpurged touches if any entry only stored an int max_turn
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            service_filter = "AND service = %(service)s" if ledger.service is not None else ""
+            await cur.execute(
+                f"""
+                SELECT thread_id::text AS thread_id,
+                       MIN(turn_index) AS min_turn,
+                       MAX(turn_index) AS max_turn
+                FROM dalton_thread_integration_touches
+                WHERE user_id = %(user_id)s
+                  AND provider = %(provider)s
+                  {service_filter}
+                  AND auth_epoch <= %(auth_epoch_upto)s
+                  AND purged_at IS NULL
+                GROUP BY thread_id
+                """,
+                {
+                    "user_id": ledger.user_id,
+                    "provider": ledger.provider,
+                    "service": ledger.service,
+                    "auth_epoch_upto": ledger.auth_epoch_upto,
+                },
+            )
+            for row in await cur.fetchall():
+                tid = str(row["thread_id"])
+                lo = int(row["min_turn"])
+                hi = int(row["max_turn"])
+                if tid in ranges:
+                    cur_lo, cur_hi = ranges[tid]
+                    ranges[tid] = (min(cur_lo, lo), max(cur_hi, hi))
+                else:
+                    ranges[tid] = (lo, hi)
+    return ranges
+
+
+async def run_local_purge(
+    purge_id: str,
+    *,
+    cancel_drain_timeout_s: float = 15.0,
+) -> LocalPurgeReport:
+    """Execute the 6-layer Scheme 2A local online purge for ``purge_id`` (idempotent & re-entrant).
+
+    Commits thread unblocking (``personal_purge_in_progress = FALSE`` + second
+    ``personal_purge_generation`` bump + ``purged_at = NOW()`` +
+    ``local_purge_status = 'completed'``) atomically in one ``FOR UPDATE`` transaction.
+    """
+    report = LocalPurgeReport(purge_id=str(purge_id))
+    ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
+    if ledger is None:
+        raise LookupError(f"Purge ledger {purge_id} not found")
+    if ledger.local_purge_status != LocalPurgeStatus.RUNNING:
+        report.skipped = True
+        return report
+
+    thread_ranges = await _resolve_thread_ranges(ledger)
+    target_thread_ids = sorted(thread_ranges.keys())
+    report.threads_purged = list(target_thread_ids)
+
+    # Step 0: Cancel and drain any in-flight runs on affected threads
+    for tid in target_thread_ids:
+        lo, hi = thread_ranges[tid]
+        await _cancel_and_drain_thread(
+            tid, min_turn=lo, max_turn=hi, timeout_s=cancel_drain_timeout_s
+        )
+
+    # Collect per-thread suffix run_ids, task_ids, workspace_ids
+    all_suffix_run_ids: list[str] = []
+    thread_workspace_ids: dict[str, str | None] = {}
+    blobs_to_release: list[tuple[str, str]] = []
+    redis_keys_to_delete: list[str] = []
+
+    checkpointer = None
+    try:
+        checkpointer = get_checkpointer()
+    except Exception:
+        checkpointer = None
+    cp_pool = getattr(checkpointer, "conn", None) if checkpointer is not None else None
+    cp_serde = getattr(checkpointer, "serde", None) if checkpointer is not None else None
+
+    for tid in target_thread_ids:
+        min_turn, max_turn = thread_ranges[tid]
+
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT workspace_id::text AS workspace_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                    (tid,),
+                )
+                ws_row = await cur.fetchone()
+                thread_workspace_ids[tid] = (
+                    str(ws_row["workspace_id"])
+                    if ws_row and ws_row.get("workspace_id")
+                    else None
+                )
+
+                await cur.execute(
+                    """
+                    SELECT conversation_response_id::text AS run_id,
+                           turn_index,
+                           metadata
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = %s::uuid
+                    ORDER BY turn_index ASC, attempt_no ASC
+                    """,
+                    (tid,),
+                )
+                all_responses = [dict(r) for r in await cur.fetchall()]
+                run_turn_map = {
+                    str(r["run_id"]): int(r["turn_index"])
+                    for r in all_responses
+                    if r.get("turn_index") is not None
+                }
+                suffix_responses = [
+                    r
+                    for r in all_responses
+                    if r.get("turn_index") is not None
+                    and min_turn <= int(r["turn_index"]) <= max_turn
+                ]
+                suffix_run_ids = [str(r["run_id"]) for r in suffix_responses]
+                all_suffix_run_ids.extend(suffix_run_ids)
+
+                suffix_task_ids: list[str] = []
+                suffix_task_run_ids: list[str] = []
+                if suffix_run_ids:
+                    await cur.execute(
+                        """
+                        SELECT task_id, task_run_id::text AS task_run_id
+                        FROM subagent_runs
+                        WHERE thread_id = %s::uuid
+                          AND parent_run_id = ANY(%s::uuid[])
+                        """,
+                        (tid, suffix_run_ids),
+                    )
+                    sr_rows = [dict(r) for r in await cur.fetchall()]
+                    suffix_task_ids = sorted(
+                        {str(r["task_id"]) for r in sr_rows if r.get("task_id")}
+                    )
+                    suffix_task_run_ids = sorted(
+                        {str(r["task_run_id"]) for r in sr_rows if r.get("task_run_id")}
+                    )
+
+        # Layer 1a: Checkpoints + Layer 5b BaseStore memories (on checkpointer DB)
+        if cp_serde is not None:
+            if isinstance(cp_pool, AsyncConnectionPool):
+                async with cp_pool.connection() as cp_conn, cp_conn.transaction():
+                    report.checkpoints_updated += await _purge_thread_checkpoints(
+                        cp_conn,
+                        cp_serde,
+                        thread_id=tid,
+                        min_turn=min_turn,
+                        max_turn=max_turn,
+                        run_turn_map=run_turn_map,
+                        suffix_run_ids=set(suffix_run_ids),
+                        suffix_task_ids=set(suffix_task_ids),
+                    )
+                    report.store_rows_deleted += await _purge_store_memories_for_thread(
+                        cp_conn, tid
+                    )
+            else:
+                # Same DB fallback (e.g. when checkpointer shares app DB pool in tests)
+                async with get_db_connection() as app_cp_conn, app_cp_conn.transaction():
+                    async with app_cp_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute("SELECT to_regclass('public.checkpoints') AS tbl")
+                        has_cp = await cur.fetchone()
+                    if has_cp and has_cp.get("tbl"):
+                        report.checkpoints_updated += await _purge_thread_checkpoints(
+                            app_cp_conn,
+                            cp_serde,
+                            thread_id=tid,
+                            min_turn=min_turn,
+                            max_turn=max_turn,
+                            run_turn_map=run_turn_map,
+                            suffix_run_ids=set(suffix_run_ids),
+                            suffix_task_ids=set(suffix_task_ids),
+                        )
+                    report.store_rows_deleted += await _purge_store_memories_for_thread(
+                        app_cp_conn, tid
+                    )
+
+        # App DB Layers 1b, 2a, 3a, 4, 5a
+        async with get_db_connection() as conn, conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Layer 1b: conversation_queries.content
+                await cur.execute(
+                    """
+                    UPDATE conversation_queries
+                    SET content = %s
+                    WHERE conversation_thread_id = %s::uuid
+                      AND turn_index BETWEEN %s AND %s
+                    """,
+                    (PURGED_PLACEHOLDER, tid, min_turn, max_turn),
+                )
+                report.queries_redacted += int(cur.rowcount or 0)
+
+                # Layer 1c: conversation_responses.metadata.steering_inputs
+                for r in suffix_responses:
+                    meta = r.get("metadata")
+                    if isinstance(meta, Mapping) and "steering_inputs" in meta:
+                        new_steers, changed = _redact_steering_inputs_list(
+                            meta.get("steering_inputs")
+                        )
+                        if changed:
+                            new_meta = dict(meta)
+                            new_meta["steering_inputs"] = new_steers
+                            await cur.execute(
+                                """
+                                UPDATE conversation_responses
+                                SET metadata = %s
+                                WHERE conversation_response_id = %s::uuid
+                                """,
+                                (Jsonb(new_meta), str(r["run_id"])),
+                            )
+                            report.steerings_redacted += 1
+
+                # Layer 2a: turn_slices, task_run_slices, provenance_records, replay_facts
+                if suffix_run_ids:
+                    await cur.execute(
+                        "DELETE FROM turn_slices WHERE conversation_response_id = ANY(%s::uuid[])",
+                        (suffix_run_ids,),
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE conversation_responses
+                        SET replay_facts = NULL
+                        WHERE conversation_response_id = ANY(%s::uuid[])
+                        """,
+                        (suffix_run_ids,),
+                    )
+                if suffix_task_ids or suffix_task_run_ids:
+                    await cur.execute(
+                        """
+                        DELETE FROM task_run_slices
+                        WHERE conversation_thread_id = %s::uuid
+                          AND (
+                              task_id = ANY(%s::text[])
+                              OR task_run_id = ANY(%s::uuid[])
+                          )
+                        """,
+                        (tid, suffix_task_ids, suffix_task_run_ids),
+                    )
+                if suffix_task_run_ids:
+                    await cur.execute(
+                        """
+                        UPDATE subagent_runs
+                        SET replay_facts = NULL
+                        WHERE task_run_id = ANY(%s::uuid[])
+                        """,
+                        (suffix_task_run_ids,),
+                    )
+                await cur.execute(
+                    """
+                    DELETE FROM provenance_records
+                    WHERE conversation_thread_id = %s::uuid
+                      AND turn_index BETWEEN %s AND %s
+                    """,
+                    (tid, min_turn, max_turn),
+                )
+
+                # Layer 2b: hook_outbox delivered/returned/pending/failed steers
+                if suffix_run_ids:
+                    await cur.execute(
+                        """
+                        UPDATE hook_outbox
+                        SET payload = CASE
+                                WHEN payload ? 'text'
+                                THEN jsonb_set(
+                                    jsonb_set(payload, '{content}', to_jsonb(%s::text), true),
+                                    '{text}', to_jsonb(%s::text), true
+                                )
+                                ELSE jsonb_set(payload, '{content}', to_jsonb(%s::text), true)
+                            END
+                        WHERE conversation_thread_id = %s::uuid
+                          AND hook_type = 'steer'
+                          AND (
+                              run_id = ANY(%s::uuid[])
+                              OR payload->>'steered_run_id' = ANY(%s::text[])
+                              OR payload->>'returned_run_id' = ANY(%s::text[])
+                              OR payload->>'failed_run_id' = ANY(%s::text[])
+                          )
+                        """,
+                        (
+                            PURGED_PLACEHOLDER,
+                            PURGED_PLACEHOLDER,
+                            PURGED_PLACEHOLDER,
+                            tid,
+                            suffix_run_ids,
+                            suffix_run_ids,
+                            suffix_run_ids,
+                            suffix_run_ids,
+                        ),
+                    )
+                    report.outbox_rows_redacted += int(cur.rowcount or 0)
+
+                # Terminate & redact pending or failed steers on this thread
+                await cur.execute(
+                    """
+                    UPDATE hook_outbox
+                    SET status = 'done',
+                        completed_at = COALESCE(completed_at, NOW()),
+                        payload = jsonb_set(
+                            CASE
+                                WHEN payload ? 'text'
+                                THEN jsonb_set(
+                                    jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true),
+                                    '{text}', to_jsonb(%s::text), true
+                                )
+                                ELSE jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true)
+                            END,
+                            '{outcome}',
+                            '"purged"'::jsonb,
+                            true
+                        )
+                    WHERE conversation_thread_id = %s::uuid
+                      AND hook_type = 'steer'
+                      AND (
+                          status IN ('pending', 'claimed', 'dead')
+                          OR (status = 'done' AND payload->>'outcome' = 'failed')
+                      )
+                    """,
+                    (
+                        PURGED_PLACEHOLDER,
+                        PURGED_PLACEHOLDER,
+                        PURGED_PLACEHOLDER,
+                        tid,
+                    ),
+                )
+                report.outbox_rows_redacted += int(cur.rowcount or 0)
+
+                # Layer 3a: thread_transcripts & thread_transcript_files
+                await cur.execute(
+                    """
+                    SELECT DISTINCT user_id, sha256
+                    FROM thread_transcript_files
+                    WHERE conversation_thread_id = %s::uuid
+                      AND content IS NULL
+                    """,
+                    (tid,),
+                )
+                for brow in await cur.fetchall():
+                    blobs_to_release.append((str(brow["user_id"]), str(brow["sha256"])))
+
+                await cur.execute(
+                    "DELETE FROM thread_transcript_files WHERE conversation_thread_id = %s::uuid",
+                    (tid,),
+                )
+                await cur.execute(
+                    "DELETE FROM thread_transcripts WHERE conversation_thread_id = %s::uuid",
+                    (tid,),
+                )
+                report.transcripts_deleted += int(cur.rowcount or 0)
+
+                # Layer 4: thread_search_turns in closed interval [min_turn, max_turn]
+                await cur.execute(
+                    """
+                    UPDATE thread_search_turns
+                    SET user_text = '',
+                        answer_text = '',
+                        answer_read = TRUE,
+                        read_failures = 0,
+                        retry_at = NULL,
+                        read_at = clock_timestamp()
+                    WHERE conversation_thread_id = %s::uuid
+                      AND turn_index BETWEEN %s AND %s
+                    """,
+                    (tid, min_turn, max_turn),
+                )
+                cleared_here = int(cur.rowcount or 0)
+                # Also ensure every current settled response in [min_turn, max_turn] has an empty read placeholder
+                await cur.execute(
+                    """
+                    INSERT INTO thread_search_turns (
+                        conversation_thread_id, turn_index,
+                        conversation_response_id, attempt_no,
+                        user_text, answer_text, answer_read,
+                        read_failures, retry_at, turn_at, read_at
+                    )
+                    SELECT r.conversation_thread_id, r.turn_index,
+                           r.conversation_response_id, r.attempt_no,
+                           '', '', TRUE,
+                           0, NULL, r.created_at, clock_timestamp()
+                    FROM conversation_responses r
+                    WHERE r.conversation_thread_id = %s::uuid
+                      AND r.turn_index BETWEEN %s AND %s
+                      AND r.status <> 'in_progress'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM conversation_responses n
+                          WHERE n.conversation_thread_id = r.conversation_thread_id
+                            AND n.turn_index = r.turn_index
+                            AND n.status <> 'in_progress'
+                            AND n.attempt_no > r.attempt_no
+                      )
+                    ON CONFLICT (conversation_thread_id, turn_index) DO UPDATE
+                    SET conversation_response_id = EXCLUDED.conversation_response_id,
+                        attempt_no = EXCLUDED.attempt_no,
+                        user_text = '',
+                        answer_text = '',
+                        answer_read = TRUE,
+                        read_failures = 0,
+                        retry_at = NULL,
+                        read_at = clock_timestamp()
+                    """,
+                    (tid, min_turn, max_turn),
+                )
+                report.search_rows_cleared += max(cleared_here, int(cur.rowcount or 0))
+
+            # Layer 5a: dalton_conversation_cards fallback cleanup
+            report.cards_deleted += await _purge_conversation_cards_for_thread(
+                conn, tid, ledger.user_id
+            )
+
+        # Collect Layer 2c Redis keys for this thread
+        redis_keys_to_delete.extend(
+            collect_redis_keys_for_suffix(
+                tid, suffix_run_ids, suffix_task_ids, suffix_task_run_ids
+            )
+        )
+
+    # Layer 2c: Delete Redis event stream & meta keys
+    report.redis_keys_deleted = await _delete_redis_keys(redis_keys_to_delete)
+
+    # Layer 3b: Release now-unreferenced transcript blobs
+    if blobs_to_release:
+        from src.server.database.workspace_file_blobs import release_blob
+
+        async with get_db_connection() as blob_conn:
+            for b_user_id, b_sha in set(blobs_to_release):
+                try:
+                    async with blob_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT last_referenced_at
+                            FROM workspace_file_blobs
+                            WHERE user_id = %s AND sha256 = %s AND condemned_at IS NULL
+                            """,
+                            (b_user_id, b_sha),
+                        )
+                        brow = await cur.fetchone()
+                    if brow and brow.get("last_referenced_at") is not None:
+                        await release_blob(b_user_id, b_sha, brow["last_referenced_at"])
+                except Exception:
+                    logger.warning(
+                        "[purge] release_blob failed for user=%s sha=%s",
+                        b_user_id,
+                        b_sha,
+                        exc_info=True,
+                    )
+
+    # Layer 6a: Delete approvals for disconnected service + ALL services in suffix runs
+    report.approvals_deleted = await db.delete_approvals_for_disconnect(
+        user_id=ledger.user_id,
+        provider=ledger.provider,
+        service=ledger.service,
+        thread_run_ids=list(dict.fromkeys(all_suffix_run_ids)),
+    )
+
+    # Layer 6b: Tracker calendar extension point (Step 4) or reconcile flag
+    tracker_reconcile_needed = False
+    handler = get_tracker_purge_handler()
+    if handler is not None:
+        try:
+            handled = await handler(ledger)
+            tracker_reconcile_needed = not bool(handled)
+        except Exception:
+            logger.warning(
+                "[purge] tracker purge handler raised for purge_id=%s; marking tracker_reconcile_needed",
+                purge_id,
+                exc_info=True,
+            )
+            tracker_reconcile_needed = True
+    else:
+        configured_owner = (os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID") or "").strip()
+        if (
+            configured_owner
+            and ledger.user_id == configured_owner
+            and ledger.provider == "google"
+            and ledger.service in ("calendar", None)
+        ):
+            tracker_reconcile_needed = True
+    report.tracker_reconcile_needed = tracker_reconcile_needed
+
+    # Final atomic commit: unblock threads + SECOND generation increment + mark touches & ledger completed
+    async with get_db_connection() as conn, conn.transaction():
+        async with conn.cursor() as cur:
+            if target_thread_ids:
+                await cur.execute(
+                    """
+                    SELECT conversation_thread_id
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = ANY(%s::uuid[])
+                    ORDER BY conversation_thread_id ASC
+                    FOR UPDATE
+                    """,
+                    (target_thread_ids,),
+                )
+                await cur.execute(
+                    """
+                    UPDATE conversation_threads
+                    SET personal_purge_in_progress = FALSE,
+                        personal_purge_generation = personal_purge_generation + 1,
+                        updated_at = NOW()
+                    WHERE conversation_thread_id = ANY(%s::uuid[])
+                    """,
+                    (target_thread_ids,),
+                )
+
+                service_filter = (
+                    "AND service = %(service)s" if ledger.service is not None else ""
+                )
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_thread_integration_touches
+                    SET purged_at = NOW()
+                    WHERE thread_id = ANY(%(thread_ids)s::uuid[])
+                      AND user_id = %(user_id)s
+                      AND provider = %(provider)s
+                      {service_filter}
+                      AND auth_epoch <= %(auth_epoch_upto)s
+                      AND purged_at IS NULL
+                    """,
+                    {
+                        "thread_ids": target_thread_ids,
+                        "user_id": ledger.user_id,
+                        "provider": ledger.provider,
+                        "service": ledger.service,
+                        "auth_epoch_upto": ledger.auth_epoch_upto,
+                    },
+                )
+
+            await cur.execute(
+                """
+                UPDATE dalton_integration_purge_ledger
+                SET local_purge_status = 'completed',
+                    local_completed_at = NOW(),
+                    tracker_reconcile_needed = tracker_reconcile_needed OR %s,
+                    completed_at = CASE
+                        WHEN remote_revoke_status IN ('succeeded', 'superseded', 'not_applicable')
+                        THEN COALESCE(completed_at, NOW())
+                        ELSE completed_at
+                    END
+                WHERE purge_id = %s::uuid
+                """,
+                (tracker_reconcile_needed, str(purge_id)),
+            )
+
+    # Layer 3c: Schedule re-export of redacted transcripts AFTER commit unblocks threads
+    try:
+        from src.server.services.transcripts import schedule_thread_export
+
+        for tid in target_thread_ids:
+            schedule_thread_export(tid, thread_workspace_ids.get(tid))
+    except Exception:
+        logger.warning(
+            "[purge] schedule_thread_export failed after commit for purge_id=%s",
+            purge_id,
+            exc_info=True,
+        )
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Startup resume scan (called from Dalton startup hook in setup.py)
+# ---------------------------------------------------------------------------
+
+
+async def run_startup_personal_purge_resume() -> list[str]:
+    """Scan ``dalton_integration_purge_ledger WHERE local_purge_status = 'running'``
+    and resume each incomplete local purge on backend startup.
+    """
+    from src.dalton.services.user_integrations_lifecycle import finish_disconnect
+
+    resumed: list[str] = []
+    try:
+        pending = await db.list_running_local_purges()
+    except Exception as exc:
+        logger.warning(
+            "[purge-startup] skipped startup purge resume scan: %s", exc
+        )
+        return resumed
+
+    for row in pending:
+        try:
+            await finish_disconnect(row.purge_id, revoker=None)
+            resumed.append(row.purge_id)
+        except Exception:
+            logger.warning(
+                "[purge-startup] failed to resume purge_id=%s",
+                row.purge_id,
+                exc_info=True,
+            )
+    if resumed:
+        logger.info(
+            "[purge-startup] resumed %d incomplete personal integration purge(s)",
+            len(resumed),
+        )
+    return resumed

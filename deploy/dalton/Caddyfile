@@ -18,7 +18,11 @@
 			fields {
 				request>uri query {
 					replace token REDACTED
+					replace ticket REDACTED
+					replace code REDACTED
+					replace state REDACTED
 				}
+				resp_headers>Location delete
 			}
 		}
 	}

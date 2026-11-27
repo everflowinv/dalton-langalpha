@@ -276,6 +276,10 @@ async def _admit(
     from_path: bool = False,
 ) -> AdmittedTurn:
     body = _client_body(body, raw_request)
+    # DALTON-HOOK(personal-integrations): fast-reject HTTP sends while personal data purge is active (409 + Retry-After: 3)
+    from src.dalton.services.purge_fence import check_thread_not_purging_fast
+
+    await check_thread_not_purging_fast(thread_id)
     checked = await cli_approval.admit_turn(
         raw_request, principal, body, thread_id, from_path=from_path
     )

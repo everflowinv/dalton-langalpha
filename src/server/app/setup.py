@@ -981,6 +981,14 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-watchlist-reconcile",
         )
 
+    # DALTON-HOOK(personal-integrations): one-shot startup scan to resume incomplete local 2A purges
+    if is_dalton_enabled():
+        from src.dalton.services.integration_data_purge import (
+            run_startup_personal_purge_resume,
+        )
+
+        await run_startup_personal_purge_resume()
+
     # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
     from src.dalton.services.transcriptions import (
         is_transcription_reconciliation_enabled,

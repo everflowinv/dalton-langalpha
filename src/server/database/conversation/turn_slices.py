@@ -139,21 +139,40 @@ async def get_slices_at(
             return [_stored(r) for r in await cur.fetchall()]
 
 
-async def _write_many(sql: str, params: list[tuple[Any, ...]], what: str) -> None:
+async def _write_many(
+    sql: str,
+    params: list[tuple[Any, ...]],
+    what: str,
+    *,
+    # DALTON-HOOK(personal-integrations): optional FOR SHARE dual-generation writeback fence
+    thread_id: str | None = None,
+    expected_purge_gen: int | None = None,
+) -> None:
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            try:
-                await cur.executemany(sql, params)
-                return
-            except ForeignKeyViolation:
-                if len(params) == 1:
-                    logger.debug("%s not stored, its parent row is gone", what)
+        async with conn.transaction():
+            # DALTON-HOOK(personal-integrations): verify thread is not purging and generation matches
+            if thread_id is not None and expected_purge_gen is not None:
+                from src.dalton.services.purge_fence import verify_writeback_fence_tx
+
+                if not await verify_writeback_fence_tx(
+                    conn, thread_id, expected_purge_gen, label=what
+                ):
                     return
-            for row in params:
+            async with conn.cursor() as cur:
                 try:
-                    await cur.execute(sql, row)
+                    async with conn.transaction():
+                        await cur.executemany(sql, params)
+                    return
                 except ForeignKeyViolation:
-                    logger.debug("%s not stored, its parent row is gone", what)
+                    if len(params) == 1:
+                        logger.debug("%s not stored, its parent row is gone", what)
+                        return
+                for row in params:
+                    try:
+                        async with conn.transaction():
+                            await cur.execute(sql, row)
+                    except ForeignKeyViolation:
+                        logger.debug("%s not stored, its parent row is gone", what)
 
 
 # Claims are written as given, never kept from the row: they were placed
@@ -179,7 +198,13 @@ _UPSERT_TURN = """
 """
 
 
-async def upsert_turn_slices(rows: list[TurnRow]) -> None:
+async def upsert_turn_slices(
+    rows: list[TurnRow],
+    *,
+    # DALTON-HOOK(personal-integrations): optional FOR SHARE dual-generation writeback fence
+    thread_id: str | None = None,
+    expected_purge_gen: int | None = None,
+) -> None:
     """Store turns' slices, each with its lines and run claims when known."""
     if not rows:
         return
@@ -201,34 +226,51 @@ async def upsert_turn_slices(rows: list[TurnRow]) -> None:
             for r in rows
         ],
         "turn slice",
+        thread_id=thread_id or rows[0].thread_id,
+        expected_purge_gen=expected_purge_gen,
     )
 
 
-async def update_turns(rows: list[TurnUpdate]) -> None:
+async def update_turns(
+    rows: list[TurnUpdate],
+    *,
+    # DALTON-HOOK(personal-integrations): optional FOR SHARE dual-generation writeback fence
+    thread_id: str | None = None,
+    expected_purge_gen: int | None = None,
+) -> None:
     """Set lines and run claims on stored slices."""
     if not rows:
         return
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.executemany(
-                """UPDATE turn_slices
-                   SET lines_key = COALESCE(%s, lines_key),
-                       lines = COALESCE(%s, lines),
-                       run_claims = COALESCE(%s::jsonb, run_claims),
-                       built_at = NOW()
-                   WHERE conversation_response_id = %s::uuid
-                     AND tail_checkpoint_id = %s""",
-                [
-                    (
-                        r.lines_key,
-                        r.lines,
-                        _json(r.claims),
-                        r.response_id,
-                        r.tail_checkpoint_id,
-                    )
-                    for r in rows
-                ],
-            )
+        async with conn.transaction():
+            # DALTON-HOOK(personal-integrations): verify thread is not purging and generation matches
+            if thread_id is not None and expected_purge_gen is not None:
+                from src.dalton.services.purge_fence import verify_writeback_fence_tx
+
+                if not await verify_writeback_fence_tx(
+                    conn, thread_id, expected_purge_gen, label="turn lines"
+                ):
+                    return
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    """UPDATE turn_slices
+                       SET lines_key = COALESCE(%s, lines_key),
+                           lines = COALESCE(%s, lines),
+                           run_claims = COALESCE(%s::jsonb, run_claims),
+                           built_at = NOW()
+                       WHERE conversation_response_id = %s::uuid
+                         AND tail_checkpoint_id = %s""",
+                    [
+                        (
+                            r.lines_key,
+                            r.lines,
+                            _json(r.claims),
+                            r.response_id,
+                            r.tail_checkpoint_id,
+                        )
+                        for r in rows
+                    ],
+                )
 
 
 async def get_run_slices(thread_id: str, task_ids: list[str]) -> list[RunRow]:
@@ -252,7 +294,13 @@ async def get_run_slices(thread_id: str, task_ids: list[str]) -> list[RunRow]:
             ]
 
 
-async def upsert_run_slices(rows: list[RunRow]) -> None:
+async def upsert_run_slices(
+    rows: list[RunRow],
+    *,
+    # DALTON-HOOK(personal-integrations): optional FOR SHARE dual-generation writeback fence
+    thread_id: str | None = None,
+    expected_purge_gen: int | None = None,
+) -> None:
     """Store subagent runs' slices."""
     if not rows:
         return
@@ -283,4 +331,6 @@ async def upsert_run_slices(rows: list[RunRow]) -> None:
             for r in rows
         ],
         "run slice",
+        thread_id=thread_id or rows[0].thread_id,
+        expected_purge_gen=expected_purge_gen,
     )

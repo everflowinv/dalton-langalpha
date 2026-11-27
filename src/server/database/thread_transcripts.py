@@ -388,7 +388,13 @@ def _changed_rows(
 
 
 async def save_stored(
-    thread_id: str, prefix: str, user_id: str, transcript: StoredTranscript
+    thread_id: str,
+    prefix: str,
+    user_id: str,
+    transcript: StoredTranscript,
+    *,
+    # DALTON-HOOK(personal-integrations): allow fenced caller to run save inside its FOR SHARE transaction
+    conn: Any = None,
 ) -> bool:
     """Replace one agent's stored copy unless a newer render already landed.
 
@@ -405,103 +411,110 @@ async def save_stored(
     Returns whether this save landed; raises ``StaleCopy`` when a file it
     carried over no longer matches its row.
     """
+    async def _run(tx_conn: Any) -> bool:
+        async with tx_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO thread_transcripts AS s
+                    (conversation_thread_id, prefix, fingerprint,
+                     checkpoint_id, stored_at)
+                VALUES (%s, %s, %s, %s, clock_timestamp())
+                ON CONFLICT (conversation_thread_id, prefix) DO UPDATE
+                    SET fingerprint = EXCLUDED.fingerprint,
+                        checkpoint_id = EXCLUDED.checkpoint_id,
+                        stored_at = clock_timestamp()
+                    WHERE s.checkpoint_id IS NULL
+                       OR EXCLUDED.checkpoint_id IS NULL
+                       OR s.checkpoint_id < EXCLUDED.checkpoint_id
+                       OR (s.checkpoint_id = EXCLUDED.checkpoint_id
+                           AND NOT (s.fingerprint = %s
+                                    AND EXCLUDED.fingerprint <> %s))
+                RETURNING 1
+                """,
+                (
+                    thread_id,
+                    prefix,
+                    transcript.fingerprint,
+                    transcript.checkpoint_id,
+                    LIVE_FINGERPRINT,
+                    LIVE_FINGERPRINT,
+                ),
+            )
+            if await cur.fetchone() is None:
+                return False
+            run = transcript.run
+            if run is not None:
+                # Read after the header row's lock: a save it waited
+                # on read the run before committing, so this one sees
+                # the run at least as far along as that one did.
+                await cur.execute(
+                    """
+                    SELECT 1 FROM subagent_tasks t
+                    LEFT JOIN subagent_runs r ON r.task_run_id = t.latest_run_id
+                    WHERE t.thread_id = %s AND t.task_id = %s
+                      AND r.task_run_id IS NOT DISTINCT FROM %s
+                      AND r.status IS NOT DISTINCT FROM %s
+                      AND r.final_checkpoint_id IS NOT DISTINCT FROM %s
+                    """,
+                    (
+                        thread_id,
+                        run.task_id,
+                        run.run_id,
+                        run.status,
+                        run.final_checkpoint_id,
+                    ),
+                )
+                if await cur.fetchone() is None:
+                    raise _RunMoved
+            # Every save of this agent takes the header row first, so
+            # the rows read here are the ones this save replaces.
+            await cur.execute(
+                "SELECT path, sha256, user_id, content IS NOT NULL AS has_bytes "
+                "FROM thread_transcript_files "
+                "WHERE conversation_thread_id = %s AND prefix = %s",
+                (thread_id, prefix),
+            )
+            held = {
+                r["path"]: (r["sha256"], r["user_id"], r["has_bytes"])
+                for r in await cur.fetchall()
+            }
+            rows = _changed_rows(thread_id, prefix, user_id, transcript, held)
+            gone = [path for path in held if path not in transcript.files]
+            if gone:
+                await cur.execute(
+                    "DELETE FROM thread_transcript_files "
+                    "WHERE conversation_thread_id = %s AND path = ANY(%s)",
+                    (thread_id, gone),
+                )
+            if rows:
+                await cur.executemany(
+                    """
+                    INSERT INTO thread_transcript_files AS f
+                        (conversation_thread_id, prefix, path, user_id,
+                         sha256, byte_len, content)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (conversation_thread_id, path) DO UPDATE
+                        SET user_id = EXCLUDED.user_id,
+                            sha256 = EXCLUDED.sha256,
+                            byte_len = EXCLUDED.byte_len,
+                            content = EXCLUDED.content
+                    """,
+                    rows,
+                )
+        return True
+
     try:
-        async with get_db_connection() as conn:
+        # DALTON-HOOK(personal-integrations): join caller's transaction when conn is supplied
+        if conn is not None:
             async with conn.transaction():
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        INSERT INTO thread_transcripts AS s
-                            (conversation_thread_id, prefix, fingerprint,
-                             checkpoint_id, stored_at)
-                        VALUES (%s, %s, %s, %s, clock_timestamp())
-                        ON CONFLICT (conversation_thread_id, prefix) DO UPDATE
-                            SET fingerprint = EXCLUDED.fingerprint,
-                                checkpoint_id = EXCLUDED.checkpoint_id,
-                                stored_at = clock_timestamp()
-                            WHERE s.checkpoint_id IS NULL
-                               OR EXCLUDED.checkpoint_id IS NULL
-                               OR s.checkpoint_id < EXCLUDED.checkpoint_id
-                               OR (s.checkpoint_id = EXCLUDED.checkpoint_id
-                                   AND NOT (s.fingerprint = %s
-                                            AND EXCLUDED.fingerprint <> %s))
-                        RETURNING 1
-                        """,
-                        (
-                            thread_id,
-                            prefix,
-                            transcript.fingerprint,
-                            transcript.checkpoint_id,
-                            LIVE_FINGERPRINT,
-                            LIVE_FINGERPRINT,
-                        ),
-                    )
-                    if await cur.fetchone() is None:
-                        return False
-                    run = transcript.run
-                    if run is not None:
-                        # Read after the header row's lock: a save it waited
-                        # on read the run before committing, so this one sees
-                        # the run at least as far along as that one did.
-                        await cur.execute(
-                            """
-                            SELECT 1 FROM subagent_tasks t
-                            LEFT JOIN subagent_runs r ON r.task_run_id = t.latest_run_id
-                            WHERE t.thread_id = %s AND t.task_id = %s
-                              AND r.task_run_id IS NOT DISTINCT FROM %s
-                              AND r.status IS NOT DISTINCT FROM %s
-                              AND r.final_checkpoint_id IS NOT DISTINCT FROM %s
-                            """,
-                            (
-                                thread_id,
-                                run.task_id,
-                                run.run_id,
-                                run.status,
-                                run.final_checkpoint_id,
-                            ),
-                        )
-                        if await cur.fetchone() is None:
-                            raise _RunMoved
-                    # Every save of this agent takes the header row first, so
-                    # the rows read here are the ones this save replaces.
-                    await cur.execute(
-                        "SELECT path, sha256, user_id, content IS NOT NULL AS has_bytes "
-                        "FROM thread_transcript_files "
-                        "WHERE conversation_thread_id = %s AND prefix = %s",
-                        (thread_id, prefix),
-                    )
-                    held = {
-                        r["path"]: (r["sha256"], r["user_id"], r["has_bytes"])
-                        for r in await cur.fetchall()
-                    }
-                    rows = _changed_rows(thread_id, prefix, user_id, transcript, held)
-                    gone = [path for path in held if path not in transcript.files]
-                    if gone:
-                        await cur.execute(
-                            "DELETE FROM thread_transcript_files "
-                            "WHERE conversation_thread_id = %s AND path = ANY(%s)",
-                            (thread_id, gone),
-                        )
-                    if rows:
-                        await cur.executemany(
-                            """
-                            INSERT INTO thread_transcript_files AS f
-                                (conversation_thread_id, prefix, path, user_id,
-                                 sha256, byte_len, content)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (conversation_thread_id, path) DO UPDATE
-                                SET user_id = EXCLUDED.user_id,
-                                    sha256 = EXCLUDED.sha256,
-                                    byte_len = EXCLUDED.byte_len,
-                                    content = EXCLUDED.content
-                            """,
-                            rows,
-                        )
+                return await _run(conn)
+        async with get_db_connection() as db_conn:
+            async with db_conn.transaction():
+                return await _run(db_conn)
     except (ForeignKeyViolation, _RunMoved):
         # The thread was deleted while its render was in flight, or the task's
         # run moved; either way the transaction rolled the header back.
         return False
-    return True
 
 
 async def drop_rewound(thread_id: str, checkpoint_id: str, *, conn) -> None:

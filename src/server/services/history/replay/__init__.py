@@ -178,13 +178,22 @@ async def build_replay_page(
     are stamped on the way out (``finish_lines``). ``turn_fallback``: see
     ``cold.project_stale``.
     """
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading checkpoints when persisting
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+
+    expected_purge_gen = await read_expected_purge_generation(rows.thread_id) if persist else None
     reader = CheckpointHistoryReader.get_instance()
     branch = await _branch(reader, rows, branch_tip_checkpoint_id)
     if branch is None:
         raise CheckpointReplayUnavailable("no checkpoint turns found")
     inputs, anchored, tip_id = branch
     # DALTON-HOOK(team-sharing): forward persist flag to cold.Policy
-    policy = cold.Policy(turn_fallback=turn_fallback, persist=persist)
+    # DALTON-HOOK(personal-integrations): forward expected_purge_gen to cold.Policy
+    policy = cold.Policy(
+        turn_fallback=turn_fallback,
+        persist=persist,
+        expected_purge_gen=expected_purge_gen,
+    )
 
     lost: list[Any] = []
 
@@ -417,6 +426,10 @@ async def project_turns(
 
     Without ``claims_pass``, turns that need the thread's run launches placed
     raise ``ClaimsPassNeeded`` rather than read the whole thread for them."""
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading checkpoints
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+
+    expected_purge_gen = await read_expected_purge_generation(rows.thread_id)
     reader = CheckpointHistoryReader.get_instance()
     branch = await _branch(reader, rows, branch_tip_checkpoint_id)
     if branch is None:
@@ -434,7 +447,7 @@ async def project_turns(
         inputs,
         anchored,
         selected,
-        cold.Policy(claims_pass=claims_pass),
+        cold.Policy(claims_pass=claims_pass, expected_purge_gen=expected_purge_gen),
     )
 
 

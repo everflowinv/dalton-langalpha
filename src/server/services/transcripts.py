@@ -151,6 +151,8 @@ class _Job:
     window: Window
     #: A task's render from the checkpoint: the run it read.
     run: TaskRun | None = None
+    # DALTON-HOOK(personal-integrations): purge generation read before checkpoints for FOR SHARE writeback fence
+    expected_purge_gen: int | None = None
 
     def render(self, *, inline: bool, full: bool = False) -> _Rendered:
         """The copy, each file named by digest. Only the segments that changed
@@ -218,22 +220,35 @@ async def _save(target: _Target, job: _Job, rendered: _Rendered) -> bool:
     save has since moved is rendered again in full."""
     from src.server.database.thread_transcripts import StaleCopy, save_stored
     from src.server.database.workspace_file_blobs import store_unregistered_blobs
+    # DALTON-HOOK(personal-integrations): delegate fenced saves to save_stored_transcript_fenced (FOR SHARE -> upload -> same tx)
+    from src.dalton.services.purge_fence import save_stored_transcript_fenced
 
     agent = job.agent
-    try:
+
+    async def _persist(item: _Rendered) -> bool:
+        if job.expected_purge_gen is not None:
+            return await save_stored_transcript_fenced(
+                agent.thread_id,
+                agent.prefix,
+                target.user_id,
+                item.copy,
+                item.blobs,
+                expected_purge_gen=job.expected_purge_gen,
+                concurrency=_BLOB_UPLOAD_CONCURRENCY,
+            )
         await store_unregistered_blobs(
-            target.user_id, rendered.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
+            target.user_id, item.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
         )
-        return await save_stored(agent.thread_id, agent.prefix, target.user_id, rendered.copy)
+        return await save_stored(agent.thread_id, agent.prefix, target.user_id, item.copy)
+
+    try:
+        return await _persist(rendered)
     except StaleCopy:
         if job.previous is None:
             raise
         logger.info(f"Transcript {agent.directory} moved under its render; rendering it in full")
     full = await _render_job(job, inline=target.inline, full=True)
-    await store_unregistered_blobs(
-        target.user_id, full.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
-    )
-    return await save_stored(agent.thread_id, agent.prefix, target.user_id, full.copy)
+    return await _persist(full)
 
 
 @dataclass
@@ -291,6 +306,10 @@ async def _render_own(
     """Render the thread's own agent from its checkpoint and store it:
     whether the save landed. None when it stands down, the stored copy being
     newer or the checkpoint empty."""
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading checkpoint state
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+
+    expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
     state = await reader.aget_state(thread.thread_id, thread.checkpoint_id)
     rendered_at = (state.config or {}).get("configurable", {}).get("checkpoint_id")
     if own is not None and _newer(own.checkpoint_id, rendered_at):
@@ -309,6 +328,7 @@ async def _render_own(
         rendered_at,
         own.manifest if own is not None else None,
         Window.of(values),
+        expected_purge_gen=expected_purge_gen,
     )
     return await _render_and_save(target, job)
 
@@ -321,6 +341,10 @@ async def _render_task(
     it has got."""
     row = thread.tasks[task_id]
     run = _task_run(task_id, row)
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading task history
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+
+    expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
     history = await reader.aget_task_history(thread.thread_id, task_id)
     header = {
         "task_id": task_id,
@@ -340,6 +364,7 @@ async def _render_task(
         # Only the main agent's checkpoint is trimmed (``with_window``).
         Window(),
         run,
+        expected_purge_gen=expected_purge_gen,
     )
     return await _render_and_save(target, job)
 
@@ -570,6 +595,10 @@ async def save_live(
         latest = await reader.alatest_checkpoint_id(thread_id, transcript.checkpoint_ns)
     held_at = stored.checkpoint_id if stored is not None else None
     checkpoint_id = max(filter(None, (held_at, latest)), default=None)
+    # DALTON-HOOK(personal-integrations): capture purge generation before rendering live transcript
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+
+    expected_purge_gen = await read_expected_purge_generation(thread_id)
     job = _Job(
         transcript,
         list(messages),
@@ -578,6 +607,7 @@ async def save_live(
         checkpoint_id,
         stored.manifest if stored is not None else None,
         window,
+        expected_purge_gen=expected_purge_gen,
     )
     rendered = await _render_job(job, inline=target.inline)
     if stored is not None and rendered.copy.manifest == stored.manifest:

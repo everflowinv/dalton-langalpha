@@ -38,6 +38,8 @@
 				request>uri query {
 					replace token REDACTED
 					replace ticket REDACTED
+					replace code REDACTED
+					replace state REDACTED
 				}
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete

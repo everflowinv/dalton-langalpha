@@ -449,6 +449,11 @@ async def start_run(
                 if locked_tail_turn and not isinstance(metadata, dict):
                     metadata = {**(metadata or {}), "tail_turn_no_new_work": True}
 
+                # DALTON-HOOK(personal-integrations): refuse run start inside START txn while personal data purge is active
+                from src.dalton.services.purge_fence import assert_thread_not_purging_tx
+
+                await assert_thread_not_purging_tx(conn, thread_id)
+
                 # Fast-path dedup probe. The unique index below is the
                 # race-safe backstop; this just avoids burning a turn_index
                 # (and, on a fork, re-truncating rows the first transmit's

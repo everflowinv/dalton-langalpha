@@ -60,6 +60,8 @@ ADMISSION_CONFLICT_CODES = {
     "comments_unavailable",
     # A shared workspace's thread whose running turn another member sent.
     "another_member",
+    # DALTON-HOOK(personal-integrations): thread has an active personal integration data purge.
+    "personal_data_purge_in_progress",
 }
 
 

@@ -4590,6 +4590,16 @@ async def extract_segment_cards(
     agent = str(first_ev.get("agent") or "main")
     session_id = str(first_ev.get("session_id") or "")
     session_key = str(first_ev.get("session_key") or session_id)
+    from src.dalton.services.purge_fence import is_personal_integration_thread
+
+    if await is_personal_integration_thread(session_id, session_key=session_key):
+        return SegmentExtractionOutcome(
+            ok=True,
+            category="private",
+            cards=[],
+            discarded_segment=True,
+            model_used=eff_model,
+        )
     generation = str(first_ev.get("generation") or "")
     channel = str(first_ev.get("channel") or "")
     chat_type = str(first_ev.get("chat_type") or "")

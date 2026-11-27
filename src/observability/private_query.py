@@ -46,6 +46,9 @@ def _as_a_path(query: str) -> str:
 
 def is_private(path: str, query: str) -> bool:
     mount, folders = _markers()
+    # DALTON-HOOK(personal-integrations): strip OAuth callback query strings (code/state) from access logs and spans
+    if "/api/v1/dalton/integrations/" in path and path.rstrip("/").endswith("/callback"):
+        return True
     # Anywhere in the path, so a server mounted under a root path matches
     # too; anywhere in the decoded query, so any spelling of the folder does.
     # A false match only loses a query string from a log line.

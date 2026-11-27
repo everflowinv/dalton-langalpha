@@ -1512,6 +1512,15 @@ info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
 
+PERSONAL_INTEGRATIONS_RESET_SQL="${WORK_DIR}/scripts/dalton/sql/personal_integrations_restore_reset.sql"
+if [[ -f "$PERSONAL_INTEGRATIONS_RESET_SQL" ]]; then
+  info "Clearing restored personal-integration tokens and transient OAuth state..."
+  compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+    psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 \
+    < "$PERSONAL_INTEGRATIONS_RESET_SQL"
+  ok "Restored personal-integration tokens cleared (existing connections marked needs_reauth)."
+fi
+
 # Verify every completed DB-referenced object exists in object storage; skip in-progress
 # 'uploading' records (incomplete at backup time) and report how many were skipped.
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
