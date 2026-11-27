@@ -105,6 +105,8 @@ NO_USER_CREDENTIAL = {
     ("GET", "/api/v1/public/shared/{share_token}/replay"),
     # DALTON-HOOK(share-redaction): public shared media route is governed by share token & allow_files policy.
     ("GET", "/api/v1/public/shared/{share_token}/media/{media_ref}"),
+    # Share-preview OpenGraph fragment: reads no credential, answers brand-only on any failure.
+    ("GET", "/api/v1/public/og-meta"),
     # Redirects an old preview URL to the page that resolves it for its owner.
     ("GET", "/api/v1/preview/{workspace_id}/{port}"),
     ("GET", "/api/v1/preview/{workspace_id}/{port}/{path:path}"),

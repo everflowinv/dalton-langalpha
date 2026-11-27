@@ -1050,6 +1050,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
     tuple[str, str], CapabilityId | tuple[CapabilityId, ...] | None
 ] = MappingProxyType(
     {
+        # --- public_og.py --- (share-preview OpenGraph fragment; brand-only fallback, no credentials)
+        ("public_og.py", "get_public_og_meta"): CORE_CAPABILITY,
         # --- router.py ---
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
