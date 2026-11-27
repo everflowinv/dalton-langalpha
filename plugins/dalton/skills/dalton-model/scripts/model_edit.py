@@ -581,6 +581,42 @@ def apply_edit_plan(
     cand.parent.mkdir(parents=True, exist_ok=True)
 
     tk = ticker.strip().upper()
+    non_target_sheets: set[str] = {
+        str(entry["name"])
+        for entry in (fp.get("sheet_order") or [])
+        if entry.get("company_tag") is not None and str(entry["company_tag"]).upper() != tk
+    }
+    known_sheets: set[str] = set((fp.get("sheets") or {}).keys())
+
+    # Validate target scope & consensus-snapshot zone BEFORE mutating donor or workbook (Codex R2 #3)
+    ops = list(plan.get("ops") or [])
+    for op in ops:
+        op_sh = str(op.get("sheet") or "")
+        if op_sh in non_target_sheets:
+            raise ValueError(
+                f"Refusing structural op {op.get('op')!r} on non-target company sheet {op_sh!r} for ticker {tk}"
+            )
+        if known_sheets and op_sh not in known_sheets:
+            raise ValueError(f"Unknown sheet in structural ops: {op_sh!r}")
+    for clone_spec in plan.get("clone_columns") or []:
+        c_sh = str(clone_spec.get("sheet") or "")
+        if c_sh in non_target_sheets:
+            raise ValueError(
+                f"Refusing column clone on non-target company sheet {c_sh!r} for ticker {tk}"
+            )
+    for edit in plan.get("cell_edits") or []:
+        e_sh = str(edit.get("sheet") or "")
+        if e_sh in non_target_sheets:
+            raise ValueError(
+                f"Refusing cell edit on non-target company sheet {e_sh!r} for ticker {tk}"
+            )
+        if edit.get("is_consensus_snapshot"):
+            low_sh = e_sh.lower()
+            if not any(k in low_sh for k in ("vs consensus", "street vs house", "consensus")):
+                raise ValueError(
+                    f"Refusing consensus snapshot write (is_consensus_snapshot=True) on non-consensus sheet {e_sh!r}"
+                )
+
     donor_path = (
         Path(donor_out).expanduser().resolve()
         if donor_out
@@ -590,7 +626,6 @@ def apply_edit_plan(
     shutil.copyfile(base, donor_path)
 
     # Step 1: Structural ops via insert.py --preserve-calcpr (preserves all OOXML <v> caches!)
-    ops = list(plan.get("ops") or [])
     if ops:
         insert_mod = _load_module("_dalton_xlsx_insert", _locate_xlsx_script("insert.py"))
         op_cmd_map = {

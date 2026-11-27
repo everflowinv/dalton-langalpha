@@ -75,9 +75,19 @@ _CAGR_DELTA_RE = re.compile(
     re.IGNORECASE,
 )
 _Q_FIRST_RE = re.compile(r"^\s*Q?([1-4])Q\s*['\-/\s]?(\d{2}|\d{4})\s*([AEFP])?\s*$", re.IGNORECASE)
+_Q_FISCAL_FIRST_RE = re.compile(r"^\s*([1-4])Q\s*FY\s*'?(\d{2}|\d{4})\s*([AEFP])?\s*$", re.IGNORECASE)
+_FQ_PREFIX_RE = re.compile(r"^\s*FQ\s*([1-4])\s*['\-/\s]?(?:FY)?\s*'?(\d{2}|\d{4})\s*([AEFP])?\s*$", re.IGNORECASE)
 _Q_PREFIX_RE = re.compile(r"^\s*Q([1-4])\s*['\-/\s]?(\d{2}|\d{4})\s*([AEFP])?\s*$", re.IGNORECASE)
-_Y_FIRST_Q_RE = re.compile(r"^\s*(?:FY|CY)?\s*(\d{2}|\d{4})\s*['\-/\s]?Q([1-4])\s*([AEFP])?\s*$", re.IGNORECASE)
+_Y_FIRST_Q_RE = re.compile(r"^\s*(FY|CY)?\s*(\d{2}|\d{4})\s*['\-/\s]?Q([1-4])\s*([AEFP])?\s*$", re.IGNORECASE)
+_MONTH_YEAR_RE = re.compile(
+    r"^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\-\s'/]+(\d{2}|\d{4})\s*([AEFP])?\s*$",
+    re.IGNORECASE,
+)
 _ANNUAL_RE = re.compile(r"^\s*(?:FY|CY)?\s*'?((?:19|20)\d{2}|\d{2})\s*([AEFP])?\s*$", re.IGNORECASE)
+_QUALIFIED_NAME_RE = re.compile(
+    r"(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.\-]*))!([A-Za-z_][A-Za-z0-9_.]*)\b"
+)
+_PLAIN_CELL_COORD_RE = re.compile(r"^[A-Za-z]{1,3}\d+$")
 
 _SINGLE_COMPANY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+-model-v\d+\.xlsx$", re.IGNORECASE)
 _TICKER_SUFFIX_RE = re.compile(r"\s*[-–—]\s*([A-Z0-9]{1,10})\s*$")
@@ -192,6 +202,21 @@ def parse_period_header(val: Any) -> dict[str, Any] | None:
     text = " ".join(str(val).strip().split())
     if not text or _CAGR_DELTA_RE.search(text):
         return None
+    for rx in (_Q_FISCAL_FIRST_RE, _FQ_PREFIX_RE):
+        m = rx.match(text)
+        if m:
+            q = int(m.group(1))
+            yr = _expand_year(m.group(2))
+            suf = (m.group(3) or "").upper()
+            return {
+                "raw": text,
+                "kind": "quarter",
+                "year": yr,
+                "quarter": q,
+                "is_forecast": suf in ("E", "F", "P"),
+                "is_fiscal_labeled": True,
+                "normalized": f"{q}Q{yr % 100:02d}",
+            }
     for rx in (_Q_FIRST_RE, _Q_PREFIX_RE):
         m = rx.match(text)
         if m:
@@ -204,21 +229,42 @@ def parse_period_header(val: Any) -> dict[str, Any] | None:
                 "year": yr,
                 "quarter": q,
                 "is_forecast": suf in ("E", "F", "P"),
+                "is_fiscal_labeled": False,
                 "normalized": f"{q}Q{yr % 100:02d}",
             }
     m = _Y_FIRST_Q_RE.match(text)
     if m:
-        yr = _expand_year(m.group(1))
-        q = int(m.group(2))
-        suf = (m.group(3) or "").upper()
+        prefix = (m.group(1) or "").upper()
+        yr = _expand_year(m.group(2))
+        q = int(m.group(3))
+        suf = (m.group(4) or "").upper()
         return {
             "raw": text,
             "kind": "quarter",
             "year": yr,
             "quarter": q,
             "is_forecast": suf in ("E", "F", "P"),
+            "is_fiscal_labeled": prefix == "FY",
             "normalized": f"{q}Q{yr % 100:02d}",
         }
+    m = _MONTH_YEAR_RE.match(text)
+    if m:
+        mo_key = m.group(1).lower()[:3]
+        end_mo = _MONTH_MAP.get(mo_key)
+        if end_mo is not None:
+            yr = _expand_year(m.group(2))
+            q = ((end_mo - 1) // 3) + 1
+            suf = (m.group(3) or "").upper()
+            return {
+                "raw": text,
+                "kind": "quarter",
+                "year": yr,
+                "quarter": q,
+                "end_month": end_mo,
+                "is_forecast": suf in ("E", "F", "P"),
+                "is_fiscal_labeled": False,
+                "normalized": f"{q}Q{yr % 100:02d}",
+            }
     m = _ANNUAL_RE.match(text)
     if m:
         yr_s = m.group(1)
@@ -447,25 +493,74 @@ def extract_formula_refs(expr: str, current_sheet: str) -> list[tuple[str, str]]
     return refs
 
 
-def _extract_name_tokens(expr: str) -> list[str]:
-    """Return candidate defined-name identifiers referenced by ``expr``."""
-    tokens_to_check: list[str] = []
+def _extract_name_refs(expr: str) -> list[tuple[str | None, str]]:
+    """Return ``(explicit_sheet_or_none, defined_name)`` candidates referenced by ``expr``."""
+    out: list[tuple[str | None, str]] = []
+    seen: set[tuple[str | None, str]] = set()
     if not expr:
-        return tokens_to_check
+        return out
+
+    def _add(sh: str | None, name: str) -> None:
+        if not name or name.upper() in _EXCEL_BUILTIN_FUNCS:
+            return
+        if _PLAIN_CELL_COORD_RE.match(name):
+            return
+        key = (sh.lower() if sh else None, name.lower())
+        if key not in seen:
+            seen.add(key)
+            out.append((sh, name))
+
     try:
         for tok in Tokenizer(expr if expr.startswith("=") else "=" + expr).items:
             if tok.type == Token.OPERAND and tok.subtype == Token.RANGE:
                 val = tok.value.strip()
-                if "!" not in val and ":" not in val and "[" not in val:
-                    tokens_to_check.append(val)
+                if ":" in val or "[" in val:
+                    continue
+                if "!" in val:
+                    if _CELL_REF_RE.match(val):
+                        continue
+                    sh_part, name_part = val.rsplit("!", 1)
+                    sh_part = sh_part.strip()
+                    if sh_part.startswith("'") and sh_part.endswith("'"):
+                        sh_name = sh_part[1:-1].replace("''", "'")
+                    else:
+                        sh_name = sh_part
+                    if sh_name and name_part and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name_part):
+                        _add(sh_name, name_part)
+                else:
+                    _add(None, val)
     except Exception:
         pass
+
     cleaned = _EXCEL_STR_RE.sub('""', expr)
+    # Sheet-qualified local defined names like 'Rates'!ExtRate or Rates!ExtRate
+    qualified_spans: list[tuple[int, int]] = []
+    for m in _QUALIFIED_NAME_RE.finditer(cleaned):
+        sh_name = m.group(1).replace("''", "'") if m.group(1) else m.group(2)
+        rhs = m.group(3)
+        end_pos = m.end()
+        if end_pos < len(cleaned) and cleaned[end_pos] in ("(", ":"):
+            continue
+        if sh_name and "[" not in sh_name and not _PLAIN_CELL_COORD_RE.match(rhs):
+            _add(sh_name, rhs)
+            qualified_spans.append((m.start(), m.end()))
+
+    # Bare name tokens (skip tokens already consumed as part of Sheet!Name)
     for m in _NAME_TOKEN_RE.finditer(cleaned):
-        tok_s = m.group(1)
-        if tok_s.upper() not in _EXCEL_BUILTIN_FUNCS:
-            tokens_to_check.append(tok_s)
-    return tokens_to_check
+        start_p, end_p = m.start(), m.end()
+        if any(qs <= start_p and end_p <= qe for qs, qe in qualified_spans):
+            continue
+        if end_p < len(cleaned) and cleaned[end_p] == "(":
+            continue
+        if start_p > 0 and cleaned[start_p - 1] == "!":
+            continue
+        _add(None, m.group(1))
+    return out
+
+
+def _extract_name_tokens(expr: str) -> list[str]:
+    """Return bare defined-name identifiers referenced by ``expr``."""
+    return [name for _, name in _extract_name_refs(expr)]
 
 
 def expand_defined_names_in_expr(
@@ -475,9 +570,9 @@ def expand_defined_names_in_expr(
     *,
     tables: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[set[tuple[str, str]], list[tuple[str, int, int, int, int]], str | None, bool]:
-    """Expand defined names recursively; return ``(cell_refs, range_rects, ext_ref_or_none, has_dynamic)``."""
+    """Expand defined names recursively (including ``'Sheet'!LocalName``); return ``(cell_refs, range_rects, ext_ref_or_none, has_dynamic)``."""
     wb_names: dict[str, str] = {}
-    sheet_names: dict[tuple[str, str], str] = {}
+    sheet_names_ci: dict[tuple[str, str], tuple[str, str]] = {}
     for dn in defined_names:
         n_low = str(dn.get("name") or "").strip().lower()
         scope = str(dn.get("scope") or "workbook")
@@ -487,7 +582,7 @@ def expand_defined_names_in_expr(
         if scope == "workbook":
             wb_names[n_low] = d_expr
         else:
-            sheet_names[(scope, n_low)] = d_expr
+            sheet_names_ci[(scope.lower(), n_low)] = (scope, d_expr)
 
     refs: set[tuple[str, str]] = set()
     rects: list[tuple[str, int, int, int, int]] = []
@@ -507,14 +602,27 @@ def expand_defined_names_in_expr(
         for rsh, rcoord in c_refs:
             refs.add((rsh, rcoord.upper()))
         rects.extend(c_rects)
-        for tok_s in _extract_name_tokens(cur_expr):
+        for exp_sh, tok_s in _extract_name_refs(cur_expr):
             key_low = tok_s.lower()
-            target_expr = sheet_names.get((cur_sh, key_low)) or wb_names.get(key_low)
+            target_expr: str | None = None
+            target_scope = cur_sh
+            if exp_sh is not None:
+                local_hit = sheet_names_ci.get((exp_sh.lower(), key_low))
+                if local_hit is not None:
+                    target_scope, target_expr = local_hit
+                elif key_low in wb_names:
+                    target_scope, target_expr = exp_sh, wb_names[key_low]
+            else:
+                local_hit = sheet_names_ci.get((cur_sh.lower(), key_low))
+                if local_hit is not None:
+                    target_scope, target_expr = local_hit
+                elif key_low in wb_names:
+                    target_scope, target_expr = cur_sh, wb_names[key_low]
             if target_expr is not None:
-                vkey = (cur_sh, key_low)
+                vkey = (target_scope.lower(), key_low)
                 if vkey not in visited:
                     visited.add(vkey)
-                    _walk(target_expr, cur_sh)
+                    _walk(target_expr, target_scope)
 
     _walk(expr, current_sheet)
     return refs, rects, ext_hit, has_dyn
@@ -812,19 +920,53 @@ def is_subtotal_or_ratio_row(
     return False
 
 
+def quarter_to_fiscal_year(
+    year: int,
+    quarter: int,
+    fy_end_month: int,
+    *,
+    is_fiscal_labeled: bool = False,
+    end_month: int | None = None,
+) -> tuple[int, int]:
+    """Map a parsed quarter header ``(year, quarter)`` into ``(fiscal_year, fiscal_quarter)`` using ``fy_end_month``.
+
+    - Explicit fiscal labels (e.g. ``FY26Q1``, ``1QFY26``) and December fiscal years (``fy_end_month == 12``)
+      return ``(year, quarter)`` unchanged.
+    - Non-December calendar-quarter labels (e.g. ``fy_end_month == 3`` where ``2Q25..4Q25`` and ``1Q26``
+      belong to ``FY26``) shift quarters ending after ``fy_end_month`` into ``year + 1`` and renumber
+      fiscal quarters 1..4 ending with the ``fy_end_month`` quarter as FQ4.
+    """
+    if is_fiscal_labeled or fy_end_month == 12 or not (1 <= fy_end_month <= 11):
+        return int(year), int(quarter)
+    eff_end_month = int(end_month) if end_month is not None else int(quarter) * 3
+    fy = int(year) + 1 if eff_end_month > fy_end_month else int(year)
+    fy_end_q = ((fy_end_month - 1) // 3) + 1
+    fq = ((int(quarter) - fy_end_q - 1) % 4) + 1
+    return fy, fq
+
+
 def _detect_annual_quarter_map(columns: dict[str, dict[str, Any]], fy_end_month: int) -> dict[str, list[str]]:
-    """Map annual column letters to their 4 fiscal-quarter column letters."""
-    q_by_year: dict[int, dict[int, str]] = defaultdict(dict)
+    """Map annual column letters to their 4 fiscal-quarter column letters honoring ``fy_end_month``."""
+    q_by_fy: dict[int, dict[int, str]] = defaultdict(dict)
     for col_l, meta in columns.items():
         if meta.get("kind") == "quarter" and meta.get("year") and meta.get("quarter"):
-            q_by_year[int(meta["year"])][int(meta["quarter"])] = col_l
+            fy, fq = quarter_to_fiscal_year(
+                int(meta["year"]),
+                int(meta["quarter"]),
+                fy_end_month,
+                is_fiscal_labeled=bool(meta.get("is_fiscal_labeled", False)),
+                end_month=meta.get("end_month"),
+            )
+            meta["fiscal_year"] = fy
+            meta["fiscal_quarter"] = fq
+            q_by_fy[fy][fq] = col_l
 
     mapping: dict[str, list[str]] = {}
     for col_l, meta in columns.items():
         if meta.get("kind") != "annual" or not meta.get("year"):
             continue
         yr = int(meta["year"])
-        qs = q_by_year.get(yr, {})
+        qs = q_by_fy.get(yr, {})
         if all(q in qs for q in (1, 2, 3, 4)):
             mapping[col_l] = [qs[1], qs[2], qs[3], qs[4]]
     return mapping

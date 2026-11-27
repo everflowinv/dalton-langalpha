@@ -54,22 +54,115 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
     "breakeven_margin_bp": 150.0,
 }
 
-_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
-    "total_revenue": ("total revenue", "revenue", "总收入", "营业总收入", "营业收入"),
-    "operating_income": ("operating income", "operating profit", "ebit", "营业利润"),
-    "net_income": ("net income", "net profit", "归母净利润", "净利润"),
-    "diluted_eps": ("diluted eps", "eps", "epads", "每股收益"),
-    "gross_profit": ("gross profit", "毛利"),
-    "operating_expenses_ratio": ("opex %", "operating expenses %", "费用率"),
+_GROUP_METRIC_EXACT: dict[str, tuple[str, ...]] = {
+    "total_revenue": (
+        "total revenue",
+        "revenue",
+        "net revenue",
+        "net revenues",
+        "total net revenues",
+        "group revenue",
+        "consolidated revenue",
+        "总收入",
+        "营业总收入",
+        "营业收入",
+        "集团总收入",
+        "集团收入",
+    ),
+    "operating_income": (
+        "operating income",
+        "operating profit",
+        "group operating income",
+        "group operating profit",
+        "consolidated operating income",
+        "ebit",
+        "营业利润",
+        "集团营业利润",
+    ),
+    "net_income": (
+        "net income",
+        "net profit",
+        "group net income",
+        "net income attributable to shareholders",
+        "归母净利润",
+        "净利润",
+    ),
+    "diluted_eps": (
+        "diluted eps",
+        "eps",
+        "epads",
+        "diluted epads",
+        "每股收益",
+        "稀释每股收益",
+    ),
+    "gross_profit": ("gross profit", "group gross profit", "毛利", "毛利润"),
+    "operating_expenses_ratio": ("opex %", "operating expenses %", "opex ratio", "费用率"),
 }
 
+_SEGMENT_METRIC_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("operating income", "operating_income"),
+    ("operating profit", "operating_income"),
+    ("gross profit", "gross_profit"),
+    ("net revenues", "revenue"),
+    ("net revenue", "revenue"),
+    ("revenue", "revenue"),
+    ("ebitda", "ebitda"),
+    ("ebit", "operating_income"),
+    ("margin", "margin"),
+    ("营业利润", "operating_income"),
+    ("毛利", "gross_profit"),
+    ("收入", "revenue"),
+)
 
-def _normalize_metric_key(name: str) -> str:
-    low = " ".join(str(name or "").strip().lower().split())
-    for canon, aliases in _METRIC_ALIASES.items():
-        if low == canon or any(a == low or a in low for a in aliases):
+_GROUP_PREFIX_WORDS = frozenset({"total", "group", "consolidated", "net", "总", "集团", "合并", "营业"})
+_SEG_FILLER_RE = re.compile(r"\b(?:segment|division|business)\b|分部|业务", re.IGNORECASE)
+
+
+def _slugify_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "_", text.strip().lower()).strip("_")
+
+
+def _normalize_metric_key(name: str, segment: str | None = None) -> str:
+    """Normalize ``(segment, metric)`` while preserving distinct segment identities.
+
+    Ensures ``Cloud Revenue`` (``cloud::revenue``), ``Retail Revenue`` (``retail::revenue``),
+    and ``Total Revenue`` (``total_revenue``) NEVER collide across snapshot writes, diff, or C04.
+    """
+    raw = str(name or "").strip()
+    # Strip leading hierarchy prefixes joined by '|' (e.g. 'Segment Reporting | Cloud Revenue')
+    if "|" in raw:
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        raw = parts[-1] if parts else raw
+    low = " ".join(raw.lower().split())
+
+    if segment and str(segment).strip():
+        seg_clean = _SEG_FILLER_RE.sub(" ", str(segment).strip().lower())
+        seg_slug = _slugify_key(seg_clean)
+        base_m = _normalize_metric_key(low)
+        if base_m == "total_revenue":
+            base_m = "revenue"
+        return f"{seg_slug}::{base_m}" if seg_slug else base_m
+
+    # 1. Exact group-level metric match
+    for canon, aliases in _GROUP_METRIC_EXACT.items():
+        if low == canon or low in aliases:
             return canon
-    return low.replace(" ", "_")
+
+    # 2. Segment-qualified metric (e.g. "Cloud Revenue", "Retail Segment Revenue", "JD Retail Operating Profit")
+    for suffix, base_metric in _SEGMENT_METRIC_SUFFIXES:
+        if low.endswith(suffix) and len(low) > len(suffix):
+            prefix = low[: -len(suffix)].strip(" -:|/")
+            if not prefix:
+                continue
+            prefix_tokens = set(prefix.split())
+            if prefix in _GROUP_PREFIX_WORDS or (prefix_tokens and prefix_tokens <= _GROUP_PREFIX_WORDS):
+                return "total_revenue" if base_metric == "revenue" else base_metric
+            seg_clean = _SEG_FILLER_RE.sub(" ", prefix)
+            seg_slug = _slugify_key(seg_clean)
+            if seg_slug:
+                return f"{seg_slug}::{base_metric}"
+
+    return _slugify_key(low)
 
 
 def _metric_category(metric_key: str, raw_category: str | None = None) -> str:
@@ -77,10 +170,10 @@ def _metric_category(metric_key: str, raw_category: str | None = None) -> str:
         return str(raw_category).strip().lower()
     if metric_key == "total_revenue":
         return "revenue"
-    if metric_key in ("operating_income", "net_income", "diluted_eps"):
-        return "profit_eps"
-    if "segment" in metric_key and "revenue" in metric_key:
+    if metric_key.endswith("::revenue") or ("segment" in metric_key and "revenue" in metric_key):
         return "segment_revenue"
+    if metric_key in ("operating_income", "net_income", "diluted_eps") or metric_key.endswith("::operating_income"):
+        return "profit_eps"
     if "ratio" in metric_key or "margin" in metric_key or "费用率" in metric_key:
         return "opex_ratio"
     return "profit_eps"
@@ -377,6 +470,33 @@ def write_consensus_snapshot(
                 "As-Of Date",
                 "Rationale",
             ]
+            def _open_isolated_block() -> dict[str, Any]:
+                banner_r = max(ws.max_row, 1) + 2
+                hdr_r = banner_r + 1
+                banner_c = ws.cell(banner_r, 1, "Consensus Snapshot (Isolated Reference Zone)")
+                model_style.apply_cell_style(banner_c, "section_report")
+                touched_coords.append(f"A{banner_r}")
+                for idx, h in enumerate(headers, start=1):
+                    c = ws.cell(hdr_r, idx, h)
+                    model_style.apply_cell_style(c, "header")
+                    c.alignment = openpyxl.styles.Alignment(
+                        horizontal="left" if idx in (1, 2, 6, 7, 8) else "right", vertical="center"
+                    )
+                    touched_coords.append(f"{get_column_letter(idx)}{hdr_r}")
+                return {
+                    "header_row": hdr_r,
+                    "data_start_row": hdr_r + 1,
+                    "data_end_row": hdr_r,
+                    "period_col": 1,
+                    "metric_col": 2,
+                    "house_col": 3,
+                    "consensus_col": 4,
+                    "diff_col": 5,
+                    "source_col": 6,
+                    "date_col": 7,
+                    "rationale_col": 8,
+                }
+
             if target_sh is None:
                 ws = wb.create_sheet(sheet_name)
                 target_sh = sheet_name
@@ -412,40 +532,48 @@ def write_consensus_snapshot(
                 else:
                     # Unrecognizable or formula-colliding layout -> create brand-new isolated zone below!
                     layout_mode = "isolated_block"
-                    banner_r = max(ws.max_row, 1) + 2
-                    hdr_r = banner_r + 1
-                    banner_c = ws.cell(banner_r, 1, "Consensus Snapshot (Isolated Reference Zone)")
-                    model_style.apply_cell_style(banner_c, "section_report")
-                    touched_coords.append(f"A{banner_r}")
-                    for idx, h in enumerate(headers, start=1):
-                        c = ws.cell(hdr_r, idx, h)
-                        model_style.apply_cell_style(c, "header")
-                        c.alignment = openpyxl.styles.Alignment(
-                            horizontal="left" if idx in (1, 2, 6, 7, 8) else "right", vertical="center"
-                        )
-                        touched_coords.append(f"{get_column_letter(idx)}{hdr_r}")
-                    layout = {
-                        "header_row": hdr_r,
-                        "data_start_row": hdr_r + 1,
-                        "data_end_row": hdr_r,
-                        "period_col": 1,
-                        "metric_col": 2,
-                        "house_col": 3,
-                        "consensus_col": 4,
-                        "diff_col": 5,
-                        "source_col": 6,
-                        "date_col": 7,
-                        "rationale_col": 8,
-                    }
+                    layout = _open_isolated_block()
 
-            p_col = int(layout["period_col"])
-            m_col = int(layout["metric_col"])
-            h_col = layout.get("house_col")
-            c_col = int(layout["consensus_col"])
-            d_col = layout.get("diff_col")
-            s_col = layout.get("source_col")
-            dt_col = layout.get("date_col")
-            rat_col = layout.get("rationale_col")
+            def _layout_cols(lay: dict[str, Any]) -> tuple[int, int, int | None, int, int | None, int | None, int | None, int | None]:
+                return (
+                    int(lay["period_col"]),
+                    int(lay["metric_col"]),
+                    lay.get("house_col"),
+                    int(lay["consensus_col"]),
+                    lay.get("diff_col"),
+                    lay.get("source_col"),
+                    lay.get("date_col"),
+                    lay.get("rationale_col"),
+                )
+
+            def _row_conflicts_for_append(r_cand: int, lay: dict[str, Any]) -> bool:
+                """Check ALL planned write positions & table span on ``r_cand`` before appending (Codex R2 #2)."""
+                cols_in_lay = [
+                    int(lay[k])
+                    for k in ("period_col", "metric_col", "house_col", "consensus_col", "diff_col", "source_col", "date_col", "rationale_col")
+                    if lay.get(k) is not None
+                ]
+                if not cols_in_lay:
+                    return True
+                for c_idx in range(min(cols_in_lay), max(cols_in_lay) + 1):
+                    if ws.cell(r_cand, c_idx).value is not None:
+                        return True
+                return False
+
+            def _existing_row_has_formula_conflict(r_exist: int, lay: dict[str, Any], item_obj: dict[str, Any]) -> bool:
+                check_cols = [int(lay["consensus_col"])]
+                for opt_k in ("source_col", "date_col"):
+                    if lay.get(opt_k) is not None:
+                        check_cols.append(int(lay[opt_k]))
+                if lay.get("rationale_col") is not None and item_obj.get("rationale") is not None:
+                    check_cols.append(int(lay["rationale_col"]))
+                for c_idx in check_cols:
+                    val = ws.cell(r_exist, c_idx).value
+                    if isinstance(val, str) and val.strip().startswith("="):
+                        return True
+                return False
+
+            p_col, m_col, h_col, c_col, d_col, s_col, dt_col, rat_col = _layout_cols(layout)
 
             # Build existing (period, metric_key) -> row index lookup strictly within detected table
             row_lookup: dict[tuple[str, str], int] = {}
@@ -456,72 +584,116 @@ def write_consensus_snapshot(
                 if p_val and m_val:
                     row_lookup[(p_val.upper(), _normalize_metric_key(m_val))] = r
 
+            # Pre-validate append rows: if any prospective append row collides with existing formulas/content
+            # (e.g. a summary row right below the table carrying House/Diff formulas), open an isolated zone!
+            isolated_layout: dict[str, Any] | None = None
+            isolated_next_row = 0
+            isolated_lookup: dict[tuple[str, str], int] = {}
+
+            def _ensure_isolated_append() -> dict[str, Any]:
+                nonlocal isolated_layout, isolated_next_row, layout_mode
+                if isolated_layout is None:
+                    isolated_layout = _open_isolated_block()
+                    isolated_next_row = int(isolated_layout["data_start_row"])
+                    layout_mode = "isolated_block"
+                return isolated_layout
+
             for item in items:
                 period = str(item.get("period") or "").strip()
                 metric_label = str(item.get("metric") or item.get("label") or "").strip()
+                segment_label = str(item.get("segment") or "").strip() or None
                 cons_val = item.get("consensus")
                 if not period or not metric_label or cons_val is None:
                     continue
-                mkey = _normalize_metric_key(metric_label)
+                display_metric = (
+                    f"{segment_label} {metric_label}"
+                    if (segment_label and segment_label.lower() not in metric_label.lower())
+                    else metric_label
+                )
+                mkey = _normalize_metric_key(metric_label, segment=segment_label)
                 row_idx = row_lookup.get((period.upper(), mkey))
+                active_lay = layout
+                use_isolated = False
+
+                if row_idx is not None and _existing_row_has_formula_conflict(row_idx, layout, item):
+                    use_isolated = True
+                    row_idx = None
+                elif row_idx is None:
+                    if isolated_layout is not None or (
+                        layout_mode == "existing_table" and _row_conflicts_for_append(next_row, layout)
+                    ):
+                        use_isolated = True
+
+                if use_isolated:
+                    active_lay = _ensure_isolated_append()
+                    row_idx = isolated_lookup.get((period.upper(), mkey))
+
+                ap_col, am_col, ah_col, ac_col, ad_col, as_col, adt_col, arat_col = _layout_cols(active_lay)
                 is_new_row = False
                 if row_idx is None:
                     is_new_row = True
-                    row_idx = next_row
-                    next_row += 1
-                    ws.cell(row_idx, p_col, period)
-                    ws.cell(row_idx, m_col, metric_label)
-                    touched_coords.append(f"{get_column_letter(p_col)}{row_idx}")
-                    touched_coords.append(f"{get_column_letter(m_col)}{row_idx}")
-                    if h_col is not None and item.get("house_formula"):
-                        hc = ws.cell(row_idx, int(h_col), str(item["house_formula"]))
+                    if use_isolated:
+                        row_idx = isolated_next_row
+                        isolated_next_row += 1
+                    else:
+                        row_idx = next_row
+                        next_row += 1
+                    ws.cell(row_idx, ap_col, period)
+                    ws.cell(row_idx, am_col, display_metric)
+                    touched_coords.append(f"{get_column_letter(ap_col)}{row_idx}")
+                    touched_coords.append(f"{get_column_letter(am_col)}{row_idx}")
+                    if ah_col is not None and item.get("house_formula"):
+                        hc = ws.cell(row_idx, int(ah_col), str(item["house_formula"]))
                         model_style.apply_cell_style(hc, "formula", is_link=True)
-                        hc_ref = f"{get_column_letter(int(h_col))}{row_idx}"
+                        hc_ref = f"{get_column_letter(int(ah_col))}{row_idx}"
                         touched_coords.append(hc_ref)
                         touched_formula_coords.append(hc_ref)
-                    if d_col is not None and h_col is not None:
-                        c_let = get_column_letter(c_col)
-                        h_let = get_column_letter(int(h_col))
-                        d_let = get_column_letter(int(d_col))
+                    if ad_col is not None and ah_col is not None:
+                        c_let = get_column_letter(ac_col)
+                        h_let = get_column_letter(int(ah_col))
+                        d_let = get_column_letter(int(ad_col))
                         dc = ws.cell(
                             row_idx,
-                            int(d_col),
+                            int(ad_col),
                             f'=IF(OR({c_let}{row_idx}="",{c_let}{row_idx}=0),"",({h_let}{row_idx}-{c_let}{row_idx})/ABS({c_let}{row_idx}))',
                         )
                         model_style.apply_cell_style(dc, "formula", is_ratio=True, is_percent=True)
                         dc_ref = f"{d_let}{row_idx}"
                         touched_coords.append(dc_ref)
                         touched_formula_coords.append(dc_ref)
-                    row_lookup[(period.upper(), mkey)] = row_idx
+                    if use_isolated:
+                        isolated_lookup[(period.upper(), mkey)] = row_idx
+                    else:
+                        row_lookup[(period.upper(), mkey)] = row_idx
 
-                cons_coord = f"{get_column_letter(c_col)}{row_idx}"
-                snap_cell = ws.cell(row_idx, c_col, float(cons_val))
+                cons_coord = f"{get_column_letter(ac_col)}{row_idx}"
+                snap_cell = ws.cell(row_idx, ac_col, float(cons_val))
                 model_style.apply_cell_style(snap_cell, "external_input")
                 written_coords.append(cons_coord)
                 touched_coords.append(cons_coord)
 
-                if s_col is not None:
-                    src_cell = ws.cell(row_idx, int(s_col), str(item.get("source_type") or source_type))
+                if as_col is not None:
+                    src_cell = ws.cell(row_idx, int(as_col), str(item.get("source_type") or source_type))
                     model_style.apply_cell_style(src_cell, "source_note")
-                    touched_coords.append(f"{get_column_letter(int(s_col))}{row_idx}")
-                if dt_col is not None:
-                    dt_cell = ws.cell(row_idx, int(dt_col), str(item.get("as_of_date") or as_of_date))
+                    touched_coords.append(f"{get_column_letter(int(as_col))}{row_idx}")
+                if adt_col is not None:
+                    dt_cell = ws.cell(row_idx, int(adt_col), str(item.get("as_of_date") or as_of_date))
                     model_style.apply_cell_style(dt_cell, "source_note")
-                    touched_coords.append(f"{get_column_letter(int(dt_col))}{row_idx}")
-                if rat_col is not None and item.get("rationale") is not None:
-                    ws.cell(row_idx, int(rat_col), str(item["rationale"]))
-                    touched_coords.append(f"{get_column_letter(int(rat_col))}{row_idx}")
+                    touched_coords.append(f"{get_column_letter(int(adt_col))}{row_idx}")
+                if arat_col is not None and item.get("rationale") is not None:
+                    ws.cell(row_idx, int(arat_col), str(item["rationale"]))
+                    touched_coords.append(f"{get_column_letter(int(arat_col))}{row_idx}")
 
                 # Track any diff formula cell on this row so its cached value is refreshed, not left stale!
-                if d_col is not None:
-                    d_coord = f"{get_column_letter(int(d_col))}{row_idx}"
-                    d_val = ws.cell(row_idx, int(d_col)).value
+                if ad_col is not None:
+                    d_coord = f"{get_column_letter(int(ad_col))}{row_idx}"
+                    d_val = ws.cell(row_idx, int(ad_col)).value
                     if isinstance(d_val, str) and d_val.strip().startswith("="):
                         touched_formula_coords.append(d_coord)
                         diff_targets.append(
                             {
                                 "diff_coord": d_coord,
-                                "house_coord": f"{get_column_letter(int(h_col))}{row_idx}" if h_col is not None else None,
+                                "house_coord": f"{get_column_letter(int(ah_col))}{row_idx}" if ah_col is not None else None,
                                 "cons_coord": cons_coord,
                                 "cons_val": float(cons_val),
                                 "is_new_row": is_new_row,
@@ -622,13 +794,21 @@ def _extract_house_values_from_model(
             model_basis["currency"] = "USD"
 
         anchors = sh_data.get("semantic_anchors") or {}
-        anchor_rows = {
+        anchor_rows: dict[str, int | None] = {
             "total_revenue": anchors.get("total_revenue_row"),
             "gross_profit": anchors.get("gross_profit_row"),
             "operating_income": anchors.get("operating_income_row"),
             "net_income": anchors.get("net_income_row"),
             "diluted_eps": anchors.get("eps_row"),
         }
+        lim = sh_data.get("line_item_map") or {}
+        for row_s, rmeta in lim.items():
+            lbl = str(rmeta.get("label") or "").strip()
+            if not lbl:
+                continue
+            r_mkey = _normalize_metric_key(lbl)
+            if r_mkey and r_mkey not in anchor_rows:
+                anchor_rows[r_mkey] = int(row_s)
         cells = sh_data.get("cells") or {}
         cols = p_axis.get("columns") or {}
 
@@ -795,7 +975,8 @@ def compute_consensus_diff(
     for item in raw_items:
         period = str(item.get("period") or "").strip()
         metric_lbl = str(item.get("metric") or item.get("label") or "").strip()
-        mkey = _normalize_metric_key(metric_lbl)
+        segment_lbl = str(item.get("segment") or "").strip() or None
+        mkey = _normalize_metric_key(metric_lbl, segment=segment_lbl)
         cons_val = item.get("consensus")
         if cons_val is None:
             continue

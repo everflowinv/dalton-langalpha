@@ -35,6 +35,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1539,15 +1540,47 @@ def test_recover_baseline_postgres_sql_casts_and_datetime_binding() -> None:
     assert params["turn_created_at"].tzinfo is not None
 
 
+def _extract_pg_dbname(dsn: str) -> str:
+    """Extract database name from a PostgreSQL URI or libpq conninfo string."""
+    raw = str(dsn or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw)
+        return parsed.path.lstrip("/").strip()
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        info = conninfo_to_dict(raw)
+        return str(info.get("dbname") or "").strip()
+    except Exception:
+        m = re.search(r"\bdbname\s*=\s*([^\s']+)", raw)
+        return m.group(1).strip() if m else ""
+
+
+def _resolve_safe_test_pg_dsn() -> str | None:
+    """Return explicit ``DALTON_TEST_PG_DSN`` ONLY if its database name ends with ``_test``."""
+    dsn = os.environ.get("DALTON_TEST_PG_DSN", "").strip()
+    if not dsn:
+        return None
+    dbname = _extract_pg_dbname(dsn)
+    if not dbname or not dbname.endswith("_test"):
+        return None
+    return dsn
+
+
 @pytest.mark.skipif(
-    not (os.environ.get("DALTON_TEST_PG_DSN") or os.environ.get("DATABASE_URL")),
-    reason="No PostgreSQL test DSN configured (set DALTON_TEST_PG_DSN or DATABASE_URL; run on remote pgtest)",
+    _resolve_safe_test_pg_dsn() is None,
+    reason="Requires explicit DALTON_TEST_PG_DSN whose database name ends with '_test' (never falls back to DATABASE_URL)",
 )
 def test_recover_baseline_real_postgres_integration(tmp_path: Path) -> None:
-    """Principle #5: execute real PostgreSQL SQL queries via PostgresReadOnlyAdapter against a real PG DB."""
+    """Principle #5 & R3 #1: execute real PostgreSQL SQL queries ONLY against explicit *_test DB."""
     import psycopg
 
-    dsn = os.environ.get("DALTON_TEST_PG_DSN") or os.environ["DATABASE_URL"]
+    dsn = _resolve_safe_test_pg_dsn()
+    assert dsn is not None
     schema = f"dalton_p0a_pgtest_{uuid.uuid4().hex[:10]}"
     baseline_bytes = FIXTURE_XLSX.read_bytes()
     baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
@@ -1791,3 +1824,799 @@ def test_consensus_snapshot_isolation_and_diff_thresholds(tmp_path: Path) -> Non
     assert by_metric[("2027E", "net_income")]["exceeds_threshold"] is True
     assert by_metric[("2027E", "net_income")]["missing_rationale"] is True
     assert diff_res["missing_rationale_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 10. Round-3 targeted tests (Codex & Grok R2 review items + Prompt #1-#6)
+# ---------------------------------------------------------------------------
+
+
+def test_pg_test_dsn_guard_never_falls_back_to_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3 #1 / Codex #10: PG integration test MUST only accept explicit DALTON_TEST_PG_DSN ending in _test."""
+    monkeypatch.delenv("DALTON_TEST_PG_DSN", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://prod:secret@prod.db/dalton_test")
+    assert _resolve_safe_test_pg_dsn() is None
+
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_prod")
+    assert _resolve_safe_test_pg_dsn() is None
+
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_test")
+    assert _resolve_safe_test_pg_dsn() == "postgresql://u:p@localhost:5432/dalton_test"
+
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "host=localhost port=5432 dbname=pg_unit_test user=postgres")
+    assert _resolve_safe_test_pg_dsn() == "host=localhost port=5432 dbname=pg_unit_test user=postgres"
+
+
+def _xml_full_cell_states(xlsx_path: Path, sheet_name: str) -> dict[str, dict[str, Any]]:
+    """Inspect raw XML cell state (t, has_v, v_text, has_is) for ALL cells on ``sheet_name``."""
+    _, payload = mhooks._read_package(xlsx_path)
+    sst = mhooks._read_shared_strings(payload)
+    part = mhooks._sheet_parts(payload)[sheet_name]
+    root = etree.fromstring(payload[part], mhooks._XML)
+    out: dict[str, dict[str, Any]] = {}
+    for c in root.iter(f"{{{mhooks._SML}}}c"):
+        ref = (c.get("r") or "").upper()
+        if not ref:
+            continue
+        v = c.find(f"{{{mhooks._SML}}}v")
+        is_el = c.find(f"{{{mhooks._SML}}}is")
+        t = c.get("t")
+        resolved = None
+        if t == "s" and v is not None and (v.text or "").isdigit():
+            idx = int(v.text)
+            resolved = sst[idx] if 0 <= idx < len(sst) else None
+        out[ref] = {
+            "t": t,
+            "has_v": v is not None,
+            "v_text": v.text if v is not None else None,
+            "has_is": is_el is not None,
+            "resolved_sst": resolved,
+        }
+    return out
+
+
+def test_cache_fidelity_sst_missing_v_target_exempt_and_unmodified_downstream_lo_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 #2 / Codex #1 / Grok #1 & 疑似:
+    - Non-target t="s" stays t="s" (never degrades to inlineStr) even when reinserted.
+    - Missing <v> with t="n" stays missing <v> with t="n" (never becomes <v/>); empty <v/> stays empty <v/>.
+    - Dropped exempt cell on target sheet is reinserted by restore_donor_cache.
+    - Editing a driver where unmodified downstream XIRR/XLOOKUP errors in LO keeps baseline <v>,
+      does NOT backfill missing-cache unmodified formulas, and classifies as baseline_legacy in C13."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+    wb = openpyxl.load_workbook(base, data_only=False)
+    ws_jd = wb["Model - JD"]
+    # Add unmodified downstream XIRR/XLOOKUP formula (P44) depending on driver P25, plus missing-cache formula (K44)
+    ws_jd["D44"].value = "Implied XIRR Check"
+    ws_jd["P44"].value = "=XIRR(P4:P5,P25:P26)"
+    ws_jd["K44"].value = "=SUM(E4:F4)"
+    wb.save(base)
+    wb.close()
+
+    # Craft raw XML on base (simulating real Excel workbook with sharedStrings.xml):
+    # - Model - BABA!D4 uses shared string t="s", <v>0</v> in xl/sharedStrings.xml
+    # - Model - JD!P44 has non-empty baseline <v>0.185</v>
+    # - Model - JD!K44 has explicit t="n" and NO <v> element at all
+    # - Model - JD!K45 has explicit t="n" and empty <v/>
+    infos, payload = mhooks._read_package(base)
+    parts = mhooks._sheet_parts(payload)
+    sst_setup = mhooks._SharedStringsMutator(infos, payload)
+    baba_root = etree.fromstring(payload[parts["Model - BABA"]], mhooks._XML)
+    for c in baba_root.iter(f"{{{mhooks._SML}}}c"):
+        if (c.get("r") or "").upper() == "D4":
+            idx0 = sst_setup.intern("BABA Revenue")
+            mhooks._apply_cached_value(c, "s", str(idx0))
+    payload[parts["Model - BABA"]] = etree.tostring(baba_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    sst_setup.flush()
+
+    jd_root = etree.fromstring(payload[parts["Model - JD"]], mhooks._XML)
+    for c in jd_root.iter(f"{{{mhooks._SML}}}c"):
+        ref = (c.get("r") or "").upper()
+        if ref == "E45":
+            mhooks._apply_cached_value(c, "n", "38.5")
+        elif ref == "P44":
+            mhooks._apply_cached_value(c, "n", "0.185")
+        elif ref == "K44":
+            v_old = c.find(f"{{{mhooks._SML}}}v")
+            if v_old is not None:
+                c.remove(v_old)
+            c.set("t", "n")
+    # Insert K45 formula cell with empty <v/> and t="n"
+    sd = jd_root.find(f"{{{mhooks._SML}}}sheetData")
+    r45 = next(r for r in sd.findall(f"{{{mhooks._SML}}}row") if r.get("r") == "45")
+    c_k45 = etree.SubElement(r45, f"{{{mhooks._SML}}}c", r="K45", t="n")
+    f_k45 = etree.SubElement(c_k45, f"{{{mhooks._SML}}}f")
+    f_k45.text = "SUM(E4:F4)"
+    etree.SubElement(c_k45, f"{{{mhooks._SML}}}v")  # empty <v/>
+    payload[parts["Model - JD"]] = etree.tostring(jd_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(base, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in infos:
+            zout.writestr(info, payload[info.filename])
+
+    # Confirm base preconditions (including exact t="s" + <v>0</v>)
+    baba_before = _xml_full_cell_states(base, "Model - BABA")
+    assert baba_before["D4"]["t"] == "s" and baba_before["D4"]["v_text"] == "0"
+    assert baba_before["D4"]["resolved_sst"] == "BABA Revenue"
+    jd_before = _xml_full_cell_states(base, "Model - JD")
+    assert jd_before["K44"]["has_v"] is False and jd_before["K44"]["t"] == "n"
+    assert jd_before["K45"]["has_v"] is True and jd_before["K45"]["v_text"] is None and jd_before["K45"]["t"] == "n"
+
+    # Simulate LibreOffice returning #NAME? on unmodified downstream XIRR P44, "0" on missing-cache K44,
+    # valid updated value on P4, and #DIV/0! on newly added broken formula H50
+    def _fake_soffice_xirr(src: Path, out_dir: Path, timeout: int) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        produced = out_dir / (src.stem + ".xlsx")
+        shutil.copyfile(src, produced)
+        _inject_xml_v_values(
+            produced,
+            {
+                "Model - JD": {
+                    "P4": (None, "2850.0"),
+                    "P44": ("e", "#NAME?"),
+                    "K44": (None, "0"),
+                    "H50": ("e", "#DIV/0!"),
+                }
+            },
+        )
+        return produced
+
+    soffice_stub = create_autospec(_REAL_SOFFICE_CALC, side_effect=_fake_soffice_xirr)
+    which_stub = create_autospec(_REAL_SHUTIL_WHICH, return_value="/usr/bin/soffice")
+    monkeypatch.setattr(recalc_mod, "soffice_calculate", soffice_stub)
+    monkeypatch.setattr(recalc_mod.shutil, "which", which_stub)
+
+    res = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "P25", "value": 0.14},
+                {"sheet": "Model - JD", "cell": "H50", "value": "=1/0"},
+            ],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "Driver edit"},
+        },
+        workspace_dir=ws,
+        recalc_mod_override=recalc_mod,
+    )
+    cand = Path(res["candidate_path"])
+    jd_after = _xml_full_cell_states(cand, "Model - JD")
+    baba_after = _xml_full_cell_states(cand, "Model - BABA")
+
+    # 1. Non-target sheet t="s" stayed t="s" (NOT inlineStr!)
+    assert baba_after["D4"]["t"] == "s" and baba_after["D4"]["has_is"] is False
+    assert baba_after["D4"]["resolved_sst"] == "BABA Revenue"
+    # 2. Missing <v> with t="n" stayed missing <v> with t="n" (NOT <v/> and NOT backfilled to 0!)
+    assert jd_after["K44"]["has_v"] is False and jd_after["K44"]["t"] == "n"
+    # 3. Empty <v/> stayed empty <v/> with t="n"
+    assert jd_after["K45"]["has_v"] is True and jd_after["K45"]["v_text"] is None and jd_after["K45"]["t"] == "n"
+    # 4. Unmodified downstream XIRR P44 KEPT baseline <v>0.185</v> instead of #NAME?!
+    assert jd_after["P44"]["v_text"] == "0.185" and jd_after["P44"]["t"] == "n"
+    # 5. Newly added broken formula H50 KEPT its error value!
+    assert jd_after["H50"]["t"] == "e" and jd_after["H50"]["v_text"] == "#DIV/0!"
+
+    # 6. C13 classifies P44 as baseline_legacy and H50 as actionable!
+    chk = mchk.run_checks(candidate_path=cand, ticker="JD", baseline_path=base, coord_map=res["coord_map"])
+    c13_act = [f for f in chk["findings"] if f["check_id"] == "C13" and f["severity_class"] == "actionable"]
+    c13_leg = [f for f in chk["findings"] if f["check_id"] == "C13" and f["severity_class"] == "baseline_legacy"]
+    assert any(f.get("cell") == "H50" for f in c13_act), c13_act
+    assert not any(f.get("cell") == "P44" for f in c13_act), c13_act
+    assert any(f.get("cell") == "P44" for f in c13_leg), c13_leg
+
+    # 7. Dropped t="s" cell on non-target sheet AND dropped exempt CIQ cell on target sheet are reinserted cleanly
+    dropped = tmp_path / "dropped_both.xlsx"
+    shutil.copyfile(base, dropped)
+    inf2, pay2 = mhooks._read_package(dropped)
+    pts2 = mhooks._sheet_parts(pay2)
+    for sh_rm, crd_rm in (("Model - BABA", "D4"), ("Model - JD", "E45")):
+        rt = etree.fromstring(pay2[pts2[sh_rm]], mhooks._XML)
+        for cel in list(rt.iter(f"{{{mhooks._SML}}}c")):
+            if (cel.get("r") or "").upper() == crd_rm:
+                cel.getparent().remove(cel)
+        pay2[pts2[sh_rm]] = etree.tostring(rt, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(dropped, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf2:
+            zout.writestr(info, pay2[info.filename])
+
+    mhooks.restore_donor_cache(
+        dropped,
+        {
+            "cache_donor_path": str(base),
+            "skip_sheets": ["Model - BABA"],
+            "skip_cells": {"Model - JD": ["E45"]},
+            "touched_formula_cells": {},
+        },
+    )
+    baba_re = _xml_full_cell_states(dropped, "Model - BABA")
+    assert baba_re["D4"]["t"] == "s" and baba_re["D4"]["resolved_sst"] == "BABA Revenue"
+    jd_re = _xml_full_cell_states(dropped, "Model - JD")
+    assert "E45" in jd_re and jd_re["E45"]["v_text"] == "38.5" and jd_re["E45"]["t"] == "n"
+
+
+def test_consensus_append_protects_summary_formulas_and_distinguishes_segments(tmp_path: Path) -> None:
+    """Codex #2 & #6: appending to consensus sheet never overwrites trailing summary formulas,
+    and Cloud Revenue / Retail Revenue / Total Revenue keep distinct segment+metric keys."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+    cand = ws / "model" / "China_Ecommerce_cons_r3_v02.xlsx"
+    shutil.copyfile(base, cand)
+
+    # 1. Verify distinct segment+metric keys
+    assert mcons._normalize_metric_key("Total Revenue") == "total_revenue"
+    assert mcons._normalize_metric_key("Cloud Revenue") == "cloud::revenue"
+    assert mcons._normalize_metric_key("Retail Revenue") == "retail::revenue"
+    assert mcons._normalize_metric_key("Revenue", segment="Cloud") == "cloud::revenue"
+    assert mcons._metric_category("cloud::revenue") == "segment_revenue"
+
+    # 2. Put a trailing summary row immediately after row 5 (row 6 has ONLY House=SUM and Diff=AVERAGE formulas)
+    wb = openpyxl.load_workbook(cand, data_only=False)
+    ws_con = wb["vs Consensus"]
+    ws_con["C6"].value = "=SUM(C2:C5)"
+    ws_con["E6"].value = "=AVERAGE(E2:E5)"
+    wb.save(cand)
+    wb.close()
+
+    snap = mcons.write_consensus_snapshot(
+        model_path=cand,
+        consensus_data={
+            "items": [
+                {"period": "2026E", "metric": "Total Revenue", "consensus": 12000.0},
+                {"period": "2026E", "metric": "Cloud Revenue", "consensus": 2100.0},
+                {"period": "2026E", "metric": "Retail Revenue", "consensus": 9900.0},
+            ]
+        },
+        sheet_name="vs Consensus",
+    )
+    assert snap["layout_mode"] == "isolated_block"
+    # Existing Total Revenue updated in row 2, while new Cloud & Retail items went to isolated block AFTER row 6!
+    wb2 = openpyxl.load_workbook(cand, data_only=False)
+    try:
+        ws2 = wb2["vs Consensus"]
+        assert ws2["C6"].value == "=SUM(C2:C5)"  # Summary formula preserved!
+        assert ws2["E6"].value == "=AVERAGE(E2:E5)"  # Diff formula preserved!
+        snap_coords = snap["consensus_snapshot_cells"]["vs Consensus"]
+        # Three distinct rows (no collision between Total / Cloud / Retail Revenue!)
+        assert len(set(snap_coords)) == 3, snap_coords
+        new_rows = [int(c[1:]) for c in snap_coords if c != "D2"]
+        assert all(r >= 8 for r in new_rows), snap_coords
+    finally:
+        wb2.close()
+
+    # 3. Verify C04 does NOT confuse Group Total Revenue constant with Cloud Revenue snapshot value (2100.0)!
+    cand_c04 = ws / "model" / "China_Ecommerce_seg_c04_v03.xlsx"
+    shutil.copyfile(cand, cand_c04)
+    wb3 = openpyxl.load_workbook(cand_c04, data_only=False)
+    wb3["Model - JD"]["G6"].value = 2100.0  # Matches Cloud Revenue snapshot, NOT Total Revenue (12000.0)!
+    wb3["README & Changelog"].cell(3, 1, "v03")
+    wb3["README & Changelog"].cell(3, 4, "Segment key C04 test")
+    wb3.save(cand_c04)
+    wb3.close()
+    chk_seg = mchk.run_checks(
+        candidate_path=cand_c04,
+        ticker="JD",
+        baseline_path=cand,
+        coord_map={"ops": [], "touched_cells": {"Model - JD": ["G6"]}, "cache_donor_path": str(cand)},
+    )
+    c04_act = [f for f in chk_seg["findings"] if f["check_id"] == "C04" and f["severity_class"] == "actionable"]
+    assert not any(f.get("cell") == "G6" for f in c04_act), c04_act
+
+
+def test_target_scope_enforcement_and_c14_rejects_non_target_structural_ops(tmp_path: Path) -> None:
+    """Codex #3: model_edit rejects ops/edits on non-target sheets and is_consensus_snapshot on forecast sheets;
+    C14 independently rejects illegal structural ops targeting non-target sheets."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+
+    # 1. model_edit refuses structural op on non-target BABA sheet
+    with pytest.raises(ValueError, match="non-target company sheet"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="JD",
+            plan={"ops": [{"op": "insert_columns", "sheet": "Model - BABA", "at": "F", "count": 1}]},
+            workspace_dir=ws,
+            skip_recalc=True,
+        )
+
+    # 2. model_edit refuses cell edit on non-target BABA sheet
+    with pytest.raises(ValueError, match="non-target company sheet"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="JD",
+            plan={"cell_edits": [{"sheet": "Model - BABA", "cell": "F4", "value": 999.0}]},
+            workspace_dir=ws,
+            skip_recalc=True,
+        )
+
+    # 3. model_edit refuses is_consensus_snapshot on forecast sheet Model - JD
+    with pytest.raises(ValueError, match="non-consensus sheet"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="JD",
+            plan={"cell_edits": [{"sheet": "Model - JD", "cell": "G6", "value": 12000.0, "is_consensus_snapshot": True}]},
+            workspace_dir=ws,
+            skip_recalc=True,
+        )
+
+    # 4. C14 independently rejects an illegal structural op on Model - BABA even with forged post-insert donor!
+    forged_donor = tmp_path / "forged_donor.xlsx"
+    shutil.copyfile(base, forged_donor)
+    rep = insert_mod.execute(
+        ["columns", str(forged_donor), "--sheet", "Model - BABA", "--at", "F", "--count", "1", "--preserve-calcpr"]
+    )
+    assert rep["status"] == "success"
+    forged_cand = ws / "model" / "China_Ecommerce_forged_v02.xlsx"
+    shutil.copyfile(forged_donor, forged_cand)
+    chk = mchk.run_checks(
+        candidate_path=forged_cand,
+        ticker="JD",
+        baseline_path=base,
+        coord_map={
+            "ops": [{"op": "insert_columns", "sheet": "Model - BABA", "at": "F", "count": 1}],
+            "cache_donor_path": str(forged_donor),
+        },
+    )
+    c14_act = [f for f in chk["findings"] if f["check_id"] == "C14" and f["severity_class"] == "actionable"]
+    assert any("Illegal structural op" in f["message"] and f["sheet"] == "Model - BABA" for f in c14_act), c14_act
+
+
+def test_c13_replaced_ciq_formula_is_actionable_and_sheet_qualified_defined_name_exempt(tmp_path: Path) -> None:
+    """Codex #4: replacing a former CIQ cell with =1/0 is actionable in C13, while 'Rates'!ExtRate
+    (sheet-qualified local defined name) is resolved as an external link and exempted."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+
+    # Enrich base with a sheet 'Rates' holding a sheet-scoped external defined name ExtRate
+    wb_b = openpyxl.load_workbook(base, data_only=False)
+    ws_rates = wb_b.create_sheet("Rates")
+    ws_rates["A1"].value = "FX Rates"
+    ws_rates.defined_names.add(DefinedName(name="ExtRate", attr_text="[ExternalFX.xlsx]FX!$B$2", localSheetId=wb_b.sheetnames.index("Rates")))
+    ws_jd_b = wb_b["Model - JD"]
+    ws_jd_b["D49"].value = "Sheet-Qualified ExtRate"
+    ws_jd_b["E49"].value = "='Rates'!ExtRate*1.0"
+    ws_jd_b["F49"].value = "=E49*2"
+    wb_b.save(base)
+    wb_b.close()
+    _inject_xml_v_values(base, {"Model - JD": {"E49": ("n", "7.25"), "F49": ("n", "14.5")}})
+
+    fp_b = mfp.build_fingerprint(base, ticker="JD")
+    assert fp_b["sheets"]["Model - JD"]["cells"]["E49"]["subcategory"] == "external_link"
+    assert any(
+        c["sheet"] == "Model - JD" and c["cell"] == "E49"
+        for c in fp_b["external_links_baseline"]["cells"]
+    )
+
+    # Replace former CIQ cell E45 with =1/0 (#DIV/0!) while leaving 'Rates'!ExtRate (E49/F49) intact
+    cand = ws / "model" / "China_Ecommerce_c13_r3_v02.xlsx"
+    shutil.copyfile(base, cand)
+    wb_c = openpyxl.load_workbook(cand, data_only=False)
+    wb_c["Model - JD"]["E45"].value = "=1/0"
+    wb_c["README & Changelog"].cell(3, 1, "v02")
+    wb_c["README & Changelog"].cell(3, 4, "Replace CIQ with 1/0")
+    wb_c.save(cand)
+    wb_c.close()
+    _inject_xml_v_values(cand, {"Model - JD": {"E45": ("e", "#DIV/0!"), "E49": ("e", "#REF!"), "F49": ("e", "#REF!")}})
+
+    chk = mchk.run_checks(
+        candidate_path=cand,
+        ticker="JD",
+        baseline_path=base,
+        coord_map={"ops": [], "touched_cells": {"Model - JD": ["E45"]}, "touched_formula_cells": {"Model - JD": ["E45"]}},
+    )
+    c13_act = [f for f in chk["findings"] if f["check_id"] == "C13" and f["severity_class"] == "actionable"]
+    c13_leg = [f for f in chk["findings"] if f["check_id"] == "C13" and f["severity_class"] == "baseline_legacy"]
+    assert any(f.get("cell") == "E45" for f in c13_act), c13_act
+    assert not any(f.get("cell") in ("E49", "F49") for f in c13_act), c13_act
+    assert any(f.get("cell") == "E49" for f in c13_leg), c13_leg
+    assert any(f.get("cell") == "F49" for f in c13_leg), c13_leg
+
+
+def test_c09_c10_c11_c12_baseline_relative_discrepancy_comparison(tmp_path: Path) -> None:
+    """R3 #3 / Codex #5 / Grok #2: editing an unrelated driver (Q25) in a column with pre-existing
+    C09/C11/C12 discrepancies MUST keep them baseline_legacy (actionable == 0); only worsening or new
+    discrepancies become actionable."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+    # Inject pre-existing legacy discrepancies on col Q (3Q26E) into BASELINE:
+    # - C11 Segment OP disconnect: Q12=300 vs segments 150+30-10=170 (diff=+130)
+    # - C09 Cash bridge mismatch: Q34=2500 vs Q37=2300 (diff=+200)
+    # - C09 Balance Sheet imbalance: Q39=10500 vs Q42=10000 (diff=+500)
+    # - C12 Cash rollforward break: Q32=2000 + Q33=100 != Q34=2500 (diff=-400)
+    _inject_xml_v_values(
+        base,
+        {
+            "Model - JD": {
+                "Q12": (None, "300.0"),
+                "Q19": (None, "150.0"),
+                "Q20": (None, "30.0"),
+                "Q21": (None, "-10.0"),
+                "Q32": (None, "2000.0"),
+                "Q33": (None, "100.0"),
+                "Q34": (None, "2500.0"),
+                "Q37": (None, "2300.0"),
+                "Q39": (None, "10500.0"),
+                "Q42": (None, "10000.0"),
+            }
+        },
+    )
+
+    # 1. Edit ONLY unrelated driver Q25 (+ changelog) -> all legacy discrepancies stay baseline_legacy!
+    res_clean = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [{"sheet": "Model - JD", "cell": "Q25", "value": 0.125}],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "Unrelated driver edit"},
+        },
+        workspace_dir=ws,
+        skip_recalc=True,
+    )
+    chk_clean = mchk.run_checks(
+        candidate_path=res_clean["candidate_path"],
+        ticker="JD",
+        baseline_path=base,
+        coord_map=res_clean["coord_map"],
+    )
+    assert chk_clean["counts"]["actionable"] == 0, [f for f in chk_clean["findings"] if f["severity_class"] == "actionable"]
+    leg_ids = {f["check_id"] for f in chk_clean["findings"] if f["severity_class"] == "baseline_legacy"}
+    assert {"C09", "C11", "C12"} <= leg_ids, chk_clean["findings"]
+
+    # 2. Now WORSEN the C11 discrepancy at Q12 (300 -> 450, diff grows from +130 to +280) -> MUST be actionable!
+    cand_worse = Path(res_clean["candidate_path"])
+    _inject_xml_v_values(cand_worse, {"Model - JD": {"Q12": (None, "450.0")}})
+    chk_worse = mchk.run_checks(
+        candidate_path=cand_worse,
+        ticker="JD",
+        baseline_path=base,
+        coord_map=res_clean["coord_map"],
+    )
+    assert any(
+        f["check_id"] == "C11" and f["severity_class"] == "actionable" and f["cell"] == "Q12"
+        for f in chk_worse["findings"]
+    ), chk_worse["findings"]
+
+
+def test_c02_missing_first_forecast_quarter_and_non_dec_march_fy_c10(tmp_path: Path) -> None:
+    """R3 #5 & #6 / Codex #7 / Grok #4:
+    - C02 catches a missing quarter immediately after latest actual quarter (2Q26A -> 4Q26E..4Q27E missing 3Q26E).
+    - Non-Dec March fiscal year end (fy_end_month=3) maps calendar quarters 2Q25..1Q26 -> FY26 and 2Q26..1Q27 -> FY27,
+      and C10 catches a mismatch on FY27E."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+
+    # Part A: 2Q26A (P1) followed directly by 4Q26E (Q1) .. 4Q27E (U1) -> missing 3Q26E MUST be C02 actionable!
+    cand_c02 = ws / "model" / "China_Ecommerce_c02_gap_v02.xlsx"
+    shutil.copyfile(base, cand_c02)
+    wb = openpyxl.load_workbook(cand_c02, data_only=False)
+    ws_jd = wb["Model - JD"]
+    ws_jd["P1"].value = "2Q26A"
+    ws_jd["Q1"].value = "4Q26E"
+    ws_jd["R1"].value = "1Q27E"
+    ws_jd["S1"].value = "2Q27E"
+    ws_jd["T1"].value = "3Q27E"
+    ws_jd["U1"].value = "4Q27E"
+    ws_jd["V1"].value = None
+    wb["README & Changelog"].cell(3, 1, "v02")
+    wb["README & Changelog"].cell(3, 4, "Missing 3Q26E test")
+    wb.save(cand_c02)
+    wb.close()
+    chk_c02 = mchk.run_checks(
+        candidate_path=cand_c02,
+        ticker="JD",
+        baseline_path=base,
+        coord_map={"ops": [], "touched_cells": {"Model - JD": ["P1", "Q1"]}, "cache_donor_path": str(base)},
+    )
+    c02_act = [f for f in chk_c02["findings"] if f["check_id"] == "C02" and f["severity_class"] == "actionable"]
+    assert any("3Q26E" in f["message"] for f in c02_act), c02_act
+
+    # Part B: March fiscal-year-end (fy_end_month=3) fixture where quarters cross two calendar years
+    mar_base = ws / "model" / "BABA_MarFY_v01.xlsx"
+    wb_m = openpyxl.Workbook()
+    ws_rm = wb_m.active
+    ws_rm.title = "README & Changelog"
+    ws_rm["A1"].value = "Version"
+    ws_rm["A2"].value = "v01"
+    ws_m = wb_m.create_sheet("Model - BABA")
+    ws_m["A1"].value = "RMB MM"
+    ws_m["A2"].value = "FY ends Mar"
+    headers_m = [
+        (5, "FY26A"), (6, "FY27E"), (7, "FY28E"), (8, "FY29E"),
+        (10, "2Q25A"), (11, "3Q25A"), (12, "4Q25A"), (13, "1Q26A"),
+        (14, "2Q26E"), (15, "3Q26E"), (16, "4Q26E"), (17, "1Q27E"),
+    ]
+    for ci, lbl in headers_m:
+        ws_m.cell(1, ci, lbl)
+    ws_m["A3"].value = "Income Statement"
+    ws_m["D4"].value = "Total Revenue"
+    ws_m["E4"].value = "=SUM(J4:M4)"
+    ws_m["F4"].value = "=SUM(N4:Q4)"
+    ws_m["G4"].value = "=F4*1.1"
+    ws_m["H4"].value = "=G4*1.1"
+    for ci, val in ((10, 100.0), (11, 110.0), (12, 120.0), (13, 130.0), (14, 140.0), (15, 150.0), (16, 160.0), (17, 170.0)):
+        ws_m.cell(4, ci, val)
+    wb_m.save(mar_base)
+    wb_m.close()
+    _inject_xml_v_values(mar_base, {"Model - BABA": {"E4": (None, "460.0"), "F4": (None, "620.0"), "G4": (None, "682.0"), "H4": (None, "750.2")}})
+
+    fp_mar = mfp.build_fingerprint(mar_base, ticker="BABA")
+    p_axis = fp_mar["sheets"]["Model - BABA"]["period_axis"]
+    assert p_axis["fiscal_year_end_month"] == 3
+    assert p_axis["annual_sum_quarters"]["E"] == ["J", "K", "L", "M"]
+    assert p_axis["annual_sum_quarters"]["F"] == ["N", "O", "P", "Q"]
+
+    # Inject a C10 mismatch on FY27E (F4 = 999 instead of 140+150+160+170 = 620) -> MUST hit C10 actionable!
+    mar_bad = ws / "model" / "BABA_MarFY_v02.xlsx"
+    shutil.copyfile(mar_base, mar_bad)
+    _inject_xml_v_values(mar_bad, {"Model - BABA": {"F4": (None, "999.0")}})
+    chk_mar = mchk.run_checks(
+        candidate_path=mar_bad,
+        ticker="BABA",
+        baseline_path=mar_base,
+        coord_map={"ops": [], "touched_cells": {"Model - BABA": ["F4"]}, "cache_donor_path": str(mar_base)},
+    )
+    assert any(
+        f["check_id"] == "C10" and f["severity_class"] == "actionable" and f["cell"] == "F4"
+        for f in chk_mar["findings"]
+    ), chk_mar["findings"]
+
+
+def test_stale_consensus_diff_hash_is_stage_failure_only_and_cross_run_id_rejected(tmp_path: Path) -> None:
+    """R3 #4 / Grok #3 / Codex #8:
+    - Stale consensus-diff.json hash records ONLY failed_stages=['consensus'], NEVER actionable.
+    - Same-hash model-check.md from an earlier run_id is rejected by write_fallback_ledger and verify_done;
+      verify_done also enforces all 4 count classes."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+    dump_dir = rdir / "model_dump"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    # Part A: Stale consensus-diff.json with mismatched hash in research dir -> actionable == 0, consensus in failed_stages!
+    (dump_dir / "consensus-diff.json").write_text(
+        json.dumps({"status": "ok", "model_sha256": "0" * 64, "missing_rationale_count": 3, "items": []}),
+        encoding="utf-8",
+    )
+    (dump_dir / "consensus-diff.md").write_text("# Stale diff\n000000000000\n", encoding="utf-8")
+
+    res_a = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-A",
+    )
+    assert res_a["counts"]["actionable"] == 0, res_a["findings"]
+    assert "consensus" in res_a["failed_stages"]
+    assert res_a["final_status"] == "delivered_with_open_issues"
+    vd_a = mchk.verify_done(workspace_dir=ws, ticker="JD", research_dir=rdir, expected_run_id="run-A")
+    assert vd_a["ok"] is True, vd_a
+
+    # Part B: Rerun same day on the EXACT SAME candidate file (identical SHA-256!) under run-B
+    wl_b = mchk.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=base,
+        kind="modeling",
+        failed_stages=["consensus"],
+        run_id="run-B",
+    )
+    # Old run-A model-check.md MUST NOT be accepted for run-B even though SHA-256 matches!
+    assert "check" in wl_b["failed_stages"], wl_b
+    assert "check" not in wl_b["ledger"]["rounds"][-1]["evidence"]
+
+    # Tamper ledger to claim run-B completed check with run-A's model-check.md -> verify_done MUST fail!
+    ledger_p = dump_dir / "model-verification.json"
+    tampered = json.loads(ledger_p.read_text(encoding="utf-8"))
+    tampered["failed_stages"] = ["consensus"]
+    tampered["rounds"][-1]["failed_stages"] = ["consensus"]
+    tampered["rounds"][-1]["evidence"]["check"] = {
+        "path": "research/2026-11-27-model-JD/model_dump/model-check.md",
+        "evidence_model_sha256": tampered["final_model_sha256"],
+        "counts": res_a["counts"],
+    }
+    ledger_p.write_text(json.dumps(tampered, indent=2), encoding="utf-8")
+    vd_b = mchk.verify_done(workspace_dir=ws, ticker="JD", research_dir=rdir, expected_run_id="run-B")
+    assert vd_b["ok"] is False
+    assert any("run_id" in e for e in vd_b["errors"]), vd_b["errors"]
+
+    # Tamper one of the 4 counts (baseline_legacy) in ledger -> verify_done MUST reject count mismatch!
+    res_c = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-C",
+    )
+    assert res_c["counts"]["baseline_legacy"] >= 1
+    leg_tamp = json.loads(ledger_p.read_text(encoding="utf-8"))
+    leg_tamp["rounds"][-1]["evidence"]["check"]["counts"]["baseline_legacy"] += 99
+    ledger_p.write_text(json.dumps(leg_tamp, indent=2), encoding="utf-8")
+    vd_c = mchk.verify_done(workspace_dir=ws, ticker="JD", research_dir=rdir, expected_run_id="run-C")
+    assert vd_c["ok"] is False
+    assert any("baseline_legacy" in e for e in vd_c["errors"]), vd_c["errors"]
+
+
+def test_recover_baseline_minio_xl_meta_part_and_pg_dump_custom_format(tmp_path: Path) -> None:
+    """Codex #9 & Scenario 7:
+    - Weekly MinIO volume backup recovery supports xl.meta inline XL2 payloads AND bitrot-prefixed part.1.
+    - Daily pg_dump -Fc (PGDMP) uses compatible pg_restore and emits an explicit diagnostic (never silent SQL scan) when missing.
+    - SQLite time-window filter strictly excludes outside-window candidates."""
+    baseline_bytes = FIXTURE_XLSX.read_bytes()
+    baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
+    key_file = tmp_path / "backup.key"
+    key_file.write_text("r3-minio-pgdmp-test-key\n", encoding="utf-8")
+    ws_id = "11111111-2222-3333-4444-555555555555"
+
+    def _encrypt_bytes(raw: bytes, out_path: Path) -> None:
+        subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key_file}", "-out", str(out_path)],
+            input=raw,
+            check=True,
+        )
+
+    def _make_fake_rclone(script_path: Path, subdir: str, day: str, filename: str, enc_path: Path) -> None:
+        script_path.write_text(
+            f"""#!/usr/bin/env bash
+if [[ "$1" == "lsf" && "$2" == "--dirs-only" && "$3" == *"/{subdir}/" ]]; then
+  echo "{day}/"
+elif [[ "$1" == "lsf" && "$2" == "--files-only" && "$3" == *"/{subdir}/{day}/" ]]; then
+  echo "{filename}"
+elif [[ "$1" == "cat" ]]; then
+  cat "{enc_path}"
+fi
+""",
+            encoding="utf-8",
+        )
+        script_path.chmod(0o755)
+
+    # 1. MinIO XL2 inline xl.meta inside weekly tar.gz.enc
+    # Construct valid XL2 header + msgpack map {"V": 2, "Inline": <bin32 baseline_bytes>}
+    import struct as _st
+
+    msgpack_inline = (
+        b"\x82"  # fixmap(2)
+        b"\xa1V\x02"  # "V": 2
+        b"\xa6Inline"
+        + b"\xc6" + _st.pack(">I", len(baseline_bytes)) + baseline_bytes
+    )
+    xl_meta_bytes = b"XL2 " + _st.pack("<HH", 1, 3) + msgpack_inline
+    tar_xl = io.BytesIO()
+    with tarfile.open(fileobj=tar_xl, mode="w:gz") as tf:
+        ti = tarfile.TarInfo(name="dalton-uploads/attachments/att-1/China_Ecommerce_Model.xlsx/xl.meta")
+        ti.size = len(xl_meta_bytes)
+        tf.addfile(ti, io.BytesIO(xl_meta_bytes))
+    enc_xl = tmp_path / "minio-xl-2026-09-25.tar.gz.enc"
+    _encrypt_bytes(tar_xl.getvalue(), enc_xl)
+    rc_xl = tmp_path / "rclone_xl.sh"
+    _make_fake_rclone(rc_xl, "weekly", "2026-09-25", enc_xl.name, enc_xl)
+
+    out_xl = tmp_path / "recovered_xl.xlsx"
+    res_xl = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out_xl,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        expected_filename="China_Ecommerce_Model.xlsx",
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc_xl),
+        backup_key_file=key_file,
+    )
+    assert res_xl.found is True and "minio-xl-inline:" in (res_xl.source_ref or "")
+    assert out_xl.read_bytes() == baseline_bytes
+
+    # 2. MinIO single-drive part.1 with 32-byte HighwayHash256 bitrot header inside weekly tar.gz.enc
+    part1_bytes = (b"\xab" * 32) + baseline_bytes
+    tar_part = io.BytesIO()
+    with tarfile.open(fileobj=tar_part, mode="w:gz") as tf:
+        ti_m = tarfile.TarInfo(name="dalton-uploads/uploads/up-1/China_Ecommerce_Model.xlsx/xl.meta")
+        ti_m.size = 8
+        tf.addfile(ti_m, io.BytesIO(b"XL2 \x01\x00\x03\x00"))
+        ti_p = tarfile.TarInfo(name="dalton-uploads/uploads/up-1/China_Ecommerce_Model.xlsx/data-uuid/part.1")
+        ti_p.size = len(part1_bytes)
+        tf.addfile(ti_p, io.BytesIO(part1_bytes))
+    enc_part = tmp_path / "minio-part-2026-09-25.tar.gz.enc"
+    _encrypt_bytes(tar_part.getvalue(), enc_part)
+    rc_part = tmp_path / "rclone_part.sh"
+    _make_fake_rclone(rc_part, "weekly", "2026-09-25", enc_part.name, enc_part)
+
+    out_part = tmp_path / "recovered_part.xlsx"
+    res_part = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out_part,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        expected_filename="China_Ecommerce_Model.xlsx",
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc_part),
+        backup_key_file=key_file,
+    )
+    assert res_part.found is True and "minio-part:" in (res_part.source_ref or "")
+    assert out_part.read_bytes() == baseline_bytes
+
+    # 3. Daily pg_dump -Fc (PGDMP custom format) with compatible pg_restore vs missing pg_restore diagnostic
+    pgdmp_payload = b"PGDMP\x01\x0e\x00FAKE-CUSTOM-DUMP-BODY"
+    enc_pgdmp = tmp_path / "dalton-2026-09-29.dump.enc"
+    _encrypt_bytes(pgdmp_payload, enc_pgdmp)
+    rc_pgdmp = tmp_path / "rclone_pgdmp.sh"
+    _make_fake_rclone(rc_pgdmp, "db", "2026-09-29", enc_pgdmp.name, enc_pgdmp)
+
+    fake_pg_restore = tmp_path / "fake_pg_restore.py"
+    sql_fixture_file = tmp_path / "restored_copy.sql"
+    sql_fixture_file.write_text(
+        "COPY public.chat_attachments (attachment_id, user_id, name, size, content) FROM stdin;\n"
+        f"att-pgdmp\tsender-u3\tChina_Ecommerce_Model.xlsx\t{len(baseline_bytes)}\t\\\\x{baseline_bytes.hex()}\n"
+        "\\.\n",
+        encoding="utf-8",
+    )
+    fake_pg_restore.write_text(
+        f"""#!{sys.executable}
+import sys
+data = sys.stdin.buffer.read()
+assert data.startswith(b"PGDMP"), "expected PGDMP custom format on stdin"
+sys.stdout.write(open({str(sql_fixture_file)!r}, encoding="utf-8").read())
+""",
+        encoding="utf-8",
+    )
+    fake_pg_restore.chmod(0o755)
+
+    out_pgdmp = tmp_path / "recovered_pgdmp.xlsx"
+    res_pgdmp = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out_pgdmp,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc_pgdmp),
+        backup_key_file=key_file,
+        pg_restore_bin=str(fake_pg_restore),
+    )
+    assert res_pgdmp.found is True and res_pgdmp.channel == "rclone_encrypted_db_backup"
+    assert out_pgdmp.read_bytes() == baseline_bytes
+
+    # Missing pg_restore on PGDMP MUST report diagnostic (never silently scan binary as SQL)
+    res_pgdmp_miss = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=tmp_path / "missing_pgdmp.xlsx",
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc_pgdmp),
+        backup_key_file=key_file,
+        pg_restore_bin="/nonexistent/pg_restore_bin",
+        pg_restore_docker_image=None,
+    )
+    assert res_pgdmp_miss.found is False
+    assert any("PGDMP" in d and "pg_restore" in d for d in res_pgdmp_miss.diagnostics), res_pgdmp_miss.diagnostics
+
+    # 4. Direct time-window exclusion assertion (Scenario 7 strictness)
+    db_win = tmp_path / "win_only.sqlite3"
+    c_w = sqlite3.connect(db_win)
+    c_w.execute(
+        """
+        CREATE TABLE chat_attachments (
+            attachment_id TEXT PRIMARY KEY, user_id TEXT, name TEXT, size INT,
+            object_key TEXT, content BLOB, state TEXT, created_at TEXT, sent_at TEXT, cleaned_at TEXT
+        );
+        """
+    )
+    c_w.execute(
+        "INSERT INTO chat_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "att-outside-only", "sender-u3", "China_Ecommerce_Model.xlsx", len(baseline_bytes),
+            None, baseline_bytes, "sent", "2026-09-28T07:00:00+00:00", "2026-09-28T07:15:00+00:00", None,
+        ),
+    )
+    c_w.commit()
+    c_w.close()
+    adp_w = recover_lib.SQLiteReadOnlyAdapter(db_win)
+    try:
+        cands = adp_w.fetch_inline_candidates(
+            sender_user_ids=["sender-u3"],
+            att_name="China_Ecommerce_Model.xlsx",
+            att_size=len(baseline_bytes),
+            before_ts="2026-10-01T10:00:00+00:00",
+            turn_created_at="2026-09-28T08:00:00+00:00",
+        )
+        assert cands == [], f"outside-window candidate should be excluded: {cands}"
+    finally:
+        adp_w.close()

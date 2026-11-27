@@ -11,7 +11,8 @@ encrypted `rclone` backups when DB/object-store channels miss.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
@@ -22,6 +23,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tarfile
@@ -178,6 +180,7 @@ class RecoveryResult:
     source_ref: str | None = None
     checked_candidates: int = 0
     detail: str = ""
+    diagnostics: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,6 +192,7 @@ class RecoveryResult:
             "source_ref": self.source_ref,
             "checked_candidates": self.checked_candidates,
             "detail": self.detail,
+            "diagnostics": list(self.diagnostics),
         }
 
 
@@ -476,14 +480,284 @@ def build_object_reader(
     return _read
 
 
+def _decode_msgpack_one(buf: bytes, pos: int) -> tuple[Any, int]:
+    """Decode one msgpack object from ``buf`` starting at ``pos`` (stdlib-only for MinIO xl.meta)."""
+    if pos >= len(buf):
+        raise ValueError("unexpected EOF in msgpack")
+    b = buf[pos]
+    pos += 1
+    if b <= 0x7F:
+        return b, pos
+    if b >= 0xE0:
+        return b - 256, pos
+    if 0x80 <= b <= 0x8F:
+        n = b & 0x0F
+        out: dict[Any, Any] = {}
+        for _ in range(n):
+            k, pos = _decode_msgpack_one(buf, pos)
+            v, pos = _decode_msgpack_one(buf, pos)
+            out[k] = v
+        return out, pos
+    if 0x90 <= b <= 0x9F:
+        n = b & 0x0F
+        arr = []
+        for _ in range(n):
+            v, pos = _decode_msgpack_one(buf, pos)
+            arr.append(v)
+        return arr, pos
+    if 0xA0 <= b <= 0xBF:
+        n = b & 0x1F
+        return buf[pos : pos + n].decode("utf-8", errors="replace"), pos + n
+    if b == 0xC0:
+        return None, pos
+    if b == 0xC2:
+        return False, pos
+    if b == 0xC3:
+        return True, pos
+    if b == 0xC4:
+        n = buf[pos]
+        return buf[pos + 1 : pos + 1 + n], pos + 1 + n
+    if b == 0xC5:
+        n = struct.unpack_from(">H", buf, pos)[0]
+        return buf[pos + 2 : pos + 2 + n], pos + 2 + n
+    if b == 0xC6:
+        n = struct.unpack_from(">I", buf, pos)[0]
+        return buf[pos + 4 : pos + 4 + n], pos + 4 + n
+    if b in (0xC7, 0xC8, 0xC9):
+        if b == 0xC7:
+            n = buf[pos]
+            pos += 1
+        elif b == 0xC8:
+            n = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+        else:
+            n = struct.unpack_from(">I", buf, pos)[0]
+            pos += 4
+        _ext_type = buf[pos]
+        return buf[pos + 1 : pos + 1 + n], pos + 1 + n
+    if b == 0xCA:
+        return struct.unpack_from(">f", buf, pos)[0], pos + 4
+    if b == 0xCB:
+        return struct.unpack_from(">d", buf, pos)[0], pos + 8
+    if b == 0xCC:
+        return buf[pos], pos + 1
+    if b == 0xCD:
+        return struct.unpack_from(">H", buf, pos)[0], pos + 2
+    if b == 0xCE:
+        return struct.unpack_from(">I", buf, pos)[0], pos + 4
+    if b == 0xCF:
+        return struct.unpack_from(">Q", buf, pos)[0], pos + 8
+    if b == 0xD0:
+        return struct.unpack_from(">b", buf, pos)[0], pos + 1
+    if b == 0xD1:
+        return struct.unpack_from(">h", buf, pos)[0], pos + 2
+    if b == 0xD2:
+        return struct.unpack_from(">i", buf, pos)[0], pos + 4
+    if b == 0xD3:
+        return struct.unpack_from(">q", buf, pos)[0], pos + 8
+    if b in (0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
+        sizes = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}
+        n = sizes[b]
+        return buf[pos + 1 : pos + 1 + n], pos + 1 + n
+    if b == 0xD9:
+        n = buf[pos]
+        return buf[pos + 1 : pos + 1 + n].decode("utf-8", errors="replace"), pos + 1 + n
+    if b == 0xDA:
+        n = struct.unpack_from(">H", buf, pos)[0]
+        return buf[pos + 2 : pos + 2 + n].decode("utf-8", errors="replace"), pos + 2 + n
+    if b == 0xDB:
+        n = struct.unpack_from(">I", buf, pos)[0]
+        return buf[pos + 4 : pos + 4 + n].decode("utf-8", errors="replace"), pos + 4 + n
+    if b == 0xDC:
+        n = struct.unpack_from(">H", buf, pos)[0]
+        pos += 2
+        arr = []
+        for _ in range(n):
+            v, pos = _decode_msgpack_one(buf, pos)
+            arr.append(v)
+        return arr, pos
+    if b == 0xDD:
+        n = struct.unpack_from(">I", buf, pos)[0]
+        pos += 4
+        arr = []
+        for _ in range(n):
+            v, pos = _decode_msgpack_one(buf, pos)
+            arr.append(v)
+        return arr, pos
+    if b == 0xDE:
+        n = struct.unpack_from(">H", buf, pos)[0]
+        pos += 2
+        out = {}
+        for _ in range(n):
+            k, pos = _decode_msgpack_one(buf, pos)
+            v, pos = _decode_msgpack_one(buf, pos)
+            out[k] = v
+        return out, pos
+    if b == 0xDF:
+        n = struct.unpack_from(">I", buf, pos)[0]
+        pos += 4
+        out = {}
+        for _ in range(n):
+            k, pos = _decode_msgpack_one(buf, pos)
+            v, pos = _decode_msgpack_one(buf, pos)
+            out[k] = v
+        return out, pos
+    raise ValueError(f"unsupported msgpack prefix byte 0x{b:02x}")
+
+
+def _extract_xl_meta_inline_blobs(xl_meta_bytes: bytes) -> list[bytes]:
+    """Extract inline binary object payloads stored inside a MinIO XL2 ``xl.meta`` file."""
+    blobs: list[bytes] = []
+    if len(xl_meta_bytes) < 8 or xl_meta_bytes[:4] != b"XL2 ":
+        return blobs
+    pos = 8  # Skip 4-byte 'XL2 ' magic + 2-byte major + 2-byte minor
+
+    def _collect(obj: Any) -> None:
+        if isinstance(obj, (bytes, bytearray)):
+            if len(obj) >= 64:
+                blobs.append(bytes(obj))
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _collect(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _collect(v)
+
+    while pos < len(xl_meta_bytes):
+        try:
+            obj, new_pos = _decode_msgpack_one(xl_meta_bytes, pos)
+        except Exception:
+            break
+        if new_pos <= pos:
+            break
+        _collect(obj)
+        pos = new_pos
+    return blobs
+
+
+def _strip_minio_bitrot_headers(raw: bytes, block_size: int = 1048576, hash_len: int = 32) -> bytes | None:
+    """Strip 32-byte HighwayHash256 per-block bitrot headers from a single-drive MinIO ``part.*`` blob."""
+    if len(raw) <= hash_len:
+        return None
+    out = bytearray()
+    step = hash_len + block_size
+    pos = 0
+    while pos < len(raw):
+        if len(raw) - pos <= hash_len:
+            return None
+        chunk_end = min(pos + step, len(raw))
+        out.extend(raw[pos + hash_len : chunk_end])
+        pos = chunk_end
+    return bytes(out)
+
+
+def _iter_minio_part_candidates(part_blobs: list[bytes]) -> list[bytes]:
+    """Yield candidate payload byte sequences from ordered MinIO ``part.1..part.N`` files."""
+    if not part_blobs:
+        return []
+    raw_concat = b"".join(part_blobs)
+    candidates: list[bytes] = [raw_concat]
+    # Single-drive MinIO HighwayHash256 bitrot-prefixed per-part chunks (default 1 MiB or 10 MiB block size)
+    for bsize in (1048576, 10485760):
+        stripped_parts: list[bytes] = []
+        ok = True
+        for pb in part_blobs:
+            sp = _strip_minio_bitrot_headers(pb, block_size=bsize, hash_len=32)
+            if sp is None:
+                ok = False
+                break
+            stripped_parts.append(sp)
+        if ok:
+            candidates.append(b"".join(stripped_parts))
+    return candidates
+
+
+def _recover_from_minio_tar_bytes(
+    tar_bytes: bytes,
+    *,
+    expected_sha256: str,
+    target_filename: str | None = None,
+    diagnostics: list[str] | None = None,
+) -> tuple[bytes | None, str | None]:
+    """Inspect a decrypted tar archive supporting BOTH plain ``.xlsx`` members AND MinIO volume layout
+    (``xl.meta`` inline XL2 objects and ``<dir>/part.1..part.N`` erasure/single-drive parts)."""
+    want_sha = expected_sha256.lower()
+    part_re = re.compile(r"^part\.(\d+)$")
+    part_groups: dict[str, list[tuple[int, str, bytes]]] = defaultdict(list)
+    xl_meta_members: list[tuple[str, bytes]] = []
+    has_minio_layout = False
+
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            mname = member.name.lstrip("./")
+            base = Path(mname).name
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                continue
+
+            # 1. Plain .xlsx file (e.g. sandbox-*.tar.gz.enc workspace backups)
+            if base.lower().endswith(".xlsx"):
+                data = fobj.read()
+                if sha256_bytes(data) == want_sha:
+                    return data, mname
+                continue
+
+            # 2. MinIO volume metadata (`xl.meta`) — may hold inline XL2 object bytes
+            if base == "xl.meta":
+                has_minio_layout = True
+                xl_meta_members.append((mname, fobj.read()))
+                continue
+
+            # 3. MinIO data parts (`part.1`, `part.2`, ...)
+            pm = part_re.match(base)
+            if pm:
+                has_minio_layout = True
+                parent = str(Path(mname).parent)
+                part_groups[parent].append((int(pm.group(1)), mname, fobj.read()))
+
+    # Inspect MinIO xl.meta inline blobs (prioritize paths matching target_filename or .xlsx)
+    target_base = Path(target_filename).name.lower() if target_filename else None
+
+    def _prio(path_str: str) -> tuple[int, str]:
+        low = path_str.lower()
+        if target_base and target_base in low:
+            return (0, path_str)
+        if ".xlsx" in low:
+            return (1, path_str)
+        return (2, path_str)
+
+    for mname, raw_meta in sorted(xl_meta_members, key=lambda kv: _prio(kv[0])):
+        for blob in _extract_xl_meta_inline_blobs(raw_meta):
+            if sha256_bytes(blob) == want_sha:
+                return blob, f"minio-xl-inline:{mname}"
+
+    # Inspect MinIO part.1..part.N groups (raw and bitrot-stripped)
+    for parent, entries in sorted(part_groups.items(), key=lambda kv: _prio(kv[0])):
+        entries.sort(key=lambda item: item[0])
+        blobs = [b for _, _, b in entries]
+        for cand in _iter_minio_part_candidates(blobs):
+            if sha256_bytes(cand) == want_sha:
+                return cand, f"minio-part:{parent}"
+
+    if has_minio_layout and diagnostics is not None:
+        diagnostics.append(
+            "MinIO volume backup inspected (xl.meta inline + part.* raw/bitrot); "
+            "no object matched expected sha256 (multi-disk erasure/encrypted MinIO volumes require isolated MinIO server replay)"
+        )
+    return None, None
+
+
 def recover_from_encrypted_tar_stream(
     enc_stream_cmd: list[str],
     backup_key_file: Path,
     *,
     expected_sha256: str,
     target_filename: str | None = None,
+    diagnostics: list[str] | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Stream-decrypt an AES-256-CBC PBKDF2 tar.gz.enc backup and match ``expected_sha256``."""
+    """Stream-decrypt an AES-256-CBC PBKDF2 tar.gz.enc backup (plain workspace or MinIO volume) and match ``expected_sha256``."""
     p1 = subprocess.Popen(enc_stream_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p2 = subprocess.Popen(
         [
@@ -506,27 +780,76 @@ def recover_from_encrypted_tar_stream(
     if p1.returncode != 0 or p2.returncode != 0 or not decrypted:
         return None, None
 
-    target_base = Path(target_filename).name.lower() if target_filename else None
     try:
-        with tarfile.open(fileobj=io.BytesIO(decrypted), mode="r:*") as tf:
-            for member in tf.getmembers():
-                if not member.isfile():
-                    continue
-                if not member.name.lower().endswith(".xlsx"):
-                    continue
-                if target_base and Path(member.name).name.lower() != target_base:
-                    # Still check hash in case object was stored under upload_id/object_key
-                    pass
-                fobj = tf.extractfile(member)
-                if fobj is None:
-                    continue
-                data = fobj.read()
-                if sha256_bytes(data) == expected_sha256.lower():
-                    return data, member.name
+        return _recover_from_minio_tar_bytes(
+            decrypted,
+            expected_sha256=expected_sha256,
+            target_filename=target_filename,
+            diagnostics=diagnostics,
+        )
     except tarfile.TarError:
         if sha256_bytes(decrypted) == expected_sha256.lower():
             return decrypted, "raw"
     return None, None
+
+
+def _run_pg_restore_custom_dump(
+    payload: bytes,
+    *,
+    pg_restore_bin: str = "pg_restore",
+    pg_restore_docker_image: str | None = None,
+    diagnostics: list[str] | None = None,
+) -> bytes | None:
+    """Convert a PostgreSQL custom-format dump (``PGDMP``) ``chat_attachments`` table to COPY SQL via compatible ``pg_restore``."""
+    resolved = pg_restore_bin if Path(pg_restore_bin).is_file() else shutil.which(pg_restore_bin)
+    err_reasons: list[str] = []
+
+    if resolved:
+        pr = subprocess.run(
+            [resolved, "-f", "-", "--data-only", "-t", "chat_attachments"],
+            input=payload,
+            capture_output=True,
+            check=False,
+        )
+        if pr.returncode == 0 and pr.stdout:
+            return pr.stdout
+        err_msg = (pr.stderr or b"").decode("utf-8", errors="ignore").strip()
+        err_reasons.append(f"local {resolved} exited {pr.returncode}: {err_msg[:200]}")
+    else:
+        err_reasons.append(f"{pg_restore_bin!r} not found on PATH")
+
+    # Optional Docker fallback when host lacks a compatible pg_restore version
+    if pg_restore_docker_image and shutil.which("docker") is not None:
+        pr_dk = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-i",
+                pg_restore_docker_image,
+                "pg_restore",
+                "-f",
+                "-",
+                "--data-only",
+                "-t",
+                "chat_attachments",
+            ],
+            input=payload,
+            capture_output=True,
+            check=False,
+        )
+        if pr_dk.returncode == 0 and pr_dk.stdout:
+            return pr_dk.stdout
+        err_msg_dk = (pr_dk.stderr or b"").decode("utf-8", errors="ignore").strip()
+        err_reasons.append(f"docker {pg_restore_docker_image} pg_restore exited {pr_dk.returncode}: {err_msg_dk[:200]}")
+
+    if diagnostics is not None:
+        diagnostics.append(
+            "PGDMP custom-format daily Postgres backup could not be read without compatible pg_restore ("
+            + "; ".join(err_reasons)
+            + ")"
+        )
+    return None
 
 
 def _scan_pg_sql_for_attachment(
@@ -602,8 +925,15 @@ def recover_from_encrypted_db_backup_stream(
     backup_key_file: Path,
     *,
     expected_sha256: str,
+    pg_restore_bin: str = "pg_restore",
+    pg_restore_docker_image: str | None = None,
+    diagnostics: list[str] | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Stream-decrypt a daily Postgres offsite backup (``db/<date>/*.enc``) and scan ``chat_attachments``."""
+    """Stream-decrypt a daily Postgres offsite backup (``db/<date>/*.enc``) and scan ``chat_attachments``.
+
+    Handles ``pg_dump -Fc`` (``PGDMP``) via compatible ``pg_restore`` (host binary or Docker fallback)
+    and NEVER silently scans binary ``PGDMP`` payloads as plain SQL text.
+    """
     p1 = subprocess.Popen(enc_stream_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p2 = subprocess.Popen(
         [
@@ -634,18 +964,17 @@ def recover_from_encrypted_db_backup_stream(
         except Exception:
             pass
 
-    # Handle PostgreSQL custom-format dump (PGDMP) via pg_restore if installed
-    if payload[:5] == b"PGDMP" and shutil.which("pg_restore") is not None:
-        pr = subprocess.run(
-            ["pg_restore", "-f", "-", "--data-only", "-t", "chat_attachments"],
-            input=payload,
-            capture_output=True,
-            check=False,
+    # Handle PostgreSQL custom-format dump (PGDMP) via compatible pg_restore; NEVER scan binary PGDMP as SQL
+    if payload[:5] == b"PGDMP":
+        restored_sql = _run_pg_restore_custom_dump(
+            payload,
+            pg_restore_bin=pg_restore_bin,
+            pg_restore_docker_image=pg_restore_docker_image,
+            diagnostics=diagnostics,
         )
-        if pr.returncode == 0 and pr.stdout:
-            blob, ref = _scan_pg_sql_for_attachment(pr.stdout, expected_sha256)
-            if blob is not None:
-                return blob, ref
+        if restored_sql is None:
+            return None, None
+        return _scan_pg_sql_for_attachment(restored_sql, expected_sha256)
 
     return _scan_pg_sql_for_attachment(payload, expected_sha256)
 
@@ -664,6 +993,8 @@ def recover_baseline(
     rclone_drive_dir: str | None = None,
     rclone_bin: str = "rclone",
     backup_key_file: Path | None = None,
+    pg_restore_bin: str = "pg_restore",
+    pg_restore_docker_image: str | None = None,
 ) -> RecoveryResult:
     """Execute §4.1 / §8.5 read-only baseline recovery across all channels."""
     want_sha = expected_sha256.strip().lower()
@@ -671,6 +1002,7 @@ def recover_baseline(
         raise ValueError(f"expected_sha256 must be a 64-char hex digest, got {expected_sha256!r}")
 
     checked = 0
+    diagnostics: list[str] = []
 
     def _accept(data: bytes, channel: str, source_ref: str) -> RecoveryResult | None:
         nonlocal checked
@@ -690,6 +1022,7 @@ def recover_baseline(
                 source_ref=source_ref,
                 checked_candidates=checked,
                 detail="verified against records[0].input_sha256",
+                diagnostics=diagnostics,
             )
         return None
 
@@ -840,6 +1173,7 @@ def recover_baseline(
                         backup_key_file,
                         expected_sha256=want_sha,
                         target_filename=expected_filename,
+                        diagnostics=diagnostics,
                     )
                     if blob is not None:
                         res = _accept(
@@ -883,6 +1217,9 @@ def recover_baseline(
                         [rclone_bin, "cat", remote_obj],
                         backup_key_file,
                         expected_sha256=want_sha,
+                        pg_restore_bin=pg_restore_bin,
+                        pg_restore_docker_image=pg_restore_docker_image,
+                        diagnostics=diagnostics,
                     )
                     if blob is not None:
                         res = _accept(
@@ -893,11 +1230,15 @@ def recover_baseline(
                         if res is not None:
                             return res
 
+    detail_msg = f"no candidate matched expected sha256 {want_sha}"
+    if diagnostics:
+        detail_msg += "; diagnostics: " + " | ".join(diagnostics)
     return RecoveryResult(
         found=False,
         channel="none",
         checked_candidates=checked,
-        detail=f"no candidate matched expected sha256 {want_sha}",
+        detail=detail_msg,
+        diagnostics=diagnostics,
     )
 
 
@@ -921,6 +1262,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rclone-drive-dir", default=None)
     parser.add_argument("--rclone-bin", default="rclone")
     parser.add_argument("--backup-key-file", default=None)
+    parser.add_argument("--pg-restore-bin", default="pg_restore")
+    parser.add_argument("--pg-restore-docker-image", default=None)
     parser.add_argument("--manifest-out", default=None)
     args = parser.parse_args(argv)
 
@@ -973,6 +1316,8 @@ def main(argv: list[str] | None = None) -> int:
             backup_key_file=Path(args.backup_key_file).expanduser().resolve()
             if args.backup_key_file
             else None,
+            pg_restore_bin=args.pg_restore_bin,
+            pg_restore_docker_image=args.pg_restore_docker_image,
         )
     finally:
         if db is not None and hasattr(db, "close"):
