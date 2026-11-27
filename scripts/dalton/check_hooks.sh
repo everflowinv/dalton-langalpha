@@ -561,6 +561,10 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # HF2: surface-aware stop_reason=refusal exhaustion notice and one cross-family
+  # backup model retry delegated to src/dalton/middleware/refusal_fallback.py
+  # (empty_call_retry.py, model_resilience.py).
+  "refusal-handling"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -329,7 +329,10 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
             return "output_cap"
         if malformed_call_stop_reason(ai_msg) is not None:
             return "malformed_call"
-        if _visible_reply_empty(ai_msg) and _user_sent_turn(_turn_messages(request)):
+        # DALTON-HOOK(refusal-handling): treat safety refusal replies on user-sent turns as retryable
+        from src.dalton.middleware.refusal_fallback import is_refusal_reply
+
+        if (_visible_reply_empty(ai_msg) or is_refusal_reply(ai_msg)) and _user_sent_turn(_turn_messages(request)):
             return "empty_reply"
         return None
 
@@ -549,8 +552,17 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
         kind: str | None,
         injected: list,
         last_sanitized_kind: str | None,
+        *,
+        seen: list[AIMessage] = (),
     ):
         failure_kind = kind if kind in _SANITIZED_KINDS else (last_sanitized_kind or kind)
+        # DALTON-HOOK(refusal-handling): delegate all-refusal exhaustion to Dalton notice/backup retry
+        if failure_kind == "empty_reply":
+            from src.dalton.middleware.refusal_fallback import handle_refusal_exhausted
+
+            handled = handle_refusal_exhausted(response, seen, self.max_retries, _turn_config())
+            if handled is not None:
+                return handled
         if failure_kind in _EXHAUSTED_NOTICES:
             prefix = injected if last_sanitized_kind is not None else []
             return self._exhausted_failure(
@@ -569,9 +581,11 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
         last_sanitized_kind: str | None = None
         rehintable = False
         kind: str | None = None
+        seen: list[AIMessage] = []  # DALTON-HOOK(refusal-handling)
         for attempt in range(1 + self.max_retries):
             response = handler(request)
             ai_msg = response.result[0]
+            seen.append(ai_msg)
             kind = self._retry_kind(ai_msg, request)
             if kind is None:
                 return self._keep_injected(
@@ -594,18 +608,22 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
                 request, ai_msg, kind, injected, rehintable
             )
         return self._finish_retry(
-            response, request, kind, injected, last_sanitized_kind
+            response, request, kind, injected, last_sanitized_kind, seen=seen
         )
 
     # DALTON-HOOK(empty-turn-guard): the async loop, using the same helpers.
     async def awrap_model_call(self, request, handler):
+        from src.dalton.middleware.refusal_fallback import in_refusal_fallback  # DALTON-HOOK(refusal-handling)
+
         injected: list = []
         last_sanitized_kind: str | None = None
         rehintable = False
         kind: str | None = None
-        for attempt in range(1 + self.max_retries):
+        seen: list[AIMessage] = []
+        for attempt in range(1 if in_refusal_fallback() else 1 + self.max_retries):
             response = await handler(request)
             ai_msg = response.result[0]
+            seen.append(ai_msg)
             kind = self._retry_kind(ai_msg, request)
             if kind is None:
                 return self._keep_injected(
@@ -613,7 +631,7 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
                 )
             if kind in _SANITIZED_KINDS:
                 last_sanitized_kind = kind
-            if attempt == self.max_retries:
+            if attempt == self.max_retries or in_refusal_fallback():
                 if kind in _SANITIZED_KINDS:
                     injected = [
                         *injected,
@@ -628,7 +646,7 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
                 request, ai_msg, kind, injected, rehintable
             )
         return self._finish_retry(
-            response, request, kind, injected, last_sanitized_kind
+            response, request, kind, injected, last_sanitized_kind, seen=seen
         )
 
     # DALTON-HOOK(empty-turn-guard): after the checkpoint commits the failure

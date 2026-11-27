@@ -211,34 +211,146 @@ def _content_blocks(message: BaseMessage) -> list[Any]:
     return [{"type": "text", "text": str(content)}]
 
 
+_SILENT_SKIP_BLOCK_TYPES = frozenset(
+    {"tool_result", "thinking", "redacted_thinking", "reasoning", "compaction"}
+)
+
+
+def _undelivered_placeholder(block: Any) -> str:
+    """User/model-visible placeholder when an attachment or block cannot be sent."""
+    label = ""
+    if isinstance(block, dict):
+        filename = block.get("filename")
+        if not filename and isinstance(block.get("file"), dict):
+            filename = block["file"].get("filename")
+        if isinstance(filename, str) and filename.strip():
+            label = filename.strip()
+        elif isinstance(block.get("type"), str) and block["type"].strip():
+            label = block["type"].strip()
+        else:
+            label = "dict"
+    else:
+        label = type(block).__name__
+    return f"[附件未能送达当前模型：{label}]"
+
+
+def _parse_data_url(url: Any, *, default_mime: str = "image/png") -> tuple[str, str] | None:
+    """Parse ``data:<mime>;base64,<data>`` into ``(mime_type, data)`` or ``None``."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, sep, data = url.partition(",")
+    if not sep or not data:
+        return None
+    mime = header[5:].split(";")[0].strip() or default_mime
+    return mime, data
+
+
+def _extract_file_inline_data(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract Gemini ``inlineData`` from a ``file`` or ``document`` block.
+
+    Internal annotations such as ``pages``, ``filename``, or ``unsaved`` are
+    intentionally omitted from the upstream payload.
+    """
+    b64 = block.get("base64")
+    mime = block.get("mime_type") or block.get("media_type")
+    if isinstance(b64, str) and b64 and isinstance(mime, str) and mime:
+        return {"inlineData": {"mimeType": mime, "data": b64}}
+
+    if block.get("source_type") == "base64":
+        data = block.get("data")
+        if isinstance(data, str) and data and isinstance(mime, str) and mime:
+            return {"inlineData": {"mimeType": mime, "data": data}}
+
+    source = block.get("source")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        data = source.get("data")
+        src_mime = source.get("media_type") or source.get("mime_type") or mime
+        if isinstance(data, str) and data and isinstance(src_mime, str) and src_mime:
+            return {"inlineData": {"mimeType": src_mime, "data": data}}
+
+    nested = block.get("file")
+    if isinstance(nested, dict):
+        parsed = _parse_data_url(nested.get("file_data"), default_mime="application/pdf")
+        if parsed is not None:
+            return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+
+    return None
+
+
+def _extract_image_inline_data(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract Gemini ``inlineData`` from an ``image`` block."""
+    b64 = block.get("base64")
+    mime = block.get("mime_type") or block.get("media_type") or "image/png"
+    if isinstance(b64, str) and b64:
+        return {"inlineData": {"mimeType": str(mime), "data": b64}}
+
+    if block.get("source_type") == "base64":
+        data = block.get("data")
+        if isinstance(data, str) and data:
+            return {"inlineData": {"mimeType": str(mime), "data": data}}
+
+    source = block.get("source")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        data = source.get("data")
+        src_mime = source.get("media_type") or source.get("mime_type") or mime
+        if isinstance(data, str) and data:
+            return {"inlineData": {"mimeType": str(src_mime), "data": data}}
+
+    parsed = _parse_data_url(block.get("url"), default_mime="image/png")
+    if parsed is not None:
+        return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+
+    return None
+
+
 def _part_from_block(block: Any) -> dict | None:
     """One content block → one Gemini part."""
     if isinstance(block, str):
         return {"text": block} if block else None
     if not isinstance(block, dict):
-        return None
+        logger.warning(
+            "[antigravity] Dropping unsupported non-dict content block type=%s",
+            type(block).__name__,
+        )
+        return {"text": _undelivered_placeholder(block)}
     btype = block.get("type")
     if btype in ("text", "input_text", "output_text"):
         text_val = block.get("text", "")
         return {"text": text_val} if text_val else None
     if btype == "image_url":
-        url = (block.get("image_url") or {}).get("url", "")
-        if not isinstance(url, str) or not url.startswith("data:"):
-            logger.warning("[antigravity] Non-data-URL image block dropped (endpoint takes inline data only)")
-            return None
-        header, _, data = url.partition(",")
-        mime = header[5:].split(";")[0] or "image/png"
-        return {"inlineData": {"mimeType": mime, "data": data}}
-    if btype in ("tool_use", "tool_result"):  # anthropic-style blocks from history
-        if btype == "tool_use":
-            fc: dict[str, Any] = {"name": block.get("name", ""), "args": block.get("input", {})}
-            if block.get("id"):
-                fc["id"] = block["id"]
-            return {"functionCall": fc}
-        return None  # handled via ToolMessage path
-    if btype == "thinking":
-        return None  # reasoning is not replayed (fresh thinking per turn)
-    return None
+        raw_img = block.get("image_url")
+        url = raw_img.get("url", "") if isinstance(raw_img, dict) else (raw_img if isinstance(raw_img, str) else "")
+        parsed = _parse_data_url(url, default_mime="image/png")
+        if parsed is None:
+            logger.warning(
+                "[antigravity] Non-data-URL image block cannot be delivered (endpoint takes inline data only)"
+            )
+            return {"text": _undelivered_placeholder(block)}
+        return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+    if btype == "image":
+        part = _extract_image_inline_data(block)
+        if part is not None:
+            return part
+        logger.warning("[antigravity] Image block missing inline base64 data; replaced with placeholder")
+        return {"text": _undelivered_placeholder(block)}
+    if btype in ("file", "document"):
+        part = _extract_file_inline_data(block)
+        if part is not None:
+            return part
+        logger.warning(
+            "[antigravity] File block type=%r missing inline base64 data or mime_type; replaced with placeholder",
+            btype,
+        )
+        return {"text": _undelivered_placeholder(block)}
+    if btype == "tool_use":  # anthropic-style blocks from history
+        fc: dict[str, Any] = {"name": block.get("name", ""), "args": block.get("input", {})}
+        if block.get("id"):
+            fc["id"] = block["id"]
+        return {"functionCall": fc}
+    if btype in _SILENT_SKIP_BLOCK_TYPES:
+        return None
+    logger.warning("[antigravity] Unsupported content block type=%r; replaced with placeholder", btype)
+    return {"text": _undelivered_placeholder(block)}
 
 
 def _messages_to_gemini(
@@ -267,8 +379,11 @@ def _messages_to_gemini(
 
         if isinstance(message, ToolMessage):
             # Gemini expects one functionResponse per tool call, named after
-            # the tool, with the payload as a JSON object.
+            # the tool, with the payload as a JSON object. Multimodal parts
+            # (inlineData images/PDFs) ride in the same user turn right after
+            # the functionResponse part.
             result: Any = message.content
+            extra_parts: list[dict[str, Any]] = []
             if isinstance(result, str):
                 try:
                     # DALTON-HOOK(antigravity-json-nan): coerce bare NaN/Infinity/-Infinity JSON constants to None
@@ -276,13 +391,31 @@ def _messages_to_gemini(
                 except json.JSONDecodeError:
                     result = {"result": result}
             elif isinstance(result, list):
-                result = {
-                    "result": "\n".join(
-                        block.get("text", "")
-                        for block in result
-                        if isinstance(block, dict)
-                    )
-                }
+                text_chunks: list[str] = []
+                for block in result:
+                    if isinstance(block, str):
+                        if block:
+                            text_chunks.append(block)
+                        continue
+                    if isinstance(block, dict) and block.get("type") in (
+                        "text",
+                        "input_text",
+                        "output_text",
+                    ):
+                        t = block.get("text", "")
+                        if t:
+                            text_chunks.append(t)
+                        continue
+                    part = _part_from_block(block)
+                    if part is None:
+                        continue
+                    if "inlineData" in part:
+                        extra_parts.append(part)
+                    elif "text" in part:
+                        text_chunks.append(part["text"])
+                    else:
+                        extra_parts.append(part)
+                result = {"result": "\n".join(text_chunks)}
             if not isinstance(result, dict):
                 result = {"result": result}
             result = _sanitize_json_non_finite(result)
@@ -301,11 +434,7 @@ def _messages_to_gemini(
             contents.append(
                 {
                     "role": "user",  # tool results ride the user turn in Gemini
-                    "parts": [
-                        {
-                            "functionResponse": fn_resp
-                        }
-                    ],
+                    "parts": [{"functionResponse": fn_resp}, *extra_parts],
                 }
             )
             continue
