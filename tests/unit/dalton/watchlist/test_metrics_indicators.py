@@ -1058,12 +1058,238 @@ async def test_r5_cold_300_watchlist_partial_slow_sources_first_response_warmup_
         assert res_after["snapshot_pending_symbols"] == []
         assert all(res_after["items"][sym]["price"] == 88.0 for sym in slow_syms)
         assert all(snap_calls.get(sym, 0) == 1 for sym in slow_syms)
-        # Shared Redis cache received write-through for newly fetched snapshots
+        # Newly fetched snapshots populate local _SNAPSHOT_CACHE without writing shared Redis quote keys
         _, sample_qkey = metrics_mod._resolve_quote_cache_key("SYM042")
-        assert sample_qkey in redis_store
+        assert sample_qkey not in redis_store
+        assert "SYM042" in metrics_mod._SNAPSHOT_CACHE
     finally:
         slow_release.set()
         qcs._inflight.pop(inflight_qkey, None)
         if not resolve_shared_task.done():
             resolve_shared_task.cancel()
         metrics_mod._clear_metrics_cache_for_tests()
+
+
+def test_r6_non_ginlix_with_null_last_trade_at_uses_as_of() -> None:
+    """r6 item 1: SnapshotData serializes last_trade_at: None for every provider; only source=='ginlix-data' ignores as_of."""
+    T2 = 1_764_151_260_000
+    for src in ("fmp", "tushare", "yfinance"):
+        assert (
+            metrics_mod._extract_selected_price_trade_ts(
+                {
+                    "source": src,
+                    "price": 152.5,
+                    "last_trade_at": None,
+                    "regular_as_of": None,
+                    "as_of": T2,
+                },
+                152.5,
+            )
+            == T2
+        )
+    # Ginlix with last_trade_at=None still refuses bid/ask composite as_of
+    assert (
+        metrics_mod._extract_selected_price_trade_ts(
+            {
+                "source": "ginlix-data",
+                "price": 152.5,
+                "last_trade_at": None,
+                "as_of": T2,
+            },
+            152.5,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_r6_fallback_snapshot_does_not_write_shared_quote_cache_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 item 4: /metrics fallback snapshots populate local _SNAPSHOT_CACHE only and never write shared QuoteCacheService keys."""
+    metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SOURCE_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SYMBOL_TIMEOUT_SECONDS", 0.25)
+
+    redis_store: dict[str, Any] = {}
+    redis_writes: list[str] = []
+    fake_redis = create_autospec(RedisCacheClient, instance=True)
+    fake_redis.enabled = True
+    fake_redis.mget.side_effect = lambda keys: [redis_store.get(k) for k in keys]
+    fake_redis.get.side_effect = lambda k: redis_store.get(k)
+
+    async def _redis_set(k: str, v: Any, ttl: int | None = None) -> bool:
+        _ = ttl
+        redis_writes.append(k)
+        redis_store[k] = v
+        return True
+
+    fake_redis.set.side_effect = _redis_set
+    monkeypatch.setattr(
+        metrics_mod,
+        "_get_redis_cache_client",
+        create_autospec(metrics_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+
+    primary_src = create_autospec(MarketDataSource, instance=True)
+    fallback_src = create_autospec(MarketDataSource, instance=True)
+    primary_src.get_snapshots.return_value = []
+    fallback_src.get_snapshots.return_value = [
+        {"symbol": "NVDA", "price": 195.5, "previous_close": 190.0, "as_of": 1_764_151_200_000}
+    ]
+    provider = MarketDataProvider(
+        entries=[
+            ProviderEntry(name="ginlix-data", source=primary_src, markets={"all"}),
+            ProviderEntry(name="yfinance", source=fallback_src, markets={"all"}),
+        ]
+    )
+
+    snaps, pending = await metrics_mod._fetch_snapshots_per_symbol(
+        ["NVDA"],
+        user_id="u1",
+        provider=provider,
+    )
+    assert pending == set()
+    assert snaps["NVDA"]["price"] == 195.5
+    assert snaps["NVDA"]["source"] == "yfinance"
+    assert "NVDA" in metrics_mod._SNAPSHOT_CACHE
+
+    _, nvda_qkey = metrics_mod._resolve_quote_cache_key("NVDA")
+    assert nvda_qkey is not None
+    assert nvda_qkey not in redis_store
+    assert nvda_qkey not in redis_writes
+
+
+@pytest.mark.asyncio
+async def test_r6_roster_fallback_earnings_filters_expired_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 item 5: Saved roster earnings.next_date fallback is adopted only when >= today; expired dates return None."""
+    metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[
+                {
+                    "user_id": "u1",
+                    "ticker": "NVDA",
+                    "tier": "core",
+                    "is_private": False,
+                    "earnings": {"next_date": "2020-01-15"},
+                },
+                {
+                    "user_id": "u1",
+                    "ticker": "AAPL",
+                    "tier": "core",
+                    "is_private": False,
+                    "earnings": {"next_date": "2099-05-01"},
+                },
+            ],
+        ),
+    )
+    # Calendar mirror does not contain NVDA or AAPL
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value={"ledger": {"entries": {}}}),
+    )
+
+    mkt_prov = create_autospec(MarketDataProvider, instance=True)
+    mkt_prov.get_snapshots.side_effect = lambda symbols, asset_type="stocks", user_id=None: [
+        {"symbol": symbols[0], "price": 150.0, "previous_close": 148.0, "currency": "USD"}
+    ]
+    mkt_prov.get_daily.return_value = []
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(mkt_prov, "fmp", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(
+            metrics_mod._resolve_financial_provider,
+            return_value=FinancialDataProvider(financial=None),
+        ),
+    )
+
+    out = await metrics_mod.WatchlistMetricsService().get_metrics_for_user("u1", wait_for_cold=True)
+    assert out["items"]["NVDA"]["next_earnings"] is None
+    assert out["items"]["AAPL"]["next_earnings"] == "2099-05-01"
+    assert out["summary"]["upcoming_earnings"] == [{"ticker": "AAPL", "date": "2099-05-01"}]
+
+
+@pytest.mark.asyncio
+async def test_r6_last_source_uses_full_remaining_symbol_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 item 6: Single/last source (including no-entries chain) uses full remaining symbol budget instead of 3s cap, allowing a 5s response to succeed."""
+    metrics_mod._clear_metrics_cache_for_tests()
+
+    # 1. Production 3s / 8s constants: verify single source receives >5s timeout (full ~8s budget)
+    captured_timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _recording_wait_for(aw: Any, timeout: float | None = None) -> Any:
+        captured_timeouts.append(timeout)
+        return await real_wait_for(aw, timeout=timeout)
+
+    monkeypatch.setattr(
+        metrics_mod.asyncio,
+        "wait_for",
+        create_autospec(asyncio.wait_for, side_effect=_recording_wait_for),
+    )
+
+    yf_src = create_autospec(MarketDataSource, instance=True)
+    yf_src.get_snapshots.return_value = [
+        {"symbol": "AAPL", "price": 210.0, "previous_close": 205.0, "as_of": 1_764_151_200_000}
+    ]
+    single_entry_provider = MarketDataProvider(
+        entries=[ProviderEntry(name="yfinance", source=yf_src, markets={"all"})]
+    )
+    snap_single = await metrics_mod._fetch_symbol_snapshot_with_fallback(
+        single_entry_provider, "AAPL", user_id="u1"
+    )
+    assert snap_single is not None and snap_single["price"] == 210.0
+    assert len(captured_timeouts) == 1
+    assert captured_timeouts[0] is not None and captured_timeouts[0] > 5.0
+
+    # Also verify no-entries whole-chain branch gets full remaining budget (>5s)
+    captured_timeouts.clear()
+    plain_provider = create_autospec(MarketDataProvider, instance=True)
+    plain_provider.get_snapshots.return_value = [
+        {"symbol": "MSFT", "price": 420.0, "previous_close": 415.0, "as_of": 1_764_151_200_000}
+    ]
+    snap_plain = await metrics_mod._fetch_symbol_snapshot_with_fallback(
+        plain_provider, "MSFT", user_id="u1"
+    )
+    assert snap_plain is not None and snap_plain["price"] == 420.0
+    assert len(captured_timeouts) == 1
+    assert captured_timeouts[0] is not None and captured_timeouts[0] > 5.0
+
+    # 2. Real async sleep exceeding SNAPSHOT_SOURCE_TIMEOUT_SECONDS (5s/3s scaled to 0.08s/0.04s inside 0.25s symbol budget)
+    monkeypatch.setattr(metrics_mod.asyncio, "wait_for", real_wait_for)
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SOURCE_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SYMBOL_TIMEOUT_SECONDS", 0.25)
+
+    slow_single_src = create_autospec(MarketDataSource, instance=True)
+
+    async def _slow_5s_equiv(
+        symbols: list[str], asset_type: str = "stocks", user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        _ = (asset_type, user_id)
+        await asyncio.sleep(0.08)  # exceeds 0.04s per-source cap, fits in 0.25s symbol budget
+        return [{"symbol": symbols[0], "price": 215.5, "previous_close": 210.0, "as_of": 1_764_151_200_000}]
+
+    slow_single_src.get_snapshots.side_effect = _slow_5s_equiv
+    slow_single_provider = MarketDataProvider(
+        entries=[ProviderEntry(name="yfinance", source=slow_single_src, markets={"all"})]
+    )
+    snaps_out, pending_out = await metrics_mod._fetch_snapshots_per_symbol(
+        ["AAPL"], user_id="u1", provider=slow_single_provider
+    )
+    assert pending_out == set()
+    assert snaps_out["AAPL"]["price"] == 215.5
+    assert snaps_out["AAPL"]["source"] == "yfinance"

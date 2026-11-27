@@ -216,6 +216,20 @@ async def _write_bars_to_cache(cache_key: str, bars: list[dict[str, Any]]) -> No
             pass
 
 
+def _normalize_upcoming_earnings_date(
+    raw: Any,
+    *,
+    today_iso: str | None = None,
+) -> str | None:
+    """Normalize an ISO date string and keep it only if it is today or later."""
+    dt = str(raw or "").strip()
+    if len(dt) < 10:
+        return None
+    dt_iso = dt[:10]
+    ref_today = today_iso if today_iso is not None else date.today().isoformat()
+    return dt_iso if dt_iso >= ref_today else None
+
+
 def _extract_next_earnings_map(mirror_row: dict[str, Any] | None) -> dict[str, str]:
     """Read upcoming earnings dates per ticker from the user's personal calendar mirror.
 
@@ -244,17 +258,14 @@ def _extract_next_earnings_map(mirror_row: dict[str, Any] | None) -> dict[str, s
     for sym, item in pairs:
         if not sym:
             continue
-        dt = str(
+        dt_iso = _normalize_upcoming_earnings_date(
             item.get("earnings_date")
             or item.get("date")
             or item.get("next_earnings_date")
-            or item.get("tentative_date")
-            or ""
-        ).strip()
-        if len(dt) < 10:
-            continue
-        dt_iso = dt[:10]
-        if dt_iso >= today_iso:
+            or item.get("tentative_date"),
+            today_iso=today_iso,
+        )
+        if dt_iso is not None:
             prev = out.get(sym)
             if prev is None or dt_iso < prev:
                 out[sym] = dt_iso
@@ -595,11 +606,11 @@ def _extract_selected_price_trade_ts(
     - ``live_tick_at`` stamps a WS tick directly for ``price``.
     - ``regular_as_of`` stamps ``regular_close`` on extended-hours enriched rows
       (``regular_only is False``) where ``as_of`` reflects extended hours.
-    - On Ginlix rows (``source == "ginlix-data"`` or ``"last_trade_at"`` key
-      present), composite ``as_of`` can advance from bid/ask ``last_quote``
-      updates while ``price`` is an earlier ``session.close``. Only use
-      ``last_trade_at`` when ``last_trade_price`` is absent or matches
-      ``selected_price``; never promote bid/ask ``as_of`` as a trade timestamp.
+    - On Ginlix rows (``source == "ginlix-data"``), composite ``as_of`` can
+      advance from bid/ask ``last_quote`` updates while ``price`` is an earlier
+      ``session.close``. Only use ``last_trade_at`` when ``last_trade_price`` is
+      absent or matches ``selected_price``; never promote bid/ask ``as_of`` as a
+      trade timestamp.
     - Other providers (FMP, yfinance regular, CN/tushare) stamp trade time in
       ``as_of`` / ``timestamp``.
     """
@@ -612,10 +623,7 @@ def _extract_selected_price_trade_ts(
     if regular_as_of is not None and snap.get("regular_only") is False:
         return regular_as_of
 
-    is_ginlix = (
-        str(snap.get("source") or "").strip().lower() == "ginlix-data"
-        or "last_trade_at" in snap
-    )
+    is_ginlix = str(snap.get("source") or "").strip().lower() == "ginlix-data"
     if is_ginlix:
         last_trade_at = snap.get("last_trade_at")
         last_trade_price = _positive_float(snap.get("last_trade_price"))
@@ -707,23 +715,6 @@ async def _read_shared_snapshots_from_cache(
 
     still_missing = [sym for sym in missing if sym not in out]
     return out, still_missing
-
-
-async def _write_shared_snapshot_to_cache(sym: str, snap: dict[str, Any]) -> None:
-    """Best-effort write-through to shared Redis ``QuoteCacheService`` key."""
-    redis_client = await _get_redis_cache_client()
-    if redis_client is None:
-        return
-    ref, qkey = _resolve_quote_cache_key(sym)
-    if ref is None or qkey is None:
-        return
-    try:
-        from src.server.services.cache.quote_cache_service import _quote_ttl
-
-        ttl = _quote_ttl(ref, tier=snap.get("tier"), as_of=snap.get("as_of"))
-        await redis_client.set(qkey, snap, ttl=ttl)
-    except Exception:
-        pass
 
 
 async def _await_shared_quote_inflight(sym: str, timeout: float) -> dict[str, Any] | None:
@@ -825,7 +816,7 @@ async def _fetch_symbol_snapshot_with_fallback(
             if remaining_sources > 1:
                 src_timeout = min(SNAPSHOT_SOURCE_TIMEOUT_SECONDS, remaining * 0.5)
             else:
-                src_timeout = min(SNAPSHOT_SOURCE_TIMEOUT_SECONDS, remaining)
+                src_timeout = remaining
             if src_timeout <= 0:
                 break
             try:
@@ -861,7 +852,7 @@ async def _fetch_symbol_snapshot_with_fallback(
         return None
 
     remaining = max(0.0, deadline - time.monotonic())
-    single_timeout = min(SNAPSHOT_SOURCE_TIMEOUT_SECONDS, remaining)
+    single_timeout = remaining
     if single_timeout <= 0:
         return None
     try:
@@ -899,7 +890,6 @@ def _ensure_snapshot_singleflight_task(
         if snap is not None:
             _SNAPSHOT_CACHE[sym] = (fetched_at, snap)
             _SNAPSHOT_FAILURE_STREAK.pop(sym, None)
-            await _write_shared_snapshot_to_cache(sym, snap)
             return snap
         _record_snapshot_failure(sym, fetched_at)
         return None
@@ -1196,6 +1186,8 @@ class WatchlistMetricsService:
         )
         pending_set.update(snapshot_pending_set)
 
+        today_iso = date.today().isoformat()
+
         def _assemble_item(
             sym: str,
             bars: list[dict[str, Any]],
@@ -1205,9 +1197,11 @@ class WatchlistMetricsService:
             snap = snaps.get(sym) or {}
             row = rows_by_ticker.get(sym) or {}
             extra_earn = row.get("earnings") if isinstance(row.get("earnings"), dict) else {}
-            next_earn = earnings_by_ticker.get(sym) or (
-                str(extra_earn.get("next_date") or "").strip()[:10] or None
+            fallback_earn = _normalize_upcoming_earnings_date(
+                extra_earn.get("next_date"),
+                today_iso=today_iso,
             )
+            next_earn = earnings_by_ticker.get(sym) or fallback_earn
 
             snap_currency = _normalize_currency(snap.get("currency"))
             eff_currency = snap_currency or mcap_currency

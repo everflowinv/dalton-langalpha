@@ -74,8 +74,7 @@ export function extractSelectedPriceTradeTsMs(
     return regularAsOf;
   }
 
-  const hasLastTradeKey = 'last_trade_at' in record;
-  const isGinlix = quote.source === 'ginlix-data' || hasLastTradeKey;
+  const isGinlix = quote.source === 'ginlix-data';
   if (isGinlix) {
     const lastTradeAt = parsePriceTimestampMs(quote.last_trade_at ?? record.last_trade_at);
     const lastTradePrice =
@@ -150,9 +149,7 @@ function quotePriceCandidateForCache(row: QuoteRow): PricedCandidate {
     const extTradeTs =
       parsePriceTimestampMs(row.live_tick_at) ??
       parsePriceTimestampMs(row.last_trade_at ?? record.last_trade_at) ??
-      (row.source === 'ginlix-data' || 'last_trade_at' in record
-        ? null
-        : parsePriceTimestampMs(row.as_of));
+      (row.source === 'ginlix-data' ? null : parsePriceTimestampMs(row.as_of));
     return {
       price: lastMin,
       tradeTsMs: extTradeTs,
@@ -189,22 +186,53 @@ export function mergeRestQuoteRow(
     return incoming;
   }
 
-  // Keep existing newer price, 1D move, and its own trade timestamp fields while
-  // refreshing non-price REST metadata (name, OHLC, volume, extended-hours fields).
-  const keepAsOf =
-    prev.live_tick_at != null ? (incoming.as_of ?? prev.as_of) : (prev.as_of ?? incoming.as_of);
-  return {
+  // Keep existing newer price, 1D move, and its own provenance/trade timestamp
+  // fields (dropping incoming ones that prev does not carry) while refreshing
+  // non-price REST metadata (name, OHLC, volume).
+  const prevRecord = prev as Record<string, unknown>;
+  const incomingRecord = incoming as Record<string, unknown>;
+  const merged: QuoteRow = {
     ...incoming,
     price: prev.price,
     change: prev.change,
     change_percent: prev.change_percent,
-    ...(prev.last_minute_close != null ? { last_minute_close: prev.last_minute_close } : {}),
-    ...(prev.live_tick_at != null ? { live_tick_at: prev.live_tick_at } : {}),
-    ...(prev.last_trade_at !== undefined ? { last_trade_at: prev.last_trade_at } : {}),
-    ...(prev.last_trade_price !== undefined ? { last_trade_price: prev.last_trade_price } : {}),
-    ...(prev.regular_as_of !== undefined ? { regular_as_of: prev.regular_as_of } : {}),
-    ...(keepAsOf !== undefined ? { as_of: keepAsOf } : {}),
   };
+  const mergedRecord = merged as Record<string, unknown>;
+  const priceMetaKeys = [
+    'source',
+    'as_of',
+    'tier',
+    'last_trade_at',
+    'last_trade_price',
+    'regular_as_of',
+    'regular_only',
+    'live_tick_at',
+  ] as const;
+  for (const key of priceMetaKeys) {
+    if (prevRecord[key] !== undefined) {
+      mergedRecord[key] = prevRecord[key];
+    } else {
+      delete mergedRecord[key];
+    }
+  }
+
+  // Only keep prev's extended-hours last_minute_close when prev's live WS tick
+  // is at least as new as incoming's extended-hours print time; otherwise adopt
+  // incoming's last_minute_close and extended-hours fields.
+  const prevLiveTickTs = parsePriceTimestampMs(prev.live_tick_at);
+  const incomingExtTs =
+    parsePriceTimestampMs(incoming.last_trade_at ?? incomingRecord.last_trade_at) ??
+    parsePriceTimestampMs(incoming.as_of);
+  const keepPrevLastMinuteClose =
+    prev.last_minute_close != null &&
+    prevLiveTickTs != null &&
+    (incomingExtTs == null || prevLiveTickTs >= incomingExtTs);
+  if (keepPrevLastMinuteClose) {
+    merged.last_minute_close = prev.last_minute_close;
+  } else if (prevLiveTickTs != null && incomingExtTs != null && prevLiveTickTs < incomingExtTs) {
+    merged.last_minute_close = incoming.last_minute_close ?? null;
+  }
+  return merged;
 }
 
 /**
@@ -231,6 +259,7 @@ export function mergeWsQuoteRow(
   return {
     ...prev,
     symbol: prev.symbol ?? key,
+    ...(prev.source === 'daily' ? { source: 'ws' } : {}),
     price: fields.price,
     // A frame is a minute aggregate: its close is the row's last minute close,
     // which an extended-hours row prints as its session price.

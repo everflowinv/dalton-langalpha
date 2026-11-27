@@ -113,7 +113,10 @@ export function deriveQuoteDisplay(
   const isUs = isUSEquity(row?.symbol);
   const info = isUs ? getExtendedHoursInfo(effectiveStatus ?? null, row ?? null) : null;
   const extType = isUs ? ((row?.extType !== undefined ? row.extType : info?.extType) ?? null) : null;
-  const session: 'regular' | 'pre' | 'post' = extType ?? 'regular';
+  const isUnprintedPreMarket =
+    row != null && isUs && effectiveStatus?.earlyHours === true && extType == null;
+  const session: 'regular' | 'pre' | 'post' =
+    extType ?? (isUnprintedPreMarket ? 'pre' : 'regular');
 
   const rowPrice = row?.price ?? null;
   const rowChange = row?.change ?? null;
@@ -123,12 +126,18 @@ export function deriveQuoteDisplay(
   const tickHasTimestamp =
     liveTick != null &&
     (liveTick.timestamp != null || liveTick.liveTickAt != null || liveTick.live_tick_at != null);
+  const rowLastMinuteClose = row?.lastMinuteClose ?? row?.last_minute_close ?? null;
   const rowHasLiveTick =
     row != null && (row.liveTickAt != null || row.live_tick_at != null);
   const rawTickPrice = tickHasTimestamp
     ? liveTick?.price
     : rowHasLiveTick
-      ? (liveTick?.price ?? rowPrice)
+      ? (liveTick?.price ??
+          (rowLastMinuteClose != null
+            ? rowLastMinuteClose
+            : row?.lastMinuteClose === null || row?.last_minute_close === null
+              ? null
+              : rowPrice))
       : null;
   const tickPrice =
     typeof rawTickPrice === 'number' && Number.isFinite(rawTickPrice) ? rawTickPrice : null;
@@ -189,17 +198,19 @@ export function deriveQuoteDisplay(
 
   // In after-hours (`post`), require `regularClose` as the session anchor; do not accept
   // a post-market price synthesized against `prevClose` when `regularClose` is missing.
-  const hasPostAnchor = session !== 'post' || regularClose != null;
-  const extAnchor = hasPostAnchor ? (info?.extAnchor ?? null) : null;
-  const baseExtPrice = hasPostAnchor ? (row?.extPrice ?? info?.extPrice ?? null) : null;
-  const baseExtChange = hasPostAnchor ? (row?.extChange ?? info?.extChange ?? null) : null;
-  const baseExtPct = hasPostAnchor ? (row?.extPct ?? info?.extPct ?? null) : null;
+  // In pre-market without current-session prints (`extType == null`), suppress the
+  // extended-hours sub-row so stale prior-session WS ticks never render as PM.
+  const hasExtSessionTrade = extType != null && (session !== 'post' || regularClose != null);
+  const extAnchor = hasExtSessionTrade ? (info?.extAnchor ?? null) : null;
+  const baseExtPrice = hasExtSessionTrade ? (row?.extPrice ?? info?.extPrice ?? null) : null;
+  const baseExtChange = hasExtSessionTrade ? (row?.extChange ?? info?.extChange ?? null) : null;
+  const baseExtPct = hasExtSessionTrade ? (row?.extPct ?? info?.extPct ?? null) : null;
 
-  const extPrice = hasPostAnchor ? (tickPrice ?? baseExtPrice) : null;
-  const extChange = hasPostAnchor
+  const extPrice = hasExtSessionTrade ? (tickPrice ?? baseExtPrice) : null;
+  const extChange = hasExtSessionTrade
     ? (tickPrice != null && extAnchor != null ? tickPrice - extAnchor : baseExtChange)
     : null;
-  const extChangePct = hasPostAnchor
+  const extChangePct = hasExtSessionTrade
     ? (tickPrice != null && extAnchor ? ((tickPrice - extAnchor) / extAnchor) * 100 : baseExtPct)
     : null;
 

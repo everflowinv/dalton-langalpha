@@ -158,6 +158,7 @@ export class QuoteBatcher {
       // adopting the shown spelling lands on a warm entry.
       const shown = value ? quoteKey(String(value.symbol), isIndex) : key;
       if (shown !== key && !pool.has(shown)) {
+        // DALTON-HOOK(watchlist): preserve newer WS/cached trade prices on alias backfill
         this.queryClient.setQueryData<QuoteRow | null>(queryKeys.quote.detail(shown), (prev) =>
           value ? mergeRestQuoteRow(prev, value) : null,
         );
