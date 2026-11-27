@@ -17,6 +17,12 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>__HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__/src:__REPO_ROOT__</string>
+        <key>DALTON_REPO_ENV_FILE</key>
+        <string>__REPO_ENV_FILE__</string>
+        <key>DALTON_GUIDEPOINT_OWNERSHIP_FILE</key>
+        <string>__GUIDEPOINT_OWNERSHIP_FILE__</string>
         <key>DALTON_RESEARCH_CODE</key>
         <string>__RESEARCH_CODE__</string>
         <key>DALTON_RESEARCH_HOME</key>

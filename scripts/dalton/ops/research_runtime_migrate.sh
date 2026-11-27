@@ -803,10 +803,20 @@ PY
         echo "ERROR: target DALTON_RESEARCH_HOME does not exist: ${DST_ROOT} (run --apply first)" >&2
         exit 1
     fi
+    local bridge_py="${REPO_ROOT}/.venv/bin/python"
+    if [[ ! -x "${bridge_py}" ]]; then
+        echo "ERROR: missing repository virtualenv Python: ${bridge_py} (run 'uv sync --frozen' first)" >&2
+        exit 1
+    fi
+    local repo_env_file="${DALTON_REPO_ENV_FILE:-${REPO_ROOT}/.env}"
+    local ownership_file="${DALTON_GUIDEPOINT_OWNERSHIP_FILE:-${REPO_ROOT}/var/dalton/cutover-snapshots/research-host/handoff-journal.json}"
+    PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}" \
+    DALTON_REPO_ENV_FILE="${repo_env_file}" \
+    DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}" \
     DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
     DALTON_RESEARCH_CODE="${CODE_ROOT}" \
     DALTON_RESEARCH_HOME="${DST_ROOT}" \
-        "${helper_py}" "${REPO_ROOT}/scripts/dalton/researchdata_bridge.py" --check-runtime >/dev/null || {
+        "${bridge_py}" "${REPO_ROOT}/scripts/dalton/researchdata_bridge.py" --check-runtime >/dev/null || {
         echo "ERROR: --check-runtime failed for target ${DST_ROOT}; aborting switch" >&2
         exit 1
     }

@@ -27,6 +27,8 @@
         <string>__GUIDEPOINT_ENV_FILE__</string>
         <key>GUIDEPOINT_TOKENS_FILE</key>
         <string>__GUIDEPOINT_TOKENS_FILE__</string>
+        <key>DALTON_GUIDEPOINT_OWNERSHIP_FILE</key>
+        <string>__GUIDEPOINT_OWNERSHIP_FILE__</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

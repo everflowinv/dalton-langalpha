@@ -172,6 +172,7 @@ resolve_runtime_context
 
 GUIDEPOINT_ENV_PATH="${GUIDEPOINT_ENV_FILE:-${DATA_ROOT}/config/guidepoint_mcp.env}"
 GUIDEPOINT_TOKENS_PATH="${GUIDEPOINT_TOKENS_FILE:-${DATA_ROOT}/config/guidepoint_mcp_tokens.json}"
+GUIDEPOINT_OWNERSHIP_PATH="${DALTON_GUIDEPOINT_OWNERSHIP_FILE:-${REPO_ROOT}/var/dalton/cutover-snapshots/research-host/handoff-journal.json}"
 WATCHDOG_STATE_FILE="${ALPHAENGINE_WATCHDOG_STATE_FILE:-${DATA_ROOT}/state/alphaengine-desktop-watchdog.json}"
 ALPHAENGINE_DOWNLOADS_DIR="${DATA_ROOT}/temp/alphaengine-mcp-downloads"
 
@@ -256,7 +257,10 @@ render_plist_template() {
   TMP_ARTIFACTS+=("${tmp_path}")
   if ! "${helper_py}" - "${template_path}" "${tmp_path}" \
     "${REPO_ROOT}" "${HOME}" "${LOGS_DIR}" "${RUNTIME_ENV_KEY}" "${RUNTIME_ENV_VAL}" \
-    "${NODE_BIN}" "${PYTHON_BIN}" "${GUIDEPOINT_ENV_PATH}" "${GUIDEPOINT_TOKENS_PATH}" <<'PY'
+    "${NODE_BIN}" "${PYTHON_BIN}" "${GUIDEPOINT_ENV_PATH}" "${GUIDEPOINT_TOKENS_PATH}" \
+    "${GUIDEPOINT_OWNERSHIP_PATH}" <<'PY'
+import plistlib
+import re
 import sys
 from xml.sax.saxutils import escape
 
@@ -272,7 +276,8 @@ from xml.sax.saxutils import escape
     py_bin,
     gp_env,
     gp_tokens,
-) = sys.argv[1:12]
+    gp_ownership,
+) = sys.argv[1:13]
 
 with open(tpl_path, "r", encoding="utf-8") as f:
     text = f.read()
@@ -287,9 +292,15 @@ replacements = {
     "__PYTHON_BIN__": escape(py_bin),
     "__GUIDEPOINT_ENV_FILE__": escape(gp_env),
     "__GUIDEPOINT_TOKENS_FILE__": escape(gp_tokens),
+    "__GUIDEPOINT_OWNERSHIP_FILE__": escape(gp_ownership),
 }
 for k, v in replacements.items():
     text = text.replace(k, v)
+
+leftover = re.findall(r"__[A-Z][A-Z0-9_]*__", text)
+if leftover:
+    raise SystemExit(f"Unreplaced placeholders in {tpl_path}: {sorted(set(leftover))}")
+plistlib.loads(text.encode("utf-8"))
 
 with open(out_path, "w", encoding="utf-8") as f:
     f.write(text)
