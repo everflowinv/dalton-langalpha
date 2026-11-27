@@ -654,6 +654,8 @@ const _MODEL_DISK_PROBE_SCHEMA = {
     exists: { type: 'boolean' },
     readable: { type: 'boolean' },
     model_sha256: { type: ['string', 'null'] },
+    run_matched: { type: ['boolean', 'null'] },
+    receipt_run_id: { type: ['string', 'null'] },
   },
   required: ['path', 'exists', 'readable'],
 }
@@ -912,39 +914,87 @@ async function _mResolveNextModelPath(W, T, baselinePath, recordPath, phaseTitle
   return _mNormPath(res.next_path, W)
 }
 
-async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label) {
+async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expectedRunId = null) {
   const norm = _mNormPath(candidatePath, W)
+  const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
   if (!norm) {
-    return { exists: false, readable: false, model_sha256: null }
+    return {
+      verified: true,
+      status: 'missing',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: !wantRunId,
+      receipt_run_id: null,
+    }
   }
   const pyCode = [
     `import json, pathlib, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
-    `import model_readable, model_fingerprint`,
+    `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
+    `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
-    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha}))`,
-  ].join('; ')
-  const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘且可读（不修改任何文件）。`,
-    `在 Bash 执行：\`python3 -c "${pyCode}" "${norm}"\`，将输出 JSON 的 path、exists、readable、model_sha256 字段原样回传。`,
+    `run_matched = None`,
+    `receipt_rid = None`,
+    `if want_rid:`,
+    `    run_matched = False`,
+    `    if ok and sha:`,
+    `        rp = model_edit.publish_receipt_path(p)`,
+    `        if rp.is_file():`,
+    `            try:`,
+    `                rd = json.loads(rp.read_text(encoding='utf-8'))`,
+    `                receipt_rid = rd.get('run_id') if isinstance(rd, dict) else None`,
+    `                r_sha = str(rd.get('candidate_sha256') or '').strip().lower() if isinstance(rd, dict) else ''`,
+    `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
+    `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
+    `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
+    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `            except Exception:`,
+    `                run_matched = False`,
+    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
-  const res = await _mSafeAgent(prompt, {
+  const prompt = [
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+  ].join('\n')
+  const probeOpts = {
     agentType: 'dalton-evidence',
     label: label || '核验候选落盘',
     phase: phaseTitle || '核验候选落盘',
     schema: _MODEL_DISK_PROBE_SCHEMA,
     checkFiles: false,
-  })
-  if (!res || typeof res !== 'object') {
-    return { exists: false, readable: false, model_sha256: null }
   }
+  let res = await _mSafeAgent(prompt, probeOpts)
+  if (!res || typeof res !== 'object') {
+    log(`[modeling] ${probeOpts.label}首次超时或无返回，重试一次`)
+    res = await _mSafeAgent(prompt, probeOpts)
+  }
+  if (!res || typeof res !== 'object') {
+    return {
+      verified: false,
+      status: 'unverified',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: false,
+      receipt_run_id: null,
+    }
+  }
+  const ex = Boolean(res.exists)
+  const rd = ex && Boolean(res.readable)
+  const sha = rd ? _mValidSha(res.model_sha256) : null
+  const runMatched = wantRunId ? res.run_matched === true : true
   return {
-    exists: Boolean(res.exists),
-    readable: Boolean(res.exists) && Boolean(res.readable),
-    model_sha256: _mValidSha(res.model_sha256),
+    verified: true,
+    status: !ex ? 'missing' : (rd && sha ? 'readable' : 'unreadable'),
+    exists: ex,
+    readable: rd && Boolean(sha),
+    model_sha256: sha,
+    run_matched: runMatched,
+    receipt_run_id: typeof res.receipt_run_id === 'string' && res.receipt_run_id.trim() ? res.receipt_run_id.trim() : null,
   }
 }
 
@@ -1002,11 +1052,15 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `extras = json.loads(sys.argv[4])`,
     `ex = rp.is_file() and rp.stat().st_size > 0`,
     `rsha = hashlib.sha256(rp.read_bytes()).hexdigest() if ex else None`,
+    `path_re = re.compile(r'(?<![A-Za-z0-9_./\\\\-])(?:\\./)?' + re.escape(mp) + r'(?![A-Za-z0-9_./\\\\-])')`,
+    `def _md_synced(raw):`,
+    `    clean = re.sub(r'<!--.*?-->', '', raw, flags=re.S)`,
+    `    refs = [re.sub(r'^(?:\\./)+', '', r) for r in re.findall(r'model:([^\\s!#()\\[\\]<>\"\\x27\\x60]+\\.xlsx)[!#]', clean, re.I)]`,
+    `    return all(r == mp for r in refs) and (bool(refs) or bool(path_re.search(clean)))`,
     `synced = False`,
     `if ex:`,
     `    txt = rp.read_text(encoding='utf-8', errors='replace')`,
-    `    refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]`,
-    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt))`,
+    `    report_ok = _md_synced(txt)`,
     `    extras_ok = True`,
     `    for ep_s in extras:`,
     `        ep = pathlib.Path(ep_s)`,
@@ -1021,8 +1075,7 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `                extras_ok = False; break`,
     `        else:`,
     `            etxt = ep.read_text(encoding='utf-8', errors='replace')`,
-    `            erefs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', etxt, re.I)]`,
-    `            if any(r != mp for r in erefs) or (not erefs and mp not in etxt):`,
+    `            if not _md_synced(etxt):`,
     `                extras_ok = False; break`,
     `    synced = bool(report_ok and extras_ok)`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'synced': synced, 'report_sha256': rsha}))`,
@@ -1452,12 +1505,13 @@ async function runModelingPipeline(ctx) {
     : ''
   const editSourcePath = baselinePath || '.agents/skills/dalton-model/assets/default_model_template.xlsx'
   const stage2aOutArg = ` --out "${plannedCandPath}"`
+  const editRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
   const stage2aPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/SKILL.md、.agents/skills/dalton-model/references/forecast-rules.md、.agents/skills/dalton-model/references/rollforward.md 与 .agents/skills/dalton-model/references/format-spec.md${modelSpecPath ? `，以及 ${modelSpecPath}` : ''}。`,
     `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}；本轮绑定输出路径：${plannedCandPath}。`,
     `执行独立建模与受控原地编辑（先落盘并确认可读候选模型，暂不写一致预期快照）：`,
     `- 完整遵守既有建模约定：预测期金额全部用公式算出、由季度汇总的年度列按行项类型写公式、季度预测覆盖至下一财年 Q4、年度预测覆盖至少 3 个完整财年（下一财年各季度加之后两个完整财年），原模型保持只读；多公司行业整本只改 ${T} 所属工作表与变更记录，保留其他公司工作表原状。`,
-    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
+    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${editRunIdArg}${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
     `返回 JSON：files（含落盘后的候选模型路径与 ${coordMapPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
 
@@ -1481,16 +1535,16 @@ async function runModelingPipeline(ctx) {
     modelSha = stage2aSha
     if (stage2a.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
   } else {
-    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径独立实测盘上可读性与哈希
-    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘')
-    if (diskProbe.readable && diskProbe.model_sha256) {
+    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径与本轮 run_id 独立实测盘上可读性与发布记录
+    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+    if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
       candidatePath = plannedCandPath
       modelSha = diskProbe.model_sha256
       if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
         _mPushUnique(failedStages, 'recalc')
       }
       if (!stage2a) {
-        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已落盘且可读，按 recalc 降级继续后续阶段`)
+        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已由本轮落盘且可读，按 recalc 降级继续后续阶段`)
       }
     }
   }
@@ -1513,7 +1567,7 @@ async function runModelingPipeline(ctx) {
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
     `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
-    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
+    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,
   ].join('\n')
 
@@ -1679,7 +1733,7 @@ async function runModelingPipeline(ctx) {
         actionableIssues.map((it) => `- ${it}`).join('\n'),
         `操作要求（必须以当前候选 ${candidatePath} 为基础应用增量，保留前序写入的实际值、扩列与预测）：`,
         `1) 先对当前候选重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${fixFpPath}"\`；`,
-        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
+        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"${editRunIdArg}\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
         `3) 按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "<最新候选路径>" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；`,
         `4) 返回更新后的 files、candidate_path、model_sha256、recalc_status 与 consensus_diff_generated。`,
       ].join('\n')
@@ -1956,6 +2010,7 @@ async function reviseModelForReport(ctx) {
     )
   }
   const revOutArg = ` --out "${plannedNextPath}"`
+  const revRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
 
   // -------------------------------------------------------------------------
   // 派发 1：仅重提指纹 + 改模落盘（按预绑路径独立实测可读性与哈希后，再分别派发差异刷新与报告同步）
@@ -1966,7 +2021,7 @@ async function reviseModelForReport(ctx) {
     `1) 若审稿意见仅涉及文字表达、无需改动模型数字或驱动假设：核对 ${currentModelPath} 哈希未变，不修改模型与报告文件，直接返回 changed=false、model_path="${currentModelPath}"、model_sha256。`,
     `2) 若审稿意见要求调整模型数字、驱动假设或勾稽（本步只做重提指纹与改模落盘，暂不刷新差异表也不改写报告，确认新候选后再分别执行）：`,
     `   a) 先对当前候选模型重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${currentModelPath}" --ticker "${T}" --out "${revFpPath}"\`；`,
-    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
+    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update${revRunIdArg}\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
     `审稿意见：\n${typeof reviewFeedback === 'string' ? reviewFeedback : JSON.stringify(reviewFeedback)}`,
     `返回 JSON：files（含新模型路径 ${plannedNextPath} 与 ${coordMapPath}）、summary、changed、model_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
@@ -1978,25 +2033,45 @@ async function reviseModelForReport(ctx) {
     schema: _MODEL_REV_EDIT_SCHEMA,
   })
 
-  // 父流程始终先按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，再判断是否发生改动；
-  // 绝不信任子任务回传的旧路径或自报哈希。
+  // 父流程始终先按预绑路径 plannedNextPath 与本轮 run_id 独立实测盘上可读性、发布记录与 SHA-256，再判断是否发生改动；
+  // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-  if (diskProbe.readable && diskProbe.model_sha256) {
+  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256
-    if (!editRes || !editRes.changed || editRes.recalc_status === 'recalc_failed') {
+    const hasRecalcStatus = Boolean(
+      editRes && typeof editRes.recalc_status === 'string' && editRes.recalc_status.trim()
+    )
+    if (!editRes || !hasRecalcStatus || editRes.recalc_status === 'recalc_failed') {
       _mPushUnique(failedStages, 'recalc')
     }
     if (!editRes) {
-      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     } else if (!editRes.changed) {
-      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     }
-  } else if (editRes && !editRes.changed && !diskProbe.exists) {
-    // 预绑路径未生成新文件且子任务声称未改：仍须读盘实测当前模型可读性与哈希，绝不采用自报哈希
+  } else if (!diskProbe.verified) {
+    // 核验子任务重试后仍无返回：按「未核验」处理，交由降级账本命令自己读盘，不提前终止报告修订
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模新候选核验子任务超时未核验，保留当前模型并由降级账本命令直接读盘确认',
+      '报告联动改模新候选核验子任务超时（未核验）'
+    )
+  } else if (editRes && !editRes.changed && (!diskProbe.exists || (diskProbe.readable && !diskProbe.run_matched))) {
+    // 本轮未在预绑路径发布新候选且子任务声称未改：读盘实测当前模型可读性与哈希，绝不采用自报哈希
     const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘')
+    if (!curProbe.verified) {
+      // 核验当前模型的子任务重试后仍超时：按「未核验」处理，由降级账本命令直接读盘确认当前模型，不提前终止报告修订
+      _mPushUnique(failedStages, 'report_revision')
+      return await fallbackOnCurrent(
+        failedStages,
+        '报告联动改模声称未改但当前模型核验子任务超时（未核验），已交由降级账本命令直接读盘确认当前模型',
+        '当前模型核验子任务超时（未核验）'
+      )
+    }
     if (!curProbe.readable || !curProbe.model_sha256) {
       return {
         ok: false,
@@ -2005,7 +2080,11 @@ async function reviseModelForReport(ctx) {
         modelSha256: null,
         reportSha256: null,
         status: 'failed_unusable',
-        openIssues: ['报告联动改模未产出新版本，且当前模型在盘上不可读'],
+        openIssues: [
+          curProbe.status === 'missing'
+            ? '报告联动改模未产出新版本，且当前模型在盘上不存在'
+            : '报告联动改模未产出新版本，且当前模型在盘上不可读',
+        ],
         artifacts: currentArtifacts,
         failedStages: [...carriedNoteFailures, 'report_revision'],
         remainingIssuesPath: null,
@@ -2037,7 +2116,9 @@ async function reviseModelForReport(ctx) {
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模落盘子任务超时或返回空，且预绑路径文件非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
       '报告联动改模落盘子任务超时或返回空'
     )
   } else if (!editRes.changed && diskProbe.exists) {
@@ -2048,13 +2129,17 @@ async function reviseModelForReport(ctx) {
       '报告联动改模在预绑输出路径留下不可读文件'
     )
   } else {
-    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径或写失败）：
-    // 绝不把旧路径当新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
+    // editRes.changed === true，但预绑新路径盘上未见本轮发布的可读候选（不存在、不可读或属于其他运行）：
+    // 绝不把旧路径或其他运行的候选认作本轮新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
-      '报告联动改模未在预绑输出路径产出可读新候选模型'
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模声称已改，但预绑输出路径文件属于其他运行而非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模预绑输出路径文件非本轮发布'
+        : '报告联动改模未在预绑输出路径产出可读新候选模型'
     )
   }
 
@@ -2466,6 +2551,8 @@ const _MODEL_DISK_PROBE_SCHEMA = {
     exists: { type: 'boolean' },
     readable: { type: 'boolean' },
     model_sha256: { type: ['string', 'null'] },
+    run_matched: { type: ['boolean', 'null'] },
+    receipt_run_id: { type: ['string', 'null'] },
   },
   required: ['path', 'exists', 'readable'],
 }
@@ -2724,39 +2811,87 @@ async function _mResolveNextModelPath(W, T, baselinePath, recordPath, phaseTitle
   return _mNormPath(res.next_path, W)
 }
 
-async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label) {
+async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expectedRunId = null) {
   const norm = _mNormPath(candidatePath, W)
+  const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
   if (!norm) {
-    return { exists: false, readable: false, model_sha256: null }
+    return {
+      verified: true,
+      status: 'missing',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: !wantRunId,
+      receipt_run_id: null,
+    }
   }
   const pyCode = [
     `import json, pathlib, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
-    `import model_readable, model_fingerprint`,
+    `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
+    `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
-    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha}))`,
-  ].join('; ')
-  const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘且可读（不修改任何文件）。`,
-    `在 Bash 执行：\`python3 -c "${pyCode}" "${norm}"\`，将输出 JSON 的 path、exists、readable、model_sha256 字段原样回传。`,
+    `run_matched = None`,
+    `receipt_rid = None`,
+    `if want_rid:`,
+    `    run_matched = False`,
+    `    if ok and sha:`,
+    `        rp = model_edit.publish_receipt_path(p)`,
+    `        if rp.is_file():`,
+    `            try:`,
+    `                rd = json.loads(rp.read_text(encoding='utf-8'))`,
+    `                receipt_rid = rd.get('run_id') if isinstance(rd, dict) else None`,
+    `                r_sha = str(rd.get('candidate_sha256') or '').strip().lower() if isinstance(rd, dict) else ''`,
+    `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
+    `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
+    `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
+    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `            except Exception:`,
+    `                run_matched = False`,
+    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
-  const res = await _mSafeAgent(prompt, {
+  const prompt = [
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+  ].join('\n')
+  const probeOpts = {
     agentType: 'dalton-evidence',
     label: label || '核验候选落盘',
     phase: phaseTitle || '核验候选落盘',
     schema: _MODEL_DISK_PROBE_SCHEMA,
     checkFiles: false,
-  })
-  if (!res || typeof res !== 'object') {
-    return { exists: false, readable: false, model_sha256: null }
   }
+  let res = await _mSafeAgent(prompt, probeOpts)
+  if (!res || typeof res !== 'object') {
+    log(`[modeling] ${probeOpts.label}首次超时或无返回，重试一次`)
+    res = await _mSafeAgent(prompt, probeOpts)
+  }
+  if (!res || typeof res !== 'object') {
+    return {
+      verified: false,
+      status: 'unverified',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: false,
+      receipt_run_id: null,
+    }
+  }
+  const ex = Boolean(res.exists)
+  const rd = ex && Boolean(res.readable)
+  const sha = rd ? _mValidSha(res.model_sha256) : null
+  const runMatched = wantRunId ? res.run_matched === true : true
   return {
-    exists: Boolean(res.exists),
-    readable: Boolean(res.exists) && Boolean(res.readable),
-    model_sha256: _mValidSha(res.model_sha256),
+    verified: true,
+    status: !ex ? 'missing' : (rd && sha ? 'readable' : 'unreadable'),
+    exists: ex,
+    readable: rd && Boolean(sha),
+    model_sha256: sha,
+    run_matched: runMatched,
+    receipt_run_id: typeof res.receipt_run_id === 'string' && res.receipt_run_id.trim() ? res.receipt_run_id.trim() : null,
   }
 }
 
@@ -2814,11 +2949,15 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `extras = json.loads(sys.argv[4])`,
     `ex = rp.is_file() and rp.stat().st_size > 0`,
     `rsha = hashlib.sha256(rp.read_bytes()).hexdigest() if ex else None`,
+    `path_re = re.compile(r'(?<![A-Za-z0-9_./\\\\-])(?:\\./)?' + re.escape(mp) + r'(?![A-Za-z0-9_./\\\\-])')`,
+    `def _md_synced(raw):`,
+    `    clean = re.sub(r'<!--.*?-->', '', raw, flags=re.S)`,
+    `    refs = [re.sub(r'^(?:\\./)+', '', r) for r in re.findall(r'model:([^\\s!#()\\[\\]<>\"\\x27\\x60]+\\.xlsx)[!#]', clean, re.I)]`,
+    `    return all(r == mp for r in refs) and (bool(refs) or bool(path_re.search(clean)))`,
     `synced = False`,
     `if ex:`,
     `    txt = rp.read_text(encoding='utf-8', errors='replace')`,
-    `    refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]`,
-    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt))`,
+    `    report_ok = _md_synced(txt)`,
     `    extras_ok = True`,
     `    for ep_s in extras:`,
     `        ep = pathlib.Path(ep_s)`,
@@ -2833,8 +2972,7 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `                extras_ok = False; break`,
     `        else:`,
     `            etxt = ep.read_text(encoding='utf-8', errors='replace')`,
-    `            erefs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', etxt, re.I)]`,
-    `            if any(r != mp for r in erefs) or (not erefs and mp not in etxt):`,
+    `            if not _md_synced(etxt):`,
     `                extras_ok = False; break`,
     `    synced = bool(report_ok and extras_ok)`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'synced': synced, 'report_sha256': rsha}))`,
@@ -3264,12 +3402,13 @@ async function runModelingPipeline(ctx) {
     : ''
   const editSourcePath = baselinePath || '.agents/skills/dalton-model/assets/default_model_template.xlsx'
   const stage2aOutArg = ` --out "${plannedCandPath}"`
+  const editRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
   const stage2aPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/SKILL.md、.agents/skills/dalton-model/references/forecast-rules.md、.agents/skills/dalton-model/references/rollforward.md 与 .agents/skills/dalton-model/references/format-spec.md${modelSpecPath ? `，以及 ${modelSpecPath}` : ''}。`,
     `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}；本轮绑定输出路径：${plannedCandPath}。`,
     `执行独立建模与受控原地编辑（先落盘并确认可读候选模型，暂不写一致预期快照）：`,
     `- 完整遵守既有建模约定：预测期金额全部用公式算出、由季度汇总的年度列按行项类型写公式、季度预测覆盖至下一财年 Q4、年度预测覆盖至少 3 个完整财年（下一财年各季度加之后两个完整财年），原模型保持只读；多公司行业整本只改 ${T} 所属工作表与变更记录，保留其他公司工作表原状。`,
-    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
+    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${editRunIdArg}${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
     `返回 JSON：files（含落盘后的候选模型路径与 ${coordMapPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
 
@@ -3293,16 +3432,16 @@ async function runModelingPipeline(ctx) {
     modelSha = stage2aSha
     if (stage2a.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
   } else {
-    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径独立实测盘上可读性与哈希
-    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘')
-    if (diskProbe.readable && diskProbe.model_sha256) {
+    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径与本轮 run_id 独立实测盘上可读性与发布记录
+    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+    if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
       candidatePath = plannedCandPath
       modelSha = diskProbe.model_sha256
       if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
         _mPushUnique(failedStages, 'recalc')
       }
       if (!stage2a) {
-        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已落盘且可读，按 recalc 降级继续后续阶段`)
+        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已由本轮落盘且可读，按 recalc 降级继续后续阶段`)
       }
     }
   }
@@ -3325,7 +3464,7 @@ async function runModelingPipeline(ctx) {
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
     `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
-    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
+    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,
   ].join('\n')
 
@@ -3491,7 +3630,7 @@ async function runModelingPipeline(ctx) {
         actionableIssues.map((it) => `- ${it}`).join('\n'),
         `操作要求（必须以当前候选 ${candidatePath} 为基础应用增量，保留前序写入的实际值、扩列与预测）：`,
         `1) 先对当前候选重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${fixFpPath}"\`；`,
-        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
+        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"${editRunIdArg}\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
         `3) 按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "<最新候选路径>" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；`,
         `4) 返回更新后的 files、candidate_path、model_sha256、recalc_status 与 consensus_diff_generated。`,
       ].join('\n')
@@ -3768,6 +3907,7 @@ async function reviseModelForReport(ctx) {
     )
   }
   const revOutArg = ` --out "${plannedNextPath}"`
+  const revRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
 
   // -------------------------------------------------------------------------
   // 派发 1：仅重提指纹 + 改模落盘（按预绑路径独立实测可读性与哈希后，再分别派发差异刷新与报告同步）
@@ -3778,7 +3918,7 @@ async function reviseModelForReport(ctx) {
     `1) 若审稿意见仅涉及文字表达、无需改动模型数字或驱动假设：核对 ${currentModelPath} 哈希未变，不修改模型与报告文件，直接返回 changed=false、model_path="${currentModelPath}"、model_sha256。`,
     `2) 若审稿意见要求调整模型数字、驱动假设或勾稽（本步只做重提指纹与改模落盘，暂不刷新差异表也不改写报告，确认新候选后再分别执行）：`,
     `   a) 先对当前候选模型重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${currentModelPath}" --ticker "${T}" --out "${revFpPath}"\`；`,
-    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
+    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update${revRunIdArg}\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
     `审稿意见：\n${typeof reviewFeedback === 'string' ? reviewFeedback : JSON.stringify(reviewFeedback)}`,
     `返回 JSON：files（含新模型路径 ${plannedNextPath} 与 ${coordMapPath}）、summary、changed、model_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
@@ -3790,25 +3930,45 @@ async function reviseModelForReport(ctx) {
     schema: _MODEL_REV_EDIT_SCHEMA,
   })
 
-  // 父流程始终先按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，再判断是否发生改动；
-  // 绝不信任子任务回传的旧路径或自报哈希。
+  // 父流程始终先按预绑路径 plannedNextPath 与本轮 run_id 独立实测盘上可读性、发布记录与 SHA-256，再判断是否发生改动；
+  // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-  if (diskProbe.readable && diskProbe.model_sha256) {
+  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256
-    if (!editRes || !editRes.changed || editRes.recalc_status === 'recalc_failed') {
+    const hasRecalcStatus = Boolean(
+      editRes && typeof editRes.recalc_status === 'string' && editRes.recalc_status.trim()
+    )
+    if (!editRes || !hasRecalcStatus || editRes.recalc_status === 'recalc_failed') {
       _mPushUnique(failedStages, 'recalc')
     }
     if (!editRes) {
-      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     } else if (!editRes.changed) {
-      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     }
-  } else if (editRes && !editRes.changed && !diskProbe.exists) {
-    // 预绑路径未生成新文件且子任务声称未改：仍须读盘实测当前模型可读性与哈希，绝不采用自报哈希
+  } else if (!diskProbe.verified) {
+    // 核验子任务重试后仍无返回：按「未核验」处理，交由降级账本命令自己读盘，不提前终止报告修订
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模新候选核验子任务超时未核验，保留当前模型并由降级账本命令直接读盘确认',
+      '报告联动改模新候选核验子任务超时（未核验）'
+    )
+  } else if (editRes && !editRes.changed && (!diskProbe.exists || (diskProbe.readable && !diskProbe.run_matched))) {
+    // 本轮未在预绑路径发布新候选且子任务声称未改：读盘实测当前模型可读性与哈希，绝不采用自报哈希
     const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘')
+    if (!curProbe.verified) {
+      // 核验当前模型的子任务重试后仍超时：按「未核验」处理，由降级账本命令直接读盘确认当前模型，不提前终止报告修订
+      _mPushUnique(failedStages, 'report_revision')
+      return await fallbackOnCurrent(
+        failedStages,
+        '报告联动改模声称未改但当前模型核验子任务超时（未核验），已交由降级账本命令直接读盘确认当前模型',
+        '当前模型核验子任务超时（未核验）'
+      )
+    }
     if (!curProbe.readable || !curProbe.model_sha256) {
       return {
         ok: false,
@@ -3817,7 +3977,11 @@ async function reviseModelForReport(ctx) {
         modelSha256: null,
         reportSha256: null,
         status: 'failed_unusable',
-        openIssues: ['报告联动改模未产出新版本，且当前模型在盘上不可读'],
+        openIssues: [
+          curProbe.status === 'missing'
+            ? '报告联动改模未产出新版本，且当前模型在盘上不存在'
+            : '报告联动改模未产出新版本，且当前模型在盘上不可读',
+        ],
         artifacts: currentArtifacts,
         failedStages: [...carriedNoteFailures, 'report_revision'],
         remainingIssuesPath: null,
@@ -3849,7 +4013,9 @@ async function reviseModelForReport(ctx) {
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模落盘子任务超时或返回空，且预绑路径文件非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
       '报告联动改模落盘子任务超时或返回空'
     )
   } else if (!editRes.changed && diskProbe.exists) {
@@ -3860,13 +4026,17 @@ async function reviseModelForReport(ctx) {
       '报告联动改模在预绑输出路径留下不可读文件'
     )
   } else {
-    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径或写失败）：
-    // 绝不把旧路径当新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
+    // editRes.changed === true，但预绑新路径盘上未见本轮发布的可读候选（不存在、不可读或属于其他运行）：
+    // 绝不把旧路径或其他运行的候选认作本轮新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
-      '报告联动改模未在预绑输出路径产出可读新候选模型'
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模声称已改，但预绑输出路径文件属于其他运行而非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模预绑输出路径文件非本轮发布'
+        : '报告联动改模未在预绑输出路径产出可读新候选模型'
     )
   }
 
@@ -4711,6 +4881,8 @@ const _MODEL_DISK_PROBE_SCHEMA = {
     exists: { type: 'boolean' },
     readable: { type: 'boolean' },
     model_sha256: { type: ['string', 'null'] },
+    run_matched: { type: ['boolean', 'null'] },
+    receipt_run_id: { type: ['string', 'null'] },
   },
   required: ['path', 'exists', 'readable'],
 }
@@ -4969,39 +5141,87 @@ async function _mResolveNextModelPath(W, T, baselinePath, recordPath, phaseTitle
   return _mNormPath(res.next_path, W)
 }
 
-async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label) {
+async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expectedRunId = null) {
   const norm = _mNormPath(candidatePath, W)
+  const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
   if (!norm) {
-    return { exists: false, readable: false, model_sha256: null }
+    return {
+      verified: true,
+      status: 'missing',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: !wantRunId,
+      receipt_run_id: null,
+    }
   }
   const pyCode = [
     `import json, pathlib, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
-    `import model_readable, model_fingerprint`,
+    `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
+    `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
-    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha}))`,
-  ].join('; ')
-  const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘且可读（不修改任何文件）。`,
-    `在 Bash 执行：\`python3 -c "${pyCode}" "${norm}"\`，将输出 JSON 的 path、exists、readable、model_sha256 字段原样回传。`,
+    `run_matched = None`,
+    `receipt_rid = None`,
+    `if want_rid:`,
+    `    run_matched = False`,
+    `    if ok and sha:`,
+    `        rp = model_edit.publish_receipt_path(p)`,
+    `        if rp.is_file():`,
+    `            try:`,
+    `                rd = json.loads(rp.read_text(encoding='utf-8'))`,
+    `                receipt_rid = rd.get('run_id') if isinstance(rd, dict) else None`,
+    `                r_sha = str(rd.get('candidate_sha256') or '').strip().lower() if isinstance(rd, dict) else ''`,
+    `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
+    `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
+    `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
+    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `            except Exception:`,
+    `                run_matched = False`,
+    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
-  const res = await _mSafeAgent(prompt, {
+  const prompt = [
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+  ].join('\n')
+  const probeOpts = {
     agentType: 'dalton-evidence',
     label: label || '核验候选落盘',
     phase: phaseTitle || '核验候选落盘',
     schema: _MODEL_DISK_PROBE_SCHEMA,
     checkFiles: false,
-  })
-  if (!res || typeof res !== 'object') {
-    return { exists: false, readable: false, model_sha256: null }
   }
+  let res = await _mSafeAgent(prompt, probeOpts)
+  if (!res || typeof res !== 'object') {
+    log(`[modeling] ${probeOpts.label}首次超时或无返回，重试一次`)
+    res = await _mSafeAgent(prompt, probeOpts)
+  }
+  if (!res || typeof res !== 'object') {
+    return {
+      verified: false,
+      status: 'unverified',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: false,
+      receipt_run_id: null,
+    }
+  }
+  const ex = Boolean(res.exists)
+  const rd = ex && Boolean(res.readable)
+  const sha = rd ? _mValidSha(res.model_sha256) : null
+  const runMatched = wantRunId ? res.run_matched === true : true
   return {
-    exists: Boolean(res.exists),
-    readable: Boolean(res.exists) && Boolean(res.readable),
-    model_sha256: _mValidSha(res.model_sha256),
+    verified: true,
+    status: !ex ? 'missing' : (rd && sha ? 'readable' : 'unreadable'),
+    exists: ex,
+    readable: rd && Boolean(sha),
+    model_sha256: sha,
+    run_matched: runMatched,
+    receipt_run_id: typeof res.receipt_run_id === 'string' && res.receipt_run_id.trim() ? res.receipt_run_id.trim() : null,
   }
 }
 
@@ -5059,11 +5279,15 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `extras = json.loads(sys.argv[4])`,
     `ex = rp.is_file() and rp.stat().st_size > 0`,
     `rsha = hashlib.sha256(rp.read_bytes()).hexdigest() if ex else None`,
+    `path_re = re.compile(r'(?<![A-Za-z0-9_./\\\\-])(?:\\./)?' + re.escape(mp) + r'(?![A-Za-z0-9_./\\\\-])')`,
+    `def _md_synced(raw):`,
+    `    clean = re.sub(r'<!--.*?-->', '', raw, flags=re.S)`,
+    `    refs = [re.sub(r'^(?:\\./)+', '', r) for r in re.findall(r'model:([^\\s!#()\\[\\]<>\"\\x27\\x60]+\\.xlsx)[!#]', clean, re.I)]`,
+    `    return all(r == mp for r in refs) and (bool(refs) or bool(path_re.search(clean)))`,
     `synced = False`,
     `if ex:`,
     `    txt = rp.read_text(encoding='utf-8', errors='replace')`,
-    `    refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]`,
-    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt))`,
+    `    report_ok = _md_synced(txt)`,
     `    extras_ok = True`,
     `    for ep_s in extras:`,
     `        ep = pathlib.Path(ep_s)`,
@@ -5078,8 +5302,7 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `                extras_ok = False; break`,
     `        else:`,
     `            etxt = ep.read_text(encoding='utf-8', errors='replace')`,
-    `            erefs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', etxt, re.I)]`,
-    `            if any(r != mp for r in erefs) or (not erefs and mp not in etxt):`,
+    `            if not _md_synced(etxt):`,
     `                extras_ok = False; break`,
     `    synced = bool(report_ok and extras_ok)`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'synced': synced, 'report_sha256': rsha}))`,
@@ -5509,12 +5732,13 @@ async function runModelingPipeline(ctx) {
     : ''
   const editSourcePath = baselinePath || '.agents/skills/dalton-model/assets/default_model_template.xlsx'
   const stage2aOutArg = ` --out "${plannedCandPath}"`
+  const editRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
   const stage2aPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/SKILL.md、.agents/skills/dalton-model/references/forecast-rules.md、.agents/skills/dalton-model/references/rollforward.md 与 .agents/skills/dalton-model/references/format-spec.md${modelSpecPath ? `，以及 ${modelSpecPath}` : ''}。`,
     `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}；本轮绑定输出路径：${plannedCandPath}。`,
     `执行独立建模与受控原地编辑（先落盘并确认可读候选模型，暂不写一致预期快照）：`,
     `- 完整遵守既有建模约定：预测期金额全部用公式算出、由季度汇总的年度列按行项类型写公式、季度预测覆盖至下一财年 Q4、年度预测覆盖至少 3 个完整财年（下一财年各季度加之后两个完整财年），原模型保持只读；多公司行业整本只改 ${T} 所属工作表与变更记录，保留其他公司工作表原状。`,
-    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
+    `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${editRunIdArg}${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
     `返回 JSON：files（含落盘后的候选模型路径与 ${coordMapPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
 
@@ -5538,16 +5762,16 @@ async function runModelingPipeline(ctx) {
     modelSha = stage2aSha
     if (stage2a.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
   } else {
-    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径独立实测盘上可读性与哈希
-    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘')
-    if (diskProbe.readable && diskProbe.model_sha256) {
+    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径与本轮 run_id 独立实测盘上可读性与发布记录
+    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+    if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
       candidatePath = plannedCandPath
       modelSha = diskProbe.model_sha256
       if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
         _mPushUnique(failedStages, 'recalc')
       }
       if (!stage2a) {
-        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已落盘且可读，按 recalc 降级继续后续阶段`)
+        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已由本轮落盘且可读，按 recalc 降级继续后续阶段`)
       }
     }
   }
@@ -5570,7 +5794,7 @@ async function runModelingPipeline(ctx) {
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
     `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
-    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
+    `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,
   ].join('\n')
 
@@ -5736,7 +5960,7 @@ async function runModelingPipeline(ctx) {
         actionableIssues.map((it) => `- ${it}`).join('\n'),
         `操作要求（必须以当前候选 ${candidatePath} 为基础应用增量，保留前序写入的实际值、扩列与预测）：`,
         `1) 先对当前候选重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${fixFpPath}"\`；`,
-        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
+        `2) 通过 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<fix_plan_${fixRounds}.json>" ${editInPlaceArgs} --workspace-dir "${W}" --fingerprint "${fixFpPath}"${fixShaArg} --mode "${effMode}"${editRunIdArg}\` 在当前候选模型上定点应用增量并合并坐标映射，完成母本缓存恢复与复算写回；`,
         `3) 按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "<最新候选路径>" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；`,
         `4) 返回更新后的 files、candidate_path、model_sha256、recalc_status 与 consensus_diff_generated。`,
       ].join('\n')
@@ -6013,6 +6237,7 @@ async function reviseModelForReport(ctx) {
     )
   }
   const revOutArg = ` --out "${plannedNextPath}"`
+  const revRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
 
   // -------------------------------------------------------------------------
   // 派发 1：仅重提指纹 + 改模落盘（按预绑路径独立实测可读性与哈希后，再分别派发差异刷新与报告同步）
@@ -6023,7 +6248,7 @@ async function reviseModelForReport(ctx) {
     `1) 若审稿意见仅涉及文字表达、无需改动模型数字或驱动假设：核对 ${currentModelPath} 哈希未变，不修改模型与报告文件，直接返回 changed=false、model_path="${currentModelPath}"、model_sha256。`,
     `2) 若审稿意见要求调整模型数字、驱动假设或勾稽（本步只做重提指纹与改模落盘，暂不刷新差异表也不改写报告，确认新候选后再分别执行）：`,
     `   a) 先对当前候选模型重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${currentModelPath}" --ticker "${T}" --out "${revFpPath}"\`；`,
-    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
+    `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update${revRunIdArg}\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
     `审稿意见：\n${typeof reviewFeedback === 'string' ? reviewFeedback : JSON.stringify(reviewFeedback)}`,
     `返回 JSON：files（含新模型路径 ${plannedNextPath} 与 ${coordMapPath}）、summary、changed、model_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
@@ -6035,25 +6260,45 @@ async function reviseModelForReport(ctx) {
     schema: _MODEL_REV_EDIT_SCHEMA,
   })
 
-  // 父流程始终先按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，再判断是否发生改动；
-  // 绝不信任子任务回传的旧路径或自报哈希。
+  // 父流程始终先按预绑路径 plannedNextPath 与本轮 run_id 独立实测盘上可读性、发布记录与 SHA-256，再判断是否发生改动；
+  // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-  if (diskProbe.readable && diskProbe.model_sha256) {
+  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256
-    if (!editRes || !editRes.changed || editRes.recalc_status === 'recalc_failed') {
+    const hasRecalcStatus = Boolean(
+      editRes && typeof editRes.recalc_status === 'string' && editRes.recalc_status.trim()
+    )
+    if (!editRes || !hasRecalcStatus || editRes.recalc_status === 'recalc_failed') {
       _mPushUnique(failedStages, 'recalc')
     }
     if (!editRes) {
-      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     } else if (!editRes.changed) {
-      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     }
-  } else if (editRes && !editRes.changed && !diskProbe.exists) {
-    // 预绑路径未生成新文件且子任务声称未改：仍须读盘实测当前模型可读性与哈希，绝不采用自报哈希
+  } else if (!diskProbe.verified) {
+    // 核验子任务重试后仍无返回：按「未核验」处理，交由降级账本命令自己读盘，不提前终止报告修订
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模新候选核验子任务超时未核验，保留当前模型并由降级账本命令直接读盘确认',
+      '报告联动改模新候选核验子任务超时（未核验）'
+    )
+  } else if (editRes && !editRes.changed && (!diskProbe.exists || (diskProbe.readable && !diskProbe.run_matched))) {
+    // 本轮未在预绑路径发布新候选且子任务声称未改：读盘实测当前模型可读性与哈希，绝不采用自报哈希
     const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘')
+    if (!curProbe.verified) {
+      // 核验当前模型的子任务重试后仍超时：按「未核验」处理，由降级账本命令直接读盘确认当前模型，不提前终止报告修订
+      _mPushUnique(failedStages, 'report_revision')
+      return await fallbackOnCurrent(
+        failedStages,
+        '报告联动改模声称未改但当前模型核验子任务超时（未核验），已交由降级账本命令直接读盘确认当前模型',
+        '当前模型核验子任务超时（未核验）'
+      )
+    }
     if (!curProbe.readable || !curProbe.model_sha256) {
       return {
         ok: false,
@@ -6062,7 +6307,11 @@ async function reviseModelForReport(ctx) {
         modelSha256: null,
         reportSha256: null,
         status: 'failed_unusable',
-        openIssues: ['报告联动改模未产出新版本，且当前模型在盘上不可读'],
+        openIssues: [
+          curProbe.status === 'missing'
+            ? '报告联动改模未产出新版本，且当前模型在盘上不存在'
+            : '报告联动改模未产出新版本，且当前模型在盘上不可读',
+        ],
         artifacts: currentArtifacts,
         failedStages: [...carriedNoteFailures, 'report_revision'],
         remainingIssuesPath: null,
@@ -6094,7 +6343,9 @@ async function reviseModelForReport(ctx) {
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模落盘子任务超时或返回空，且预绑路径文件非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
       '报告联动改模落盘子任务超时或返回空'
     )
   } else if (!editRes.changed && diskProbe.exists) {
@@ -6105,13 +6356,17 @@ async function reviseModelForReport(ctx) {
       '报告联动改模在预绑输出路径留下不可读文件'
     )
   } else {
-    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径或写失败）：
-    // 绝不把旧路径当新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
+    // editRes.changed === true，但预绑新路径盘上未见本轮发布的可读候选（不存在、不可读或属于其他运行）：
+    // 绝不把旧路径或其他运行的候选认作本轮新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
-      '报告联动改模未在预绑输出路径产出可读新候选模型'
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模声称已改，但预绑输出路径文件属于其他运行而非本轮发布，已保留当前可读模型并补写降级账本'
+        : '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
+      diskProbe.exists && !diskProbe.run_matched
+        ? '报告联动改模预绑输出路径文件非本轮发布'
+        : '报告联动改模未在预绑输出路径产出可读新候选模型'
     )
   }
 

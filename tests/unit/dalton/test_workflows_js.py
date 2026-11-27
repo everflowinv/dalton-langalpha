@@ -1145,7 +1145,7 @@ class DiskHost(ScriptedHost):
             p = self.workspace / rel if rel else None
             ex = bool(p and p.is_file())
             sha = hashlib.sha256(p.read_bytes()).hexdigest() if ex and p is not None else None
-            return {"path": rel, "exists": ex, "readable": ex, "model_sha256": sha}
+            return {"path": rel, "exists": ex, "readable": ex, "model_sha256": sha, "run_matched": ex}
         if label == "完整覆盖页签核验" and label not in self.by_label:
             m_cand = re.search(r'--candidate "([^"]+)"', prompt)
             cand = m_cand.group(1) if m_cand else self._latest_disk_model()[0]

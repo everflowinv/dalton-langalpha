@@ -1985,10 +1985,15 @@ async def _resolve_full_coverage_expected_mode(
         raw_mode = params.get("mode")
         if isinstance(raw_mode, str) and raw_mode.strip().lower() in ("build", "update"):
             return raw_mode.strip().lower(), []
-        raw_mp = params.get("model_path")
-        if isinstance(raw_mp, str) and raw_mp.strip():
-            return "update", []
-        return None, []
+        if raw_mode is None or (isinstance(raw_mode, str) and not raw_mode.strip()):
+            return None, [
+                "手动降级路径（manual=true）调用完整覆盖 dalton_check_done 时必须在 params 中显式传入 "
+                "mode（'build' 或 'update'），缺失时无法核对终态建模模式与必需工作表。"
+            ]
+        return None, [
+            f"手动降级路径（manual=true）的 params.mode 无效（{raw_mode!r}，期望 'build' 或 'update'），"
+            "无法核对完整覆盖终态建模模式。"
+        ]
     if not expected_run_id:
         return None, []
     try:

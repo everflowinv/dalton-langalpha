@@ -35,6 +35,7 @@ import re
 import shutil
 import sys
 from typing import Any
+import uuid
 import zipfile
 
 from lxml import etree
@@ -82,6 +83,54 @@ def _load_module(mod_name: str, path: Path) -> Any:
     return mod
 
 
+def _safe_run_token(run_id: str | None) -> str:
+    if not isinstance(run_id, str):
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", run_id.strip()).strip("._-")
+    return cleaned[:48]
+
+
+def publish_receipt_path(model_path: str | Path) -> Path:
+    """Return canonical sidecar publish receipt path beside ``model_path``."""
+    mp = Path(model_path).expanduser().resolve()
+    return mp.with_name(f".{mp.stem}.publish-receipt.json")
+
+
+def _write_publish_receipt(
+    *,
+    model_path: Path,
+    workspace_root: Path,
+    model_sha256: str,
+    run_id: str | None,
+    ticker: str,
+    mode: str,
+    in_place: bool,
+    edit_uid: str,
+) -> Path:
+    """Atomically write publish receipt binding ``run_id``, output path, and SHA-256."""
+    mp = Path(model_path).expanduser().resolve()
+    ws_root = Path(workspace_root).expanduser().resolve()
+    try:
+        rel_cand = mp.relative_to(ws_root).as_posix()
+    except ValueError:
+        rel_cand = mp.name
+    rcpt = publish_receipt_path(mp)
+    doc = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "candidate_path": rel_cand,
+        "candidate_abs_path": str(mp),
+        "candidate_sha256": str(model_sha256).strip().lower(),
+        "ticker": ticker.strip().upper(),
+        "mode": mode,
+        "in_place": bool(in_place),
+    }
+    tmp = rcpt.with_name(f".{rcpt.name}.{edit_uid}.tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, rcpt)
+    return rcpt
+
+
 def _resolve_and_validate_output_path(
     *,
     output_path: str | Path | None,
@@ -90,24 +139,28 @@ def _resolve_and_validate_output_path(
     ticker: str,
     naming_mode: str,
     in_place: bool,
-) -> tuple[Path, Path | None]:
-    """Resolve ``cand`` and verify its real path resides under workspace ``model/``."""
-    if workspace_dir is not None:
-        ws_root = Path(workspace_dir).expanduser().resolve()
-        model_root: Path | None = (ws_root / "model").resolve()
-    elif base.parent.name == "model":
-        ws_root = base.parent.parent.resolve()
-        model_root = (ws_root / "model").resolve()
-    else:
-        ws_root = base.parent.parent.resolve()
-        model_root = None
+) -> tuple[Path, Path, Path]:
+    """Resolve ``cand`` and verify its real path resides under explicit ``<workspace>/model/``."""
+    if workspace_dir is None or not str(workspace_dir).strip():
+        raise ValueError(
+            "Refusing edit without explicit --workspace-dir: workspace root is required to restrict output under <workspace>/model/"
+        )
+    ws_root = Path(workspace_dir).expanduser().resolve()
+    raw_model_dir = ws_root / "model"
+    if raw_model_dir.is_symlink():
+        raise ValueError(f"Refusing symlink workspace model/ directory: {raw_model_dir}")
+    model_root = raw_model_dir.resolve()
+    if model_root != ws_root / "model" or not model_root.is_relative_to(ws_root):
+        raise ValueError(
+            f"Refusing workspace model/ directory outside workspace root: {model_root} (expected under {ws_root})"
+        )
 
     if output_path is not None:
         p_out = Path(output_path).expanduser()
         if p_out.is_absolute():
             raw_cand = p_out
             cand = p_out.resolve()
-        elif workspace_dir is not None:
+        else:
             cand_cwd = p_out.resolve()
             if cand_cwd.is_relative_to(ws_root):
                 raw_cand = p_out
@@ -115,12 +168,11 @@ def _resolve_and_validate_output_path(
             else:
                 raw_cand = ws_root / p_out
                 cand = raw_cand.resolve()
-        else:
-            raw_cand = p_out
-            cand = p_out.resolve()
-        if not in_place and raw_cand.is_symlink():
+        if raw_cand.is_symlink():
             raise ValueError(f"Refusing to overwrite symlink output path: {raw_cand}")
     elif in_place:
+        if base.is_symlink():
+            raise ValueError(f"Refusing to overwrite symlink output path: {base}")
         cand = base
     else:
         cand = next_model_output_path(
@@ -132,15 +184,12 @@ def _resolve_and_validate_output_path(
 
     if cand.suffix.lower() != ".xlsx":
         raise ValueError(f"Refusing non-.xlsx output path: {cand}")
-    if model_root is not None:
-        if cand == model_root or not cand.is_relative_to(model_root):
-            raise ValueError(
-                f"Refusing output path outside workspace model/: {cand} (expected under {model_root})"
-            )
-    elif "model" not in cand.parent.parts:
-        raise ValueError(f"Refusing output path outside model/: {cand}")
+    if cand == model_root or not cand.is_relative_to(model_root) or not cand.is_relative_to(ws_root):
+        raise ValueError(
+            f"Refusing output path outside workspace model/: {cand} (expected under {model_root})"
+        )
 
-    return cand, model_root
+    return cand, ws_root, model_root
 
 
 def _atomic_publish_workbook(
@@ -148,23 +197,46 @@ def _atomic_publish_workbook(
     dst: Path,
     *,
     in_place: bool,
+    workspace_root: Path | None = None,
     model_root: Path | None = None,
+    expected_in_place_sha256: str | None = None,
 ) -> None:
     """Publish staged workbook ``src`` to ``dst``.
 
     When ``in_place`` is False, atomically refuses to overwrite any existing
     file (including a concurrent writer or symlink) via ``os.link`` +
     ``os.unlink`` (with ``O_CREAT | O_EXCL`` fallback when hard links are
-    unsupported by the filesystem).
+    unsupported by the filesystem). When ``in_place`` is True, verifies ``dst``
+    is a non-symlink regular file matching ``expected_in_place_sha256`` before
+    swapping.
     """
+    if workspace_root is not None and (workspace_root / "model").is_symlink():
+        src.unlink(missing_ok=True)
+        raise ValueError(f"Refusing symlink workspace model/ directory: {workspace_root / 'model'}")
     real_parent = dst.parent.resolve()
     real_dst = real_parent / dst.name
-    if model_root is not None and (real_dst == model_root or not real_dst.is_relative_to(model_root)):
+    if model_root is not None and (
+        real_dst == model_root
+        or not real_dst.is_relative_to(model_root)
+        or (workspace_root is not None and not real_dst.is_relative_to(workspace_root))
+    ):
         src.unlink(missing_ok=True)
         raise ValueError(
             f"Refusing output path outside workspace model/: {real_dst} (expected under {model_root})"
         )
     if in_place:
+        if dst.is_symlink() or not dst.is_file():
+            src.unlink(missing_ok=True)
+            raise ValueError(f"Refusing --in-place overwrite on missing or symlink target: {dst}")
+        if not expected_in_place_sha256:
+            src.unlink(missing_ok=True)
+            raise ValueError("Refusing --in-place publish without verified target sha256")
+        live_sha = model_fingerprint.file_sha256(dst)
+        if live_sha != expected_in_place_sha256.strip().lower():
+            src.unlink(missing_ok=True)
+            raise ValueError(
+                f"Refusing --in-place overwrite: target sha256 changed before publish (expected {expected_in_place_sha256}, got {live_sha})"
+            )
         os.replace(src, dst)
         return
     try:
@@ -291,7 +363,13 @@ def next_model_output_path(
     """Compute next non-overwriting output path under ``<workspace_dir>/model/``."""
     ws_dir = Path(workspace_dir).expanduser().resolve()
     model_dir = ws_dir / "model"
+    if model_dir.is_symlink():
+        raise ValueError(f"Refusing symlink workspace model/ directory: {model_dir}")
     model_dir.mkdir(parents=True, exist_ok=True)
+    if model_dir.resolve() != model_dir or not model_dir.resolve().is_relative_to(ws_dir):
+        raise ValueError(
+            f"Refusing workspace model/ directory outside workspace root: {model_dir.resolve()} (expected under {ws_dir})"
+        )
     tk = ticker.strip().upper()
 
     resolved_mode = naming_mode
@@ -878,6 +956,26 @@ def _merge_coord_maps(prior_cm: dict[str, Any], delta_cm: dict[str, Any]) -> dic
     return merged
 
 
+def _resolve_run_id(run_id: str | None, progress_path: str | Path | None, ws_root: Path) -> str | None:
+    if isinstance(run_id, str) and run_id.strip():
+        return run_id.strip()
+    if progress_path is None or not str(progress_path).strip():
+        return None
+    p = Path(progress_path).expanduser()
+    cand = p if p.is_absolute() else (ws_root / p)
+    if not cand.is_file() and not p.is_absolute() and p.is_file():
+        cand = p
+    if not cand.is_file():
+        return None
+    try:
+        doc = json.loads(cand.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("run_id"), str) and doc["run_id"].strip():
+        return doc["run_id"].strip()
+    return None
+
+
 def apply_edit_plan(
     *,
     baseline_path: str | Path,
@@ -896,11 +994,21 @@ def apply_edit_plan(
     mode: str = "auto",
     in_place: bool = False,
     prior_coord_map: dict[str, Any] | None = None,
+    run_id: str | None = None,
+    progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Execute P0 controlled edit plan and return structured result with ``coord_map``."""
-    base = Path(baseline_path).expanduser().resolve()
+    base_raw = Path(baseline_path).expanduser()
+    if in_place and base_raw.is_symlink():
+        raise ValueError(f"Refusing --in-place edit on symlink baseline workbook: {base_raw}")
+    base = base_raw.resolve()
     if not base.is_file():
         raise FileNotFoundError(f"baseline workbook not found: {base}")
+
+    if in_place and not (isinstance(expected_baseline_sha256, str) and expected_baseline_sha256.strip()):
+        raise ValueError(
+            "Refusing --in-place edit without --expected-baseline-sha256: in-place edits must verify target workbook hash"
+        )
 
     base_sha = model_fingerprint.file_sha256(base)
     if expected_baseline_sha256:
@@ -930,7 +1038,7 @@ def apply_edit_plan(
             "Refusing --skip-recalc on default-template / build mode: recalculation is required so formulas do not ship with empty cached values"
         )
 
-    cand, model_root = _resolve_and_validate_output_path(
+    cand, ws_root, model_root = _resolve_and_validate_output_path(
         output_path=output_path,
         workspace_dir=workspace_dir,
         base=base,
@@ -938,6 +1046,10 @@ def apply_edit_plan(
         naming_mode=fp.get("naming_mode", "auto"),
         in_place=in_place,
     )
+    if in_place and cand != base:
+        raise ValueError(
+            f"Refusing --in-place edit where output path differs from baseline: out={cand} vs baseline={base}"
+        )
     if cand == base and not in_place:
         raise ValueError("Refusing to overwrite read-only baseline workbook in place")
     if prior_coord_map is not None:
@@ -948,11 +1060,17 @@ def apply_edit_plan(
         raise ValueError(f"Refusing to overwrite existing model version: {cand}")
     cand.parent.mkdir(parents=True, exist_ok=True)
     # Re-verify real path after directory creation in case an intermediate component was a symlink.
+    if (ws_root / "model").is_symlink():
+        raise ValueError(f"Refusing symlink workspace model/ directory: {ws_root / 'model'}")
     real_cand = cand.parent.resolve() / cand.name
-    if model_root is not None and (real_cand == model_root or not real_cand.is_relative_to(model_root)):
+    if real_cand == model_root or not real_cand.is_relative_to(model_root) or not real_cand.is_relative_to(ws_root):
         raise ValueError(
             f"Refusing output path outside workspace model/: {real_cand} (expected under {model_root})"
         )
+
+    norm_run_id = _resolve_run_id(run_id, progress_path, ws_root)
+    run_tok = _safe_run_token(norm_run_id)
+    edit_uid = f"{run_tok}.{os.getpid()}.{uuid.uuid4().hex[:8]}" if run_tok else f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
 
     tk = ticker.strip().upper()
     non_target_sheets: set[str] = {
@@ -995,9 +1113,9 @@ def apply_edit_plan(
         Path(donor_out).expanduser().resolve()
         if donor_out
         else cand.parent / (
-            f".{tk}-pre-openpyxl-{cand.stem}-inc.xlsx"
+            f".{tk}-pre-openpyxl-{cand.stem}.{edit_uid}-inc.xlsx"
             if (in_place or prior_coord_map is not None)
-            else f".{tk}-pre-openpyxl-{cand.stem}.xlsx"
+            else f".{tk}-pre-openpyxl-{cand.stem}.{edit_uid}.xlsx"
         )
     )
     donor_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1037,6 +1155,7 @@ def apply_edit_plan(
         "schema_version": 1,
         "engine": "openpyxl",
         "ticker": tk,
+        "run_id": norm_run_id,
         "baseline_path": str(base),
         "baseline_sha256": base_sha,
         "candidate_path": str(cand),
@@ -1077,8 +1196,8 @@ def apply_edit_plan(
                 if mapped is not None:
                     subtotal_rows_new[sh_name].add(mapped[0])
 
-    # Step 2: Controlled openpyxl edits on temporary editing copy (.editing.tmp.xlsx)
-    editing_tmp = cand.with_name(f".{cand.stem}.editing.tmp.xlsx")
+    # Step 2: Controlled openpyxl edits on per-edit isolated staging copy (bound to run_id + pid + uuid)
+    editing_tmp = cand.with_name(f".{cand.stem}.{edit_uid}.editing.tmp.xlsx")
     shutil.copyfile(donor_path, editing_tmp)
 
     touched_cells: dict[str, set[str]] = defaultdict(set)
@@ -1293,14 +1412,32 @@ def apply_edit_plan(
                 post_coord_map_sha256=pre_recalc_cm_sha,
             )
 
-    _atomic_publish_workbook(editing_tmp, cand, in_place=in_place, model_root=model_root)
+    _atomic_publish_workbook(
+        editing_tmp,
+        cand,
+        in_place=in_place,
+        workspace_root=ws_root,
+        model_root=model_root,
+        expected_in_place_sha256=base_sha if in_place else None,
+    )
+
+    pub_rcpt = _write_publish_receipt(
+        model_path=cand,
+        workspace_root=ws_root,
+        model_sha256=pre_recalc_sha,
+        run_id=norm_run_id,
+        ticker=tk,
+        mode=coord_map["mode"],
+        in_place=in_place,
+        edit_uid=edit_uid,
+    )
 
     ok_read, read_msg = model_readable.check_workbook_readable(cand)
     if not ok_read:
         raise ValueError(f"published candidate workbook unreadable before recalc: {read_msg} ({cand})")
 
     if cp_resolved is not None and pre_cm_text is not None:
-        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{os.getpid()}.tmp")
+        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{edit_uid}.tmp")
         tmp_cm.write_text(pre_cm_text, encoding="utf-8")
         os.replace(tmp_cm, cp_resolved)
 
@@ -1309,7 +1446,7 @@ def apply_edit_plan(
     if skip_recalc:
         # Non-template --skip-recalc: enable fullCalcOnLoad=1 on a staged copy first so
         # we can record the transition receipt BEFORE replacing cand on disk.
-        staged_skip = cand.with_name(f".{cand.name}.{os.getpid()}.skiprecalc.tmp")
+        staged_skip = cand.with_name(f".{cand.name}.{edit_uid}.skiprecalc.tmp")
         shutil.copyfile(cand, staged_skip)
         model_xlsx_hooks.set_full_calc_on_load(staged_skip, True)
         if in_place and cp_resolved is not None:
@@ -1360,7 +1497,7 @@ def apply_edit_plan(
         # keep fullCalcOnLoad=1 so Excel recalculates immediately on open; if it succeeded cleanly,
         # restore the donor <calcPr>.
         if is_template_build:
-            staged_post = cand.with_name(f".{cand.name}.{os.getpid()}.postrecalc.tmp")
+            staged_post = cand.with_name(f".{cand.name}.{edit_uid}.postrecalc.tmp")
             shutil.copyfile(cand, staged_post)
             pre_post_sha = model_fingerprint.file_sha256(cand)
             if recalc_res.get("status") in ("recalc_failed", "incomplete"):
@@ -1383,7 +1520,18 @@ def apply_edit_plan(
             os.replace(staged_post, cand)
 
     cand_sha = model_fingerprint.file_sha256(cand)
+    pub_rcpt = _write_publish_receipt(
+        model_path=cand,
+        workspace_root=ws_root,
+        model_sha256=cand_sha,
+        run_id=norm_run_id,
+        ticker=tk,
+        mode=coord_map["mode"],
+        in_place=in_place,
+        edit_uid=edit_uid,
+    )
     coord_map["candidate_sha256"] = cand_sha
+    coord_map["publish_receipt_path"] = str(pub_rcpt)
     coord_map["donor_cache_restored"] = True
     coord_map["full_calc_on_load_enabled_on_recalc_failure"] = full_calc_fallback
     coord_map["full_calc_on_load_enabled_on_skip_recalc"] = bool(skip_recalc and full_calc_fallback)
@@ -1409,7 +1557,7 @@ def apply_edit_plan(
                 pre_coord_map_sha256=pre_recalc_cm_sha,
                 post_coord_map_sha256=final_cm_sha,
             )
-        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{os.getpid()}.tmp")
+        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{edit_uid}.tmp")
         tmp_cm.write_text(final_cm_text, encoding="utf-8")
         os.replace(tmp_cm, cp_resolved)
 
@@ -1417,6 +1565,8 @@ def apply_edit_plan(
         "status": "ok",
         "candidate_path": str(cand),
         "candidate_sha256": cand_sha,
+        "run_id": norm_run_id,
+        "publish_receipt_path": str(pub_rcpt),
         "baseline_path": str(coord_map.get("baseline_path") or base),
         "baseline_sha256": str(coord_map.get("baseline_sha256") or base_sha),
         "cache_donor_path": str(coord_map.get("cache_donor_path") or donor_path),
@@ -1456,6 +1606,8 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--skip-recalc", action="store_true")
     p_apply.add_argument("--recalc-timeout", type=int, default=120)
     p_apply.add_argument("--mode", default="auto", choices=["auto", "build", "update"])
+    p_apply.add_argument("--run-id", default=None)
+    p_apply.add_argument("--progress-path", default=None)
 
     args = parser.parse_args(argv)
     if args.cmd == "next-path":
@@ -1493,6 +1645,8 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 in_place=args.in_place,
                 prior_coord_map=prior_cm,
+                run_id=args.run_id,
+                progress_path=args.progress_path,
             )
         except ValueError as exc:
             print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)

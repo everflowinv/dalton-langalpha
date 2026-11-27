@@ -6563,8 +6563,9 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
             if "model_check.py verify-done" in v.get("command", "")
         ]
         assert len(cmds) == 1, (workflow_name, cmds)
+        extra_flags = " --manual --expected-mode update" if workflow_name == "full-coverage" else " --manual"
         return subprocess.run(
-            ["bash", "-c", cmds[0] + " --manual"],
+            ["bash", "-c", cmds[0] + extra_flags],
             cwd=workspace,
             env=run_env,
             capture_output=True,
@@ -8153,3 +8154,149 @@ async def test_p0b_r5_full_coverage_verify_done_enforces_prepare_mode(
     assert res["done"] is False
     assert any("模式" in m and "不一致" in m for m in res["missing"]), res["missing"]
     assert any("mode mismatch" in m or "DCF" in m for m in res["missing"]), res["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r6_full_coverage_manual_requires_explicit_mode_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6 #6: Manual `full-coverage` `dalton_check_done` (`manual=True`) requires explicit
+    `params['mode']` (`build` or `update`). Missing or invalid `mode` fails closed instead of
+    falling back to the self-reported ledger mode; SKILL.md manual example carries `mode`."""
+    import importlib.util
+    import shutil
+    import subprocess
+    import sys
+    import openpyxl
+
+    repo_root = Path(__file__).resolve().parents[3]
+    fc_skill_text = (repo_root / "plugins" / "dalton" / "skills" / "dalton-full-coverage" / "SKILL.md").read_text(encoding="utf-8")
+    assert '"mode": "<build|update>", "manual": true' in fc_skill_text
+
+    scripts_src = repo_root / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    ws = tmp_path / "ws_fc_manual_r6"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
+
+    if str(scripts_src) not in sys.path:
+        sys.path.insert(0, str(scripts_src))
+    spec = importlib.util.spec_from_file_location("_mchk_r6_cd", scripts_src / "model_check.py")
+    assert spec and spec.loader
+    mchk_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mchk_mod)
+
+    r_rel = "research/2026-10-23-fc"
+    xlsx_p = ws / "model" / "META-model-v01.xlsx"
+    xlsx_p.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    wb.active.title = "README & Changelog"
+    wb.active["A1"] = "v01"
+    for sh in ("Facts", "Guidance vs Actual", "Street vs House", "Checks"):
+        wb.create_sheet(sh)["A1"] = sh
+    wb.save(xlsx_p)
+    wb.close()
+
+    # Manual ledger (run_id=None) claiming mode="update" on 4-sheet workbook
+    mchk_mod.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="META",
+        research_dir=ws / r_rel,
+        candidate_path=xlsx_p,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id=None,
+        workflow="full-coverage",
+        mode="update",
+    )
+    ledger_text = (ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8")
+
+    memo_text = "# 深度备忘录\n" + "核心分析内容。" * 150
+    memo_sha = _draft_hash(memo_text)
+    base_files = {
+        f"{r_rel}/facts.md": "<!-- FACTS-LEDGER\n{}\n-->\n" + "底表" * 300,
+        f"{r_rel}/questions.md": "# 12 问\n" + "问题" * 150,
+        f"{r_rel}/ea.md": "A" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/eb.md": "B" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ec.md": "C" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ed.md": "D" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/model_dump/model-verification.json": ledger_text,
+        "model/META-model-v01.xlsx": "x" * 1200,
+        "drafts/2026-10-23-memo.md": memo_text,
+        "drafts/2026-10-23-memo.audit.md": f"# 数字核验报告\n- **草稿哈希**：`{memo_sha[:16]}…`\n",
+        f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}),
+        f"{r_rel}/review.json": json.dumps(
+            {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": [], "draft_sha256": memo_sha},
+            ensure_ascii=False,
+        ),
+    }
+    _with_full_language_sidecars(base_files)
+
+    run_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
+    _patch_knowledge(monkeypatch, ["company", "thesis", "debate", "drivers", "management", "models"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED")])
+
+    async def _run_manual(extra_params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        seen_cmds: list[str] = []
+        backend = _make_backend(base_files)
+        backend.workspace_dir = str(ws)
+        orig_exec = backend.aexecute.side_effect
+
+        async def _exec(command: str, *, timeout: int | None = None) -> Any:
+            if "model_check.py verify-done" in command:
+                seen_cmds.append(command)
+                proc = subprocess.run(
+                    ["bash", "-c", command.replace("python3 ", f"{sys.executable} ")],
+                    cwd=ws,
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                class _Resp:
+                    def __init__(self, out: str, rc: int) -> None:
+                        self.output = out
+                        self.exit_code = rc
+
+                return _Resp(proc.stdout + proc.stderr, proc.returncode)
+            return await orig_exec(command, timeout=timeout)
+
+        backend.aexecute.side_effect = _exec
+        res = await run_check_done(
+            workflow="full-coverage",
+            params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-23", "manual": True, **extra_params},
+            backend=backend,
+            workspace_id=WS,
+            thread_id="short-fc-manual",
+        )
+        return res, seen_cmds
+
+    # 1. Missing mode -> FAILS CLOSED (never falls back to self-reported ledger mode, even with model_path!)
+    res_missing, cmds_missing = await _run_manual({})
+    assert res_missing["done"] is False
+    assert any("mode" in m for m in res_missing["missing"]), res_missing["missing"]
+    assert cmds_missing and "--expected-mode" not in cmds_missing[0]
+
+    res_missing_with_mp, _ = await _run_manual({"model_path": "model/META-model-v01.xlsx"})
+    assert res_missing_with_mp["done"] is False
+    assert any("mode" in m for m in res_missing_with_mp["missing"]), res_missing_with_mp["missing"]
+
+    # 2. Invalid mode -> FAILS CLOSED
+    res_invalid, _ = await _run_manual({"mode": "auto"})
+    assert res_invalid["done"] is False
+    assert any("params.mode 无效" in m for m in res_invalid["missing"]), res_invalid["missing"]
+
+    # 3. mode="build" on tampered mode="update" 4-sheet workbook -> FAILS with mode mismatch & missing build sheets
+    res_build, cmds_build = await _run_manual({"mode": "build"})
+    assert res_build["done"] is False
+    assert cmds_build and "--expected-mode build" in cmds_build[0]
+    assert any("不一致" in m for m in res_build["missing"]), res_build["missing"]
+    assert any("DCF" in m or "mode mismatch" in m for m in res_build["missing"]), res_build["missing"]
+
+    # 4. mode="update" matching 4-sheet update workbook -> PASSES
+    res_update, cmds_update = await _run_manual({"mode": "update"})
+    assert cmds_update and "--expected-mode update" in cmds_update[0]
+    assert res_update["done"] is True, res_update["missing"]

@@ -3557,22 +3557,28 @@ def verify_done(
                         )
 
         # Full-coverage required worksheet gate: independently re-read candidate workbook on disk
-        if effective_wf == "full-coverage" and final_model_p is not None and final_model_p.is_file():
-            if want_mode in ("build", "update"):
-                fc_mode = want_mode
-            else:
-                fc_mode = ledger_mode
-                if fc_mode not in ("build", "update"):
-                    fc_mode = "build" if not ledger.get("baseline_path") else "update"
-            ok_sh, sh_names, sh_err = _read_workbook_sheet_names(final_model_p)
-            if not ok_sh:
-                errors.append(f"full-coverage final model sheets unreadable on disk: {sh_err}")
-            else:
-                fc_missing = _missing_full_coverage_sheets(sh_names, fc_mode)
-                if fc_missing:
-                    errors.append(
-                        f"full-coverage ({fc_mode}) final model missing required worksheets on disk: {', '.join(fc_missing)}"
-                    )
+        if effective_wf == "full-coverage":
+            if not want_mode:
+                errors.append(
+                    "full-coverage verify-done requires explicit --expected-mode ('build' or 'update'); "
+                    "refusing to trust self-reported ledger mode"
+                )
+            if final_model_p is not None and final_model_p.is_file():
+                if want_mode in ("build", "update"):
+                    fc_mode = want_mode
+                else:
+                    fc_mode = ledger_mode
+                    if fc_mode not in ("build", "update"):
+                        fc_mode = "build" if not ledger.get("baseline_path") else "update"
+                ok_sh, sh_names, sh_err = _read_workbook_sheet_names(final_model_p)
+                if not ok_sh:
+                    errors.append(f"full-coverage final model sheets unreadable on disk: {sh_err}")
+                else:
+                    fc_missing = _missing_full_coverage_sheets(sh_names, fc_mode)
+                    if fc_missing:
+                        errors.append(
+                            f"full-coverage ({fc_mode}) final model missing required worksheets on disk: {', '.join(fc_missing)}"
+                        )
 
     return {
         "ok": len(errors) == 0,
