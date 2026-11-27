@@ -495,9 +495,13 @@ def test_column_insert_cross_sheet_shift_c14_passes_and_non_shift_fails(tmp_path
     cand = Path(edit_res["candidate_path"])
     donor = Path(edit_res["cache_donor_path"])
 
-    # Verify insert.py --preserve-calcpr kept fullCalcOnLoad disabled AND shifted Model - BABA!F6
+    # Verify insert.py --preserve-calcpr kept fullCalcOnLoad disabled on donor,
+    # while non-template --skip-recalc enables fullCalcOnLoad=1 on candidate (R6 #2),
+    # AND shifted Model - BABA!F6!
+    donor_fp = mfp.build_fingerprint(donor, ticker="JD")
+    assert donor_fp["calc_properties"]["full_calc_on_load"] is False
     cand_fp = mfp.build_fingerprint(cand, ticker="JD")
-    assert cand_fp["calc_properties"]["full_calc_on_load"] is False
+    assert cand_fp["calc_properties"]["full_calc_on_load"] is True
     assert cand_fp["sheets"]["Model - BABA"]["cells"]["F6"]["formula"] == "='Model - JD'!Q6"
     # Verify donor cache restored cell-by-cell on both Model - BABA and Subs - BABA
     assert _xml_cached_map(cand, "Model - BABA") == _xml_cached_map(donor, "Model - BABA")
@@ -3563,33 +3567,51 @@ def test_default_template_build_populates_formula_caches_and_recalc_failure_enab
         assert vd_f["ok"] is True, vd_f
         assert vd_f["final_status"] == "delivered_with_open_issues"
 
-    # 4. Skipping recalc on default template build -> C13 actionable (refuses clean pass with empty formulas!)
-    rdir_skip = ws / "research" / "2026-11-27-build-skip"
-    cm_skip_p = rdir_skip / "model_dump" / "coord_map.json"
-    res_skip = medit.apply_edit_plan(
-        baseline_path=tpl_copy,
-        ticker="DEMO",
-        plan=plan_tpl,
-        output_path=ws / "model" / "DEMO-model-v05.xlsx",
-        coord_map_out=cm_skip_p,
-        skip_recalc=True,
-        mode="build",
+    # 4. R6 #2: Skipping recalc on default-template / build mode MUST fail immediately and exit non-zero!
+    out_skip = ws / "model" / "DEMO-model-v05.xlsx"
+    with pytest.raises(ValueError, match="--skip-recalc"):
+        medit.apply_edit_plan(
+            baseline_path=tpl_copy,
+            ticker="DEMO",
+            plan=plan_tpl,
+            output_path=out_skip,
+            skip_recalc=True,
+            mode="build",
+        )
+    assert not out_skip.exists()
+
+    # Even with mode="auto", empty-cache default_model_template.xlsx refuses --skip-recalc!
+    with pytest.raises(ValueError, match="--skip-recalc"):
+        medit.apply_edit_plan(
+            baseline_path=tpl_copy,
+            ticker="DEMO",
+            plan=plan_tpl,
+            output_path=out_skip,
+            skip_recalc=True,
+            mode="auto",
+        )
+    assert not out_skip.exists()
+
+    plan_json_p = tmp_path / "tpl_plan.json"
+    plan_json_p.write_text(json.dumps(plan_tpl), encoding="utf-8")
+    rc = medit.main(
+        [
+            "apply",
+            "--baseline",
+            str(tpl_copy),
+            "--ticker",
+            "DEMO",
+            "--plan",
+            str(plan_json_p),
+            "--out",
+            str(out_skip),
+            "--skip-recalc",
+            "--mode",
+            "build",
+        ]
     )
-    chk_skip = mchk.write_check_and_ledger(
-        workspace_dir=ws,
-        ticker="DEMO",
-        research_dir=rdir_skip,
-        candidate_path=res_skip["candidate_path"],
-        baseline_path=tpl_copy,
-        coord_map_path=cm_skip_p,
-        run_id="run-tpl-skip",
-        mode="build",
-    )
-    assert chk_skip["final_status"] != "pass"
-    assert any(
-        f["check_id"] == "C13" and f["severity_class"] == "actionable" and "empty formula" in f["message"]
-        for f in chk_skip["findings"]
-    ), chk_skip["findings"]
+    assert rc != 0
+    assert not out_skip.exists()
 
 
 def test_editing_jd_preserves_baba_raw_xml_byte_for_byte_and_c14_catches_raw_xml_tamper(
@@ -3868,3 +3890,443 @@ def test_unchanged_model_never_triggers_c04_actionable_and_unit_scale_alignment(
         f["check_id"] == "C04" and f["severity_class"] == "actionable"
         for f in chk_ed["findings"]
     ), chk_ed["findings"]
+
+
+def test_multi_company_charts_preserve_series_on_jd_edit_and_check_catches_misaligned_rels(
+    tmp_path: Path,
+) -> None:
+    """R6 #1 (Codex high):
+    - Multi-company workbook with charts on both Model - JD and Model - BABA where donor drawing/chart
+      numbering differs from openpyxl's sheet-order numbering (JD -> rId2 -> drawing2/chart2, BABA -> rId1 -> drawing1/chart1).
+    - Editing ONLY 1 cell on Model - JD leaves EVERY chart's referenced data range identical to baseline,
+      preserves donor's worksheet .rels / drawings / charts verbatim, and remaps <drawing r:id="rId2"/> cleanly.
+    - Importing a genuinely NEW chart on a new sheet allocates fresh non-colliding paths (drawing3/chart3)
+      without clobbering donor drawings/charts.
+    - Deliberately misaligning relationships (JD -> BABA's drawing1, BABA -> JD's drawing2, or dangling rId)
+      is caught by model_check as actionable."""
+    from openpyxl.chart import BarChart, Reference
+
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+    orig_base = tmp_path / "orig_base_for_charts.xlsx"
+    shutil.copyfile(base, orig_base)
+
+    # 1. Attach charts to both Model - JD and Model - BABA using openpyxl, restore donor caches, then swap donor drawing/chart
+    #    part paths & add a non-drawing rId1 on Model - JD so donor has:
+    #    - Model - JD   -> rId1 (printerSettings1.bin), rId2 -> ../drawings/drawing2.xml -> chart2.xml ('Model - JD'!$E$4:$G$4)
+    #    - Model - BABA -> rId1 -> ../drawings/drawing1.xml -> chart1.xml ('Model - BABA'!$E$4:$G$4)
+    wb = openpyxl.load_workbook(base, data_only=False)
+    ws_jd = wb["Model - JD"]
+    ch_jd = BarChart()
+    ch_jd.title = "JD Revenue"
+    ch_jd.add_data(Reference(ws_jd, min_col=5, min_row=4, max_col=7, max_row=4), from_rows=True)
+    ws_jd.add_chart(ch_jd, "A52")
+
+    ws_baba = wb["Model - BABA"]
+    ch_baba = BarChart()
+    ch_baba.title = "BABA Revenue"
+    ch_baba.add_data(Reference(ws_baba, min_col=5, min_row=4, max_col=7, max_row=4), from_rows=True)
+    ws_baba.add_chart(ch_baba, "A15")
+    wb.save(base)
+    wb.close()
+    mhooks.restore_donor_cache(base, {"cache_donor_path": str(orig_base), "touched_cells": {"Model - JD": ["A1"]}})
+
+    # Rewire donor ZIP so BABA owns drawing1/chart1 and JD owns drawing2/chart2 under rId2 (with rId1=printerSettings)
+    infos_b, pay_b = mhooks._read_package(base)
+    parts_b = mhooks._sheet_parts(pay_b)
+    jd_part = parts_b["Model - JD"]
+    baba_part = parts_b["Model - BABA"]
+    jd_rels_p = mhooks._worksheet_rels_path(jd_part)
+    baba_rels_p = mhooks._worksheet_rels_path(baba_part)
+
+    # Swap drawing1 <-> drawing2 and chart1 <-> chart2 contents so drawing1/chart1 belong to BABA and drawing2/chart2 to JD
+    pay_b["xl/drawings/drawing1.xml"], pay_b["xl/drawings/drawing2.xml"] = (
+        pay_b["xl/drawings/drawing2.xml"],
+        pay_b["xl/drawings/drawing1.xml"],
+    )
+    pay_b["xl/charts/chart1.xml"], pay_b["xl/charts/chart2.xml"] = (
+        pay_b["xl/charts/chart2.xml"],
+        pay_b["xl/charts/chart1.xml"],
+    )
+    # Point drawing1 -> chart1 (BABA) and drawing2 -> chart2 (JD)
+    pay_b["xl/drawings/_rels/drawing1.xml.rels"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>'
+        b"</Relationships>"
+    )
+    pay_b["xl/drawings/_rels/drawing2.xml.rels"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart2.xml"/>'
+        b"</Relationships>"
+    )
+    # Add dummy printerSettings1.bin so JD's drawing is rId2 while openpyxl will renumber it to rId1 on save!
+    zi_ps = zipfile.ZipInfo("xl/printerSettings/printerSettings1.bin")
+    zi_ps.compress_type = zipfile.ZIP_DEFLATED
+    infos_b.append(zi_ps)
+    pay_b["xl/printerSettings/printerSettings1.bin"] = b"PS"
+    pay_b[jd_rels_p] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/printerSettings" Target="../printerSettings/printerSettings1.bin"/>'
+        b'<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing2.xml"/>'
+        b"</Relationships>"
+    )
+    pay_b[baba_rels_p] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>'
+        b"</Relationships>"
+    )
+    jd_sh_root = etree.fromstring(pay_b[jd_part], mhooks._XML)
+    for dr_el in jd_sh_root.findall(f"{{{mhooks._SML}}}drawing"):
+        dr_el.set(mhooks._REL_ID, "rId2")
+    pay_b[jd_part] = etree.tostring(jd_sh_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(base, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in infos_b:
+            zout.writestr(info, pay_b[info.filename], compress_type=info.compress_type)
+
+    base_bindings = mhooks.extract_sheet_chart_bindings(pay_b)
+    assert base_bindings["Model - JD"]["charts"][0]["formulas"] == ["'Model - JD'!$E$4:$G$4"]
+    assert base_bindings["Model - BABA"]["charts"][0]["formulas"] == ["'Model - BABA'!$E$4:$G$4"]
+    assert base_bindings["Model - JD"]["drawings"] == ["xl/drawings/drawing2.xml"]
+    assert base_bindings["Model - BABA"]["drawings"] == ["xl/drawings/drawing1.xml"]
+
+    # 2. Edit ONLY 1 cell on Model - JD via apply_edit_plan
+    res_ed = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [{"sheet": "Model - JD", "cell": "Q25", "value": 0.125}],
+            "changelog_entry": {
+                "version": "v02",
+                "date": "2026-11-27",
+                "baseline": base.name,
+                "summary": "Edit JD single cell with charts present",
+            },
+        },
+        workspace_dir=ws,
+        skip_recalc=True,
+    )
+    cand = Path(res_ed["candidate_path"])
+    _, cand_pay = mhooks._read_package(cand)
+    cand_bindings = mhooks.extract_sheet_chart_bindings(cand_pay)
+
+    # Every chart on every sheet references the EXACT same data range as baseline!
+    assert cand_bindings["Model - JD"]["broken_refs"] == []
+    assert cand_bindings["Model - BABA"]["broken_refs"] == []
+    assert cand_bindings["Model - JD"]["charts"][0]["formulas"] == base_bindings["Model - JD"]["charts"][0]["formulas"]
+    assert cand_bindings["Model - BABA"]["charts"][0]["formulas"] == base_bindings["Model - BABA"]["charts"][0]["formulas"]
+    assert cand_bindings["Model - JD"]["drawings"] == ["xl/drawings/drawing2.xml"]
+    assert cand_bindings["Model - BABA"]["drawings"] == ["xl/drawings/drawing1.xml"]
+    # Donor .rels for both JD and BABA stayed byte-for-byte untouched!
+    assert cand_pay[jd_rels_p] == pay_b[jd_rels_p]
+    assert cand_pay[baba_rels_p] == pay_b[baba_rels_p]
+
+    # Clean check passes with 0 actionable!
+    chk_ok = mchk.run_checks(candidate_path=cand, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    assert chk_ok["counts"]["actionable"] == 0, chk_ok["findings"]
+
+    # 3. Importing a genuinely NEW sheet with a new chart allocates fresh non-colliding drawing3/chart3!
+    ed_new_chart = tmp_path / "edited_new_chart.xlsx"
+    wb_n = openpyxl.Workbook()
+    ws_new = wb_n.active
+    ws_new.title = "Chart New"
+    ws_new["A1"] = 10
+    ws_new["B1"] = 20
+    ch_new = BarChart()
+    ch_new.add_data(Reference(ws_new, min_col=1, min_row=1, max_col=2, max_row=1), from_rows=True)
+    ws_new.add_chart(ch_new, "A5")
+    wb_n.save(ed_new_chart)
+    wb_n.close()
+
+    merged_new = tmp_path / "merged_with_new_chart.xlsx"
+    mhooks.merge_edited_sheets_into_donor(base, ed_new_chart, merged_new, modified_sheets={"Chart New"})
+    _, merged_pay = mhooks._read_package(merged_new)
+    merged_bindings = mhooks.extract_sheet_chart_bindings(merged_pay)
+    assert merged_bindings["Model - JD"]["charts"][0]["formulas"] == ["'Model - JD'!$E$4:$G$4"]
+    assert merged_bindings["Model - BABA"]["charts"][0]["formulas"] == ["'Model - BABA'!$E$4:$G$4"]
+    assert merged_bindings["Chart New"]["charts"][0]["formulas"] == ["'Chart New'!$A$1:$B$1"]
+    assert merged_bindings["Chart New"]["drawings"] == ["xl/drawings/drawing3.xml"]
+    assert merged_bindings["Chart New"]["charts"][0]["chart_part"] == "xl/charts/chart3.xml"
+
+    # 4a. Tamper: misalign Model - JD's rels so JD's drawing points to BABA's drawing1 -> check catches actionable!
+    t_jd_swap = ws / "model" / "China_Ecommerce_chart_swap_jd.xlsx"
+    shutil.copyfile(cand, t_jd_swap)
+    inf_s, pay_s = mhooks._read_package(t_jd_swap)
+    pay_s[jd_rels_p] = pay_s[jd_rels_p].replace(b"drawing2.xml", b"drawing1.xml")
+    with zipfile.ZipFile(t_jd_swap, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf_s:
+            zout.writestr(info, pay_s[info.filename], compress_type=info.compress_type)
+    chk_jd_swap = mchk.run_checks(candidate_path=t_jd_swap, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    assert any(
+        f["severity_class"] == "actionable" and ("Chart data series" in f["message"] or "cross-shared" in f["message"])
+        for f in chk_jd_swap["findings"]
+    ), chk_jd_swap["findings"]
+
+    # 4b. Tamper: misalign Model - BABA's rels to point to JD's drawing2 -> C14 catches actionable!
+    t_baba_swap = ws / "model" / "China_Ecommerce_chart_swap_baba.xlsx"
+    shutil.copyfile(cand, t_baba_swap)
+    inf_bs, pay_bs = mhooks._read_package(t_baba_swap)
+    pay_bs[baba_rels_p] = pay_bs[baba_rels_p].replace(b"drawing1.xml", b"drawing2.xml")
+    with zipfile.ZipFile(t_baba_swap, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf_bs:
+            zout.writestr(info, pay_bs[info.filename], compress_type=info.compress_type)
+    chk_baba_swap = mchk.run_checks(candidate_path=t_baba_swap, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    assert any(
+        f["check_id"] == "C14" and f["severity_class"] == "actionable" and f.get("sheet") == "Model - BABA"
+        for f in chk_baba_swap["findings"]
+    ), chk_baba_swap["findings"]
+
+    # 4c. Tamper: point Model - JD <drawing> to a nonexistent rId99 -> check catches broken relationship!
+    t_brk = ws / "model" / "China_Ecommerce_chart_broken_rid.xlsx"
+    shutil.copyfile(cand, t_brk)
+    inf_k, pay_k = mhooks._read_package(t_brk)
+    r_k = etree.fromstring(pay_k[jd_part], mhooks._XML)
+    for dr_el in r_k.findall(f"{{{mhooks._SML}}}drawing"):
+        dr_el.set(mhooks._REL_ID, "rId99")
+    pay_k[jd_part] = etree.tostring(r_k, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(t_brk, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf_k:
+            zout.writestr(info, pay_k[info.filename], compress_type=info.compress_type)
+    chk_brk = mchk.run_checks(candidate_path=t_brk, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    assert any(
+        f["severity_class"] == "actionable" and "Broken chart/drawing relationship" in f["message"]
+        for f in chk_brk["findings"]
+    ), chk_brk["findings"]
+
+
+def test_skip_recalc_non_template_enables_full_calc_before_report_and_report_matches_file(
+    tmp_path: Path,
+) -> None:
+    """R6 #2 (Codex high):
+    - On non-template update with --skip-recalc, model_edit enables fullCalcOnLoad=1 BEFORE hashing/reporting.
+    - model_check records 'recalc' in failed_stages (delivered_with_open_issues) and remaining-issues.md
+      accurately reports fullCalcOnLoad=1 enabled matching the workbook on disk.
+    - If a candidate workbook has fullCalcOnLoad OFF while recalc was skipped, C13 flags actionable and
+      remaining-issues.md NEVER falsely claims fullCalcOnLoad=1 is enabled."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+    cm_p = rdir / "model_dump" / "coord_map.json"
+    res = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [{"sheet": "Model - JD", "cell": "Q25", "value": 0.12}],
+            "changelog_entry": {
+                "version": "v02",
+                "date": "2026-11-27",
+                "baseline": base.name,
+                "summary": "Update with skip-recalc",
+            },
+        },
+        workspace_dir=ws,
+        coord_map_out=cm_p,
+        skip_recalc=True,
+    )
+    cand = Path(res["candidate_path"])
+    assert res["recalc_status"] == "skipped"
+    assert res["recalc_result"]["full_calc_on_load_enabled"] is True
+    assert mfp.build_fingerprint(cand, ticker="JD")["calc_properties"]["full_calc_on_load"] is True
+    assert mfp.file_sha256(cand) == res["candidate_sha256"]
+
+    chk = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=cand,
+        baseline_path=base,
+        coord_map_path=cm_p,
+        run_id="run-skip-update",
+    )
+    assert "recalc" in chk["failed_stages"]
+    assert chk["final_status"] == "delivered_with_open_issues"
+    assert chk["full_calc_on_load"] is True
+    assert chk["counts"]["actionable"] == 0, chk["findings"]
+    rem_md = (rdir / "model_dump" / "remaining-issues.md").read_text(encoding="utf-8")
+    assert "已开启 `fullCalcOnLoad=1`" in rem_md
+    vd = mchk.verify_done(workspace_dir=ws, ticker="JD", research_dir=rdir, expected_run_id="run-skip-update")
+    assert vd["ok"] is True, vd
+
+    # Consistency check: if fullCalcOnLoad is actually OFF in file while recalc was skipped,
+    # remaining-issues.md MUST NOT falsely claim fullCalcOnLoad=1 is enabled!
+    rdir_off = ws / "research" / "2026-11-27-skip-off"
+    cand_off = ws / "model" / "China_Ecommerce_skip_off_v03.xlsx"
+    shutil.copyfile(cand, cand_off)
+    mhooks.set_full_calc_on_load(cand_off, False)
+    assert mfp.build_fingerprint(cand_off, ticker="JD")["calc_properties"]["full_calc_on_load"] is False
+    chk_off = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_off,
+        candidate_path=cand_off,
+        baseline_path=base,
+        coord_map_path=cm_p,
+        run_id="run-skip-off",
+    )
+    assert chk_off["full_calc_on_load"] is False
+    assert any(
+        f["check_id"] == "C13" and f["severity_class"] == "actionable" and "without fullCalcOnLoad=1" in f["message"]
+        for f in chk_off["findings"]
+    ), chk_off["findings"]
+    rem_off = (rdir_off / "model_dump" / "remaining-issues.md").read_text(encoding="utf-8")
+    assert "已开启 `fullCalcOnLoad=1`" not in rem_off
+    assert "未开启 `fullCalcOnLoad=1`" in rem_off
+
+
+def test_yi_unit_scale_alignment_model_and_consensus_shared_parser(
+    tmp_path: Path,
+) -> None:
+    """R6 #3 (Grok medium):
+    - Model side parses '亿' / '亿元' as 1e8 via the exact same parser as consensus side.
+    - When both model and consensus are in '亿元', scale_factor == 1.0 (no 1e8 mis-multiplication),
+      and editing a driver on a 亿元 model does NOT trigger false C04 actionable.
+    - Cross-unit alignment ('亿元' vs '元' and '亿元' vs '百万元') aligns to 0% diff.
+    - Genuine >5% gap in '亿元' without rationale on a round-edited cell STILL triggers C04 actionable.
+    - Unrecognized model unit never silently divides by 1.0 (produces missing_evidence)."""
+    assert mfp.parse_unit_scale(None, "JD.com (RMB 亿元)") == (1e8, True)
+    assert mfp.parse_unit_scale(None, "单位：亿") == (1e8, True)
+    assert mfp.parse_unit_scale(None, "人民币十亿元") == (1e9, True)
+    assert mfp.parse_unit_scale(None, "JD.com (RMB MM)") == (1e6, True)
+    assert mfp.parse_unit_scale(None, "Unit: RMB") == (1.0, True)
+    assert mfp.parse_unit_scale(None, "JD.com (单位：未知)") == (None, True)
+    assert mfp._parse_unit_scale("JD.com (RMB 亿元)") == 1e8
+
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+    orig_base = tmp_path / "orig_base_for_yi.xlsx"
+    shutil.copyfile(base, orig_base)
+    # Set Model - JD!A1 unit header to 亿元 while preserving formula caches
+    wb = openpyxl.load_workbook(base, data_only=False)
+    wb["Model - JD"]["A1"].value = "JD.com Financial Model (单位：人民币亿元)"
+    wb.save(base)
+    wb.close()
+    mhooks.restore_donor_cache(base, {"cache_donor_path": str(orig_base), "touched_cells": {"Model - JD": ["A1"]}})
+
+    fp_yi = mfp.build_fingerprint(base, ticker="JD")
+    assert fp_yi["sheets"]["Model - JD"]["period_axis"]["unit_scale"] == 1e8
+    assert fp_yi["sheets"]["Model - JD"]["period_axis"]["unit_scale_parsed"] == 1e8
+    q3_house = float(fp_yi["sheets"]["Model - JD"]["cells"]["Q6"]["cached_value"])
+
+    # Edit driver Q25 feeding Q6 so Q6 is in-scope for C04!
+    rdir_eq = ws / "research" / "2026-11-27-yi-eq"
+    cm_p = rdir_eq / "model_dump" / "coord_map.json"
+    res_ed = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [{"sheet": "Model - JD", "cell": "Q25", "value": 0.13}],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "Yi unit test"},
+        },
+        workspace_dir=ws,
+        coord_map_out=cm_p,
+        skip_recalc=True,
+    )
+    cand = Path(res_ed["candidate_path"])
+
+    # 1. Both model & consensus in '亿元' with equal value -> scale_factor == 1.0, 0% diff, C04 actionable == 0!
+    diff_yi = mcons.compute_consensus_diff(
+        model_path=cand,
+        ticker="JD",
+        research_dir=rdir_eq,
+        consensus_data={
+            "source_type": "Wind Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB", "unit": "亿元"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house}],
+        },
+    )
+    assert diff_yi["status"] == "ok"
+    assert diff_yi["exceeds_count"] == 0
+    assert diff_yi["missing_rationale_count"] == 0
+    assert abs(float(diff_yi["items"][0]["scale_factor"]) - 1.0) < 1e-12
+    assert abs(float(diff_yi["items"][0]["diff_pct"])) < 1e-9
+    chk_yi = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_eq,
+        candidate_path=cand,
+        baseline_path=base,
+        coord_map_path=cm_p,
+        run_id="run-yi-eq",
+    )
+    assert not any(f["check_id"] == "C04" and f["severity_class"] == "actionable" for f in chk_yi["findings"]), chk_yi["findings"]
+
+    # 2. Model '亿元' vs Consensus '元' (House * 1e8) & '百万元' (House * 100) -> 0% diff!
+    rdir_cross = ws / "research" / "2026-11-27-yi-cross"
+    diff_cross = mcons.compute_consensus_diff(
+        model_path=cand,
+        ticker="JD",
+        research_dir=rdir_cross,
+        consensus_data={
+            "source_type": "Wind Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB"},
+            "items": [
+                {"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house * 1e8, "unit": "元"},
+                {"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house * 100.0, "unit": "百万元"},
+            ],
+        },
+    )
+    assert diff_cross["status"] == "ok"
+    assert diff_cross["exceeds_count"] == 0
+    assert all(abs(float(it["diff_pct"])) < 1e-9 for it in diff_cross["items"])
+
+    # 3. Both '亿元' with genuine >5% gap and no rationale on edited Q6 -> C04 actionable!
+    rdir_gap = ws / "research" / "2026-11-27-yi-gap"
+    diff_gap = mcons.compute_consensus_diff(
+        model_path=cand,
+        ticker="JD",
+        research_dir=rdir_gap,
+        consensus_data={
+            "source_type": "Wind Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB", "unit": "亿"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house * 0.7}],
+        },
+    )
+    assert diff_gap["exceeds_count"] == 1
+    assert diff_gap["missing_rationale_count"] == 1
+    chk_gap = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_gap,
+        candidate_path=cand,
+        baseline_path=base,
+        coord_map_path=cm_p,
+        run_id="run-yi-gap",
+    )
+    assert any(f["check_id"] == "C04" and f["severity_class"] == "actionable" for f in chk_gap["findings"]), chk_gap["findings"]
+
+    # 4. Unrecognized model unit + consensus '亿元' -> missing_evidence (NEVER divide by 1.0)!
+    cand_unk = ws / "model" / "China_Ecommerce_unk_unit_v03.xlsx"
+    shutil.copyfile(cand, cand_unk)
+    wb_u = openpyxl.load_workbook(cand_unk, data_only=False)
+    wb_u["Model - JD"]["A1"].value = "JD.com (单位：神秘刻度)"
+    wb_u.save(cand_unk)
+    wb_u.close()
+    mhooks.restore_donor_cache(cand_unk, {"cache_donor_path": str(cand), "touched_cells": {"Model - JD": ["A1"]}})
+    rdir_unk = ws / "research" / "2026-11-27-yi-unk"
+    diff_unk = mcons.compute_consensus_diff(
+        model_path=cand_unk,
+        ticker="JD",
+        research_dir=rdir_unk,
+        consensus_data={
+            "source_type": "Wind Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"unit": "亿元"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house}],
+        },
+    )
+    assert diff_unk["status"] == "missing_evidence"
+    assert diff_unk["unaligned_count"] == 1
+    assert diff_unk["exceeds_count"] == 0
+    chk_unk = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_unk,
+        candidate_path=cand_unk,
+        baseline_path=base,
+        coord_map_path=cm_p,
+        run_id="run-yi-unk",
+    )
+    assert any(f["check_id"] == "C04" and f["severity_class"] == "missing_evidence" for f in chk_unk["findings"]), chk_unk["findings"]
+    assert not any(f["check_id"] == "C04" and f["severity_class"] == "actionable" for f in chk_unk["findings"]), chk_unk["findings"]

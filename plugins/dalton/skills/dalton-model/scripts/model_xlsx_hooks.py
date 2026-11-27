@@ -13,6 +13,8 @@ import io
 import json
 import os
 from pathlib import Path
+import posixpath
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,7 +24,11 @@ import zipfile
 from lxml import etree
 
 _SML = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-_REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_REL_ID = f"{{{_OFFICE_REL_NS}}}id"
+_CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_DRAWING_REL_TYPE = f"{_OFFICE_REL_NS}/drawing"
+_CHART_REL_TYPE = f"{_OFFICE_REL_NS}/chart"
 _XML = etree.XMLParser(resolve_entities=False, no_network=True)
 
 
@@ -613,12 +619,273 @@ class _StylesMutator:
         )
 
 
-def _worksheet_rels_path(sheet_part: str) -> str:
-    import posixpath
+def _part_rels_path(part_path: str) -> str:
+    d = posixpath.dirname(part_path)
+    b = posixpath.basename(part_path)
+    return posixpath.join(d, "_rels", f"{b}.rels") if d else f"_rels/{b}.rels"
 
-    d = posixpath.dirname(sheet_part)
-    b = posixpath.basename(sheet_part)
-    return posixpath.join(d, "_rels", f"{b}.rels")
+
+def _worksheet_rels_path(sheet_part: str) -> str:
+    return _part_rels_path(sheet_part)
+
+
+def _resolve_rel_target(source_part: str, target: str) -> str:
+    if target.startswith("/"):
+        return posixpath.normpath(target.lstrip("/"))
+    return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
+
+
+_PART_NUM_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def _allocate_fresh_part_path(existing_parts: set[str], ed_part_path: str) -> str:
+    """Allocate a non-colliding OOXML part path in ``existing_parts`` for a newly imported part."""
+    norm = ed_part_path.lstrip("/")
+    if norm not in existing_parts:
+        return norm
+    d = posixpath.dirname(norm)
+    b = posixpath.basename(norm)
+    stem, ext = posixpath.splitext(b)
+    m = _PART_NUM_RE.match(stem)
+    if m:
+        prefix, num_s = m.group(1), m.group(2)
+        n = int(num_s) + 1
+    else:
+        prefix = stem
+        n = 1
+    while True:
+        cand = posixpath.join(d, f"{prefix}{n}{ext}") if d else f"{prefix}{n}{ext}"
+        if cand not in existing_parts:
+            return cand
+        n += 1
+
+
+def _copy_content_type_for_imported_part(
+    donor_payload: dict[str, bytes],
+    edited_payload: dict[str, bytes],
+    ed_part_path: str,
+    new_donor_path: str,
+) -> None:
+    """Ensure ``[Content_Types].xml`` in donor covers ``new_donor_path`` matching ``ed_part_path``."""
+    d_ct_raw = donor_payload.get("[Content_Types].xml")
+    e_ct_raw = edited_payload.get("[Content_Types].xml")
+    if not d_ct_raw or not e_ct_raw:
+        return
+    d_ct = etree.fromstring(d_ct_raw, _XML)
+    e_ct = etree.fromstring(e_ct_raw, _XML)
+    changed = False
+
+    ed_part_name = f"/{ed_part_path.lstrip('/')}"
+    new_part_name = f"/{new_donor_path.lstrip('/')}"
+    ed_ov_ct: str | None = None
+    for ov in e_ct.findall(f"{{{_CT_NS}}}Override"):
+        if ov.get("PartName") == ed_part_name:
+            ed_ov_ct = ov.get("ContentType")
+            break
+    if ed_ov_ct:
+        has_ov = any(ov.get("PartName") == new_part_name for ov in d_ct.findall(f"{{{_CT_NS}}}Override"))
+        if not has_ov:
+            etree.SubElement(
+                d_ct,
+                f"{{{_CT_NS}}}Override",
+                PartName=new_part_name,
+                ContentType=ed_ov_ct,
+            )
+            changed = True
+
+    ext = posixpath.splitext(new_donor_path)[1].lstrip(".").lower()
+    if ext:
+        d_exts = {(df.get("Extension") or "").lower() for df in d_ct.findall(f"{{{_CT_NS}}}Default")}
+        if ext not in d_exts:
+            for df in e_ct.findall(f"{{{_CT_NS}}}Default"):
+                if (df.get("Extension") or "").lower() == ext and df.get("ContentType"):
+                    etree.SubElement(
+                        d_ct,
+                        f"{{{_CT_NS}}}Default",
+                        Extension=ext,
+                        ContentType=str(df.get("ContentType")),
+                    )
+                    changed = True
+                    break
+
+    if changed:
+        donor_payload["[Content_Types].xml"] = etree.tostring(
+            d_ct, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+
+def _import_new_part_into_donor(
+    donor_infos: list[zipfile.ZipInfo],
+    donor_payload: dict[str, bytes],
+    edited_payload: dict[str, bytes],
+    ed_part_path: str,
+    imported_part_map: dict[str, str],
+) -> str:
+    """Import a genuinely new part (and recursively its sub-rels & target parts) into donor under fresh paths."""
+    norm_ed = ed_part_path.lstrip("/")
+    if norm_ed in imported_part_map:
+        return imported_part_map[norm_ed]
+
+    existing_parts = set(donor_payload) | {i.filename for i in donor_infos}
+    new_path = _allocate_fresh_part_path(existing_parts, norm_ed)
+    imported_part_map[norm_ed] = new_path
+
+    zi = zipfile.ZipInfo(new_path)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    donor_infos.append(zi)
+    donor_payload[new_path] = edited_payload[norm_ed]
+    _copy_content_type_for_imported_part(donor_payload, edited_payload, norm_ed, new_path)
+
+    ed_sub_rels = _part_rels_path(norm_ed)
+    if ed_sub_rels in edited_payload:
+        sub_root = etree.fromstring(edited_payload[ed_sub_rels], _XML)
+        for rel in sub_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+            if (rel.get("TargetMode") or "").lower() == "external":
+                continue
+            tgt = rel.get("Target") or ""
+            if not tgt:
+                continue
+            resolved_sub = _resolve_rel_target(norm_ed, tgt)
+            if resolved_sub in edited_payload:
+                new_sub_path = _import_new_part_into_donor(
+                    donor_infos, donor_payload, edited_payload, resolved_sub, imported_part_map
+                )
+                rel.set("Target", posixpath.relpath(new_sub_path, posixpath.dirname(new_path)))
+        new_sub_rels = _part_rels_path(new_path)
+        if new_sub_rels not in donor_payload and not any(i.filename == new_sub_rels for i in donor_infos):
+            zi_sr = zipfile.ZipInfo(new_sub_rels)
+            zi_sr.compress_type = zipfile.ZIP_DEFLATED
+            donor_infos.append(zi_sr)
+        donor_payload[new_sub_rels] = etree.tostring(
+            sub_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+    return new_path
+
+
+_WS_TRAILING_ORDER = (
+    "drawing",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "drawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+)
+
+
+def _insert_ws_element_in_schema_order(sh_root: Any, elem: Any) -> None:
+    """Insert a worksheet child element (e.g. ``<drawing>``) in ECMA-376 CT_Worksheet order."""
+    local = etree.QName(elem.tag).localname
+    if local in _WS_TRAILING_ORDER:
+        after_tags = set(_WS_TRAILING_ORDER[_WS_TRAILING_ORDER.index(local) + 1 :])
+        for idx, child in enumerate(list(sh_root)):
+            if isinstance(child.tag, str) and etree.QName(child.tag).localname in after_tags:
+                sh_root.insert(idx, elem)
+                return
+    sh_root.append(elem)
+
+
+def extract_sheet_chart_bindings(payload: dict[str, bytes]) -> dict[str, dict[str, Any]]:
+    """Trace every worksheet's drawing/chart relationships and chart ``<c:f>`` data-range references."""
+    out: dict[str, dict[str, Any]] = {}
+    for sh_name, sh_part in _sheet_parts(payload).items():
+        if sh_part not in payload:
+            continue
+        rels_part = _worksheet_rels_path(sh_part)
+        rels_bytes = payload.get(rels_part)
+        rel_by_id: dict[str, tuple[str, str, str, str]] = {}
+        if rels_bytes:
+            r_root = etree.fromstring(rels_bytes, _XML)
+            for rel in r_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                rid = rel.get("Id") or ""
+                rtype = rel.get("Type") or ""
+                rtgt = rel.get("Target") or ""
+                rmode = (rel.get("TargetMode") or "").lower()
+                resolved = rtgt if rmode == "external" else (_resolve_rel_target(sh_part, rtgt) if rtgt else "")
+                if rid:
+                    rel_by_id[rid] = (rtype, rtgt, rmode, resolved)
+
+        sh_root = etree.fromstring(payload[sh_part], _XML)
+        drawings: list[str] = []
+        charts: list[dict[str, Any]] = []
+        broken_refs: list[str] = []
+        seen_drawing_rids: set[str] = set()
+
+        for dr_el in sh_root.findall(f"{{{_SML}}}drawing"):
+            rid = dr_el.get(_REL_ID) or ""
+            seen_drawing_rids.add(rid)
+            if not rid or rid not in rel_by_id:
+                broken_refs.append(f"worksheet <drawing r:id={rid!r}> missing in {rels_part}")
+                continue
+            rtype, _rtgt, rmode, d_part = rel_by_id[rid]
+            if rmode == "external" or not d_part or d_part not in payload:
+                broken_refs.append(f"worksheet drawing rel {rid!r} target {d_part!r} missing from package")
+                continue
+            if rtype and rtype != _DRAWING_REL_TYPE:
+                broken_refs.append(f"worksheet <drawing r:id={rid!r}> points to non-drawing rel type {rtype!r}")
+                continue
+            drawings.append(d_part)
+
+            d_rels_part = _part_rels_path(d_part)
+            d_rel_by_id: dict[str, tuple[str, str, str]] = {}
+            if d_rels_part in payload:
+                dr_rels_root = etree.fromstring(payload[d_rels_part], _XML)
+                for drel in dr_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                    drid = drel.get("Id") or ""
+                    drtype = drel.get("Type") or ""
+                    drtgt = drel.get("Target") or ""
+                    drmode = (drel.get("TargetMode") or "").lower()
+                    dresolved = drtgt if drmode == "external" else (_resolve_rel_target(d_part, drtgt) if drtgt else "")
+                    if drid:
+                        d_rel_by_id[drid] = (drtype, drmode, dresolved)
+
+            d_root = etree.fromstring(payload[d_part], _XML)
+            chart_els = list(d_root.iter(f"{{{_CHART_NS}}}chart"))
+            for ch_el in chart_els:
+                crid = ch_el.get(_REL_ID) or ""
+                if not crid or crid not in d_rel_by_id:
+                    broken_refs.append(f"drawing {d_part!r} <c:chart r:id={crid!r}> missing in {d_rels_part}")
+                    continue
+                crtype, crmode, c_part = d_rel_by_id[crid]
+                if crmode == "external" or not c_part or c_part not in payload:
+                    broken_refs.append(f"drawing {d_part!r} chart rel {crid!r} target {c_part!r} missing from package")
+                    continue
+                if crtype and crtype != _CHART_REL_TYPE:
+                    broken_refs.append(f"drawing {d_part!r} <c:chart r:id={crid!r}> points to non-chart rel type {crtype!r}")
+                    continue
+                c_root = etree.fromstring(payload[c_part], _XML)
+                formulas = [
+                    (f_el.text or "").strip()
+                    for f_el in c_root.iter(f"{{{_CHART_NS}}}f")
+                    if (f_el.text or "").strip()
+                ]
+                charts.append(
+                    {
+                        "drawing_part": d_part,
+                        "chart_part": c_part,
+                        "formulas": formulas,
+                    }
+                )
+
+        # Also check any dangling drawing/chart rels declared in worksheet .rels
+        for rid, (rtype, _rtgt, rmode, resolved) in rel_by_id.items():
+            if rmode == "external":
+                continue
+            if rtype in (_DRAWING_REL_TYPE, _CHART_REL_TYPE) and (not resolved or resolved not in payload):
+                broken_refs.append(f"dangling worksheet rel {rid!r} -> {resolved!r}")
+
+        out[sh_name] = {
+            "sheet_part": sh_part,
+            "rels_part": rels_part,
+            "rels_bytes": rels_bytes,
+            "drawings": drawings,
+            "charts": charts,
+            "broken_refs": broken_refs,
+        }
+    return out
 
 
 def _register_new_sheet_in_donor(
@@ -725,14 +992,17 @@ def merge_edited_sheets_into_donor(
     )
 
     merged_sheets: list[str] = []
+    imported_part_map: dict[str, str] = {}
     for sh_name in sorted(set(modified_sheets)):
         ed_part = edited_parts.get(sh_name)
         if not ed_part or ed_part not in edited_payload:
             continue
+        is_new_sheet = sh_name not in donor_parts
         d_part = donor_parts.get(sh_name)
         if d_part is None:
             d_part = _register_new_sheet_in_donor(donor_infos, donor_payload, sh_name)
             donor_parts[sh_name] = d_part
+        orig_donor_sh_bytes = None if is_new_sheet else donor_payload.get(d_part)
 
         sh_root = etree.fromstring(edited_payload[ed_part], _XML)
 
@@ -776,36 +1046,140 @@ def merge_edited_sheets_into_donor(
                         new_idx = sst_mut.intern_si(edited_sis[old_idx])
                         v_el.text = str(new_idx)
 
+        # Preserve donor's existing worksheet relationships, drawings, charts, and related parts verbatim!
+        # NEVER overwrite donor's _rels with openpyxl's renumbered _rels (which collides with other sheets' drawings/charts).
+        # Only genuinely NEW parts (e.g. new sheet or newly added drawing/hyperlink/comment) are imported under freshly
+        # allocated non-colliding paths with remapped relationships.
+        d_rels_part = _worksheet_rels_path(d_part)
+        ed_rels_part = _worksheet_rels_path(ed_part)
+        d_rels_raw = None if is_new_sheet else donor_payload.get(d_rels_part)
+        ed_rels_raw = edited_payload.get(ed_rels_part)
+
+        d_rels_root = etree.fromstring(d_rels_raw, _XML) if d_rels_raw else None
+        donor_used_rids: set[str] = set()
+        donor_ext_by_key: dict[tuple[str, str], str] = {}
+        donor_int_by_type: dict[str, list[str]] = {}
+        if d_rels_root is not None:
+            for drel in d_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                did = drel.get("Id") or ""
+                dtype = drel.get("Type") or ""
+                dtgt = drel.get("Target") or ""
+                dmode = (drel.get("TargetMode") or "").lower()
+                if did:
+                    donor_used_rids.add(did)
+                if dmode == "external":
+                    if did:
+                        donor_ext_by_key.setdefault((dtype, dtgt), did)
+                elif did:
+                    donor_int_by_type.setdefault(dtype, []).append(did)
+
+        def _alloc_rid() -> str:
+            n = 1
+            while f"rId{n}" in donor_used_rids:
+                n += 1
+            rid = f"rId{n}"
+            donor_used_rids.add(rid)
+            return rid
+
+        rid_map: dict[str, str] = {}
+        matched_int_cursor: dict[str, int] = {}
+        donor_rels_changed = False
+
+        if ed_rels_raw:
+            ed_rels_root = etree.fromstring(ed_rels_raw, _XML)
+            for erel in ed_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                eid = erel.get("Id") or ""
+                etype = erel.get("Type") or ""
+                etgt = erel.get("Target") or ""
+                emode = (erel.get("TargetMode") or "").lower()
+                if emode == "external":
+                    existing_did = donor_ext_by_key.get((etype, etgt))
+                    if existing_did:
+                        if eid:
+                            rid_map[eid] = existing_did
+                    else:
+                        if d_rels_root is None:
+                            d_rels_root = etree.Element(f"{{{_PKG_REL_NS}}}Relationships", nsmap={None: _PKG_REL_NS})
+                        new_rid = _alloc_rid()
+                        etree.SubElement(
+                            d_rels_root,
+                            f"{{{_PKG_REL_NS}}}Relationship",
+                            Id=new_rid,
+                            Type=etype,
+                            Target=etgt,
+                            TargetMode="External",
+                        )
+                        donor_ext_by_key[(etype, etgt)] = new_rid
+                        if eid:
+                            rid_map[eid] = new_rid
+                        donor_rels_changed = True
+                    continue
+
+                # Internal relationship: reuse donor's untouched relationship & part for existing sheets
+                if not is_new_sheet:
+                    d_list = donor_int_by_type.get(etype) or []
+                    cur_i = matched_int_cursor.get(etype, 0)
+                    if cur_i < len(d_list):
+                        matched_int_cursor[etype] = cur_i + 1
+                        if eid:
+                            rid_map[eid] = d_list[cur_i]
+                        continue
+
+                # Genuinely new internal part -> import under a fresh non-colliding path & remap sub-rels
+                if not etgt:
+                    continue
+                resolved_ed_tgt = _resolve_rel_target(ed_part, etgt)
+                if resolved_ed_tgt not in edited_payload:
+                    continue
+                new_donor_tgt = _import_new_part_into_donor(
+                    donor_infos, donor_payload, edited_payload, resolved_ed_tgt, imported_part_map
+                )
+                rel_target = posixpath.relpath(new_donor_tgt, posixpath.dirname(d_part))
+                if d_rels_root is None:
+                    d_rels_root = etree.Element(f"{{{_PKG_REL_NS}}}Relationships", nsmap={None: _PKG_REL_NS})
+                new_rid = _alloc_rid()
+                etree.SubElement(
+                    d_rels_root,
+                    f"{{{_PKG_REL_NS}}}Relationship",
+                    Id=new_rid,
+                    Type=etype,
+                    Target=rel_target,
+                )
+                if eid:
+                    rid_map[eid] = new_rid
+                donor_rels_changed = True
+
+        # Remap every r:* relationship-ID attribute inside the edited worksheet XML to donor's rId
+        if rid_map:
+            rel_ns_prefix = f"{{{_OFFICE_REL_NS}}}"
+            for el in sh_root.iter():
+                for attr_k, attr_v in list(el.attrib.items()):
+                    if attr_k.startswith(rel_ns_prefix) and attr_v in rid_map:
+                        el.set(attr_k, rid_map[attr_v])
+
+        # If openpyxl dropped donor's <drawing> or <legacyDrawing> element on an existing sheet, restore it verbatim
+        if orig_donor_sh_bytes:
+            orig_sh_root = etree.fromstring(orig_donor_sh_bytes, _XML)
+            for tag_local in ("drawing", "legacyDrawing"):
+                fq = f"{{{_SML}}}{tag_local}"
+                if sh_root.find(fq) is None:
+                    for orig_el in orig_sh_root.findall(fq):
+                        cloned_el = etree.fromstring(etree.tostring(orig_el, encoding="UTF-8"), _XML)
+                        _insert_ws_element_in_schema_order(sh_root, cloned_el)
+
         donor_payload[d_part] = etree.tostring(
             sh_root, xml_declaration=True, encoding="UTF-8", standalone=True
         )
 
-        # If modified sheet carries a _rels file in edited package, sync any referenced target parts
-        ed_rels_part = _worksheet_rels_path(ed_part)
-        if ed_rels_part in edited_payload:
-            d_rels_part = _worksheet_rels_path(d_part)
+        # Flush d_rels_part ONLY if genuinely new relationships were added; otherwise keep donor bytes untouched!
+        if donor_rels_changed and d_rels_root is not None:
             if d_rels_part not in donor_payload and not any(i.filename == d_rels_part for i in donor_infos):
                 zi_r = zipfile.ZipInfo(d_rels_part)
                 zi_r.compress_type = zipfile.ZIP_DEFLATED
                 donor_infos.append(zi_r)
-            donor_payload[d_rels_part] = edited_payload[ed_rels_part]
-            ed_rels_root = etree.fromstring(edited_payload[ed_rels_part], _XML)
-            for rel in ed_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
-                if (rel.get("TargetMode") or "").lower() == "external":
-                    continue
-                tgt = rel.get("Target") or ""
-                if not tgt:
-                    continue
-                resolved_tgt = (
-                    tgt.lstrip("/")
-                    if tgt.startswith("/")
-                    else posixpath.normpath(posixpath.join(posixpath.dirname(ed_part), tgt))
-                )
-                if resolved_tgt in edited_payload and resolved_tgt not in donor_payload:
-                    zi_t = zipfile.ZipInfo(resolved_tgt)
-                    zi_t.compress_type = zipfile.ZIP_DEFLATED
-                    donor_infos.append(zi_t)
-                    donor_payload[resolved_tgt] = edited_payload[resolved_tgt]
+            donor_payload[d_rels_part] = etree.tostring(
+                d_rels_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
 
         merged_sheets.append(sh_name)
 

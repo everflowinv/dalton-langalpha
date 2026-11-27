@@ -800,8 +800,9 @@ def _extract_house_values_from_model(
     model_basis: dict[str, Any] = {
         "fiscal_year_end_month": 12,
         "unit_text": None,
-        "unit_scale": 1.0,
+        "unit_scale": None,
         "unit_scale_explicit": False,
+        "unit_text_present": False,
         "currency": None,
         "accounting_basis": "GAAP",
         "share_basis": "ordinary",
@@ -813,14 +814,18 @@ def _extract_house_values_from_model(
         model_basis["fiscal_year_end_month"] = p_axis.get("fiscal_year_end_month", 12)
         unit_text = str(p_axis.get("unit_text") or "")
         model_basis["unit_text"] = unit_text
-        model_basis["unit_scale"] = float(p_axis.get("unit_scale") or 1.0)
-        model_basis["unit_scale_explicit"] = bool(unit_text.strip())
-        if "RMB" in unit_text.upper() or "CNY" in unit_text.upper():
+        m_scale_parsed, m_unit_present = model_fingerprint.parse_unit_scale(None, unit_text)
+        model_basis["unit_scale"] = m_scale_parsed
+        model_basis["unit_scale_explicit"] = m_scale_parsed is not None
+        model_basis["unit_text_present"] = bool(m_unit_present)
+        if "RMB" in unit_text.upper() or "CNY" in unit_text.upper() or "人民币" in unit_text:
             model_basis["currency"] = "RMB"
-        elif "HK" in unit_text.upper():
+        elif "HK" in unit_text.upper() or "港元" in unit_text or "港币" in unit_text:
             model_basis["currency"] = "HKD"
-        elif "US" in unit_text.upper() or "$" in unit_text:
+        elif "US" in unit_text.upper() or "$" in unit_text or "美元" in unit_text:
             model_basis["currency"] = "USD"
+        elif "元" in unit_text:
+            model_basis["currency"] = "RMB"
 
         anchors = sh_data.get("semantic_anchors") or {}
         anchor_rows: dict[str, int | None] = {
@@ -914,39 +919,8 @@ def _parse_consensus_unit_scale(
     raw_scale: Any,
     raw_unit_text: Any,
 ) -> tuple[float | None, bool]:
-    """Parse explicit consensus monetary unit multiplier -> ``(scale_or_none, was_explicit)``."""
-    if raw_scale is not None and raw_scale != "":
-        if isinstance(raw_scale, (int, float)) and not isinstance(raw_scale, bool):
-            val = float(raw_scale)
-            return (val, True) if val > 0 else (None, True)
-        s = str(raw_scale).strip()
-        try:
-            val = float(s)
-            return (val, True) if val > 0 else (None, True)
-        except ValueError:
-            raw_unit_text = s
-
-    if raw_unit_text is None:
-        return None, False
-    txt = str(raw_unit_text).strip()
-    if not txt:
-        return None, False
-    low = txt.lower().strip("()[] ")
-    if any(tok in low for tok in ("billion", " bn", "b)", "十亿")) or low in ("bn", "b"):
-        return 1e9, True
-    if "亿" in low and not any(tok in low for tok in ("十亿", "百亿", "千亿")):
-        return 1e8, True
-    if any(tok in low for tok in ("mm", "million", "百万", " mn", "m)")) or low in ("mm", "mn", "m"):
-        return 1e6, True
-    if any(tok in low for tok in ("'000", "000)", "thousand", "千", " k", "k)")) or low in ("k", "000"):
-        return 1e3, True
-    if low in ("1", "raw", "unit", "units", "actual", "exact", "元", "人民币元", "美元", "港元", "rmb", "cny", "usd", "hkd", "$", "¥"):
-        return 1.0, True
-    if any(tok in low for tok in ("元", "rmb", "cny", "usd", "hkd", "$", "¥")) and not any(
-        tok in low for tok in ("万", "亿", "千", "百", "k", "m", "b")
-    ):
-        return 1.0, True
-    return None, True
+    """Parse explicit consensus monetary unit multiplier using the shared model/consensus parser."""
+    return model_fingerprint.parse_unit_scale(raw_scale, raw_unit_text)
 
 
 def _is_monetary_amount_metric(mkey: str, cat: str) -> bool:
@@ -1041,8 +1015,9 @@ def compute_consensus_diff(
     if reflects_latest is False:
         basis_warnings.append("consensus snapshot does not yet reflect the latest earnings release")
 
-    m_scale = float(model_basis.get("unit_scale") or 1.0)
-    m_scale_explicit = bool(model_basis.get("unit_scale_explicit"))
+    m_scale_raw = model_basis.get("unit_scale")
+    m_scale: float | None = float(m_scale_raw) if m_scale_raw is not None else None
+    m_scale_explicit = m_scale is not None
     c_scale_top, c_scale_top_exp = _parse_consensus_unit_scale(
         c_basis.get("unit_scale"),
         c_basis.get("unit") or c_basis.get("unit_text") or c_basis.get("scale"),
@@ -1054,10 +1029,10 @@ def compute_consensus_diff(
             basis_warnings.append(
                 f"unit_scale unrecognized: consensus={c_basis.get('unit_scale') or c_basis.get('unit') or c_basis.get('unit_text')!r}"
             )
-        elif not m_scale_explicit and abs(c_scale_top - 1.0) > 1e-9:
+        elif not m_scale_explicit:
             top_scale_aligned = False
             basis_warnings.append(
-                f"unit_scale mismatch: model unit missing while consensus scale={c_scale_top:g}"
+                f"unit_scale mismatch: model unit missing/unrecognized ({model_basis.get('unit_text')!r}) while consensus scale={c_scale_top:g}"
             )
     checks["unit_scale"] = {
         "model": m_scale,
@@ -1119,19 +1094,20 @@ def compute_consensus_diff(
                     warns.append(
                         f"unit_scale unrecognized: consensus={item_b.get('unit_scale') or item_b.get('unit') or item_b.get('unit_text')!r}"
                     )
-                elif not m_scale_explicit and abs(c_sc - 1.0) > 1e-9:
+                elif m_scale is None:
                     warns.append(
-                        f"unit_scale incomparable: model unit_text missing while consensus scale={c_sc:g}"
+                        f"unit_scale incomparable: model unit_text missing/unrecognized ({model_basis.get('unit_text')!r}) while consensus scale={c_sc:g}"
                     )
                 else:
                     scale_factor = c_sc / m_scale
                     cons_aligned = cons_raw * scale_factor
             else:
-                # Undeclared consensus unit scale: guard against 100x+ magnitude mismatch (e.g. raw RMB vs RMB MM)
+                # Undeclared consensus unit scale: guard against 100x+ magnitude mismatch (e.g. raw RMB vs RMB MM / 亿元)
                 if (
                     house_val is not None
                     and abs(house_val) > 1e-9
                     and abs(cons_raw) > 1e-9
+                    and m_scale is not None
                     and abs(m_scale - 1.0) > 1e-9
                 ):
                     mag_ratio = abs(cons_raw / house_val)

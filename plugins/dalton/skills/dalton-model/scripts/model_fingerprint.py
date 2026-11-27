@@ -671,17 +671,78 @@ def _tarjan_scc(graph: dict[str, set[str]]) -> list[list[str]]:
     return sorted(sccs)
 
 
+_STR_SCALE_LETTER_RE = re.compile(r"\b(?:k|m|mm|mn|b|bn)\b", re.IGNORECASE)
+_CURRENCY_WORDS_RE = re.compile(r"\b(?:rmb|cny|usd|hkd|eur|jpy|gbp)\b", re.IGNORECASE)
+
+
+def parse_unit_scale(
+    raw_scale: Any = None,
+    raw_unit_text: Any = None,
+) -> tuple[float | None, bool]:
+    """Shared monetary unit scale parser for both model and consensus sides -> ``(scale_or_none, was_explicit)``."""
+    if raw_scale is not None and raw_scale != "":
+        if isinstance(raw_scale, (int, float)) and not isinstance(raw_scale, bool):
+            val = float(raw_scale)
+            return (val, True) if val > 0 else (None, True)
+        s = str(raw_scale).strip()
+        try:
+            val = float(s)
+            return (val, True) if val > 0 else (None, True)
+        except ValueError:
+            raw_unit_text = s
+
+    if raw_unit_text is None:
+        return None, False
+    txt = str(raw_unit_text).strip()
+    if not txt:
+        return None, False
+    low = txt.lower().strip("()[]（）【】 ")
+    if "千亿" in low:
+        return 1e11, True
+    if "百亿" in low:
+        return 1e10, True
+    if any(tok in low for tok in ("billion", " bn", "b)", "b）", "十亿")) or low in ("bn", "b"):
+        return 1e9, True
+    if "亿" in low:
+        return 1e8, True
+    if "千万" in low:
+        return 1e7, True
+    if any(tok in low for tok in ("mm", "million", "百万", " mn", "m)", "m）")) or low in ("mm", "mn", "m"):
+        return 1e6, True
+    if "万" in low:
+        return 1e4, True
+    if any(tok in low for tok in ("'000", "000)", "000）", "thousand", "千", " k", "k)", "k）")) or low in ("k", "000"):
+        return 1e3, True
+    if low in (
+        "1",
+        "raw",
+        "unit",
+        "units",
+        "actual",
+        "exact",
+        "元",
+        "人民币元",
+        "美元",
+        "港元",
+        "港币",
+        "rmb",
+        "cny",
+        "usd",
+        "hkd",
+        "$",
+        "¥",
+    ):
+        return 1.0, True
+    if any(tok in low for tok in ("元", "rmb", "cny", "usd", "hkd", "$", "¥")):
+        stripped = _CURRENCY_WORDS_RE.sub(" ", low)
+        if not any(tok in stripped for tok in ("万", "亿", "千", "百")) and not _STR_SCALE_LETTER_RE.search(stripped):
+            return 1.0, True
+    return None, True
+
+
 def _parse_unit_scale(text: str | None) -> float:
-    if not text:
-        return 1.0
-    low = text.lower()
-    if any(tok in low for tok in ("billion", " bn", "b)", "十亿")):
-        return 1e9
-    if any(tok in low for tok in ("mm", "million", "百万", " mn")):
-        return 1e6
-    if any(tok in low for tok in ("'000", "000)", "thousand", "千")):
-        return 1e3
-    return 1.0
+    scale, _ = parse_unit_scale(None, text)
+    return scale if scale is not None else 1.0
 
 
 def _parse_fy_end_month(ws: Any) -> tuple[int, bool]:
@@ -1140,7 +1201,8 @@ def build_fingerprint(
             fy_end_month, fy_explicit = _parse_fy_end_month(ws)
             a1_val = ws["A1"].value
             unit_text = str(a1_val).strip() if isinstance(a1_val, str) and a1_val.strip() else None
-            unit_scale = _parse_unit_scale(unit_text)
+            unit_scale_parsed, _ = parse_unit_scale(None, unit_text)
+            unit_scale = unit_scale_parsed if unit_scale_parsed is not None else 1.0
 
             # Detect header row & period columns
             header_row: int | None = None
@@ -1518,6 +1580,8 @@ def build_fingerprint(
                     "fiscal_year_end_explicit": fy_explicit,
                     "unit_text": unit_text,
                     "unit_scale": unit_scale,
+                    "unit_scale_parsed": unit_scale_parsed,
+                    "unit_scale_explicit": unit_scale_parsed is not None,
                     "source_note_col": source_note_col,
                     "columns": columns_meta,
                     "annual_sum_quarters": annual_sum_quarters,

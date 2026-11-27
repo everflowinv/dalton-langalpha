@@ -591,6 +591,16 @@ def apply_edit_plan(
 
     fp = fingerprint if fingerprint is not None else model_fingerprint.build_fingerprint(base, ticker=ticker)
 
+    is_template_build = (
+        str(mode).strip().lower() == "build"
+        or str(plan.get("mode") or "").strip().lower() == "build"
+        or _is_empty_cache_template(fp, base)
+    )
+    if is_template_build and skip_recalc:
+        raise ValueError(
+            "Refusing --skip-recalc on default-template / build mode: recalculation is required so formulas do not ship with empty cached values"
+        )
+
     if output_path is not None:
         cand = Path(output_path).expanduser().resolve()
     else:
@@ -848,11 +858,6 @@ def apply_edit_plan(
     finally:
         wb.close()
 
-    is_template_build = (
-        str(mode).strip().lower() == "build"
-        or str(plan.get("mode") or "").strip().lower() == "build"
-        or _is_empty_cache_template(fp, base)
-    )
     coord_map["mode"] = "build" if is_template_build else "update"
     coord_map["from_default_template"] = is_template_build
 
@@ -906,30 +911,35 @@ def apply_edit_plan(
     os.replace(editing_tmp, cand)
 
     # Step 4: Temp-copy LibreOffice recalculation & selective non-error merge
+    full_calc_fallback = False
     if skip_recalc:
+        # Non-template --skip-recalc: enable fullCalcOnLoad=1 BEFORE hashing/reporting so Excel recalculates
+        # on open and generated reports match the actual workbook state.
+        model_xlsx_hooks.set_full_calc_on_load(cand, True)
+        full_calc_fallback = True
         recalc_res: dict[str, Any] = {
             "status": "skipped",
             "engine": "libreoffice",
             "donor_cache_restored": True,
             "kept_cache_count": donor_restore_res.get("kept_cache_count", 0),
+            "full_calc_on_load_enabled": True,
         }
     else:
         recalc_res = model_xlsx_hooks.recalculate_keep_cache(
             recalc_mod, cand, int(recalc_timeout), set(), keep_cache_spec
         )
-
-    # For default-template builds, if recalculation failed or left unmatched target formulas,
-    # enable fullCalcOnLoad=1 so Excel recalculates immediately when the user opens the workbook!
-    full_calc_fallback = False
-    if is_template_build and recalc_res.get("status") in ("recalc_failed", "incomplete"):
-        model_xlsx_hooks.set_full_calc_on_load(cand, True)
-        full_calc_fallback = True
-        recalc_res["full_calc_on_load_enabled"] = True
+        # For default-template builds, if recalculation failed or left unmatched target formulas,
+        # enable fullCalcOnLoad=1 so Excel recalculates immediately when the user opens the workbook!
+        if is_template_build and recalc_res.get("status") in ("recalc_failed", "incomplete"):
+            model_xlsx_hooks.set_full_calc_on_load(cand, True)
+            full_calc_fallback = True
+            recalc_res["full_calc_on_load_enabled"] = True
 
     cand_sha = model_fingerprint.file_sha256(cand)
     coord_map["candidate_sha256"] = cand_sha
     coord_map["donor_cache_restored"] = True
     coord_map["full_calc_on_load_enabled_on_recalc_failure"] = full_calc_fallback
+    coord_map["full_calc_on_load_enabled_on_skip_recalc"] = bool(skip_recalc and full_calc_fallback)
     coord_map["kept_cache_count"] = recalc_res.get(
         "kept_cache_count", donor_restore_res.get("kept_cache_count", 0)
     )
@@ -996,21 +1006,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "apply":
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         fp = json.loads(Path(args.fingerprint).read_text(encoding="utf-8")) if args.fingerprint else None
-        res = apply_edit_plan(
-            baseline_path=args.baseline,
-            ticker=args.ticker,
-            plan=plan,
-            output_path=args.out,
-            workspace_dir=args.workspace_dir,
-            fingerprint=fp,
-            coord_map_out=args.coord_map_out,
-            donor_out=args.donor_out,
-            spec_out=args.spec_out,
-            expected_baseline_sha256=args.expected_baseline_sha256,
-            skip_recalc=args.skip_recalc,
-            recalc_timeout=args.recalc_timeout,
-            mode=args.mode,
-        )
+        try:
+            res = apply_edit_plan(
+                baseline_path=args.baseline,
+                ticker=args.ticker,
+                plan=plan,
+                output_path=args.out,
+                workspace_dir=args.workspace_dir,
+                fingerprint=fp,
+                coord_map_out=args.coord_map_out,
+                donor_out=args.donor_out,
+                spec_out=args.spec_out,
+                expected_baseline_sha256=args.expected_baseline_sha256,
+                skip_recalc=args.skip_recalc,
+                recalc_timeout=args.recalc_timeout,
+                mode=args.mode,
+            )
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
         print(json.dumps({k: v for k, v in res.items() if k != "coord_map"}, indent=2, ensure_ascii=False))
         return 0
 

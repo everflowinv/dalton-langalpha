@@ -59,6 +59,8 @@ def _unit_tolerance(unit_scale: float, benchmark_abs: float = 0.0) -> float:
     """Adaptive tolerance per §8.7."""
     if unit_scale >= 1e9:
         unit_tol = 0.002
+    elif unit_scale >= 1e8:
+        unit_tol = 0.02
     elif unit_scale >= 1e6:
         unit_tol = 1.0
     elif unit_scale >= 1e3:
@@ -2055,19 +2057,29 @@ def run_checks(
                             )
 
     # C13 fullCalcOnLoad, default-template empty-cache guard, exempt cells, baseline error comparison, downstream diffs & new circular references
+    recalc_skipped = (recalc_st == "skipped")
     base_full_calc = bool((base_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     cand_full_calc = bool((cand_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     if not base_full_calc and cand_full_calc:
-        if is_template_build and recalc_failed:
+        if (is_template_build and recalc_failed) or recalc_skipped:
             _add_finding(
                 findings, "C13", "missing_evidence",
-                "Default-template recalculation failed; fullCalcOnLoad=1 enabled so Excel recalculates on open",
+                (
+                    "Recalculation was skipped (--skip-recalc); fullCalcOnLoad=1 enabled so Excel recalculates on open"
+                    if recalc_skipped
+                    else "Default-template recalculation failed; fullCalcOnLoad=1 enabled so Excel recalculates on open"
+                ),
             )
         else:
             _add_finding(
                 findings, "C13", "actionable",
                 "Workbook <calcPr> has fullCalcOnLoad=1 enabled (was disabled in baseline)",
             )
+    elif recalc_skipped and not cand_full_calc:
+        _add_finding(
+            findings, "C13", "actionable",
+            "Recalculation was skipped (--skip-recalc) without fullCalcOnLoad=1 enabled; formulas may carry stale or empty cached values",
+        )
 
     # Build exempt cell set strictly from CANDIDATE formulas (Codex R2 #4):
     # never grant exemption to a coordinate whose original CIQ/ext formula was replaced with e.g. =1/0!
@@ -2261,17 +2273,112 @@ def run_checks(
                 f"Default-template build has {len(empty_target_formulas)} empty formula cell(s) without cached values ({sample_empty}); a successful recalculation is required before delivery",
             )
 
+    # Chart & drawing relationship integrity across ALL sheets (R6 #1):
+    # Catch miswired chart data series (e.g. JD chart wired to BABA series), broken drawing/chart rels,
+    # or newly cross-shared drawing/chart parts between sheets!
+    non_target_set = set(non_target_sheets)
+    all_ops = list(cm.get("ops") or [])
+    legal_target_ops = [op for op in all_ops if str(op.get("sheet") or "") not in non_target_set]
+
+    true_base_p: Path | None = None
+    if baseline_path is not None and Path(baseline_path).is_file():
+        true_base_p = Path(baseline_path).expanduser().resolve()
+    elif base_fp.get("source_path") and Path(str(base_fp["source_path"])).is_file():
+        true_base_p = Path(str(base_fp["source_path"])).expanduser().resolve()
+
+    expected_nt_xml: dict[str, bytes] = {}
+    expected_pkg_payload: dict[str, bytes] = {}
+    cand_pkg_payload: dict[str, bytes] = {}
+    if true_base_p is not None:
+        expected_nt_xml, expected_pkg_payload = _expected_non_target_sheet_xml_map(
+            true_base_p, legal_target_ops, non_target_sheets
+        )
+        _, cand_pkg_payload = model_xlsx_hooks._read_package(cand)
+
+        exp_chart_map = model_xlsx_hooks.extract_sheet_chart_bindings(expected_pkg_payload)
+        cand_chart_map = model_xlsx_hooks.extract_sheet_chart_bindings(cand_pkg_payload)
+
+        # Check broken drawing/chart refs and chart series formula preservation per sheet
+        for sh_name, c_bind in cand_chart_map.items():
+            cid = "C14" if sh_name in non_target_set else "C01"
+            for brk in c_bind.get("broken_refs") or ():
+                _add_finding(
+                    findings, cid, "actionable",
+                    f"Broken chart/drawing relationship on {sh_name!r}: {brk}",
+                    sheet=sh_name,
+                )
+
+        for sh_name, e_bind in exp_chart_map.items():
+            cid = "C14" if sh_name in non_target_set else "C01"
+            c_bind = cand_chart_map.get(sh_name)
+            if c_bind is None:
+                continue
+            exp_series = [ch["formulas"] for ch in (e_bind.get("charts") or ())]
+            cand_series = [ch["formulas"] for ch in (c_bind.get("charts") or ())]
+            if exp_series:
+                if sh_name in non_target_set:
+                    if cand_series != exp_series:
+                        _add_finding(
+                            findings, "C14", "actionable",
+                            f"Non-target sheet chart data series mismatch on {sh_name!r}: expected {exp_series!r}, got {cand_series!r}",
+                            sheet=sh_name,
+                        )
+                else:
+                    if len(cand_series) < len(exp_series) or cand_series[: len(exp_series)] != exp_series:
+                        _add_finding(
+                            findings, cid, "actionable",
+                            f"Chart data series relationship mismatch on {sh_name!r}: expected {exp_series!r}, got {cand_series!r}",
+                            sheet=sh_name,
+                        )
+            if sh_name in non_target_set:
+                e_rels = e_bind.get("rels_bytes")
+                c_rels = c_bind.get("rels_bytes")
+                if (e_rels is None) != (c_rels is None):
+                    _add_finding(
+                        findings, "C14", "actionable",
+                        f"Non-target sheet relationships file added/removed on {sh_name!r}",
+                        sheet=sh_name,
+                    )
+                elif e_rels is not None and c_rels is not None:
+                    if model_xlsx_hooks.canonical_sheet_xml(e_rels) != model_xlsx_hooks.canonical_sheet_xml(c_rels):
+                        _add_finding(
+                            findings, "C14", "actionable",
+                            f"Non-target sheet relationships (.rels) modified on {sh_name!r}",
+                            sheet=sh_name,
+                        )
+
+        # Detect newly cross-shared drawing or chart parts across distinct sheets
+        exp_part_owners: dict[str, set[str]] = defaultdict(set)
+        for sh_name, e_bind in exp_chart_map.items():
+            for dp in e_bind.get("drawings") or ():
+                exp_part_owners[dp].add(sh_name)
+            for ch in e_bind.get("charts") or ():
+                exp_part_owners[ch["chart_part"]].add(sh_name)
+        cand_part_owners: dict[str, set[str]] = defaultdict(set)
+        for sh_name, c_bind in cand_chart_map.items():
+            for dp in c_bind.get("drawings") or ():
+                cand_part_owners[dp].add(sh_name)
+            for ch in c_bind.get("charts") or ():
+                cand_part_owners[ch["chart_part"]].add(sh_name)
+        for part_p, owners in sorted(cand_part_owners.items()):
+            if len(owners) > 1 and owners != exp_part_owners.get(part_p, set()):
+                ordered_owners = sorted(owners)
+                cid = "C14" if any(o in non_target_set for o in ordered_owners) else "C01"
+                _add_finding(
+                    findings, cid, "actionable",
+                    f"Chart/drawing part {part_p!r} is cross-shared across sheets {ordered_owners} (not shared in baseline)",
+                    sheet=ordered_owners[0],
+                )
+
     # C14 Multi-company non-target sheets preserved:
     # Independently reject ANY structural op targeting a non-target sheet and compare candidate's
     # FULL normalized worksheet XML directly against TRUE baseline replayed through legal target_ops!
     if not non_target_sheets:
         _add_finding(findings, "C14", "not_applicable", "Single-company workbook (no non-target company sheets)")
     else:
-        non_target_set = set(non_target_sheets)
         all_base_sheets = [s["name"] for s in (base_fp.get("sheet_order") or [])]
-        ops = list(cm.get("ops") or [])
         target_ops: list[dict[str, Any]] = []
-        for op in ops:
+        for op in all_ops:
             op_sh = str(op.get("sheet") or "")
             if op_sh in non_target_set:
                 _add_finding(
@@ -2283,21 +2390,12 @@ def run_checks(
                 target_ops.append(op)
 
         # Full-sheet normalized raw OOXML comparison + per-cell raw XML & SST <si>/<is> verification (R5 #2)
-        true_base_p: Path | None = None
-        if baseline_path is not None and Path(baseline_path).is_file():
-            true_base_p = Path(baseline_path).expanduser().resolve()
-        elif base_fp.get("source_path") and Path(str(base_fp["source_path"])).is_file():
-            true_base_p = Path(str(base_fp["source_path"])).expanduser().resolve()
-
-        expected_nt_xml: dict[str, bytes] = {}
         expected_nt_cells: dict[str, dict[str, Any]] = {}
         cand_nt_xml: dict[str, bytes] = {}
         cand_nt_cells: dict[str, dict[str, Any]] = {}
         base_raw_nt: dict[str, dict[str, dict[str, Any]]] = {}
         cand_raw_nt: dict[str, dict[str, dict[str, Any]]] = {}
         if true_base_p is not None:
-            expected_nt_xml, _ = _expected_non_target_sheet_xml_map(true_base_p, target_ops, non_target_sheets)
-            _, cand_pkg_payload = model_xlsx_hooks._read_package(cand)
             cand_pkg_parts = model_xlsx_hooks._sheet_parts(cand_pkg_payload)
             for nt_sh in non_target_sheets:
                 c_part = cand_pkg_parts.get(nt_sh)
@@ -2471,6 +2569,8 @@ def _render_remaining_issues_md(
     candidate_sha256: str | None,
     *,
     needs_excel_recalc_note: bool = False,
+    full_calc_on_load: bool = False,
+    recalc_skipped: bool = False,
 ) -> str:
     lines = [
         "> ⚠️ **模型已按「带问题交付」完成版本登记，以下未决事项或降级阶段供审阅参考：**",
@@ -2487,9 +2587,15 @@ def _render_remaining_issues_md(
             f"> - `[阶段降级记录]` 阶段 `{st}` 执行失败或超时（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
         )
     if needs_excel_recalc_note:
-        lines.append(
-            f"> - `[公式重算提示]` 复算未完成，已开启 `fullCalcOnLoad=1`，公式结果需在 Excel 中打开后重算（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
-        )
+        if full_calc_on_load:
+            prefix_txt = "本轮跳过复算（`--skip-recalc`）" if recalc_skipped else "复算未完成"
+            lines.append(
+                f"> - `[公式重算提示]` {prefix_txt}，已开启 `fullCalcOnLoad=1`，公式结果需在 Excel 中打开后重算（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
+            )
+        else:
+            lines.append(
+                f"> - `[公式重算提示]` 复算未完成，且当前工作簿未开启 `fullCalcOnLoad=1`，公式缓存可能为空或过期，需完成复算或开启 `fullCalcOnLoad=1` 后再交付（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -2707,14 +2813,7 @@ def write_check_and_ledger(
 
     f_stages = [s.strip() for s in (failed_stages or []) if s.strip()]
     recalc_st = str(((cm or {}).get("recalc_result") or {}).get("status") or "").strip().lower()
-    if recalc_st in ("recalc_failed", "incomplete") and "recalc" not in f_stages:
-        f_stages.append("recalc")
-    if (
-        res.get("is_template_build")
-        and int(res.get("empty_formula_count") or 0) > 0
-        and recalc_st == "skipped"
-        and "recalc" not in f_stages
-    ):
+    if recalc_st in ("recalc_failed", "incomplete", "skipped") and "recalc" not in f_stages:
         f_stages.append("recalc")
 
     # Principle #4: if consensus-diff.{json,md} was not generated for the current candidate,
@@ -2743,10 +2842,12 @@ def write_check_and_ledger(
     review_pack_path.write_text(_render_review_pack_md(res, ticker, summary_10), encoding="utf-8")
 
     has_open = (len(actionable_list) > 0) or (len(f_stages) > 0)
+    cand_full_calc_actual = bool(res.get("full_calc_on_load"))
     needs_excel_recalc_note = ("recalc" in f_stages) and bool(
         res.get("is_template_build")
         or int(res.get("empty_formula_count") or 0) > 0
-        or res.get("full_calc_on_load")
+        or cand_full_calc_actual
+        or recalc_st == "skipped"
     )
     if not res["readable"]:
         final_status = "failed_unusable"
@@ -2758,6 +2859,8 @@ def write_check_and_ledger(
                 f_stages,
                 res["candidate_sha256"],
                 needs_excel_recalc_note=needs_excel_recalc_note,
+                full_calc_on_load=cand_full_calc_actual,
+                recalc_skipped=(recalc_st == "skipped"),
             ),
             encoding="utf-8",
         )
@@ -2939,7 +3042,13 @@ def write_fallback_ledger(
             needs_excel_recalc_fb = bool((xml_m.get("calc_properties") or {}).get("full_calc_on_load"))
         except Exception:
             needs_excel_recalc_fb = False
-    rem_text = _render_remaining_issues_md([], f_stages, cand_sha, needs_excel_recalc_note=needs_excel_recalc_fb)
+    rem_text = _render_remaining_issues_md(
+        [],
+        f_stages,
+        cand_sha,
+        needs_excel_recalc_note=needs_excel_recalc_fb,
+        full_calc_on_load=needs_excel_recalc_fb,
+    )
     if reason:
         rem_text += f"> - `[补充说明]` {reason}\n"
     if not ok_read:
