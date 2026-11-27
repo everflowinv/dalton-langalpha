@@ -45,6 +45,13 @@ from src.server.services.egress import reachability as egress_reachability
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _install_restore_reset_sql(work_dir: Path) -> None:
+    src = REPO_ROOT / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst = work_dir / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+
+
 def _clear_storage_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for prefix in ("DALTON_CHAT_UPLOAD_STORAGE_", "DALTON_ASR_STORAGE_"):
         for suffix in (
@@ -2505,6 +2512,7 @@ class TestSandboxNetworkAndInitScript:
         def _make_work(name: str, env_text: str, *, include_agent_yaml: bool = True) -> Path:
             w = tmp_path / name
             w.mkdir(parents=True, exist_ok=True)
+            _install_restore_reset_sql(w)
             (w / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
             (w / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
             if include_agent_yaml:
@@ -2834,6 +2842,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_mid = tmp_path / "work-mid-fail"
         w_mid.mkdir()
+        _install_restore_reset_sql(w_mid)
         (w_mid / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mid / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mid / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -3493,6 +3502,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_ov = tmp_path / "r9-work-ov"
         w_ov.mkdir()
+        _install_restore_reset_sql(w_ov)
         (w_ov / "docker-compose.yml").write_text(
             "services:\n  backend:\n    env_file: .env\n", encoding="utf-8"
         )
@@ -3707,6 +3717,7 @@ class TestSandboxNetworkAndInitScript:
         proj_multi_db = f"r9-multi-db-{os.getpid()}"
         w_mdb = tmp_path / "r9-work-mdb"
         w_mdb.mkdir()
+        _install_restore_reset_sql(w_mdb)
         (w_mdb / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mdb / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mdb / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4136,6 +4147,7 @@ class TestSandboxNetworkAndInitScript:
         bak_post = _make_r11_backup("r11-bak-post", proj_post, new_env_post)
         w_post = tmp_path / "r11-work-post"
         w_post.mkdir()
+        _install_restore_reset_sql(w_post)
         (w_post / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_post / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_post / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4211,6 +4223,7 @@ class TestSandboxNetworkAndInitScript:
         bak_ok = _make_r11_backup("r11-bak-ok", proj_ok, new_env_ok)
         w_ok = tmp_path / "r11-work-ok"
         w_ok.mkdir()
+        _install_restore_reset_sql(w_ok)
         (w_ok / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_ok / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_ok / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4294,6 +4307,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_keep = tmp_path / "r11-work-keep"
         w_keep.mkdir()
+        _install_restore_reset_sql(w_keep)
         (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4566,6 +4580,7 @@ class TestSandboxNetworkAndInitScript:
         bak_term = _make_r12_backup("r12-bak-term", proj_term, new_term_env)
         w_term = tmp_path / "r12-work-term"
         w_term.mkdir()
+        _install_restore_reset_sql(w_term)
         (w_term / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_term / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_term / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4829,6 +4844,7 @@ class TestSandboxNetworkAndInitScript:
         bak_keep = _make_r13_backup("r13-bak-keep", proj_keep, orig_keep_env + "EXTRA=from-backup\n")
         w_keep = tmp_path / "r13-work-keep"
         w_keep.mkdir()
+        _install_restore_reset_sql(w_keep)
         (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -5024,6 +5040,7 @@ class TestSandboxNetworkAndInitScript:
         bak_unr = _make_r13_backup("r13-bak-unreadable", proj_unr, new_unr_env)
         w_unr = tmp_path / "r13-work-unreadable"
         w_unr.mkdir()
+        _install_restore_reset_sql(w_unr)
         (w_unr / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_unr / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_unr / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -5510,6 +5527,7 @@ class TestSandboxNetworkAndInitScript:
                 work_r = case_dir / "work"
                 bak_r = case_dir / "backup"
                 (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                _install_restore_reset_sql(work_r)
                 bak_r.mkdir()
                 (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
                 (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
@@ -5948,6 +5966,7 @@ class TestSandboxNetworkAndInitScript:
                     work_r = case_dir / "work"
                     bak_r = case_dir / "backup"
                     (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                    _install_restore_reset_sql(work_r)
                     bak_r.mkdir()
                     (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
                     (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")

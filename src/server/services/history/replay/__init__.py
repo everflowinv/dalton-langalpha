@@ -185,11 +185,7 @@ async def build_replay_page(
     inputs, anchored, tip_id = branch
     # DALTON-HOOK(team-sharing): forward persist flag to cold.Policy
     # DALTON-HOOK(personal-integrations): forward expected_purge_gen captured before replay reads
-    policy = cold.Policy(
-        turn_fallback=turn_fallback,
-        persist=persist,
-        expected_purge_gen=rows.expected_purge_gen if persist else None,
-    )
+    policy = cold.Policy(turn_fallback=turn_fallback, persist=persist, expected_purge_gen=rows.expected_purge_gen if persist else None)
 
     lost: list[Any] = []
 

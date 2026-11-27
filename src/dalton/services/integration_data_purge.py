@@ -8,7 +8,8 @@ State lives exclusively in PostgreSQL; no process-local truth is kept.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import logging
 import os
@@ -38,8 +39,11 @@ from src.dalton.database.user_integrations import (
     LocalPurgeStatus,
     PurgeLedgerRow,
     purge_lock_key,
+    purge_thread_lock_key,
 )
 from src.llms.reasoning_payload import REASONING_KWARG_KEYS
+from src.server.database import pool as db_pool
+from src.server.database import session_lock
 from src.server.database.pool import get_db_connection
 from src.server.database.runs import lifecycle as run_lifecycle
 from src.server.database.runs import subagent_runs
@@ -485,24 +489,38 @@ def redact_ui_record(
             fallback_in_suffix=in_suffix,
         ):
             new_rep = dict(replaced)
+            if SIDECAR_KEY in new_rep:
+                new_rep.pop(SIDECAR_KEY, None)
+                changed = True
             if "summary_text" in new_rep or new_rep.get("action") == "summarize":
                 new_rep["summary_text"] = PURGED_PLACEHOLDER
                 new_rep["summary_length"] = len(PURGED_PLACEHOLDER)
+                changed = True
+            if changed:
                 meta_dict["replaced_summary"] = new_rep  # type: ignore[index]
+            if meta_dict is not None and SIDECAR_KEY in meta_dict:
+                meta_dict.pop(SIDECAR_KEY, None)
                 changed = True
 
     if props_dict is not None:
-        if "summary_text" in props_dict:
+        if "summary_text" in props_dict or SIDECAR_KEY in props_dict:
             if _is_summary_id_affected(
                 sum_id,
                 affected_summary_ids=affected_summary_ids,
                 pre_touch_summary_ids=pre_touch_summary_ids,
                 fallback_in_suffix=in_suffix,
             ):
-                props_dict["summary_text"] = PURGED_PLACEHOLDER
-                if "summary_length" in props_dict:
-                    props_dict["summary_length"] = len(PURGED_PLACEHOLDER)
-                changed = True
+                if "summary_text" in props_dict:
+                    props_dict["summary_text"] = PURGED_PLACEHOLDER
+                    if "summary_length" in props_dict:
+                        props_dict["summary_length"] = len(PURGED_PLACEHOLDER)
+                    changed = True
+                if SIDECAR_KEY in props_dict:
+                    props_dict.pop(SIDECAR_KEY, None)
+                    changed = True
+                if meta_dict is not None and SIDECAR_KEY in meta_dict:
+                    meta_dict.pop(SIDECAR_KEY, None)
+                    changed = True
         if in_suffix:
             for tkey in ("text", "content", "message"):
                 if isinstance(props_dict.get(tkey), str) and props_dict[tkey] != PURGED_PLACEHOLDER:
@@ -661,6 +679,93 @@ def _redact_ui_container(
     )
 
 
+def _extract_summary_messages_from_event(value: Any) -> list[Any]:
+    """Extract ``summary_message`` from a ``_summarization_event`` channel value."""
+    if isinstance(value, _DeltaSnapshot):
+        return _extract_summary_messages_from_event(value.value)
+    if isinstance(value, Mapping):
+        sm = value.get("summary_message")
+        if sm is not None:
+            return [sm]
+    return []
+
+
+def _redact_summary_message_entry(msg: Any) -> Any:
+    """Replace a compaction summary message body with ``PURGED_PLACEHOLDER`` and drop ``SIDECAR_KEY``."""
+    if isinstance(msg, BaseMessage):
+        ak = dict(msg.additional_kwargs or {})
+        ak.pop(SIDECAR_KEY, None)
+        if isinstance(ak.get("summarize_complete"), Mapping):
+            sc = dict(ak["summarize_complete"])
+            sc["summary_length"] = len(PURGED_PLACEHOLDER)
+            ak["summarize_complete"] = sc
+        return msg.model_copy(
+            update={"content": PURGED_PLACEHOLDER, "additional_kwargs": ak}
+        )
+    if isinstance(msg, Mapping):
+        out = dict(msg)
+        ak = dict(out.get("additional_kwargs") or {})
+        ak.pop(SIDECAR_KEY, None)
+        if isinstance(ak.get("summarize_complete"), Mapping):
+            sc = dict(ak["summarize_complete"])
+            sc["summary_length"] = len(PURGED_PLACEHOLDER)
+            ak["summarize_complete"] = sc
+        out["content"] = PURGED_PLACEHOLDER
+        out["additional_kwargs"] = ak
+        return out
+    return msg
+
+
+def _redact_summarization_event_container(
+    value: Any,
+    *,
+    affected_summary_ids: set[str],
+    pre_touch_summary_ids: set[str],
+    min_turn: int,
+    max_turn: int,
+    force_suffix: bool = False,
+    in_suffix: bool = False,
+) -> tuple[Any, bool]:
+    """Redact ``_summarization_event.summary_message`` when affected, keeping ``cutoff_index``,
+    ``anchor_message_id``, and ``file_path`` intact. Pre-touch summaries are preserved verbatim.
+    """
+    if isinstance(value, _DeltaSnapshot):
+        inner, changed = _redact_summarization_event_container(
+            value.value,
+            affected_summary_ids=affected_summary_ids,
+            pre_touch_summary_ids=pre_touch_summary_ids,
+            min_turn=min_turn,
+            max_turn=max_turn,
+            force_suffix=force_suffix,
+            in_suffix=in_suffix,
+        )
+        return (_DeltaSnapshot(inner), True) if changed else (value, False)
+    if not isinstance(value, Mapping):
+        return value, False
+    sm = value.get("summary_message")
+    if sm is None:
+        return value, False
+    mid = _msg_id(sm)
+    if mid is not None:
+        affected = (
+            force_suffix
+            or _summary_span_overlaps(sm, min_turn, max_turn)
+            or mid in affected_summary_ids
+            or mid not in pre_touch_summary_ids
+        )
+    else:
+        affected = (
+            force_suffix
+            or in_suffix
+            or _summary_span_overlaps(sm, min_turn, max_turn)
+        )
+    if not affected:
+        return value, False
+    out = dict(value)
+    out["summary_message"] = _redact_summary_message_entry(sm)
+    return out, True
+
+
 # ---------------------------------------------------------------------------
 # Step 0: Cancel & drain in-flight runs on affected threads
 # ---------------------------------------------------------------------------
@@ -674,6 +779,10 @@ async def _cancel_and_drain_thread(
     timeout_s: float = 120.0,
 ) -> None:
     """Stamp durable cancellation on live runs/subagents on ``thread_id`` and wait for full WriterGuard drain.
+
+    Always waits until exclusive ``writer_guard.thread_key`` can be acquired AND
+    ``held_task_namespaces`` returns empty for ALL suffix subagent ``task_id`` values
+    (not only currently active rows), closing the finalize-before-release window.
 
     Raises on cancellation failure or drain timeout so the ledger stays ``running``
     and the thread stays blocked until the resume loop retries.
@@ -693,12 +802,11 @@ async def _cancel_and_drain_thread(
 
             await cur.execute(
                 """
-                SELECT sr.task_id, sr.task_run_id::text AS task_run_id
+                SELECT sr.task_id, sr.task_run_id::text AS task_run_id, sr.status
                 FROM subagent_runs sr
                 LEFT JOIN conversation_responses r
                   ON r.conversation_response_id = sr.parent_run_id
                 WHERE sr.thread_id = %s::uuid
-                  AND sr.status IN ('in_progress', 'running')
                   AND (
                       r.turn_index IS NULL
                       OR r.turn_index BETWEEN %s AND %s
@@ -706,7 +814,7 @@ async def _cancel_and_drain_thread(
                 """,
                 (thread_id, min_turn, max_turn),
             )
-            live_tasks = [dict(r) for r in await cur.fetchall()]
+            suffix_tasks = [dict(r) for r in await cur.fetchall()]
 
     for rid in live_runs:
         await run_lifecycle.request_run_cancel(
@@ -714,23 +822,23 @@ async def _cancel_and_drain_thread(
         )
         await publish_cancel_nudge(thread_id, rid)
 
-    active_task_ids: list[str] = []
-    for task in live_tasks:
+    suffix_task_ids: list[str] = []
+    for task in suffix_tasks:
         tid_task = str(task.get("task_id") or "")
         trid = str(task.get("task_run_id") or "")
-        if trid:
-            await subagent_runs.request_task_run_cancel(trid, thread_id=thread_id)
+        task_status = task.get("status")
         if tid_task:
-            active_task_ids.append(tid_task)
-            await publish_cancel_nudge(
-                thread_id, None, task_id=tid_task, task_run_id=trid or None
-            )
-    active_task_ids = sorted(set(active_task_ids))
+            suffix_task_ids.append(tid_task)
+        if task_status in ("in_progress", "running"):
+            if trid:
+                await subagent_runs.request_task_run_cancel(trid, thread_id=thread_id)
+            if tid_task:
+                await publish_cancel_nudge(
+                    thread_id, None, task_id=tid_task, task_run_id=trid or None
+                )
+    suffix_task_ids = sorted(set(suffix_task_ids))
 
-    if not live_runs and not live_tasks:
-        return
-
-    # Wait until exclusive T(thread) can be acquired AND no active suffix task namespace is held
+    # Wait until exclusive T(thread) can be acquired AND no suffix task namespace is held
     tkey = writer_guard.thread_key(thread_id)
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     async with get_db_connection() as lock_conn:
@@ -740,7 +848,7 @@ async def _cancel_and_drain_thread(
             if row and row[0]:
                 try:
                     held = await writer_guard.held_task_namespaces(
-                        thread_id, active_task_ids
+                        thread_id, suffix_task_ids
                     )
                 finally:
                     with anyio.CancelScope(shield=True):
@@ -832,6 +940,7 @@ async def _purge_thread_checkpoints(
 
         pre_touch_cp_ids: set[str] = set()
         suffix_cp_ids: set[str] = set()
+        post_range_cp_ids: set[str] = set()
         for c in main_cps:
             cid = str(c["checkpoint_id"])
             meta = c.get("metadata") or {}
@@ -841,6 +950,8 @@ async def _purge_thread_checkpoints(
                 suffix_cp_ids.add(cid)
             elif ti is not None and ti < min_turn:
                 pre_touch_cp_ids.add(cid)
+            elif ti is not None and ti > max_turn:
+                post_range_cp_ids.add(cid)
             else:
                 # Unresolved checkpoint: if min_turn == 0 treat as suffix; otherwise preserve unless summary overlaps
                 if min_turn == 0:
@@ -848,29 +959,38 @@ async def _purge_thread_checkpoints(
                 else:
                     pre_touch_cp_ids.add(cid)
 
-        # Determine which checkpoint_blobs versions are referenced by pre-touch checkpoints
+        # Determine which checkpoint_blobs versions are referenced by pre-touch / suffix / post-range checkpoints
         pre_blob_versions: set[tuple[str, str, str]] = set()
+        suffix_blob_versions: set[tuple[str, str, str]] = set()
+        post_blob_versions: set[tuple[str, str, str]] = set()
+        blob_version_to_cp_id: dict[tuple[str, str, str], str] = {}
         suffix_task_namespaces = {f"task:{tid}" for tid in suffix_task_ids}
 
         for c in all_cps:
             ns = str(c["checkpoint_ns"])
             cid = str(c["checkpoint_id"])
-            if ns != "" or cid not in pre_touch_cp_ids:
-                continue
             cp_obj = c.get("checkpoint") or {}
             ch_vers = cp_obj.get("channel_versions") if isinstance(cp_obj, Mapping) else {}
             if not isinstance(ch_vers, Mapping):
                 continue
             for ch, ver in ch_vers.items():
-                pre_blob_versions.add((ns, str(ch), str(ver)))
+                vkey = (ns, str(ch), str(ver))
+                blob_version_to_cp_id.setdefault(vkey, cid)
+                if ns == "":
+                    if cid in pre_touch_cp_ids:
+                        pre_blob_versions.add(vkey)
+                    if cid in suffix_cp_ids:
+                        suffix_blob_versions.add(vkey)
+                    if cid in post_range_cp_ids:
+                        post_blob_versions.add(vkey)
 
-        # Load writes & blobs for this thread
+        # Load writes & blobs for this thread (including real compaction channel _summarization_event)
         await cur.execute(
             """
             SELECT checkpoint_ns, checkpoint_id, task_id, idx, channel, type, blob
             FROM checkpoint_writes
             WHERE thread_id = %s
-              AND channel IN ('messages', 'ui', '__interrupt__')
+              AND channel IN ('messages', 'ui', '__interrupt__', '_summarization_event')
               AND blob IS NOT NULL
             """,
             (thread_id,),
@@ -882,7 +1002,7 @@ async def _purge_thread_checkpoints(
             SELECT checkpoint_ns, channel, version, type, blob
             FROM checkpoint_blobs
             WHERE thread_id = %s
-              AND channel IN ('messages', 'ui')
+              AND channel IN ('messages', 'ui', '_summarization_event')
               AND blob IS NOT NULL
             """,
             (thread_id,),
@@ -892,6 +1012,8 @@ async def _purge_thread_checkpoints(
         # Pass 1a: collect every message id, summary id, and ui record id present in any pre-touch checkpoint
         # (including blob versions shared between pre-touch and suffix checkpoints)
         pre_touch_msg_ids: set[str] = set()
+        suffix_seen_msg_ids: set[str] = set()
+        post_range_seen_msg_ids: set[str] = set()
         pre_touch_summary_ids: set[str] = set()
         pre_touch_ui_ids: set[str] = set()
         affected_summary_ids: set[str] = set()
@@ -906,6 +1028,13 @@ async def _purge_thread_checkpoints(
                 cs_id = _context_summary_id(m)
                 if cs_id:
                     pre_touch_summary_ids.add(cs_id)
+
+        def _collect_pre_summarization_event(val: Any) -> None:
+            for sm in _extract_summary_messages_from_event(val):
+                mid = _msg_id(sm)
+                if mid:
+                    pre_touch_msg_ids.add(mid)
+                    pre_touch_summary_ids.add(mid)
 
         def _collect_pre_ui(recs: list[Any]) -> None:
             for rec in recs:
@@ -939,6 +1068,17 @@ async def _purge_thread_checkpoints(
                 if cs_id and (force_suffix or cs_id not in pre_touch_summary_ids):
                     affected_summary_ids.add(cs_id)
 
+        def _collect_affected_summarization_event(val: Any, *, force_suffix: bool) -> None:
+            for sm in _extract_summary_messages_from_event(val):
+                mid = _msg_id(sm)
+                if (
+                    force_suffix
+                    or _summary_span_overlaps(sm, min_turn, max_turn)
+                    or (mid is not None and mid not in pre_touch_summary_ids)
+                ):
+                    if mid:
+                        affected_summary_ids.add(mid)
+
         def _collect_affected_ui(recs: list[Any], *, force_suffix: bool) -> None:
             for rec in recs:
                 if not isinstance(rec, Mapping):
@@ -961,11 +1101,25 @@ async def _purge_thread_checkpoints(
                 continue
             try:
                 val = serde.loads_typed((w["type"], bytes(w["blob"])))
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to decode checkpoint write for thread_id={thread_id} "
+                    f"checkpoint_id={w['checkpoint_id']} channel={w['channel']}"
+                ) from exc
             decoded_writes.append((w, val))
             ns = str(w["checkpoint_ns"])
             cid = str(w["checkpoint_id"])
+            if ns == "" and w["channel"] == "messages":
+                if cid in suffix_cp_ids:
+                    for m in _collect_messages_from_value(val):
+                        mid = _msg_id(m)
+                        if mid:
+                            suffix_seen_msg_ids.add(mid)
+                if cid in post_range_cp_ids:
+                    for m in _collect_messages_from_value(val):
+                        mid = _msg_id(m)
+                        if mid:
+                            post_range_seen_msg_ids.add(mid)
             is_pre = ns == "" and cid in pre_touch_cp_ids
             if not is_pre:
                 continue
@@ -973,23 +1127,46 @@ async def _purge_thread_checkpoints(
                 _collect_pre_msgs(_collect_messages_from_value(val))
             elif w["channel"] == "ui":
                 _collect_pre_ui(_collect_ui_records_from_value(val))
+            elif w["channel"] == "_summarization_event":
+                _collect_pre_summarization_event(val)
 
         decoded_blobs: list[tuple[dict[str, Any], Any]] = []
         for b in blobs:
             if not b["type"] or b["type"] == "empty":
                 continue
+            key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
             try:
                 val = serde.loads_typed((b["type"], bytes(b["blob"])))
-            except Exception:
-                continue
+            except Exception as exc:
+                ref_cid = blob_version_to_cp_id.get(key, str(b["version"]))
+                raise RuntimeError(
+                    f"Failed to decode checkpoint blob for thread_id={thread_id} "
+                    f"checkpoint_id={ref_cid} channel={b['channel']}"
+                ) from exc
             decoded_blobs.append((b, val))
-            key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
+            if b["channel"] == "messages":
+                if key in suffix_blob_versions:
+                    for m in _collect_messages_from_value(val):
+                        mid = _msg_id(m)
+                        if mid:
+                            suffix_seen_msg_ids.add(mid)
+                if key in post_blob_versions:
+                    for m in _collect_messages_from_value(val):
+                        mid = _msg_id(m)
+                        if mid:
+                            post_range_seen_msg_ids.add(mid)
             if key not in pre_blob_versions:
                 continue
             if b["channel"] == "messages":
                 _collect_pre_msgs(_collect_messages_from_value(val))
             elif b["channel"] == "ui":
                 _collect_pre_ui(_collect_ui_records_from_value(val))
+            elif b["channel"] == "_summarization_event":
+                _collect_pre_summarization_event(val)
+
+        # Preserve messages strictly before min_turn AND messages born strictly after max_turn
+        if post_range_seen_msg_ids:
+            pre_touch_msg_ids.update(post_range_seen_msg_ids - suffix_seen_msg_ids)
 
         # Pass 1b: determine affected summary ids (span overlaps [min_turn, max_turn] OR not in pre-touch)
         for w, val in decoded_writes:
@@ -999,6 +1176,8 @@ async def _purge_thread_checkpoints(
                 _collect_affected_msgs(_collect_messages_from_value(val), force_suffix=force_suf)
             elif w["channel"] == "ui":
                 _collect_affected_ui(_collect_ui_records_from_value(val), force_suffix=force_suf)
+            elif w["channel"] == "_summarization_event":
+                _collect_affected_summarization_event(val, force_suffix=force_suf)
 
         for b, val in decoded_blobs:
             ns = str(b["checkpoint_ns"])
@@ -1007,6 +1186,8 @@ async def _purge_thread_checkpoints(
                 _collect_affected_msgs(_collect_messages_from_value(val), force_suffix=force_suf)
             elif b["channel"] == "ui":
                 _collect_affected_ui(_collect_ui_records_from_value(val), force_suffix=force_suf)
+            elif b["channel"] == "_summarization_event":
+                _collect_affected_summarization_event(val, force_suffix=force_suf)
 
         # Pass 2: rewrite checkpoint_writes
         for w, val in decoded_writes:
@@ -1034,6 +1215,16 @@ async def _purge_thread_checkpoints(
                     pre_touch_ui_ids=pre_touch_ui_ids,
                     pre_touch_summary_ids=pre_touch_summary_ids,
                     force_suffix=force_suf,
+                )
+            elif ch == "_summarization_event":
+                new_val, changed = _redact_summarization_event_container(
+                    val,
+                    affected_summary_ids=affected_summary_ids,
+                    pre_touch_summary_ids=pre_touch_summary_ids,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    force_suffix=force_suf,
+                    in_suffix=is_suf,
                 )
             elif ch == "__interrupt__" and is_suf:
                 new_val = redact_interrupt_payload(val)
@@ -1068,6 +1259,7 @@ async def _purge_thread_checkpoints(
             ns = str(b["checkpoint_ns"])
             ch = str(b["channel"])
             ver = str(b["version"])
+            key = (ns, ch, ver)
             force_suf = ns in suffix_task_namespaces
 
             changed = False
@@ -1088,6 +1280,16 @@ async def _purge_thread_checkpoints(
                     pre_touch_ui_ids=pre_touch_ui_ids,
                     pre_touch_summary_ids=pre_touch_summary_ids,
                     force_suffix=force_suf,
+                )
+            elif ch == "_summarization_event":
+                new_val, changed = _redact_summarization_event_container(
+                    val,
+                    affected_summary_ids=affected_summary_ids,
+                    pre_touch_summary_ids=pre_touch_summary_ids,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    force_suffix=force_suf,
+                    in_suffix=key not in pre_blob_versions,
                 )
 
             if changed:
@@ -1187,16 +1389,30 @@ def collect_redis_keys_for_suffix(
     return list(dict.fromkeys(keys))
 
 
+def is_redis_configured_for_purge() -> bool:
+    """Return True if Redis cache is enabled by deployment configuration (config.yaml + REDIS_CACHE_ENABLED)."""
+    from src.config.settings import is_redis_cache_enabled
+
+    cache_enabled_env = os.getenv("REDIS_CACHE_ENABLED", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    return bool(is_redis_cache_enabled() and cache_enabled_env)
+
+
 async def _delete_redis_keys(keys: list[str]) -> int:
     if not keys:
+        return 0
+    if not is_redis_configured_for_purge():
         return 0
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
-    if not cache.enabled:
-        return 0
-    if not cache.client:
-        raise RuntimeError("Redis cache is enabled but client is unavailable for purge key deletion")
+    if not cache.enabled or not cache.client:
+        raise RuntimeError(
+            "Redis cache is configured enabled but client is unavailable for purge key deletion"
+        )
     deleted = await cache.client.delete(*keys)
     return int(deleted or 0)
 
@@ -1362,6 +1578,41 @@ async def _resolve_thread_ranges(
     return ranges
 
 
+@asynccontextmanager
+async def try_purge_ledger_lock(purge_id: str) -> AsyncIterator[bool]:
+    """Acquire the per-ledger advisory lock on a dedicated out-of-pool session."""
+    async with session_lock.try_own_session_lock(purge_lock_key(purge_id)) as acquired:
+        yield acquired
+
+
+@asynccontextmanager
+async def acquire_purge_thread_lock(
+    thread_id: str,
+    *,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 0.05,
+) -> AsyncIterator[None]:
+    """Hold per-thread purge mutex on a dedicated out-of-pool session until ``timeout_s``."""
+    lock_key = purge_thread_lock_key(thread_id)
+    conn = await db_pool.open_session_connection()
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    try:
+        while True:
+            cur = await conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            row = await cur.fetchone()
+            if row and row[0]:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out waiting for purge thread lock on thread={thread_id} after {timeout_s:.1f}s"
+                )
+            await asyncio.sleep(min(poll_interval_s, remaining))
+        yield
+    finally:
+        await session_lock.await_settled(asyncio.ensure_future(conn.close()))
+
+
 async def run_local_purge(
     purge_id: str,
     *,
@@ -1371,7 +1622,7 @@ async def run_local_purge(
     """Execute the 6-layer Scheme 2A local online purge for ``purge_id`` (idempotent & re-entrant).
 
     Acquires per-ledger advisory lock ``advisory_key('dalton_integration_purge', purge_id)``
-    unless ``_lock_held=True`` (when called via ``finish_disconnect_locked``).
+    on an out-of-pool session unless ``_lock_held=True`` (when called via ``finish_disconnect_locked``).
     Raises if any required layer fails so the ledger remains ``running`` and the thread
     remains blocked until retried.
 
@@ -1381,21 +1632,368 @@ async def run_local_purge(
     ``FOR UPDATE`` transaction.
     """
     if not _lock_held:
-        lock_key = purge_lock_key(purge_id)
-        async with get_db_connection() as lock_conn:
-            cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
-            lock_row = await cur.fetchone()
-            if not (lock_row and lock_row[0]):
+        async with try_purge_ledger_lock(purge_id) as acquired:
+            if not acquired:
                 return LocalPurgeReport(purge_id=str(purge_id), skipped=True)
-            try:
-                return await _run_local_purge_body(
-                    purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
-                )
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            return await _run_local_purge_body(
+                purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+            )
     return await _run_local_purge_body(
         purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+    )
+
+
+async def _purge_single_thread_layers(
+    *,
+    tid: str,
+    min_turn: int,
+    max_turn: int,
+    user_id: str,
+    cp_pool: Any,
+    cp_serde: Any,
+    report: LocalPurgeReport,
+    thread_workspace_ids: dict[str, str | None],
+    all_suffix_run_ids: list[str],
+    blobs_to_release: list[tuple[str, str]],
+    redis_keys_to_delete: list[str],
+) -> None:
+    """Execute per-thread Layer 1, 2a, 2b, 3a, 4, 5a, 5b reads and commits under the thread purge lock."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT workspace_id::text AS workspace_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+            ws_row = await cur.fetchone()
+            thread_workspace_ids[tid] = (
+                str(ws_row["workspace_id"])
+                if ws_row and ws_row.get("workspace_id")
+                else None
+            )
+
+            await cur.execute(
+                """
+                SELECT conversation_response_id::text AS run_id,
+                       turn_index,
+                       metadata
+                FROM conversation_responses
+                WHERE conversation_thread_id = %s::uuid
+                ORDER BY turn_index ASC, attempt_no ASC
+                """,
+                (tid,),
+            )
+            all_responses = [dict(r) for r in await cur.fetchall()]
+            run_turn_map = {
+                str(r["run_id"]): int(r["turn_index"])
+                for r in all_responses
+                if r.get("turn_index") is not None
+            }
+            suffix_responses = [
+                r
+                for r in all_responses
+                if r.get("turn_index") is not None
+                and min_turn <= int(r["turn_index"]) <= max_turn
+            ]
+            suffix_run_ids = [str(r["run_id"]) for r in suffix_responses]
+            all_suffix_run_ids.extend(suffix_run_ids)
+
+            suffix_task_ids: list[str] = []
+            suffix_task_run_ids: list[str] = []
+            if suffix_run_ids:
+                await cur.execute(
+                    """
+                    SELECT task_id, task_run_id::text AS task_run_id
+                    FROM subagent_runs
+                    WHERE thread_id = %s::uuid
+                      AND parent_run_id = ANY(%s::uuid[])
+                    """,
+                    (tid, suffix_run_ids),
+                )
+                sr_rows = [dict(r) for r in await cur.fetchall()]
+                suffix_task_ids = sorted(
+                    {str(r["task_id"]) for r in sr_rows if r.get("task_id")}
+                )
+                suffix_task_run_ids = sorted(
+                    {str(r["task_run_id"]) for r in sr_rows if r.get("task_run_id")}
+                )
+
+    # Layer 1a: Checkpoints + Layer 5b BaseStore memories (on checkpointer DB)
+    if cp_serde is not None:
+        if isinstance(cp_pool, AsyncConnectionPool):
+            async with cp_pool.connection() as cp_conn, cp_conn.transaction():
+                report.checkpoints_updated += await _purge_thread_checkpoints(
+                    cp_conn,
+                    cp_serde,
+                    thread_id=tid,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    run_turn_map=run_turn_map,
+                    suffix_run_ids=set(suffix_run_ids),
+                    suffix_task_ids=set(suffix_task_ids),
+                )
+                report.store_rows_deleted += await _purge_store_memories_for_thread(
+                    cp_conn, tid
+                )
+        else:
+            # Same DB fallback (e.g. when checkpointer shares app DB pool in tests)
+            async with get_db_connection() as app_cp_conn, app_cp_conn.transaction():
+                async with app_cp_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute("SELECT to_regclass('public.checkpoints') AS tbl")
+                    has_cp = await cur.fetchone()
+                if not (has_cp and has_cp.get("tbl")):
+                    raise RuntimeError(
+                        f"Checkpoints table public.checkpoints missing in same-DB fallback for thread_id={tid}"
+                    )
+                report.checkpoints_updated += await _purge_thread_checkpoints(
+                    app_cp_conn,
+                    cp_serde,
+                    thread_id=tid,
+                    min_turn=min_turn,
+                    max_turn=max_turn,
+                    run_turn_map=run_turn_map,
+                    suffix_run_ids=set(suffix_run_ids),
+                    suffix_task_ids=set(suffix_task_ids),
+                )
+                report.store_rows_deleted += await _purge_store_memories_for_thread(
+                    app_cp_conn, tid
+                )
+
+    # App DB Layers 1b, 2a, 3a, 4, 5a
+    async with get_db_connection() as conn, conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            # Layer 1b: conversation_queries.content
+            await cur.execute(
+                """
+                UPDATE conversation_queries
+                SET content = %s
+                WHERE conversation_thread_id = %s::uuid
+                  AND turn_index BETWEEN %s AND %s
+                """,
+                (PURGED_PLACEHOLDER, tid, min_turn, max_turn),
+            )
+            report.queries_redacted += int(cur.rowcount or 0)
+
+            # Layer 1c: conversation_responses.metadata.steering_inputs
+            for r in suffix_responses:
+                meta = r.get("metadata")
+                if isinstance(meta, Mapping) and "steering_inputs" in meta:
+                    new_steers, changed = _redact_steering_inputs_list(
+                        meta.get("steering_inputs")
+                    )
+                    if changed:
+                        new_meta = dict(meta)
+                        new_meta["steering_inputs"] = new_steers
+                        await cur.execute(
+                            """
+                            UPDATE conversation_responses
+                            SET metadata = %s
+                            WHERE conversation_response_id = %s::uuid
+                            """,
+                            (Jsonb(new_meta), str(r["run_id"])),
+                        )
+                        report.steerings_redacted += 1
+
+            # Layer 2a: turn_slices, task_run_slices, provenance_records, replay_facts
+            if suffix_run_ids:
+                await cur.execute(
+                    "DELETE FROM turn_slices WHERE conversation_response_id = ANY(%s::uuid[])",
+                    (suffix_run_ids,),
+                )
+                await cur.execute(
+                    """
+                    UPDATE conversation_responses
+                    SET replay_facts = NULL
+                    WHERE conversation_response_id = ANY(%s::uuid[])
+                    """,
+                    (suffix_run_ids,),
+                )
+            if suffix_task_ids or suffix_task_run_ids:
+                await cur.execute(
+                    """
+                    DELETE FROM task_run_slices
+                    WHERE conversation_thread_id = %s::uuid
+                      AND (
+                          task_id = ANY(%s::text[])
+                          OR task_run_id = ANY(%s::uuid[])
+                      )
+                    """,
+                    (tid, suffix_task_ids, suffix_task_run_ids),
+                )
+            if suffix_task_run_ids:
+                await cur.execute(
+                    """
+                    UPDATE subagent_runs
+                    SET replay_facts = NULL
+                    WHERE task_run_id = ANY(%s::uuid[])
+                    """,
+                    (suffix_task_run_ids,),
+                )
+            await cur.execute(
+                """
+                DELETE FROM provenance_records
+                WHERE conversation_thread_id = %s::uuid
+                  AND turn_index BETWEEN %s AND %s
+                """,
+                (tid, min_turn, max_turn),
+            )
+
+            # Layer 2b: hook_outbox delivered/returned/pending/failed steers
+            if suffix_run_ids:
+                await cur.execute(
+                    """
+                    UPDATE hook_outbox
+                    SET payload = CASE
+                            WHEN payload ? 'text'
+                            THEN jsonb_set(
+                                jsonb_set(payload, '{content}', to_jsonb(%s::text), true),
+                                '{text}', to_jsonb(%s::text), true
+                            )
+                            ELSE jsonb_set(payload, '{content}', to_jsonb(%s::text), true)
+                        END
+                    WHERE conversation_thread_id = %s::uuid
+                      AND hook_type = 'steer'
+                      AND (
+                          run_id = ANY(%s::uuid[])
+                          OR payload->>'steered_run_id' = ANY(%s::text[])
+                          OR payload->>'returned_run_id' = ANY(%s::text[])
+                          OR payload->>'failed_run_id' = ANY(%s::text[])
+                      )
+                    """,
+                    (
+                        PURGED_PLACEHOLDER,
+                        PURGED_PLACEHOLDER,
+                        PURGED_PLACEHOLDER,
+                        tid,
+                        suffix_run_ids,
+                        suffix_run_ids,
+                        suffix_run_ids,
+                        suffix_run_ids,
+                    ),
+                )
+                report.outbox_rows_redacted += int(cur.rowcount or 0)
+
+            # Terminate & redact pending or failed steers on this thread
+            await cur.execute(
+                """
+                UPDATE hook_outbox
+                SET status = 'done',
+                    completed_at = COALESCE(completed_at, NOW()),
+                    payload = jsonb_set(
+                        CASE
+                            WHEN payload ? 'text'
+                            THEN jsonb_set(
+                                jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true),
+                                '{text}', to_jsonb(%s::text), true
+                            )
+                            ELSE jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true)
+                        END,
+                        '{outcome}',
+                        '"purged"'::jsonb,
+                        true
+                    )
+                WHERE conversation_thread_id = %s::uuid
+                  AND hook_type = 'steer'
+                  AND (
+                      status IN ('pending', 'claimed', 'dead')
+                      OR (status = 'done' AND payload->>'outcome' = 'failed')
+                  )
+                """,
+                (
+                    PURGED_PLACEHOLDER,
+                    PURGED_PLACEHOLDER,
+                    PURGED_PLACEHOLDER,
+                    tid,
+                ),
+            )
+            report.outbox_rows_redacted += int(cur.rowcount or 0)
+
+            # Layer 3a: thread_transcripts & thread_transcript_files
+            await cur.execute(
+                """
+                SELECT DISTINCT user_id, sha256
+                FROM thread_transcript_files
+                WHERE conversation_thread_id = %s::uuid
+                  AND content IS NULL
+                """,
+                (tid,),
+            )
+            for brow in await cur.fetchall():
+                blobs_to_release.append((str(brow["user_id"]), str(brow["sha256"])))
+
+            await cur.execute(
+                "DELETE FROM thread_transcript_files WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+            await cur.execute(
+                "DELETE FROM thread_transcripts WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+            report.transcripts_deleted += int(cur.rowcount or 0)
+
+            # Layer 4: thread_search_turns in closed interval [min_turn, max_turn]
+            await cur.execute(
+                """
+                UPDATE thread_search_turns
+                SET user_text = '',
+                    answer_text = '',
+                    answer_read = TRUE,
+                    read_failures = 0,
+                    retry_at = NULL,
+                    read_at = clock_timestamp()
+                WHERE conversation_thread_id = %s::uuid
+                  AND turn_index BETWEEN %s AND %s
+                """,
+                (tid, min_turn, max_turn),
+            )
+            cleared_here = int(cur.rowcount or 0)
+            # Also ensure every current settled response in [min_turn, max_turn] has an empty read placeholder
+            await cur.execute(
+                """
+                INSERT INTO thread_search_turns (
+                    conversation_thread_id, turn_index,
+                    conversation_response_id, attempt_no,
+                    user_text, answer_text, answer_read,
+                    read_failures, retry_at, turn_at, read_at
+                )
+                SELECT r.conversation_thread_id, r.turn_index,
+                       r.conversation_response_id, r.attempt_no,
+                       '', '', TRUE,
+                       0, NULL, r.created_at, clock_timestamp()
+                FROM conversation_responses r
+                WHERE r.conversation_thread_id = %s::uuid
+                  AND r.turn_index BETWEEN %s AND %s
+                  AND r.status <> 'in_progress'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM conversation_responses n
+                      WHERE n.conversation_thread_id = r.conversation_thread_id
+                        AND n.turn_index = r.turn_index
+                        AND n.status <> 'in_progress'
+                        AND n.attempt_no > r.attempt_no
+                  )
+                ON CONFLICT (conversation_thread_id, turn_index) DO UPDATE
+                SET conversation_response_id = EXCLUDED.conversation_response_id,
+                    attempt_no = EXCLUDED.attempt_no,
+                    user_text = '',
+                    answer_text = '',
+                    answer_read = TRUE,
+                    read_failures = 0,
+                    retry_at = NULL,
+                    read_at = clock_timestamp()
+                """,
+                (tid, min_turn, max_turn),
+            )
+            report.search_rows_cleared += max(cleared_here, int(cur.rowcount or 0))
+
+        # Layer 5a: dalton_conversation_cards fallback cleanup
+        report.cards_deleted += await _purge_conversation_cards_for_thread(
+            conn, tid, user_id
+        )
+
+    # Collect Layer 2c Redis keys for this thread
+    redis_keys_to_delete.extend(
+        collect_redis_keys_for_suffix(
+            tid, suffix_run_ids, suffix_task_ids, suffix_task_run_ids
+        )
     )
 
 
@@ -1442,341 +2040,20 @@ async def _run_local_purge_body(
 
     for tid in target_thread_ids:
         min_turn, max_turn = thread_ranges[tid]
-
-        async with get_db_connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT workspace_id::text AS workspace_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
-                    (tid,),
-                )
-                ws_row = await cur.fetchone()
-                thread_workspace_ids[tid] = (
-                    str(ws_row["workspace_id"])
-                    if ws_row and ws_row.get("workspace_id")
-                    else None
-                )
-
-                await cur.execute(
-                    """
-                    SELECT conversation_response_id::text AS run_id,
-                           turn_index,
-                           metadata
-                    FROM conversation_responses
-                    WHERE conversation_thread_id = %s::uuid
-                    ORDER BY turn_index ASC, attempt_no ASC
-                    """,
-                    (tid,),
-                )
-                all_responses = [dict(r) for r in await cur.fetchall()]
-                run_turn_map = {
-                    str(r["run_id"]): int(r["turn_index"])
-                    for r in all_responses
-                    if r.get("turn_index") is not None
-                }
-                suffix_responses = [
-                    r
-                    for r in all_responses
-                    if r.get("turn_index") is not None
-                    and min_turn <= int(r["turn_index"]) <= max_turn
-                ]
-                suffix_run_ids = [str(r["run_id"]) for r in suffix_responses]
-                all_suffix_run_ids.extend(suffix_run_ids)
-
-                suffix_task_ids: list[str] = []
-                suffix_task_run_ids: list[str] = []
-                if suffix_run_ids:
-                    await cur.execute(
-                        """
-                        SELECT task_id, task_run_id::text AS task_run_id
-                        FROM subagent_runs
-                        WHERE thread_id = %s::uuid
-                          AND parent_run_id = ANY(%s::uuid[])
-                        """,
-                        (tid, suffix_run_ids),
-                    )
-                    sr_rows = [dict(r) for r in await cur.fetchall()]
-                    suffix_task_ids = sorted(
-                        {str(r["task_id"]) for r in sr_rows if r.get("task_id")}
-                    )
-                    suffix_task_run_ids = sorted(
-                        {str(r["task_run_id"]) for r in sr_rows if r.get("task_run_id")}
-                    )
-
-        # Layer 1a: Checkpoints + Layer 5b BaseStore memories (on checkpointer DB)
-        if cp_serde is not None:
-            if isinstance(cp_pool, AsyncConnectionPool):
-                async with cp_pool.connection() as cp_conn, cp_conn.transaction():
-                    report.checkpoints_updated += await _purge_thread_checkpoints(
-                        cp_conn,
-                        cp_serde,
-                        thread_id=tid,
-                        min_turn=min_turn,
-                        max_turn=max_turn,
-                        run_turn_map=run_turn_map,
-                        suffix_run_ids=set(suffix_run_ids),
-                        suffix_task_ids=set(suffix_task_ids),
-                    )
-                    report.store_rows_deleted += await _purge_store_memories_for_thread(
-                        cp_conn, tid
-                    )
-            else:
-                # Same DB fallback (e.g. when checkpointer shares app DB pool in tests)
-                async with get_db_connection() as app_cp_conn, app_cp_conn.transaction():
-                    async with app_cp_conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute("SELECT to_regclass('public.checkpoints') AS tbl")
-                        has_cp = await cur.fetchone()
-                    if has_cp and has_cp.get("tbl"):
-                        report.checkpoints_updated += await _purge_thread_checkpoints(
-                            app_cp_conn,
-                            cp_serde,
-                            thread_id=tid,
-                            min_turn=min_turn,
-                            max_turn=max_turn,
-                            run_turn_map=run_turn_map,
-                            suffix_run_ids=set(suffix_run_ids),
-                            suffix_task_ids=set(suffix_task_ids),
-                        )
-                    report.store_rows_deleted += await _purge_store_memories_for_thread(
-                        app_cp_conn, tid
-                    )
-
-        # App DB Layers 1b, 2a, 3a, 4, 5a
-        async with get_db_connection() as conn, conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
-                # Layer 1b: conversation_queries.content
-                await cur.execute(
-                    """
-                    UPDATE conversation_queries
-                    SET content = %s
-                    WHERE conversation_thread_id = %s::uuid
-                      AND turn_index BETWEEN %s AND %s
-                    """,
-                    (PURGED_PLACEHOLDER, tid, min_turn, max_turn),
-                )
-                report.queries_redacted += int(cur.rowcount or 0)
-
-                # Layer 1c: conversation_responses.metadata.steering_inputs
-                for r in suffix_responses:
-                    meta = r.get("metadata")
-                    if isinstance(meta, Mapping) and "steering_inputs" in meta:
-                        new_steers, changed = _redact_steering_inputs_list(
-                            meta.get("steering_inputs")
-                        )
-                        if changed:
-                            new_meta = dict(meta)
-                            new_meta["steering_inputs"] = new_steers
-                            await cur.execute(
-                                """
-                                UPDATE conversation_responses
-                                SET metadata = %s
-                                WHERE conversation_response_id = %s::uuid
-                                """,
-                                (Jsonb(new_meta), str(r["run_id"])),
-                            )
-                            report.steerings_redacted += 1
-
-                # Layer 2a: turn_slices, task_run_slices, provenance_records, replay_facts
-                if suffix_run_ids:
-                    await cur.execute(
-                        "DELETE FROM turn_slices WHERE conversation_response_id = ANY(%s::uuid[])",
-                        (suffix_run_ids,),
-                    )
-                    await cur.execute(
-                        """
-                        UPDATE conversation_responses
-                        SET replay_facts = NULL
-                        WHERE conversation_response_id = ANY(%s::uuid[])
-                        """,
-                        (suffix_run_ids,),
-                    )
-                if suffix_task_ids or suffix_task_run_ids:
-                    await cur.execute(
-                        """
-                        DELETE FROM task_run_slices
-                        WHERE conversation_thread_id = %s::uuid
-                          AND (
-                              task_id = ANY(%s::text[])
-                              OR task_run_id = ANY(%s::uuid[])
-                          )
-                        """,
-                        (tid, suffix_task_ids, suffix_task_run_ids),
-                    )
-                if suffix_task_run_ids:
-                    await cur.execute(
-                        """
-                        UPDATE subagent_runs
-                        SET replay_facts = NULL
-                        WHERE task_run_id = ANY(%s::uuid[])
-                        """,
-                        (suffix_task_run_ids,),
-                    )
-                await cur.execute(
-                    """
-                    DELETE FROM provenance_records
-                    WHERE conversation_thread_id = %s::uuid
-                      AND turn_index BETWEEN %s AND %s
-                    """,
-                    (tid, min_turn, max_turn),
-                )
-
-                # Layer 2b: hook_outbox delivered/returned/pending/failed steers
-                if suffix_run_ids:
-                    await cur.execute(
-                        """
-                        UPDATE hook_outbox
-                        SET payload = CASE
-                                WHEN payload ? 'text'
-                                THEN jsonb_set(
-                                    jsonb_set(payload, '{content}', to_jsonb(%s::text), true),
-                                    '{text}', to_jsonb(%s::text), true
-                                )
-                                ELSE jsonb_set(payload, '{content}', to_jsonb(%s::text), true)
-                            END
-                        WHERE conversation_thread_id = %s::uuid
-                          AND hook_type = 'steer'
-                          AND (
-                              run_id = ANY(%s::uuid[])
-                              OR payload->>'steered_run_id' = ANY(%s::text[])
-                              OR payload->>'returned_run_id' = ANY(%s::text[])
-                              OR payload->>'failed_run_id' = ANY(%s::text[])
-                          )
-                        """,
-                        (
-                            PURGED_PLACEHOLDER,
-                            PURGED_PLACEHOLDER,
-                            PURGED_PLACEHOLDER,
-                            tid,
-                            suffix_run_ids,
-                            suffix_run_ids,
-                            suffix_run_ids,
-                            suffix_run_ids,
-                        ),
-                    )
-                    report.outbox_rows_redacted += int(cur.rowcount or 0)
-
-                # Terminate & redact pending or failed steers on this thread
-                await cur.execute(
-                    """
-                    UPDATE hook_outbox
-                    SET status = 'done',
-                        completed_at = COALESCE(completed_at, NOW()),
-                        payload = jsonb_set(
-                            CASE
-                                WHEN payload ? 'text'
-                                THEN jsonb_set(
-                                    jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true),
-                                    '{text}', to_jsonb(%s::text), true
-                                )
-                                ELSE jsonb_set(COALESCE(payload, '{}'::jsonb), '{content}', to_jsonb(%s::text), true)
-                            END,
-                            '{outcome}',
-                            '"purged"'::jsonb,
-                            true
-                        )
-                    WHERE conversation_thread_id = %s::uuid
-                      AND hook_type = 'steer'
-                      AND (
-                          status IN ('pending', 'claimed', 'dead')
-                          OR (status = 'done' AND payload->>'outcome' = 'failed')
-                      )
-                    """,
-                    (
-                        PURGED_PLACEHOLDER,
-                        PURGED_PLACEHOLDER,
-                        PURGED_PLACEHOLDER,
-                        tid,
-                    ),
-                )
-                report.outbox_rows_redacted += int(cur.rowcount or 0)
-
-                # Layer 3a: thread_transcripts & thread_transcript_files
-                await cur.execute(
-                    """
-                    SELECT DISTINCT user_id, sha256
-                    FROM thread_transcript_files
-                    WHERE conversation_thread_id = %s::uuid
-                      AND content IS NULL
-                    """,
-                    (tid,),
-                )
-                for brow in await cur.fetchall():
-                    blobs_to_release.append((str(brow["user_id"]), str(brow["sha256"])))
-
-                await cur.execute(
-                    "DELETE FROM thread_transcript_files WHERE conversation_thread_id = %s::uuid",
-                    (tid,),
-                )
-                await cur.execute(
-                    "DELETE FROM thread_transcripts WHERE conversation_thread_id = %s::uuid",
-                    (tid,),
-                )
-                report.transcripts_deleted += int(cur.rowcount or 0)
-
-                # Layer 4: thread_search_turns in closed interval [min_turn, max_turn]
-                await cur.execute(
-                    """
-                    UPDATE thread_search_turns
-                    SET user_text = '',
-                        answer_text = '',
-                        answer_read = TRUE,
-                        read_failures = 0,
-                        retry_at = NULL,
-                        read_at = clock_timestamp()
-                    WHERE conversation_thread_id = %s::uuid
-                      AND turn_index BETWEEN %s AND %s
-                    """,
-                    (tid, min_turn, max_turn),
-                )
-                cleared_here = int(cur.rowcount or 0)
-                # Also ensure every current settled response in [min_turn, max_turn] has an empty read placeholder
-                await cur.execute(
-                    """
-                    INSERT INTO thread_search_turns (
-                        conversation_thread_id, turn_index,
-                        conversation_response_id, attempt_no,
-                        user_text, answer_text, answer_read,
-                        read_failures, retry_at, turn_at, read_at
-                    )
-                    SELECT r.conversation_thread_id, r.turn_index,
-                           r.conversation_response_id, r.attempt_no,
-                           '', '', TRUE,
-                           0, NULL, r.created_at, clock_timestamp()
-                    FROM conversation_responses r
-                    WHERE r.conversation_thread_id = %s::uuid
-                      AND r.turn_index BETWEEN %s AND %s
-                      AND r.status <> 'in_progress'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_responses n
-                          WHERE n.conversation_thread_id = r.conversation_thread_id
-                            AND n.turn_index = r.turn_index
-                            AND n.status <> 'in_progress'
-                            AND n.attempt_no > r.attempt_no
-                      )
-                    ON CONFLICT (conversation_thread_id, turn_index) DO UPDATE
-                    SET conversation_response_id = EXCLUDED.conversation_response_id,
-                        attempt_no = EXCLUDED.attempt_no,
-                        user_text = '',
-                        answer_text = '',
-                        answer_read = TRUE,
-                        read_failures = 0,
-                        retry_at = NULL,
-                        read_at = clock_timestamp()
-                    """,
-                    (tid, min_turn, max_turn),
-                )
-                report.search_rows_cleared += max(cleared_here, int(cur.rowcount or 0))
-
-            # Layer 5a: dalton_conversation_cards fallback cleanup
-            report.cards_deleted += await _purge_conversation_cards_for_thread(
-                conn, tid, ledger.user_id
+        async with acquire_purge_thread_lock(tid, timeout_s=cancel_drain_timeout_s):
+            await _purge_single_thread_layers(
+                tid=tid,
+                min_turn=min_turn,
+                max_turn=max_turn,
+                user_id=ledger.user_id,
+                cp_pool=cp_pool,
+                cp_serde=cp_serde,
+                report=report,
+                thread_workspace_ids=thread_workspace_ids,
+                all_suffix_run_ids=all_suffix_run_ids,
+                blobs_to_release=blobs_to_release,
+                redis_keys_to_delete=redis_keys_to_delete,
             )
-
-        # Collect Layer 2c Redis keys for this thread
-        redis_keys_to_delete.extend(
-            collect_redis_keys_for_suffix(
-                tid, suffix_run_ids, suffix_task_ids, suffix_task_run_ids
-            )
-        )
 
     # Layer 2c: Delete Redis event stream & meta keys
     report.redis_keys_deleted = await _delete_redis_keys(redis_keys_to_delete)

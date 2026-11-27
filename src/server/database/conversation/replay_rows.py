@@ -81,14 +81,15 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         return None
 
     async with pool.get_db_connection() as conn:
+        # DALTON-HOOK(personal-integrations): capture purge generation before reading replay inputs
+        from src.dalton.services.purge_fence import read_expected_purge_generation
+        expected_purge_gen = await read_expected_purge_generation(thread_id, conn=conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             # 1. Owner check (join threads -> workspaces)
             # DALTON-HOOK(colleague-dispatch): return thread owner (A) as user_id and workspace owner (B) as workspace_owner_id.
-            # DALTON-HOOK(personal-integrations): capture personal_purge_generation before reading any replay rows.
             await cur.execute(
                 """SELECT COALESCE(t.user_id, w.user_id) AS user_id,
-                          w.user_id AS workspace_owner_id,
-                          t.personal_purge_generation
+                          w.user_id AS workspace_owner_id
                    FROM conversation_threads t
                    JOIN workspaces w ON w.workspace_id = t.workspace_id
                    WHERE t.conversation_thread_id = %s
@@ -102,7 +103,6 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
                 if owner_row
                 else None
             )
-            expected_purge_gen = int(owner_row["personal_purge_generation"]) if owner_row and owner_row.get("personal_purge_generation") is not None else None
 
             if owner_id is None:
                 return None
@@ -244,8 +244,7 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         workspace_owner_id=workspace_owner_id,
         # DALTON-HOOK(chat-large-upload): pass failed_steers for replay surfacing.
         failed_steers=failed_steers,
-        # DALTON-HOOK(personal-integrations): pass purge generation captured before replay reads.
-        expected_purge_gen=expected_purge_gen,
+        expected_purge_gen=expected_purge_gen,  # DALTON-HOOK(personal-integrations)
     )
 
 

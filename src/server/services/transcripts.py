@@ -299,7 +299,6 @@ async def _render_own(
     newer or the checkpoint empty."""
     # DALTON-HOOK(personal-integrations): capture purge generation before reading checkpoint state
     from src.dalton.services.purge_fence import read_expected_purge_generation
-
     expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
     state = await reader.aget_state(thread.thread_id, thread.checkpoint_id)
     rendered_at = (state.config or {}).get("configurable", {}).get("checkpoint_id")
@@ -334,7 +333,6 @@ async def _render_task(
     run = _task_run(task_id, row)
     # DALTON-HOOK(personal-integrations): capture purge generation before reading task history
     from src.dalton.services.purge_fence import read_expected_purge_generation
-
     expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
     history = await reader.aget_task_history(thread.thread_id, task_id)
     header = {
@@ -588,7 +586,6 @@ async def save_live(
     checkpoint_id = max(filter(None, (held_at, latest)), default=None)
     # DALTON-HOOK(personal-integrations): capture purge generation before rendering live transcript
     from src.dalton.services.purge_fence import read_expected_purge_generation
-
     expected_purge_gen = await read_expected_purge_generation(thread_id)
     job = _Job(
         transcript,

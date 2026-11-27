@@ -387,10 +387,7 @@ def _changed_rows(
     return rows
 
 
-async def save_stored(
-    thread_id: str, prefix: str, user_id: str, transcript: StoredTranscript,
-    *, conn: Any = None,  # DALTON-HOOK(personal-integrations): optional caller tx conn
-) -> bool:
+async def save_stored(thread_id: str, prefix: str, user_id: str, transcript: StoredTranscript, *, conn: Any = None) -> bool:  # DALTON-HOOK(personal-integrations)
     """Replace one agent's stored copy unless a newer render already landed.
 
     Each copy's checkpoint is its own agent's (the thread's, or the task's
@@ -408,8 +405,7 @@ async def save_stored(
     """
     try:
         # DALTON-HOOK(personal-integrations): reuse caller's transaction when conn is supplied
-        async with get_db_connection(conn) as conn:
-            async with conn.transaction():
+        async with get_db_connection(conn) as conn, conn.transaction():
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """

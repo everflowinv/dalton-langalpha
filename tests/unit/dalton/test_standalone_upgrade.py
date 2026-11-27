@@ -16,6 +16,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _UPGRADE_SCRIPT = _REPO_ROOT / "scripts/standalone/upgrade.sh"
 
 
+def _install_restore_reset_sql(work_dir: Path) -> None:
+    src = _REPO_ROOT / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst = work_dir / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+
+
 def _make_fake_env(
     tmp_path: Path,
     *,
@@ -1464,6 +1471,7 @@ def test_backup_and_restore_include_wiki_volume_sqlite_originals_and_receipts(tm
 
     work_dir = tmp_path / "work"
     work_dir.mkdir()
+    _install_restore_reset_sql(work_dir)
     (work_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
     (work_dir / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
     (work_dir / ".env").write_text(

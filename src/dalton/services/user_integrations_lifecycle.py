@@ -25,8 +25,8 @@ from src.dalton.database.user_integrations import (
     RemoteRevokeStatus,
     TriggerReason,
     lifecycle_lock_key,
-    purge_lock_key,
     refresh_lock_key,
+    touch_user_lock_key,
 )
 from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
 from src.dalton.services.purge_fence import merge_turn_range
@@ -91,6 +91,10 @@ async def _lock_and_register_phase1_tx(
     3. Inserts the ``dalton_integration_purge_ledger`` row (``local_purge_status = 'running'``).
     """
     async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (touch_user_lock_key(user_id),),
+        )
         service_filter = "AND service = %(service)s" if service is not None else ""
         await cur.execute(
             f"""
@@ -419,6 +423,12 @@ async def begin_disconnect_all_services(
                           AND service = ANY(%s)
                         """,
                         (str(target_status), user_id, provider, target_services),
+                    )
+
+                    # Serialize with concurrent Fork touch copy before enumerating touches
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (touch_user_lock_key(user_id),),
                     )
 
                     # Collect unpurged touches per target connection row
@@ -780,65 +790,61 @@ async def finish_disconnect_locked(
     Once acquired, re-reads the ledger inside the lock and skips local purge if
     ``local_purge_status != 'running'``.
     """
-    from src.dalton.services.integration_data_purge import run_local_purge
+    from src.dalton.services.integration_data_purge import (
+        run_local_purge,
+        try_purge_ledger_lock,
+    )
 
-    lock_key = purge_lock_key(purge_id)
-    async with get_db_connection() as lock_conn:
-        cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
-        lock_row = await cur.fetchone()
-        if not (lock_row and lock_row[0]):
+    async with try_purge_ledger_lock(purge_id) as acquired:
+        if not acquired:
             logger.debug(
                 "[integration-disconnect] purge_id=%s already locked by another worker; skipping",
                 purge_id,
             )
             return None
-        try:
-            ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
-            if ledger is None:
-                raise LookupError(f"Purge ledger {purge_id} not found")
+        ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
+        if ledger is None:
+            raise LookupError(f"Purge ledger {purge_id} not found")
 
-            deleted_connections = 0
-            if ledger.local_purge_status == LocalPurgeStatus.RUNNING:
-                await _drain_refresh_locks(
-                    user_id=ledger.user_id,
-                    provider=ledger.provider,
-                    service=ledger.service,
-                    oauth_client_id=ledger.oauth_client_id,
-                    provider_account_id=ledger.provider_account_id,
-                )
-
-                if ledger.trigger_reason != TriggerReason.ACCOUNT_SWITCH:
-                    deleted_connections = await db.delete_connection_upto_epoch(
-                        ledger.user_id,
-                        ledger.provider,
-                        ledger.service,
-                        ledger.auth_epoch_upto,
-                    )
-
-                await run_local_purge(
-                    purge_id,
-                    cancel_drain_timeout_s=cancel_drain_timeout_s,
-                    _lock_held=True,
-                )
-
-            refreshed = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
-            assert refreshed is not None
-            final_remote_status = refreshed.remote_revoke_status
-            if (
-                final_remote_status == RemoteRevokeStatus.PENDING
-                and revoker is not None
-            ):
-                final_remote_status = await process_revoke(purge_id, revoker)
-
-            return FinishDisconnectResult(
-                purge_id=purge_id,
-                deleted_connections=deleted_connections,
-                local_purge_status=refreshed.local_purge_status,
-                remote_revoke_status=final_remote_status,
+        deleted_connections = 0
+        if ledger.local_purge_status == LocalPurgeStatus.RUNNING:
+            await _drain_refresh_locks(
+                user_id=ledger.user_id,
+                provider=ledger.provider,
+                service=ledger.service,
+                oauth_client_id=ledger.oauth_client_id,
+                provider_account_id=ledger.provider_account_id,
             )
-        finally:
-            with anyio.CancelScope(shield=True):
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+            if ledger.trigger_reason != TriggerReason.ACCOUNT_SWITCH:
+                deleted_connections = await db.delete_connection_upto_epoch(
+                    ledger.user_id,
+                    ledger.provider,
+                    ledger.service,
+                    ledger.auth_epoch_upto,
+                )
+
+            await run_local_purge(
+                purge_id,
+                cancel_drain_timeout_s=cancel_drain_timeout_s,
+                _lock_held=True,
+            )
+
+        refreshed = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
+        assert refreshed is not None
+        final_remote_status = refreshed.remote_revoke_status
+        if (
+            final_remote_status == RemoteRevokeStatus.PENDING
+            and revoker is not None
+        ):
+            final_remote_status = await process_revoke(purge_id, revoker)
+
+        return FinishDisconnectResult(
+            purge_id=purge_id,
+            deleted_connections=deleted_connections,
+            local_purge_status=refreshed.local_purge_status,
+            remote_revoke_status=final_remote_status,
+        )
 
 
 async def finish_disconnect(

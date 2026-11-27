@@ -180,10 +180,7 @@ async def turns_to_index(
     return sources, read_at
 
 
-async def write_turns(
-    thread_id: str, rows: Sequence[IndexedTurn], *, read_at: datetime | None,
-    expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
-) -> int:
+async def write_turns(thread_id: str, rows: Sequence[IndexedTurn], *, read_at: datetime | None, expected_purge_gen: int | None = None) -> int:  # DALTON-HOOK(personal-integrations)
     """Write each turn's row from its response, read at ``read_at``, unless
     the response is no longer the turn's current one or the row holds a read
     as new. Returns the rows written or changed."""

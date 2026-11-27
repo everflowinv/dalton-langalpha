@@ -19,14 +19,18 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
+import importlib
 from pathlib import Path
+import pkgutil
+import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 import uuid
 
 from alembic import command
 from alembic.config import Config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 import psycopg
@@ -38,7 +42,8 @@ import pytest_asyncio
 from ptc_agent.agent.middleware.compaction.utils import (
     COMPACTION_SUMMARY_KEY,
     SIDECAR_KEY,
-    SUMMARIZED_KEY,
+    SummarySpan,
+    build_summary_message,
 )
 from src.dalton.database import user_integrations as ui_db
 from src.dalton.database.user_integrations import (
@@ -83,6 +88,8 @@ from src.dalton.services.user_integrations_lifecycle import (
     finish_disconnect_locked,
     replace_connection_for_account_switch,
 )
+import src.server.database as server_db_pkg
+from src.server.app import setup as server_setup
 from src.server.database import pool as pool_mod
 from src.server.database import thread_transcripts as tt_db
 from src.server.database import workspace_file_blobs as blobs_db
@@ -91,11 +98,16 @@ from src.server.database.conversation import threads_write as tw_db
 from src.server.database.conversation import turn_slices as slices_db
 from src.server.database.runs import lifecycle as runs_lifecycle
 from src.server.database.search import index as search_db
+from src.server.services import transcripts as transcripts_svc
 from src.server.services import writer_guard
-from src.server.services.forks.model import BeforeTurn, ForkRefused, ThroughTurn
+from src.server.services.forks import service as forks_svc
+from src.server.services.forks.model import BeforeTurn, ForkRefused, ForkRequest, ThroughTurn
 from src.server.services.history import reader as history_reader
 from src.server.services.history import replay as replay_mod
-from src.server.services.history import slices as history_slices
+from src.server.services.search import index as search_svc
+from src.server.utils import checkpoint_helpers as cp_helpers
+from src.utils import storage as storage_mod
+from src.utils.cache import redis_cache as redis_cache_mod
 
 pytestmark = pytest.mark.integration
 
@@ -121,11 +133,13 @@ async def gws_live_pool(
 ):
     """Open an isolated AsyncConnectionPool wired into all Dalton & server DB call sites."""
     monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "test-byok-key-for-gws-r1-integration")
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
 
     local_pool = AsyncConnectionPool(
         conninfo=test_db_uri,
         min_size=2,
-        max_size=8,
+        max_size=12,
         configure=pool_mod._configure_postgres_connection,
         check=AsyncConnectionPool.check_connection,
         kwargs=dict(pool_mod._CONNECTION_KWARGS),
@@ -142,19 +156,45 @@ async def gws_live_pool(
         async with local_pool.connection(timeout=10) as owned:
             yield owned
 
-    call_sites = (
-        pool_mod,
-        ui_db,
-        fence_mod,
-        revoke_mod,
-        lifecycle_mod,
-        purge_mod,
-        tt_db,
-        blobs_db,
+    async def _live_open_session_connection():
+        conn = await psycopg.AsyncConnection.connect(
+            test_db_uri, **pool_mod._CONNECTION_KWARGS
+        )
+        await pool_mod._configure_postgres_connection(conn)
+        return conn
+
+    # Ensure LangGraph checkpoint tables exist in the test database so real
+    # AsyncPostgresSaver, CheckpointHistoryReader, and fork_thread work end-to-end.
+    live_checkpointer = AsyncPostgresSaver(local_pool)
+    await live_checkpointer.setup()
+
+    # Sweep every module holding a direct reference to pool.get_db_connection
+    for _info in pkgutil.walk_packages(
+        server_db_pkg.__path__, prefix="src.server.database."
+    ):
+        importlib.import_module(_info.name)
+    _pool_gdc = pool_mod.get_db_connection
+    holders = {
+        module
+        for name, module in list(sys.modules.items())
+        if name.startswith(("src.", "ptc_agent."))
+        and getattr(module, "get_db_connection", None) is _pool_gdc
+    }
+    holders.update(
+        {
+            pool_mod,
+            ui_db,
+            fence_mod,
+            revoke_mod,
+            lifecycle_mod,
+            purge_mod,
+            tt_db,
+            blobs_db,
+            forks_svc,
+        }
     )
 
-    default_checkpointer = SimpleNamespace(conn=local_pool, serde=JsonPlusSerializer())
-
+    history_reader.CheckpointHistoryReader.reset_instance()
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(pool_mod, "get_db_connection_string", lambda: test_db_uri)
@@ -163,12 +203,27 @@ async def gws_live_pool(
             patch.object(pool_mod, "get_or_create_pool", lambda: local_pool)
         )
         stack.enter_context(
-            patch.object(purge_mod, "get_checkpointer", lambda: default_checkpointer)
+            patch.object(pool_mod, "open_session_connection", _live_open_session_connection)
         )
         stack.enter_context(
-            patch("src.server.services.transcripts.schedule_thread_export")
+            patch.object(purge_mod, "get_checkpointer", lambda: live_checkpointer)
         )
-        for mod in call_sites:
+        stack.enter_context(
+            patch.object(cp_helpers, "get_checkpointer", lambda: live_checkpointer)
+        )
+        stack.enter_context(
+            patch.object(forks_svc, "get_checkpointer", lambda: live_checkpointer)
+        )
+        stack.enter_context(
+            patch.object(server_setup, "checkpointer", live_checkpointer)
+        )
+        stack.enter_context(
+            patch.object(transcripts_svc, "schedule_thread_export", autospec=True)
+        )
+        stack.enter_context(
+            patch.object(search_svc, "schedule_thread_search_index", autospec=True)
+        )
+        for mod in holders:
             stack.enter_context(
                 patch.object(mod, "get_db_connection", _live_get_db_connection)
             )
@@ -200,18 +255,13 @@ async def gws_live_pool(
                 CASCADE
                 """
             )
-            has_cp = (
-                await (
-                    await conn.execute("SELECT to_regclass('public.checkpoints')")
-                ).fetchone()
-            )[0]
-            if has_cp:
-                await conn.execute(
-                    "TRUNCATE TABLE checkpoint_writes, checkpoint_blobs, checkpoints CASCADE"
-                )
+            await conn.execute(
+                "TRUNCATE TABLE checkpoint_writes, checkpoint_blobs, checkpoints CASCADE"
+            )
         try:
             yield local_pool
         finally:
+            history_reader.CheckpointHistoryReader.reset_instance()
             await local_pool.close()
 
 
@@ -297,9 +347,9 @@ async def _seed_turn(
                 conversation_response_id, conversation_thread_id, turn_index,
                 attempt_no, status, request_key, metadata, created_at
             )
-            VALUES (%s::uuid, %s::uuid, %s, 1, 'in_progress', %s, %s, NOW())
+            VALUES (%s::uuid, %s::uuid, %s, 1, 'in_progress', %s::uuid, %s, NOW())
             """,
-            (rid, thread_id, turn_index, f"rk-{rid}", Jsonb(meta)),
+            (rid, thread_id, turn_index, str(uuid.uuid4()), Jsonb(meta)),
         )
         if status != "in_progress":
             await conn.execute(
@@ -311,6 +361,114 @@ async def _seed_turn(
                 (status, rid),
             )
     return rid
+
+
+async def _seed_conversation_card(
+    pool: AsyncConnectionPool,
+    *,
+    card_id: str,
+    thread_id: str,
+    workspace_id: str,
+    claim: str = "secret",
+    content_hash: str | None = None,
+) -> None:
+    """Seed one schema-valid ``dalton_conversation_cards`` row (per d009 + render.py)."""
+    chash = content_hash or f"hash-{card_id}"
+    rendered_locs = [
+        {
+            "target": "home",
+            "workspace_id": workspace_id,
+            "path": "research/topics/conversations/2026-11-26.md",
+        }
+    ]
+    async with pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO dalton_conversation_cards (
+                card_id, source_type, agent, session_id, session_key, generation,
+                channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
+                speaker_role, tickers, entities, sectors, topic_label, type, claim,
+                figures, quote, quote_event_id, cited_sources, confidence, status,
+                extractor_model, prompt_version, content_hash, search_text,
+                rendered_locations
+            )
+            VALUES (
+                %s, 'conversation', 'analyst', %s, %s, '1',
+                'web', 'dm', ARRAY['e1'], '[1, 1]'::jsonb, NOW(), CURRENT_DATE,
+                '{"id": "u1", "name": "Owner"}'::jsonb,
+                'owner', ARRAY[]::text[], ARRAY[]::text[], ARRAY[]::text[], 'cal', 'fact', %s,
+                '[]'::jsonb, %s, 'e1', '[]'::jsonb, 0.9, 'active',
+                'm', 'v1', %s, %s, %s
+            )
+            ON CONFLICT (card_id) DO NOTHING
+            """,
+            (card_id, thread_id, thread_id, claim, claim, chash, claim, Jsonb(rendered_locs)),
+        )
+
+
+async def _seed_real_turn_checkpoints(
+    pool: AsyncConnectionPool,
+    *,
+    thread_id: str,
+    turn_index: int,
+    run_id: str,
+    input_cp_id: str,
+    end_cp_id: str,
+    parent_cp_id: str | None,
+    input_messages: list[object],
+    end_messages: list[object],
+) -> None:
+    """Persist genuine LangGraph input + loop checkpoints via ``AsyncPostgresSaver.aput``."""
+    saver = AsyncPostgresSaver(pool)
+    ver_in = f"{turn_index * 2 + 1:032d}.0"
+    ver_end = f"{turn_index * 2 + 2:032d}.0"
+
+    in_cfg: dict = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    if parent_cp_id is not None:
+        in_cfg["configurable"]["checkpoint_id"] = parent_cp_id
+    in_cp = {
+        "v": 4,
+        "id": input_cp_id,
+        "ts": datetime.now(UTC).isoformat(),
+        "channel_values": {"messages": _DeltaSnapshot(list(input_messages))},
+        "channel_versions": {"messages": ver_in},
+        "versions_seen": {},
+        "updated_channels": ["messages"],
+    }
+    await saver.aput(
+        in_cfg,
+        in_cp,
+        {"source": "input", "step": -1, "turn_index": turn_index, "run_id": run_id},
+        {"messages": ver_in},
+    )
+
+    end_cfg = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+            "checkpoint_id": input_cp_id,
+        }
+    }
+    end_cp = {
+        "v": 4,
+        "id": end_cp_id,
+        "ts": datetime.now(UTC).isoformat(),
+        "channel_values": {"messages": _DeltaSnapshot(list(end_messages))},
+        "channel_versions": {"messages": ver_end},
+        "versions_seen": {},
+        "updated_channels": ["messages"],
+    }
+    await saver.aput(
+        end_cfg,
+        end_cp,
+        {"source": "loop", "step": 0, "turn_index": turn_index, "run_id": run_id},
+        {"messages": ver_end},
+    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE conversation_threads SET latest_checkpoint_id = %s WHERE conversation_thread_id = %s::uuid",
+            (end_cp_id, thread_id),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +762,7 @@ async def test_revoke_state_machine_outcomes_supersede_and_lock_mutual_exclusion
         return RevokeOutcome.SUCCEEDED
 
     revoker = create_autospec(RemoteRevoker, instance=True)
-    revoker.revoke = AsyncMock(side_effect=_slow_revoke)
+    revoker.revoke.side_effect = _slow_revoke
 
     t1 = asyncio.create_task(process_revoke(ledger.purge_id, revoker))
     await entered.wait()
@@ -634,7 +792,7 @@ async def test_revoke_state_machine_outcomes_supersede_and_lock_mutual_exclusion
         revoke_token_plaintext="rt-retry",
     )
     rev_retry = create_autospec(RemoteRevoker, instance=True)
-    rev_retry.revoke = AsyncMock(return_value=RevokeOutcome.RETRYABLE)
+    rev_retry.revoke.return_value = RevokeOutcome.RETRYABLE
     assert await process_revoke(l2.purge_id, rev_retry) == RemoteRevokeStatus.FAILED_RETRYABLE
     l2_after = await ui_db.get_purge_ledger(l2.purge_id)
     assert l2_after is not None and l2_after.retry_count == 1 and l2_after.next_retry_at is not None
@@ -707,7 +865,7 @@ async def test_gates_start_run_admit_and_fork_refuse_during_purge(gws_live_pool)
         await runs_lifecycle.start_run(
             run_id=str(uuid.uuid4()),
             thread_id=tid,
-            request_key=f"rk-{uuid.uuid4()}",
+            request_key=str(uuid.uuid4()),
             turn_index=1,
             user_id=uid,
         )
@@ -814,8 +972,8 @@ async def test_dual_connection_interleaving_fences_replay_search_and_transcript(
     )
 
     with (
-        patch("src.utils.storage.upload_bytes", return_value=True),
-        patch.object(tt_db, "save_stored", AsyncMock(return_value=False)),
+        patch.object(storage_mod, "upload_bytes", autospec=True, return_value=True),
+        patch.object(tt_db, "save_stored", autospec=True, return_value=False),
     ):
         ok = await save_stored_transcript_fenced(
             tid, "", uid, tr_ok, {sha: blob_bytes}, expected_purge_gen=gen_after
@@ -914,119 +1072,144 @@ async def test_2a_full_scope_checkpoints_summaries_outbox_redis_approvals_and_tr
             (str(uuid.uuid4()), uid, tid, r1),
         )
 
-    # Seed checkpoint tables (if present on test DB) with pre-touch turn 0, suffix turn 1,
-    # shared ui version u0, pre-touch summary in cumulative messages, and cross-boundary summary
+    # Seed real checkpoint tables with pre-touch turn 0, suffix turn 1, shared ui version u0,
+    # and real compaction state (_summarization_event built with build_summary_message + native sidecar)
     serde = JsonPlusSerializer()
-    pre_summary_id = "sum-pre-db"
-    summary_id = "sum-cross-db"
-    fake_cp = SimpleNamespace(conn=gws_live_pool, serde=serde)
+    sum_pre_msg = build_summary_message(
+        "pure turn-0 research summary",
+        original_message_count=4,
+        span=SummarySpan(0, 0),
+        native={"type": "compaction", "content": "pre-native-keep"},
+        origin="anthropic",
+    )
+    sum_msg = build_summary_message(
+        "cross-boundary summary leaking private dinner",
+        original_message_count=8,
+        span=SummarySpan(0, 1),
+        native={"type": "compaction", "content": "secret-native-block"},
+        origin="anthropic",
+    )
+    pre_summary_id = str(sum_pre_msg.id)
+    summary_id = str(sum_msg.id)
+    assert SIDECAR_KEY in sum_pre_msg.additional_kwargs
+    assert SIDECAR_KEY in sum_msg.additional_kwargs
 
     async with gws_live_pool.connection() as conn:
-        has_cp_tbl = (await (await conn.execute("SELECT to_regclass('public.checkpoints')")).fetchone())[0]
-        if has_cp_tbl:
+        await conn.execute(
+            """
+            INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata)
+            VALUES
+              (%s, '', 'cp-0', NULL, 'json', %s, %s),
+              (%s, '', 'cp-1', 'cp-0', 'json', %s, %s)
+            """,
+            (
+                tid,
+                Jsonb({"channel_versions": {"messages": "v0", "ui": "u0", "_summarization_event": "e0"}}),
+                Jsonb({"turn_index": 0, "run_id": r0}),
+                tid,
+                Jsonb({"channel_versions": {"messages": "v1", "ui": "u0", "_summarization_event": "e1"}}),  # shared ui version u0!
+                Jsonb({"turn_index": 1, "run_id": r1}),
+            ),
+        )
+        m0 = HumanMessage(content="public NVDA question", id="m0")
+        ai0 = AIMessage(
+            content="public NVDA answer",
+            id="ai0",
+            response_metadata={
+                COMPACTION_SUMMARY_KEY: {
+                    "summary_message_id": pre_summary_id,
+                    "summary_text": "pure turn-0 research summary",
+                    "summary_length": 28,
+                }
+            },
+        )
+        ai0_cross = AIMessage(
+            content="public NVDA follow-up",
+            id="ai0_cross",
+            response_metadata={
+                COMPACTION_SUMMARY_KEY: {
+                    "summary_message_id": summary_id,
+                    "summary_text": "cross-boundary summary leaking private dinner",
+                    "summary_length": 45,
+                }
+            },
+        )
+        m1 = HumanMessage(content="show my personal calendar", id="m1")
+        ai1 = AIMessage(
+            content="Private dinner at 8pm",
+            id="ai1",
+            tool_calls=[{"id": "tc1", "name": "dalton_calendar", "type": "tool_call", "args": {"secret": "val"}}],
+            additional_kwargs={
+                "reasoning_content": "private reasoning",
+                "reasoning_details": [{"type": "reasoning.encrypted", "data": "secret-enc"}],
+            },
+        )
+        t1 = ToolMessage(content="Dinner with CEO", tool_call_id="tc1", id="t1")
+
+        ev_pre = {
+            "cutoff_index": 2,
+            "summary_message": sum_pre_msg,
+            "file_path": "/workspace/pre-summary.md",
+            "anchor_message_id": "m0",
+        }
+        ev_cross = {
+            "cutoff_index": 4,
+            "summary_message": sum_msg,
+            "file_path": "/workspace/cross-summary.md",
+            "anchor_message_id": "m1",
+        }
+
+        b0_t, b0_b = serde.dumps_typed(_DeltaSnapshot([m0, ai0, ai0_cross]))
+        b1_t, b1_b = serde.dumps_typed(_DeltaSnapshot([m0, ai0, ai0_cross, m1, ai1, t1]))
+        e0_t, e0_b = serde.dumps_typed(ev_pre)
+        e1_t, e1_b = serde.dumps_typed(ev_cross)
+        u0_t, u0_b = serde.dumps_typed(
+            [
+                {
+                    "type": "ui",
+                    "id": "ui-pre-0",
+                    "name": "context_window",
+                    "props": {"action": "summarize"},
+                    "metadata": {
+                        "summary_message_id": pre_summary_id,
+                        "replaced_summary": {
+                            "id": pre_summary_id,
+                            "action": "summarize",
+                            "summary_text": "pre-touch replaced summary preserved",
+                        },
+                    },
+                },
+                {
+                    "type": "ui",
+                    "id": "ui-1",
+                    "name": "context_window",
+                    "props": {"action": "summarize"},
+                    "metadata": {
+                        "summary_message_id": summary_id,
+                        "replaced_summary": {
+                            "id": summary_id,
+                            "action": "summarize",
+                            "summary_text": "replaced cross summary secret",
+                            SIDECAR_KEY: {"content": "secret-ui-sidecar"},
+                        },
+                    },
+                },
+            ]
+        )
+        for ch, ver, ty, bl in (
+            ("messages", "v0", b0_t, b0_b),
+            ("messages", "v1", b1_t, b1_b),
+            ("ui", "u0", u0_t, u0_b),
+            ("_summarization_event", "e0", e0_t, e0_b),
+            ("_summarization_event", "e1", e1_t, e1_b),
+        ):
             await conn.execute(
                 """
-                INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata)
-                VALUES
-                  (%s, '', 'cp-0', NULL, 'json', %s, %s),
-                  (%s, '', 'cp-1', 'cp-0', 'json', %s, %s)
+                INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
+                VALUES (%s, '', %s, %s, %s, %s)
                 """,
-                (
-                    tid,
-                    Jsonb({"channel_versions": {"messages": "v0", "ui": "u0"}}),
-                    Jsonb({"turn_index": 0, "run_id": r0}),
-                    tid,
-                    Jsonb({"channel_versions": {"messages": "v1", "ui": "u0"}}),  # shared ui version u0!
-                    Jsonb({"turn_index": 1, "run_id": r1}),
-                ),
+                (tid, ch, ver, ty, bl),
             )
-            m0 = HumanMessage(content="public NVDA question", id="m0")
-            ai0 = AIMessage(
-                content="public NVDA answer",
-                id="ai0",
-                response_metadata={
-                    COMPACTION_SUMMARY_KEY: {
-                        "summary_message_id": summary_id,
-                        "summary_text": "cross-boundary summary leaking private dinner",
-                        "summary_length": 45,
-                    }
-                },
-            )
-            sum_pre_msg = HumanMessage(
-                content="pure turn-0 research summary",
-                id=pre_summary_id,
-                additional_kwargs={
-                    "lc_source": "summarization",
-                    SUMMARIZED_KEY: {"span": [0, 0], "gap": None, "skills": []},
-                },
-            )
-            sum_msg = HumanMessage(
-                content="cross-boundary summary leaking private dinner",
-                id=summary_id,
-                additional_kwargs={
-                    "lc_source": "summarization",
-                    SUMMARIZED_KEY: {"span": [0, 1], "gap": None, "skills": []},
-                    SIDECAR_KEY: {"native": "secret"},
-                },
-            )
-            m1 = HumanMessage(content="show my personal calendar", id="m1")
-            ai1 = AIMessage(
-                content="Private dinner at 8pm",
-                id="ai1",
-                tool_calls=[{"id": "tc1", "name": "dalton_calendar", "type": "tool_call", "args": {"secret": "val"}}],
-                additional_kwargs={
-                    "reasoning_content": "private reasoning",
-                    "reasoning_details": [{"type": "reasoning.encrypted", "data": "secret-enc"}],
-                },
-            )
-            t1 = ToolMessage(content="Dinner with CEO", tool_call_id="tc1", id="t1")
-
-            b0_t, b0_b = serde.dumps_typed(_DeltaSnapshot([m0, ai0, sum_pre_msg, sum_msg]))
-            b1_t, b1_b = serde.dumps_typed(_DeltaSnapshot([m0, ai0, sum_pre_msg, sum_msg, m1, ai1, t1]))
-            u0_t, u0_b = serde.dumps_typed(
-                [
-                    {
-                        "type": "ui",
-                        "id": "ui-pre-0",
-                        "name": "context_window",
-                        "props": {"action": "summarize"},
-                        "metadata": {
-                            "summary_message_id": pre_summary_id,
-                            "replaced_summary": {
-                                "id": pre_summary_id,
-                                "action": "summarize",
-                                "summary_text": "pre-touch replaced summary preserved",
-                            },
-                        },
-                    },
-                    {
-                        "type": "ui",
-                        "id": "ui-1",
-                        "name": "context_window",
-                        "props": {"action": "summarize"},
-                        "metadata": {
-                            "summary_message_id": summary_id,
-                            "replaced_summary": {
-                                "id": summary_id,
-                                "action": "summarize",
-                                "summary_text": "replaced cross summary secret",
-                            },
-                        },
-                    },
-                ]
-            )
-            for ch, ver, ty, bl in (
-                ("messages", "v0", b0_t, b0_b),
-                ("messages", "v1", b1_t, b1_b),
-                ("ui", "u0", u0_t, u0_b),
-            ):
-                await conn.execute(
-                    """
-                    INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
-                    VALUES (%s, '', %s, %s, %s, %s)
-                    """,
-                    (tid, ch, ver, ty, bl),
-                )
 
     deleted_redis_keys: list[str] = []
 
@@ -1036,12 +1219,12 @@ async def test_2a_full_scope_checkpoints_summaries_outbox_redis_approvals_and_tr
             return len(keys)
 
     fake_cache = SimpleNamespace(enabled=True, client=_FakeRedisClient())
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "true")
 
     purge_id = await begin_disconnect(uid, "google", "calendar", remote_mode="local_only")
     with (
-        patch.object(purge_mod, "get_checkpointer", return_value=fake_cp),
-        patch("src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache),
-        patch("src.server.services.transcripts.schedule_thread_export"),
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=fake_cache),
     ):
         report = await run_local_purge(purge_id)
 
@@ -1080,27 +1263,39 @@ async def test_2a_full_scope_checkpoints_summaries_outbox_redis_approvals_and_tr
         app_cnt = (await (await conn.execute("SELECT COUNT(*) FROM dalton_integration_action_approvals WHERE thread_id=%s::uuid", (tid,))).fetchone())[0]
         assert app_cnt == 0
 
-        # Checkpoint blobs redacted (including all 3 compaction summary copies) while pre-touch preserved
-        if has_cp_tbl:
-            row_v1 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='messages' AND version='v1'", (tid,))).fetchone()
-            msgs_v1 = serde.loads_typed((row_v1[0], bytes(row_v1[1]))).value
-            by_id = {m.id: m for m in msgs_v1}
-            assert by_id["m0"].content == "public NVDA question"
-            assert by_id["ai0"].content == "public NVDA answer"
-            assert by_id[pre_summary_id].content == "pure turn-0 research summary"
-            assert by_id["ai0"].response_metadata[COMPACTION_SUMMARY_KEY]["summary_text"] == PURGED_PLACEHOLDER
-            assert by_id[summary_id].content == PURGED_PLACEHOLDER
-            assert by_id["m1"].content == PURGED_PLACEHOLDER
-            assert by_id["ai1"].content == PURGED_PLACEHOLDER
-            assert by_id["ai1"].tool_calls == [{"id": "tc1", "name": "dalton_calendar", "type": "tool_call", "args": PURGED_TOOL_ARGS}]
-            assert by_id["ai1"].additional_kwargs["reasoning_content"] == PURGED_PLACEHOLDER
-            assert "reasoning_details" not in by_id["ai1"].additional_kwargs
-            assert by_id["t1"].content == PURGED_PLACEHOLDER
+        # Checkpoint blobs redacted (including real _summarization_event + context_summary + ui) while pre-touch preserved
+        row_v1 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='messages' AND version='v1'", (tid,))).fetchone()
+        msgs_v1 = serde.loads_typed((row_v1[0], bytes(row_v1[1]))).value
+        by_id = {m.id: m for m in msgs_v1}
+        assert by_id["m0"].content == "public NVDA question"
+        assert by_id["ai0"].content == "public NVDA answer"
+        assert by_id["ai0"].response_metadata[COMPACTION_SUMMARY_KEY]["summary_text"] == "pure turn-0 research summary"
+        assert by_id["ai0_cross"].response_metadata[COMPACTION_SUMMARY_KEY]["summary_text"] == PURGED_PLACEHOLDER
+        assert by_id["m1"].content == PURGED_PLACEHOLDER
+        assert by_id["ai1"].content == PURGED_PLACEHOLDER
+        assert by_id["ai1"].tool_calls == [{"id": "tc1", "name": "dalton_calendar", "type": "tool_call", "args": PURGED_TOOL_ARGS}]
+        assert by_id["ai1"].additional_kwargs["reasoning_content"] == PURGED_PLACEHOLDER
+        assert "reasoning_details" not in by_id["ai1"].additional_kwargs
+        assert by_id["t1"].content == PURGED_PLACEHOLDER
 
-            row_u0 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='ui' AND version='u0'", (tid,))).fetchone()
-            ui_u0 = {r["id"]: r for r in serde.loads_typed((row_u0[0], bytes(row_u0[1])))}
-            assert ui_u0["ui-pre-0"]["metadata"]["replaced_summary"]["summary_text"] == "pre-touch replaced summary preserved"
-            assert ui_u0["ui-1"]["metadata"]["replaced_summary"]["summary_text"] == PURGED_PLACEHOLDER
+        row_e0 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='_summarization_event' AND version='e0'", (tid,))).fetchone()
+        ev0_after = serde.loads_typed((row_e0[0], bytes(row_e0[1])))
+        assert "pure turn-0 research summary" in ev0_after["summary_message"].content
+        assert SIDECAR_KEY in ev0_after["summary_message"].additional_kwargs
+
+        row_e1 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='_summarization_event' AND version='e1'", (tid,))).fetchone()
+        ev1_after = serde.loads_typed((row_e1[0], bytes(row_e1[1])))
+        assert ev1_after["cutoff_index"] == 4
+        assert ev1_after["file_path"] == "/workspace/cross-summary.md"
+        assert ev1_after["anchor_message_id"] == "m1"
+        assert ev1_after["summary_message"].content == PURGED_PLACEHOLDER
+        assert SIDECAR_KEY not in ev1_after["summary_message"].additional_kwargs
+
+        row_u0 = await (await conn.execute("SELECT type, blob FROM checkpoint_blobs WHERE thread_id=%s AND channel='ui' AND version='u0'", (tid,))).fetchone()
+        ui_u0 = {r["id"]: r for r in serde.loads_typed((row_u0[0], bytes(row_u0[1])))}
+        assert ui_u0["ui-pre-0"]["metadata"]["replaced_summary"]["summary_text"] == "pre-touch replaced summary preserved"
+        assert ui_u0["ui-1"]["metadata"]["replaced_summary"]["summary_text"] == PURGED_PLACEHOLDER
+        assert SIDECAR_KEY not in ui_u0["ui-1"]["metadata"]["replaced_summary"]
 
 
 # ---------------------------------------------------------------------------
@@ -1314,7 +1509,7 @@ async def test_purge_ledger_mutex_concurrent_finish_disconnect_runs_once(gws_liv
         await release.wait()
         return await real_run(*args, **kwargs)
 
-    with patch.object(purge_mod, "run_local_purge", side_effect=_gated_run):
+    with patch.object(purge_mod, "run_local_purge", autospec=True, side_effect=_gated_run):
         t1 = asyncio.create_task(finish_disconnect_locked(purge_id))
         await entered.wait()
         t2 = asyncio.create_task(finish_disconnect_locked(purge_id))
@@ -1423,8 +1618,10 @@ async def test_two_ledgers_overlapping_same_thread_unblock_only_after_both_compl
 
 
 @pytest.mark.asyncio
-async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_resumed(gws_live_pool):
-    uid, _, tid = await _seed_user_ws_thread(gws_live_pool)
+async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_resumed(
+    gws_live_pool, monkeypatch
+):
+    uid, wid, tid = await _seed_user_ws_thread(gws_live_pool)
     r0 = await _seed_turn(
         gws_live_pool,
         thread_id=tid,
@@ -1452,28 +1649,14 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
         user_id=uid,
         provider_account_id="ou_inc",
     )
-    # Seed a conversation card so digest re-render failure rolls back card deletion
-    async with gws_live_pool.connection() as conn:
-        await conn.execute(
-            """
-            INSERT INTO dalton_conversation_cards (
-                card_id, source_type, agent, session_id, session_key, generation,
-                channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
-                speaker_role, tickers, entities, sectors, topic_label, type, claim,
-                figures, quote, quote_event_id, cited_sources, confidence, status,
-                extractor_model, prompt_version, content_hash, search_text,
-                rendered_locations
-            )
-            VALUES (
-                'card-inc-1', 'web', 'analyst', %s, %s, 1,
-                'web', 'dm', ARRAY['e1'], '[1,1]'::int4range, NOW(), CURRENT_DATE, 'u',
-                'user', ARRAY[]::text[], ARRAY[]::text[], ARRAY[]::text[], 'cal', 'fact', 'secret',
-                '[]'::jsonb, 'secret', 'e1', '[]'::jsonb, 'high', 'active',
-                'm', 'v1', 'hash-inc-1', 'secret', ARRAY['digests/2026-11-26.md']
-            )
-            """,
-            (tid, tid),
-        )
+    # Seed a schema-valid conversation card so digest re-render failure rolls back card deletion
+    await _seed_conversation_card(
+        gws_live_pool,
+        card_id="card-inc-1",
+        thread_id=tid,
+        workspace_id=wid,
+        claim="secret",
+    )
 
     purge_id = await begin_disconnect(uid, "feishu", "calendar")
 
@@ -1509,20 +1692,75 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
         )
 
     # (b) Missing checkpointer / serde
-    with patch.object(purge_mod, "get_checkpointer", return_value=None):
+    with patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None):
         with pytest.raises(RuntimeError):
             await finish_disconnect(purge_id)
     await _assert_still_running_and_blocked()
 
-    # (c) Redis delete failure
+    # (c) Corrupt checkpoint blob decode failure (serde.loads_typed raises RuntimeError)
+    async with gws_live_pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata)
+            VALUES (%s, '', 'cp-bad-0', NULL, 'json', %s, %s)
+            """,
+            (tid, Jsonb({"channel_versions": {"messages": "v-bad"}}), Jsonb({"turn_index": 0, "run_id": r0})),
+        )
+        await conn.execute(
+            """
+            INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
+            VALUES (%s, '', 'messages', 'v-bad', 'json', %s)
+            """,
+            (tid, b"NOT_VALID_JSON_BLOB"),
+        )
+    with pytest.raises(RuntimeError, match="cp-bad-0"):
+        await finish_disconnect(purge_id)
+    await _assert_still_running_and_blocked()
+    async with gws_live_pool.connection() as conn:
+        await conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (tid,))
+        await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (tid,))
+
+    # (d) Same-DB fallback when public.checkpoints is missing -> raises RuntimeError
+    async with gws_live_pool.connection() as conn:
+        await conn.execute("ALTER TABLE public.checkpoints RENAME TO _checkpoints_hidden_for_test")
+    try:
+        with patch.object(
+            purge_mod,
+            "get_checkpointer",
+            autospec=True,
+            return_value=SimpleNamespace(conn=None, serde=JsonPlusSerializer()),
+        ):
+            with pytest.raises(RuntimeError, match="public.checkpoints"):
+                await finish_disconnect(purge_id)
+    finally:
+        async with gws_live_pool.connection() as conn:
+            await conn.execute("ALTER TABLE public._checkpoints_hidden_for_test RENAME TO checkpoints")
+    await _assert_still_running_and_blocked()
+
+    # (e) Redis configured enabled but unavailable (cache.enabled=False after startup failure) & delete error
     class _BrokenRedis:
         async def delete(self, *keys):
             raise ConnectionError("redis failure")
 
     from src.dalton.conversations import render as render_mod
 
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "true")
     with (
-        patch("src.utils.cache.redis_cache.get_cache_client", return_value=SimpleNamespace(enabled=True, client=_BrokenRedis())),
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=False, client=None)),
+        patch.object(
+            render_mod,
+            "render_and_write_conversation_digests",
+            create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await finish_disconnect(purge_id)
+    await _assert_still_running_and_blocked()
+
+    with (
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=True, client=_BrokenRedis())),
         patch.object(
             render_mod,
             "render_and_write_conversation_digests",
@@ -1532,41 +1770,24 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
         with pytest.raises(ConnectionError):
             await finish_disconnect(purge_id)
     await _assert_still_running_and_blocked()
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
 
-    # Re-insert card if step (c) committed Layer 5a before Layer 2c failed
-    async with gws_live_pool.connection() as conn:
-        await conn.execute(
-            """
-            INSERT INTO dalton_conversation_cards (
-                card_id, source_type, agent, session_id, session_key, generation,
-                channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
-                speaker_role, tickers, entities, sectors, topic_label, type, claim,
-                figures, quote, quote_event_id, cited_sources, confidence, status,
-                extractor_model, prompt_version, content_hash, search_text,
-                rendered_locations
-            )
-            VALUES (
-                'card-inc-2', 'web', 'analyst', %s, %s, 1,
-                'web', 'dm', ARRAY['e2'], '[1,1]'::int4range, NOW(), CURRENT_DATE, 'u',
-                'user', ARRAY[]::text[], ARRAY[]::text[], ARRAY[]::text[], 'cal', 'fact', 'secret2',
-                '[]'::jsonb, 'secret2', 'e2', '[]'::jsonb, 'high', 'active',
-                'm', 'v1', 'hash-inc-2', 'secret2', ARRAY['digests/2026-11-26.md']
-            )
-            ON CONFLICT (card_id) DO NOTHING
-            """,
-            (tid, tid),
-        )
+    # Re-insert card if step (e) committed Layer 5a before Layer 2c failed
+    await _seed_conversation_card(
+        gws_live_pool,
+        card_id="card-inc-2",
+        thread_id=tid,
+        workspace_id=wid,
+        claim="secret2",
+    )
 
-    # (d) Conversation digest re-render failure rolls back card deletion & keeps ledger running
-    with (
-        patch("src.utils.cache.redis_cache.get_cache_client", return_value=SimpleNamespace(enabled=False, client=None)),
-        patch.object(
-            render_mod,
-            "render_and_write_conversation_digests",
-            create_autospec(
-                render_mod.render_and_write_conversation_digests,
-                side_effect=RuntimeError("digest render failed"),
-            ),
+    # (f) Conversation digest re-render failure rolls back card deletion & keeps ledger running
+    with patch.object(
+        render_mod,
+        "render_and_write_conversation_digests",
+        create_autospec(
+            render_mod.render_and_write_conversation_digests,
+            side_effect=RuntimeError("digest render failed"),
         ),
     ):
         with pytest.raises(RuntimeError, match="digest render failed"):
@@ -1583,13 +1804,10 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
     assert card_cnt == 1  # rolled back cleanly!
 
     # Repair & run resume scan -> completes, deletes card, unblocks thread
-    with (
-        patch("src.utils.cache.redis_cache.get_cache_client", return_value=SimpleNamespace(enabled=False, client=None)),
-        patch.object(
-            render_mod,
-            "render_and_write_conversation_digests",
-            create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
-        ),
+    with patch.object(
+        render_mod,
+        "render_and_write_conversation_digests",
+        create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
     ):
         resumed = await run_personal_purge_resume_once()
     assert purge_id in resumed
@@ -1734,7 +1952,7 @@ async def test_begin_disconnect_all_services_splits_ledgers_and_dedups_revoke_by
 
 
 # ---------------------------------------------------------------------------
-# 15. Replay generation captured in get_replay_thread_data rejects interleaved project_turns
+# 15. Replay generation captured in get_replay_thread_data rejects interleaved real project_turns
 # ---------------------------------------------------------------------------
 
 
@@ -1742,11 +1960,22 @@ async def test_begin_disconnect_all_services_splits_ledgers_and_dedups_revoke_by
 async def test_replay_generation_captured_before_reads_rejects_interleaved_project_turns(gws_live_pool):
     uid, _, tid = await _seed_user_ws_thread(gws_live_pool)
     r0 = await _seed_turn(gws_live_pool, thread_id=tid, turn_index=0, user_text="secret replay turn")
-    async with gws_live_pool.connection() as conn:
-        await conn.execute(
-            "UPDATE conversation_threads SET latest_checkpoint_id = 'cp-0' WHERE conversation_thread_id = %s::uuid",
-            (tid,),
-        )
+    in_cp = "00000000-0000-0000-0000-000000000001"
+    end_cp = "00000000-0000-0000-0000-000000000002"
+    await _seed_real_turn_checkpoints(
+        gws_live_pool,
+        thread_id=tid,
+        turn_index=0,
+        run_id=r0,
+        input_cp_id=in_cp,
+        end_cp_id=end_cp,
+        parent_cp_id=None,
+        input_messages=[HumanMessage(content="secret replay turn", id="hm-0")],
+        end_messages=[
+            HumanMessage(content="secret replay turn", id="hm-0"),
+            AIMessage(content="secret replay answer", id="am-0"),
+        ],
+    )
 
     c = await ui_db.upsert_connection(
         user_id=uid,
@@ -1769,48 +1998,302 @@ async def test_replay_generation_captured_before_reads_rejects_interleaved_proje
         provider_account_id="ou_rep",
     )
 
-    # Connection 1 reads ThreadRows BEFORE purge begins (captures expected_purge_gen == 0)
-    rows = await replay_rows_db.get_replay_thread_data(tid)
-    assert rows is not None
-    assert rows.expected_purge_gen == 0
+    # True dual-task interleaving: Task 1 reads get_replay_thread_data (gen == 0) and pauses;
+    # Task 2 completes a full disconnect + purge on another connection (gen 0 -> 1 -> 2);
+    # Task 1 resumes with REAL project_turns & build_replay_page(persist=True) -> REJECTED!
+    rows_read_ready = asyncio.Event()
+    purge_finished = asyncio.Event()
 
-    # Connection 2 completes a full disconnect + 2A purge (generation 0 -> 1 -> 2)
-    purge_id = await begin_disconnect(uid, "feishu", "calendar")
-    await finish_disconnect(purge_id)
+    async def _replay_reader_task() -> None:
+        rows = await replay_rows_db.get_replay_thread_data(tid)
+        assert rows is not None
+        assert rows.expected_purge_gen == 0
+        rows_read_ready.set()
+        await purge_finished.wait()
+        await replay_mod.project_turns(rows, end_cp, turn_indexes=[0])
+        assert await slices_db.get_turn_lines([r0]) == {}
+        await replay_mod.build_replay_page(rows, end_cp, persist=True)
+        assert await slices_db.get_turn_lines([r0]) == {}
+
+    async def _purge_task() -> None:
+        await rows_read_ready.wait()
+        purge_id = await begin_disconnect(uid, "feishu", "calendar")
+        await finish_disconnect(purge_id)
+        assert await read_expected_purge_generation(tid) == 2
+        purge_finished.set()
+
+    await asyncio.gather(_replay_reader_task(), _purge_task())
+
+
+# ---------------------------------------------------------------------------
+# 16. Fork race: purge-completes-first (409) & fork-commits-first (Phase 1 sees new fork)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fork_race_purge_completes_before_fork_lock_and_fork_commits_before_phase1(gws_live_pool):
+    # --- Order A: Purge completes after take_snapshot and before fork locks source -> 409 ---
+    uid_a, wid_a, tid_a = await _seed_user_ws_thread(gws_live_pool)
+    r0_a = await _seed_turn(gws_live_pool, thread_id=tid_a, turn_index=0, user_text="private cal A")
+    in_cp_a = "00000000-0000-0000-0000-000000000101"
+    end_cp_a = "00000000-0000-0000-0000-000000000102"
+    await _seed_real_turn_checkpoints(
+        gws_live_pool,
+        thread_id=tid_a,
+        turn_index=0,
+        run_id=r0_a,
+        input_cp_id=in_cp_a,
+        end_cp_id=end_cp_a,
+        parent_cp_id=None,
+        input_messages=[HumanMessage(content="private cal A", id="hm-a0")],
+        end_messages=[
+            HumanMessage(content="private cal A", id="hm-a0"),
+            AIMessage(content="calendar answer A", id="am-a0"),
+        ],
+    )
+    c_a = await ui_db.upsert_connection(
+        user_id=uid_a,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_fk_a",
+        provider_account_id="ou_fk_a",
+        granted_scopes="offline_access",
+        access_token="at",
+        refresh_token="rt",
+    )
+    await ui_db.record_touch(
+        thread_id=tid_a,
+        response_id=r0_a,
+        provider="feishu",
+        service="calendar",
+        auth_epoch=c_a.auth_epoch,
+        turn_index=0,
+        user_id=uid_a,
+        provider_account_id="ou_fk_a",
+    )
+
+    snap_done = asyncio.Event()
+    purge_done = asyncio.Event()
+    real_take_snapshot = forks_svc.take_snapshot
+
+    async def _gated_take_snapshot(*args, **kwargs):
+        res = await real_take_snapshot(*args, **kwargs)
+        snap_done.set()
+        await purge_done.wait()
+        return res
+
+    async def _purge_while_fork_paused() -> None:
+        await snap_done.wait()
+        pid = await begin_disconnect(uid_a, "feishu", "calendar")
+        await finish_disconnect(pid)
+        purge_done.set()
+
+    with patch.object(forks_svc, "take_snapshot", autospec=True, side_effect=_gated_take_snapshot):
+        purge_t = asyncio.create_task(_purge_while_fork_paused())
+        with pytest.raises(ForkRefused) as exc_fork_a:
+            await forks_svc.fork_thread(ForkRequest(source_thread_id=tid_a, cut=ThroughTurn(0), user_id=uid_a))
+        await purge_t
+
+    assert exc_fork_a.value.status_code == 409
+    assert exc_fork_a.value.detail["code"] == PURGE_IN_PROGRESS_CODE
+    async with gws_live_pool.connection() as conn:
+        cnt_a = (
+            await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM conversation_threads WHERE workspace_id = %s::uuid",
+                    (wid_a,),
+                )
+            ).fetchone()
+        )[0]
+    assert cnt_a == 1  # no forked thread row created
+
+    # --- Order B: Fork holds user shared lock uncommitted -> Phase 1 blocks -> Fork commits -> Phase 1 sees new fork ---
+    uid_b, wid_b, tid_b = await _seed_user_ws_thread(gws_live_pool)
+    r0_b = await _seed_turn(gws_live_pool, thread_id=tid_b, turn_index=0, user_text="private cal B")
+    in_cp_b = "00000000-0000-0000-0000-000000000201"
+    end_cp_b = "00000000-0000-0000-0000-000000000202"
+    await _seed_real_turn_checkpoints(
+        gws_live_pool,
+        thread_id=tid_b,
+        turn_index=0,
+        run_id=r0_b,
+        input_cp_id=in_cp_b,
+        end_cp_id=end_cp_b,
+        parent_cp_id=None,
+        input_messages=[HumanMessage(content="private cal B", id="hm-b0")],
+        end_messages=[
+            HumanMessage(content="private cal B", id="hm-b0"),
+            AIMessage(content="calendar answer B", id="am-b0"),
+        ],
+    )
+    c_b = await ui_db.upsert_connection(
+        user_id=uid_b,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_fk_b",
+        provider_account_id="ou_fk_b",
+        granted_scopes="offline_access",
+        access_token="at",
+        refresh_token="rt",
+    )
+    await ui_db.record_touch(
+        thread_id=tid_b,
+        response_id=r0_b,
+        provider="feishu",
+        service="calendar",
+        auth_epoch=c_b.auth_epoch,
+        turn_index=0,
+        user_id=uid_b,
+        provider_account_id="ou_fk_b",
+    )
+
+    fork_locked = asyncio.Event()
+    release_fork = asyncio.Event()
+    real_write_thread = forks_svc._write_thread
+
+    async def _gated_write_thread(*args, **kwargs):
+        await real_write_thread(*args, **kwargs)
+        fork_locked.set()
+        await release_fork.wait()
+
+    with patch.object(forks_svc, "_write_thread", autospec=True, side_effect=_gated_write_thread):
+        fork_task = asyncio.create_task(
+            forks_svc.fork_thread(ForkRequest(source_thread_id=tid_b, cut=ThroughTurn(0), user_id=uid_b))
+        )
+        await fork_locked.wait()
+
+        # Start Phase 1 on another connection while Fork holds user shared lock -> must block!
+        phase1_task = asyncio.create_task(begin_disconnect(uid_b, "feishu", "calendar"))
+        await asyncio.sleep(0.15)
+        assert not phase1_task.done(), "Phase 1 must wait on user exclusive advisory lock until Fork commits"
+
+        # Let Fork commit -> Phase 1 unblocks and enumerates the newly forked thread's touches!
+        release_fork.set()
+        fork_res = await fork_task
+        purge_id_b = await phase1_task
+
+    ledger_b = await ui_db.get_purge_ledger(purge_id_b)
+    assert ledger_b is not None
+    assert tid_b in ledger_b.purged_max_turn_by_thread
+    assert fork_res.thread_id in ledger_b.purged_max_turn_by_thread
+
+    async with gws_live_pool.connection() as conn:
+        fork_row = await (
+            await conn.execute(
+                "SELECT personal_purge_in_progress FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (fork_res.thread_id,),
+            )
+        ).fetchone()
+    assert fork_row == (True,)
+
+
+# ---------------------------------------------------------------------------
+# 17. Concurrent different ledgers covering the same thread produce union redaction & gen +4
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_two_ledgers_same_thread_union_redaction_and_gen_plus_four(gws_live_pool):
+    uid, _, tid = await _seed_user_ws_thread(gws_live_pool)
+    r0 = await _seed_turn(gws_live_pool, thread_id=tid, turn_index=0, user_text="public t0")
+    r1 = await _seed_turn(gws_live_pool, thread_id=tid, turn_index=1, user_text="cal secret t1")
+
+    cal = await ui_db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id="111-app.apps.googleusercontent.com",
+        provider_account_id="sub-conc-a",
+        granted_scopes="openid calendar.events",
+        access_token="at-a",
+        refresh_token="rt-a",
+    )
+    await ui_db.record_touch(
+        thread_id=tid, response_id=r1, provider="google", service="calendar",
+        auth_epoch=cal.auth_epoch, turn_index=1, user_id=uid, provider_account_id="sub-conc-a",
+    )
+    # Ledger 1 covers [1, 1] (gen 0 -> 1)
+    p1 = await begin_disconnect(uid, "google", "calendar", remote_mode="local_only")
+
+    # Turn 2 touches mail; Ledger 2 covers [2, 2] (disjoint interval, gen 1 -> 2)
+    r2 = await _seed_turn(gws_live_pool, thread_id=tid, turn_index=2, user_text="mail secret t2")
+    mail = await ui_db.upsert_connection(
+        user_id=uid,
+        provider="feishu",
+        service="mail",
+        oauth_client_id="cli_conc_mail",
+        provider_account_id="ou-conc-b",
+        granted_scopes="offline_access",
+        access_token="at-b",
+        refresh_token="rt-b",
+    )
+    await ui_db.record_touch(
+        thread_id=tid, response_id=r2, provider="feishu", service="mail",
+        auth_epoch=mail.auth_epoch, turn_index=2, user_id=uid, provider_account_id="ou-conc-b",
+    )
+    p2 = await begin_disconnect(uid, "feishu", "mail")
     assert await read_expected_purge_generation(tid) == 2
 
-    # Now project_turns and build_replay_page(persist=True) attempt writeback with stale rows -> REJECTED!
-    anchor = history_reader.TurnAnchor(
-        turn_ordinal=0,
-        input_checkpoint_id="cp-0",
-        tail_checkpoint_id="cp-0",
-        turn_index=0,
-        run_id=r0,
-        end_checkpoint_id="cp-0",
-    )
-    turn_slice = history_slices.turn_slice(
-        anchor,
-        {"messages": []},
-        {
-            "messages": [
-                HumanMessage(content="secret replay turn", id="hm-0"),
-                AIMessage(content="secret replay answer", id="am-0"),
-            ]
-        },
-    )
-    fake_reader = create_autospec(history_reader.CheckpointHistoryReader, instance=True)
-    fake_reader.serde = JsonPlusSerializer()
-    fake_reader.aget_turn_anchors = AsyncMock(return_value=([anchor], "cp-0"))
-    fake_reader.aget_turn_slices = AsyncMock(return_value=[turn_slice])
-    fake_reader.aget_tip_interrupts = AsyncMock(return_value=[])
+    serde = JsonPlusSerializer()
+    m0 = HumanMessage(content="public t0", id="cm0")
+    a0 = AIMessage(content="public answer t0", id="ca0")
+    m1 = HumanMessage(content="cal secret t1", id="cm1")
+    a1 = AIMessage(content="cal answer t1", id="ca1")
+    m2 = HumanMessage(content="mail secret t2", id="cm2")
+    a2 = AIMessage(content="mail answer t2", id="ca2")
+    v0_t, v0_b = serde.dumps_typed(_DeltaSnapshot([m0, a0]))
+    v1_t, v1_b = serde.dumps_typed(_DeltaSnapshot([m0, a0, m1, a1]))
+    v2_t, v2_b = serde.dumps_typed(_DeltaSnapshot([m0, a0, m1, a1, m2, a2]))
 
-    with patch.object(
-        replay_mod.CheckpointHistoryReader,
-        "get_instance",
-        return_value=fake_reader,
-    ):
-        await replay_mod.project_turns(rows, "cp-0", turn_indexes=[0])
-        assert await slices_db.get_turn_lines([r0]) == {}
+    async with gws_live_pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata)
+            VALUES
+              (%s, '', 'cp-c0', NULL, 'json', %s, %s),
+              (%s, '', 'cp-c1', 'cp-c0', 'json', %s, %s),
+              (%s, '', 'cp-c2', 'cp-c1', 'json', %s, %s)
+            """,
+            (
+                tid, Jsonb({"channel_versions": {"messages": "v0"}}), Jsonb({"turn_index": 0, "run_id": r0}),
+                tid, Jsonb({"channel_versions": {"messages": "v1"}}), Jsonb({"turn_index": 1, "run_id": r1}),
+                tid, Jsonb({"channel_versions": {"messages": "v2"}}), Jsonb({"turn_index": 2, "run_id": r2}),
+            ),
+        )
+        for ver, ty, bl in (("v0", v0_t, v0_b), ("v1", v1_t, v1_b), ("v2", v2_t, v2_b)):
+            await conn.execute(
+                """
+                INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
+                VALUES (%s, '', 'messages', %s, %s, %s)
+                """,
+                (tid, ver, ty, bl),
+            )
 
-        await replay_mod.build_replay_page(rows, "cp-0", persist=True)
-        assert await slices_db.get_turn_lines([r0]) == {}
+    res1, res2 = await asyncio.gather(
+        finish_disconnect_locked(p1),
+        finish_disconnect_locked(p2),
+    )
+    assert res1 is not None and res1.local_purge_status == LocalPurgeStatus.COMPLETED
+    assert res2 is not None and res2.local_purge_status == LocalPurgeStatus.COMPLETED
+
+    async with gws_live_pool.connection() as conn:
+        t_row = await (
+            await conn.execute(
+                "SELECT personal_purge_in_progress, personal_purge_generation "
+                "FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+        ).fetchone()
+        assert t_row == (False, 4)  # 0 + 1 (p1 phase1) + 1 (p2 phase1) + 1 (p1 finish) + 1 (p2 finish)
+
+        row_v2 = await (
+            await conn.execute(
+                "SELECT type, blob FROM checkpoint_blobs WHERE thread_id = %s AND channel = 'messages' AND version = 'v2'",
+                (tid,),
+            )
+        ).fetchone()
+        msgs_v2 = {m.id: m for m in serde.loads_typed((row_v2[0], bytes(row_v2[1]))).value}
+        assert msgs_v2["cm0"].content == "public t0"
+        assert msgs_v2["ca0"].content == "public answer t0"
+        for mid in ("cm1", "ca1", "cm2", "ca2"):
+            assert msgs_v2[mid].content == PURGED_PLACEHOLDER

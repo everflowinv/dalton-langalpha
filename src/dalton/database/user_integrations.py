@@ -143,6 +143,16 @@ def purge_lock_key(purge_id: str | UUID) -> int:
     return advisory_key("dalton_integration_purge", str(purge_id))
 
 
+def touch_user_lock_key(user_id: str) -> int:
+    """Per-user transaction advisory lock key serializing Fork touch copy with Phase 1 touch enumeration."""
+    return advisory_key("dalton_integration_touch_user", str(user_id))
+
+
+def purge_thread_lock_key(thread_id: str | UUID) -> int:
+    """Per-thread session advisory lock key serializing concurrent ledgers rewriting the same thread."""
+    return advisory_key("dalton_integration_purge_thread", str(thread_id))
+
+
 # ---------------------------------------------------------------------------
 # Safe row dataclasses (token fields excluded from repr)
 # ---------------------------------------------------------------------------

@@ -97,6 +97,9 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
     await thread_access(req.source_thread_id, req.user_id, meta=source)
     # DALTON-HOOK(colleague-dispatch): reject fork before copying when caller lost write access to a colleague's workspace
     await check_colleague_workspace_write(source, req.user_id)
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading any fork inputs
+    from src.dalton.services.purge_fence import assert_fork_source_not_purging_tx, read_expected_purge_generation
+    expected_purge_gen = await read_expected_purge_generation(req.source_thread_id)
     snapshot = await take_snapshot(req.source_thread_id, req.cut, req.kind)
     subagents_allowed = await threads_read.read_thread_subagents_allowed(req.source_thread_id)
 
@@ -117,9 +120,8 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                 # Again under the lock, which holds off a delete or compaction
                 # from here on: one may have landed since the plan was read.
                 await thread_fork.check_source(conn, **_source_check(snapshot))
-                # DALTON-HOOK(personal-integrations): reject fork while personal data purge is active
-                from src.dalton.services.purge_fence import assert_fork_source_not_purging_tx
-                await assert_fork_source_not_purging_tx(conn, req.source_thread_id, cut_turn_index=req.cut.turn_index)
+                # DALTON-HOOK(personal-integrations): reject fork while personal data purge is active or generation moved
+                await assert_fork_source_not_purging_tx(conn, req.source_thread_id, cut_turn_index=req.cut.turn_index, expected_purge_gen=expected_purge_gen)
                 async with _checkpoint_connection(conn) as cp:
                     await _copy_chains(cp, req.source_thread_id, thread_id, snapshot, plan)
                 await _write_thread(conn, req, snapshot, plan, source, subagents_allowed, thread_id)

@@ -139,10 +139,7 @@ async def get_slices_at(
             return [_stored(r) for r in await cur.fetchall()]
 
 
-async def _write_many(
-    sql: str, params: list[tuple[Any, ...]], what: str,
-    *, thread_id: str | None = None, expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
-) -> None:
+async def _write_many(sql: str, params: list[tuple[Any, ...]], what: str, *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     if thread_id is not None and expected_purge_gen is not None:  # DALTON-HOOK(personal-integrations)
         from src.dalton.services.purge_fence import write_many_fenced
         return await write_many_fenced(sql, params, what, thread_id=thread_id, expected_purge_gen=expected_purge_gen)
@@ -185,10 +182,7 @@ _UPSERT_TURN = """
 """
 
 
-async def upsert_turn_slices(
-    rows: list[TurnRow],
-    *, thread_id: str | None = None, expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
-) -> None:
+async def upsert_turn_slices(rows: list[TurnRow], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Store turns' slices, each with its lines and run claims when known."""
     if not rows:
         return
@@ -214,10 +208,7 @@ async def upsert_turn_slices(
     )
 
 
-async def update_turns(
-    rows: list[TurnUpdate],
-    *, thread_id: str | None = None, expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
-) -> None:
+async def update_turns(rows: list[TurnUpdate], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Set lines and run claims on stored slices."""
     if not rows:
         return
@@ -267,10 +258,7 @@ async def get_run_slices(thread_id: str, task_ids: list[str]) -> list[RunRow]:
             ]
 
 
-async def upsert_run_slices(
-    rows: list[RunRow],
-    *, thread_id: str | None = None, expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
-) -> None:
+async def upsert_run_slices(rows: list[RunRow], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Store subagent runs' slices."""
     if not rows:
         return

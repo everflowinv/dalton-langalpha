@@ -8,19 +8,25 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+import json
 import logging
+import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 import uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+import psycopg
 import pytest
 
 from ptc_agent.agent.middleware.compaction.utils import (
     COMPACTION_SUMMARY_KEY,
     SIDECAR_KEY,
     SUMMARIZED_KEY,
+    SummarySpan,
+    build_summary_message,
 )
 from src.dalton.auth.dispatch import SensitiveQueryLogFilter, redact_sensitive_query_params
 from src.dalton.database import user_integrations as db
@@ -34,8 +40,10 @@ from src.dalton.database.user_integrations import (
     extract_google_project,
     lifecycle_lock_key,
     purge_lock_key,
+    purge_thread_lock_key,
     refresh_lock_key,
     revoke_lock_key,
+    touch_user_lock_key,
 )
 from src.dalton.migrations.versions import d06X_user_integrations as d06x_mod
 from src.dalton.services import integration_data_purge as purge_mod
@@ -46,6 +54,7 @@ from src.dalton.services.integration_data_purge import (
     PURGED_TOOL_ARGS,
     PURGED_TOOL_ARGS_JSON,
     collect_redis_keys_for_suffix,
+    is_redis_configured_for_purge,
     redact_interrupt_payload,
     redact_message,
     redact_ui_record,
@@ -65,24 +74,40 @@ from src.dalton.services.purge_fence import (
     PersonalDataPurgeInProgressError,
     assert_fork_source_not_purging_tx,
     assert_thread_not_purging_tx,
+    build_guarded_search_rows,
     check_thread_not_purging_fast,
+    check_writeback_fence_tx,
+    clip_purged_ranges_on_truncate_tx,
     clip_purged_turn_ranges,
+    copy_personal_integration_state_for_fork_tx,
     fork_max_inclusive_turn,
+    is_personal_integration_thread,
     is_turn_in_purged_ranges,
     merge_turn_range,
     normalize_turn_ranges,
+    read_expected_purge_generation,
+    read_thread_purge_state,
     save_stored_transcript_fenced,
     should_skip_memory_extraction_for_thread,
     verify_writeback_fence_tx,
+    write_many_fenced,
 )
 from src.observability.private_query import (
     AccessLogQueryFilter,
     drop_span_query,
     is_private,
 )
+from src.server.database import session_lock
 from src.server.services.forks.model import BeforeTurn, ForkRefused, ThroughTurn
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def _enable_dalton_env_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicitly enable Dalton in unit tests exercising Dalton purge/fence paths."""
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +225,10 @@ def test_lock_keys_and_google_project_extraction():
     assert revoke_lock_key("u1", "123456789012", "sub-1") != revoke_lock_key("u1", "999999999999", "sub-1")
     assert purge_lock_key("p1") != purge_lock_key("p2")
     assert purge_lock_key("p1") == purge_lock_key("p1")
+    assert touch_user_lock_key("u1") != touch_user_lock_key("u2")
+    assert touch_user_lock_key("u1") == touch_user_lock_key("u1")
+    assert purge_thread_lock_key("t1") != purge_thread_lock_key("t2")
+    assert purge_thread_lock_key("t1") == purge_thread_lock_key("t1")
 
 
 def test_dataclasses_hide_secret_tokens_in_repr():
@@ -557,7 +586,7 @@ def _sample_ledger(
 @pytest.mark.asyncio
 async def test_process_revoke_outcomes_and_concurrency_with_autospec():
     revoker = create_autospec(RemoteRevoker, instance=True)
-    revoker.revoke = AsyncMock(return_value=RevokeOutcome.SUCCEEDED)
+    revoker.revoke.return_value = RevokeOutcome.SUCCEEDED
 
     pid = str(uuid.uuid4())
     row = _sample_ledger(purge_id=pid)
@@ -575,9 +604,9 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
 
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "get_purge_ledger", AsyncMock(return_value=row)),
-        patch.object(revoke_mod, "_has_newer_active_google_connection", AsyncMock(return_value=False)),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker)
 
@@ -593,13 +622,13 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
 
     # Retryable outcome -> exponential backoff & retry_count increment
     revoker_retry = create_autospec(RemoteRevoker, instance=True)
-    revoker_retry.revoke = AsyncMock(return_value=RevokeOutcome.RETRYABLE)
+    revoker_retry.revoke.return_value = RevokeOutcome.RETRYABLE
     updates.clear()
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "get_purge_ledger", AsyncMock(return_value=_sample_ledger(purge_id=pid, retry_count=2))),
-        patch.object(revoke_mod, "_has_newer_active_google_connection", AsyncMock(return_value=False)),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "get_purge_ledger", autospec=True, return_value=_sample_ledger(purge_id=pid, retry_count=2)),
+        patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker_retry)
     assert status == RemoteRevokeStatus.FAILED_RETRYABLE
@@ -610,13 +639,13 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
 
     # Permanent failure -> clear token & mark superseded
     revoker_perm = create_autospec(RemoteRevoker, instance=True)
-    revoker_perm.revoke = AsyncMock(return_value=RevokeOutcome.PERMANENT_FAILURE)
+    revoker_perm.revoke.return_value = RevokeOutcome.PERMANENT_FAILURE
     updates.clear()
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "get_purge_ledger", AsyncMock(return_value=row)),
-        patch.object(revoke_mod, "_has_newer_active_google_connection", AsyncMock(return_value=False)),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker_perm)
     assert status == RemoteRevokeStatus.SUPERSEDED
@@ -625,13 +654,13 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
 
     # Newer active authorization already exists -> mark superseded WITHOUT calling revoker
     revoker_never = create_autospec(RemoteRevoker, instance=True)
-    revoker_never.revoke = AsyncMock(return_value=RevokeOutcome.SUCCEEDED)
+    revoker_never.revoke.return_value = RevokeOutcome.SUCCEEDED
     updates.clear()
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "get_purge_ledger", AsyncMock(return_value=row)),
-        patch.object(revoke_mod, "_has_newer_active_google_connection", AsyncMock(return_value=True)),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=True),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker_never)
     assert status == RemoteRevokeStatus.SUPERSEDED
@@ -656,8 +685,8 @@ async def test_supersede_and_revoke_before_new_authorization_and_disabled_loop(c
 
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "list_active_revokes_for_google_project_sub", AsyncMock(return_value=[row1, row2])),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "list_active_revokes_for_google_project_sub", autospec=True, return_value=[row1, row2]),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         count = await supersede_pending_revokes("user-1", "123456789012", "sub-abc")
     assert count == 2
@@ -665,12 +694,12 @@ async def test_supersede_and_revoke_before_new_authorization_and_disabled_loop(c
 
     # revoke_before_new_authorization: failure immediately marks superseded (never retryable)
     revoker = create_autospec(RemoteRevoker, instance=True)
-    revoker.revoke = AsyncMock(side_effect=[RevokeOutcome.SUCCEEDED, RevokeOutcome.RETRYABLE])
+    revoker.revoke.side_effect = [RevokeOutcome.SUCCEEDED, RevokeOutcome.RETRYABLE]
     updates.clear()
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
-        patch.object(db, "list_active_revokes_for_google_project_sub", AsyncMock(return_value=[row1, row2])),
-        patch.object(db, "update_purge_ledger_remote_status", side_effect=_capture_update),
+        patch.object(db, "list_active_revokes_for_google_project_sub", autospec=True, return_value=[row1, row2]),
+        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         res = await revoke_before_new_authorization("user-1", "123456789012", "sub-abc", revoker)
     assert res[row1.purge_id] == RemoteRevokeStatus.SUCCEEDED
@@ -750,6 +779,8 @@ async def test_writeback_fence_for_share_rejects_stale_and_in_progress():
 
 @pytest.mark.asyncio
 async def test_transcript_fenced_save_releases_blobs_on_abort_and_skips_upload_on_mismatch():
+    from src.server.database import thread_transcripts as tt_db
+
     tid = str(uuid.uuid4())
     fake_conn = _FakeConn()
 
@@ -757,17 +788,20 @@ async def test_transcript_fenced_save_releases_blobs_on_abort_and_skips_upload_o
     async def _get_conn(_conn=None):
         yield fake_conn
 
-    upload_mock = AsyncMock(return_value=[("a" * 64, datetime.now(UTC))])
-    release_mock = AsyncMock()
-    save_mock = AsyncMock(return_value=False)
+    upload_mock = create_autospec(
+        purge_fence._upload_and_register_blobs_tracked,
+        return_value=[("a" * 64, datetime.now(UTC))],
+    )
+    release_mock = create_autospec(purge_fence._release_uploaded_blobs, return_value=None)
+    save_mock = create_autospec(tt_db.save_stored, return_value=False)
 
     # 1. Fence mismatch -> aborts before uploading any blob
     with (
         patch.object(purge_fence, "get_db_connection", _get_conn),
-        patch.object(purge_fence, "verify_writeback_fence_tx", AsyncMock(return_value=False)),
+        patch.object(purge_fence, "verify_writeback_fence_tx", autospec=True, return_value=False),
         patch.object(purge_fence, "_upload_and_register_blobs_tracked", upload_mock),
         patch.object(purge_fence, "_release_uploaded_blobs", release_mock),
-        patch("src.server.database.thread_transcripts.save_stored", save_mock),
+        patch.object(tt_db, "save_stored", save_mock),
     ):
         ok = await save_stored_transcript_fenced(
             tid, "", "u1", SimpleNamespace(), {"a" * 64: b"data"}, expected_purge_gen=0
@@ -779,10 +813,10 @@ async def test_transcript_fenced_save_releases_blobs_on_abort_and_skips_upload_o
     # 2. Fence passes, blob uploads, save_stored returns False -> uploaded blob is released!
     with (
         patch.object(purge_fence, "get_db_connection", _get_conn),
-        patch.object(purge_fence, "verify_writeback_fence_tx", AsyncMock(return_value=True)),
+        patch.object(purge_fence, "verify_writeback_fence_tx", autospec=True, return_value=True),
         patch.object(purge_fence, "_upload_and_register_blobs_tracked", upload_mock),
         patch.object(purge_fence, "_release_uploaded_blobs", release_mock),
-        patch("src.server.database.thread_transcripts.save_stored", save_mock),
+        patch.object(tt_db, "save_stored", save_mock),
     ):
         ok = await save_stored_transcript_fenced(
             tid, "", "u1", SimpleNamespace(), {"a" * 64: b"data"}, expected_purge_gen=0
@@ -795,6 +829,7 @@ async def test_transcript_fenced_save_releases_blobs_on_abort_and_skips_upload_o
 @pytest.mark.asyncio
 async def test_search_index_turns_closed_range_guard_and_expected_gen():
     from src.server.database.search import index as search_db
+    from src.server.services.history import committed as committed_mod
     from src.server.services.search import index as search_svc
 
     tid = str(uuid.uuid4())
@@ -821,10 +856,10 @@ async def test_search_index_turns_closed_range_guard_and_expected_gen():
         return len(rows)
 
     with (
-        patch.object(purge_fence, "read_thread_purge_state", AsyncMock(return_value=(False, 2, [[1, 2]]))),
-        patch.object(search_db, "turns_to_index", AsyncMock(return_value=(sources, now))),
-        patch("src.server.services.history.committed.read_committed_texts", AsyncMock(return_value=committed)),
-        patch.object(search_db, "write_turns", side_effect=_fake_write),
+        patch.object(purge_fence, "read_thread_purge_state", autospec=True, return_value=(False, 2, [[1, 2]])),
+        patch.object(search_db, "turns_to_index", autospec=True, return_value=(sources, now)),
+        patch.object(committed_mod, "read_committed_texts", autospec=True, return_value=committed),
+        patch.object(search_db, "write_turns", autospec=True, side_effect=_fake_write),
     ):
         res = await search_svc.index_turns(tid)
 
@@ -847,9 +882,9 @@ async def test_archive_extractor_and_memory_skip_personal_integration_threads():
     from src.dalton.conversations import extractor as ext_mod
 
     tid = str(uuid.uuid4())
-    assist_mock = AsyncMock()
+    assist_mock = create_autospec(ext_mod.assist_json)
     with (
-        patch.object(purge_fence, "is_personal_integration_thread", AsyncMock(return_value=True)),
+        patch.object(purge_fence, "is_personal_integration_thread", autospec=True, return_value=True),
         patch.object(ext_mod, "assist_json", assist_mock),
     ):
         outcome = await ext_mod.extract_segment_cards(
@@ -862,7 +897,7 @@ async def test_archive_extractor_and_memory_skip_personal_integration_threads():
     assert outcome.cards == []
     assist_mock.assert_not_awaited()
 
-    with patch.object(purge_fence, "is_personal_integration_thread", AsyncMock(return_value=True)):
+    with patch.object(purge_fence, "is_personal_integration_thread", autospec=True, return_value=True):
         assert await should_skip_memory_extraction_for_thread(tid) is True
 
 
@@ -896,17 +931,22 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
         disconnected_at=now,
         completed_at=None,
     )
-    fake_conn = _FakeConn(_FakeCursor(fetchone_seq=[(True,)], fetchall_seq=[[]]))
+    fake_conn = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
 
     @asynccontextmanager
     async def _get_conn(_conn=None):
         yield fake_conn
 
+    @asynccontextmanager
+    async def _lock_ok(_key):
+        yield True
+
     with (
-        patch.object(db, "get_purge_ledger", AsyncMock(return_value=ledger)),
+        patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
+        patch.object(db, "get_purge_ledger", autospec=True, return_value=ledger),
         patch.object(purge_mod, "get_db_connection", _get_conn),
-        patch.object(db, "delete_approvals_for_disconnect", AsyncMock(return_value=0)),
-        patch.object(purge_mod, "get_checkpointer", return_value=None),
+        patch.object(db, "delete_approvals_for_disconnect", autospec=True, return_value=0),
+        patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
     ):
         report = await purge_mod.run_local_purge(pid)
     assert report.tracker_reconcile_needed is True
@@ -920,17 +960,18 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
 
     register_tracker_purge_handler(_custom_handler)
     try:
-        fake_conn2 = _FakeConn(_FakeCursor(fetchone_seq=[(True,)], fetchall_seq=[[]]))
+        fake_conn2 = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
 
         @asynccontextmanager
         async def _get_conn2(_conn=None):
             yield fake_conn2
 
         with (
-            patch.object(db, "get_purge_ledger", AsyncMock(return_value=ledger)),
+            patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
+            patch.object(db, "get_purge_ledger", autospec=True, return_value=ledger),
             patch.object(purge_mod, "get_db_connection", _get_conn2),
-            patch.object(db, "delete_approvals_for_disconnect", AsyncMock(return_value=0)),
-            patch.object(purge_mod, "get_checkpointer", return_value=None),
+            patch.object(db, "delete_approvals_for_disconnect", autospec=True, return_value=0),
+            patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
         ):
             report2 = await purge_mod.run_local_purge(pid)
         assert report2.tracker_reconcile_needed is False
@@ -1058,12 +1099,17 @@ def test_restore_reset_sql_and_restore_script_wiring():
         assert required in sql, f"restore SQL missing {required}"
 
     restore_sh = (REPO_ROOT / "scripts" / "standalone" / "restore.sh").read_text(encoding="utf-8")
+    step3_pos = restore_sh.index('info "3/7 ')
+    check_pos = restore_sh.index("PERSONAL_INTEGRATIONS_RESET_SQL=")
+    mutation_pos = restore_sh.index("MUTATION_STARTED=1")
     migrate_pos = restore_sh.index("compose_cmd run --rm migrate")
-    reset_pos = restore_sh.index("personal_integrations_restore_reset.sql")
+    exec_pos = restore_sh.index('< "$PERSONAL_INTEGRATIONS_RESET_SQL"')
     up_pos = restore_sh.index("compose_cmd up -d\n")
-    assert migrate_pos < reset_pos < up_pos
-    assert 'if [[ ! -f "$PERSONAL_INTEGRATIONS_RESET_SQL" ]]; then' in restore_sh
-    missing_branch = restore_sh[reset_pos : reset_pos + 320]
+    assert step3_pos < check_pos < mutation_pos < migrate_pos < exec_pos < up_pos
+    missing_branch = restore_sh[check_pos : check_pos + 420]
+    assert '! -f "$PERSONAL_INTEGRATIONS_RESET_SQL"' in missing_branch
+    assert '! -r "$PERSONAL_INTEGRATIONS_RESET_SQL"' in missing_branch
+    assert '! -s "$PERSONAL_INTEGRATIONS_RESET_SQL"' in missing_branch
     assert "err " in missing_branch and "exit 1" in missing_branch
 
     pkg_sh = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
@@ -1105,7 +1151,10 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
     held_ns = create_autospec(writer_guard.held_task_namespaces, return_value=set())
 
     cur = _FakeCursor(
-        fetchall_seq=[[{"run_id": rid}], [{"task_id": "task-1", "task_run_id": trid}]],
+        fetchall_seq=[
+            [{"run_id": rid}],
+            [{"task_id": "task-1", "task_run_id": trid, "status": "in_progress"}],
+        ],
         fetchone_seq=[(True,)],
     )
     fake_conn = _FakeConn(cur)
@@ -1131,7 +1180,10 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
     # When held_task_namespaces remains non-empty, drain times out and raises TimeoutError
     held_busy = create_autospec(writer_guard.held_task_namespaces, return_value={"task-1"})
     cur2 = _FakeCursor(
-        fetchall_seq=[[{"run_id": rid}], [{"task_id": "task-1", "task_run_id": trid}]],
+        fetchall_seq=[
+            [{"run_id": rid}],
+            [{"task_id": "task-1", "task_run_id": trid, "status": "in_progress"}],
+        ],
         fetchone_seq=[(True,), (True,), (True,)],
     )
     fake_conn2 = _FakeConn(cur2)
@@ -1149,6 +1201,59 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
     ):
         with pytest.raises(TimeoutError):
             await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=0.05)
+
+    # r3: No live runs or tasks, yet thread_key is held -> waits until timeout; returns once released
+    cur_idle_busy = _FakeCursor(fetchall_seq=[[], []], fetchone_seq=[(False,), (False,), (False,)])
+    fake_idle_busy = _FakeConn(cur_idle_busy)
+
+    @asynccontextmanager
+    async def _get_idle_busy(_conn=None):
+        yield fake_idle_busy
+
+    with (
+        patch.object(purge_mod, "get_db_connection", _get_idle_busy),
+        patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
+    ):
+        with pytest.raises(TimeoutError):
+            await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=0.05)
+
+    cur_idle_free = _FakeCursor(fetchall_seq=[[], []], fetchone_seq=[(True,)])
+    fake_idle_free = _FakeConn(cur_idle_free)
+
+    @asynccontextmanager
+    async def _get_idle_free(_conn=None):
+        yield fake_idle_free
+
+    held_empty = create_autospec(writer_guard.held_task_namespaces, return_value=set())
+    with (
+        patch.object(purge_mod, "get_db_connection", _get_idle_free),
+        patch.object(writer_guard, "held_task_namespaces", held_empty),
+    ):
+        await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=1.0)
+    held_empty.assert_awaited_once_with(tid, [])
+
+    # r3: Completed subagent (no longer active) whose namespace lock is still held -> waits & times out without re-cancelling
+    req_task_never = create_autospec(subagent_runs.request_task_run_cancel)
+    held_still_locked = create_autospec(writer_guard.held_task_namespaces, return_value={"task-finished"})
+    cur_done_task = _FakeCursor(
+        fetchall_seq=[[], [{"task_id": "task-finished", "task_run_id": trid, "status": "completed"}]],
+        fetchone_seq=[(True,), (True,), (True,)],
+    )
+    fake_done_task = _FakeConn(cur_done_task)
+
+    @asynccontextmanager
+    async def _get_done_task(_conn=None):
+        yield fake_done_task
+
+    with (
+        patch.object(purge_mod, "get_db_connection", _get_done_task),
+        patch.object(subagent_runs, "request_task_run_cancel", req_task_never),
+        patch.object(writer_guard, "held_task_namespaces", held_still_locked),
+    ):
+        with pytest.raises(TimeoutError):
+            await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=0.05)
+    req_task_never.assert_not_awaited()
+    held_still_locked.assert_awaited_with(tid, ["task-finished"])
 
 
 @pytest.mark.asyncio
@@ -1274,36 +1379,57 @@ async def test_shared_ui_version_and_cumulative_messages_preserve_pre_touch_summ
 
 
 @pytest.mark.asyncio
-async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop():
+async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(monkeypatch):
     from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+    from src.server.services import writer_guard
+    from src.utils.cache import redis_cache as redis_cache_mod
 
     # begin_disconnect rejects service=None and points to begin_disconnect_all_services
     with pytest.raises(ValueError, match="begin_disconnect_all_services"):
         await lifecycle_mod.begin_disconnect("u1", "google", None)  # type: ignore[arg-type]
 
-    # finish_disconnect_locked returns None immediately if advisory lock is already held
-    busy_conn = _FakeConn(_FakeCursor(fetchone_seq=[(False,)]))
-
+    # finish_disconnect_locked & run_local_purge return early without calling body when try_own_session_lock yields False
     @asynccontextmanager
-    async def _busy_get_conn(_conn=None):
-        yield busy_conn
+    async def _lock_busy(_key):
+        yield False
 
-    with patch.object(lifecycle_mod, "get_db_connection", _busy_get_conn):
+    lock_busy_mock = create_autospec(session_lock.try_own_session_lock, side_effect=_lock_busy)
+    body_mock = create_autospec(purge_mod._run_local_purge_body)
+    with (
+        patch.object(session_lock, "try_own_session_lock", lock_busy_mock),
+        patch.object(purge_mod, "_run_local_purge_body", body_mock),
+    ):
         assert await lifecycle_mod.finish_disconnect_locked(str(uuid.uuid4())) is None
+        rep_skip = await purge_mod.run_local_purge(str(uuid.uuid4()))
+        assert rep_skip.skipped is True
+    body_mock.assert_not_awaited()
+    assert lock_busy_mock.call_count == 2
 
-    # Redis disabled -> returns 0; Redis delete failure -> propagates exception
-    disabled_cache = SimpleNamespace(enabled=False, client=None)
-    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=disabled_cache):
-        assert await purge_mod._delete_redis_keys(["k1"]) == 0
+    # Redis configured disabled -> returns 0; configured enabled + cache.enabled=False -> raises; delete error -> raises
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
+    assert is_redis_configured_for_purge() is False
+    assert await purge_mod._delete_redis_keys(["k1"]) == 0
+
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "true")
+    with (
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=False, client=None)),
+    ):
+        assert is_redis_configured_for_purge() is True
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await purge_mod._delete_redis_keys(["k1"])
 
     class _FailingRedis:
         async def delete(self, *keys):
             raise ConnectionError("redis down")
 
-    failing_cache = SimpleNamespace(enabled=True, client=_FailingRedis())
-    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=failing_cache):
+    with (
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=True, client=_FailingRedis())),
+    ):
         with pytest.raises(ConnectionError):
             await purge_mod._delete_redis_keys(["k1"])
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
 
     # Missing checkpointer on a ledger with affected threads -> raises RuntimeError (never marks completed)
     import dataclasses
@@ -1322,10 +1448,16 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
     async def _cp_missing_get_conn(_conn=None):
         yield cp_missing_conn
 
+    @asynccontextmanager
+    async def _lock_ok(_key):
+        yield True
+
     with (
+        patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
         patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
         patch.object(purge_mod, "get_db_connection", _cp_missing_get_conn),
-        patch.object(purge_mod, "get_checkpointer", return_value=None),
+        patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
+        patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
     ):
         with pytest.raises(RuntimeError, match="Checkpointer"):
             await purge_mod.run_local_purge(pid)
@@ -1335,7 +1467,7 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
         _FakeCursor(
             fetchone_seq=[{"tbl": "dalton_conversation_cards"}],
             fetchall_seq=[
-                [{"card_id": "c1", "date_et": "2026-11-26", "rendered_locations": ["a.md"], "tickers": []}],
+                [{"card_id": "c1", "date_et": "2026-11-26", "rendered_locations": [{"workspace_id": "w1", "path": "a.md"}], "tickers": []}],
                 [],
             ],
         )
@@ -1358,9 +1490,454 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
         scan_ran.set()
         return []
 
-    with patch.object(purge_mod, "run_personal_purge_resume_once", side_effect=_fake_once):
+    with patch.object(purge_mod, "run_personal_purge_resume_once", autospec=True, side_effect=_fake_once):
         task = asyncio.create_task(purge_mod.run_personal_purge_resume_loop(poll_interval_s=60.0))
         await asyncio.wait_for(scan_ran.wait(), timeout=1.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ---------------------------------------------------------------------------
+# 10. r3 additions: real _summarization_event, partial failures, Dalton=0 gate, restore.sh pre-mutation fail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_compaction_summarization_event_redaction_and_pre_touch_preservation():
+    """Real compaction stores summary_message inside ``_summarization_event`` (plus context_summary & ui).
+    Overlapping summaries redact all 3 copies and drop SIDECAR_KEY while preserving event metadata;
+    pre-touch summaries remain untouched.
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+    serde = JsonPlusSerializer()
+    tid = str(uuid.uuid4())
+    r0 = str(uuid.uuid4())
+    r1 = str(uuid.uuid4())
+
+    sum_pre = build_summary_message(
+        "Pre-touch research summary of turn 0",
+        original_message_count=4,
+        span=SummarySpan(0, 0),
+        native={"type": "compaction", "content": "pre-native-keep"},
+        origin="anthropic",
+    )
+    sum_cross = build_summary_message(
+        "Cross-boundary summary leaking turn 1 personal calendar dinner",
+        original_message_count=8,
+        span=SummarySpan(0, 1),
+        native={"type": "compaction", "content": "secret-native-block"},
+        origin="anthropic",
+    )
+    assert SIDECAR_KEY in sum_pre.additional_kwargs
+    assert SIDECAR_KEY in sum_cross.additional_kwargs
+
+    ev_pre = {
+        "cutoff_index": 2,
+        "summary_message": sum_pre,
+        "file_path": "/workspace/history-pre.md",
+        "anchor_message_id": "m-pre-anchor",
+    }
+    ev_cross = {
+        "cutoff_index": 5,
+        "summary_message": sum_cross,
+        "file_path": "/workspace/history-cross.md",
+        "anchor_message_id": "m-cross-anchor",
+    }
+
+    ai_pre = AIMessage(
+        content="Turn 0 public answer",
+        id="ai-0",
+        response_metadata={
+            COMPACTION_SUMMARY_KEY: {
+                "summary_message_id": sum_pre.id,
+                "summary_text": "Pre-touch research summary of turn 0",
+                "summary_length": 36,
+            }
+        },
+    )
+    ai_cross = AIMessage(
+        content="Turn 0 second answer carrying cross summary stamp",
+        id="ai-0b",
+        response_metadata={
+            COMPACTION_SUMMARY_KEY: {
+                "summary_message_id": sum_cross.id,
+                "summary_text": "Cross-boundary summary leaking turn 1 personal calendar dinner",
+                "summary_length": 62,
+            }
+        },
+    )
+
+    m0_t, m0_b = serde.dumps_typed(_DeltaSnapshot([HumanMessage(content="NVDA Q0", id="m0"), ai_pre, ai_cross]))
+    e0_t, e0_b = serde.dumps_typed(ev_pre)
+    e1_t, e1_b = serde.dumps_typed(ev_cross)
+    u0_t, u0_b = serde.dumps_typed(
+        [
+            {
+                "type": "ui",
+                "id": "ui-pre",
+                "name": "context_window",
+                "props": {"action": "summarize"},
+                "metadata": {
+                    "summary_message_id": sum_pre.id,
+                    "replaced_summary": {
+                        "id": sum_pre.id,
+                        "action": "summarize",
+                        "summary_text": "Pre-touch replaced summary",
+                        SIDECAR_KEY: {"content": "keep-pre"},
+                    },
+                },
+            },
+            {
+                "type": "ui",
+                "id": "ui-cross",
+                "name": "context_window",
+                "props": {"action": "summarize"},
+                "metadata": {
+                    "summary_message_id": sum_cross.id,
+                    "replaced_summary": {
+                        "id": sum_cross.id,
+                        "action": "summarize",
+                        "summary_text": "Cross replaced summary leaking dinner",
+                        SIDECAR_KEY: {"content": "drop-cross"},
+                    },
+                },
+            },
+        ]
+    )
+
+    all_cps = [
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-0",
+            "parent_checkpoint_id": None,
+            "checkpoint": {"channel_versions": {"messages": "v0", "ui": "u0", "_summarization_event": "e0"}},
+            "metadata": {"turn_index": 0, "run_id": r0},
+        },
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-1",
+            "parent_checkpoint_id": "cp-0",
+            "checkpoint": {"channel_versions": {"messages": "v0", "ui": "u0", "_summarization_event": "e1"}},
+            "metadata": {"turn_index": 1, "run_id": r1},
+        },
+    ]
+    writes = [
+        {"checkpoint_ns": "", "checkpoint_id": "cp-0", "task_id": "t0", "idx": 0, "channel": "_summarization_event", "type": e0_t, "blob": e0_b},
+        {"checkpoint_ns": "", "checkpoint_id": "cp-1", "task_id": "t1", "idx": 0, "channel": "_summarization_event", "type": e1_t, "blob": e1_b},
+    ]
+    blobs = [
+        {"checkpoint_ns": "", "channel": "messages", "version": "v0", "type": m0_t, "blob": m0_b},
+        {"checkpoint_ns": "", "channel": "ui", "version": "u0", "type": u0_t, "blob": u0_b},
+        {"checkpoint_ns": "", "channel": "_summarization_event", "version": "e0", "type": e0_t, "blob": e0_b},
+        {"checkpoint_ns": "", "channel": "_summarization_event", "version": "e1", "type": e1_t, "blob": e1_b},
+    ]
+
+    cur = _FakeCursor(fetchall_seq=[all_cps, writes, blobs])
+    cp_conn = _FakeConn(cur)
+
+    updated = await purge_mod._purge_thread_checkpoints(
+        cp_conn,
+        serde,
+        thread_id=tid,
+        min_turn=1,
+        max_turn=1,
+        run_turn_map={r0: 0, r1: 1},
+        suffix_run_ids={r1},
+        suffix_task_ids=set(),
+    )
+    assert updated == 4  # write e1 + blobs v0, u0, e1 (pre-touch e0 untouched)
+
+    updated_blobs: dict[tuple[str, str], object] = {}
+    updated_writes: dict[tuple[str, str], object] = {}
+    for sql, params in cur.executed:
+        if "UPDATE checkpoint_blobs" in sql:
+            new_type, new_blob, _t, _ns, ch, ver = params  # type: ignore[misc]
+            updated_blobs[(ch, ver)] = serde.loads_typed((new_type, new_blob))
+        elif "UPDATE checkpoint_writes" in sql:
+            new_type, new_blob, _t, _ns, cid, _tk, _idx = params  # type: ignore[misc]
+            updated_writes[(cid, "_summarization_event")] = serde.loads_typed((new_type, new_blob))
+
+    # Pre-touch _summarization_event e0 was NOT rewritten at all
+    assert ("_summarization_event", "e0") not in updated_blobs
+    assert ("cp-0", "_summarization_event") not in updated_writes
+
+    # Overlapping _summarization_event e1 rewritten in both blob and write, metadata preserved, SIDECAR_KEY removed
+    for rewritten_ev in (updated_blobs[("_summarization_event", "e1")], updated_writes[("cp-1", "_summarization_event")]):
+        assert isinstance(rewritten_ev, dict)
+        assert rewritten_ev["cutoff_index"] == 5
+        assert rewritten_ev["file_path"] == "/workspace/history-cross.md"
+        assert rewritten_ev["anchor_message_id"] == "m-cross-anchor"
+        sm = rewritten_ev["summary_message"]
+        assert sm.content == PURGED_PLACEHOLDER
+        assert SIDECAR_KEY not in sm.additional_kwargs
+
+    # Copy 2: AIMessage.response_metadata.context_summary
+    msgs_v0 = {m.id: m for m in updated_blobs[("messages", "v0")].value}
+    assert msgs_v0["ai-0"].response_metadata[COMPACTION_SUMMARY_KEY]["summary_text"] == "Pre-touch research summary of turn 0"
+    assert msgs_v0["ai-0b"].response_metadata[COMPACTION_SUMMARY_KEY]["summary_text"] == PURGED_PLACEHOLDER
+
+    # Copy 3: ui.replaced_summary
+    ui_u0 = {r["id"]: r for r in updated_blobs[("ui", "u0")]}
+    assert ui_u0["ui-pre"]["metadata"]["replaced_summary"]["summary_text"] == "Pre-touch replaced summary"
+    assert SIDECAR_KEY in ui_u0["ui-pre"]["metadata"]["replaced_summary"]
+    assert ui_u0["ui-cross"]["metadata"]["replaced_summary"]["summary_text"] == PURGED_PLACEHOLDER
+    assert SIDECAR_KEY not in ui_u0["ui-cross"]["metadata"]["replaced_summary"]
+
+
+@pytest.mark.asyncio
+async def test_partial_failures_decode_and_same_db_missing_checkpoints():
+    """Corrupt checkpoint blob/write and missing public.checkpoints in same-DB fallback must raise RuntimeError."""
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from src.server.services import writer_guard
+
+    serde = JsonPlusSerializer()
+    tid = str(uuid.uuid4())
+    r0 = str(uuid.uuid4())
+    all_cps = [
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-corrupt",
+            "parent_checkpoint_id": None,
+            "checkpoint": {"channel_versions": {"messages": "v-bad"}},
+            "metadata": {"turn_index": 0, "run_id": r0},
+        }
+    ]
+    secret_payload = b"SENSITIVE_RAW_BLOB_DO_NOT_LEAK"
+    bad_blobs = [
+        {"checkpoint_ns": "", "channel": "messages", "version": "v-bad", "type": "json", "blob": secret_payload}
+    ]
+    cur = _FakeCursor(fetchall_seq=[all_cps, [], bad_blobs])
+    cp_conn = _FakeConn(cur)
+
+    with pytest.raises(RuntimeError) as exc_blob:
+        await purge_mod._purge_thread_checkpoints(
+            cp_conn,
+            serde,
+            thread_id=tid,
+            min_turn=0,
+            max_turn=0,
+            run_turn_map={r0: 0},
+            suffix_run_ids={r0},
+            suffix_task_ids=set(),
+        )
+    msg = str(exc_blob.value)
+    assert tid in msg and "cp-corrupt" in msg and "messages" in msg
+    assert "SENSITIVE_RAW_BLOB_DO_NOT_LEAK" not in msg
+
+    # Same-DB fallback with to_regclass('public.checkpoints') returning None raises RuntimeError
+    import dataclasses
+
+    pid = str(uuid.uuid4())
+    running_ledger = dataclasses.replace(
+        _sample_ledger(purge_id=pid),
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={tid: {"min_turn": 0, "max_turn": 0}},
+    )
+    # fetchall sequence: touches=[], live_runs=[], suffix_tasks=[], all_responses=[]
+    # fetchone sequence: thread_key lock=(True,), workspace_id={"workspace_id": None}, to_regclass={"tbl": None}
+    no_cp_conn = _FakeConn(
+        _FakeCursor(
+            fetchone_seq=[(True,), {"workspace_id": None}, {"tbl": None}],
+            fetchall_seq=[[], [], [], []],
+        )
+    )
+
+    @asynccontextmanager
+    async def _get_no_cp_conn(_conn=None):
+        yield no_cp_conn
+
+    @asynccontextmanager
+    async def _lock_ok(_key):
+        yield True
+
+    @asynccontextmanager
+    async def _thread_lock_ok(_tid, *, timeout_s=120.0, poll_interval_s=0.05):
+        yield
+
+    with (
+        patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
+        patch.object(purge_mod, "acquire_purge_thread_lock", autospec=True, side_effect=_thread_lock_ok),
+        patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
+        patch.object(purge_mod, "get_db_connection", _get_no_cp_conn),
+        patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
+        patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=SimpleNamespace(conn=None, serde=serde)),
+    ):
+        with pytest.raises(RuntimeError, match="public.checkpoints"):
+            await purge_mod.run_local_purge(pid)
+
+
+@pytest.mark.asyncio
+async def test_dalton_disabled_skips_all_purge_fence_sql(monkeypatch: pytest.MonkeyPatch):
+    """When DALTON_ENABLED=0, all upstream-facing purge_fence helpers execute zero Dalton SQL."""
+    from src.server.database import thread_transcripts as tt_db
+    from src.server.database.search import index as search_db
+
+    monkeypatch.setenv("DALTON_ENABLED", "0")
+    tid = str(uuid.uuid4())
+    dst_tid = str(uuid.uuid4())
+
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    conn.cursor.return_value.__aenter__.return_value = cur
+
+    class _NoSqlConn(_FakeConn):
+        async def execute(self, sql: str, params=None):
+            raise AssertionError(f"Unexpected SQL when DALTON_ENABLED=0: {sql}")
+
+    class _NoSqlCursor(_FakeCursor):
+        async def execute(self, sql: str, params=None):
+            raise AssertionError(f"Unexpected SQL when DALTON_ENABLED=0: {sql}")
+
+    no_sql_conn = _NoSqlConn(_NoSqlCursor())
+
+    @asynccontextmanager
+    async def _never_db(_conn=None):
+        yield no_sql_conn
+
+    with patch.object(purge_fence, "get_db_connection", _never_db):
+        for target_conn in (conn, no_sql_conn):
+            await check_thread_not_purging_fast(tid)
+            await assert_thread_not_purging_tx(target_conn, tid)
+            await assert_fork_source_not_purging_tx(target_conn, tid, cut_turn_index=0, expected_purge_gen=0)
+            assert await clip_purged_ranges_on_truncate_tx(target_conn, tid, 1) == []
+            await copy_personal_integration_state_for_fork_tx(
+                target_conn,
+                source_thread_id=tid,
+                target_thread_id=dst_tid,
+                cut=ThroughTurn(0),
+                kept_turn_indexes=[0],
+                run_map={},
+            )
+            assert await read_thread_purge_state(tid, conn=target_conn) is None
+            assert await read_expected_purge_generation(tid, conn=target_conn) is None
+            assert await verify_writeback_fence_tx(target_conn, tid, expected_purge_gen=0) is True
+            assert await check_writeback_fence_tx(target_conn, tid, expected_purge_gen=0) is True
+            assert await is_personal_integration_thread(tid, conn=target_conn) is False
+            assert await should_skip_memory_extraction_for_thread(tid, conn=target_conn) is False
+
+    conn.execute.assert_not_called()
+    cur.execute.assert_not_called()
+    assert no_sql_conn.executed == []
+    assert no_sql_conn._cursor.executed == []
+
+    # build_guarded_search_rows ignores purged ranges and returns expected_purge_gen=None
+    now = datetime.now(UTC)
+    src = search_db.TurnSource(0, str(uuid.uuid4()), "Q0", "user", now)
+    rows, gen = build_guarded_search_rows(
+        [src],
+        SimpleNamespace(texts={src.response_id: "A0"}, unread=set()),
+        (False, 5, [[0, 0]]),
+        lambda s: s or "",
+    )
+    assert gen is None
+    assert rows[0].user_text == "Q0"
+    assert rows[0].answer_text == "A0"
+
+    # save_stored_transcript_fenced skips fence SQL and calls save_stored directly
+    save_mock = create_autospec(tt_db.save_stored, return_value=True)
+    with patch.object(tt_db, "save_stored", save_mock):
+        assert await save_stored_transcript_fenced(
+            tid, "", "u1", SimpleNamespace(), {}, expected_purge_gen=0
+        ) is True
+    save_mock.assert_awaited_once()
+    assert "conn" not in save_mock.call_args.kwargs
+
+    # write_many_fenced runs plain executemany without calling verify_writeback_fence_tx
+    verify_mock = create_autospec(purge_fence.verify_writeback_fence_tx)
+    plain_cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    plain_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    plain_conn.cursor.return_value.__aenter__.return_value = plain_cur
+
+    @asynccontextmanager
+    async def _plain_db(_conn=None):
+        yield plain_conn
+
+    from src.server.database import pool as pool_mod
+
+    with (
+        patch.object(pool_mod, "get_db_connection", _plain_db),
+        patch.object(purge_fence, "verify_writeback_fence_tx", verify_mock),
+    ):
+        await write_many_fenced("INSERT 1", [(1,)], "slice", thread_id=tid, expected_purge_gen=0)
+    verify_mock.assert_not_awaited()
+    plain_cur.executemany.assert_awaited_once()
+
+
+def test_restore_script_fails_before_any_mutation_when_reset_sql_missing(tmp_path: Path):
+    """When work_dir lacks personal_integrations_restore_reset.sql, restore.sh exits non-zero
+    in Step 3 before running pg_restore, MinIO restore, or CREATE DATABASE.
+    """
+    proj = f"r3-miss-sql-{uuid.uuid4().hex[:10]}"
+    work_dir = tmp_path / "work"
+    bak_dir = tmp_path / "backup"
+    bin_dir = tmp_path / "bin"
+    work_dir.mkdir()
+    bak_dir.mkdir()
+    bin_dir.mkdir()
+
+    (work_dir / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+    (work_dir / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+    (work_dir / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+    (work_dir / ".env").write_text(
+        f"COMPOSE_PROJECT_NAME={proj}\n"
+        "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pgtest\nDB_NAME=postgres\n"
+        "DALTON_TLS_MODE=loopback\nDALTON_EDGE_PORT=8088\n",
+        encoding="utf-8",
+    )
+    (work_dir / ".env").chmod(0o600)
+
+    (bak_dir / "postgres.dump").write_bytes(b"PGDMP-fake")
+    (bak_dir / "manifest.json").write_text(
+        json.dumps({"schema_version": 2, "compose_project": proj, "db_name": "postgres"}),
+        encoding="utf-8",
+    )
+
+    calls_log = tmp_path / "docker-calls.log"
+    (bin_dir / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (bin_dir / "flock").chmod(0o755)
+    (bin_dir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{calls_log}"\n'
+        'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+        'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "docker").chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    proj_lock = Path(f"/tmp/dalton-{proj}.restore.lock")
+    try:
+        res = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(work_dir),
+                "--backup-dir",
+                str(bak_dir),
+                "--skip-minio",
+                "--skip-caddy",
+                "--skip-edge-build",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert res.returncode != 0
+        assert "personal_integrations_restore_reset.sql" in res.stderr
+        logged = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
+        assert "pg_restore" not in logged
+        assert "MINIO_RESTORE" not in logged and "minio" not in logged.lower()
+        assert "CREATE DATABASE" not in logged
+    finally:
+        if proj_lock.is_dir():
+            proj_lock.rmdir()
+        elif proj_lock.exists():
+            proj_lock.unlink()

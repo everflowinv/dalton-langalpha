@@ -16,6 +16,8 @@ from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from src.dalton.database.user_integrations import touch_user_lock_key
+from src.dalton.settings import is_dalton_enabled
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import normalize_uuid
 
@@ -154,6 +156,8 @@ async def _has_running_purge_touch(
 
 async def check_thread_not_purging_fast(thread_id: str | None) -> None:
     """Fast preflight check for HTTP ``_admit``: raises 409 + Retry-After: 3 if thread is purging."""
+    if not is_dalton_enabled():
+        return
     tid = normalize_uuid(thread_id)
     if tid is None:
         return
@@ -188,6 +192,8 @@ async def assert_thread_not_purging_tx(conn: Any, thread_id: str) -> None:
     disconnect locking and refuses all entry points (HTTP, automations, wakeups,
     report-backs, retries) while a local 2A purge is in progress.
     """
+    if not is_dalton_enabled():
+        return
     if _is_scripted_mock_conn(conn):
         return
     tid = normalize_uuid(thread_id)
@@ -217,13 +223,19 @@ async def assert_fork_source_not_purging_tx(
     source_thread_id: str,
     *,
     cut_turn_index: int | None = None,
+    expected_purge_gen: int | None = None,
 ) -> None:
-    """Authoritative Fork gate inside the fork transaction (after locking the source thread row).
+    """Authoritative Fork gate inside the fork transaction.
 
-    Raises ``ForkRefused(409, "personal_data_purge_in_progress", ...)`` when the
-    source thread is purging or has unpurged touches up to ``cut_turn_index``
-    associated with a running purge ledger.
+    1. Acquires shared per-user transaction advisory locks (in sorted ``user_id`` order)
+       for every user with unpurged touches on ``source_thread_id``, serializing Fork touch
+       copying against Phase 1 touch enumeration.
+    2. Locks the source thread row ``FOR UPDATE`` and verifies ``personal_purge_in_progress``
+       is False, ``personal_purge_generation == expected_purge_gen`` (when supplied), and no
+       running purge covers touches up to ``cut_turn_index``.
     """
+    if not is_dalton_enabled():
+        return
     if _is_scripted_mock_conn(conn):
         return
     from src.server.services.forks.model import ForkRefused
@@ -234,7 +246,23 @@ async def assert_fork_source_not_purging_tx(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT personal_purge_in_progress
+            SELECT DISTINCT user_id
+            FROM dalton_thread_integration_touches
+            WHERE thread_id = %s::uuid
+              AND purged_at IS NULL
+            ORDER BY user_id ASC
+            """,
+            (tid,),
+        )
+        touch_user_rows = await cur.fetchall()
+        for urow in touch_user_rows:
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock_shared(%s)",
+                (touch_user_lock_key(str(urow["user_id"])),),
+            )
+        await cur.execute(
+            """
+            SELECT personal_purge_in_progress, personal_purge_generation
             FROM conversation_threads
             WHERE conversation_thread_id = %s::uuid
             FOR UPDATE
@@ -244,8 +272,11 @@ async def assert_fork_source_not_purging_tx(
         row = await cur.fetchone()
     if row is None:
         return
-    if bool(row["personal_purge_in_progress"]) or await _has_running_purge_touch(
-        conn, tid, max_turn_index=cut_turn_index
+    current_gen = int(row.get("personal_purge_generation") or 0)
+    if (
+        bool(row["personal_purge_in_progress"])
+        or (expected_purge_gen is not None and current_gen != expected_purge_gen)
+        or await _has_running_purge_touch(conn, tid, max_turn_index=cut_turn_index)
     ):
         raise ForkRefused(409, PURGE_IN_PROGRESS_CODE, PURGE_IN_PROGRESS_MESSAGE)
 
@@ -261,6 +292,8 @@ async def clip_purged_ranges_on_truncate_tx(
     from_turn_index: int,
 ) -> list[list[int]]:
     """Clip ``personal_purged_turn_ranges`` to ``<= from_turn_index - 1`` inside ``truncate_thread_from_turn``."""
+    if not is_dalton_enabled():
+        return []
     if _is_scripted_mock_conn(conn):
         return []
     tid = normalize_uuid(thread_id)
@@ -322,6 +355,8 @@ async def copy_personal_integration_state_for_fork_tx(
     """Propagate ``has_personal_integration_data``, clipped ``personal_purged_turn_ranges``,
     and remapped ``dalton_thread_integration_touches`` onto a forked thread inside the fork tx.
     """
+    if not is_dalton_enabled():
+        return
     if _is_scripted_mock_conn(conn):
         return
     src_id = normalize_uuid(source_thread_id)
@@ -430,6 +465,10 @@ async def read_thread_purge_state(
     conn: Any = None,
 ) -> tuple[bool, int, list[list[int]]] | None:
     """Read ``(personal_purge_in_progress, personal_purge_generation, personal_purged_turn_ranges)``."""
+    if not is_dalton_enabled():
+        return None
+    if conn is not None and _is_scripted_mock_conn(conn):
+        return None
     tid = normalize_uuid(thread_id)
     if tid is None:
         return None
@@ -466,6 +505,8 @@ async def read_expected_purge_generation(
     conn: Any = None,
 ) -> int | None:
     """Snapshot ``personal_purge_generation`` BEFORE reading checkpoints for a writeback."""
+    if not is_dalton_enabled():
+        return None
     state = await read_thread_purge_state(thread_id, conn=conn)
     return None if state is None else state[1]
 
@@ -483,6 +524,10 @@ async def verify_writeback_fence_tx(
     and ``personal_purge_generation == expected_purge_gen`` (when ``expected_purge_gen``
     is provided). Logs and returns ``False`` on fence mismatch without raising to callers.
     """
+    if not is_dalton_enabled():
+        return True
+    if _is_scripted_mock_conn(conn):
+        return True
     tid = normalize_uuid(thread_id)
     if tid is None:
         return True
@@ -529,8 +574,8 @@ async def check_writeback_fence_tx(
     *,
     label: str = "writeback",
 ) -> bool:
-    """Thin-hook wrapper: passes immediately when no fence is requested; otherwise runs ``verify_writeback_fence_tx``."""
-    if thread_id is None or expected_purge_gen is None:
+    """Thin-hook wrapper: passes immediately when Dalton is disabled or no fence is requested; otherwise runs ``verify_writeback_fence_tx``."""
+    if not is_dalton_enabled() or thread_id is None or expected_purge_gen is None:
         return True
     return await verify_writeback_fence_tx(
         conn, thread_id, expected_purge_gen, label=label
@@ -548,6 +593,23 @@ async def write_many_fenced(
     """Fenced ``_write_many`` implementation for ``turn_slices`` / ``task_run_slices``."""
     from psycopg.errors import ForeignKeyViolation
     from src.server.database import pool
+
+    if not is_dalton_enabled():
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await cur.executemany(sql, params)
+                    return
+                except ForeignKeyViolation:
+                    if len(params) == 1:
+                        logger.debug("%s not stored, its parent row is gone", what)
+                        return
+                for row in params:
+                    try:
+                        await cur.execute(sql, row)
+                    except ForeignKeyViolation:
+                        logger.debug("%s not stored, its parent row is gone", what)
+        return
 
     async with pool.get_db_connection() as conn, conn.transaction():
         if not await verify_writeback_fence_tx(
@@ -591,6 +653,22 @@ def build_guarded_search_rows(
         if notification_query_types is None
         else notification_query_types
     )
+    if not is_dalton_enabled():
+        return (
+            [
+                search_db.IndexedTurn(
+                    response_id=s.response_id,
+                    user_text=""
+                    if s.query_type in notif_types
+                    else clean_fn(s.user_text),
+                    answer_text=clean_fn(read.texts.get(s.response_id)),
+                    answer_read=s.response_id not in read.unread,
+                    turn_at=s.turn_at,
+                )
+                for s in sources
+            ],
+            None,
+        )
     expected_purge_gen = purge_state[1] if purge_state is not None else None
     purged_ranges = purge_state[2] if purge_state is not None else []
     indexed_rows = [
@@ -614,6 +692,27 @@ def build_guarded_search_rows(
         for s in sources
     ]
     return indexed_rows, expected_purge_gen
+
+
+async def write_guarded_search_turns(
+    write_fn: Any,
+    thread_id: str,
+    sources: Sequence[Any],
+    read: Any,
+    purge_state: tuple[bool, int, list[list[int]]] | None,
+    read_at: datetime | None,
+    clean_fn: Any,
+    notification_query_types: Any = None,
+) -> int:
+    """Thin-hook helper for ``search.index.index_turns``: builds guarded rows and writes with fence when enabled."""
+    rows, expected_purge_gen = build_guarded_search_rows(
+        sources, read, purge_state, clean_fn, notification_query_types
+    )
+    if expected_purge_gen is None:
+        return await write_fn(thread_id, rows, read_at=read_at)
+    return await write_fn(
+        thread_id, rows, read_at=read_at, expected_purge_gen=expected_purge_gen
+    )
 
 
 async def save_transcript_with_stale_retry(
@@ -770,6 +869,13 @@ async def save_stored_transcript_fenced(
     """
     from src.server.database.thread_transcripts import save_stored
 
+    if not is_dalton_enabled():
+        if blobs:
+            from src.server.database.workspace_file_blobs import store_unregistered_blobs
+
+            await store_unregistered_blobs(user_id, blobs, concurrency=concurrency)
+        return await save_stored(thread_id, prefix, user_id, transcript)
+
     uploaded_stamps: list[tuple[str, datetime]] = []
     committed = False
     try:
@@ -822,6 +928,8 @@ async def is_personal_integration_thread(
 
     Safe to call from archive extraction and memory extraction entrypoints.
     """
+    if not is_dalton_enabled():
+        return False
     candidates: list[str] = []
     for raw in (thread_or_session_id, session_key):
         if not raw:
