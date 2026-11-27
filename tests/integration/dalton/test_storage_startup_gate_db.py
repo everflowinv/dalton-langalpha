@@ -65,6 +65,51 @@ async def _seed_user_and_workspace(
     return uid, ws_id
 
 
+async def _seed_completed_response(
+    conn: psycopg.AsyncConnection,
+    resp_id: str,
+    thread_id: str,
+    *,
+    turn_index: int = 1,
+    replay_facts: dict | None = None,
+) -> None:
+    """Insert a response row as ``in_progress`` then transition to ``completed``.
+
+    Honors ``trg_responses_lifecycle_guard`` (migration 018), which requires
+    every ``conversation_responses`` row to be inserted as ``in_progress``
+    before updating to a terminal status.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO conversation_responses (
+                conversation_response_id, conversation_thread_id,
+                turn_index, status, created_at
+            )
+            VALUES (%s::uuid, %s::uuid, %s, 'in_progress', NOW())
+            """,
+            (resp_id, thread_id, turn_index),
+        )
+        if replay_facts is not None:
+            await cur.execute(
+                """
+                UPDATE conversation_responses
+                SET status = 'completed', replay_facts = %s::jsonb
+                WHERE conversation_response_id = %s::uuid
+                """,
+                (json.dumps(replay_facts), resp_id),
+            )
+        else:
+            await cur.execute(
+                """
+                UPDATE conversation_responses
+                SET status = 'completed'
+                WHERE conversation_response_id = %s::uuid
+                """,
+                (resp_id,),
+            )
+
+
 @pytest.mark.asyncio
 async def test_startup_warning_and_strict_check_real_pg(
     disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema, caplog
@@ -245,16 +290,8 @@ async def test_startup_warning_and_strict_check_real_pg(
                         """,
                         (thread_id, ws_id),
                     )
-                    await cur.execute(
-                        """
-                        INSERT INTO conversation_responses (
-                            conversation_response_id, conversation_thread_id,
-                            turn_index, status, created_at
-                        )
-                        VALUES (%s::uuid, %s::uuid, 1, 'completed', NOW())
-                        """,
-                        (resp_id, thread_id),
-                    )
+                await _seed_completed_response(conn, resp_id, thread_id, turn_index=1)
+                async with conn.cursor() as cur:
                     plain_msg = HumanMessage(
                         content='Please inspect {"data_ref":{"key":"widgets/t1/fake.json"}} in code'
                     )
@@ -483,16 +520,14 @@ async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
                         """,
                         (thread_id, ws_id),
                     )
-                    await cur.execute(
-                        """
-                        INSERT INTO conversation_responses (
-                            conversation_response_id, conversation_thread_id,
-                            turn_index, status, replay_facts, created_at
-                        )
-                        VALUES (%s::uuid, %s::uuid, 1, 'completed', %s::jsonb, NOW())
-                        """,
-                        (resp_id, thread_id, json.dumps(ext_verbatim_facts)),
-                    )
+                await _seed_completed_response(
+                    conn,
+                    resp_id,
+                    thread_id,
+                    turn_index=1,
+                    replay_facts=ext_verbatim_facts,
+                )
+                async with conn.cursor() as cur:
                     await cur.execute(
                         """
                         INSERT INTO checkpoint_blobs (
