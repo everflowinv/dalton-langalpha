@@ -569,6 +569,7 @@ async def build_watchlist_confirmation_snapshot(
             action=raw_action,
             tickers=args.get("tickers"),
             tier=args.get("tier"),
+            policy=args.get("policy") if isinstance(args.get("policy"), dict) else None,
             label=args.get("label"),
             criteria=args.get("criteria") if isinstance(args.get("criteria"), dict) else None,
             default_tier=args.get("default_tier"),

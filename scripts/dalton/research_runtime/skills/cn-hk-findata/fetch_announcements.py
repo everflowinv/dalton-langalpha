@@ -3,8 +3,10 @@ import argparse
 import datetime as dt
 import io
 import json
+import math
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import fitz
@@ -82,8 +84,23 @@ def classify_title(title: str) -> str:
     return "other"
 
 
-def get_org_id(stock_code: str, headers: dict) -> str:
-    r = requests.post(SEARCH_URL, data={"keyWord": stock_code, "maxNum": 10}, headers=headers, timeout=15)
+CNINFO_MAX_PAGE_SIZE = 30
+DEFAULT_SINGLE_DAY_MAX_PAGES = 5
+CNINFO_PAGE_TIMEOUT_S = 20.0
+CNINFO_ORG_ID_TIMEOUT_S = 15.0
+CNINFO_RETURN_MARGIN_S = 1.5
+CNINFO_DEADLINE_MARGIN_S = CNINFO_RETURN_MARGIN_S
+
+
+def _summarize_page_error(exc: Exception) -> str:
+    name = type(exc).__name__
+    msg = " ".join(str(exc).split())
+    summary = f"{name}: {msg}" if msg else name
+    return summary[:160]
+
+
+def get_org_id(stock_code: str, headers: dict, timeout: float = CNINFO_ORG_ID_TIMEOUT_S) -> str:
+    r = requests.post(SEARCH_URL, data={"keyWord": stock_code, "maxNum": 10}, headers=headers, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list) or not data:
@@ -91,7 +108,17 @@ def get_org_id(stock_code: str, headers: dict) -> str:
     return str(data[0].get("orgId", "") or "")
 
 
-def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_from: str = "", date_to: str = ""):
+def fetch_announcements(
+    ticker: str,
+    limit: int = 10,
+    max_pages: int | None = None,
+    date_from: str = "",
+    date_to: str = "",
+    start_page: int = 1,
+    deadline_at: float | None = None,
+    deadline_s: float | None = None,
+    clock=None,
+):
     stock_code = normalize_ticker(ticker)
     market = resolve_market(stock_code)
     headers = {
@@ -100,23 +127,68 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         "X-Requested-With": "XMLHttpRequest",
     }
 
+    now_fn = clock if clock is not None else (time.time if deadline_at is not None else time.monotonic)
+    eff_deadline_at = None
+    stop_margin_s = 0.0
+    if deadline_at is not None and not isinstance(deadline_at, bool):
+        cand_at = float(deadline_at)
+        if math.isfinite(cand_at) and cand_at > 0:
+            eff_deadline_at = cand_at
+            stop_margin_s = CNINFO_RETURN_MARGIN_S
+    elif deadline_s is not None and not isinstance(deadline_s, bool):
+        eff_deadline_s = float(deadline_s)
+        if math.isfinite(eff_deadline_s) and eff_deadline_s > 0:
+            eff_deadline_at = now_fn() + eff_deadline_s
+            stop_margin_s = min(CNINFO_RETURN_MARGIN_S, eff_deadline_s * 0.3)
+
+    stop_at = (eff_deadline_at - stop_margin_s) if eff_deadline_at is not None else None
+
     org_id = ""
     try:
-        org_id = get_org_id(stock_code, headers)
+        if stop_at is None:
+            org_id = get_org_id(stock_code, headers, timeout=CNINFO_ORG_ID_TIMEOUT_S)
+        else:
+            rem_for_org = stop_at - now_fn()
+            if rem_for_org > 0:
+                org_timeout = min(CNINFO_ORG_ID_TIMEOUT_S, min(5.0, rem_for_org * 0.4))
+                org_id = get_org_id(stock_code, headers, timeout=org_timeout)
     except Exception:
         org_id = ""
 
-    page_size = min(max(10, int(limit)), 30)
-    max_pages = max(1, int(max_pages))
+    is_single_day = bool(date_from and date_to and date_from.strip() == date_to.strip())
+    start_page = max(1, int(start_page or 1))
+    if max_pages is None:
+        page_budget = DEFAULT_SINGLE_DAY_MAX_PAGES if is_single_day else 1
+    else:
+        page_budget = max(1, int(max_pages))
+    page_size = CNINFO_MAX_PAGE_SIZE if is_single_day else min(max(10, int(limit)), CNINFO_MAX_PAGE_SIZE)
     wanted = max(1, int(limit))
+    end_page = start_page + page_budget - 1
 
     rows = []
     seen = set()
     pages_fetched = 0
+    last_page = start_page - 1
     total_count = None
     has_more = False
+    next_page = None
+    page_error = None
+    deadline_reached = False
 
-    for page in range(1, max_pages + 1):
+    for page in range(start_page, end_page + 1):
+        if stop_at is not None:
+            remaining = stop_at - now_fn()
+            if remaining <= 0:
+                has_more = True
+                next_page = page
+                # Out of local budget before this page: an incomplete page set to
+                # resume from next_page, not a source error (no source backoff).
+                deadline_reached = True
+                break
+            req_timeout = min(CNINFO_PAGE_TIMEOUT_S, remaining)
+        else:
+            req_timeout = CNINFO_PAGE_TIMEOUT_S
+
         payload = {
             "pageNum": page,
             "pageSize": page_size,
@@ -134,10 +206,20 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
             "isHLtitle": "true",
         }
 
-        r = requests.post(ANN_URL, data=payload, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            r = requests.post(ANN_URL, data=payload, headers=headers, timeout=req_timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"invalid_json_type:{type(data).__name__}")
+        except (requests.RequestException, ValueError) as exc:
+            has_more = True
+            next_page = page
+            page_error = _summarize_page_error(exc)
+            break
+
         pages_fetched += 1
+        last_page = page
         raw_has_more = data.get("hasMore")
         if isinstance(raw_has_more, bool):
             api_has_more = raw_has_more
@@ -157,6 +239,7 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         items = data.get("announcements", []) or []
         if not items:
             has_more = False
+            next_page = None
             break
 
         stopped_for_limit = False
@@ -177,20 +260,24 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
                 "pdf_link": f"{STATIC_BASE}/{adjunct_url}" if adjunct_url else "",
                 "source": "cninfo",
             })
-            if len(rows) >= wanted:
+            # Single-day queries crawl complete pages up to page_budget so all filings on
+            # that day are collected (or cleanly resumable by page number when budget runs out).
+            if not is_single_day and len(rows) >= wanted:
                 stopped_for_limit = True
+                consumed_pos = (page - 1) * page_size + idx + 1
                 if (
                     idx < len(items) - 1
                     or api_has_more is True
-                    or (total_count is not None and total_count > len(rows))
+                    or (total_count is not None and total_count > consumed_pos)
                     or (api_has_more is None and len(items) >= page_size)
                 ):
                     has_more = True
+                    next_page = page if idx < len(items) - 1 else page + 1
                 break
         if stopped_for_limit:
             break
 
-        # Detect whether upstream pagination actually completed or was cut off by max_pages.
+        # Detect whether upstream pagination actually completed or was cut off by page_budget.
         reached_end = (
             api_has_more is False
             or (total_count is not None and page * page_size >= total_count)
@@ -198,13 +285,15 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         )
         if reached_end:
             has_more = False
+            next_page = None
             break
-        if page == max_pages:
+        if page == end_page:
             has_more = (
                 api_has_more is True
-                or (total_count is not None and total_count > len(rows))
+                or (total_count is not None and total_count > page * page_size)
                 or len(items) >= page_size
             )
+            next_page = (page + 1) if has_more else None
 
     for i, r in enumerate(rows, start=1):
         r["index"] = i
@@ -220,9 +309,17 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         "pagination_complete": not bool(has_more),
         "page_size": page_size,
         "pages_fetched": pages_fetched,
+        "start_page": start_page,
+        "last_page": last_page,
+        "max_pages": page_budget,
+        "next_page": next_page if has_more else None,
     }
     if total_count is not None:
         result["total_count"] = total_count
+    if page_error is not None:
+        result["page_error"] = page_error
+    if deadline_reached:
+        result["deadline_reached"] = True
     return result
 
 
@@ -387,7 +484,12 @@ def self_test(ticker: str = "00700"):
     checks = []
     try:
         out = fetch_announcements(ticker=ticker, limit=1)
-        checks.append({"name": "api.connectivity", "ok": bool(out.get("ok")), "count": out.get("count", 0)})
+        conn_ok = bool(out.get("ok")) and not out.get("page_error")
+        check = {"name": "api.connectivity", "ok": conn_ok, "count": out.get("count", 0)}
+        if out.get("page_error"):
+            check["error"] = out["page_error"]
+            check["hint"] = error_hint(str(out["page_error"]))
+        checks.append(check)
     except Exception as e:
         checks.append({"name": "api.connectivity", "ok": False, "error": str(e), "hint": error_hint(str(e))})
 
@@ -426,7 +528,10 @@ def main():
     parser = argparse.ArgumentParser(description="CN/HK filing fetcher + report extractor")
     parser.add_argument("--ticker", type=str, help="Stock ticker")
     parser.add_argument("--limit", type=int, default=10, help="Number of filings to return")
-    parser.add_argument("--max-pages", type=int, default=1, help="How many pages to crawl from Cninfo")
+    parser.add_argument("--max-pages", type=int, default=None, help="How many pages to crawl from Cninfo (default: 5 for single-day, 1 otherwise)")
+    parser.add_argument("--start-page", type=int, default=1, help="1-based start page for Cninfo pagination")
+    parser.add_argument("--deadline-at", type=float, default=None, help="Absolute Unix timestamp (seconds) cutoff for paginated announcement fetch")
+    parser.add_argument("--deadline-s", type=float, default=None, help="Total time budget in seconds for paginated announcement fetch (legacy compat)")
     parser.add_argument("--date-from", type=str, default="", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--date-to", type=str, default="", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
@@ -477,7 +582,16 @@ def main():
         if args.extract_financials_latest:
             args.financials = True
 
-        ann = fetch_announcements(args.ticker, args.limit, max_pages=args.max_pages, date_from=args.date_from, date_to=args.date_to)
+        ann = fetch_announcements(
+            args.ticker,
+            args.limit,
+            max_pages=args.max_pages,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            start_page=args.start_page,
+            deadline_at=args.deadline_at,
+            deadline_s=args.deadline_s,
+        )
 
         if args.facts_metric:
             out = build_facts_series(args.ticker, args.facts_metric, args.facts_limit, args.ocr_fallback == "true", args.max_pages, args.date_from, args.date_to)

@@ -60,6 +60,10 @@ export function buildWatchlistProposalState(
       typeof proposalData.preserve_workspace_notice === 'string'
         ? proposalData.preserve_workspace_notice
         : null,
+    policy_diff:
+      proposalData.policy_diff && typeof proposalData.policy_diff === 'object'
+        ? (proposalData.policy_diff as WatchlistProposalState['policy_diff'])
+        : null,
     group_id: typeof proposalData.group_id === 'string' ? proposalData.group_id : null,
     group_label: typeof proposalData.group_label === 'string' ? proposalData.group_label : null,
     tool_call_id: toolCallId || undefined,

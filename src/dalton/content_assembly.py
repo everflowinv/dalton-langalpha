@@ -23,9 +23,12 @@ validation so malformed or unclosed markers fail loudly with the file path:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any
@@ -37,6 +40,8 @@ from src.dalton.capabilities import (
     is_bridge_route_enabled,
     is_research_source_enabled,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ContentAssemblyError(ValueError):
@@ -478,16 +483,115 @@ def assemble_json_text(
     return text
 
 
+_DEDICATED_RESEARCH_SERVER_CAPS: dict[str, CapabilityId] = {
+    "dalton_company_wiki": CapabilityId.COMPANY_WIKI,
+    "dalton_sales_notes": CapabilityId.SALES_NOTES,
+    "dalton_tmtb": CapabilityId.TMTB,
+    "dalton_funda_ai": CapabilityId.FUNDA_AI,
+}
+
+_SERVER_REQUIRED_ANY_TOOLS: dict[str, frozenset[str]] = {
+    "dalton_company_wiki": frozenset({"search", "list", "read"}),
+    "dalton_sales_notes": frozenset({"search", "list", "read"}),
+    "dalton_tmtb": frozenset({"search", "list", "read"}),
+    "dalton_funda_ai": frozenset({"search", "list", "read"}),
+    "dalton_research_all": frozenset({"search", "list", "read", "sales_mail"}),
+    "dalton_guidepoint": frozenset({"search_library", "list_transcripts"}),
+    "researchdata": frozenset({"research"}),
+}
+
+
+def _discovered_server_usable(
+    discovered_servers: Mapping[str, Any] | Iterable[str],
+    server_name: str,
+) -> bool:
+    """Return True only when `server_name` is present, enabled, and exposes at least one usable tool."""
+    if not isinstance(discovered_servers, Mapping):
+        return False
+    if server_name not in discovered_servers:
+        return False
+    entry = discovered_servers.get(server_name)
+    if not isinstance(entry, Mapping):
+        return False
+    if entry.get("enabled") is False:
+        return False
+    tools_meta = entry.get("tools")
+    if tools_meta is None:
+        return False
+    wanted = _SERVER_REQUIRED_ANY_TOOLS.get(server_name, frozenset())
+    if isinstance(tools_meta, Mapping):
+        names = {str(k) for k in tools_meta.keys() if k}
+    elif isinstance(tools_meta, (list, tuple, set, frozenset)):
+        names = {
+            str(item if isinstance(item, str) else item.get("name") or "")
+            for item in tools_meta
+            if isinstance(item, (str, Mapping))
+        }
+        names.discard("")
+    else:
+        return False
+    if not names:
+        return False
+    if wanted and not (names & wanted):
+        return False
+    return True
+
+
+def filter_capabilities_by_discovered_servers(
+    active_caps: frozenset[CapabilityId],
+    discovered_servers: Mapping[str, Any] | Iterable[str],
+) -> tuple[frozenset[CapabilityId], bool, bool]:
+    """Narrow research/bridge capabilities to actually discovered usable MCP servers.
+
+    Returns ``(effective_caps, has_dedicated_research, has_legacy_bridge)``.
+    """
+    filtered = set(active_caps)
+    has_all_connector = _discovered_server_usable(discovered_servers, "dalton_research_all")
+    has_legacy_bridge = (
+        CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+        and _discovered_server_usable(discovered_servers, "researchdata")
+    )
+    if not has_legacy_bridge:
+        filtered.discard(CapabilityId.RESEARCHDATA_BRIDGE)
+
+    has_dedicated_research = False
+    for srv_name, cap in _DEDICATED_RESEARCH_SERVER_CAPS.items():
+        if cap not in active_caps:
+            continue
+        if _discovered_server_usable(discovered_servers, srv_name) or has_all_connector:
+            has_dedicated_research = True
+        else:
+            filtered.discard(cap)
+
+    if CapabilityId.GUIDEPOINT in active_caps:
+        gp_usable = _discovered_server_usable(discovered_servers, "dalton_guidepoint") or has_legacy_bridge
+        if not gp_usable:
+            filtered.discard(CapabilityId.GUIDEPOINT)
+
+    return frozenset(filtered), has_dedicated_research, has_legacy_bridge
+
+
 def assemble_text(
     text: str,
     *,
     path: Path | str | None = None,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> str:
-    """Assemble *text* according to file suffix and active capabilities."""
+    """Assemble *text* according to file suffix, active capabilities, and discovered MCP servers."""
+    base_caps = effective_capabilities() if capabilities is None else capabilities
+    has_dedicated_discovered: bool | None = None
+    if discovered_servers is not None:
+        effective_caps, has_dedicated_discovered, _ = filter_capabilities_by_discovered_servers(
+            base_caps,
+            discovered_servers,
+        )
+    else:
+        effective_caps = base_caps
+
     suffix = Path(path).suffix.lower() if path is not None else ".md"
     if suffix == ".js":
-        assembled = assemble_js_text(text, path=path, capabilities=capabilities)
+        assembled = assemble_js_text(text, path=path, capabilities=effective_caps)
         # When dedicated Batch 3 connectors are active alongside the legacy bridge
         # (post-cutover Everflow), direct `topic-research/workflow.js` to the mounted
         # dedicated research connectors rather than retired legacy bridge routes, while
@@ -497,37 +601,306 @@ def assemble_text(
             from src.dalton.capabilities import is_batch3_connectors_enabled
             from src.dalton.settings import get_dalton_research_host_base_url
 
-            active_caps = effective_capabilities() if capabilities is None else capabilities
-            if (
-                CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+            use_dedicated_wording = (
+                CapabilityId.RESEARCHDATA_BRIDGE in effective_caps
                 and is_batch3_connectors_enabled()
                 and bool(get_dalton_research_host_base_url())
-                and has_any_research_connector_capability(active_caps)
-            ):
+                and has_any_research_connector_capability(effective_caps)
+                and (has_dedicated_discovered is None or has_dedicated_discovered)
+            )
+            if use_dedicated_wording:
                 assembled = assembled.replace(
                     "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）",
                     "检索已启用的内部研究知识库连接器（只读）",
                 )
         return assembled
     if suffix == ".json":
-        return assemble_json_text(text, path=path, capabilities=capabilities)
-    return assemble_markdown_text(text, path=path, capabilities=capabilities)
+        return assemble_json_text(text, path=path, capabilities=effective_caps)
+    return assemble_markdown_text(text, path=path, capabilities=effective_caps)
+
+
+def build_minimal_discovered_mcp_servers(
+    mcp_registry: Any | None,
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Build minimal ``{server: {"enabled": True, "tools": [...]}}`` from server-side ``mcp_registry``.
+
+    Returns ``(minimal_servers, discovery_status)`` where ``discovery_status`` is
+    ``"ok"``, ``"unavailable"``, or ``"error"``. Servers without discovered tools
+    are excluded so name-and-enabled-only configs never count as usable.
+    """
+    if mcp_registry is None:
+        return {}, "unavailable"
+    get_all_tools = getattr(mcp_registry, "get_all_tools", None)
+    if not callable(get_all_tools):
+        return {}, "unavailable"
+    try:
+        tools_by_server = get_all_tools()
+    except Exception as exc:
+        logger.warning(
+            "Server-side MCP tool discovery failed for workflow launch; falling back to empty tool set: %s",
+            exc,
+        )
+        return {}, "error"
+    if not isinstance(tools_by_server, Mapping):
+        return {}, "error"
+
+    disabled_servers: set[str] = set()
+    cfg = getattr(mcp_registry, "config", None)
+    mcp_cfg = getattr(cfg, "mcp", None) if cfg is not None else None
+    cfg_servers = getattr(mcp_cfg, "servers", None) if mcp_cfg is not None else None
+    if isinstance(cfg_servers, Iterable) and not isinstance(cfg_servers, (str, bytes)):
+        for srv in cfg_servers:
+            srv_name = getattr(srv, "name", None)
+            if isinstance(srv_name, str) and getattr(srv, "enabled", True) is False:
+                disabled_servers.add(srv_name)
+
+    minimal: dict[str, dict[str, Any]] = {}
+    for srv_name, tools_list in tools_by_server.items():
+        name_str = str(srv_name)
+        if name_str in disabled_servers:
+            continue
+        tool_names: list[str] = []
+        if isinstance(tools_list, Iterable) and not isinstance(tools_list, (str, bytes)):
+            for item in tools_list:
+                if isinstance(item, str):
+                    tname = item.strip()
+                elif isinstance(item, Mapping):
+                    tname = str(item.get("name") or "").strip()
+                else:
+                    tname = str(getattr(item, "name", "") or "").strip()
+                if tname:
+                    tool_names.append(tname)
+        unique_tools = sorted(set(tool_names))
+        if unique_tools:
+            minimal[name_str] = {"enabled": True, "tools": unique_tools}
+    return minimal, "ok"
+
+
+def decide_topic_research_internal_memory(
+    discovered_servers: Mapping[str, Any],
+    active_caps: frozenset[CapabilityId],
+    *,
+    discovery_status: str = "ok",
+) -> dict[str, Any]:
+    """Decide whether `topic-research` runs internal-memory retrieval from server-discovered tools."""
+    active_direct_servers = [
+        srv for srv, cap in _DEDICATED_RESEARCH_SERVER_CAPS.items() if cap in active_caps
+    ]
+    direct_ok = any(
+        _discovered_server_usable(discovered_servers, srv) for srv in active_direct_servers
+    )
+    fed_ok = (
+        bool(active_direct_servers)
+        and not direct_ok
+        and _discovered_server_usable(discovered_servers, "dalton_research_all")
+    )
+    if direct_ok:
+        mode = "direct"
+        run_internal = True
+    elif fed_ok:
+        mode = "federated"
+        run_internal = True
+    else:
+        mode = "skip"
+        run_internal = False
+    return {
+        "run": run_internal,
+        "mode": mode,
+        "discovery_status": discovery_status,
+    }
+
+
+def _internal_memory_decision_mac(
+    *,
+    workflow: str = "topic-research",
+    short_thread_id: str,
+    run_id: str,
+    run: bool,
+    mode: str,
+    discovery_status: str,
+) -> str:
+    from src.dalton.settings import get_dalton_workflow_decision_hmac_key
+
+    canonical = json.dumps(
+        {
+            "workflow": str(workflow),
+            "short_thread_id": short_thread_id,
+            "run_id": run_id,
+            "run": bool(run),
+            "mode": str(mode),
+            "discovery_status": str(discovery_status),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hmac.new(
+        get_dalton_workflow_decision_hmac_key(),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def sign_topic_research_internal_memory_decision(
+    params: dict[str, Any],
+    *,
+    short_thread_id: str,
+    run_id: str,
+    workflow_name: str = "topic-research",
+) -> dict[str, Any]:
+    """Bind a server-computed `internal_memory_decision` for `topic-research` to
+    `(workflow, short_thread_id, run_id)` with an HMAC.
+
+    For any non-`topic-research` workflow, strips `internal_memory_decision`
+    instead of signing it so caller-supplied fields can never receive a valid
+    `topic-research` signature.
+    """
+    if not isinstance(params, dict):
+        return params
+    if workflow_name != "topic-research":
+        if "internal_memory_decision" in params:
+            return {k: v for k, v in params.items() if k != "internal_memory_decision"}
+        return params
+    decision = params.get("internal_memory_decision")
+    if not isinstance(decision, dict) or not isinstance(decision.get("run"), bool):
+        return params
+    thread_key = str(short_thread_id or "").strip()
+    run_key = str(run_id or "").strip()
+    if not thread_key or not run_key:
+        return params
+    mode = str(decision.get("mode") or "")
+    discovery_status = str(decision.get("discovery_status") or "")
+    sig = _internal_memory_decision_mac(
+        workflow="topic-research",
+        short_thread_id=thread_key,
+        run_id=run_key,
+        run=decision["run"],
+        mode=mode,
+        discovery_status=discovery_status,
+    )
+    signed = {
+        **decision,
+        "workflow": "topic-research",
+        "short_thread_id": thread_key,
+        "run_id": run_key,
+        "signature": sig,
+    }
+    return {**params, "internal_memory_decision": signed}
+
+
+def verify_topic_research_internal_memory_decision(
+    decision: Any,
+    *,
+    short_thread_id: str | None,
+    run_id: str | None,
+    workflow_name: str = "topic-research",
+) -> dict[str, Any] | None:
+    """Verify a server-signed `internal_memory_decision` for `(workflow, short_thread_id, run_id)`.
+
+    Returns the verified decision dict on success, or ``None`` if unsigned,
+    forged, tampered, or bound to a different workflow/thread/run.
+    """
+    if workflow_name != "topic-research" or not isinstance(decision, dict):
+        return None
+    run_val = decision.get("run")
+    sig = decision.get("signature")
+    if not isinstance(run_val, bool) or not isinstance(sig, str) or not sig:
+        return None
+    thread_key = str(short_thread_id or "").strip()
+    run_key = str(run_id or "").strip()
+    if not thread_key or not run_key:
+        return None
+    if (
+        decision.get("workflow") != "topic-research"
+        or decision.get("short_thread_id") != thread_key
+        or decision.get("run_id") != run_key
+    ):
+        return None
+    expected = _internal_memory_decision_mac(
+        workflow="topic-research",
+        short_thread_id=thread_key,
+        run_id=run_key,
+        run=run_val,
+        mode=str(decision.get("mode") or ""),
+        discovery_status=str(decision.get("discovery_status") or ""),
+    )
+    if not hmac.compare_digest(sig, expected):
+        return None
+    return decision
+
+
+async def resolve_launch_discovered_mcp_servers(
+    backend: Any,
+    workflow_name: str,
+    params: dict[str, Any],
+    *,
+    mcp_registry: Any | None = None,
+) -> dict[str, Any]:
+    """Attach server-discovered MCP tools and internal-memory decision for `topic-research`.
+
+    Always strips any caller-supplied `discovered_mcp_servers`, `mcp_servers`, or
+    `internal_memory_decision` across ALL workflows — including non-`topic-research`
+    workflows and when legacy `researchdata_bridge` is enabled — so callers can
+    never smuggle or spoof a skip decision. When `workflow_name == "topic-research"`
+    and legacy `researchdata_bridge` is disabled, attaches server-discovered minimal
+    tools and the server-computed decision.
+    """
+    _ = backend
+    if not isinstance(params, dict):
+        return params
+
+    cleaned = {
+        k: v
+        for k, v in params.items()
+        if k not in ("discovered_mcp_servers", "mcp_servers", "internal_memory_decision")
+    }
+    if workflow_name != "topic-research":
+        return cleaned
+    active_caps = effective_capabilities()
+    if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
+        return cleaned
+
+    minimal_servers, discovery_status = build_minimal_discovered_mcp_servers(mcp_registry)
+    decision = decide_topic_research_internal_memory(
+        minimal_servers,
+        active_caps,
+        discovery_status=discovery_status,
+    )
+    if discovery_status != "ok" and any(
+        cap in active_caps for cap in _DEDICATED_RESEARCH_SERVER_CAPS.values()
+    ):
+        logger.warning(
+            "topic-research MCP tool discovery %s; falling back to skipping internal-memory retrieval",
+            discovery_status,
+        )
+    return {
+        **cleaned,
+        "discovered_mcp_servers": minimal_servers,
+        "internal_memory_decision": decision,
+    }
 
 
 def read_assembled_text(
     path: Path,
     *,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> str:
     """Read UTF-8 file *path* and assemble conditional capability fragments."""
     raw = path.read_text(encoding="utf-8")
-    return assemble_text(raw, path=path, capabilities=capabilities)
+    return assemble_text(
+        raw,
+        path=path,
+        capabilities=capabilities,
+        discovered_servers=discovered_servers,
+    )
 
 
 def assemble_file_bytes(
     path: Path,
     *,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> bytes:
     """Return capability-assembled bytes for *path* (raw bytes for non-text files)."""
     if path.suffix.lower() not in _ASSEMBLED_TEXT_EXTENSIONS:
@@ -536,7 +909,12 @@ def assemble_file_bytes(
         raw = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return path.read_bytes()
-    assembled = assemble_text(raw, path=path, capabilities=capabilities)
+    assembled = assemble_text(
+        raw,
+        path=path,
+        capabilities=capabilities,
+        discovered_servers=discovered_servers,
+    )
     return assembled.encode("utf-8")
 
 

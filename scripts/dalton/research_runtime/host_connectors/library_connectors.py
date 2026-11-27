@@ -137,6 +137,385 @@ class MarketDigestPartitionStore:
     def _library(self) -> research_library_mod.Library:
         return research_library_mod.Library(data_root=self.data_root, code_root=self.code_root)
 
+    def _load_embedding_config(self) -> dict[str, Any]:
+        candidates = (
+            self.data_root / "config" / "config.json",
+            self.data_root / "skills" / "market-digest" / "config.json",
+            self.code_root / "skills" / "market-digest" / "config.json",
+            self.code_root / "skills" / "market-digest" / "config.example.json",
+        )
+        for cfg_path in candidates:
+            if cfg_path.is_file():
+                try:
+                    loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("embedding"), dict):
+                        return loaded
+                except Exception:
+                    continue
+        return {
+            "embedding": {
+                "model": os.environ.get("DALTON_EMBEDDING_MODEL", "gemini-embedding-2"),
+                "dimensions": 3072,
+            }
+        }
+
+    @staticmethod
+    def _call_module_embed(mod: Any, attr_name: str, *args: Any) -> Any:
+        """Invoke a module embedding helper without redirecting process-global stdout.
+
+        When the unmodified CLI helper would print to stdout and call `sys.exit(1)`
+        because `GEMINI_API_KEY` is missing, raise a clean RuntimeError instead.
+        """
+        fn = getattr(mod, attr_name)
+        is_unmodified_cli = (
+            getattr(fn, "__module__", None) == getattr(mod, "__name__", None)
+            and getattr(mod, "_genai_client", None) is None
+        )
+        if is_unmodified_cli and not os.environ.get("GEMINI_API_KEY"):
+            raise RuntimeError("GEMINI_API_KEY not set")
+        return fn(*args)
+
+    def _embed_texts(self, texts: list[str]) -> tuple[list[bytes | None], str | None]:
+        """Compute float32 embedding BLOBs for sales-note chunks.
+
+        Returns ``(blobs, error_message)``. ``error_message`` is ``None`` iff every chunk
+        received a valid finite non-zero vector.
+        """
+        if not texts:
+            return [], None
+        try:
+            import numpy as np
+
+            mod = self._library().module("sales-notes")
+            cfg = self._load_embedding_config()
+            vectors = self._call_module_embed(mod, "embed_texts", texts, cfg)
+            if not isinstance(vectors, (list, tuple)) or len(vectors) != len(texts):
+                return [None] * len(texts), "embedding returned mismatched vector count"
+            blobs: list[bytes | None] = []
+            invalid = 0
+            for vec in vectors:
+                arr = np.asarray(vec, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                if arr.ndim != 1 or arr.size == 0 or not np.isfinite(norm) or norm == 0.0:
+                    blobs.append(None)
+                    invalid += 1
+                else:
+                    blobs.append(arr.tobytes())
+            if invalid:
+                return blobs, f"{invalid} chunk(s) produced invalid embedding vectors"
+            return blobs, None
+        except (Exception, SystemExit) as exc:
+            return [None] * len(texts), str(exc) or type(exc).__name__
+
+    def _embed_query(self, lib: research_library_mod.Library, source: str, query: str) -> Any:
+        mod = lib.module(source)
+        cfg = self._load_embedding_config()
+        return self._call_module_embed(mod, "embed_query", query, cfg)
+
+    def _sales_notes_hybrid_or_semantic_search(
+        self,
+        lib: research_library_mod.Library,
+        *,
+        query: str,
+        start: str | None,
+        end: str | None,
+        limit: int,
+        params: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        """Streamed minimal-column semantic/hybrid search for sales-notes.
+
+        Never runs `SELECT *` and never loads the full table's embedding BLOBs into memory:
+        - Keyword pass selects only non-BLOB text/metadata columns.
+        - Semantic pass streams `(id, doc_key, embedding)` in bounded batches (`fetchmany(256)`)
+          filtered in SQL to `embedding IS NOT NULL AND length(embedding) = ?`, then fetches
+          text/metadata columns only for the winning top-K row IDs.
+        """
+        import numpy as np
+
+        warnings: list[str] = []
+        terms = research_library_mod.words(query)
+        vec: Any = None
+        try:
+            raw_vec = self._embed_query(lib, "sales-notes", query)
+            arr = np.asarray(raw_vec, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            if arr.ndim != 1 or arr.size == 0 or not np.isfinite(norm) or norm == 0.0:
+                raise ValueError("invalid query vector")
+            vec = arr / norm
+        except (Exception, SystemExit):
+            vec = None
+            warnings.append("语义检索不可用，已降为关键词检索")
+
+        if vec is None:
+            kw_res = lib.mail(
+                "sales-notes",
+                "search",
+                query,
+                None,
+                start,
+                end,
+                limit,
+                {**params, "search_mode": "keyword"},
+            )
+            combined_warnings = list(dict.fromkeys([*warnings, *list(kw_res.get("warnings") or [])]))
+            return {
+                **kw_res,
+                "warnings": combined_warnings,
+                "status": research_library_mod.source_status(list(kw_res.get("results") or []), combined_warnings),
+            }
+
+        expected_blob_bytes = int(vec.size * 4)
+        layers = ["raw", "digest"] if params.get("layer") == "all" else [str(params.get("layer") or "raw")]
+        coverage: dict[str, Any] = {}
+        sem_results_all: list[dict[str, Any]] = []
+        kw_results_all: list[dict[str, Any]] = []
+        mismatched = 0
+        unindexed = 0
+        batch_size = 256
+
+        with research_library_mod.readonly(self.mail_db) as conn:
+            for layer in layers:
+                raw = layer == "raw"
+                table = "email_chunks" if raw else "chunks"
+                clauses: list[str] = []
+                sql_params: list[Any] = []
+                if raw:
+                    clauses.append(KEY_SQL + " NOT LIKE 'alphaengine:%'")
+                if start:
+                    clauses.append("date>=?")
+                    sql_params.append(start)
+                if end:
+                    clauses.append("date<=?")
+                    sql_params.append(end)
+                if params.get("sender"):
+                    if not raw:
+                        raise ValueError("sender 筛选仅用于原文层")
+                    clauses.append("instr(lower(COALESCE(sender,'')),lower(?))>0")
+                    sql_params.append(params["sender"])
+                where = " AND ".join(clauses) or "1=1"
+                doc_key_expr = KEY_SQL if raw else "('digest:' || id)"
+
+                agg = conn.execute(
+                    f"SELECT COUNT(*), COUNT(DISTINCT {KEY_SQL if raw else 'id'}), MAX(date), "
+                    "COALESCE(SUM(CASE WHEN embedding IS NULL THEN 1 ELSE 0 END), 0), "
+                    "COALESCE(SUM(CASE WHEN embedding IS NOT NULL AND length(embedding) != ? THEN 1 ELSE 0 END), 0) "
+                    f"FROM {table} WHERE {where}",
+                    [expected_blob_bytes, *sql_params],
+                ).fetchone()
+                count, documents, latest, null_cnt, mismatch_cnt = agg
+                coverage[layer] = {"chunks": count, "documents": documents, "latest_document_date": latest}
+                unindexed += int(null_cnt or 0)
+                mismatched += int(mismatch_cnt or 0)
+
+                non_blob_cols = (
+                    f"id,date,email_id,message_id,sender,subject,chunk_index,content,created_at,{KEY_SQL} AS doc_key"
+                    if raw
+                    else "id,date,period,section_id,section_label,content,source_emails,created_at"
+                )
+                anchors: dict[str, int] = {}
+
+                # 1. Keyword arm (hybrid mode): explicit non-BLOB columns only.
+                if mode != "semantic":
+                    conn.row_factory = sqlite3.Row
+                    kw_best: dict[str, dict[str, Any]] = {}
+                    kw_cur = conn.execute(
+                        f"SELECT {non_blob_cols} FROM {table} WHERE {where} ORDER BY date DESC,id",
+                        sql_params,
+                    )
+                    for row in kw_cur:
+                        key = row["doc_key"] if raw else f"digest:{row['id']}"
+                        if raw:
+                            prev_anchor = anchors.get(key)
+                            if prev_anchor is None or row["id"] < prev_anchor:
+                                anchors[key] = row["id"]
+                        kw = research_library_mod.keyword_score(row["content"], terms)
+                        if kw <= 0:
+                            continue
+                        rank = (kw,)
+                        if key not in kw_best or rank > kw_best[key]["rank"]:
+                            item = lib.mail_meta(row) if raw else lib.digest_meta(row)
+                            item.update(layer=layer, snippet=row["content"][:800], score=None, keyword_hits=kw)
+                            kw_best[key] = {"rank": rank, "item": item}
+                    conn.row_factory = None
+                    for entry in sorted(kw_best.values(), key=lambda x: x["rank"], reverse=True)[:limit]:
+                        item = entry["item"]
+                        if raw:
+                            item["document_id"] = f"mail:{anchors[item['original_document_id']]}"
+                        kw_results_all.append(item)
+
+                # 2. Semantic arm: stream ONLY (id, doc_key, embedding) for valid-size non-NULL vectors.
+                sem_best: dict[str, tuple[float, int]] = {}
+                sem_cur = conn.execute(
+                    f"SELECT id, {doc_key_expr}, embedding FROM {table} "
+                    f"WHERE {where} AND embedding IS NOT NULL AND length(embedding) = ?",
+                    [*sql_params, expected_blob_bytes],
+                )
+                while True:
+                    batch = sem_cur.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    for row_id, doc_key_val, emb_blob in batch:
+                        stored = np.frombuffer(emb_blob, dtype=np.float32)
+                        if stored.shape != vec.shape:
+                            mismatched += 1
+                            continue
+                        snorm = float(np.linalg.norm(stored))
+                        if not snorm or not np.isfinite(snorm):
+                            unindexed += 1
+                            continue
+                        sim = float(np.dot(vec, stored) / snorm)
+                        prev = sem_best.get(doc_key_val)
+                        if prev is None or sim > prev[0] or (sim == prev[0] and row_id < prev[1]):
+                            sem_best[doc_key_val] = (sim, int(row_id))
+
+                top_sem = sorted(
+                    sem_best.items(),
+                    key=lambda kv: (kv[1][0], -kv[1][1]),
+                    reverse=True,
+                )[:limit]
+                if top_sem:
+                    top_ids = [row_id for _, (_, row_id) in top_sem]
+                    score_by_id = {row_id: sim for _, (sim, row_id) in top_sem}
+                    if raw and not anchors:
+                        top_keys = [dk for dk, _ in top_sem]
+                        key_ph = ",".join("?" for _ in top_keys)
+                        for dk, min_id in conn.execute(
+                            f"SELECT {KEY_SQL} AS doc_key, MIN(id) FROM email_chunks "
+                            f"WHERE {where} AND {KEY_SQL} IN ({key_ph}) GROUP BY {KEY_SQL}",
+                            [*sql_params, *top_keys],
+                        ):
+                            anchors[dk] = int(min_id)
+
+                    id_ph = ",".join("?" for _ in top_ids)
+                    conn.row_factory = sqlite3.Row
+                    fetched_by_id = {
+                        int(r["id"]): r
+                        for r in conn.execute(
+                            f"SELECT {non_blob_cols} FROM {table} WHERE id IN ({id_ph})",
+                            top_ids,
+                        )
+                    }
+                    conn.row_factory = None
+                    for dk, (sim, row_id) in top_sem:
+                        row = fetched_by_id.get(row_id)
+                        if row is None:
+                            continue
+                        kw = research_library_mod.keyword_score(row["content"], terms)
+                        item = lib.mail_meta(row) if raw else lib.digest_meta(row)
+                        item.update(
+                            layer=layer,
+                            snippet=row["content"][:800],
+                            score=score_by_id[row_id],
+                            keyword_hits=kw,
+                        )
+                        if raw:
+                            item["document_id"] = f"mail:{anchors.get(dk, row_id)}"
+                        sem_results_all.append(item)
+
+        if mismatched:
+            warnings.append(f"{mismatched} 个分块向量维度不符，语义覆盖不完整")
+        if unindexed:
+            warnings.append(f"{unindexed} 个分块缺少有效向量，仅作关键词匹配")
+
+        if mode == "semantic":
+            final_results = sorted(
+                sem_results_all,
+                key=lambda x: (
+                    float(x["score"]) if x.get("score") is not None else -1.0,
+                    int(x.get("keyword_hits") or 0),
+                ),
+                reverse=True,
+            )[:limit]
+        else:
+            final_results = self._merge_keyword_and_semantic(
+                sem_results_all,
+                kw_results_all,
+                limit=limit,
+            )
+
+        return {
+            "ok": True,
+            "status": research_library_mod.source_status(final_results, warnings),
+            "results": final_results,
+            "warnings": warnings,
+            "coverage": {"scope": "local_index_in_requested_window", "layers": coverage},
+        }
+
+    @staticmethod
+    def _merge_keyword_and_semantic(
+        semantic_results: list[dict[str, Any]],
+        keyword_results: list[dict[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fuse semantic and keyword document ranks via RRF (k=60) so neither arm buries the other."""
+        rrf_k = 60.0
+        fused: dict[str, dict[str, Any]] = {}
+        sem_ranked = sorted(
+            (
+                it
+                for it in semantic_results
+                if isinstance(it, dict) and it.get("score") is not None
+            ),
+            key=lambda x: (
+                float(x["score"]),
+                int(x.get("keyword_hits") or 0),
+                str(x.get("date") or ""),
+            ),
+            reverse=True,
+        )
+        kw_ranked = sorted(
+            (
+                it
+                for it in keyword_results
+                if isinstance(it, dict) and int(it.get("keyword_hits") or 0) > 0
+            ),
+            key=lambda x: (
+                int(x.get("keyword_hits") or 0),
+                str(x.get("date") or ""),
+            ),
+            reverse=True,
+        )
+
+        def _doc_key(item: dict[str, Any]) -> str:
+            return str(item.get("document_id") or item.get("canonical_id") or id(item))
+
+        for arm, items in (("semantic", sem_ranked), ("keyword", kw_ranked)):
+            for rank, item in enumerate(items, start=1):
+                k = _doc_key(item)
+                entry = fused.get(k)
+                if entry is None:
+                    merged_item = dict(item)
+                    merged_item["matched"] = [arm]
+                    merged_item["rrf_score"] = 1.0 / (rrf_k + rank)
+                    fused[k] = merged_item
+                else:
+                    entry["rrf_score"] = float(entry.get("rrf_score") or 0.0) + 1.0 / (rrf_k + rank)
+                    matched = list(entry.get("matched") or [])
+                    if arm not in matched:
+                        matched.append(arm)
+                    entry["matched"] = matched
+                    if entry.get("score") is None and item.get("score") is not None:
+                        entry["score"] = item.get("score")
+                    entry["keyword_hits"] = max(
+                        int(entry.get("keyword_hits") or 0),
+                        int(item.get("keyword_hits") or 0),
+                    )
+                    if not entry.get("snippet") and item.get("snippet"):
+                        entry["snippet"] = item.get("snippet")
+
+        ranked = sorted(
+            fused.values(),
+            key=lambda x: (
+                float(x.get("rrf_score") or 0.0),
+                float(x["score"]) if x.get("score") is not None else -1.0,
+                int(x.get("keyword_hits") or 0),
+            ),
+            reverse=True,
+        )
+        return ranked[:limit]
+
     def read(self, source: str, document: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.mail_db.is_file():
             raise ValueError("Document not found")
@@ -179,17 +558,32 @@ class MarketDigestPartitionStore:
         if source == "tmtb" and str(p.get("layer") or "raw") != "raw":
             raise ValueError("tmtb only supports raw layer")
         mail_params = dict(p)
-        mail_params.setdefault("search_mode", "keyword")
-        res = self._library().mail(
-            source,
-            operation,
-            query,
-            document,
-            start,
-            end,
-            capped_limit,
-            mail_params,
-        )
+        default_mode = "hybrid" if (operation == "search" and source == "sales-notes") else "keyword"
+        requested_mode = str(mail_params.setdefault("search_mode", default_mode)).strip().lower()
+        lib = self._library()
+        if source == "sales-notes" and operation == "search" and requested_mode != "keyword":
+            res = self._sales_notes_hybrid_or_semantic_search(
+                lib,
+                query=query or "",
+                start=start,
+                end=end,
+                limit=capped_limit,
+                params=mail_params,
+                mode=requested_mode,
+            )
+        else:
+            if operation == "search" and requested_mode != "keyword":
+                lib.embed = lambda src, q: self._embed_query(lib, src, q)  # type: ignore[method-assign]
+            res = lib.mail(
+                source,
+                operation,
+                query,
+                document,
+                start,
+                end,
+                capped_limit,
+                mail_params,
+            )
         results = list(res.get("results") or [])
         srv = "dalton_tmtb" if source == "tmtb" else "dalton_sales_notes"
         sources_list = [_make_source(srv, source, it) for it in results[:50]]
@@ -278,6 +672,113 @@ class MarketDigestPartitionStore:
         if current:
             chunks.append(prefix + current)
         return chunks or [prefix + body]
+
+    def _backfill_missing_embeddings(
+        self,
+        doc_key: str,
+        receipt_prior: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Attempt to backfill NULL chunk embeddings for an ingested `doc_key` on retry.
+
+        Returns ``(updated_receipt, backfilled)``. Leaves `embedding_pending=True` if
+        embedding computation still fails so a later retry can still repair the index.
+        """
+        if not doc_key or not self.mail_db.is_file():
+            return receipt_prior, False
+        with sqlite3.connect(self.mail_db, timeout=20) as conn:
+            missing_rows = conn.execute(
+                "SELECT id, content FROM email_chunks "
+                "WHERE message_id = ? AND embedding IS NULL ORDER BY chunk_index, id",
+                (doc_key,),
+            ).fetchall()
+        if not missing_rows:
+            if receipt_prior.get("embedding_indexed") is True and not receipt_prior.get("embedding_pending"):
+                return receipt_prior, False
+            updated = {
+                **receipt_prior,
+                "embedding_indexed": True,
+                "embedding_pending": False,
+            }
+            updated.pop("embedding_error", None)
+            with sqlite3.connect(self.mail_db, timeout=20) as conn:
+                conn.execute(
+                    "UPDATE sales_ingest_receipts SET receipt_json = ? WHERE doc_key = ?",
+                    (json.dumps(updated, ensure_ascii=False), doc_key),
+                )
+                conn.commit()
+            return updated, False
+
+        chunk_texts = [str(r[1] or "") for r in missing_rows]
+        blobs, embed_err = self._embed_texts(chunk_texts)
+        valid_pairs: list[tuple[int, bytes]] = []
+        for idx, (row_id, _) in enumerate(missing_rows):
+            if idx < len(blobs) and blobs[idx] is not None:
+                valid_pairs.append((int(row_id), blobs[idx]))
+        if embed_err is not None or len(valid_pairs) != len(missing_rows):
+            still_pending = {
+                **receipt_prior,
+                "embedding_indexed": False,
+                "embedding_pending": True,
+                **({"embedding_error": embed_err} if embed_err else {}),
+            }
+            if (
+                valid_pairs
+                or receipt_prior.get("embedding_pending") is not True
+                or receipt_prior.get("embedding_indexed") is not False
+            ):
+                conn = sqlite3.connect(self.mail_db, timeout=20, isolation_level=None)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for row_id, blob in valid_pairs:
+                        conn.execute(
+                            "UPDATE email_chunks SET embedding = ? WHERE id = ?",
+                            (blob, row_id),
+                        )
+                    conn.execute(
+                        "UPDATE sales_ingest_receipts SET receipt_json = ? WHERE doc_key = ?",
+                        (json.dumps(still_pending, ensure_ascii=False), doc_key),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                finally:
+                    conn.close()
+            return still_pending, False
+
+        updated = {
+            **receipt_prior,
+            "embedding_indexed": True,
+            "embedding_pending": False,
+        }
+        updated.pop("embedding_error", None)
+        conn = sqlite3.connect(self.mail_db, timeout=20, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for (row_id, _), blob in zip(missing_rows, blobs, strict=True):
+                conn.execute(
+                    "UPDATE email_chunks SET embedding = ? WHERE id = ?",
+                    (blob, int(row_id)),
+                )
+            conn.execute(
+                "UPDATE sales_ingest_receipts SET receipt_json = ? WHERE doc_key = ?",
+                (json.dumps(updated, ensure_ascii=False), doc_key),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+        return updated, True
 
     def _find_audit_by_request_id(self, request_id: str) -> dict[str, Any] | None:
         if not request_id or not self.audit_path.is_file():
@@ -387,11 +888,24 @@ class MarketDigestPartitionStore:
                 audit_prior = self._find_audit_by_request_id(request_id)
                 if db_pair is not None:
                     manifest_entry, receipt_prior = db_pair
-                    if manifest_entry.get("doc_key") not in manifest:
+                    prior_doc_key = str(manifest_entry.get("doc_key") or doc_key)
+                    receipt_prior, backfilled = self._backfill_missing_embeddings(
+                        prior_doc_key,
+                        receipt_prior,
+                    )
+                    still_pending = bool(receipt_prior.get("embedding_pending"))
+                    if prior_doc_key not in manifest:
                         sales_notes_store_mod.append_manifest(self.data_root, manifest_entry)
-                    if audit_prior is None:
+                    if audit_prior is None or backfilled:
                         self._append_audit_entry(receipt_prior)
-                    return 200, {**receipt_prior, "ok": True, "status": "ingested", "idempotent_replay": True}
+                    return 200, {
+                        **receipt_prior,
+                        "ok": True,
+                        "status": "ingested",
+                        "idempotent_replay": True,
+                        **({"retryable": True} if still_pending else {}),
+                        **({"embedding_backfilled": True} if backfilled else {}),
+                    }
                 if audit_prior is not None and audit_prior.get("status") in ("ingested", "done"):
                     return 200, {**audit_prior, "ok": True, "status": "ingested", "idempotent_replay": True}
             else:
@@ -400,12 +914,24 @@ class MarketDigestPartitionStore:
                     manifest_entry, receipt_prior = db_doc_pair
                     need_manifest = manifest_entry.get("doc_key") not in manifest
                     need_audit = self._find_audit_by_doc_key(doc_key) is None
-                    if need_manifest or need_audit:
+                    receipt_prior, backfilled = self._backfill_missing_embeddings(
+                        doc_key,
+                        receipt_prior,
+                    )
+                    still_pending = bool(receipt_prior.get("embedding_pending"))
+                    if need_manifest or need_audit or backfilled or still_pending:
                         if need_manifest:
                             sales_notes_store_mod.append_manifest(self.data_root, manifest_entry)
-                        if need_audit:
+                        if need_audit or backfilled:
                             self._append_audit_entry(receipt_prior)
-                        return 200, {**receipt_prior, "ok": True, "status": "ingested", "idempotent_replay": True}
+                        return 200, {
+                            **receipt_prior,
+                            "ok": True,
+                            "status": "ingested",
+                            "idempotent_replay": True,
+                            **({"retryable": True} if still_pending else {}),
+                            **({"embedding_backfilled": True} if backfilled else {}),
+                        }
 
         if doc_key in manifest or self._find_db_receipt_by_doc_key(doc_key) is not None:
             return 200, {
@@ -505,23 +1031,47 @@ class MarketDigestPartitionStore:
         }
         note_prefix = f"[{institution}] {title}\n\n"
         chunks_list = self._chunk_sales_note(body_text, note_prefix, max_chunk_chars=1500)
+        chunk_embeddings, embed_err = self._embed_texts(chunks_list)
+        all_embedded = (
+            embed_err is None
+            and len(chunk_embeddings) == len(chunks_list)
+            and all(blob is not None for blob in chunk_embeddings)
+        )
+        embedding_pending = not all_embedded
+
+        is_image_ingest = binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS
+        wiki_img_store: OpenWikiStore | None = None
+        image_asset_abs: Path | None = None
+        image_asset_sha: str | None = None
+        if is_image_ingest and binary_bytes is not None:
+            wiki_img_store = OpenWikiStore(self.data_root)
+            _, _, _, image_asset_sha, _, image_asset_abs = wiki_img_store._prepare_image_asset(
+                image_bytes=binary_bytes,
+                suffix=orig_binary_suffix,
+            )
+            wiki_img_store.ensure_images_schema()
+
         file_written = False
         orig_written = False
+        asset_written = False
         conn = sqlite3.connect(self.mail_db, timeout=20, isolation_level=None)
         try:
+            if is_image_ingest and wiki_img_store is not None:
+                conn.execute("ATTACH DATABASE ? AS img_db", (str(wiki_img_store.images_db),))
             conn.execute("BEGIN IMMEDIATE")
             row_id: int | None = None
             for chunk_idx, chunk_body in enumerate(chunks_list):
+                emb_blob = chunk_embeddings[chunk_idx] if chunk_idx < len(chunk_embeddings) else None
                 cur = conn.execute(
-                    "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (received_date, doc_key, doc_key, institution, title, chunk_idx, chunk_body, created_at),
+                    "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (received_date, doc_key, doc_key, institution, title, chunk_idx, chunk_body, emb_blob, created_at),
                 )
                 if row_id is None:
                     row_id = cur.lastrowid
             image_doc_id: str | None = None
-            if binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS:
-                image_doc_id = OpenWikiStore(self.data_root).register_image_asset(
+            if is_image_ingest and binary_bytes is not None and wiki_img_store is not None:
+                image_doc_id = wiki_img_store.register_image_asset(
                     image_bytes=binary_bytes,
                     suffix=orig_binary_suffix,
                     source="sales-notes",
@@ -534,6 +1084,9 @@ class MarketDigestPartitionStore:
                         "caption": body_text[:1000],
                     },
                     created_at=created_at,
+                    conn=conn,
+                    db_alias="img_db",
+                    write_asset_file=False,
                 )
             receipt = {
                 "ok": True,
@@ -545,6 +1098,9 @@ class MarketDigestPartitionStore:
                 **({"original_filepath": orig_rel} if orig_rel else {}),
                 "sha256": sha_hex,
                 "chunk_count": len(chunks_list),
+                "embedding_indexed": all_embedded,
+                "embedding_pending": embedding_pending,
+                **({"embedding_error": embed_err} if embed_err else {}),
                 **({"request_id": request_id} if request_id else {}),
             }
             receipt_key = request_id or f"doc:{doc_key}"
@@ -561,6 +1117,8 @@ class MarketDigestPartitionStore:
                     created_at,
                 ),
             )
+            if is_image_ingest and binary_bytes is not None and wiki_img_store is not None and image_asset_abs is not None:
+                asset_written = wiki_img_store._persist_image_asset_file(image_asset_abs, binary_bytes)
             if binary_bytes is not None and orig_abs is not None:
                 orig_abs.parent.mkdir(parents=True, exist_ok=True)
                 b_fd = os.open(str(orig_abs), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -608,6 +1166,13 @@ class MarketDigestPartitionStore:
                     orig_abs.unlink()
                 except OSError:
                     pass
+            if (
+                asset_written
+                and wiki_img_store is not None
+                and image_asset_abs is not None
+                and image_asset_sha is not None
+            ):
+                wiki_img_store._cleanup_unreferenced_image_asset(image_asset_abs, image_asset_sha)
             raise
         finally:
             conn.close()

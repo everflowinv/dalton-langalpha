@@ -11,6 +11,7 @@ from fastapi import Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config.settings import get_sse_keepalive_interval
+from src.dalton.llm.run_model import adopted_run_llm_model  # DALTON-HOOK(antigravity-series)
 from src.llms.model_identity import client_effort
 from src.server.utils.api import (
     CurrentUserId,
@@ -474,6 +475,9 @@ async def _reject_duplicate_request(
             run_status=existing["status"],
             retryable=can_retry(existing),
         )
+        # DALTON-HOOK(antigravity-series): expose adopted run's effective llm_model on 409 duplicate_request
+        if adopted_model := adopted_run_llm_model(existing):
+            detail["llm_model"] = adopted_model
         # A steer's run is another message's turn, not one to retry or adopt.
         if keyed.steered:
             detail["steered"] = True

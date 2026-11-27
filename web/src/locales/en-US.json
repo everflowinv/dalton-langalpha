@@ -1989,6 +1989,8 @@
       },
       "affectedCompanies": "Affected companies ({{count}})",
       "affectedWorkspaces": "Affected workspaces & tasks ({{count}})",
+      "policyDiffTitle": "Policy changes (before → after)",
+      "policyOff": "Off",
       "confirm": "Confirm",
       "submitting": "Applying…",
       "decline": "Cancel",

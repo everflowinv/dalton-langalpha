@@ -12,6 +12,8 @@ import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from 
 import { noteIfSuspended } from '@/lib/accountSuspension';
 // DALTON-HOOK(team-model-catalog): observe X-Dalton-Catalog-Revision and catalog 400 errors on raw SSE fetch streams
 import { observeCatalogModelError, observeCatalogRevisionHeader } from '@/lib/dalton/catalogRevision';
+// DALTON-HOOK(antigravity-series): gate onRunIdResolved on unified stream run-admission predicate
+import { isStreamRunAdmissionEvent } from '@/lib/dalton/turnAdmission';
 
 export const baseURL = api.defaults.baseURL;
 
@@ -291,7 +293,8 @@ export async function postSSEStream(
     let duplicate: Record<string, unknown> | null = null;
     const onEvent = (event: Record<string, unknown>) => {
       if (event.event === 'metadata' || event.event === 'steering_accepted') release();
-      if (event.event !== 'turn_held') {
+      // DALTON-HOOK(antigravity-series): gate onRunIdResolved on unified stream run-admission check (blocks refusal and unstarted retry/error frames without run_id)
+      if (isStreamRunAdmissionEvent(event)) {
         const runId = parseRunIdFromContentLocation(runLocation);
         if (runId && onRunIdResolved) onRunIdResolved(runId, parseThreadIdFromContentLocation(runLocation));
         runLocation = null;
@@ -339,6 +342,8 @@ function duplicateRequestError(frame: Record<string, unknown>): Error & { status
     errorInfo.retryable = frame.retryable;
     errorInfo.thread_id = frame.run_thread_id || frame.thread_id;
     if (frame.steered === true) errorInfo.steered = true;
+    // DALTON-HOOK(antigravity-series): preserve adopted run's llm_model from SSE duplicate_request frame
+    if (typeof frame.llm_model === 'string' && frame.llm_model) errorInfo.llm_model = frame.llm_model;
   }
   return Object.assign(new Error(message || 'HTTP error! status: 409'), { status: 409, errorInfo });
 }

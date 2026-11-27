@@ -53,6 +53,102 @@ export interface WatchlistTierPolicy {
   earnings_stages: string[];
 }
 
+export interface WatchlistTierPolicyDiff {
+  tier: WatchlistTier;
+  before: WatchlistTierPolicy;
+  after: WatchlistTierPolicy;
+  changed_fields: string[];
+}
+
+export interface WatchlistCronPreset {
+  id: string;
+  cron: string;
+  label_zh: string;
+  label_en: string;
+}
+
+export interface WatchlistTierPoliciesResponse {
+  ok: boolean;
+  user_id?: string;
+  policies: Record<WatchlistTier, WatchlistTierPolicy>;
+  defaults?: Record<WatchlistTier, WatchlistTierPolicy>;
+  presets?: {
+    watch_cron: WatchlistCronPreset[];
+    delta_cron: WatchlistCronPreset[];
+    move_threshold_pct: number[];
+    earnings_stages: string[];
+  };
+}
+
+export interface WatchlistTierPolicyPreviewRequest {
+  tier: WatchlistTier;
+  action?: 'set_tier_policy' | 'reset_tier_policy';
+  policy?: Partial<Omit<WatchlistTierPolicy, 'tier' | 'policy_version'>>;
+  watch_enabled?: boolean;
+  watch_cron?: string;
+  delta_enabled?: boolean;
+  delta_cron?: string;
+  delta_timezone?: string;
+  move_enabled?: boolean;
+  move_threshold_pct?: number;
+  earnings_stages?: string[];
+  override_user_pause?: boolean;
+}
+
+export interface WatchlistTierPolicyCommitRequest {
+  snapshot_id: string;
+  expected_policy_version?: number;
+  expected_roster_hash?: string;
+  override_user_pause?: boolean;
+}
+
+export interface WatchlistTierPolicyCommitResponse {
+  ok: boolean;
+  action: string;
+  tier: WatchlistTier;
+  policy: WatchlistTierPolicy;
+  before_policy?: WatchlistTierPolicy;
+  policy_diff?: WatchlistTierPolicyDiff;
+  affected_tickers?: string[];
+  job_id?: string | null;
+  reconcile_status?: string;
+  failed_items?: Array<Record<string, unknown>>;
+  home_synced?: boolean;
+}
+
+export type ValuationStatus =
+  | 'ok'
+  | 'loss'
+  | 'no_coverage'
+  | 'unit_unverified'
+  | 'stale'
+  | 'rate_limited'
+  | 'unlisted';
+
+export interface WatchlistValuationMeta {
+  ticker?: string;
+  fy1_eps: number | null;
+  fy2_eps: number | null;
+  fy1_end: string | null;
+  fy2_end: string | null;
+  estimate_currency: string | null;
+  quote_currency: string | null;
+  shares_per_quote_unit: number | null;
+  unit_verified: boolean;
+  analyst_count: number | null;
+  provider: string | null;
+  as_of: string | null;
+  fx_rate?: number | null;
+  status: ValuationStatus;
+  pe_fy1: number | null;
+  pe_fy2: number | null;
+  eps_growth_fy2: number | null;
+  pe_fy1_status?: ValuationStatus;
+  pe_fy2_status?: ValuationStatus;
+  eps_growth_fy2_status?: ValuationStatus;
+  status_reason?: string | null;
+}
+
 export interface PersonalWatchlistSummary {
   ok: boolean;
   user_id?: string;
@@ -98,6 +194,10 @@ export interface WatchlistMetricRow {
   market_cap: number | null;
   market_cap_currency?: string | null;
   next_earnings: string | null;
+  pe_fy1?: number | null;
+  pe_fy2?: number | null;
+  eps_growth_fy2?: number | null;
+  valuation?: WatchlistValuationMeta | null;
 }
 
 export interface WatchlistMetricsSummary {
@@ -116,6 +216,7 @@ export interface WatchlistMetricsResponse {
   ok: boolean;
   items: Record<string, WatchlistMetricRow>;
   pending_symbols: string[];
+  pending_valuation_symbols?: string[];
   snapshot_pending_symbols?: string[];
   summary?: WatchlistMetricsSummary;
   as_of: string;
@@ -169,6 +270,7 @@ export interface WatchlistPreviewResponse {
   target_tier?: WatchlistTier | null;
   not_found?: string[];
   expected_roster_hash?: string;
+  expected_policy_version?: number | null;
   expected_policy_versions?: Record<string, number>;
   expected_pause_versions?: Record<string, number>;
   override_user_pause?: boolean;
@@ -177,6 +279,9 @@ export interface WatchlistPreviewResponse {
   affected_tickers: WatchlistAffectedTicker[];
   affected_workspaces: WatchlistAffectedWorkspace[];
   task_summary: WatchlistTaskSummary;
+  before_policy?: WatchlistTierPolicy | null;
+  after_policy?: WatchlistTierPolicy | null;
+  policy_diff?: WatchlistTierPolicyDiff | null;
   card_title?: string;
   card_description?: string;
   preserve_workspace_notice?: string | null;
@@ -212,7 +317,7 @@ export interface WatchlistMutateResponse {
   workspace_notice?: string | null;
 }
 
-/** Batch-1 base column keys (no Batch-2 valuation / Batch-3 custom columns). */
+/** Built-in watchlist column keys (Batch 1 + Batch 2 public consensus valuation columns). */
 export type WatchlistColumnKey =
   | 'tier'
   | 'price'
@@ -222,13 +327,16 @@ export type WatchlistColumnKey =
   | 'chg_3m'
   | 'chg_ytd'
   | 'chg_1y'
+  | 'pe_fy1'
+  | 'pe_fy2'
+  | 'eps_growth_fy2'
   | 'range_52w'
   | 'rsi_14d'
   | 'rsi_30d'
   | 'market_cap'
   | 'next_earnings';
 
-export const BATCH1_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = [
+export const ALL_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = [
   'tier',
   'price',
   'chg_1d',
@@ -237,12 +345,18 @@ export const BATCH1_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = [
   'chg_3m',
   'chg_ytd',
   'chg_1y',
+  'pe_fy1',
+  'pe_fy2',
+  'eps_growth_fy2',
   'range_52w',
   'rsi_14d',
   'rsi_30d',
   'market_cap',
   'next_earnings',
 ] as const;
+
+/** Kept as alias for backwards compatibility with Batch-1 imports. */
+export const BATCH1_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = ALL_WATCHLIST_COLUMNS;
 
 export const DEFAULT_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = [
   'tier',
@@ -251,6 +365,8 @@ export const DEFAULT_WATCHLIST_COLUMNS: readonly WatchlistColumnKey[] = [
   'chg_1w',
   'chg_1m',
   'chg_3m',
+  'pe_fy1',
+  'pe_fy2',
   'range_52w',
   'rsi_14d',
   'rsi_30d',
@@ -293,6 +409,53 @@ export async function reconcileWatchlist(jobId?: string): Promise<Record<string,
     sync_home: true,
   });
   return data;
+}
+
+export async function fetchWatchlistTierPolicies(): Promise<WatchlistTierPoliciesResponse> {
+  const { data } = await api.get<WatchlistTierPoliciesResponse>('/api/v1/dalton/watchlist/tier-policies');
+  return data;
+}
+
+export async function previewWatchlistTierPolicy(
+  body: WatchlistTierPolicyPreviewRequest,
+): Promise<WatchlistPreviewResponse> {
+  const { data } = await api.post<WatchlistPreviewResponse>(
+    '/api/v1/dalton/watchlist/tier-policies/preview',
+    body,
+  );
+  return data;
+}
+
+export async function updateWatchlistTierPolicy(
+  tier: WatchlistTier,
+  body: WatchlistTierPolicyCommitRequest,
+): Promise<WatchlistTierPolicyCommitResponse> {
+  const { data } = await api.put<WatchlistTierPolicyCommitResponse>(
+    `/api/v1/dalton/watchlist/tier-policies/${encodeURIComponent(tier)}`,
+    body,
+  );
+  return data;
+}
+
+export async function resetWatchlistTierPolicy(
+  tier: WatchlistTier,
+  body: WatchlistTierPolicyCommitRequest,
+): Promise<WatchlistTierPolicyCommitResponse> {
+  const { data } = await api.post<WatchlistTierPolicyCommitResponse>(
+    `/api/v1/dalton/watchlist/tier-policies/${encodeURIComponent(tier)}/reset`,
+    body,
+  );
+  return data;
+}
+
+export function useWatchlistTierPolicies(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.dalton.watchlistTierPolicies(),
+    queryFn: fetchWatchlistTierPolicies,
+    enabled: enabled && isDaltonBuild,
+    staleTime: 30_000,
+    retry: 1,
+  });
 }
 
 export function flattenWatchlistCompanies(
@@ -451,6 +614,14 @@ function mergeMetricRow(
     }
   }
 
+  const hasNextValuation = nextRow.valuation != null;
+  const valuation = hasNextValuation ? nextRow.valuation : prevRow.valuation;
+  const peFy1 = hasNextValuation ? (nextRow.pe_fy1 ?? null) : (nextRow.pe_fy1 ?? prevRow.pe_fy1);
+  const peFy2 = hasNextValuation ? (nextRow.pe_fy2 ?? null) : (nextRow.pe_fy2 ?? prevRow.pe_fy2);
+  const epsGrowthFy2 = hasNextValuation
+    ? (nextRow.eps_growth_fy2 ?? null)
+    : (nextRow.eps_growth_fy2 ?? prevRow.eps_growth_fy2);
+
   return {
     ...prevRow,
     ...nextRow,
@@ -474,6 +645,10 @@ function mergeMetricRow(
     market_cap: nextRow.market_cap ?? prevRow.market_cap,
     market_cap_currency: nextRow.market_cap_currency ?? prevRow.market_cap_currency,
     next_earnings: nextRow.next_earnings ?? prevRow.next_earnings,
+    ...(peFy1 !== undefined ? { pe_fy1: peFy1 } : {}),
+    ...(peFy2 !== undefined ? { pe_fy2: peFy2 } : {}),
+    ...(epsGrowthFy2 !== undefined ? { eps_growth_fy2: epsGrowthFy2 } : {}),
+    ...(valuation !== undefined ? { valuation } : {}),
   };
 }
 
@@ -501,6 +676,23 @@ function mergePendingList(
   return merged;
 }
 
+function collectPendingSubsetSymbols(data: WatchlistMetricsResponse | undefined): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const sym of [
+    ...(data?.pending_symbols ?? []),
+    ...(data?.pending_valuation_symbols ?? []),
+  ]) {
+    const trimmed = sym.trim();
+    const up = trimmed.toUpperCase();
+    if (trimmed && !seen.has(up)) {
+      seen.add(up);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
 /** Merge a pending-only subset poll response into the full cached metrics response without clobbering existing values with nulls. */
 export function mergeWatchlistMetricsResponse(
   prev: WatchlistMetricsResponse,
@@ -513,6 +705,10 @@ export function mergeWatchlistMetricsResponse(
   }
   const polledSet = new Set(polledSymbols.map((s) => s.toUpperCase()));
   const nextPending = mergePendingList(prev.pending_symbols, subset.pending_symbols, polledSet);
+  const nextPendingValuation =
+    prev.pending_valuation_symbols || subset.pending_valuation_symbols
+      ? mergePendingList(prev.pending_valuation_symbols, subset.pending_valuation_symbols, polledSet)
+      : undefined;
   const nextSnapshotPending =
     prev.snapshot_pending_symbols || subset.snapshot_pending_symbols
       ? mergePendingList(prev.snapshot_pending_symbols, subset.snapshot_pending_symbols, polledSet)
@@ -522,6 +718,7 @@ export function mergeWatchlistMetricsResponse(
     ok: prev.ok && subset.ok,
     items: mergedItems,
     pending_symbols: nextPending,
+    ...(nextPendingValuation !== undefined ? { pending_valuation_symbols: nextPendingValuation } : {}),
     ...(nextSnapshotPending !== undefined ? { snapshot_pending_symbols: nextSnapshotPending } : {}),
     summary: recomputeSummaryFromItems(prev.summary ?? subset.summary, mergedItems),
     as_of: subset.as_of || prev.as_of,
@@ -714,7 +911,7 @@ export function usePersonalWatchlistMetrics(
     retry: 1,
   });
 
-  const pendingKey = (query.data?.pending_symbols ?? []).join(',');
+  const pendingKey = collectPendingSubsetSymbols(query.data).join(',');
 
   useEffect(() => {
     if (!isEnabled || !pendingKey) return;
@@ -739,17 +936,17 @@ export function usePersonalWatchlistMetrics(
           if (cancelled) return;
           if (gen < state.appliedGen) {
             const latest = queryClient.getQueryData<WatchlistMetricsResponse>(key);
-            currentPending = latest?.pending_symbols ?? [];
+            currentPending = collectPendingSubsetSymbols(latest);
             if (currentPending.length > 0 && currentPending.join(',') === pendingKey) {
               scheduleNext();
             }
             return;
           }
           state.appliedGen = gen;
-          let mergedPending: string[] = subset.pending_symbols ?? [];
+          let mergedPending: string[] = collectPendingSubsetSymbols(subset);
           queryClient.setQueryData<WatchlistMetricsResponse>(key, (prev) => {
             const merged = prev ? mergeWatchlistMetricsResponse(prev, subset, batch) : subset;
-            mergedPending = merged.pending_symbols ?? [];
+            mergedPending = collectPendingSubsetSymbols(merged);
             return merged;
           });
           currentPending = mergedPending;
@@ -816,15 +1013,22 @@ export function buildPersonalWatchlistContextText(
       );
     }
   }
-  const tableHeader = '| Ticker | Name | Tier | Price | 1D% | 1W% | 1M% | 52W% | 14D RSI | 30D RSI | Next Earnings |';
-  const sep = '|---|---|---|---|---|---|---|---|---|---|---|';
+  const tableHeader = '| Ticker | Name | Tier | Price | 1D% | 1W% | 1M% | FY1 P/E | FY2 P/E | 52W% | 14D RSI | 30D RSI | Next Earnings |';
+  const sep = '|---|---|---|---|---|---|---|---|---|---|---|---|---|';
   const fmtPct = (v: number | null | undefined) => (v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`);
   const fmtNum = (v: number | null | undefined, digits = 2) => (v == null ? '—' : v.toFixed(digits));
+  const fmtPe = (v: number | null | undefined, status?: ValuationStatus) => {
+    if (status === 'loss') return 'NM';
+    if (v == null) return '—';
+    return `${v.toFixed(1)}x`;
+  };
   const lines = companies.slice(0, 120).map((c) => {
     const m = metrics[c.ticker];
     const priceStr = c.is_private || m?.is_private ? 'Unlisted' : fmtNum(m?.price);
     const posStr = m?.position_52w == null ? '—' : `${m.position_52w.toFixed(0)}%`;
-    return `| ${c.ticker} | ${c.name || c.ticker} | ${c.tier} | ${priceStr} | ${fmtPct(m?.chg_1d)} | ${fmtPct(m?.chg_1w)} | ${fmtPct(m?.chg_1m)} | ${posStr} | ${fmtNum(m?.rsi_14d, 1)} | ${fmtNum(m?.rsi_30d, 1)} | ${m?.next_earnings ?? '—'} |`;
+    const pe1 = c.is_private || m?.is_private ? '—' : fmtPe(m?.pe_fy1, m?.valuation?.pe_fy1_status ?? m?.valuation?.status);
+    const pe2 = c.is_private || m?.is_private ? '—' : fmtPe(m?.pe_fy2, m?.valuation?.pe_fy2_status ?? m?.valuation?.status);
+    return `| ${c.ticker} | ${c.name || c.ticker} | ${c.tier} | ${priceStr} | ${fmtPct(m?.chg_1d)} | ${fmtPct(m?.chg_1w)} | ${fmtPct(m?.chg_1m)} | ${pe1} | ${pe2} | ${posStr} | ${fmtNum(m?.rsi_14d, 1)} | ${fmtNum(m?.rsi_30d, 1)} | ${m?.next_earnings ?? '—'} |`;
   });
   const parts = [header, ...summaryLines, tableHeader, sep, ...lines];
   return `<watchlist_context>\n${parts.join('\n')}\n</watchlist_context>`;

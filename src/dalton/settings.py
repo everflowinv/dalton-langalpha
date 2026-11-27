@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from functools import lru_cache
@@ -1945,6 +1946,36 @@ def get_dalton_audit_cache_hmac_key() -> bytes | None:
     return hmac.new(seed.encode("utf-8"), b"dalton-audit-cache-v1", hashlib.sha256).digest()
 
 
+_EPHEMERAL_WORKFLOW_DECISION_KEY: bytes = secrets.token_bytes(32)
+
+
+def get_dalton_workflow_decision_hmac_key() -> bytes:
+    """Derive the server-only HMAC-SHA256 key for signing workflow launch decisions.
+
+    Uses a deployment server secret (never exposed to sandboxes) when configured so
+    signatures survive process restarts and multi-worker routing, falling back to a
+    process-ephemeral 32-byte key in local/test runs without env secrets.
+    """
+    for env_name in (
+        "JWT_SIGNING_SECRET",
+        "DALTON_AUDIT_CACHE_KEY",
+        "SUPABASE_SECRET_KEY",
+        "DALTON_RESEARCH_HOST_ADMIN_TOKEN",
+    ):
+        seed = os.getenv(env_name, "").strip()
+        if seed:
+            return hmac.new(
+                seed.encode("utf-8"),
+                b"dalton-workflow-decision-v1",
+                hashlib.sha256,
+            ).digest()
+    return hmac.new(
+        _EPHEMERAL_WORKFLOW_DECISION_KEY,
+        b"dalton-workflow-decision-v1",
+        hashlib.sha256,
+    ).digest()
+
+
 DEFAULT_INVITE_EMAIL_DOMAIN = "team.dalton.local"
 
 
@@ -2049,6 +2080,53 @@ def get_stop_backup_close_timeout_s() -> float:
     return _positive_float_env(
         "DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S",
         cfg.stop_backup_close_timeout_s,
+    )
+
+
+def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool = True) -> bool:
+    """Resolve a channel runtime switch from ``env_var`` -> merged YAML ``channels.<yaml_key>`` -> ``default``.
+
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
+    for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
+    """
+    raw = os.getenv(env_var)
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("0", "false", "no", "off"):
+            return False
+        if cleaned in ("1", "true", "yes", "on"):
+            return True
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    channels_cfg = raw_yaml.get("channels")
+    if isinstance(channels_cfg, Mapping) and isinstance(channels_cfg.get(yaml_key), bool):
+        return bool(channels_cfg[yaml_key])
+    return bool(default)
+
+
+def is_channel_interactive_actions_enabled() -> bool:
+    """Static switch for channel interactive action buttons (``DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED",
+        "interactive_actions_enabled",
+        default=True,
+    )
+
+
+def is_channel_interrupt_ledger_enabled() -> bool:
+    """Static switch for channel HITL interrupt resume ledger (``DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED",
+        "interrupt_ledger_enabled",
+        default=True,
+    )
+
+
+def is_channel_bt2_link_recovery_enabled() -> bool:
+    """Static switch for BT2 deliverable link crash recovery enrollment (``DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED",
+        "bt2_link_recovery_enabled",
+        default=True,
     )
 
 

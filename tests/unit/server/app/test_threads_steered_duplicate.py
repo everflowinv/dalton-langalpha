@@ -138,3 +138,31 @@ async def test_another_users_copy_of_the_key_learns_no_turn():
     assert "run_id" not in detail and "thread_id" not in detail
     assert "steered" not in detail
     workflow.assert_not_called()
+
+
+# DALTON-HOOK(antigravity-series): verify 409 duplicate_request exposes adopted run's metadata.llm_model
+@pytest.mark.asyncio
+async def test_duplicate_request_409_exposes_adopted_run_llm_model():
+    resp, workflow = await _resend(
+        CALLER,
+        steered=False,
+        metadata={"llm_model": "gemini-4-neon-high-oauth"},
+    )
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "duplicate_request"
+    assert detail["run_id"] == TURN
+    assert detail["llm_model"] == "gemini-4-neon-high-oauth"
+    workflow.assert_not_called()
+
+    # Ownership gating stays unchanged: non-owner receives no run_id or llm_model.
+    other_resp, _ = await _resend(
+        OWNER,
+        steered=False,
+        metadata={"llm_model": "gemini-4-neon-high-oauth"},
+    )
+    assert other_resp.status_code == 409
+    other_detail = other_resp.json()["detail"]
+    assert "run_id" not in other_detail
+    assert "llm_model" not in other_detail

@@ -32,8 +32,9 @@ import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelO
 import { isLargePaste, getModelDisplayName, MAX_FILES, sameMention } from './chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import { useToast } from './use-toast';
 import { effortOptions, isCodexModel, resolveEffort } from '@/lib/modelTuning';
-// DALTON-HOOK(antigravity-series): series display name, effort switching, and collapsed picker wiring
+// DALTON-HOOK(antigravity-series): series display name, effort switching, collapsed picker wiring, and modelPickSeq forwarding
 import { inspectSavedAntigravityModel, sameAntigravitySeries } from '@/lib/antigravitySeries';
+import { attachComposerModelPickSeq } from '@/lib/dalton/threadModelDalton';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
   ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
@@ -65,6 +66,8 @@ import { readGivenBack, spellOutQuotes } from './chat-input.quoteTokens';
 import { formatContextBlock } from './chat-input.wire';
 // DALTON-HOOK(composer-drafts): persist unsent composer draft text across view/thread switches
 import { useComposerDraft, type DraftParts } from '@/lib/dalton/chatDrafts';
+// DALTON-HOOK(automation-effort): draft-content & retry-intent helpers for effort picks and standalone actions
+import { hasComposerDraftContent, invalidateRetryIntent, recordEffortPickRetryIntent } from '@/lib/dalton/composerRetryGuard';
 import { useAccount } from '@/hooks/useAccount';
 import { modelRefusedBy, modelRuleRowKey } from '@/lib/accountRules';
 
@@ -205,6 +208,8 @@ export interface ChatInputProps {
   /** The model a send names where the host's thread names another than the
    *  pill shows (`useThreadModel`'s `sendModel`); unset, the pill's. */
   sendModel?: string | null;
+  // DALTON-HOOK(antigravity-series): sequence of the active manual model pick for composer getModelOptions()
+  sendModelSeq?: number | null;
   /**
    * The thread's own reasoning effort and fast mode, over what Settings gives
    * its model, owned by a thread host (`useThreadTuning`), which also receives
@@ -300,6 +305,8 @@ function ChatInput({
   model: hostModel,
   onPickModel = null,
   sendModel: hostSendModel,
+  // DALTON-HOOK(antigravity-series): active manual model pick sequence forwarded into getModelOptions
+  sendModelSeq: hostSendModelSeq = null,
   // Thread effort and fast mode
   tuning: hostTuning,
   onPickReasoningEffort = null,
@@ -702,14 +709,15 @@ function ChatInput({
   // Expose addContext method for external callers (e.g. FilePanel, message selection)
   useImperativeHandle(ref, () => ({
     getModelOptions() {
-      return {
+      // DALTON-HOOK(antigravity-series): attach active manual pick sequence for Dalton HITL/composer readers
+      return attachComposerModelPickSeq({
         model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
         ...ownOverrides,
-      };
+      }, { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
     },
     // DALTON-HOOK(automation-effort): omit saved composer effort (and unsent Antigravity effort variant) on retry unless explicitly picked for this retry
     getRetryModelOptions() {
@@ -742,14 +750,14 @@ function ChatInput({
           }
         : {};
       // DALTON-HOOK(automation-effort): retry submits the variant only when it was picked for this retry
-      return {
+      return attachComposerModelPickSeq({
         model: retryModel,
         reasoningEffort: matchedExplicit ? explicit.effort : null,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
         ...retryOwnOverrides,
-      };
+      }, { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
     },
     addContext(ctx) {
       // Dictation rewrites the draft from what it held when it started.
@@ -843,7 +851,7 @@ function ChatInput({
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
+  }), [sentModel, hostSendModelSeq, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -892,19 +900,20 @@ function ChatInput({
 
   // The menu names null for the level Settings gives, which returns the
   // thread to following Settings rather than pinning today's value.
+  // DALTON-HOOK(automation-effort): switching effort while a draft is already composed belongs to the draft, not a retry
+  const hasDraftContent = hasComposerDraftContent({
+    message, attachedCount: attachedFiles.length, hasChartImage: Boolean(chartImage),
+    chipsCount: chips.length, widgetSnapshotsCount: widgetSnapshots.length, hasExternalContext,
+  });
   // DALTON-HOOK(antigravity-series): for Antigravity series, switching effort picks the series variant key
   const handleReasoningEffortChange = useCallback((effort: string | null) => {
+    const retryRefs = { explicitRetryEffortRef, seriesEffortModelRef };
     if (pillSeriesMatch) {
       if (!effort) return;
       const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
       if (!targetKey) return;
-      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target
-      seriesEffortModelRef.current = {
-        model: targetKey,
-        targetId: retryTargetId ?? null,
-        activeForRetry: !isLoading && retryTargetId !== null,
-      };
-      explicitRetryEffortRef.current = undefined;
+      // DALTON-HOOK(automation-effort): record series-effort retry intent via Dalton helper
+      recordEffortPickRetryIntent(retryRefs, { isLoading, retryTargetId, hasDraftContent, seriesTargetModel: targetKey, effort, settingsEffort: settingsTuning.reasoning_effort });
       if (targetKey === pillModel) return;
       if (hostModel === undefined) setOwnModel(targetKey);
       else onPickModel?.(targetKey);
@@ -913,22 +922,15 @@ function ChatInput({
       }
       return;
     }
-    // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target
-    if (!isLoading && retryTargetId !== null) {
-      explicitRetryEffortRef.current = {
-        targetId: retryTargetId ?? null,
-        effort: effort ?? settingsTuning.reasoning_effort ?? null,
-      };
-    } else {
-      explicitRetryEffortRef.current = undefined;
-    }
+    // DALTON-HOOK(automation-effort): record explicit retry effort intent via Dalton helper
+    recordEffortPickRetryIntent(retryRefs, { isLoading, retryTargetId, hasDraftContent, effort, settingsEffort: settingsTuning.reasoning_effort });
     if (effort === tuning.reasoningEffort) return;
     if (hostTuning === undefined) setOwnTuning((prev) => ({ ...prev, reasoningEffort: effort }));
     else onPickReasoningEffort?.(effort);
   }, [
     pillSeriesMatch, pillSelectableSeries, pillModel, hostModel, setOwnModel, onPickModel,
     tuning.reasoningEffort, hostTuning, onPickReasoningEffort, settingsTuning.reasoning_effort,
-    isLoading, retryTargetId,
+    isLoading, retryTargetId, hasDraftContent,
   ]);
 
   // Speed has no Default of its own in the menu, so the side Settings is on
@@ -1092,9 +1094,8 @@ function ChatInput({
       // staged attachments / mentions / widget context behind for the next turn.
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
-      // DALTON-HOOK(automation-effort): standalone action commands also clear any pending retry effort pick
-      explicitRetryEffortRef.current = undefined;
-      seriesEffortModelRef.current = undefined;
+      // DALTON-HOOK(automation-effort): standalone action commands invalidate retry eligibility without erasing the series-effort guard over sentModel
+      invalidateRetryIntent({ explicitRetryEffortRef, seriesEffortModelRef });
       resetSlash();
       // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
       discardFiles();

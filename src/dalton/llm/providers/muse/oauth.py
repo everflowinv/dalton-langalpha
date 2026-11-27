@@ -62,6 +62,7 @@ def set_active_muse_context(
     user_id: str,
     cred_user_id: str,
     base_url: str,
+    api_key_fp: str = "",
 ) -> None:
     """Bind the active Muse context for downstream client construction."""
     _current_muse_context.set(
@@ -69,6 +70,7 @@ def set_active_muse_context(
             "user_id": str(user_id or ""),
             "cred_user_id": str(cred_user_id or ""),
             "base_url": str(base_url or MUSE_DEFAULT_BASE_URL),
+            "api_key_fp": str(api_key_fp or ""),
         }
     )
 
@@ -494,6 +496,7 @@ async def get_valid_token(user_id: str) -> dict[str, Any] | None:
         user_id=user_id,
         cred_user_id=cred_user_id,
         base_url=base_url,
+        api_key_fp=_muse_key_fp(tokens["access_token"]),
     )
     return {
         "access_token": tokens["access_token"],
