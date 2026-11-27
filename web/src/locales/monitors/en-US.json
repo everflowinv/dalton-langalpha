@@ -85,7 +85,9 @@
     "viewRaw": "View raw",
     "viewRendered": "View rendered",
     "download": "Download",
-    "downloadFailed": "Failed to download file"
+    "downloadFailed": "Failed to download file",
+    "linkUnavailable": "Restricted or missing",
+    "backToDocument": "Back to {{name}}"
   },
   "demo": {
     "title": "Realtime Monitor Demo",

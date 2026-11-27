@@ -207,6 +207,8 @@
   "viewPreview": "查看页面",
   "viewRaw": "查看原文",
   "viewRendered": "查看渲染",
+  "sharedLinkUnavailable": "需授权或暂缺",
+  "backToSharedDoc": "返回 {{name}}",
   "htmlPreviewFailed": "无法加载预览。",
   "pdfPrintHint": "按 Cmd/Ctrl-P 将页面保存为 PDF。",
   "pdfGenerating": "正在生成 PDF…",

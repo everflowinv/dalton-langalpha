@@ -14,6 +14,7 @@
   "public": "Public link",
   "published": "Published",
   "publishedAt": "Published v{{seq}}",
+  "afterSave": "After saving: {{hint}}",
   "sharedHint": "Anyone with the link can open it.",
   "upToDate": "Visitors see v{{seq}}. Nothing has changed since.",
   "changedSince": "Changed since v{{seq}}. Visitors see v{{seq}} until you update.",

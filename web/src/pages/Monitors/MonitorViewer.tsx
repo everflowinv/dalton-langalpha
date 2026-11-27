@@ -141,8 +141,16 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     ? detail?.versions.find((v) => v.seq === effectiveSeq)
     : undefined;
   const effectiveEntryPath = selectedVersion?.entry_path || monitor?.entry_path;
-  const isMarkdownEntry = Boolean(effectiveEntryPath && isMarkdownFile(effectiveEntryPath));
+  const isMarkdownEntry = Boolean(
+    (effectiveEntryPath && isMarkdownFile(effectiveEntryPath)) ||
+    monitor?.entry_file_type === 'markdown',
+  );
+  const isAnonymousMarkdownEntry = publicMode && isMarkdownEntry && !effectiveEntryPath;
   const activeVersionPrefix = activeGrant ? versionPrefix(activeGrant.frameBase, effectiveSeq) : '';
+  const viewerMarkdownPath = effectiveEntryPath || (isMarkdownEntry && monitor ? `${monitor.slug}.md` : undefined);
+  const anonymousEntryUrl = isAnonymousMarkdownEntry && activeVersionPrefix
+    ? `${activeVersionPrefix.replace(/\/+$/, '')}/`
+    : undefined;
   const frameSource = useMemo<FrameSource | null>(() => {
     if (!monitor || !activeGrant || isMarkdownEntry) return null;
     const prefix = versionPrefix(activeGrant.frameBase, effectiveSeq);
@@ -226,10 +234,15 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
   };
 
   const handleDownloadMarkdown = () => {
-    if (!activeVersionPrefix || !effectiveEntryPath) return;
-    const fileName = effectiveEntryPath.split('/').pop() || `${monitor?.slug || 'document'}.md`;
+    if (!activeVersionPrefix) return;
+    const downloadUrl = effectiveEntryPath
+      ? buildServeUrl(activeVersionPrefix, effectiveEntryPath)
+      : `${activeVersionPrefix.replace(/\/+$/, '')}/`;
+    const fileName = effectiveEntryPath
+      ? (effectiveEntryPath.split('/').pop() || `${monitor?.slug || 'document'}.md`)
+      : `${monitor?.slug || 'document'}.md`;
     setDownloading(true);
-    downloadServedFile(buildServeUrl(activeVersionPrefix, effectiveEntryPath), fileName)
+    downloadServedFile(downloadUrl, fileName)
       .catch(() => {
         toast({ description: t('monitors:markdown.downloadFailed'), variant: 'destructive' });
       })
@@ -420,12 +433,14 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
 
       {/* DALTON-HOOK(monitors): expose docState on monitor host and wire BridgedFrame expectedDocKey & onDocStateChange */}
       <div className="monitors-frame-host" data-doc-state={docState.kind}>
-        {isMarkdownEntry && effectiveEntryPath && activeVersionPrefix ? (
+        {isMarkdownEntry && viewerMarkdownPath && activeVersionPrefix ? (
           <Suspense fallback={null}>
             <SharedFileBody
               scope={`monitor:${monitor.monitor_id}:v${effectiveSeq}`}
-              path={effectiveEntryPath}
+              path={viewerMarkdownPath}
               frameBase={activeVersionPrefix}
+              entryUrl={anonymousEntryUrl}
+              anonymousEntry={isAnonymousMarkdownEntry}
               onDownload={handleDownloadMarkdown}
               downloading={downloading}
               onGone={() => {

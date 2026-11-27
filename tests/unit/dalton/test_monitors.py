@@ -7,7 +7,6 @@ import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec, patch
 
@@ -324,7 +323,6 @@ async def test_checklist_3_public_downgrade_unshares_and_invalidates_old_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.server.app import public as public_app
-    from src.server.database import artifacts as artifacts_db
     from src.server.database.share_links import ShareLink
 
     public_monitor = _make_monitor(
@@ -567,7 +565,6 @@ async def test_checklist_5_workspace_after_turn_update_dedup_and_prune(
         create_autospec(artifacts_db.get_artifact, return_value=artifact),
     )
 
-    v1_bytes = b"<html><body>v1</body></html>"
     v2_bytes = b"<html><body>v2</body></html>"
     snap_v2 = Snapshot(
         entries=[ManifestEntry("report.html", len(v2_bytes), "entry")],
@@ -642,7 +639,6 @@ async def test_checklist_5_workspace_after_turn_update_dedup_and_prune(
         executed_sql.append((sql, params))
 
     cur.execute.side_effect = _capture_exec
-    conn = create_autospec(AsyncConnection, instance=True)
     deleted_count = await real_prune(
         cur, ARTIFACT_ID, published_seq=105, keep_count=100
     )
@@ -1620,10 +1616,20 @@ async def test_r2_3_public_write_paths_check_current_admin_and_data_job_approver
     monkeypatch.setattr(
         "src.dalton.settings.is_dalton_supabase_auth_enabled", lambda: True
     )
+    from src.dalton.monitors import shared_documents as shared_doc_service
+
     monkeypatch.setattr(
         monitor_db,
         "list_workspace_auto_update_monitors",
         create_autospec(orig_list_auto, return_value=[]),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "list_workspace_auto_update_shared_documents",
+        create_autospec(
+            shared_doc_service.list_workspace_auto_update_shared_documents,
+            return_value=[],
+        ),
     )
     monkeypatch.setattr(
         artifacts_db,

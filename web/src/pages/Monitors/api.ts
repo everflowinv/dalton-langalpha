@@ -24,6 +24,7 @@ export interface MonitorSummary {
   artifact_code?: string | null;
   workspace_id?: string | null;
   entry_path?: string | null;
+  entry_file_type?: 'html' | 'markdown' | 'other';
   owner_user_id?: string;
   owner_name: string | null;
   owner_email: string | null;

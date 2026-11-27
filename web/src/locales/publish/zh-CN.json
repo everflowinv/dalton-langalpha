@@ -14,6 +14,7 @@
   "public": "公开链接",
   "published": "已发布",
   "publishedAt": "已发布 v{{seq}}",
+  "afterSave": "保存后：{{hint}}",
   "sharedHint": "拥有链接的任何人都可以打开此链接。",
   "upToDate": "访问者看到的是 v{{seq}}，之后没有改动。",
   "changedSince": "v{{seq}} 之后有改动。更新前，访问者看到的仍是 v{{seq}}。",

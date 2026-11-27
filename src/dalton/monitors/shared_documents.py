@@ -105,6 +105,7 @@ _SHARED_DOC_SELECT = """
         ) AS member_user_ids
       FROM dalton_shared_documents d
       JOIN share_links l ON l.artifact_id = d.artifact_id
+      JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'
       LEFT JOIN users u ON u.user_id = d.owner_user_id
 """
 
@@ -213,13 +214,71 @@ async def downgrade_public_shared_document_in_cur(cur: Any, artifact_id: str) ->
         )
 
 
+async def list_workspace_auto_update_shared_documents(
+    workspace_id: str,
+) -> list[SharedDocumentRecord]:
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                {_SHARED_DOC_SELECT}
+                WHERE d.keep_updated = TRUE
+                  AND l.workspace_id = %s::uuid
+                ORDER BY d.doc_id
+                """,
+                (workspace_id,),
+            )
+            return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
+
+
+async def _deactivate_legacy_non_html_monitor_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Deactivate a legacy non-HTML ``dalton_monitors`` row's ACL/auto-update in-tx.
+
+    Preserves the historical monitor row, its versions, and its data while
+    immediately revoking old audience access and ``m1.`` grants.
+    """
+    if is_html_entry_path(entry_path):
+        return
+    await cur.execute(
+        """
+        SELECT monitor_id::text AS monitor_id, visibility, keep_updated
+          FROM dalton_monitors
+         WHERE artifact_id = %s::uuid
+           FOR UPDATE
+        """,
+        (artifact_id,),
+    )
+    mon = await cur.fetchone()
+    if mon is None:
+        return
+    mon_id = mon["monitor_id"]
+    await cur.execute(
+        "DELETE FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
+        (mon_id,),
+    )
+    if mon.get("visibility") != "own" or bool(mon.get("keep_updated")):
+        await cur.execute(
+            """
+            UPDATE dalton_monitors
+               SET visibility = 'own',
+                   keep_updated = FALSE,
+                   acl_revision = acl_revision + 1,
+                   updated_at = NOW()
+             WHERE monitor_id = %s::uuid
+            """,
+            (mon_id,),
+        )
+
+
 async def downgrade_dalton_share_on_unshare_in_cur(
     cur: Any, artifact_id: str, *, entry_path: str | None = None
 ) -> None:
     """Downgrade public monitors, legacy non-HTML monitors, and shared documents to ``own``."""
     await cur.execute(
         """
-        SELECT monitor_id::text AS monitor_id, visibility
+        SELECT monitor_id::text AS monitor_id, visibility, keep_updated
           FROM dalton_monitors
          WHERE artifact_id = %s::uuid
            FOR UPDATE
@@ -228,27 +287,37 @@ async def downgrade_dalton_share_on_unshare_in_cur(
     )
     mon = await cur.fetchone()
     mon_vis = mon.get("visibility") if mon is not None else None
-    if mon is not None and (
-        mon_vis == "public"
-        or (mon_vis != "own" and not is_html_entry_path(entry_path))
-    ):
-        await cur.execute(
-            """
-            UPDATE dalton_monitors
-               SET visibility = 'own',
-                   acl_revision = acl_revision + 1,
-                   updated_at = NOW()
-             WHERE monitor_id = %s::uuid
-            """,
-            (mon["monitor_id"],),
-        )
-        if mon_vis == "members":
+    is_html = is_html_entry_path(entry_path)
+    if mon is not None:
+        if is_html and mon_vis == "public":
+            await cur.execute(
+                """
+                UPDATE dalton_monitors
+                   SET visibility = 'own',
+                       acl_revision = acl_revision + 1,
+                       updated_at = NOW()
+                 WHERE monitor_id = %s::uuid
+                """,
+                (mon["monitor_id"],),
+            )
+        elif not is_html:
             await cur.execute(
                 "DELETE FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
                 (mon["monitor_id"],),
             )
-    elif mon is None:
-        await downgrade_public_shared_document_in_cur(cur, artifact_id)
+            if mon_vis != "own" or bool(mon.get("keep_updated")):
+                await cur.execute(
+                    """
+                    UPDATE dalton_monitors
+                       SET visibility = 'own',
+                           keep_updated = FALSE,
+                           acl_revision = acl_revision + 1,
+                           updated_at = NOW()
+                     WHERE monitor_id = %s::uuid
+                    """,
+                    (mon["monitor_id"],),
+                )
+    await downgrade_public_shared_document_in_cur(cur, artifact_id)
 
 
 async def can_view_shared_document(
@@ -360,6 +429,9 @@ async def list_shared_documents_for_user(user_id: str) -> list[dict[str, Any]]:
     legacy_monitors = await monitor_db.list_all_monitors()
 
     visible_records: list[SharedDocumentRecord] = []
+    # Any artifact that has a current dalton_shared_documents record is governed
+    # solely by that record (even if narrowed to 'own' or a subset of members).
+    superseded_artifacts: set[str] = {doc.artifact_id for doc in docs}
     seen_artifacts: set[str] = set()
 
     for doc in docs:
@@ -376,7 +448,7 @@ async def list_shared_documents_for_user(user_id: str) -> list[dict[str, Any]]:
     for mon in legacy_monitors:
         if mon.source_kind != "workspace" or is_html_entry_path(mon.entry_path):
             continue
-        if mon.artifact_id in seen_artifacts:
+        if mon.artifact_id in superseded_artifacts or mon.artifact_id in seen_artifacts:
             continue
         if mon.visibility == "own" or mon.published_seq <= 0:
             continue
@@ -480,6 +552,9 @@ async def commit_shared_document_publish_tx(
                         ):
                             raise WorkspaceAutoPublishPaused(locked.workspace_id)
 
+                await _deactivate_legacy_non_html_monitor_in_cur(
+                    cur, artifact_id, entry_path=locked.path
+                )
                 await cur.execute(
                     """
                     SELECT doc_id::text AS doc_id, visibility, acl_revision
@@ -628,8 +703,11 @@ async def update_shared_document_settings_tx(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await artifacts_records_db.lock_owned(
+                locked = await artifacts_records_db.lock_owned(
                     cur, user_id=owner_user_id, artifact_id=artifact_id
+                )
+                await _deactivate_legacy_non_html_monitor_in_cur(
+                    cur, artifact_id, entry_path=locked.path
                 )
                 await cur.execute(
                     """
@@ -775,7 +853,18 @@ async def share_workspace_document(
     if not is_artifact_publishing_enabled():
         if not is_downgrade_only:
             monitor_service._require_publishing_enabled()
-        if existing is not None and legacy_mon is None:
+        if existing is not None:
+            if legacy_mon is not None:
+                return await update_shared_document_settings(
+                    artifact.artifact_id,
+                    UpdateSharedDocumentRequest(
+                        title=(payload.title or "").strip() or None,
+                        visibility=payload.visibility,
+                        keep_updated=payload.keep_updated,
+                        member_user_ids=members if payload.visibility == "members" else [],
+                    ),
+                    caller_id=caller_id,
+                ) | {"cut": False}
             updated_doc = await update_shared_document_settings_tx(
                 existing.doc_id,
                 artifact_id=existing.artifact_id,
@@ -1102,3 +1191,229 @@ async def serve_shared_document_file(
 
     headers.append(("content-length", str(len(body))))
     return ServedArtifactFile(body=body, headers=headers)
+
+
+async def commit_shared_document_version_tx(
+    *,
+    doc_id: str,
+    artifact_id: str,
+    workspace_owner_id: str,
+    files: list[VersionFile],
+    title: str | None,
+    read_basis: ReadBasis | None = None,
+    origin: Origin = "keep_updated",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+    verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
+    check_pending_outbound_confirm: bool = False,
+) -> tuple[SharedDocumentRecord, PublishResult | None]:
+    """Lock ``share_links`` + ``dalton_shared_documents``, re-check ACL/pause, and cut atomically."""
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                locked = await artifacts_records_db.lock_owned(
+                    cur, user_id=workspace_owner_id, artifact_id=artifact_id
+                )
+                await _deactivate_legacy_non_html_monitor_in_cur(
+                    cur, artifact_id, entry_path=locked.path
+                )
+                await cur.execute(
+                    """
+                    SELECT doc_id::text AS doc_id,
+                           visibility,
+                           owner_user_id,
+                           title,
+                           published_seq,
+                           keep_updated
+                      FROM dalton_shared_documents
+                     WHERE doc_id = %s::uuid
+                       FOR UPDATE
+                    """,
+                    (doc_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise LookupError(f"Shared document {doc_id} not found")
+                if not bool(row.get("keep_updated")):
+                    existing = await _select_doc_in_cur(cur, doc_id)
+                    if existing is None:
+                        raise LookupError(f"Shared document {doc_id} not found")
+                    return existing, None
+
+                if check_pending_outbound_confirm:
+                    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                    if is_dalton_sharing_auth_enabled():
+                        from src.dalton.colleague_outbound_guard import (
+                            is_workspace_pending_outbound_confirm_in_cur,
+                        )
+
+                        if await is_workspace_pending_outbound_confirm_in_cur(
+                            cur, locked.workspace_id
+                        ):
+                            existing = await _select_doc_in_cur(cur, doc_id)
+                            if existing is None:
+                                raise LookupError(f"Shared document {doc_id} not found")
+                            return existing, None
+
+                live_visibility: MonitorVisibility = row["visibility"]
+                locked_owner = str(row["owner_user_id"])
+                share_public = live_visibility == "public"
+
+                from src.dalton.settings import is_dalton_local_auth_enabled
+
+                live_tier = await monitor_db._resolve_live_tier_in_cur(cur, locked_owner)
+                if live_tier == "external" and live_visibility != "own":
+                    require_monitor_publish_visibility(live_tier, live_visibility)
+                if share_public and verify_public_authority is not None:
+                    if is_dalton_local_auth_enabled():
+                        if live_tier != "admin":
+                            from src.dalton.monitors.service import (
+                                PUBLIC_PERMISSION_LOST_MESSAGE,
+                                PublicAuthorityLostError,
+                            )
+
+                            raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+                    else:
+                        await monitor_db._call_with_optional_conn(
+                            verify_public_authority,
+                            locked_owner,
+                            conn=getattr(cur, "connection", None),
+                        )
+                require_monitor_publish_visibility(live_tier, live_visibility)
+
+                if read_basis is not None:
+                    read_basis.check(locked)
+
+                if not share_public and locked.shared:
+                    locked = await artifacts_records_db.unshare_in_cur(
+                        cur, user_id=workspace_owner_id, artifact_id=artifact_id
+                    )
+
+                result = await artifacts_versions_db.cut_monitor_in_cur(
+                    cur,
+                    locked,
+                    user_id=workspace_owner_id,
+                    files=files,
+                    title=title or str(row["title"]),
+                    share_public=share_public,
+                    origin=origin,
+                    loaded_files=loaded_files,
+                    left_out_files=left_out_files,
+                )
+                await cur.execute(
+                    """
+                    UPDATE dalton_shared_documents
+                       SET published_seq = %s,
+                           updated_at = NOW()
+                     WHERE doc_id = %s::uuid
+                    """,
+                    (result.seq, doc_id),
+                )
+                loaded = await _select_doc_in_cur(cur, doc_id)
+    if loaded is None:
+        raise LookupError(f"Shared document {doc_id} not found")
+    return loaded, result
+
+
+async def republish_workspace_shared_documents_after_turn(*, workspace_id: str) -> None:
+    """Refresh every workspace shared document with ``keep_updated=TRUE`` after a turn ends.
+
+    Reuses the same publishing switch, live owner permission re-check, colleague
+    outbound pause guard, and absent-dependency protection as workspace monitors.
+    """
+    from src.dalton.monitors import service as monitor_service
+
+    if not is_artifact_publishing_enabled():
+        return
+    docs = await list_workspace_auto_update_shared_documents(workspace_id)
+    if not docs:
+        return
+    workspace = await db_get_workspace(workspace_id)
+    if not workspace or workspace.get("status") != "running":
+        return
+    workspace_owner_id = str(workspace["user_id"])
+
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    if sharing_auth_enabled:
+        from src.dalton.colleague_outbound_guard import (
+            is_workspace_pending_outbound_confirm,
+        )
+
+        if is_workspace_pending_outbound_confirm(workspace):
+            logger.info(
+                "Skipping auto-update for workspace %s shared documents: pending_outbound_confirm",
+                workspace_id,
+            )
+            return
+
+    for doc in docs:
+        if sharing_auth_enabled:
+            from src.dalton.colleague_outbound_guard import (
+                is_workspace_pending_outbound_confirm,
+            )
+
+            try:
+                fresh_ws = await db_get_workspace(workspace_id)
+            except Exception:
+                logger.warning(
+                    "Skipping auto-update for shared document %s: failed to re-read workspace %s",
+                    doc.doc_id,
+                    workspace_id,
+                    exc_info=True,
+                )
+                continue
+            if not fresh_ws or is_workspace_pending_outbound_confirm(fresh_ws):
+                logger.info(
+                    "Skipping auto-update for shared document %s: pending_outbound_confirm",
+                    doc.doc_id,
+                )
+                continue
+        try:
+            owner_tier = await get_user_tier(doc.owner_user_id)
+            if owner_tier == "external" and doc.visibility != "own":
+                require_monitor_publish_visibility(owner_tier, doc.visibility)
+            if doc.visibility == "public" and owner_tier != "admin":
+                raise monitor_service.PublicAuthorityLostError(
+                    monitor_service.PUBLIC_PERMISSION_LOST_MESSAGE
+                )
+            require_monitor_publish_visibility(owner_tier, doc.visibility)
+            artifact = await artifacts_db.get_artifact(
+                doc.artifact_id, user_id=workspace_owner_id
+            )
+            if artifact is None:
+                continue
+            snap = await artifact_snapshot.capture_workspace_monitor_snapshot(
+                artifact,
+                user_id=workspace_owner_id,
+                mode=ReadMode.WARM_ONLY,
+            )
+            await monitor_service._abort_if_absent_dependencies(
+                doc.artifact_id,
+                doc.published_seq or artifact.latest_seq,
+                snap,
+            )
+            await commit_shared_document_version_tx(
+                doc_id=doc.doc_id,
+                artifact_id=doc.artifact_id,
+                workspace_owner_id=workspace_owner_id,
+                files=snap.files,
+                title=doc.title,
+                read_basis=ReadBasis.of(artifact),
+                origin="keep_updated",
+                loaded_files=[
+                    e.path for e in snap.entries if e.reason == REASON_LOADED
+                ],
+                verify_public_authority=monitor_service._verify_user_is_admin,
+                check_pending_outbound_confirm=sharing_auth_enabled,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Auto-updating shared document %s (%s) failed: %s",
+                doc.doc_id,
+                doc.artifact_id,
+                exc,
+                exc_info=True,
+            )

@@ -724,3 +724,523 @@ async def test_shared_documents_two_groups_mixed_ownership_and_unshare_revoke(
         cur_html, "71000000-0000-4000-8000-000000000498", entry_path="dashboard.html"
     )
     assert not any("UPDATE dalton_monitors" in s for s in executed_html)
+
+
+@pytest.mark.asyncio
+async def test_republish_legacy_non_html_deactivates_old_monitor_and_unshare_revokes_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncCursor
+
+    from src.server.services import account as accounts_svc
+
+    tiers = {
+        "owner-1": "internal",
+        "colleague-a": "internal",
+        "colleague-b": "internal",
+    }
+
+    async def _tier(uid: str | None) -> str:
+        return tiers.get(str(uid or ""), "external")
+
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_user_tier",
+        create_autospec(shared_doc_service.get_user_tier, side_effect=_tier),
+    )
+    monkeypatch.setattr(
+        monitor_perms,
+        "get_user_tier",
+        create_autospec(monitor_perms.get_user_tier, side_effect=_tier),
+    )
+    monkeypatch.setattr(
+        accounts_svc,
+        "read_standing",
+        create_autospec(
+            accounts_svc.read_standing,
+            return_value=SimpleNamespace(suspended=False),
+        ),
+    )
+
+    # 1) Re-publishing a legacy non-HTML monitor inside commit_shared_document_publish_tx
+    #    atomically deactivates the legacy dalton_monitors row while preserving it.
+    art = _make_artifact(
+        artifact_id="71000000-0000-4000-8000-000000000501",
+        path="notes/legacy-memo.md",
+    )
+    executed_tx: list[str] = []
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur._row = None
+
+    async def _exec_tx(sql: str, _params: Any = None) -> None:
+        norm = " ".join(sql.split())
+        executed_tx.append(norm)
+        if "FROM dalton_monitors" in norm:
+            cur._row = {
+                "monitor_id": "60000000-0000-4000-8000-000000000501",
+                "visibility": "company",
+                "keep_updated": True,
+            }
+        elif "INSERT INTO dalton_shared_documents" in norm:
+            cur._row = {"doc_id": "70000000-0000-4000-8000-000000000501"}
+        elif "WHERE d.doc_id = %s::uuid" in norm:
+            cur._row = {
+                "doc_id": "70000000-0000-4000-8000-000000000501",
+                "artifact_id": art.artifact_id,
+                "owner_user_id": "owner-1",
+                "title": "Legacy Memo",
+                "visibility": "members",
+                "published_seq": 2,
+                "keep_updated": False,
+                "acl_revision": 1,
+                "created_at": NOW,
+                "updated_at": NOW,
+                "artifact_code": art.code,
+                "workspace_id": WS_ID,
+                "entry_path": art.path,
+                "owner_name": "Alice",
+                "owner_email": "alice@company.com",
+                "member_user_ids": ["colleague-a"],
+            }
+        else:
+            cur._row = None
+
+    cur.execute.side_effect = _exec_tx
+    cur.fetchone.side_effect = lambda: cur._row
+    cur.fetchall.return_value = []
+    cur.executemany.return_value = None
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
+
+    class _FakeTx:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+    class _FakeConn:
+        def transaction(self) -> _FakeTx:
+            return _FakeTx()
+
+        def cursor(self, **_kwargs: Any) -> Any:
+            return cur
+
+    @asynccontextmanager
+    async def _fake_conn():
+        yield _FakeConn()
+
+    monkeypatch.setattr(shared_doc_service, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        shared_doc_service.artifacts_records_db,
+        "lock_owned",
+        create_autospec(
+            shared_doc_service.artifacts_records_db.lock_owned, return_value=art
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "_resolve_live_tier_in_cur",
+        create_autospec(monitor_db._resolve_live_tier_in_cur, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        shared_doc_service.artifacts_versions_db,
+        "cut_monitor_in_cur",
+        create_autospec(
+            shared_doc_service.artifacts_versions_db.cut_monitor_in_cur,
+            return_value=PublishResult(artifact=art, seq=2, cut=True, shared_now=False),
+        ),
+    )
+
+    saved_doc, _res = await shared_doc_service.commit_shared_document_publish_tx(
+        artifact_id=art.artifact_id,
+        workspace_owner_id="owner-1",
+        doc_owner_id="owner-1",
+        title="Legacy Memo",
+        visibility="members",
+        keep_updated=False,
+        member_user_ids=["colleague-a"],
+        files=[
+            VersionFile(
+                path=art.path,
+                sha256="b" * 64,
+                content_type="text/markdown",
+                byte_len=10,
+                content=b"# updated\n",
+            )
+        ],
+    )
+    assert saved_doc.visibility == "members"
+    assert any(
+        "UPDATE dalton_monitors SET visibility = 'own', keep_updated = FALSE, acl_revision = acl_revision + 1"
+        in s
+        for s in executed_tx
+    )
+    assert any("DELETE FROM dalton_monitor_members" in s for s in executed_tx)
+    assert not any("DELETE FROM dalton_monitors" in s for s in executed_tx)
+
+    # 2) After narrowing scope to colleague-a, old audience (colleague-b) cannot read
+    #    via /monitors/{slug}, /m/{slug}, old m1. grant, or /a/{code}, and does NOT see it in list.
+    deactivated_mon = _make_monitor(
+        monitor_id="60000000-0000-4000-8000-000000000501",
+        slug="legacy-memo",
+        artifact_id=art.artifact_id,
+        artifact_code=art.code,
+        entry_path=art.path,
+        visibility="own",
+        keep_updated=False,
+        acl_revision=2,
+        published_seq=1,
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(monitor_db.get_monitor_by_slug, return_value=deactivated_mon),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_id",
+        create_autospec(monitor_db.get_monitor_by_id, return_value=deactivated_mon),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_shared_document_by_artifact_id",
+        create_autospec(
+            shared_doc_service.get_shared_document_by_artifact_id,
+            return_value=saved_doc,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_pub:
+        await monitor_service.get_public_monitor_detail("legacy-memo")
+    assert exc_pub.value.status_code == 404
+
+    with pytest.raises(HTTPException) as exc_mon:
+        await monitor_service.get_monitor_detail("legacy-memo", viewer_id="colleague-b")
+    assert exc_mon.value.status_code == 403
+
+    old_grant = await monitor_grants.mint_monitor_grant(
+        deactivated_mon.monitor_id, "colleague-b", acl_revision=1
+    )
+    with pytest.raises(HTTPException) as exc_grant:
+        await monitor_service.serve_monitor_file(old_grant.token, "1", art.path)
+    assert exc_grant.value.status_code == 403
+
+    assert (
+        await shared_doc_service.resolve_shared_document_for_link(
+            art.artifact_id, "colleague-b"
+        )
+        == "denied"
+    )
+    assert (
+        await shared_doc_service.resolve_shared_document_for_link(
+            art.artifact_id, "colleague-a"
+        )
+        == "member"
+    )
+
+    # Even if a legacy monitor row with broad visibility were still returned,
+    # the active dalton_shared_documents row governs the list exclusively.
+    stale_broad_legacy = _make_monitor(
+        monitor_id="60000000-0000-4000-8000-000000000501",
+        slug="legacy-memo",
+        artifact_id=art.artifact_id,
+        artifact_code=art.code,
+        entry_path=art.path,
+        visibility="company",
+        published_seq=1,
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "list_all_shared_documents",
+        create_autospec(
+            shared_doc_service.list_all_shared_documents, return_value=[saved_doc]
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "list_all_monitors",
+        create_autospec(monitor_db.list_all_monitors, return_value=[stale_broad_legacy]),
+    )
+    items_b = await shared_doc_service.list_shared_documents_for_user("colleague-b")
+    assert items_b == []
+    items_a = await shared_doc_service.list_shared_documents_for_user("colleague-a")
+    assert [i["artifact_id"] for i in items_a] == [art.artifact_id]
+
+    # 3) Unsharing when BOTH dalton_monitors and dalton_shared_documents exist
+    #    downgrades BOTH tables atomically instead of skipping dalton_shared_documents.
+    executed_both: list[str] = []
+    cur_both = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec_both(sql: str, _params: Any = None) -> None:
+        norm = " ".join(sql.split())
+        executed_both.append(norm)
+        if "FROM dalton_monitors" in norm:
+            cur_both._row = {
+                "monitor_id": deactivated_mon.monitor_id,
+                "visibility": "own",
+                "keep_updated": False,
+            }
+        elif "FROM dalton_shared_documents" in norm:
+            cur_both._row = {"doc_id": saved_doc.doc_id, "visibility": "members"}
+        else:
+            cur_both._row = None
+
+    cur_both.execute.side_effect = _exec_both
+    cur_both.fetchone.side_effect = lambda: getattr(cur_both, "_row", None)
+
+    await shared_doc_service.downgrade_dalton_share_on_unshare_in_cur(
+        cur_both, art.artifact_id, entry_path=art.path
+    )
+    assert any(
+        "UPDATE dalton_shared_documents SET visibility = 'own'" in s
+        for s in executed_both
+    )
+    assert any("DELETE FROM dalton_shared_document_members" in s for s in executed_both)
+
+
+def test_shared_documents_and_monitors_queries_exclude_soft_deleted_workspaces() -> None:
+    doc_sql = " ".join(shared_doc_service._SHARED_DOC_SELECT.split())
+    mon_sql = " ".join(monitor_db._MONITOR_SELECT.split())
+    assert "JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'" in doc_sql
+    assert "JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'" in mon_sql
+
+
+@pytest.mark.asyncio
+async def test_public_monitor_detail_exposes_safe_entry_file_type_and_blocks_root_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    md_mon = _make_monitor(
+        slug="legacy-public-md",
+        entry_path="reports/q4/memo.md",
+        visibility="public",
+        published_seq=2,
+    )
+    html_mon = _make_monitor(
+        slug="public-html",
+        entry_path="nested/index.html",
+        visibility="public",
+        published_seq=1,
+    )
+    pdf_mon = _make_monitor(
+        slug="public-pdf",
+        entry_path="slides/deck.pdf",
+        visibility="public",
+        published_seq=1,
+    )
+    by_slug = {
+        md_mon.slug: md_mon,
+        html_mon.slug: html_mon,
+        pdf_mon.slug: pdf_mon,
+    }
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(
+            monitor_db.get_monitor_by_slug, side_effect=lambda slug: by_slug.get(slug)
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "is_monitor_version_published",
+        create_autospec(monitor_db.is_monitor_version_published, return_value=True),
+    )
+
+    files_in_version = {
+        "reports/q4/memo.md": StoredVersionFile(
+            user_id="owner-1",
+            sha256="a" * 64,
+            content_type="text/markdown",
+            byte_len=12,
+            content=b"# Q4 Report\n",
+        ),
+        "reports/q4/charts/rev.png": StoredVersionFile(
+            user_id="owner-1",
+            sha256="b" * 64,
+            content_type="image/png",
+            byte_len=7,
+            content=b"nested!",
+        ),
+        # Same-named file at workspace root must NEVER be returned as a fallback for markdown relative paths.
+        "charts/other.png": StoredVersionFile(
+            user_id="owner-1",
+            sha256="c" * 64,
+            content_type="image/png",
+            byte_len=5,
+            content=b"root!",
+        ),
+    }
+
+    async def _get_vfile(_aid: str, _seq: int, path: str) -> StoredVersionFile | None:
+        return files_in_version.get(path)
+
+    monkeypatch.setattr(
+        monitor_service.artifacts_db,
+        "get_version_file",
+        create_autospec(
+            monitor_service.artifacts_db.get_version_file, side_effect=_get_vfile
+        ),
+    )
+
+    app = FastAPI()
+    app.include_router(monitors_router)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        r_md = await client.get("/api/v1/dalton/monitors/public/legacy-public-md")
+        assert r_md.status_code == 200
+        body_md = r_md.json()
+        assert "entry_path" not in body_md["monitor"]
+        assert "workspace_id" not in body_md["monitor"]
+        assert body_md["versions"] == []
+        assert body_md["monitor"]["entry_file_type"] == "markdown"
+
+        r_html = await client.get("/api/v1/dalton/monitors/public/public-html")
+        assert r_html.status_code == 200
+        assert r_html.json()["monitor"]["entry_file_type"] == "html"
+
+        r_pdf = await client.get("/api/v1/dalton/monitors/public/public-pdf")
+        assert r_pdf.status_code == 200
+        assert r_pdf.json()["monitor"]["entry_file_type"] == "other"
+
+        # Entry file and nested relative image resolve under reports/q4/
+        r_entry = await client.get("/api/v1/dalton/monitors/public/legacy-public-md/v/2/")
+        assert r_entry.status_code == 200
+        assert r_entry.content == b"# Q4 Report\n"
+
+        r_img = await client.get(
+            "/api/v1/dalton/monitors/public/legacy-public-md/v/2/charts/rev.png"
+        )
+        assert r_img.status_code == 200
+        assert r_img.content == b"nested!"
+
+        # Missing nested file does NOT fall back to workspace root charts/other.png
+        r_root_fallback = await client.get(
+            "/api/v1/dalton/monitors/public/legacy-public-md/v/2/charts/other.png"
+        )
+        assert r_root_fallback.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_shared_document_auto_update_after_turn_reuses_permission_and_pause_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton import settings as dalton_settings
+    from src.server.services.artifacts import snapshot as snapshot_svc
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_sharing_auth_enabled",
+        create_autospec(dalton_settings.is_dalton_sharing_auth_enabled, return_value=True),
+    )
+
+    doc_ok = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000601",
+        artifact_id="71000000-0000-4000-8000-000000000601",
+        owner_user_id="owner-internal",
+        visibility="company",
+        keep_updated=True,
+        published_seq=1,
+    )
+    doc_lost_admin = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000602",
+        artifact_id="71000000-0000-4000-8000-000000000602",
+        owner_user_id="demoted-user",
+        visibility="public",
+        keep_updated=True,
+        published_seq=1,
+    )
+    art_ok = _make_artifact(artifact_id=doc_ok.artifact_id, latest_seq=1)
+    snap_ok = Snapshot(
+        entries=[ManifestEntry("notes/q4-memo.md", 14, "entry")],
+        left_out=[],
+        files=[
+            VersionFile(
+                path="notes/q4-memo.md",
+                sha256="f" * 64,
+                content_type="text/markdown",
+                byte_len=14,
+                content=b"# Updated v2!\n",
+            )
+        ],
+        blobs={},
+        title="Q4 Memo",
+    )
+
+    tiers = {"owner-internal": "internal", "demoted-user": "internal"}
+
+    async def _tier(uid: str | None) -> str:
+        return tiers.get(str(uid or ""), "external")
+
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_user_tier",
+        create_autospec(shared_doc_service.get_user_tier, side_effect=_tier),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "list_workspace_auto_update_shared_documents",
+        create_autospec(
+            shared_doc_service.list_workspace_auto_update_shared_documents,
+            return_value=[doc_ok, doc_lost_admin],
+        ),
+    )
+    ws_running = {"workspace_id": WS_ID, "user_id": "owner-internal", "status": "running", "config": {}}
+    ws_paused = {
+        "workspace_id": WS_ID,
+        "user_id": "owner-internal",
+        "status": "running",
+        "config": {"pending_outbound_confirm": {"token": "tok-1", "reason": "colleague_outbound_blocked"}},
+    }
+    ws_spy = create_autospec(shared_doc_service.db_get_workspace, return_value=ws_running)
+    monkeypatch.setattr(shared_doc_service, "db_get_workspace", ws_spy)
+    monkeypatch.setattr(
+        shared_doc_service.artifacts_db,
+        "get_artifact",
+        create_autospec(shared_doc_service.artifacts_db.get_artifact, return_value=art_ok),
+    )
+    monkeypatch.setattr(
+        shared_doc_service.artifact_snapshot,
+        "capture_workspace_monitor_snapshot",
+        create_autospec(
+            shared_doc_service.artifact_snapshot.capture_workspace_monitor_snapshot,
+            return_value=snap_ok,
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_abort_if_absent_dependencies",
+        create_autospec(monitor_service._abort_if_absent_dependencies, return_value=None),
+    )
+    commit_spy = create_autospec(
+        shared_doc_service.commit_shared_document_version_tx,
+        return_value=(doc_ok, PublishResult(artifact=art_ok, seq=2, cut=True, shared_now=False)),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "commit_shared_document_version_tx",
+        commit_spy,
+    )
+
+    # 1) Turn-end hook runs shared documents auto-update: doc_ok cuts v2, doc_lost_admin is blocked.
+    monkeypatch.setattr(
+        monitor_service,
+        "republish_workspace_monitors_after_turn",
+        create_autospec(monitor_service.republish_workspace_monitors_after_turn, return_value=None),
+    )
+    monkeypatch.setattr(
+        snapshot_svc.artifacts_db,
+        "list_kept_updated",
+        create_autospec(snapshot_svc.artifacts_db.list_kept_updated, return_value=[]),
+    )
+
+    await snapshot_svc.keep_updated_after_turn(workspace_id=WS_ID, user_id="owner-internal")
+    assert commit_spy.await_count == 1
+    assert commit_spy.await_args_list[0].kwargs["doc_id"] == doc_ok.doc_id
+    assert commit_spy.await_args_list[0].kwargs["check_pending_outbound_confirm"] is True
+
+    # 2) When workspace is paused (pending_outbound_confirm), shared documents auto-update skips cleanly.
+    commit_spy.reset_mock()
+    ws_spy.return_value = ws_paused
+    await shared_doc_service.republish_workspace_shared_documents_after_turn(workspace_id=WS_ID)
+    commit_spy.assert_not_called()

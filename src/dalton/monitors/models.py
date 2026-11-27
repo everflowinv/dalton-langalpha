@@ -71,12 +71,29 @@ RESERVED_MONITOR_SLUGS: frozenset[str] = frozenset(
 )
 
 _HTML_ENTRY_SUFFIXES: tuple[str, ...] = (".html", ".htm")
+_MARKDOWN_ENTRY_SUFFIXES: tuple[str, ...] = (".md", ".markdown")
+EntryFileType = Literal["html", "markdown", "other"]
 
 
 def is_html_entry_path(path: str | None) -> bool:
     """Return True when *path* points to an HTML web page (``.html`` or ``.htm``)."""
     clean = str(path or "").strip().lower()
     return bool(clean) and clean.endswith(_HTML_ENTRY_SUFFIXES)
+
+
+def is_markdown_entry_path(path: str | None) -> bool:
+    """Return True when *path* points to a Markdown document (``.md`` or ``.markdown``)."""
+    clean = str(path or "").strip().lower()
+    return bool(clean) and clean.endswith(_MARKDOWN_ENTRY_SUFFIXES)
+
+
+def entry_file_type_of(path: str | None) -> EntryFileType:
+    """Return a safe, path-free file type tag for viewer rendering."""
+    if is_html_entry_path(path):
+        return "html"
+    if is_markdown_entry_path(path):
+        return "markdown"
+    return "other"
 
 
 def is_monitor_panel_entry(monitor: MonitorRecord) -> bool:

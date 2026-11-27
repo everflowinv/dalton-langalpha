@@ -85,7 +85,9 @@
     "viewRaw": "查看原文",
     "viewRendered": "查看渲染",
     "download": "下载",
-    "downloadFailed": "下载失败，请重试"
+    "downloadFailed": "下载失败，请重试",
+    "linkUnavailable": "需授权或暂缺",
+    "backToDocument": "返回 {{name}}"
   },
   "demo": {
     "title": "实时数据监控示例",

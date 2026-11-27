@@ -84,6 +84,7 @@ _MONITOR_SELECT = """
         ) AS member_user_ids
       FROM dalton_monitors m
       JOIN share_links l ON l.artifact_id = m.artifact_id
+      JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'
       LEFT JOIN users u ON u.user_id = m.owner_user_id
 """
 

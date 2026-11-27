@@ -27,6 +27,8 @@ export interface ResolvedPublishStatus {
   hintKey?: string;
   hintParams?: Record<string, string | number>;
   publishedVersionSeq: number | null;
+  pendingVisibility: MonitorVisibility | null;
+  pendingHintKey: string | null;
 }
 
 export function visibilityHintKey(visibility: MonitorVisibility): string {
@@ -64,27 +66,42 @@ export function resolvePublishStatus(input: PublishStatusInput): ResolvedPublish
     hasVisibilityDraft,
   } = input;
 
-  const displayedVisibility: MonitorVisibility | null =
-    (!unshareOnly ? effectiveVisibility : null) ?? activeShare?.visibility ?? null;
+  const activeVisibility: MonitorVisibility | null = activeShare?.visibility ?? null;
   const isPublished = Boolean(activeShare);
   const publishedSeq = activeShare ? (activeShare.published_seq || latestSeq || null) : null;
+  const currentEffectiveVisibility: MonitorVisibility =
+    activeVisibility ?? (shared ? (membersOnly ? 'company' : 'public') : 'own');
+  const hasUnsavedChange =
+    !unshareOnly &&
+    !standingPaused &&
+    effectiveVisibility !== null &&
+    effectiveVisibility !== currentEffectiveVisibility &&
+    (Boolean(activeShare) || !shared || hasVisibilityDraft);
+  const pendingVisibility: MonitorVisibility | null = hasUnsavedChange ? effectiveVisibility : null;
+  const pendingHintKey: string | null = pendingVisibility
+    ? visibilityHintKey(pendingVisibility)
+    : null;
 
   if (standingPaused) {
     return {
-      showLinkIcon: shared || isPublished || (displayedVisibility !== null && displayedVisibility !== 'own'),
-      titleKey: displayedVisibility
-        ? visibilityTitleKey(displayedVisibility, isPublished)
+      showLinkIcon: shared || (activeVisibility !== null && activeVisibility !== 'own'),
+      titleKey: activeVisibility
+        ? visibilityTitleKey(activeVisibility, isPublished)
         : shared
           ? (visitorsAt > 0 ? 'publish:publishedAt' : 'publish:published')
           : 'publish:private',
-      titleParams: !displayedVisibility && shared && visitorsAt > 0 ? { seq: visitorsAt } : undefined,
+      titleParams: !activeVisibility && shared && visitorsAt > 0 ? { seq: visitorsAt } : undefined,
       hintKind: 'paused',
       publishedVersionSeq: null,
+      pendingVisibility: null,
+      pendingHintKey: null,
     };
   }
 
-  // Upstream legacy shared artifact with no Dalton monitor/document record and no visibility override yet.
-  if (shared && !activeShare && !hasVisibilityDraft) {
+  // Upstream legacy shared artifact with no Dalton monitor/document record:
+  // always reflect the currently effective share state, and surface any unsaved
+  // draft selection separately as a pending "after saving" preview.
+  if (shared && !activeShare) {
     const titleKey = visitorsAt > 0 ? 'publish:publishedAt' : 'publish:published';
     const titleParams = visitorsAt > 0 ? { seq: visitorsAt } : undefined;
     if (legacyRefused) {
@@ -95,6 +112,8 @@ export function resolvePublishStatus(input: PublishStatusInput): ResolvedPublish
         hintKind: 'key',
         hintKey: 'publish:legacyRefused',
         publishedVersionSeq: null,
+        pendingVisibility,
+        pendingHintKey,
       };
     }
     if (visitorsAt === 0 || statusChanged == null) {
@@ -105,6 +124,8 @@ export function resolvePublishStatus(input: PublishStatusInput): ResolvedPublish
         hintKind: membersOnly ? 'orgMembers' : 'key',
         hintKey: membersOnly ? undefined : 'publish:sharedHint',
         publishedVersionSeq: null,
+        pendingVisibility,
+        pendingHintKey,
       };
     }
     return {
@@ -115,28 +136,30 @@ export function resolvePublishStatus(input: PublishStatusInput): ResolvedPublish
       hintKey: 'publish:changedSince',
       hintParams: { seq: visitorsAt },
       publishedVersionSeq: null,
+      pendingVisibility,
+      pendingHintKey,
     };
   }
 
-  if (displayedVisibility !== null) {
-    const showPrivateWithVersions =
-      displayedVisibility === 'own' && !isPublished && latestSeq > 0;
+  if (activeVisibility !== null) {
     return {
-      showLinkIcon: displayedVisibility !== 'own' || shared,
-      titleKey: visibilityTitleKey(displayedVisibility, isPublished),
+      showLinkIcon: activeVisibility !== 'own' || shared,
+      titleKey: visibilityTitleKey(activeVisibility, isPublished),
       hintKind: 'key',
-      hintKey: showPrivateWithVersions
-        ? 'publish:privateWithVersions'
-        : visibilityHintKey(displayedVisibility),
-      publishedVersionSeq: isPublished ? publishedSeq : null,
+      hintKey: visibilityHintKey(activeVisibility),
+      publishedVersionSeq: publishedSeq,
+      pendingVisibility,
+      pendingHintKey,
     };
   }
 
   return {
-    showLinkIcon: shared,
+    showLinkIcon: false,
     titleKey: 'publish:private',
     hintKind: 'key',
     hintKey: latestSeq > 0 ? 'publish:privateWithVersions' : 'publish:privateHint',
     publishedVersionSeq: null,
+    pendingVisibility,
+    pendingHintKey,
   };
 }

@@ -1314,29 +1314,30 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       files: [{ path: 'notes/memo.md', size: 256, reason: 'entry', optional: false }],
       total_size: 256,
     });
-    mockShareDocument.mockResolvedValue({
-      document: {
-        doc_id: 'd-md-1',
-        artifact_id: mdArtifact.artifact_id,
-        artifact_code: mdArtifact.code,
-        workspace_id: 'ws-1',
-        entry_path: 'notes/memo.md',
-        file_name: 'memo.md',
-        title: 'memo.md',
-        owner_user_id: 'u-1',
-        owner_name: 'Alice',
-        owner_email: 'alice@company.com',
-        visibility: 'members',
-        member_user_ids: ['u-colleague-1'],
-        published_seq: 1,
-        keep_updated: false,
-        acl_revision: 1,
-        url: `/a/${mdArtifact.code}`,
-        created_at: '2026-11-27T08:00:00Z',
-        updated_at: '2026-11-27T08:00:00Z',
-        can_manage: true,
-      },
-      cut: true,
+    const savedDoc = {
+      doc_id: 'd-md-1',
+      artifact_id: mdArtifact.artifact_id,
+      artifact_code: mdArtifact.code,
+      workspace_id: 'ws-1',
+      entry_path: 'notes/memo.md',
+      file_name: 'memo.md',
+      title: 'memo.md',
+      owner_user_id: 'u-1',
+      owner_name: 'Alice',
+      owner_email: 'alice@company.com',
+      visibility: 'members' as const,
+      member_user_ids: ['u-colleague-1'],
+      published_seq: 1,
+      keep_updated: false,
+      acl_revision: 1,
+      url: `/a/${mdArtifact.code}`,
+      created_at: '2026-11-27T08:00:00Z',
+      updated_at: '2026-11-27T08:00:00Z',
+      can_manage: true,
+    };
+    mockShareDocument.mockImplementation(async () => {
+      mockGetSharedDoc.mockResolvedValue(savedDoc);
+      return { document: savedDoc, cut: true };
     });
 
     renderWithProviders(
@@ -1346,22 +1347,29 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     // Monitor-only title & category inputs are hidden for non-HTML files
     expect(await screen.findByText('Only you can open this link.')).toBeInTheDocument();
     expect(screen.queryByPlaceholderText('Enter monitor title')).toBeNull();
+    expect(screen.queryByTestId('publish-status-pending')).toBeNull();
 
-    // Switching to Selected colleagues immediately replaces Private copy
+    // Switching to Selected colleagues before saving keeps active Private status and shows "After saving:" preview
     await userEvent.click(screen.getByRole('button', { name: 'Selected colleagues' }));
-    expect(screen.getByText('Colleagues you select can open this link.')).toBeInTheDocument();
-    expect(screen.queryByText('Private')).toBeNull();
-    expect(screen.queryByText('Only you can open this link.')).toBeNull();
+    expect(screen.getByText('Private')).toBeInTheDocument();
+    expect(screen.getByText('Only you can open this link.')).toBeInTheDocument();
+    expect(screen.getByTestId('publish-status-pending')).toHaveTextContent(
+      'After saving: Colleagues you select can open this link.',
+    );
 
-    // Switching to Company shows team copy
+    // Switching to Company previews team copy while active status stays Private
     await userEvent.click(screen.getByRole('button', { name: 'Company' }));
-    expect(screen.getByText('Team members can open this link.')).toBeInTheDocument();
-    expect(screen.queryByText('Private')).toBeNull();
+    expect(screen.getByText('Private')).toBeInTheDocument();
+    expect(screen.getByTestId('publish-status-pending')).toHaveTextContent(
+      'After saving: Team members can open this link.',
+    );
 
-    // Switching to Anyone (Public link) shows public copy
+    // Switching to Anyone (Public link) previews public copy while active status stays Private
     await userEvent.click(screen.getByRole('button', { name: /Anyone \(Public link\)/i }));
-    expect(screen.getByText('Anyone with the link can open it.')).toBeInTheDocument();
-    expect(screen.queryByText('Private')).toBeNull();
+    expect(screen.getByText('Private')).toBeInTheDocument();
+    expect(screen.getByTestId('publish-status-pending')).toHaveTextContent(
+      'After saving: Anyone with the link can open it.',
+    );
 
     // Share md to Selected colleagues -> calls shareDocument, NEVER publishMonitor
     await userEvent.click(screen.getByRole('button', { name: 'Selected colleagues' }));
@@ -1379,5 +1387,14 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       visibility: 'members',
       member_user_ids: ['u-colleague-1'],
     });
+
+    // Once saved as Selected colleagues, switching back to Only me keeps active status and shows pending hint
+    expect(await screen.findByText('Colleagues you select can open this link.')).toBeInTheDocument();
+    expect(screen.queryByTestId('publish-status-pending')).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Only me' }));
+    expect(screen.getByText('Colleagues you select can open this link.')).toBeInTheDocument();
+    expect(screen.getByTestId('publish-status-pending')).toHaveTextContent(
+      'After saving: Only you can open this link.',
+    );
   });
 });

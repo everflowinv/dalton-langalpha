@@ -7,7 +7,7 @@ import { renderWithProviders } from '@/test/utils';
 import { buildServeUrl, versionPrefix } from '@/pages/ChatAgent/components/viewers/html/wsfilesUrl';
 import SharedPageView from '@/pages/SharedChat/SharedPageView';
 import type { SharedPublicFileMetadata } from '@/pages/SharedChat/api';
-import { isMarkdownFile, resolveSharedImageCandidates } from '../sharedMarkdown';
+import { isMarkdownFile, resolveSharedImageCandidates, resolveSharedRelativePath } from '../sharedMarkdown';
 
 vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'light', setTheme: () => {} }),
@@ -70,21 +70,22 @@ describe('sharedMarkdown helpers', () => {
     expect(isMarkdownFile(null)).toBe(false);
   });
 
-  it('resolves document-relative image paths and blocks root-escaping traversals', () => {
+  it('resolves document-relative paths strictly without workspace-root fallback and blocks escaping traversals', () => {
     expect(resolveSharedImageCandidates('reports/q4/memo.md', './charts/rev.png')).toEqual([
       'reports/q4/charts/rev.png',
     ]);
     expect(resolveSharedImageCandidates('reports/q4/memo.md', '../shared/logo.png')).toEqual([
       'reports/shared/logo.png',
     ]);
+    // No fallback to workspace root charts/rev.png
     expect(resolveSharedImageCandidates('reports/q4/memo.md', 'charts/rev.png')).toEqual([
       'reports/q4/charts/rev.png',
-      'charts/rev.png',
     ]);
-    expect(resolveSharedImageCandidates('reports/q4/memo.md', 'reports/q4/charts/rev.png')).toEqual([
-      'reports/q4/charts/rev.png',
-    ]);
+    expect(resolveSharedRelativePath('reports/q4/memo.md', './appendix.md#sec-1')).toBe(
+      'reports/q4/appendix.md',
+    );
     expect(resolveSharedImageCandidates('reports/memo.md', '../../../etc/passwd.png')).toEqual([]);
+    expect(resolveSharedRelativePath('reports/memo.md', '../../../etc/passwd.md')).toBeNull();
   });
 });
 
@@ -117,15 +118,20 @@ describe('SharedPageView Markdown rendering & security', () => {
       'growth = (1.5 - 1.2) / 1.2',
       '```',
       '',
-      'Read [External Docs](https://example.com/docs) or [Internal Draft](./draft.md).',
+      'Read [External Docs](https://example.com/docs), [Allowed Appendix](./appendix.md), [Internal Draft](./draft.md), or [Outside](../../../etc/passwd.md).',
       '',
       '![Revenue Chart](./charts/rev.png)',
+      '![Root Decoy Chart](charts/decoy.png)',
       '![Restricted Chart](./charts/private.png)',
     ].join('\n');
 
-    mockServedFiles({
+    const fetchMock = mockServedFiles({
       'reports/memo.md': { body: mdContent, contentType: 'text/markdown; charset=utf-8' },
+      'reports/appendix.md': { body: '# Appendix Details\n**Permitted sibling doc**', contentType: 'text/markdown; charset=utf-8' },
       'reports/charts/rev.png': { body: 'png-bytes', contentType: 'image/png' },
+      // Same-named file at workspace root must NOT be loaded as fallback for reports/memo.md
+      'charts/decoy.png': { body: 'wrong-root-image', contentType: 'image/png' },
+      'draft.md': { body: '# Wrong Root Draft', contentType: 'text/markdown; charset=utf-8' },
     });
 
     renderWithProviders(
@@ -146,16 +152,35 @@ describe('SharedPageView Markdown rendering & security', () => {
     expect(screen.getByText('$1.5B')).toBeInTheDocument();
     expect(screen.getByText(/growth/)).toBeInTheDocument();
 
-    // External link stays clickable; relative workspace link without access renders as non-clickable span
+    // External link stays clickable
     expect(screen.getByRole('link', { name: 'External Docs' })).toHaveAttribute('href', 'https://example.com/docs');
-    const siblingLink = screen.getByText('Internal Draft');
-    expect(siblingLink.tagName).toBe('SPAN');
-    expect(siblingLink.closest('a')).toBeNull();
 
-    // Shared relative image resolves under reports/charts/rev.png; unshared image shows placeholder
+    // Authorized relative link resolves in current version and becomes openable
+    const allowedLink = await screen.findByRole('link', { name: 'Allowed Appendix' });
+    expect(allowedLink).toHaveAttribute('href', buildServeUrl(PREFIX, 'reports/appendix.md'));
+
+    // Missing/unauthorized relative links render as non-clickable placeholders (no workspace-root fallback)
+    const placeholders = await screen.findAllByTestId('shared-link-placeholder');
+    expect(placeholders.map((el) => el.textContent).join(' ')).toContain('Internal Draft');
+    expect(placeholders.map((el) => el.textContent).join(' ')).toContain('Outside');
+    expect(screen.queryByRole('link', { name: 'Internal Draft' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Outside' })).toBeNull();
+
+    // Shared relative image resolves under reports/charts/rev.png; missing/decoy/unshared images show placeholders
     const allowedImg = await screen.findByAltText('Revenue Chart');
     await waitFor(() => expect(allowedImg).toHaveAttribute('src', 'blob:shared-md-image'));
+    expect(await screen.findByText(/decoy\.png/i)).toBeInTheDocument();
     expect(await screen.findByText(/private\.png/i)).toBeInTheDocument();
+    const requestedUrls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(requestedUrls).not.toContain(buildServeUrl(PREFIX, 'charts/decoy.png'));
+    expect(requestedUrls).not.toContain(buildServeUrl(PREFIX, 'draft.md'));
+
+    // Clicking an authorized relative link opens the target doc inside the viewer with a Back bar
+    await user.click(allowedLink);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Appendix Details' })).toBeInTheDocument();
+    expect(screen.getByText('Permitted sibling doc').tagName).toBe('STRONG');
+    await user.click(screen.getByRole('button', { name: /Back to memo\.md/i }));
+    expect(await screen.findByRole('heading', { level: 1, name: 'Q4 Investment Memo' })).toBeInTheDocument();
 
     // View raw / View rendered toggle and Download button are both present
     expect(screen.getByRole('button', { name: /Download/i })).toBeInTheDocument();

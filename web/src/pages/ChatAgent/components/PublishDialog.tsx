@@ -1382,6 +1382,11 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
                     </>
                   )}
                 </span>
+                {publishStatus.pendingHintKey && (
+                  <span className="text-xs" data-testid="publish-status-pending" style={{ color: 'var(--color-accent-primary)' }}>
+                    {t('publish:afterSave', { hint: t(publishStatus.pendingHintKey) })}
+                  </span>
+                )}
               </div>
             </div>
             {/* DALTON-HOOK(external-share-guard): stop button stays available for active shares and historical public monitors even while confirming */}

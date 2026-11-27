@@ -214,6 +214,8 @@
   "viewPreview": "View page",
   "viewRaw": "View raw",
   "viewRendered": "View rendered",
+  "sharedLinkUnavailable": "Restricted or missing",
+  "backToSharedDoc": "Back to {{name}}",
   "htmlPreviewFailed": "Couldn't load the preview.",
   "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
   "pdfGenerating": "Generating PDF…",

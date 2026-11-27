@@ -719,4 +719,97 @@ describe('Monitors page (Checklist 8)', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('renders an anonymous public /m/ legacy Markdown page from real trimmed public payload with raw toggle and download', async () => {
+    const user = userEvent.setup();
+    const mdBody = [
+      '# Public Weekly Note',
+      '',
+      'Highlights: **margin expansion** this quarter.',
+      '',
+      '<script>window.__publicMdXss = true;</script>',
+    ].join('\n');
+
+    const createObjectURLMock = vi.fn<typeof URL.createObjectURL>(() => 'blob:public-md-download');
+    const revokeObjectURLMock = vi.fn<typeof URL.revokeObjectURL>();
+    URL.createObjectURL = createObjectURLMock;
+    URL.revokeObjectURL = revokeObjectURLMock;
+
+    const publicDetailPayload: MonitorDetail = {
+      monitor: {
+        monitor_id: 'm-pub-md',
+        slug: 'public-weekly-note',
+        owner_name: 'Alice',
+        owner_email: null,
+        title: 'Public Weekly Note',
+        category: 'other',
+        sort_order: 0,
+        visibility: 'public',
+        member_user_ids: [],
+        published_seq: 2,
+        keep_updated: false,
+        source_kind: 'workspace',
+        source_ref: null,
+        acl_revision: 1,
+        last_publish_error: null,
+        last_publish_failed_at: null,
+        data_as_of: null,
+        created_at: '2026-11-27T08:00:00Z',
+        updated_at: '2026-11-27T08:00:00Z',
+        can_manage: false,
+        entry_file_type: 'markdown',
+      },
+      versions: [],
+      monitor_grant: '',
+      frame_base: '/api/v1/dalton/monitors/public/public-weekly-note/',
+      data_base: '/api/v1/dalton/monitors/public/public-weekly-note/data',
+      expires_in: 0,
+    };
+
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url === '/api/v1/dalton/monitors/public/public-weekly-note/v/2/') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'text/markdown; charset=utf-8' }),
+          text: async () => mdBody,
+          blob: async () => new Blob([mdBody], { type: 'text/markdown' }),
+        } as Response;
+      }
+      return { ok: false, status: 404, headers: new Headers() } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    mockGetPublicMonitorDetail.mockResolvedValue(publicDetailPayload);
+
+    try {
+      renderWithProviders(
+        <Routes>
+          <Route path="/m/:slug" element={<PublicMonitorPage />} />
+        </Routes>,
+        { route: '/m/public-weekly-note' },
+      );
+
+      const bold = await screen.findByText('margin expansion', {}, { timeout: 5000 });
+      expect(bold.tagName).toBe('STRONG');
+      expect(screen.queryByTestId('bridged-frame')).toBeNull();
+      expect(document.querySelector('script')).toBeNull();
+      expect((window as unknown as Record<string, unknown>).__publicMdXss).toBeUndefined();
+
+      // View raw / View rendered toggle works in anonymous mode
+      await user.click(screen.getByRole('button', { name: /View raw/i }));
+      expect(await screen.findByText(/\*\*margin expansion\*\*/)).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /View rendered/i }));
+      expect((await screen.findByText('margin expansion')).tagName).toBe('STRONG');
+
+      // Download button fetches the anonymous entry endpoint
+      await user.click(screen.getByRole('button', { name: /Download/i }));
+      await waitFor(() => expect(createObjectURLMock).toHaveBeenCalled());
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/dalton/monitors/public/public-weekly-note/v/2/',
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

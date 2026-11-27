@@ -83,6 +83,8 @@ export interface FileViewerProps {
   onAddContext?: ((ctx: ContextPayload) => void) | null;
   /** Left out, a link to another workspace file renders as plain text. */
   onViewerLink?: OpenFileHandler;
+  // DALTON-HOOK(monitors): custom renderer for permission-checked relative links in shared Markdown views
+  renderFileLink?: (info: { href: string; children: React.ReactNode }) => React.ReactNode;
   /** Where a link in a framed HTML document to another workspace file opens. */
   onFrameLink?: FrameLinkHandler;
   /** The serve prefix a share was handed; omitted, the owner's grant serves HTML. */
@@ -261,6 +263,7 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
           comments={comments}
           onOpenFile={props.onViewerLink}
           onAnchorLink={props.onAnchorLink}
+          renderFileLink={props.renderFileLink} // DALTON-HOOK(monitors)
         />
       ) : (viewer === 'code' || viewer === 'html' || (viewer === 'markdown' && props.markdownSource)) && body?.content != null ? (
         <CodeFile content={body.content} language={EXT_TO_LANG[ext] || 'text'} lineRange={lineRange} comments={comments} />

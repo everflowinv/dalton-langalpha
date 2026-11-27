@@ -48,6 +48,7 @@ from src.dalton.monitors.models import (
     PublishMonitorRequest,
     RepublishMonitorRequest,
     UpdateMonitorRequest,
+    entry_file_type_of,
     is_html_entry_path,
     is_monitor_panel_entry,
     is_valid_data_key,
@@ -350,6 +351,7 @@ def serialize_monitor(monitor: MonitorRecord, *, can_manage: bool = False) -> di
         "artifact_code": monitor.artifact_code,
         "workspace_id": monitor.workspace_id,
         "entry_path": monitor.entry_path,
+        "entry_file_type": entry_file_type_of(monitor.entry_path),
         "owner_user_id": monitor.owner_user_id,
         "owner_name": monitor.owner_name,
         "owner_email": monitor.owner_email,
@@ -1555,19 +1557,14 @@ async def serve_public_monitor_file(
         or not _valid_path(target_path)
     ):
         raise HTTPException(status_code=404, detail="File not found")
-    try:
-        return await _serve_monitor_version_file(
-            monitor,
-            int(seq),
-            target_path,
-            if_none_match=if_none_match,
-            head=head,
-        )
-    except HTTPException as exc:
-        entry_dir = posixpath.dirname(monitor.entry_path or "")
-        if exc.status_code == 404 and path and entry_dir:
-            nested = posixpath.normpath(f"{entry_dir}/{path}")
-            if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+    entry_dir = posixpath.dirname(monitor.entry_path or "")
+    prefer_nested = bool(
+        path and entry_dir and not path.startswith(f"{entry_dir}/")
+    )
+    if prefer_nested:
+        nested = posixpath.normpath(f"{entry_dir}/{path}")
+        if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+            try:
                 return await _serve_monitor_version_file(
                     monitor,
                     int(seq),
@@ -1575,7 +1572,16 @@ async def serve_public_monitor_file(
                     if_none_match=if_none_match,
                     head=head,
                 )
-        raise
+            except HTTPException as exc:
+                if exc.status_code != 404 or not is_html_entry_path(monitor.entry_path):
+                    raise
+    return await _serve_monitor_version_file(
+        monitor,
+        int(seq),
+        target_path,
+        if_none_match=if_none_match,
+        head=head,
+    )
 
 
 async def _read_monitor_data_response(
