@@ -731,28 +731,89 @@ def test_markdown_reassembly_prevents_escaped_image_and_html_injection() -> None
 
 
 def test_workspace_relative_paths_scrubbed_consistently_across_markdown_and_code() -> None:
-    """Grok Medium: Workspace-relative paths (reports/q3.pdf, `out/memo.md`) scrubbed everywhere."""
+    """Grok/Codex Medium: Workspace-relative paths (incl. CJK & extensionless) scrubbed everywhere."""
     md = (
-        "详见 reports/q3.pdf 和 `out/memo.md` 以及 ./charts/fig1.png。\n\n"
-        "指标 P/E 为 18.5，日期 2025/11/26，保留 [短链](https://app.local/a/AbCdEf123456) "
+        "详见 reports/q3.pdf、reports/财报.pdf、reports/README、报告/季度总结、"
+        "docs/Makefile、`out/memo.md` 以及 ./charts/fig1.png。\n\n"
+        "指标 P/E 为 18.5，EV/EBITDA 为 12.3，日期 2025/11/26，保留 [短链](https://app.local/a/AbCdEf123456) "
         "和 https://example.com/docs/guide.html。\n\n"
         "```python\n"
         "df = read_csv('data/q3/metrics.csv')\n"
+        "open('reports/财报.pdf')\n"
         "```\n"
     )
     sanitized = sanitize_shared_markdown(md)
-    assert "reports/q3.pdf" not in sanitized
-    assert "out/memo.md" not in sanitized
-    assert "./charts/fig1.png" not in sanitized
-    assert "data/q3/metrics.csv" not in sanitized
+    for leaked in (
+        "reports/q3.pdf",
+        "reports/财报.pdf",
+        "reports/README",
+        "报告/季度总结",
+        "docs/Makefile",
+        "out/memo.md",
+        "./charts/fig1.png",
+        "data/q3/metrics.csv",
+    ):
+        assert leaked not in sanitized, f"Leaked relative path {leaked!r} in {sanitized!r}"
     assert "[redacted-path]" in sanitized
     # Benign ratios, dates, and public URLs / short links preserved
     assert "P/E" in sanitized
+    assert "EV/EBITDA" in sanitized
     assert "2025/11/26" in sanitized
     assert "https://app.local/a/AbCdEf123456" in sanitized
     assert "https://example.com/docs/guide.html" in sanitized
 
-    # Org library summary scrubbing also removes workspace-relative paths
-    cleaned_sum = clean_org_library_summary("详见 reports/q3.pdf 与 out/memo.md")
+    # Org library summary scrubbing also removes CJK and extensionless relative paths
+    cleaned_sum = clean_org_library_summary(
+        "详见 reports/q3.pdf、reports/财报.pdf、reports/README 与 out/memo.md"
+    )
     assert "reports/q3.pdf" not in cleaned_sum
+    assert "reports/财报.pdf" not in cleaned_sum
+    assert "reports/README" not in cleaned_sum
     assert "out/memo.md" not in cleaned_sum
+
+
+def test_nested_thinking_blocks_stripped_by_depth_in_cold_projection() -> None:
+    """Codex High #1: Cold projection strips nested <thinking>/<thinking_mode> by depth before turn_slices write."""
+    from langchain_core.messages import AIMessage, HumanMessage
+    from src.server.services.history import projector as projector_mod
+    from src.server.services.history.replay.lines import line_of
+
+    ai_nested = AIMessage(
+        id="ai-nested-1",
+        content=(
+            "<thinking>outer_before <thinking>inner_thought</thinking> "
+            "OUTER_NESTED_LEAK_01</thinking>"
+            "<thinking_mode>mode_before <thinking>mode_inner</thinking> "
+            "OUTER_MODE_LEAK_02</thinking_mode>"
+            "最终安全结论：营收同比增长 20%。"
+        ),
+    )
+    ai_tool_nested = AIMessage(
+        id="ai-nested-tool",
+        content="<thinking>tool_a <thinking>tool_b</thinking> TOOL_LEAK_03</thinking>pretool text",
+        tool_calls=[{"id": "tc-1", "name": "Read", "args": {"path": "x.py"}}],
+    )
+    events = projector_mod.messages_to_history_events(
+        [HumanMessage(id="h-1", content="请给出结论"), ai_tool_nested, ai_nested],
+        agent="main",
+    )
+    sse_items = projector_mod.history_events_to_sse(events, thread_id="t-nested")
+    # Projected lines (what gets written to turn_slices) MUST already be free of nested outer text
+    projected_dump = "\n".join(str(it) for it in sse_items)
+    assert "OUTER_NESTED_LEAK_01" not in projected_dump
+    assert "OUTER_MODE_LEAK_02" not in projected_dump
+    assert "TOOL_LEAK_03" not in projected_dump
+    assert "最终安全结论：营收同比增长 20%。" in projected_dump
+
+    # Feeding those projected lines through StrictNoFilesShareRedactor keeps only the clean answer
+    lines = [line_of({"event": it["event"], "data": {**it["data"], "turn_index": 0}}) for it in sse_items]
+    redactor = StrictNoFilesShareRedactor(
+        thread_id="t-nested",
+        responses_by_turn={0: {"turn_index": 0, "status": "completed", "conversation_response_id": "r0"}},
+    )
+    out = list(redactor.iter_redacted_events(lines))
+    out_dump = "\n".join(str(ev) for ev in out)
+    assert "OUTER_NESTED_LEAK_01" not in out_dump
+    assert "OUTER_MODE_LEAK_02" not in out_dump
+    assert "TOOL_LEAK_03" not in out_dump
+    assert "最终安全结论：营收同比增长 20%。" in out_dump

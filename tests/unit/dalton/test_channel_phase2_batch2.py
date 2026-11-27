@@ -82,6 +82,7 @@ class _FakeS3ClientSpec:
         Body: bytes,
         ContentType: str,
         ContentLength: int,
+        ACL: str | None = None,
     ) -> dict[str, Any]: ...
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]: ...
@@ -102,9 +103,11 @@ def _make_autospec_s3_client(store: dict[tuple[str, str], bytes]) -> Any:
         Body: bytes,
         ContentType: str,
         ContentLength: int,
+        ACL: str | None = None,
     ) -> dict[str, Any]:
         assert ContentType == "image/png"
         assert ContentLength == len(Body)
+        assert ACL == "private"
         store[(Bucket, Key)] = bytes(Body)
         return {"ETag": '"test-etag"'}
 

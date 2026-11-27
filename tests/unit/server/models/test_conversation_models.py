@@ -85,14 +85,26 @@ class TestSharePermissions:
         assert perms.allow_download is False
 
     def test_download_requires_files(self):
-        # DALTON-HOOK(share-redaction): allow_files=False collapses allow_download=False (never elevates allow_files)
+        # DALTON-HOOK(share-redaction): explicit allow_files=False collapses allow_download=False;
+        # partial allow_download=True preserves caller intent until merged with stored DB permissions
+        from src.dalton.share_redaction import normalize_merged_share_permissions
+
         perms = SharePermissions(allow_download=True, allow_files=False)
         assert perms.allow_files is False
         assert perms.allow_download is False
 
-        perms_implicit = SharePermissions(allow_download=True)
-        assert perms_implicit.allow_files is False
-        assert perms_implicit.allow_download is False
+        perms_partial = SharePermissions(allow_download=True)
+        assert perms_partial.allow_files is False
+        assert perms_partial.allow_download is True
+        assert "allow_files" not in perms_partial.model_fields_set
+        assert normalize_merged_share_permissions({"allow_files": False}, perms_partial) == {
+            "allow_files": False,
+            "allow_download": False,
+        }
+        assert normalize_merged_share_permissions({"allow_files": True}, perms_partial) == {
+            "allow_files": True,
+            "allow_download": True,
+        }
 
         perms_both = SharePermissions(allow_files=True, allow_download=True)
         assert perms_both.allow_files is True

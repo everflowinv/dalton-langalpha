@@ -4,17 +4,25 @@
 Supports two operations:
   --warm-shared-slices : Pre-warm raw unredacted ``turn_slices`` for active shared
                          threads (``conversation_threads WHERE is_shared = TRUE``)
-                         for the current ``lines_epoch()``.
+                         for the current ``lines_epoch()``, distinguishing fresh
+                         cold-projection persists (``warmed``), warm cache hits
+                         (``cache_hit``), and ``stub`` fallbacks.
   --verify             : Resolve all active physical storage buckets via
                          ``resolve_active_storage_targets()`` (upstream primary
                          including legacy ``S3_*``/``AWS_*`` and ``OSS_*``,
                          chat-upload/channel-snapshot bucket, and independent
                          ASR transcription bucket, deduplicated by physical bucket)
-                         and issue anonymous HTTP GET probes against both origin
-                         endpoints and configured public URL bases / CDN domains
-                         for every sensitive prefix, asserting zero anonymous 200s
-                         (403 required on existing/probed objects; 403/404 allowed
-                         on absent legacy keys).
+                         and issue anonymous HTTP GET probes against origin
+                         endpoints, independent signing/browser endpoints, and
+                         configured public URL bases / CDN domains for every
+                         sensitive prefix:
+                           - Listing failure fails verification immediately.
+                           - Samples multiple existing objects per prefix (none may
+                             return HTTP 200; strict HTTP 403 required).
+                           - Temporary zero-PII probes are written WITHOUT an
+                             object-level ``private`` ACL so bucket policy itself is
+                             verified (never masked by object ACL).
+                           - Optional ``--historical-url`` direct links are verified.
 
 Note: Scheme B (in-place prefix migration ``--mode prefix-migrate``) is intentionally
 omitted per the Scheme A decision (all physical buckets private; avatars-only public
@@ -25,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 import json
 import logging
@@ -35,22 +43,23 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any
-from urllib.parse import quote
 
 from psycopg.rows import dict_row
 
 from src.dalton.share_media import (
     ActiveStorageTarget,
-    is_acl_not_supported_error,
+    build_storage_object_urls,
     resolve_active_storage_targets,
-    storage_private_acl_kwargs,
 )
 from src.dalton.share_redaction import (
     PUBLIC_SHARE_MAX_TURNS,
     get_public_share_page_budget,
+    track_cold_projection_miss,
 )
 
 logger = logging.getLogger("privatize_shared_thread_objects")
+
+DEFAULT_SAMPLE_EXISTING = 5
 
 
 @dataclass(frozen=True)
@@ -65,51 +74,8 @@ class ProbeCheckResult:
 
 
 def _build_anonymous_probe_urls(target: ActiveStorageTarget, key: str) -> list[str]:
-    """Build origin & public/CDN URLs for an anonymous GET check of ``key``."""
-    urls: list[str] = []
-    quoted = quote(key.lstrip("/"), safe="/")
-
-    # 1. Origin URL
-    if target.provider == "oss":
-        ep = target.endpoint_url.rstrip("/")
-        if ep:
-            if "://" in ep:
-                scheme, rest = ep.split("://", 1)
-                if rest.lower().startswith(f"{target.bucket_name.lower()}."):
-                    urls.append(f"{ep}/{quoted}")
-                else:
-                    urls.append(f"{scheme}://{target.bucket_name}.{rest}/{quoted}")
-            else:
-                urls.append(f"https://{target.bucket_name}.{ep}/{quoted}")
-    else:
-        ep = target.endpoint_url.rstrip("/")
-        if ep:
-            if target.addressing_style == "path":
-                urls.append(f"{ep}/{target.bucket_name}/{quoted}")
-            else:
-                if "://" in ep:
-                    scheme, rest = ep.split("://", 1)
-                    if rest.lower().startswith(f"{target.bucket_name.lower()}."):
-                        urls.append(f"{ep}/{quoted}")
-                    else:
-                        urls.append(f"{scheme}://{target.bucket_name}.{rest}/{quoted}")
-                else:
-                    urls.append(f"https://{target.bucket_name}.{ep}/{quoted}")
-        else:
-            urls.append(
-                f"https://{target.bucket_name}.s3.{target.region}.amazonaws.com/{quoted}"
-            )
-
-    # 2. Public URL bases (CDN / STORAGE_PUBLIC_URL_BASE / S3_PUBLIC_URL_BASE)
-    for base in target.public_url_bases:
-        clean_base = base.rstrip("/")
-        if not clean_base:
-            continue
-        u = f"{clean_base}/{quoted}"
-        if u not in urls:
-            urls.append(u)
-
-    return urls
+    """Build origin, independent signing/browser endpoint, and public/CDN probe URLs."""
+    return build_storage_object_urls(target, key)
 
 
 def _http_anonymous_get_status(url: str, *, timeout_s: float = 10.0) -> tuple[int | None, str]:
@@ -164,36 +130,19 @@ def _build_oss_client_for_target(target: ActiveStorageTarget) -> Any:
 
 
 def _put_temp_probe(target: ActiveStorageTarget, key: str) -> Callable[[], None]:
-    """Write a temporary zero-PII probe object to ``target`` (S3 or OSS) and return a delete callable."""
+    """Write a temporary zero-PII probe WITHOUT object-level private ACL so bucket policy is tested."""
     if target.provider == "oss":
         import alibabacloud_oss_v2 as oss
 
         client = _build_oss_client_for_target(target)
-        acl_kwargs = storage_private_acl_kwargs(
-            key, provider="oss", endpoint_url=target.endpoint_url
-        )
-        try:
-            client.put_object(
-                oss.PutObjectRequest(
-                    bucket=target.bucket_name,
-                    key=key,
-                    body=b"dalton-au1-verify-probe",
-                    content_type="text/plain",
-                    **acl_kwargs,
-                )
+        client.put_object(
+            oss.PutObjectRequest(
+                bucket=target.bucket_name,
+                key=key,
+                body=b"dalton-au1-verify-probe",
+                content_type="text/plain",
             )
-        except Exception as exc:
-            if acl_kwargs and is_acl_not_supported_error(exc):
-                client.put_object(
-                    oss.PutObjectRequest(
-                        bucket=target.bucket_name,
-                        key=key,
-                        body=b"dalton-au1-verify-probe",
-                        content_type="text/plain",
-                    )
-                )
-            else:
-                raise
+        )
 
         def _cleanup_oss() -> None:
             client.delete_object(
@@ -203,24 +152,12 @@ def _put_temp_probe(target: ActiveStorageTarget, key: str) -> Callable[[], None]
         return _cleanup_oss
 
     client = _build_s3_client_for_target(target)
-    acl_kwargs = storage_private_acl_kwargs(
-        key, provider="s3", endpoint_url=target.endpoint_url
+    client.put_object(
+        Bucket=target.bucket_name,
+        Key=key,
+        Body=b"dalton-au1-verify-probe",
+        ContentType="text/plain",
     )
-    params: dict[str, Any] = {
-        "Bucket": target.bucket_name,
-        "Key": key,
-        "Body": b"dalton-au1-verify-probe",
-        "ContentType": "text/plain",
-        **acl_kwargs,
-    }
-    try:
-        client.put_object(**params)
-    except Exception as exc:
-        if acl_kwargs and is_acl_not_supported_error(exc):
-            params.pop("ACL", None)
-            client.put_object(**params)
-        else:
-            raise
 
     def _cleanup_s3() -> None:
         client.delete_object(Bucket=target.bucket_name, Key=key)
@@ -228,66 +165,90 @@ def _put_temp_probe(target: ActiveStorageTarget, key: str) -> Callable[[], None]
     return _cleanup_s3
 
 
-def _find_existing_object_key(target: ActiveStorageTarget, prefix: str) -> str | None:
-    """Discover one real existing object under ``prefix`` in S3 or OSS (best effort)."""
-    try:
-        if target.provider == "oss":
-            import alibabacloud_oss_v2 as oss
+def _find_existing_object_keys(
+    target: ActiveStorageTarget,
+    prefix: str,
+    *,
+    max_keys: int = DEFAULT_SAMPLE_EXISTING,
+) -> list[str]:
+    """Discover up to ``max_keys`` real existing objects under ``prefix``.
 
-            client = _build_oss_client_for_target(target)
-            res = client.list_objects_v2(
-                oss.ListObjectsV2Request(
-                    bucket=target.bucket_name, prefix=prefix, max_keys=1
-                )
-            )
-            contents = getattr(res, "contents", None) or ()
-            for obj in contents:
-                k = getattr(obj, "key", None)
-                if k:
-                    return str(k)
-            return None
-        client = _build_s3_client_for_target(target)
+    Listing failures are NOT swallowed: callers treat any listing error as a
+    verification failure so an unreadable/misconfigured bucket never false-passes.
+    """
+    limit = max(1, int(max_keys))
+    found: list[str] = []
+    if target.provider == "oss":
+        import alibabacloud_oss_v2 as oss
+
+        client = _build_oss_client_for_target(target)
         res = client.list_objects_v2(
-            Bucket=target.bucket_name, Prefix=prefix, MaxKeys=1
+            oss.ListObjectsV2Request(
+                bucket=target.bucket_name, prefix=prefix, max_keys=limit
+            )
         )
-        for obj in res.get("Contents") or ():
-            if obj.get("Key"):
-                return str(obj["Key"])
-    except Exception:
-        logger.debug(
-            "Could not list existing objects for %s/%s",
-            target.bucket_name,
-            prefix,
-            exc_info=True,
-        )
-    return None
+        for obj in getattr(res, "contents", None) or ():
+            k = getattr(obj, "key", None)
+            if k:
+                ks = str(k)
+                if ks not in found:
+                    found.append(ks)
+        return found
+
+    client = _build_s3_client_for_target(target)
+    res = client.list_objects_v2(
+        Bucket=target.bucket_name, Prefix=prefix, MaxKeys=limit
+    )
+    for obj in res.get("Contents") or ():
+        if obj.get("Key"):
+            ks = str(obj["Key"])
+            if ks not in found:
+                found.append(ks)
+    return found
+
+
+def _coerce_discovered_keys(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip() and item not in out:
+            out.append(item)
+    return out
 
 
 def verify_storage_targets(
     *,
     targets: list[ActiveStorageTarget] | None = None,
     probe_write: bool = True,
+    sample_existing: int = DEFAULT_SAMPLE_EXISTING,
+    known_historical_urls: Iterable[str] | None = None,
     timeout_s: float = 10.0,
     http_get_fn: Any = None,
     put_probe_fn: Any = None,
     find_existing_fn: Any = None,
-    existing_keys_by_prefix: Mapping[str, str] | None = None,
+    existing_keys_by_prefix: Mapping[str, str | Iterable[str]] | None = None,
 ) -> tuple[bool, list[ProbeCheckResult]]:
     """Verify every deduplicated physical bucket & sensitive prefix refuses anonymous GET with HTTP 403.
 
-    Never accepts HTTP 404 as pass: every sensitive prefix is verified against a
-    real existing object (a temporary zero-PII probe written & cleaned up for both
-    S3 and OSS when ``probe_write=True``, plus any existing object discovered under
-    the prefix). Probe cleanup failure also fails verification.
+    Hardened AU1 rules:
+    - Never accepts HTTP 404 or HTTP 200 as pass.
+    - Listing failure fails verification immediately (never treated as empty prefix).
+    - Samples multiple existing objects per sensitive prefix; every sampled object
+      must return 403 (never 200) across origin, signing/browser endpoint, and CDN.
+    - Temporary zero-PII probes are written WITHOUT object-level ``private`` ACL so
+      bucket policy itself is verified.
+    - Probe cleanup failure also fails verification.
     """
     resolved = resolve_active_storage_targets() if targets is None else targets
     getter = http_get_fn or _http_anonymous_get_status
     writer = put_probe_fn or _put_temp_probe
-    finder = find_existing_fn or _find_existing_object_key
     results: list[ProbeCheckResult] = []
     all_ok = True
 
-    if not resolved:
+    if not resolved and not known_historical_urls:
         logger.info("No active object storage targets configured; nothing to verify.")
         return True, []
 
@@ -301,11 +262,19 @@ def verify_storage_targets(
 
             try:
                 if existing_keys_by_prefix and prefix in existing_keys_by_prefix:
-                    keys_to_probe.append(str(existing_keys_by_prefix[prefix]))
+                    keys_to_probe.extend(
+                        _coerce_discovered_keys(existing_keys_by_prefix[prefix])
+                    )
+                elif find_existing_fn is not None:
+                    keys_to_probe.extend(
+                        _coerce_discovered_keys(find_existing_fn(target, prefix))
+                    )
                 else:
-                    discovered = finder(target, prefix)
-                    if discovered:
-                        keys_to_probe.append(discovered)
+                    keys_to_probe.extend(
+                        _find_existing_object_keys(
+                            target, prefix, max_keys=sample_existing
+                        )
+                    )
 
                 if probe_write:
                     cleanup_fn = writer(target, probe_key)
@@ -329,6 +298,20 @@ def verify_storage_targets(
 
                 for obj_key in keys_to_probe:
                     urls = _build_anonymous_probe_urls(target, obj_key)
+                    if not urls:
+                        all_ok = False
+                        results.append(
+                            ProbeCheckResult(
+                                bucket=target.bucket_name,
+                                roles=target.roles,
+                                prefix=prefix,
+                                url=f"{target.bucket_name}/{obj_key}",
+                                status_code=None,
+                                ok=False,
+                                detail="could not construct any probe URL for target",
+                            )
+                        )
+                        continue
                     for url in urls:
                         status_code, detail = getter(url, timeout_s=timeout_s)
                         # Strict: only 403 Forbidden proves an existing object cannot be anonymously read.
@@ -356,7 +339,7 @@ def verify_storage_targets(
                         url=f"{target.endpoint_url or target.bucket_name}/{probe_key}",
                         status_code=None,
                         ok=False,
-                        detail=f"probe error: {type(exc).__name__}: {exc}",
+                        detail=f"probe/list error: {type(exc).__name__}: {exc}",
                     )
                 )
             finally:
@@ -383,11 +366,31 @@ def verify_storage_targets(
                             )
                         )
 
+    for raw_hist_url in known_historical_urls or ():
+        hist_url = str(raw_hist_url or "").strip()
+        if not hist_url:
+            continue
+        status_code, detail = getter(hist_url, timeout_s=timeout_s)
+        ok = status_code == 403
+        if not ok:
+            all_ok = False
+        results.append(
+            ProbeCheckResult(
+                bucket="historical-url",
+                roles=("historical",),
+                prefix="historical",
+                url=hist_url,
+                status_code=status_code,
+                ok=ok,
+                detail=detail,
+            )
+        )
+
     return all_ok, results
 
 
 async def _ensure_cli_pools_open() -> tuple[Any, Any, bool, bool]:
-    """Open the conversation DB pool & LangGraph checkpointer when running standalone CLI."""
+    """Open the conversation DB pool & LangGraph checkpointer with independent cleanup on failure."""
     from src.server.app import setup
     from src.server.database.pool import get_or_create_pool
     from src.server.services.history.reader import CheckpointHistoryReader
@@ -403,18 +406,29 @@ async def _ensure_cli_pools_open() -> tuple[Any, Any, bool, bool]:
 
     cp = setup.checkpointer
     if cp is None:
-        cp = get_checkpointer(
-            memory_type=os.getenv("MEMORY_DB_TYPE", "postgres"),
-            db_host=os.getenv("DB_HOST", "localhost"),
-            db_port=os.getenv("DB_PORT", "5432"),
-            db_name=os.getenv("DB_NAME", "postgres"),
-            db_user=os.getenv("DB_USER", "postgres"),
-            db_password=os.getenv("DB_PASSWORD", "postgres"),
-        )
-        await open_checkpointer_pool(cp)
-        setup.checkpointer = cp
-        CheckpointHistoryReader.reset_instance()
-        opened_checkpointer = True
+        try:
+            cp = get_checkpointer(
+                memory_type=os.getenv("MEMORY_DB_TYPE", "postgres"),
+                db_host=os.getenv("DB_HOST", "localhost"),
+                db_port=os.getenv("DB_PORT", "5432"),
+                db_name=os.getenv("DB_NAME", "postgres"),
+                db_user=os.getenv("DB_USER", "postgres"),
+                db_password=os.getenv("DB_PASSWORD", "postgres"),
+            )
+            await open_checkpointer_pool(cp)
+            setup.checkpointer = cp
+            CheckpointHistoryReader.reset_instance()
+            opened_checkpointer = True
+        except Exception:
+            if opened_app_pool:
+                try:
+                    await conv_pool.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close app DB pool after checkpointer init error",
+                        exc_info=True,
+                    )
+            raise
     return conv_pool, cp, opened_app_pool, opened_checkpointer
 
 
@@ -424,18 +438,30 @@ async def _close_cli_pools(
     opened_app_pool: bool,
     opened_checkpointer: bool,
 ) -> None:
+    """Independently close checkpointer and app DB pools so one failure never leaks the other."""
     from src.server.app import setup
     from src.server.services.history.reader import CheckpointHistoryReader
     from src.server.utils.checkpointer import close_checkpointer_pool
 
+    first_err: BaseException | None = None
     if opened_checkpointer and cp is not None:
         try:
             await close_checkpointer_pool(cp)
+        except Exception as exc:
+            first_err = exc
+            logger.warning("Failed to close checkpointer pool: %s", exc)
         finally:
             setup.checkpointer = None
             CheckpointHistoryReader.reset_instance()
     if opened_app_pool and conv_pool is not None:
-        await conv_pool.close()
+        try:
+            await conv_pool.close()
+        except Exception as exc:
+            if first_err is None:
+                first_err = exc
+            logger.warning("Failed to close app DB pool: %s", exc)
+    if first_err is not None:
+        raise first_err
 
 
 async def warm_shared_slices(
@@ -477,24 +503,32 @@ async def warm_shared_slices(
 
         sem = asyncio.Semaphore(max(1, int(concurrency)))
         warmed = 0
+        cache_hit = 0
+        stub = 0
         skipped = 0
         failed = 0
 
         async def _warm_one(tid: str) -> None:
-            nonlocal warmed, skipped, failed
+            nonlocal warmed, cache_hit, stub, skipped, failed
             async with sem:
                 try:
                     rows = await get_replay_thread_data(tid)
                     if rows is None:
                         skipped += 1
                         return
-                    await read_replay_page(
-                        rows,
-                        limit=PUBLIC_SHARE_MAX_TURNS,
-                        budget=budget,
-                        persist=True,
-                    )
-                    warmed += 1
+                    with track_cold_projection_miss() as cold_flag:
+                        _page, source = await read_replay_page(
+                            rows,
+                            limit=PUBLIC_SHARE_MAX_TURNS,
+                            budget=budget,
+                            persist=True,
+                        )
+                    if source == "stub":
+                        stub += 1
+                    elif cold_flag[0]:
+                        warmed += 1
+                    else:
+                        cache_hit += 1
                 except Exception as exc:
                     failed += 1
                     logger.warning("Failed warming shared thread %s: %s", tid, exc)
@@ -504,6 +538,8 @@ async def warm_shared_slices(
             "lines_epoch": epoch,
             "total_shared_threads": len(thread_ids),
             "warmed": warmed,
+            "cache_hit": cache_hit,
+            "stub": stub,
             "skipped": skipped,
             "failed": failed,
         }
@@ -525,7 +561,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--probe-write",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="With --verify, write & delete a zero-PII probe object per sensitive prefix on S3 and OSS (default: enabled).",
+        help="With --verify, write & delete a zero-PII probe object (without object ACL) per sensitive prefix on S3 and OSS (default: enabled).",
+    )
+    parser.add_argument(
+        "--sample-existing",
+        type=int,
+        default=DEFAULT_SAMPLE_EXISTING,
+        help=f"With --verify, max existing objects to sample per sensitive prefix (default: {DEFAULT_SAMPLE_EXISTING}).",
+    )
+    parser.add_argument(
+        "--historical-url",
+        action="append",
+        default=[],
+        help="Known historical direct URL to anonymously probe (repeatable; must return 403).",
     )
     parser.add_argument(
         "--warm-shared-slices",
@@ -589,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.verify:
         ok, checks = verify_storage_targets(
             probe_write=args.probe_write,
+            sample_existing=args.sample_existing,
+            known_historical_urls=args.historical_url,
             timeout_s=args.timeout,
         )
         summary["verify"] = {
@@ -607,7 +657,8 @@ def main(argv: list[str] | None = None) -> int:
             w = summary["warm_shared_slices"]
             print(
                 f"[warm-shared-slices] epoch={w['lines_epoch']} total={w['total_shared_threads']} "
-                f"warmed={w['warmed']} skipped={w['skipped']} failed={w['failed']}"
+                f"warmed={w['warmed']} cache_hit={w['cache_hit']} stub={w['stub']} "
+                f"skipped={w['skipped']} failed={w['failed']}"
             )
         if "verify" in summary:
             v = summary["verify"]

@@ -158,29 +158,18 @@ def _reset_clients_for_test() -> None:
 
 def open_multipart_upload(key: str, *, content_type: str) -> str | None:
     """Start a multipart upload under ``key`` with private ACL; returns upload id or ``None``."""
-    from src.dalton.share_media import is_acl_not_supported_error, storage_private_acl_kwargs
+    from src.dalton.share_media import s3_create_multipart_with_private_acl
 
-    acl_kwargs = storage_private_acl_kwargs(
-        key, provider="s3", endpoint_url=_endpoint_url()
-    )
-    params: dict[str, Any] = {
-        "Bucket": _bucket_name(),
-        "Key": resolve_full_key(key),
-        "ContentType": content_type,
-        **acl_kwargs,
-    }
     try:
-        created = _get_client().create_multipart_upload(**params)
+        created = s3_create_multipart_with_private_acl(
+            _get_client(),
+            bucket=_bucket_name(),
+            key=resolve_full_key(key),
+            content_type=content_type,
+            endpoint_url=_endpoint_url(),
+        )
         return created["UploadId"]
     except Exception as e:
-        if acl_kwargs and is_acl_not_supported_error(e):
-            params.pop("ACL", None)
-            try:
-                created = _get_client().create_multipart_upload(**params)
-                return created["UploadId"]
-            except Exception as retry_e:
-                logger.error(f"Failed to open a multipart upload for {key}: {retry_e}")
-                return None
         logger.error(f"Failed to open a multipart upload for {key}: {e}")
         return None
 

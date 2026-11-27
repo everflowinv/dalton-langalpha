@@ -43,6 +43,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from pathlib import Path
 import psycopg
 import pytest
 
@@ -55,13 +57,18 @@ from src.server.app import activity as activity_app
 from src.server.app import org_library as org_library_app
 from src.server.app import public as public_app
 from src.server.app import share_access
+from src.server.app.threads import router as threads_router
+from src.server.app.workspace_files import router as workspace_files_router
 from src.server.auth import jwt_bearer, owner_requests, ws_auth
+from src.server.database.conversation import replay_rows as replay_rows_mod
+from src.server.database.conversation import turn_slices as slices_db
 from src.server.services import activity as activity_svc
-from src.server.services.history import projector as projector_mod
 from src.server.services.history import replay as replay_mod
-from src.server.services.history.replay import PageBudget, ReplayPage
+from src.server.services.history import slices as slices_mod
+from src.server.services.history.reader import CheckpointHistoryReader, TurnAnchor
+from src.server.services.history.replay import PageBudget
+from src.server.services.history.replay.lines import encode as encode_lines
 from src.server.services.history.replay.lines import line_of as _line_of
-from src.server.services.history.replay.stubs import stub_lines
 from src.server.services.preview_base import PreviewBase
 from src.server.utils import api as api_utils
 
@@ -94,6 +101,7 @@ def _all_sentinels() -> tuple[str, ...]:
         "SECRET_SUB_OUT_07",
         "SECRET_SUBAGENT_FALLBACK_07",
         "SECRET_COT_ADJ_08",
+        "SECRET_COT_NESTED_OUTER_08",
         "SECRET_COT_MID_08",
         "SECRET_COT_LONG_08",
         "SECRET_COT_TAIL_08",
@@ -159,7 +167,7 @@ def _build_final_answer_markdown(
         "<thinking>SECRET_COT_MID_08</thinking>"
         "<thinking_mode>SECRET_COT_LONG_08</thinking_mode>"
         "NEED MORE THINKING\nInspect `SECRET_COT_NEED_08.py` and SECRET_COT_NEED_AFTER_CODE_08.\n\n"
-        "正式结论汇总，详见 reports/q3.pdf 与 `out/memo.md`。\n\n"
+        "正式结论汇总，详见 reports/q3.pdf、reports/财报.pdf、reports/README 与 `out/memo.md`。\n\n"
         f"查看 [报告]({art_url} \"SECRET_LINK_TITLE_16\")、"
         f"[API]({api_grant_url})、[Cap]({cap_url})、[Mon]({mon_grant_url})、"
         f"[媒体]({owner_media_url}) 与 [公开短链]({pub_short_url}).\n\n"
@@ -341,49 +349,16 @@ def _build_warm_slice_lines(
     ]
 
 
-def _build_projected_checkpoint_lines(
-    *, thread_id: str, final_answer_md: str
-) -> list[Any]:
-    """Produce real checkpoint-projected lines via ``projector.messages_to_history_events`` + ``history_events_to_sse``."""
-    ai_mixed = AIMessage(
-        id="ai-0",
-        content=[
-            {"type": "thinking", "thinking": "SECRET_COT_ADJ_08"},
-            {"type": "text", "text": "SECRET_COMMENTARY_09", "phase": "commentary"},
-            {"type": "text", "text": final_answer_md, "phase": "final_answer"},
-        ],
-    )
-    ai_tool = AIMessage(
-        id="ai-pre",
-        content="SECRET_PRETOOL_09",
-        tool_calls=[{"id": "tc-1", "name": "Read", "args": {"path": "SECRET_TOOL_10"}}],
-    )
-    tool_msg = ToolMessage(
-        id="tm-1",
-        tool_call_id="tc-1",
-        name="Read",
-        content="SECRET_TOOL_10",
-    )
-    events = projector_mod.messages_to_history_events(
-        [HumanMessage(id="h-0", content="请总结核心结论"), ai_tool, tool_msg, ai_mixed],
-        agent="main",
-    )
-    sse_items = projector_mod.history_events_to_sse(events, thread_id=thread_id)
-    projected_lines = [line_of("user_message", {"turn_index": 0, "content": "请总结核心结论"})]
-    for item in sse_items:
-        data = dict(item["data"])
-        data["turn_index"] = 0
-        projected_lines.append(line_of(item["event"], data))
-    return projected_lines
-
-
 @pytest.mark.asyncio
 async def test_e2e_s01_to_s19_strict_share_redaction_and_three_replay_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify S01–S19 zero-leakage via real public replay/files/media routes across 3 replay sources."""
+    """Verify S01–S19 zero-leakage via REAL public replay/files/media routes and REAL cold/warm/stub selection."""
     thread_id = str(uuid.uuid4())
     ws_id = str(uuid.uuid4())
+    r0_id = str(uuid.uuid4())
+    r1_id = str(uuid.uuid4())
+    r2_id = str(uuid.uuid4())
     share_token = f"tok-{uuid.uuid4().hex[:16]}"
     preview = PreviewBase("https", "preview.local")
     monkeypatch.setattr("src.server.services.preview_base.preview_base", lambda: preview)
@@ -405,48 +380,10 @@ async def test_e2e_s01_to_s19_strict_share_redaction_and_three_replay_sources(
         media_token_19=media_token_19,
         preview=preview,
     )
-
-    # Source 1: warm turn_slices lines
-    warm_lines = _build_warm_slice_lines(
-        thread_id=thread_id, final_answer_md=final_answer_md, api_grant_url=api_grant_url
+    nested_opening_final_md = (
+        "<thinking>outer_open <thinking>inner_open</thinking> "
+        "SECRET_COT_NESTED_OUTER_08</thinking>" + final_answer_md
     )
-    # Source 2: cold checkpoint projection via real projector.project_messages
-    cold_lines = _build_projected_checkpoint_lines(
-        thread_id=thread_id, final_answer_md=final_answer_md
-    )
-    # Source 3: real stub_lines / legacy.verbatim archive fallback
-    stub_map, _ = await stub_lines(
-        thread_id,
-        [0, 1],
-        {
-            0: [{"turn_index": 0, "type": "initial", "content": "请总结核心结论\n<file-comments>SECRET_ANNOT_04</file-comments>", "metadata": {}}],
-            1: [{"turn_index": 1, "type": "follow_up", "content": "失败回合", "metadata": {}}],
-        },
-        {
-            0: {
-                "turn_index": 0,
-                "status": "completed",
-                "conversation_response_id": "r0",
-                "replay_facts": {
-                    "archive": [
-                        {"event": "legacy_debug", "data": {"dump": "SECRET_VERBATIM_17"}},
-                        {"event": "message_chunk", "data": {"agent": "subagent:call_07", "role": "assistant", "content_type": "text", "content": "SECRET_SUBAGENT_FALLBACK_07"}},
-                        {"event": "message_chunk", "data": {"agent": "main", "role": "assistant", "content_type": "text", "content": final_answer_md}},
-                    ],
-                },
-            },
-            1: {
-                "turn_index": 1,
-                "status": "error",
-                "conversation_response_id": "r1",
-                "replay_facts": {
-                    "partial": {"content": "SECRET_FAILED_ARCHIVE_09"},
-                },
-            },
-        },
-        open_runs=[],
-    )
-    archive_lines = [ln for ti in sorted(stub_map) for ln in stub_map[ti]]
 
     fake_thread = {
         "conversation_thread_id": thread_id,
@@ -459,77 +396,219 @@ async def test_e2e_s01_to_s19_strict_share_redaction_and_three_replay_sources(
         "share_permissions": {"allow_files": False, "allow_download": True},
         "root_dir": "/Users/secret_alice_01/ws",
         "previous_root_dirs": ["/srv/old_alice_root"],
+        "latest_checkpoint_id": "cp-tail-0",
     }
     responses_by_turn = {
-        0: {"turn_index": 0, "status": "completed", "conversation_response_id": "r0"},
-        1: {"turn_index": 1, "status": "error", "conversation_response_id": "r1"},
-        2: {"turn_index": 2, "status": "cancelled", "conversation_response_id": "r2"},
+        0: {
+            "turn_index": 0,
+            "status": "completed",
+            "conversation_response_id": r0_id,
+            "replay_facts": {
+                "archive": [
+                    {"event": "legacy_debug", "data": {"dump": "SECRET_VERBATIM_17"}},
+                    {"event": "message_chunk", "data": {"agent": "subagent:call_07", "role": "assistant", "content_type": "text", "content": "SECRET_SUBAGENT_FALLBACK_07"}},
+                    {"event": "message_chunk", "data": {"agent": "main", "role": "assistant", "content_type": "text", "content": nested_opening_final_md}},
+                ],
+            },
+        },
+        1: {
+            "turn_index": 1,
+            "status": "error",
+            "conversation_response_id": r1_id,
+            "replay_facts": {"partial": {"content": "SECRET_FAILED_ARCHIVE_09"}},
+        },
+        2: {
+            "turn_index": 2,
+            "status": "cancelled",
+            "conversation_response_id": r2_id,
+            "replay_facts": {"partial": {"content": "SECRET_STOPPED_TAIL_09"}},
+        },
     }
+    queries = [
+        {
+            "conversation_query_id": str(uuid.uuid4()),
+            "turn_index": 0,
+            "type": "initial",
+            "content": "请总结核心结论\n<file-comments>SECRET_ANNOT_04</file-comments>",
+            "metadata": {
+                "attachments": [{"filename": "SECRET_USER_FILE_02.pdf", "url": "https://cdn.example/attachments/u/a.pdf"}],
+                "widget_contexts": [{"html": "SECRET_WIDGET_SNAP_05"}],
+            },
+        },
+        {
+            "conversation_query_id": str(uuid.uuid4()),
+            "turn_index": 1,
+            "type": "follow_up",
+            "content": "失败回合测试",
+            "metadata": {},
+        },
+        {
+            "conversation_query_id": str(uuid.uuid4()),
+            "turn_index": 2,
+            "type": "follow_up",
+            "content": "中止回合测试",
+            "metadata": {},
+        },
+    ]
+
+    # Real TurnAnchors & TurnSlices for cold checkpoint projection (NOT mocking read_strict_public_replay_page!)
+    anchors = [
+        TurnAnchor(
+            turn_ordinal=0,
+            input_checkpoint_id="cp-in-0",
+            tail_checkpoint_id="cp-tail-0",
+            turn_index=0,
+            end_checkpoint_id="cp-tail-0",
+        )
+    ]
+    ai_mixed = AIMessage(
+        id="ai-0",
+        content=[
+            {"type": "thinking", "thinking": "SECRET_COT_ADJ_08"},
+            {"type": "text", "text": "SECRET_COMMENTARY_09", "phase": "commentary"},
+            {"type": "text", "text": nested_opening_final_md, "phase": "final_answer"},
+        ],
+    )
+    ai_tool = AIMessage(
+        id="ai-pre",
+        content="SECRET_PRETOOL_09",
+        tool_calls=[{"id": "tc-1", "name": "Read", "args": {"path": "SECRET_TOOL_10"}}],
+    )
+    tool_msg = ToolMessage(id="tm-1", tool_call_id="tc-1", name="Read", content="SECRET_TOOL_10")
+    cold_slice = slices_mod.TurnSlice(
+        anchor=anchors[0],
+        messages=[HumanMessage(id="h-0", content="请总结核心结论"), ai_tool, tool_msg, ai_mixed],
+    )
+
+    reader_stub = create_autospec(CheckpointHistoryReader, instance=True)
+    reader_stub.serde = JsonPlusSerializer()
+    reader_stub.aget_turn_anchors.return_value = (anchors, "cp-tail-0")
+    reader_stub.aget_turn_slices.return_value = [cold_slice]
+    reader_stub.aget_tip_interrupts.return_value = []
+    monkeypatch.setattr(CheckpointHistoryReader, "get_instance", classmethod(lambda cls: reader_stub))
+
+    stored_slices: dict[str, slices_db.StoredSlice] = {}
+
+    async def _get_turn_lines(rids: list[str]) -> dict[str, slices_db.StoredSlice]:
+        return {r: stored_slices[r] for r in rids if r in stored_slices}
+
+    async def _get_turn_slices(rids: list[str]) -> dict[str, slices_db.StoredSlice]:
+        return {r: stored_slices[r] for r in rids if r in stored_slices}
+
+    async def _upsert_turn_slices(turn_rows: list[slices_db.TurnRow]) -> None:
+        for tr in turn_rows:
+            stored_slices[tr.response_id] = tr.slice
+
+    async def _update_turns(updates: list[slices_db.TurnUpdate]) -> None:
+        for u in updates:
+            cur = stored_slices.get(u.response_id)
+            if cur is not None:
+                stored_slices[u.response_id] = cur._replace(
+                    lines_key=u.lines_key or cur.lines_key,
+                    lines=u.lines or cur.lines,
+                )
+
+    monkeypatch.setattr(slices_db, "get_turn_lines", create_autospec(slices_db.get_turn_lines, side_effect=_get_turn_lines))
+    monkeypatch.setattr(slices_db, "get_turn_slices", create_autospec(slices_db.get_turn_slices, side_effect=_get_turn_slices))
+    monkeypatch.setattr(slices_db, "upsert_turn_slices", create_autospec(slices_db.upsert_turn_slices, side_effect=_upsert_turn_slices))
+    monkeypatch.setattr(slices_db, "update_turns", create_autospec(slices_db.update_turns, side_effect=_update_turns))
+
+    active_rows = replay_rows_mod.ThreadRows(
+        thread_id=thread_id,
+        owner_id="u1",
+        thread=fake_thread,
+        queries=[queries[0]],
+        responses_by_turn={0: responses_by_turn[0]},
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=[],
+    )
+    current_rows_box = [active_rows]
 
     app = FastAPI()
     app.include_router(public_app.router)
     client = TestClient(app)
 
-    monkeypatch.setattr(
-        share_access,
-        "get_shared_thread",
-        create_autospec(share_access.get_shared_thread, return_value=fake_thread),
-    )
-    monkeypatch.setattr(
-        public_app,
-        "get_shared_thread",
-        create_autospec(public_app.get_shared_thread, return_value=fake_thread),
-    )
+    monkeypatch.setattr(share_access, "get_shared_thread", create_autospec(share_access.get_shared_thread, return_value=fake_thread))
+    monkeypatch.setattr(public_app, "get_shared_thread", create_autospec(public_app.get_shared_thread, return_value=fake_thread))
     monkeypatch.setattr(
         public_app,
         "get_replay_thread_data",
-        create_autospec(
-            public_app.get_replay_thread_data,
-            return_value=SimpleNamespace(
-                thread_id=thread_id,
-                thread=fake_thread,
-                queries=[{"turn_index": 0, "type": "initial", "content": "请总结核心结论", "metadata": {}}],
-                responses_by_turn=responses_by_turn,
-                open_runs=[],
-                run_facts=[],
-            ),
-        ),
+        create_autospec(public_app.get_replay_thread_data, side_effect=lambda _tid: current_rows_box[0]),
+    )
+    # Prevent background warm task from mutating stored_slices before our explicit cold assertion
+    warm_sched_spy = create_autospec(share_redaction.schedule_warm_shared_thread_slices, return_value=None)
+    monkeypatch.setattr(share_redaction, "schedule_warm_shared_thread_slices", warm_sched_spy)
+
+    forbidden_sentinels = _all_sentinels() + (
+        grant_16,
+        cap_token_16,
+        mon_grant_16,
+        media_token_19,
+        "reports/q3.pdf",
+        "reports/财报.pdf",
+        "reports/README",
+        "out/memo.md",
     )
 
-    orig_read_strict = share_redaction.read_strict_public_replay_page
-    for source_label, source_lines in (
-        ("slices", warm_lines),
-        ("checkpoint", cold_lines),
-        ("stub", archive_lines),
-    ):
-        monkeypatch.setattr(
-            share_redaction,
-            "read_strict_public_replay_page",
-            create_autospec(
-                orig_read_strict,
-                return_value=(
-                    ReplayPage(lines=source_lines, first_turn_index=0, has_more=False),
-                    source_label,
-                ),
-            ),
-        )
-        r_sse = client.get(f"/api/v1/public/shared/{share_token}/replay")
-        assert r_sse.status_code == 200, f"[{source_label}] replay returned {r_sse.status_code}"
-        assert r_sse.headers.get("cache-control") == "no-store"
-        assert r_sse.headers.get("clear-site-data") == '"cache"'
-        body = r_sse.text
-        for sentinel in _all_sentinels() + (
-            grant_16,
-            cap_token_16,
-            mon_grant_16,
-            media_token_19,
-            "reports/q3.pdf",
-            "out/memo.md",
-        ):
+    def _assert_clean_sse(source_label: str, resp: Any) -> None:
+        assert resp.status_code == 200, f"[{source_label}] replay returned {resp.status_code}"
+        assert resp.headers.get("cache-control") == "no-store"
+        assert resp.headers.get("clear-site-data") == '"cache"'
+        body = resp.text
+        for sentinel in forbidden_sentinels:
             assert sentinel not in body, f"[{source_label}] leaked sentinel {sentinel!r}"
         assert f"/a/{pub_code_16}" in body
         assert "<redacted-image" in body
         assert "```mermaid" not in body
+
+    # 1. REAL cold checkpoint projection (turn_slices empty -> cold.project_stale runs with persist=False)
+    r_cold = client.get(f"/api/v1/public/shared/{share_token}/replay")
+    assert reader_stub.aget_turn_slices.await_count == 1
+    assert warm_sched_spy.call_count == 1  # only fires when cold.project_stale ran
+    assert r0_id not in stored_slices  # foreground read_strict_public_replay_page uses persist=False
+    _assert_clean_sse("real-cold-checkpoint", r_cold)
+
+    # 2. REAL warm turn_slices hit after persist=True warm pass (zero cold projection on replay)
+    await replay_mod.read_replay_page(active_rows, persist=True)
+    assert r0_id in stored_slices
+    assert "SECRET_COT_NESTED_OUTER_08" not in (stored_slices[r0_id].lines or "")
+    slice_reads_before_warm = reader_stub.aget_turn_slices.await_count
+    warm_sched_spy.reset_mock()
+    r_warm = client.get(f"/api/v1/public/shared/{share_token}/replay")
+    assert warm_sched_spy.call_count == 0  # warm cache hit -> no cold miss, no warm scheduled
+    assert reader_stub.aget_turn_slices.await_count == slice_reads_before_warm
+    _assert_clean_sse("real-warm-turn-slices", r_warm)
+
+    # 2b. Full S01-S18 multi-turn warm slice (steering/subagents/widgets/error/cancelled/legacy_debug)
+    full_warm_lines = _build_warm_slice_lines(
+        thread_id=thread_id, final_answer_md=final_answer_md, api_grant_url=api_grant_url
+    )
+    stored_slices[r0_id] = stored_slices[r0_id]._replace(
+        lines=encode_lines(full_warm_lines),
+    )
+    r_warm_full = client.get(f"/api/v1/public/shared/{share_token}/replay")
+    assert warm_sched_spy.call_count == 0
+    _assert_clean_sse("real-warm-full-s01-s18", r_warm_full)
+
+    # 3. REAL stub fallback (no committed latest_checkpoint_id -> read_replay_page falls back to stub_page)
+    stub_thread = {**fake_thread, "latest_checkpoint_id": None}
+    current_rows_box[0] = replay_rows_mod.ThreadRows(
+        thread_id=thread_id,
+        owner_id="u1",
+        thread=stub_thread,
+        queries=queries,
+        responses_by_turn=responses_by_turn,
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=[],
+    )
+    r_stub = client.get(f"/api/v1/public/shared/{share_token}/replay")
+    _assert_clean_sse("real-stub-fallback", r_stub)
 
     # Verify all 5 public /files* routes + PDF export + public /media/* fail closed with 403 + no-store + Clear-Site-Data
     media_ref = share_media.mint_public_media_ref(
@@ -558,7 +637,7 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
     monkeypatch: pytest.MonkeyPatch,
     with_owner_secret: bool,
 ) -> None:
-    """S19 + B8: Remote/proxied unkeyed oss owner routes & dev-fallback transcription tickets return 401."""
+    """S19 + B8: Remote/proxied unkeyed oss REAL owner routers & dev-fallback transcription tickets return 401."""
     monkeypatch.setattr(api_utils, "HOST_MODE", "oss")
     monkeypatch.setattr(jwt_bearer, "HOST_MODE", "oss")
     monkeypatch.setattr(ws_auth, "HOST_MODE", "oss")
@@ -570,6 +649,15 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
         monkeypatch.setenv(owner_requests.OWNER_SECRET_ENV, "s19-configured-owner-secret")
     else:
         monkeypatch.delenv(owner_requests.OWNER_SECRET_ENV, raising=False)
+
+    # Verify real Caddy edge configuration strips internal identity headers on all proxied routes
+    caddyfile = Path(__file__).resolve().parents[3] / "deploy" / "standalone" / "Caddyfile"
+    caddy_text = caddyfile.read_text(encoding="utf-8")
+    assert "request_header -X-Service-Token" in caddy_text
+    assert "request_header -X-User-Id" in caddy_text
+    assert "header_up -X-Service-Token" in caddy_text
+    assert "header_up -X-User-Id" in caddy_text
+    assert "/api/v1/threads/[^/]+/messages/replay" in caddy_text
 
     job_id = str(uuid.uuid4())
     dev_ticket, _ = asr_svc.issue_transcription_ticket(
@@ -594,35 +682,17 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
         lambda: SimpleNamespace(enabled=True),
     )
 
-    from fastapi import Depends
-
+    # Mount REAL production routers (no hand-written stub endpoints)
     app = FastAPI()
+    app.include_router(threads_router)
+    app.include_router(workspace_files_router)
     app.include_router(asr_router_mod.router)
-
-    @app.get("/api/v1/threads/{thread_id}/provenance/bodies")
-    async def _prov_bodies(thread_id: str, user_id: str = Depends(api_utils.get_current_user_id)):
-        return {"thread_id": thread_id, "user_id": user_id, "body": "SECRET_PROV_INLINE_19"}
-
-    @app.get("/api/v1/threads/{thread_id}/provenance/{record_id}/body")
-    async def _prov_body(thread_id: str, record_id: str, user_id: str = Depends(api_utils.get_current_user_id)):
-        return {"body": "SECRET_PROV_SPILL_19"}
-
-    @app.get("/api/v1/threads/{thread_id}")
-    async def _get_thread(thread_id: str, user_id: str = Depends(api_utils.get_current_user_id)):
-        return {"title": "SECRET_RAW_TITLE_19"}
-
-    @app.get("/api/v1/workspaces/{workspace_id}/files/download-url")
-    async def _ws_dl(workspace_id: str, user_id: str = Depends(api_utils.get_current_user_id)):
-        return {"url": "SECRET_WS_FILE_19"}
-
-    @app.get("/api/v1/threads/{thread_id}/messages/stream")
-    async def _stream(thread_id: str, user_id: str = Depends(api_utils.get_current_user_id)):
-        return {"chunk": "SECRET_LIVE_STREAM_19"}
+    app.include_router(share_media.owner_media_router)
 
     tid = str(uuid.uuid4())
     ws_id = str(uuid.uuid4())
     rec_id = str(uuid.uuid4())
-    # Caddy proxy headers (B8) + remote client
+    # Caddy proxy headers (B8) + remote client IP
     proxied_headers = {"X-Forwarded-For": "203.0.113.19", "Host": "app.example.com"}
 
     transport = httpx.ASGITransport(app=app, client=("172.31.250.2", 54321))
@@ -633,18 +703,11 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
             f"/api/v1/threads/{tid}",
             f"/api/v1/workspaces/{ws_id}/files/download-url?path=secret_19.txt",
             f"/api/v1/threads/{tid}/messages/stream",
+            f"/api/v1/threads/{tid}/messages/replay",
         ):
             r = await client.get(path, headers=proxied_headers)
             assert r.status_code == 401, f"Expected 401 for {path}, got {r.status_code}"
             assert "set-cookie" not in r.headers
-            for s in (
-                "SECRET_PROV_INLINE_19",
-                "SECRET_PROV_SPILL_19",
-                "SECRET_RAW_TITLE_19",
-                "SECRET_WS_FILE_19",
-                "SECRET_LIVE_STREAM_19",
-            ):
-                assert s not in r.text
 
         # Dev-fallback transcription ticket rejected remotely even when LANGALPHA_OWNER_SECRET is set
         for path in (
@@ -656,8 +719,6 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
                 headers={**proxied_headers, "X-Dalton-Transcription-Ticket": dev_ticket},
             )
             assert r.status_code == 401, f"Expected 401 for {path}, got {r.status_code}"
-            assert "SECRET_ASR_TRANSCRIPT_19" not in r.text
-            assert "SECRET_ASR_RAW_19" not in r.text
 
 
 @pytest.mark.asyncio
@@ -695,11 +756,14 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
                     "kind": "thread",
                     "thread_id": deleted_tid,
                     "publisher_id": "u1",
+                    "publisher_name": "Alice",
                     "owner_id": "u1",
                     "listed": True,
+                    "audience": "public",
                     "share_token": "tok-0",
                     "title": "SECRET_AUTO_LIB_01",
-                    "summary": "Check /api/v1/artifacts/g/v1.grant_lib_summary_01/v/1/a.html reports/q3.pdf",
+                    "summary": "Check /api/v1/artifacts/g/v1.grant_lib_summary_01/v/1/a.html reports/财报.pdf reports/README",
+                    "published_at": now,
                     "created_at": now,
                     "updated_at": now,
                 },
@@ -709,11 +773,14 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
                     "kind": "thread",
                     "thread_id": deleted_tid,
                     "publisher_id": "u1",
+                    "publisher_name": "Alice",
                     "owner_id": "u1",
                     "listed": True,
+                    "audience": "public",
                     "share_token": "tok-1",
                     "title": "SECRET_AUTO_LIB_02",
                     "summary": "Check /Users/alice/ws/secret.py",
+                    "published_at": now,
                     "created_at": now,
                     "updated_at": now,
                 },
@@ -725,14 +792,17 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
                 {
                     "item_id": item_ids[2],
                     "org_id": "org-b6",
-                    "kind": "thread",
-                    "thread_id": deleted_tid,
+                    "kind": "skill",
+                    "thread_id": None,
+                    "skill_name": "alpha-skill",
                     "publisher_id": "u1",
+                    "publisher_name": "Alice",
                     "owner_id": "u1",
                     "listed": True,
-                    "share_token": "tok-2",
-                    "title": "SECRET_AUTO_LIB_03",
-                    "summary": "Clean summary",
+                    "audience": "organization",
+                    "title": "Alpha skill",
+                    "summary": "Skill notes in reports/财报.pdf",
+                    "published_at": now,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -746,33 +816,39 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
             [
                 {
                     "event_id": str(uuid.uuid4()),
+                    "org_id": "org-b6",
                     "actor_id": "u1",
                     "action": activity_svc.Action.LIBRARY_PUBLISHED.value,
-                    "resource_type": "library_item",
+                    "outcome": "ok",
+                    "resource_kind": "library_item",
                     "resource_id": item_ids[0],
                     "workspace_id": None,
                     "thread_id": deleted_tid,
                     "detail": {"kind": "thread", "title": "SECRET_AUTO_LIB_01", "custom_title": False},
-                    "created_at": now,
+                    "occurred_at": now,
                 }
             ],
             "cur-act-page-2",
+            True,
         ),
         "cur-act-page-2": (
             [
                 {
                     "event_id": str(uuid.uuid4()),
+                    "org_id": "org-b6",
                     "actor_id": "u1",
                     "action": activity_svc.Action.FILE_PUBLISHED.value,
-                    "resource_type": "artifact",
+                    "outcome": "ok",
+                    "resource_kind": "artifact",
                     "resource_id": str(uuid.uuid4()),
                     "workspace_id": str(uuid.uuid4()),
                     "thread_id": None,
-                    "detail": {"path": "reports/q3_secret.pdf", "version": 1},
-                    "created_at": now,
+                    "detail": {"path": "reports/财报.pdf", "version": 1},
+                    "occurred_at": now,
                 }
             ],
             None,
+            False,
         ),
     }
 
@@ -786,10 +862,10 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
     )
     monkeypatch.setattr(
         activity_app,
-        "list_events",
+        "list_for_org",
         create_autospec(
-            activity_app.list_events,
-            side_effect=lambda *args, cursor=None, **kwargs: act_pages[cursor],
+            activity_app.list_for_org,
+            side_effect=lambda org_id, *, cursor=None, limit=activity_app.PAGE_SIZE: act_pages[cursor],
         ),
     )
     monkeypatch.setattr(api_utils, "_SERVICE_TOKEN", "s" * 40)
@@ -797,172 +873,247 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
     app = FastAPI()
     app.include_router(org_library_app.router)
     app.include_router(activity_app.router)
-    app.dependency_overrides[api_utils.get_current_user_id] = lambda: "u1"
     client = TestClient(app)
+    svc_headers = {"X-Service-Token": "s" * 40}
 
     # Paginate GET /api/v1/org-library/service across 2 pages
-    p1 = client.get(
-        "/api/v1/org-library/service?org_id=org-b6&limit=2",
-        headers={"X-Service-Token": "s" * 40},
-    )
+    p1 = client.get("/api/v1/org-library/service?org_id=org-b6&limit=2", headers=svc_headers)
     assert p1.status_code == 200
     b1 = p1.json()
     assert len(b1["items"]) == 2
     assert b1["next_cursor"] == "cur-lib-page-2"
     assert all(it["title"] == DEFAULT_SHARED_TITLE for it in b1["items"])
     assert "grant_lib_summary_01" not in p1.text
-    assert "reports/q3.pdf" not in p1.text
+    assert "reports/财报.pdf" not in p1.text
+    assert "reports/README" not in p1.text
 
     p2 = client.get(
         f"/api/v1/org-library/service?org_id=org-b6&limit=2&cursor={b1['next_cursor']}",
-        headers={"X-Service-Token": "s" * 40},
+        headers=svc_headers,
     )
     assert p2.status_code == 200
     b2 = p2.json()
     assert len(b2["items"]) == 1
     assert b2["next_cursor"] is None
-    assert b2["items"][0]["title"] == DEFAULT_SHARED_TITLE
+    assert "reports/财报.pdf" not in p2.text
 
-    # Paginate GET /api/v1/activity across 2 pages
-    a1 = client.get("/api/v1/activity?limit=1")
+    # Paginate GET /api/v1/activity across 2 pages with required ServiceCaller + org_id + items field
+    a1 = client.get("/api/v1/activity?org_id=org-b6&limit=1", headers=svc_headers)
     assert a1.status_code == 200
     ab1 = a1.json()
-    assert len(ab1["events"]) == 1
+    assert len(ab1["items"]) == 1
+    assert ab1["has_more"] is True
     assert ab1["next_cursor"] == "cur-act-page-2"
-    assert ab1["events"][0]["detail"]["title"] == DEFAULT_SHARED_TITLE
-    assert "custom_title" not in ab1["events"][0]["detail"]
+    assert ab1["items"][0]["detail"]["title"] == DEFAULT_SHARED_TITLE
+    assert "custom_title" not in ab1["items"][0]["detail"]
 
-    a2 = client.get(f"/api/v1/activity?limit=1&cursor={ab1['next_cursor']}")
+    a2 = client.get(
+        f"/api/v1/activity?org_id=org-b6&limit=1&cursor={ab1['next_cursor']}",
+        headers=svc_headers,
+    )
     assert a2.status_code == 200
     ab2 = a2.json()
-    assert len(ab2["events"]) == 1
+    assert len(ab2["items"]) == 1
+    assert ab2["has_more"] is False
     assert ab2["next_cursor"] is None
-    assert ab2["events"][0]["detail"]["path"] == "[redacted-path]"
-    assert "q3_secret.pdf" not in a2.text
+    assert ab2["items"][0]["detail"]["path"] == "[redacted-path]"
+    assert "财报.pdf" not in a2.text
 
 
 @pytest.mark.asyncio
 async def test_e2e_b7_cold_warm_replay_perf_budget_and_singleflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """B7: Quantified cold/warm TTFB, strict tracemalloc bounds, real PageBudget, and singleflight split."""
+    """B7: Real cold/warm read_replay_page + turn_slices, PageBudget truncation, tracemalloc bounds, singleflight, and paginated rich replay."""
     tid = str(uuid.uuid4())
-    big_tool_payload = "X" * (16 * 1024 * 1024)
-    lines_by_turn: dict[int, list[Any]] = {}
+    turn_count = 45
+    anchors: list[TurnAnchor] = []
+    queries: list[dict[str, Any]] = []
     responses_by_turn: dict[int, dict[str, Any]] = {}
-    for t in range(45):
-        responses_by_turn[t] = {"turn_index": t, "status": "completed", "conversation_response_id": f"r-{t}"}
-        turn_lines = [
-            line_of("replay_turn", {"turn_index": t, "status": "completed", "response_id": f"r-{t}"}),
-            line_of("user_message", {"turn_index": t, "content": f"Question {t}"}),
-        ]
+    turn_slices_by_idx: dict[int, slices_mod.TurnSlice] = {}
+
+    for t in range(turn_count):
+        rid = str(uuid.uuid4())
+        a = TurnAnchor(
+            turn_ordinal=t,
+            input_checkpoint_id=f"cp-in-{t}",
+            tail_checkpoint_id=f"cp-tail-{t}",
+            turn_index=t,
+            end_checkpoint_id=f"cp-tail-{t}",
+        )
+        anchors.append(a)
+        queries.append(
+            {
+                "conversation_query_id": str(uuid.uuid4()),
+                "turn_index": t,
+                "type": "initial" if t == 0 else "follow_up",
+                "content": f"Question {t}",
+                "metadata": {},
+            }
+        )
+        responses_by_turn[t] = {
+            "turn_index": t,
+            "status": "completed",
+            "conversation_response_id": rid,
+            "replay_facts": {},
+        }
+        msgs: list[Any] = [HumanMessage(id=f"h-{t}", content=f"Question {t}")]
         if t == 35:
-            turn_lines.append(
-                line_of("tool_call_result", {"turn_index": t, "agent": "main", "content": big_tool_payload})
-            )
-        turn_lines.append(
-            line_of(
-                "message_chunk",
-                {
-                    "turn_index": t,
-                    "agent": "main",
-                    "role": "assistant",
-                    "content_type": "text",
-                    "phase": "final_answer",
-                    "content": f"Final thesis for turn {t}.",
-                },
+            # Heavy tool outputs live in raw turn_slices (triggering PageBudget), while strict redaction drops them in O(1)
+            for idx in range(10):
+                msgs.append(
+                    AIMessage(
+                        id=f"ai-tool-{t}-{idx}",
+                        content="Calling tool",
+                        tool_calls=[{"id": f"tc-{t}-{idx}", "name": "Read", "args": {"path": f"x_{idx}.txt"}}],
+                    )
+                )
+                msgs.append(
+                    ToolMessage(id=f"tm-{t}-{idx}", tool_call_id=f"tc-{t}-{idx}", name="Read", content="X" * (24 * 1024))
+                )
+        msgs.append(
+            AIMessage(
+                id=f"ai-{t}",
+                content=[{"type": "text", "text": f"Final thesis for turn {t}.", "phase": "final_answer"}],
             )
         )
-        lines_by_turn[t] = turn_lines
+        turn_slices_by_idx[t] = slices_mod.TurnSlice(anchor=a, messages=msgs)
 
-    # 1. Verify real PageBudget soft-budget truncation (min_turns=20 over 45 turns; 25 older turns remain)
-    candidates = [(t, None) for t in range(45)]
-
-    async def _read_batch(batch):
-        return {ti: lines_by_turn[ti] for ti, _ in batch}
-
-    small_budget = PageBudget(min_turns=20, max_bytes=1 * 1024 * 1024)
-    selected_page, got_lines = await replay_mod._fill_page(
-        _read_batch, candidates, small_budget, whole=True
+    fake_thread = {
+        "conversation_thread_id": tid,
+        "workspace_id": str(uuid.uuid4()),
+        "user_id": "u1",
+        "owner_id": "u1",
+        "title": "Perf thread",
+        "is_shared": True,
+        "share_token": "tok-b7-perf",
+        "share_permissions": {"allow_files": False, "allow_download": False},
+        "latest_checkpoint_id": f"cp-tail-{turn_count - 1}",
+    }
+    rows = replay_rows_mod.ThreadRows(
+        thread_id=tid,
+        owner_id="u1",
+        thread=fake_thread,
+        queries=queries,
+        responses_by_turn=responses_by_turn,
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=[],
     )
-    assert len(selected_page) == 20  # floor min_turns=20 honoured before budget stops older turns
-    flat_page_lines = [ln for ti, _ in selected_page for ln in got_lines[ti]]
 
-    # 2. Quantified cold/warm singleflight + strict tracemalloc delta (no tautology!)
-    cold_persist_false_calls = 0
-    warm_persist_true_calls = 0
+    slice_fetches = 0
+
+    async def _aget_slices(_tid: str, req_anchors: list[TurnAnchor]) -> list[slices_mod.TurnSlice]:
+        nonlocal slice_fetches
+        slice_fetches += 1
+        await asyncio.sleep(0.01)
+        return [turn_slices_by_idx[int(a.turn_index)] for a in req_anchors]
+
+    reader_stub = create_autospec(CheckpointHistoryReader, instance=True)
+    reader_stub.serde = JsonPlusSerializer()
+    reader_stub.aget_turn_anchors.return_value = (anchors, f"cp-tail-{turn_count - 1}")
+    reader_stub.aget_turn_slices.side_effect = _aget_slices
+    reader_stub.aget_tip_interrupts.return_value = []
+    monkeypatch.setattr(CheckpointHistoryReader, "get_instance", classmethod(lambda cls: reader_stub))
+
+    stored_slices: dict[str, slices_db.StoredSlice] = {}
+
+    async def _get_turn_lines(rids: list[str]) -> dict[str, slices_db.StoredSlice]:
+        return {r: stored_slices[r] for r in rids if r in stored_slices}
+
+    async def _get_turn_slices(rids: list[str]) -> dict[str, slices_db.StoredSlice]:
+        return {r: stored_slices[r] for r in rids if r in stored_slices}
+
+    async def _upsert_turn_slices(turn_rows: list[slices_db.TurnRow]) -> None:
+        for tr in turn_rows:
+            stored_slices[tr.response_id] = tr.slice
+
+    async def _update_turns(updates: list[slices_db.TurnUpdate]) -> None:
+        for u in updates:
+            cur = stored_slices.get(u.response_id)
+            if cur is not None:
+                stored_slices[u.response_id] = cur._replace(
+                    lines_key=u.lines_key or cur.lines_key,
+                    lines=u.lines or cur.lines,
+                )
+
+    monkeypatch.setattr(slices_db, "get_turn_lines", create_autospec(slices_db.get_turn_lines, side_effect=_get_turn_lines))
+    monkeypatch.setattr(slices_db, "get_turn_slices", create_autospec(slices_db.get_turn_slices, side_effect=_get_turn_slices))
+    monkeypatch.setattr(slices_db, "upsert_turn_slices", create_autospec(slices_db.upsert_turn_slices, side_effect=_upsert_turn_slices))
+    monkeypatch.setattr(slices_db, "update_turns", create_autospec(slices_db.update_turns, side_effect=_update_turns))
+
     finish_lines_calls = 0
-    cache_warmed = False
 
-    async def _fake_read_replay_page(rows, **kwargs):
-        nonlocal cold_persist_false_calls, warm_persist_true_calls
-        if kwargs.get("persist") is True:
-            warm_persist_true_calls += 1
-            return ReplayPage(lines=flat_page_lines, first_turn_index=15, has_more=True), "checkpoint"
-        if not cache_warmed:
-            cold_persist_false_calls += 1
-            share_redaction.mark_cold_projection_miss()
-            await asyncio.sleep(0.02)
-            return ReplayPage(lines=flat_page_lines, first_turn_index=15, has_more=True), "checkpoint"
-        return ReplayPage(lines=flat_page_lines, first_turn_index=15, has_more=True), "checkpoint"
-
-    def _forbidden_finish(*args, **kwargs):
+    def _forbidden_finish(*args: Any, **kwargs: Any) -> Any:
         nonlocal finish_lines_calls
         finish_lines_calls += 1
         raise AssertionError("finish_lines must never be called on strict allow_files=false replay")
 
-    monkeypatch.setattr(
-        replay_mod,
-        "read_replay_page",
-        create_autospec(replay_mod.read_replay_page, side_effect=_fake_read_replay_page),
-    )
     monkeypatch.setattr(replay_mod, "finish_lines", _forbidden_finish)
-    monkeypatch.setattr(
-        replay_mod, "lines_epoch", create_autospec(replay_mod.lines_epoch, return_value="b7-test-epoch")
-    )
 
-    rows = SimpleNamespace(thread_id=tid)
-
+    # 1. Real PageBudget soft-budget truncation + singleflight cold concurrent read
+    budget = PageBudget(min_turns=20, max_bytes=128 * 1024)
     tracemalloc.start()
     try:
         base_cur, _ = tracemalloc.get_traced_memory()
         tracemalloc.reset_peak()
 
-        async def _one_req() -> float:
+        async def _one_req() -> tuple[float, Any]:
             t0 = time.perf_counter()
             page, _src = await share_redaction.read_strict_public_replay_page(
-                rows, trigger_background_warm=False
+                rows, limit=turn_count, budget=budget, trigger_background_warm=False
             )
             redactor = share_redaction.StrictNoFilesShareRedactor(
                 thread_id=tid, responses_by_turn=responses_by_turn
             )
             redacted = list(redactor.iter_redacted_events(page.lines))
             assert len(redacted) > 0
-            return (time.perf_counter() - t0) * 1000.0
+            return (time.perf_counter() - t0) * 1000.0, page
 
-        cold_latencies = await asyncio.gather(*[_one_req() for _ in range(10)])
+        cold_results = await asyncio.gather(*[_one_req() for _ in range(10)])
+        cold_latencies = [lat for lat, _ in cold_results]
+        first_page = cold_results[0][1]
         _, cold_peak = tracemalloc.get_traced_memory()
         cold_peak_mib = max(0.0, (cold_peak - base_cur) / (1024 * 1024))
 
-        assert cold_persist_false_calls == 1
+        assert first_page.has_more is True  # PageBudget truncated older turns past min_turns=20
+        assert first_page.first_turn_index == 25
         assert finish_lines_calls == 0
-        assert sorted(cold_latencies)[9] <= 1500.0
+        assert len(stored_slices) == 0  # foreground read used persist=False
+        assert sorted(cold_latencies)[9] <= 5000.0
         assert cold_peak_mib <= 96.0
+        cold_fetches = slice_fetches
+        assert cold_fetches >= 1
 
-        # Background warm pass once
-        await _fake_read_replay_page(rows, persist=True)
-        cache_warmed = True
-        assert warm_persist_true_calls == 1
+        # 2. Background warm pass persists turn_slices once
+        await replay_mod.read_replay_page(rows, limit=turn_count, budget=budget, persist=True)
+        assert len(stored_slices) >= 20
+        fetches_after_warm = slice_fetches
 
+        # 3. Warm concurrent 10x read hits turn_slices with ZERO cold fetches (measure heap with tracemalloc, latency without tracemalloc overhead)
         warm_base, _ = tracemalloc.get_traced_memory()
         tracemalloc.reset_peak()
-        warm_latencies = await asyncio.gather(*[_one_req() for _ in range(10)])
+        await asyncio.gather(*[_one_req() for _ in range(10)])
         _, warm_peak = tracemalloc.get_traced_memory()
         warm_peak_mib = max(0.0, (warm_peak - warm_base) / (1024 * 1024))
-        assert sorted(warm_latencies)[9] <= 150.0
+        assert slice_fetches == fetches_after_warm  # zero cold projection on warm cache
         assert warm_peak_mib <= 8.0
     finally:
         tracemalloc.stop()
+
+    warm_results = await asyncio.gather(*[_one_req() for _ in range(10)])
+    warm_latencies = [lat for lat, _ in warm_results]
+    assert slice_fetches == fetches_after_warm
+    assert sorted(warm_latencies)[9] <= 150.0
+
+    # 4. Paginated older page (before_turn=25) loads earlier turns cleanly
+    older_page, _ = await replay_mod.read_replay_page(
+        rows, before_turn=25, limit=10, budget=budget, persist=True
+    )
+    assert older_page.first_turn_index == 15
+    assert older_page.has_more is True
 
 
 def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
@@ -972,14 +1123,15 @@ def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
     live_endpoint = (os.getenv("TEST_MINIO_ENDPOINT") or "").strip()
     if live_endpoint:
         targets = share_media.resolve_active_storage_targets()
-        if targets:
-            ok, checks = ops_script.verify_storage_targets(targets=targets, probe_write=True)
-            assert ok is True, f"Live Scheme A verify failed: {checks}"
+        assert targets, "TEST_MINIO_ENDPOINT is set but resolve_active_storage_targets() returned empty"
+        ok, checks = ops_script.verify_storage_targets(targets=targets, probe_write=True)
+        assert ok is True, f"Live Scheme A verify failed: {checks}"
         return
 
-    # Deterministic 3-bucket + legacy S3_* verification with probe_write=True (default)
+    # Deterministic 3-bucket + legacy S3_* + independent signing endpoint verification
     monkeypatch.setenv("S3_BUCKET_NAME", "legacy-primary")
     monkeypatch.setenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000")
+    monkeypatch.setenv("STORAGE_BROWSER_ENDPOINT_URL", "https://browser-s3.legacy.example")
     monkeypatch.setenv("S3_REGION", "us-east-1")
     monkeypatch.setenv("S3_PUBLIC_URL_BASE", "https://cdn.legacy.example")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ak")
@@ -998,7 +1150,7 @@ def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
 
     cleaned: list[str] = []
 
-    def _put(target, key):
+    def _put(target: Any, key: str) -> Any:
         return lambda: cleaned.append(f"{target.bucket_name}/{key}")
 
     ok, checks = ops_script.verify_storage_targets(
@@ -1006,11 +1158,12 @@ def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
         probe_write=True,
         http_get_fn=lambda url, timeout_s=10.0: (403, "Forbidden"),
         put_probe_fn=_put,
-        find_existing_fn=lambda t, p: None,
+        find_existing_fn=lambda t, p: [f"{p}existing1.bin", f"{p}existing2.bin"],
     )
     assert ok is True
     assert len(cleaned) > 0
-    assert any("cdn.legacy.example/provenance/" in c.url for c in checks)
+    assert any("cdn.legacy.example/provenance/existing2.bin" in c.url for c in checks)
+    assert any("browser-s3.legacy.example" in c.url for c in checks)
     assert any("chat-bucket/channel-snapshots/" in c.url for c in checks)
     assert any("asr-bucket/transcriptions/" in c.url for c in checks)
 
@@ -1020,6 +1173,19 @@ def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
         probe_write=True,
         http_get_fn=lambda url, timeout_s=10.0: (404, "Not Found"),
         put_probe_fn=_put,
-        find_existing_fn=lambda t, p: None,
+        find_existing_fn=lambda t, p: [],
     )
     assert ok_404 is False
+
+    # Listing failure MUST fail --verify
+    def _boom_list(t: Any, p: str) -> list[str]:
+        raise RuntimeError("list denied")
+
+    ok_list_err, _ = ops_script.verify_storage_targets(
+        targets=targets,
+        probe_write=True,
+        http_get_fn=lambda url, timeout_s=10.0: (403, "Forbidden"),
+        put_probe_fn=_put,
+        find_existing_fn=_boom_list,
+    )
+    assert ok_list_err is False

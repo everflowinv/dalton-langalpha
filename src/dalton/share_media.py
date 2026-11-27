@@ -507,7 +507,7 @@ def _is_ip_or_local_host(host: str) -> bool:
     cleaned = (host or "").strip().lower().strip("[]")
     if not cleaned:
         return False
-    if cleaned == "localhost" or cleaned.endswith(".localhost"):
+    if cleaned == "localhost" or cleaned.endswith(".localhost") or "." not in cleaned:
         return True
     try:
         ipaddress.ip_address(cleaned)

@@ -270,29 +270,18 @@ def open_multipart_upload(object_key: str, *, content_type: str) -> str | None:
         raise ValueError(f"Refusing non-chat-upload object key: {object_key!r}")
     if not _has_dedicated_env():
         return _store.open_multipart_upload(object_key, content_type=content_type)
-    from src.dalton.share_media import is_acl_not_supported_error, storage_private_acl_kwargs
+    from src.dalton.share_media import s3_create_multipart_with_private_acl
 
-    acl_kwargs = storage_private_acl_kwargs(
-        object_key, provider="s3", endpoint_url=_endpoint_url()
-    )
-    params: dict[str, Any] = {
-        "Bucket": _bucket_name(),
-        "Key": resolve_full_key(object_key),
-        "ContentType": content_type,
-        **acl_kwargs,
-    }
     try:
-        created = _get_client().create_multipart_upload(**params)
+        created = s3_create_multipart_with_private_acl(
+            _get_client(),
+            bucket=_bucket_name(),
+            key=resolve_full_key(object_key),
+            content_type=content_type,
+            endpoint_url=_endpoint_url(),
+        )
         return created["UploadId"]
     except Exception as exc:
-        if acl_kwargs and is_acl_not_supported_error(exc):
-            params.pop("ACL", None)
-            try:
-                created = _get_client().create_multipart_upload(**params)
-                return created["UploadId"]
-            except Exception as retry_exc:
-                logger.error("Failed to open a multipart upload for %s: %s", object_key, retry_exc)
-                return None
         logger.error("Failed to open a multipart upload for %s: %s", object_key, exc)
         return None
 
