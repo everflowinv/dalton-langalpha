@@ -1375,6 +1375,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     const res = await sendCardFeishu(client, {
       to: target,
       card: normalizedCard,
+      fallbackSourceCard: options.fallbackSourceCard ?? resolvedCard,
       replyToMessageId: options.replyToMessageId,
       replyInThread: options.replyInThread,
       webBaseUrl: options.webBaseUrl,
@@ -1385,7 +1386,12 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     return {
       messageId: res.messageId,
       resolvedAddress: options.targetAddress,
-      ...(res.usedMarkdownFallback ? { usedMarkdownFallback: true } : {}),
+      ...(res.usedMarkdownFallback
+        ? {
+            usedMarkdownFallback: true,
+            markdownFallbackLinkCount: res.markdownFallbackLinkCount ?? 0,
+          }
+        : {}),
     };
   }
 

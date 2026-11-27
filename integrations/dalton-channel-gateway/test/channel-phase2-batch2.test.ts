@@ -4341,11 +4341,21 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     });
 
     // Fallback card dropped the image, wrote the verified chart link into markdown,
-    // and accounted as sentLinks=1 (not sentImages=1).
+    // settled as `partial` with the messageId, and accounted as sentLinks=1 (not sentImages=1).
     expect(resWithLink.settled).toBe(true);
     expect(resWithLink.delivered).toBe(true);
     expect(resWithLink.sentImages).toBe(0);
     expect(resWithLink.sentLinks).toBe(1);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-with-link",
+        status: "partial",
+        outcome: "partial",
+        sent_chunks: 1,
+        platform_message_ids: ["om_chart_fb_ok"],
+      }),
+      { platform: "feishu" },
+    );
     expect(sentPayloads).toHaveLength(2);
     const fallbackEl = (
       sentPayloads[1]!.body as { elements: Array<{ tag: string; content: string }> }
@@ -4354,7 +4364,9 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     expect(fallbackEl.content).toContain(`(${expectedUrl})`);
     expect(fallbackEl.content).toContain("打开网页交互版");
 
-    // Without a verified web URL, fallback drops the image with no link -> sentImages=0, sentLinks=0, failed
+    // Without a verified web URL, Feishu still returned a fallback messageId ->
+    // settle as `partial` with messageId preserved, sentImages=0, sentLinks=0,
+    // and replay must NOT re-claim or re-send the same delivery_key.
     let noUrlAttempt = 0;
     const noUrlClient = {
       im: {
@@ -4380,7 +4392,42 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
       outgoingOnly: true,
       client: noUrlClient,
     });
+    const noUrlLedger = new Map<string, string>();
     const backendNoUrl = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = noUrlLedger.get(req.delivery_key);
+        if (existing === "sent" || existing === "partial") {
+          return {
+            claim_status: "already_completed" as const,
+            status: existing as "sent" | "partial",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+          };
+        }
+        noUrlLedger.set(req.delivery_key, "in_flight");
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status) {
+          noUrlLedger.set(req.delivery_key, req.status);
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "in_flight",
+          sent_to_current_count: 0,
+        };
+      }),
       downloadChartSnapshot: vi.fn(async () => ({
         content: PNG_BYTES,
         filename: "chart_layer-1.png",
@@ -4409,17 +4456,202 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
         },
       ],
     });
-    expect(noUrlAttempt).toBe(2); // No extra resend
-    expect(resNoLink.settled).toBe(false);
+    expect(noUrlAttempt).toBe(2); // 1 initial (200621) + 1 fallback (ok)
+    expect(resNoLink.settled).toBe(true);
+    expect(resNoLink.delivered).toBe(false);
     expect(resNoLink.sentImages).toBe(0);
     expect(resNoLink.sentLinks).toBe(0);
     expect(backendNoUrl.updateDeliveryProgress).toHaveBeenCalledWith(
       expect.objectContaining({
         delivery_key: "charts:run-chart-fb-no-link",
-        status: "failed",
+        status: "partial",
+        outcome: "partial",
         sent_chunks: 0,
+        platform_message_ids: ["om_chart_fb_nolink"],
       }),
       { platform: "feishu" },
     );
+
+    // Replay on the same delivery_key must see `already_completed` (`partial`) and NOT re-send
+    const replayNoLink = await deliverTurnChartsAndWidgets({
+      backend: backendNoUrl,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuNoUrl]]),
+      webBaseUrl: null,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-no-link",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(replayNoLink.settled).toBe(true);
+    expect(noUrlAttempt).toBe(2);
+  });
+
+  it("does not count sentLinks when app.localhost deep link is stripped during Feishu 200621 fallback and settles as partial", async () => {
+    const selfHostedBase = "http://app.localhost:3000";
+    // Chart deep-link builder generates a URL for app.localhost,
+    // which card-normalize strips as a local hostname during 200621 fallback.
+    const generatedUrl = buildChartLayerDeepLink(
+      selfHostedBase,
+      THREAD_ID,
+      "NVDA:1day",
+      "layer-1",
+    );
+    expect(generatedUrl).toContain("http://app.localhost:3000/");
+
+    const sentPayloads: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const fakeClient = {
+      im: {
+        image: {
+          create: vi.fn(async () => ({ image_key: "img_app_localhost" })),
+        },
+        message: {
+          create: vi.fn(async (req: { data?: { content?: string } }) => {
+            attempt += 1;
+            if (req.data?.content) {
+              sentPayloads.push(JSON.parse(req.data.content));
+            }
+            if (attempt === 1) {
+              return { code: 200621, msg: "parse card json err" };
+            }
+            return { code: 0, data: { message_id: "om_chart_app_localhost_fb" } };
+          }),
+          reply: vi.fn(),
+        },
+      },
+    } as unknown as import("@larksuiteoapi/node-sdk").Client;
+
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client: fakeClient,
+    });
+    const ledger = new Map<string, string>();
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = ledger.get(req.delivery_key);
+        if (existing === "sent" || existing === "partial") {
+          return {
+            claim_status: "already_completed" as const,
+            status: existing as "sent" | "partial",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+          };
+        }
+        ledger.set(req.delivery_key, "in_flight");
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status) {
+          ledger.set(req.delivery_key, req.status);
+        }
+        return {
+          ok: true,
+          delivery_key: req.delivery_key,
+          status: req.status ?? "in_flight",
+          sent_to_current_count: 0,
+        };
+      }),
+      downloadChartSnapshot: vi.fn(async () => ({
+        content: PNG_BYTES,
+        filename: "chart_layer-1.png",
+        mimeType: "image/png",
+      })),
+    });
+
+    const res = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: selfHostedBase,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-app-localhost",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+
+    expect(attempt).toBe(2);
+    expect(sentPayloads).toHaveLength(2);
+    expect(JSON.stringify(sentPayloads[0])).toContain("app.localhost:3000");
+    const fallbackMd = (
+      sentPayloads[1]!.body as { elements: Array<{ tag: string; content: string }> }
+    ).elements[0]!.content;
+    expect(fallbackMd).not.toContain("app.localhost");
+    expect(fallbackMd).not.toContain("打开网页交互版");
+
+    // Link was stripped during fallback -> sentLinks MUST be 0, settled as partial with messageId preserved
+    expect(res.settled).toBe(true);
+    expect(res.delivered).toBe(false);
+    expect(res.sentImages).toBe(0);
+    expect(res.sentLinks).toBe(0);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery_key: "charts:run-chart-fb-app-localhost",
+        status: "partial",
+        outcome: "partial",
+        sent_chunks: 0,
+        platform_message_ids: ["om_chart_app_localhost_fb"],
+      }),
+      { platform: "feishu" },
+    );
+
+    // Replay must NOT re-claim or re-send
+    const replayRes = await deliverTurnChartsAndWidgets({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: selfHostedBase,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-chart-fb-app-localhost",
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      outboundBlocked: false,
+      charts: [{ chartId: "NVDA:1day", layerId: "layer-1", title: "NVDA 支撑位" }],
+      initialSnapshots: [
+        {
+          artifact_type: "chart_layer",
+          status: "ready",
+          chart_id: "NVDA:1day",
+          layer_id: "layer-1",
+          snapshot_key: SNAP_KEY,
+        },
+      ],
+    });
+    expect(replayRes.settled).toBe(true);
+    expect(attempt).toBe(2);
   });
 });

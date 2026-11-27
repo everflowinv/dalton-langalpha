@@ -180,6 +180,8 @@ export interface SendCardOptions {
   webBaseUrl?: string | null;
   threadId?: string | null;
   workspaceId?: string | null;
+  /** Optional pre-normalization card source for 200621 markdown fallback so plain_text elements stay escaped. */
+  fallbackSourceCard?: Record<string, unknown>;
   /** Optional DM recipient re-verification called after image upload and before card dispatch. */
   verifyRecipientBeforeSend?: () => Promise<void>;
 }
@@ -189,6 +191,8 @@ export interface SendCardResult {
   resolvedAddress?: string;
   /** True when the card fell back to a minimal markdown-only card (e.g. Feishu 200621), stripping images and buttons. */
   usedMarkdownFallback?: boolean;
+  /** Number of verified public links actually retained in the final markdown fallback body. */
+  markdownFallbackLinkCount?: number;
 }
 
 export interface DownloadedAttachment {

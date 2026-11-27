@@ -6,6 +6,7 @@
  */
 
 import { rewriteSandboxLinks } from "../../shared/sandbox-links.js";
+import { parseChannelMarkdown, type MdastNode } from "../../shared/text.js";
 import {
   escapeFeishuCardMarkdownText,
   FEISHU_CARD_MAX_BYTES,
@@ -282,21 +283,15 @@ export function escapePlainTextForFeishuMarkdown(text: string): string {
   }
   let out = text
     .replace(/\\/g, "\\\\")
-    .replace(/([`*~[\]()|!<>])/g, "\\$1")
+    .replace(/([`*~[\]()|!])/g, "\\$1")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
     .replace(/(?<![A-Za-z0-9/])_|_(?![A-Za-z0-9/])/g, "\\_");
   out = out
     .replace(/^([ \t]*)(#{1,6})(?=[ \t]|$)/gm, "$1\\$2")
     .replace(/^([ \t]*)([-+])(?=[ \t])/gm, "$1\\$2")
     .replace(/^([ \t]*\d+)\.(?=[ \t])/gm, "$1\\.");
   return out;
-}
-
-function convertEscapedAnglesToEntities(text: string): string {
-  return text.replace(
-    /(^|[^\\])((?:\\\\)*)\\([<>])/g,
-    (_match, prefix: string, slashes: string, angle: string) =>
-      `${prefix}${slashes}${angle === "<" ? "&lt;" : "&gt;"}`,
-  );
 }
 
 function isMarkdownTextTag(node: Record<string, unknown>): boolean {
@@ -467,15 +462,39 @@ function fitMinimalCardWithinMaxBytes(
   );
 }
 
+export interface FeishuMarkdownFallbackBuildResult {
+  card: FeishuSchema2Card;
+  retainedLinkCount: number;
+}
+
+function countVerifiedMarkdownLinks(markdown: string): number {
+  if (!markdown) {
+    return 0;
+  }
+  const tree = parseChannelMarkdown(markdown);
+  let count = 0;
+  const walk = (node: MdastNode): void => {
+    if (node.type === "link" && toVerifiedPublicHttpUrl(node.url)) {
+      count += 1;
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        walk(child);
+      }
+    }
+  };
+  walk(tree);
+  return count;
+}
+
 /**
  * Builds a minimal Schema 2.0 card containing only a single `markdown` element
  * combining the original card's title, subtitle, markdown/text blocks, and
- * verified public `open_url` button links. Escapes Markdown syntax from
- * `plain_text` fields and runs sandbox/local link rewriting across the final
- * fallback body. Used as a one-shot fallback when Feishu still rejects a card
- * with 200621.
+ * verified public `open_url` button links, along with the count of verified
+ * public links actually retained in the final fallback markdown body.
  */
-export function buildMinimalMarkdownFallbackCard(
+export function buildMinimalMarkdownFallbackCardWithMeta(
   card: Record<string, unknown>,
   options?: {
     maxBytes?: number;
@@ -483,7 +502,7 @@ export function buildMinimalMarkdownFallbackCard(
     threadId?: string | null;
     workspaceId?: string | null;
   },
-): FeishuSchema2Card {
+): FeishuMarkdownFallbackBuildResult {
   const webBaseUrl = options?.webBaseUrl ?? null;
   const threadId = options?.threadId ?? null;
   const workspaceId = options?.workspaceId ?? null;
@@ -520,11 +539,34 @@ export function buildMinimalMarkdownFallbackCard(
     threadId,
     workspaceId,
   );
-  const escaped = escapeFeishuCardMarkdownText(
-    convertEscapedAnglesToEntities(rewritten),
-  );
-  return fitMinimalCardWithinMaxBytes(
+  const escaped = escapeFeishuCardMarkdownText(rewritten);
+  const fitted = fitMinimalCardWithinMaxBytes(
     escaped,
     options?.maxBytes ?? FEISHU_CARD_MAX_BYTES,
   );
+  const finalContent = fitted.body.elements[0]?.content ?? "";
+  return {
+    card: fitted,
+    retainedLinkCount: countVerifiedMarkdownLinks(finalContent),
+  };
+}
+
+/**
+ * Builds a minimal Schema 2.0 card containing only a single `markdown` element
+ * combining the original card's title, subtitle, markdown/text blocks, and
+ * verified public `open_url` button links. Escapes Markdown syntax from
+ * `plain_text` fields and runs sandbox/local link rewriting across the final
+ * fallback body. Used as a one-shot fallback when Feishu still rejects a card
+ * with 200621.
+ */
+export function buildMinimalMarkdownFallbackCard(
+  card: Record<string, unknown>,
+  options?: {
+    maxBytes?: number;
+    webBaseUrl?: string | null;
+    threadId?: string | null;
+    workspaceId?: string | null;
+  },
+): FeishuSchema2Card {
+  return buildMinimalMarkdownFallbackCardWithMeta(card, options).card;
 }

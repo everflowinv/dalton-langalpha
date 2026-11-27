@@ -1429,7 +1429,8 @@ export class DataTaskNotificationService {
       if (
         plan.target_kind === "group" &&
         !groupLiveVerified &&
-        item.existing_status !== "sent"
+        item.existing_status !== "sent" &&
+        item.existing_status !== "partial"
       ) {
         const preClaimLiveCheck = await readyAdapter.checkTargetLive!({
           userId: plan.owner_user_id ?? "",
@@ -1590,6 +1591,7 @@ export class DataTaskNotificationService {
           });
           continue;
         }
+        tracker.claimedAnyItem = hadPriorClaim;
         itemOutcomes.push({
           item_index: item.item_index,
           delivery_key: item.delivery_key,
@@ -1597,23 +1599,10 @@ export class DataTaskNotificationService {
           duplicate: true,
           platform_message_ids: validatedClaim.platformMessageIds,
           code: "partial",
-          message: "Earlier attempt partially delivered this item; automatic resend is blocked.",
+          message:
+            "Earlier attempt partially delivered this item; automatic resend is blocked.",
         });
-        return {
-          status: 200,
-          data: {
-            ok: false,
-            status: "unknown",
-            code: "partial",
-            message: "Earlier attempt partially delivered an item; automatic resend is blocked.",
-            run_id: runId,
-            target,
-            platform,
-            items_total: planItems.length,
-            items_sent: itemsSent,
-            items: itemOutcomes,
-          },
-        };
+        continue;
       }
 
       if (validatedClaim.kind === "in_flight_or_unknown") {
@@ -1661,10 +1650,12 @@ export class DataTaskNotificationService {
           code: denyCode,
           message: validatedClaim.message,
         });
+        const hasDeliveredOrPartial =
+          itemsSent > 0 || itemOutcomes.some((it) => it.status === "partial");
         const overallStatus =
           validatedClaim.status === "unknown"
             ? "unknown"
-            : itemsSent === 0 && SKIP_CODES.has(denyCode)
+            : !hasDeliveredOrPartial && SKIP_CODES.has(denyCode)
               ? "skipped"
               : "failed";
         return {
@@ -1885,6 +1876,7 @@ export class DataTaskNotificationService {
             targetAddress,
             recipientPlatformUserId,
             card: outboundCard,
+            fallbackSourceCard: item.card,
             images: cardImages,
             webBaseUrl: this.webBaseUrl,
             threadId: plan.thread_id ?? null,
@@ -1968,21 +1960,7 @@ export class DataTaskNotificationService {
               code: "partial",
               message: droppedImagesMsg,
             });
-            return {
-              status: 200,
-              data: {
-                ok: false,
-                status: "unknown",
-                code: "partial",
-                message: droppedImagesMsg,
-                run_id: runId,
-                target,
-                platform,
-                items_total: planItems.length,
-                items_sent: itemsSent,
-                items: itemOutcomes,
-              },
-            };
+            continue;
           }
 
           itemsSent += 1;
@@ -2731,6 +2709,28 @@ export class DataTaskNotificationService {
         platform_message_ids: [...messageIds],
         code: null,
       });
+    }
+
+    const partialItems = itemOutcomes.filter((it) => it.status === "partial");
+    if (partialItems.length > 0) {
+      const firstPartial = partialItems[0]!;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "unknown",
+          code: "partial",
+          message:
+            firstPartial.message ??
+            "One or more items were partially delivered; automatic resend is blocked.",
+          run_id: runId,
+          target,
+          platform,
+          items_total: planItems.length,
+          items_sent: itemsSent,
+          items: itemOutcomes,
+        },
+      };
     }
 
     return {

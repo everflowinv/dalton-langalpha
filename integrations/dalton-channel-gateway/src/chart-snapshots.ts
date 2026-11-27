@@ -1242,6 +1242,7 @@ export async function deliverTurnChartsAndWidgets(
   const sentMessageIds: string[] = [];
   let sentImages = 0;
   let sentLinks = 0;
+  let partials = 0;
   let failures = 0;
   let unknowns = 0;
   let chunkIndex = 0;
@@ -1275,11 +1276,13 @@ export async function deliverTurnChartsAndWidgets(
     imageMimeType?: string;
     isWidget?: boolean;
     fixedCopy?: boolean;
-  }): Promise<"sent" | "failed" | "unknown"> => {
+  }): Promise<"sent" | "partial" | "failed" | "unknown"> => {
     const idx = chunkIndex++;
     const effectiveFixed = Boolean(opts.fixedCopy || opts.isWidget);
 
-    const sendAttempt = async (withImage: boolean): Promise<boolean> => {
+    const sendAttempt = async (
+      withImage: boolean,
+    ): Promise<"sent" | "partial" | "failed"> => {
       const imgBuf = withImage && !effectiveFixed ? (opts.imageBuffer ?? null) : null;
 
       // 1. Feishu: Schema 2.0 card with embedded PNG (`__img__`) for DM image, or link button card
@@ -1319,16 +1322,21 @@ export async function deliverTurnChartsAndWidgets(
         });
         if (res.messageId) sentMessageIds.push(res.messageId);
         if (res.usedMarkdownFallback) {
-          if (opts.webUrl) {
-            sentLinks += 1;
-            return true;
+          const retainedLinks =
+            typeof res.markdownFallbackLinkCount === "number"
+              ? Math.max(0, res.markdownFallbackLinkCount)
+              : 0;
+          if (retainedLinks > 0) {
+            sentLinks += retainedLinks;
           }
-          // Fallback stripped the image/buttons and there was no verified chart link.
-          return false;
+          // Feishu accepted the fallback card and returned a messageId:
+          // settle as `partial` with the actual image/link counts (0 when no
+          // link survived fallback) so replay never re-claims and duplicates it.
+          return res.messageId ? "partial" : "failed";
         }
         if (hasImage) sentImages += 1;
         else sentLinks += 1;
-        return true;
+        return "sent";
       }
 
       // 2. Discord: multipart PNG + ActionRow Link Button in DM; text + Link Button otherwise
@@ -1364,7 +1372,7 @@ export async function deliverTurnChartsAndWidgets(
           });
           if (res.messageId) sentMessageIds.push(res.messageId);
           sentImages += 1;
-          return true;
+          return "sent";
         }
         const text = buildTextDeepLinkMessage({
           title: opts.title,
@@ -1389,7 +1397,7 @@ export async function deliverTurnChartsAndWidgets(
         });
         if (res.messageId) sentMessageIds.push(res.messageId);
         sentLinks += 1;
-        return true;
+        return "sent";
       }
 
       // 3. Weixin (or generic adapter): encrypted IMAGE message + deep link text in DM
@@ -1404,7 +1412,7 @@ export async function deliverTurnChartsAndWidgets(
             )
           : null;
       if (params.platform === "weixin" && !weixinPreflight) {
-        return false;
+        return "failed";
       }
 
       if (imgBuf) {
@@ -1446,7 +1454,7 @@ export async function deliverTurnChartsAndWidgets(
           });
           if (linkRes.messageId) sentMessageIds.push(linkRes.messageId);
         }
-        return true;
+        return "sent";
       }
 
       const text = buildTextDeepLinkMessage({
@@ -1469,13 +1477,13 @@ export async function deliverTurnChartsAndWidgets(
       });
       if (res.messageId) sentMessageIds.push(res.messageId);
       sentLinks += 1;
-      return true;
+      return "sent";
     };
 
     const wantsImage = Boolean(opts.imageBuffer) && !effectiveFixed;
     if (wantsImage) {
       try {
-        return (await sendAttempt(true)) ? "sent" : "failed";
+        return await sendAttempt(true);
       } catch (err) {
         if (isStaleGatewayEpochError(err)) throw err;
         if (isUncertainDeliveryError(err)) {
@@ -1484,7 +1492,7 @@ export async function deliverTurnChartsAndWidgets(
         // Only confirmed undelivered errors degrade cleanly to link-only message
         // (matching the download-403 fallback path).
         try {
-          return (await sendAttempt(false)) ? "sent" : "failed";
+          return await sendAttempt(false);
         } catch (fallbackErr) {
           if (isStaleGatewayEpochError(fallbackErr)) throw fallbackErr;
           if (isUncertainDeliveryError(fallbackErr)) {
@@ -1496,7 +1504,7 @@ export async function deliverTurnChartsAndWidgets(
     }
 
     try {
-      return (await sendAttempt(false)) ? "sent" : "failed";
+      return await sendAttempt(false);
     } catch (err) {
       if (isStaleGatewayEpochError(err)) throw err;
       if (isUncertainDeliveryError(err)) {
@@ -1566,6 +1574,7 @@ export async function deliverTurnChartsAndWidgets(
       fixedCopy: useFixedChartCopy,
     });
     if (outcome === "unknown") unknowns += 1;
+    else if (outcome === "partial") partials += 1;
     else if (outcome === "failed") failures += 1;
   }
 
@@ -1584,15 +1593,16 @@ export async function deliverTurnChartsAndWidgets(
       fixedCopy: true,
     });
     if (outcome === "unknown") unknowns += 1;
+    else if (outcome === "partial") partials += 1;
     else if (outcome === "failed") failures += 1;
   }
 
   const finalStatus: "sent" | "partial" | "failed" | "unknown" =
     unknowns > 0
       ? "unknown"
-      : failures === 0
+      : failures === 0 && partials === 0
         ? "sent"
-        : sentImages + sentLinks > 0
+        : partials > 0 || sentImages + sentLinks > 0 || sentMessageIds.length > 0
           ? "partial"
           : "failed";
 

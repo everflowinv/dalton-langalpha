@@ -6767,4 +6767,56 @@ describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
     expect(replyCalls2).toEqual(["om_withdrawn_2"]);
     expect(case2.calls.messageCreate).toHaveLength(2);
   });
+
+  it("FeishuChannelAdapter.sendCard keeps tag:text link syntax escaped on 200621 fallback and preserves markdown code spans", async () => {
+    let attempt = 0;
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_sendcard_text_escaped" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      outgoingOnly: true,
+      client,
+    });
+
+    const res = await adapter.sendCard({
+      targetAddress: "feishu:oc_sendcard_escape",
+      card: {
+        schema: "2.0",
+        body: {
+          elements: [
+            {
+              tag: "text",
+              content: "纯文本链接 [点击](https://evil.example/phish) <font color='red'>红</font>",
+            },
+            {
+              tag: "markdown",
+              content: "代码片段 `\\<ANT\\>` 保持原样",
+            },
+            { tag: "custom_broken", bad: true },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_sendcard_text_escaped");
+    expect(res.usedMarkdownFallback).toBe(true);
+    expect(res.markdownFallbackLinkCount).toBe(0);
+    expect(calls.messageCreate).toHaveLength(2);
+
+    const fallbackCard = JSON.parse(calls.messageCreate[1]!.data.content);
+    const md = fallbackCard.body.elements[0].content as string;
+    expect(md).not.toContain("[点击](https://evil.example/phish)");
+    expect(md).toContain("\\[点击\\]\\(https://evil.example/phish\\)");
+    expect(md).toContain("&lt;font color='red'&gt;红&lt;/font&gt;");
+    expect(md).toContain("`\\<ANT\\>`");
+    expect(md).not.toContain("`&lt;ANT&gt;`");
+  });
 });

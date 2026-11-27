@@ -20,7 +20,7 @@ import {
 } from "../../shared/logger.js";
 import { ChannelDeliveryError } from "../adapter.js";
 import {
-  buildMinimalMarkdownFallbackCard,
+  buildMinimalMarkdownFallbackCardWithMeta,
   normalizeFeishuCard,
 } from "./card-normalize.js";
 import {
@@ -536,6 +536,7 @@ export interface FeishuMessageSendResult {
   repliedInThread?: boolean;
   usedDirectFallback?: boolean;
   usedMarkdownFallback?: boolean;
+  markdownFallbackLinkCount?: number;
 }
 
 type FeishuResolvedSendRoute =
@@ -821,6 +822,7 @@ export async function sendCardFeishu(
   params: {
     to: string;
     card: FeishuSchema2Card | Record<string, unknown>;
+    fallbackSourceCard?: FeishuSchema2Card | Record<string, unknown>;
     replyToMessageId?: string | null;
     fallbackReplyToMessageIds?: string[];
     replyInThread?: boolean;
@@ -871,14 +873,15 @@ export async function sendCardFeishu(
     if (!isFeishuCardParseError(err)) {
       throw err;
     }
-    const fallbackCard = buildMinimalMarkdownFallbackCard(
-      params.card as Record<string, unknown>,
-      {
-        webBaseUrl: params.webBaseUrl,
-        threadId: params.threadId,
-        workspaceId: params.workspaceId,
-      },
-    );
+    const { card: fallbackCard, retainedLinkCount } =
+      buildMinimalMarkdownFallbackCardWithMeta(
+        (params.fallbackSourceCard ?? params.card) as Record<string, unknown>,
+        {
+          webBaseUrl: params.webBaseUrl,
+          threadId: params.threadId,
+          workspaceId: params.workspaceId,
+        },
+      );
     log.warn("feishu_card_200621_fallback", {
       feishu_code: FEISHU_CARD_PARSE_ERROR_CODE,
       target_type: receiveIdType,
@@ -908,6 +911,7 @@ export async function sendCardFeishu(
     return {
       ...toFeishuMessageSendResult(fallbackResponse, target),
       usedMarkdownFallback: true,
+      markdownFallbackLinkCount: retainedLinkCount,
     };
   }
 }
