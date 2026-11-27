@@ -47,7 +47,7 @@ router = APIRouter(prefix="/api/v1/public", tags=["Public Sharing"])
 _SHARE_PATH_RE = re.compile(r"^/(?:s|a)/([A-Za-z0-9_-]{1,128})$")
 
 _MAX_OG_TITLE_CHARS = 160
-_CACHE_CONTROL = "public, max-age=60"
+_CACHE_CONTROL = "no-store"  # a revoked or narrowed share must stop showing its title at once
 
 
 def extract_share_token(raw_path: str | None) -> str | None:

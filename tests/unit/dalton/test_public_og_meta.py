@@ -162,7 +162,7 @@ class TestPublicOgMetaEndpoint:
 
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
-        assert resp.headers["cache-control"] == "public, max-age=60"
+        assert resp.headers["cache-control"] == "no-store"
         metas = _extract_meta(resp.text)
         assert metas["og:site_name"] == ["Everflow"]
         assert metas["og:title"] == ["英伟达 Q3 财报深度分析"]
@@ -448,7 +448,7 @@ class TestPublicOgMetaEndpoint:
         resp_err = client.get("/api/v1/public/og-meta", params={"path": "/s/CrashTok0001"})
         assert resp_err.status_code == 200
         assert _extract_meta(resp_err.text)["og:title"] == ["Everflow"]
-        assert resp_err.headers["cache-control"] == "public, max-age=60"
+        assert resp_err.headers["cache-control"] == "no-store"
 
     def test_html_escaping_prevents_attribute_breakout(
         self, monkeypatch: pytest.MonkeyPatch
