@@ -34,12 +34,10 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 import time
 from typing import Any
-from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -47,26 +45,39 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from psycopg.conninfo import conninfo_to_dict  # noqa: E402
+
+from src.dalton.integrations.tracker_calendar import (  # noqa: E402
+    resolve_tracker_calendar_target_id,
+)
+
 # Hardcoded production tracker calendar owner UUID — NEVER overridable via CLI flags.
 PROD_TRACKER_CALENDAR_OWNER_ID = "991a99ad-8ff2-4bd8-bf08-e5963a248798"
 REGISTERED_TEST_CALENDARS_ENV = "DALTON_TEST_GCAL_CALENDAR_IDS"
+BRIDGE_RUNTIME_INFO_PATH = "/internal/tracker-calendar/runtime-info"
 DRAIN_TIMEOUT_EXIT_CODE = 2
 READONLY_SKIP_REASON = "跳过：需要写权限"
 _ET = ZoneInfo("America/New_York")
 
 
 class MailLockCheckError(RuntimeError):
-    """Raised when mail prepare config or host lock files cannot be read or validated."""
+    """Raised when mail prepare config, host service config, or lock files cannot be read or validated."""
 
 
 def extract_database_name(database_url: str) -> str:
-    """Extract the database name from a PostgreSQL connection URL."""
+    """Extract the effective database name from a PostgreSQL URI or libpq conninfo string.
+
+    Uses ``psycopg.conninfo.conninfo_to_dict`` so query parameters such as
+    ``?dbname=...`` override the URL path exactly as libpq does.
+    """
     raw = str(database_url or "").strip()
     if not raw:
         return ""
-    parsed = urlparse(raw)
-    path = (parsed.path or "").strip("/")
-    return path
+    try:
+        parsed = conninfo_to_dict(raw)
+    except Exception:
+        return ""
+    return str(parsed.get("dbname") or "").strip()
 
 
 def parse_registered_test_calendar_ids(
@@ -99,14 +110,8 @@ def resolve_effective_tracker_calendar_id(
     *,
     env_calendar_id: str | None = None,
 ) -> str:
-    """Resolve the exact calendar ID that tracker cleanup will target (parity with tracker_calendar.py)."""
-    prefs = dict(getattr(conn_row, "preferences", None) or {}) if conn_row is not None else {}
-    pref_cal = str(prefs.get("tracker_calendar_id") or "").strip()
-    if pref_cal:
-        return pref_cal
-    if env_calendar_id is not None:
-        return str(env_calendar_id).strip()
-    return os.getenv("DALTON_GCAL_CALENDAR_ID", "").strip()
+    """Resolve the exact calendar ID that tracker cleanup will target (shared with ``tracker_calendar.py``)."""
+    return resolve_tracker_calendar_target_id(conn_row, env_calendar_id=env_calendar_id)
 
 
 @asynccontextmanager
@@ -323,16 +328,132 @@ def resolve_mail_prepare_state_root(
     return chosen
 
 
+def _read_bridge_env_file(path: Path) -> dict[str, str]:
+    """Read simple ``KEY=VALUE`` lines from a host bridge env file without following symlinks."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise MailLockCheckError(f"cannot stat bridge env file {path}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise MailLockCheckError(f"bridge env file is not a regular file: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise MailLockCheckError(f"cannot read bridge env file {path}: {exc}") from exc
+    out: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            out[key] = val
+    return out
+
+
+def resolve_mail_research_home(
+    *,
+    research_home: Path | None = None,
+    bridge_env_file: Path | None = None,
+) -> Path:
+    """Resolve ``DALTON_RESEARCH_HOME`` from actual host service config for ``worker.lock`` checks.
+
+    Priority matches ``scripts/dalton/researchdata_bridge.py`` and
+    ``scripts/dalton/ops/host_services_switch.sh``:
+      1. Explicit ``--research-home``
+      2. ``DALTON_RESEARCH_HOME`` from ``DALTON_BRIDGE_ENV_FILE`` (default
+         ``~/.config/dalton/researchdata-bridge.env``) and/or process env
+      3. Canonical host default ``~/Library/Application Support/Everflow/research``
+    """
+    if research_home is not None:
+        explicit = Path(research_home).expanduser()
+        if explicit.is_symlink():
+            raise MailLockCheckError("research_home must not be a symlink")
+        if not explicit.is_absolute():
+            raise MailLockCheckError("research_home must be an absolute path")
+        return explicit
+
+    raw_env_file = (
+        str(bridge_env_file).strip()
+        if bridge_env_file is not None
+        else os.getenv("DALTON_BRIDGE_ENV_FILE", "").strip()
+    )
+    env_file_explicit = bool(raw_env_file)
+    env_path = (
+        Path(raw_env_file).expanduser()
+        if env_file_explicit
+        else Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
+    )
+
+    from_env_file: Path | None = None
+    env_file_exists = False
+    try:
+        os.lstat(env_path)
+        env_file_exists = True
+    except FileNotFoundError:
+        if env_file_explicit:
+            raise MailLockCheckError(f"bridge env file not found: {env_path}") from None
+    except OSError as exc:
+        if env_file_explicit:
+            raise MailLockCheckError(f"cannot access bridge env file {env_path}: {exc}") from exc
+
+    if env_file_exists:
+        parsed_env = _read_bridge_env_file(env_path)
+        raw_from_file = str(parsed_env.get("DALTON_RESEARCH_HOME") or "").strip()
+        if raw_from_file:
+            cand = Path(raw_from_file).expanduser()
+            if not cand.is_absolute():
+                raise MailLockCheckError(
+                    "bridge env DALTON_RESEARCH_HOME must be an absolute path"
+                )
+            from_env_file = cand
+
+    raw_from_proc = os.getenv("DALTON_RESEARCH_HOME", "").strip()
+    from_proc: Path | None = None
+    if raw_from_proc:
+        cand = Path(raw_from_proc).expanduser()
+        if not cand.is_absolute():
+            raise MailLockCheckError("DALTON_RESEARCH_HOME must be an absolute path")
+        from_proc = cand
+
+    if from_env_file is not None and from_proc is not None:
+        if from_env_file.resolve() != from_proc.resolve():
+            raise MailLockCheckError(
+                "bridge env DALTON_RESEARCH_HOME does not match process DALTON_RESEARCH_HOME"
+            )
+        chosen = from_env_file
+    else:
+        chosen = (
+            from_env_file
+            or from_proc
+            or (Path.home() / "Library" / "Application Support" / "Everflow" / "research")
+        )
+
+    if chosen.is_symlink():
+        raise MailLockCheckError("research_home must not be a symlink")
+    return chosen
+
+
 def check_mail_host_locks(
     state_root: Path,
     *,
     research_home: Path | None = None,
+    bridge_env_file: Path | None = None,
 ) -> list[str]:
-    """Return names of currently held mail prepare/execution (and image worker) lock files.
+    """Return names of currently held mail prepare/execution and image worker lock files.
 
-    Inspects ``<state_root>/locks/prepare_<period>.lock`` and
-    ``<state_root>/locks/execution_<id>.lock``. Raises ``MailLockCheckError`` if
-    the lock directory or any matching lock file cannot be read.
+    Inspects ``<state_root>/locks/prepare_<period>.lock``,
+    ``<state_root>/locks/execution_<id>.lock``, AND ALWAYS checks
+    ``<research_home>/state/research-images/worker.lock``. Raises
+    ``MailLockCheckError`` if any lock directory or lock file cannot be read.
     """
     if state_root.is_symlink():
         raise MailLockCheckError("state_root must not be a symlink")
@@ -368,10 +489,25 @@ def check_mail_host_locks(
         if _probe_flock_state(lock_path):
             held.append(str(lock_path.relative_to(state_root)))
 
-    if research_home is not None:
-        worker_lock = research_home / "state" / "research-images" / "worker.lock"
-        if _probe_flock_state(worker_lock):
-            held.append(str(worker_lock.relative_to(research_home)))
+    effective_home = resolve_mail_research_home(
+        research_home=research_home,
+        bridge_env_file=bridge_env_file,
+    )
+    state_sub = effective_home / "state"
+    images_sub = state_sub / "research-images"
+    for parent_dir in (effective_home, state_sub, images_sub):
+        try:
+            st = os.lstat(parent_dir)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise MailLockCheckError(f"cannot inspect {parent_dir.name}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise MailLockCheckError(f"research images lock parent is not a directory: {parent_dir.name}")
+
+    worker_lock = images_sub / "worker.lock"
+    if _probe_flock_state(worker_lock):
+        held.append(str(worker_lock.relative_to(effective_home)))
 
     return held
 
@@ -403,80 +539,52 @@ async def _count_running_executions(
             return int(row["running_count"]) if row else 0
 
 
-async def _run_gws_json(
-    gws_bin: Path,
-    args: Sequence[str],
+async def fetch_bridge_tracker_runtime_info(
     *,
-    timeout_s: float = 15.0,
+    bridge_url: str | None = None,
+    admin_token: str | None = None,
+    http_client: Any = None,
+    timeout_s: float = 20.0,
 ) -> dict[str, Any] | None:
-    proc = await asyncio.create_subprocess_exec(
-        str(gws_bin),
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    """Query the running researchdata bridge's ``GET /internal/tracker-calendar/runtime-info``.
+
+    Returns the bridge's live ``host_gws_account``, ``calendar_id``, ``gcal_backend``,
+    and ``research_home`` so ``prod-readonly-check`` verifies against the actual running
+    bridge rather than the current shell's PATH or CLI overrides.
+    """
+    import httpx
+
+    from src.dalton.settings import get_dalton_bridge_admin_token, get_dalton_bridge_base_url
+
+    base = str(bridge_url or get_dalton_bridge_base_url() or "").strip().rstrip("/")
+    token = str(admin_token or get_dalton_bridge_admin_token() or "").strip()
+    if not base or not token:
+        return None
+    url = f"{base}{BRIDGE_RUNTIME_INFO_PATH}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Dalton-Bridge-Token": token,
+    }
+    timeout_cfg = httpx.Timeout(
+        connect=min(5.0, timeout_s),
+        read=timeout_s,
+        write=timeout_s,
+        pool=min(5.0, timeout_s),
     )
     try:
-        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        parsed = json.loads(stdout.decode("utf-8", errors="replace"))
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _extract_account_from_gws_payload(payload: dict[str, Any] | None) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    for key in ("email", "user_email", "account_email", "account", "user", "active_account", "sub"):
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, dict):
-            nested = _extract_account_from_gws_payload(val)
-            if nested:
-                return nested
-    return None
-
-
-async def resolve_host_gws_account(
-    *,
-    gws_bin: Path | None = None,
-    exec_fn: Any = None,
-) -> str | None:
-    """Resolve the active Google account (email or sub) configured on the host ``gws`` CLI."""
-    bin_path = gws_bin
-    if bin_path is None:
-        raw = os.getenv("DALTON_GWS_BIN", "").strip()
-        if raw:
-            bin_path = Path(raw).expanduser()
+        if http_client is not None:
+            resp = await http_client.get(url, headers=headers, timeout=timeout_cfg)
         else:
-            found = shutil.which("gws")
-            bin_path = Path(found) if found else None
-    if bin_path is None or not bin_path.is_file():
+            async with httpx.AsyncClient(timeout=timeout_cfg, trust_env=False) as owned:
+                resp = await owned.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+        parsed = resp.json()
+    except Exception:
         return None
-
-    runner = exec_fn or _run_gws_json
-    status_doc = await runner(bin_path, ["auth", "status"])
-    acct = _extract_account_from_gws_payload(status_doc)
-    if acct:
-        return acct
-
-    # Fallback: Google Calendar v3 primary calendar `id` is the authenticated account's email.
-    primary_doc = await runner(
-        bin_path,
-        ["calendar", "calendars", "get", "--params", json.dumps({"calendarId": "primary"})],
-    )
-    if isinstance(primary_doc, dict):
-        cal_id = primary_doc.get("id")
-        if isinstance(cal_id, str) and cal_id.strip():
-            return cal_id.strip()
-    return None
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        return None
+    return parsed
 
 
 def _account_matches_connection(host_account: str | None, conn_row: Any) -> bool:
@@ -503,7 +611,13 @@ async def run_calendar_purge_drill(
     purge_id: str | None = None,
     dry_run: bool = False,
 ) -> tuple[int, dict[str, Any]]:
-    """Execute Stage A isolated non-production purge drill (§7.1(1))."""
+    """Execute Stage A isolated non-production purge drill (§7.1(1)).
+
+    Both ``dry_run=True`` and ``dry_run=False`` query the ACTUAL connected database name
+    and connection row, resolve the EFFECTIVE target calendar ID using the same function
+    as ``tracker_calendar.py`` (never falling back to CLI ``--calendar-id``), and abort
+    before any disconnect or purge call if any guard fails.
+    """
     pool_cfg_db_name = _configured_pool_database_name()
     pre_ok, pre_reasons = validate_non_prod_drill_guard(
         database_url=database_url,
@@ -519,15 +633,6 @@ async def run_calendar_purge_drill(
             "command": "calendar-purge-drill",
             "guard_failed": True,
             "reasons": pre_reasons,
-        }
-
-    if dry_run:
-        return 0, {
-            "ok": True,
-            "command": "calendar-purge-drill",
-            "dry_run": True,
-            "guard_passed": True,
-            "database_name": pool_cfg_db_name,
         }
 
     from src.dalton.database import user_integrations as integrations_db
@@ -586,10 +691,9 @@ async def run_calendar_purge_drill(
                 "error": "test owner google/calendar connection not found in test database",
             }
 
-        # Guard the EXACT calendar ID that the purge handler will target for deletion.
-        effective_calendar_id = resolve_effective_tracker_calendar_id(
-            conn_row, env_calendar_id=calendar_id
-        )
+        # Guard the EXACT calendar ID that the purge handler will target for deletion
+        # (preferences.tracker_calendar_id, else DALTON_GCAL_CALENDAR_ID — NEVER CLI --calendar-id).
+        effective_calendar_id = resolve_effective_tracker_calendar_id(conn_row)
         actual_ok, actual_reasons = validate_non_prod_drill_guard(
             database_url=database_url,
             actual_db_name=actual_db_name,
@@ -605,6 +709,16 @@ async def run_calendar_purge_drill(
                 "command": "calendar-purge-drill",
                 "guard_failed": True,
                 "reasons": actual_reasons,
+            }
+
+        if dry_run:
+            return 0, {
+                "ok": True,
+                "command": "calendar-purge-drill",
+                "dry_run": True,
+                "guard_passed": True,
+                "database_name": actual_db_name,
+                "calendar_guard_passed": True,
             }
 
         register_default_tracker_purge_handler()
@@ -656,14 +770,16 @@ async def run_prod_readonly_check(
     *,
     owner_id: str,
     expected_calendar_id: str | None = None,
-    gws_bin: Path | None = None,
-    gws_account_resolver: Any = None,
+    bridge_url: str | None = None,
+    bridge_admin_token: str | None = None,
+    bridge_runtime_resolver: Any = None,
+    http_client: Any = None,
     google_client: Any = None,
     oauth_client: Any = None,
     now_et: datetime | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Verify production tracker owner account + calendar match BEFORE any MCP call,
-    then run read-only ``health_check`` + 400-day EST/EDT ``list_events``.
+    """Verify production tracker owner account + calendar match the RUNNING research bridge
+    BEFORE any MCP call, then run read-only ``health_check`` + 400-day EST/EDT ``list_events``.
     """
     from src.dalton.database import user_integrations as integrations_db
     from src.dalton.integrations.tracker_calendar import (
@@ -693,34 +809,77 @@ async def run_prod_readonly_check(
                 "error": "owner google/calendar connection not found",
             }
 
-        # Pre-call check 1: owner's bound Google account MUST match host gws account.
-        if gws_account_resolver is not None:
-            host_gws_account = await gws_account_resolver()
+        # Fetch actual host gws account and target calendar ID from the RUNNING research bridge.
+        if bridge_runtime_resolver is not None:
+            bridge_info = await bridge_runtime_resolver()
         else:
-            host_gws_account = await resolve_host_gws_account(gws_bin=gws_bin)
-        account_matched = _account_matches_connection(host_gws_account, conn_row)
+            bridge_info = await fetch_bridge_tracker_runtime_info(
+                bridge_url=bridge_url,
+                admin_token=bridge_admin_token,
+                http_client=http_client,
+            )
 
-        # Pre-call check 2: target sub-calendar MUST be configured and match DALTON_GCAL_CALENDAR_ID.
-        prefs = dict(conn_row.preferences or {})
-        configured_cal_id = str(prefs.get("tracker_calendar_id") or "").strip()
-        env_cal_id = str(expected_calendar_id or "").strip()
-        calendar_id_matched = bool(
-            configured_cal_id and env_cal_id and configured_cal_id == env_cal_id
+        bridge_reachable = isinstance(bridge_info, dict) and bridge_info.get("ok") is True
+        host_gws_account = (
+            str(bridge_info.get("host_gws_account") or "").strip()
+            if bridge_reachable
+            else ""
+        )
+        bridge_cal_id = (
+            str(bridge_info.get("calendar_id") or "").strip()
+            if bridge_reachable
+            else ""
+        )
+        bridge_gcal_backend = (
+            str(bridge_info.get("gcal_backend") or "").strip()
+            if bridge_reachable
+            else ""
         )
 
-        if not account_matched or not calendar_id_matched:
+        # Pre-call check 1: owner's bound Google account MUST match the running bridge's gws account.
+        account_matched = bridge_reachable and _account_matches_connection(
+            host_gws_account, conn_row
+        )
+
+        # Pre-call check 2: owner's tracker_calendar_id MUST match the running bridge's target
+        # calendar ID (and any optional CLI --calendar-id cross-check if supplied).
+        prefs = dict(conn_row.preferences or {})
+        configured_cal_id = str(prefs.get("tracker_calendar_id") or "").strip()
+        cli_cal_id = str(expected_calendar_id or "").strip()
+        calendar_id_matched = bool(
+            bridge_reachable
+            and configured_cal_id
+            and bridge_cal_id
+            and configured_cal_id == bridge_cal_id
+            and (not cli_cal_id or cli_cal_id == bridge_cal_id)
+        )
+
+        if not bridge_reachable or not account_matched or not calendar_id_matched:
             mismatch_reasons: list[str] = []
-            if not account_matched:
-                mismatch_reasons.append("host gws account does not match owner connection account")
-            if not calendar_id_matched:
+            if not bridge_reachable:
                 mismatch_reasons.append(
-                    "owner tracker_calendar_id does not match DALTON_GCAL_CALENDAR_ID"
+                    "running researchdata bridge runtime-info could not be queried"
                 )
+            else:
+                if not account_matched:
+                    mismatch_reasons.append(
+                        "running bridge gws account does not match owner connection account"
+                    )
+                if not calendar_id_matched:
+                    if cli_cal_id and bridge_cal_id and cli_cal_id != bridge_cal_id:
+                        mismatch_reasons.append(
+                            "--calendar-id does not match running bridge target calendar ID"
+                        )
+                    else:
+                        mismatch_reasons.append(
+                            "owner tracker_calendar_id does not match running bridge target calendar ID"
+                        )
             return 1, {
                 "ok": False,
                 "command": "prod-readonly-check",
                 "owner_id": cleaned_owner,
                 "provider_account_bound": bool(conn_row.provider_account_id),
+                "bridge_reachable": bridge_reachable,
                 "account_matched": account_matched,
                 "calendar_id_matched": calendar_id_matched,
                 "error": "precheck_failed",
@@ -840,6 +999,8 @@ async def run_prod_readonly_check(
             "command": "prod-readonly-check",
             "owner_id": cleaned_owner,
             "provider_account_bound": bool(conn_row.provider_account_id),
+            "bridge_reachable": bridge_reachable,
+            "bridge_gcal_backend": bridge_gcal_backend,
             "account_matched": account_matched,
             "calendar_id_matched": calendar_id_matched,
             "has_read_scope": has_read,
@@ -847,6 +1008,11 @@ async def run_prod_readonly_check(
             "health_check": {
                 "ok": health_ok,
                 "status": health_payload.get("status"),
+                "backend": (
+                    health_payload["data"].get("backend")
+                    if isinstance(health_payload.get("data"), dict)
+                    else None
+                ),
             },
             "list_events_400d": {
                 "ok": list_ok,
@@ -866,10 +1032,11 @@ async def run_drain(
     prepare_config_path: Path | None = None,
     state_root: Path | None = None,
     research_home: Path | None = None,
+    bridge_env_file: Path | None = None,
     count_running_fn: Any = None,
     check_locks_fn: Any = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Poll until target automation executions (and mail prepare locks) drain, or exit 2 on timeout."""
+    """Poll until target automation executions (and mail prepare + image worker locks) drain, or exit 2 on timeout."""
     if target not in ("calendar", "mail"):
         return 1, {"ok": False, "command": "drain", "error": f"invalid target: {target}"}
 
@@ -883,11 +1050,16 @@ async def run_drain(
         }
 
     resolved_state_root: Path | None = None
+    resolved_research_home: Path | None = None
     if target == "mail" and check_locks_fn is None:
         try:
             resolved_state_root = resolve_mail_prepare_state_root(
                 prepare_config_path=prepare_config_path,
                 state_root=state_root,
+            )
+            resolved_research_home = resolve_mail_research_home(
+                research_home=research_home,
+                bridge_env_file=bridge_env_file,
             )
         except MailLockCheckError as exc:
             return 1, {
@@ -914,10 +1086,11 @@ async def run_drain(
                         active_locks = list(check_locks_fn(resolved_state_root or research_home))
                     else:
                         assert resolved_state_root is not None
+                        assert resolved_research_home is not None
                         active_locks = list(
                             check_mail_host_locks(
                                 resolved_state_root,
-                                research_home=research_home,
+                                research_home=resolved_research_home,
                             )
                         )
                 except MailLockCheckError as exc:
@@ -1002,15 +1175,13 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("prod-readonly-check", "calendar"):
         p_prod = sub.add_parser(
             name,
-            help="Verify production tracker calendar account/calendar match and read-only connectivity.",
+            help="Verify production tracker calendar account/calendar match against running bridge and read-only connectivity.",
         )
         p_prod.add_argument(
             "--owner-id", default=os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID", "")
         )
-        p_prod.add_argument(
-            "--calendar-id", default=os.getenv("DALTON_GCAL_CALENDAR_ID", "")
-        )
-        p_prod.add_argument("--gws-bin", default=os.getenv("DALTON_GWS_BIN", ""))
+        p_prod.add_argument("--calendar-id", default="")
+        p_prod.add_argument("--bridge-url", default=os.getenv("DALTON_BRIDGE_URL", ""))
 
     p_drain = sub.add_parser(
         "drain",
@@ -1027,6 +1198,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-root", default=os.getenv("DALTON_MARKET_DIGEST_STATE_ROOT", "")
     )
     p_drain.add_argument("--research-home", default="")
+    p_drain.add_argument(
+        "--bridge-env-file", default=os.getenv("DALTON_BRIDGE_ENV_FILE", "")
+    )
 
     return parser
 
@@ -1049,12 +1223,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     elif args.command in ("prod-readonly-check", "calendar"):
-        gws_path = Path(args.gws_bin).expanduser() if args.gws_bin else None
         code, payload = asyncio.run(
             run_prod_readonly_check(
                 owner_id=args.owner_id,
                 expected_calendar_id=args.calendar_id or None,
-                gws_bin=gws_path,
+                bridge_url=args.bridge_url or None,
             )
         )
     elif args.command == "drain":
@@ -1062,6 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prep_cfg = Path(args.prepare_config).expanduser() if args.prepare_config else None
         sr = Path(args.state_root).expanduser() if args.state_root else None
         home = Path(args.research_home).expanduser() if args.research_home else None
+        benv = Path(args.bridge_env_file).expanduser() if args.bridge_env_file else None
         code, payload = asyncio.run(
             run_drain(
                 target=args.target,
@@ -1071,6 +1245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 prepare_config_path=prep_cfg,
                 state_root=sr,
                 research_home=home,
+                bridge_env_file=benv,
             )
         )
     else:

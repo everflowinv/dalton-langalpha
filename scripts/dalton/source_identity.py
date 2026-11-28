@@ -1116,7 +1116,7 @@ def _declare_gcal(
     fallback_as_of: str,
 ) -> list[dict[str, Any]]:
     operation = str(arguments.get("operation") or "").strip() or "list_events"
-    if operation == "health_check":
+    if operation in ("health_check", "reconcile_status"):
         return []
     events = _gcal_source_events(operation, payload, inner)
     out: list[dict[str, Any]] = []

@@ -745,7 +745,7 @@ async def test_tracker_calendar_gate_official_mcp_four_operations_mapping(
         assert r_hc.json()["payload"] == {
             "ok": True,
             "status": "ok",
-            "data": {"calendar_ok": True},
+            "data": {"calendar_ok": True, "backend": "official_mcp"},
         }
         assert recorded_calls[-1][0] == "list_events"
         assert recorded_calls[-1][1]["pageSize"] == 1
@@ -839,7 +839,7 @@ async def test_official_mcp_readonly_scope_refuses_writes_and_allows_reads(
             headers=headers,
         )
         assert r_hc.status_code == 200
-        assert r_hc.json()["payload"]["data"] == {"calendar_ok": True}
+        assert r_hc.json()["payload"]["data"] == {"calendar_ok": True, "backend": "official_mcp"}
 
         r_list = await client.post(
             "/api/v1/dalton/mcp/tracker-calendar",
@@ -918,7 +918,11 @@ async def test_legacy_gws_branch_calls_bridge_and_converts_health_check(
         )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["payload"] == {"ok": True, "status": "ok", "data": {"calendar_ok": True}}
+    assert body["payload"] == {
+        "ok": True,
+        "status": "ok",
+        "data": {"calendar_ok": True, "backend": "legacy_gws"},
+    }
     assert body["calendar_id"] == CALENDAR_ID
     assert len(captured_posts) == 1
     assert captured_posts[0]["url"] == "http://127.0.0.1:8960/internal/tracker-calendar/legacy-gws"
@@ -1099,6 +1103,28 @@ def test_probe_drill_accepts_valid_non_prod_configuration(monkeypatch: pytest.Mo
     probe = _load_probe_module()
     monkeypatch.setenv("DB_NAME", "langalpha_test")
     monkeypatch.setenv("DALTON_TEST_GCAL_CALENDAR_IDS", "cal-drill-subcal@group.calendar.google.com")
+    monkeypatch.setenv("DALTON_GCAL_CALENDAR_ID", "cal-drill-subcal@group.calendar.google.com")
+
+    @asynccontextmanager
+    async def _noop_pool() -> Any:
+        yield None
+
+    monkeypatch.setattr(probe, "open_probe_db_pool", _noop_pool)
+    monkeypatch.setattr(
+        probe,
+        "_query_actual_database_name",
+        create_autospec(probe._query_actual_database_name, return_value="langalpha_test"),
+    )
+    test_conn = _make_integration_row(
+        user_id=TEST_OWNER_ID,
+        calendar_id="cal-drill-subcal@group.calendar.google.com",
+    )
+    monkeypatch.setattr(
+        integrations_db,
+        "get_connection",
+        create_autospec(integrations_db.get_connection, return_value=test_conn),
+    )
+
     code, payload = asyncio.run(
         probe.run_calendar_purge_drill(
             database_url="postgresql://user:pass@localhost:5432/langalpha_test",
@@ -1110,6 +1136,7 @@ def test_probe_drill_accepts_valid_non_prod_configuration(monkeypatch: pytest.Mo
     assert code == 0
     assert payload["ok"] is True
     assert payload["guard_passed"] is True
+    assert payload["database_name"] == "langalpha_test"
 
 
 @pytest.mark.asyncio
@@ -1157,21 +1184,28 @@ async def test_probe_prod_readonly_check_skips_write_roundtrip_when_readonly(
     mcp_client = create_autospec(GoogleCalendarMCPClient, instance=True)
     mcp_client.call_mcp_tool.return_value = {"events": []}
 
-    async def _host_acct() -> str:
-        return "owner@example.test"
+    async def _bridge_info() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "gcal_backend": "legacy_gws",
+            "calendar_id": CALENDAR_ID,
+            "host_gws_account": "owner@example.test",
+        }
 
     code, payload = await probe.run_prod_readonly_check(
         owner_id=OWNER_ID,
         expected_calendar_id=CALENDAR_ID,
-        gws_account_resolver=create_autospec(_host_acct, side_effect=_host_acct),
+        bridge_runtime_resolver=create_autospec(_bridge_info, side_effect=_bridge_info),
         google_client=mcp_client,
         now_et=datetime(2026, 11, 14, 9, 0, tzinfo=ZoneInfo("America/New_York")),
     )
     assert code == 0
     assert payload["ok"] is True
+    assert payload["bridge_reachable"] is True
     assert payload["account_matched"] is True
     assert payload["calendar_id_matched"] is True
     assert payload["health_check"]["ok"] is True
+    assert payload["health_check"]["backend"] == "official_mcp"
     assert payload["list_events_400d"]["ok"] is True
     assert payload["write_roundtrip"] == {
         "status": "skipped",
@@ -1365,6 +1399,7 @@ async def test_tracker_purge_handler_readonly_marks_reconcile_and_keeps_local_cl
     wl = json.loads(wl_path.read_text(encoding="utf-8"))
     assert wl["confirmed"][0]["calendar_event_id"] is None
     assert wl["tracker_reconcile_needed"] is True
+    assert wl["tracker_reconcile_source"] == "backend"
 
     apply_doc = json.loads(apply_path.read_text(encoding="utf-8"))
     assert apply_doc["applied"][0]["event_id"] is None
@@ -1605,7 +1640,7 @@ async def test_legacy_gws_owner_unconfigured_insert_and_health_check_succeed(
     )
     hc_body = json.loads(hc_resp["result"]["content"][0]["text"])
     assert hc_body["ok"] is True
-    assert hc_body["data"] == {"calendar_ok": True}
+    assert hc_body["data"] == {"calendar_ok": True, "backend": "legacy_gws"}
     assert http_client.post.call_count == 0
 
 
@@ -2117,8 +2152,9 @@ async def test_unreachable_workspace_keeps_pg_reconcile_flag_and_weekly_scan_con
         _make_purge_ledger(),
         google_client=mcp_client,
     )
-    # Even though remote had 0 events, local workspace was NOT found -> keep tracker_reconcile_needed=TRUE!
+    # Local first: unreachable workspace skips remote deletion and keeps tracker_reconcile_needed=TRUE!
     assert handled is False
+    assert mcp_client.call_mcp_tool.call_count == 0
 
     # 2. Reconnect: official_mcp health_check surfaces persistent PG tracker_reconcile_needed=True,
     #    and ack_reconcile=True clears it in PG.
@@ -2399,11 +2435,19 @@ def test_richard_earnings_preserves_old_slot_on_query_failure_and_keeps_flag_on_
 @pytest.mark.asyncio
 async def test_probe_drain_mail_checks_prepare_and_execution_locks_and_fails_on_unreadable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = _load_probe_module()
     state_root = tmp_path / "md-state"
     locks_dir = state_root / "locks"
     locks_dir.mkdir(parents=True)
+
+    research_home = tmp_path / "research-home"
+    (research_home / "state" / "research-images").mkdir(parents=True)
+    bridge_env = tmp_path / "researchdata-bridge.env"
+    bridge_env.write_text(f"DALTON_RESEARCH_HOME={research_home}\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.delenv("DALTON_RESEARCH_HOME", raising=False)
 
     prepare_cfg = tmp_path / "market-digest-prepare.json"
     prepare_cfg.write_text(json.dumps({"state_root": str(state_root)}), encoding="utf-8")
@@ -2517,14 +2561,19 @@ async def test_probe_prod_readonly_check_aborts_before_mcp_on_account_or_calenda
 
     mcp_client = create_autospec(GoogleCalendarMCPClient, instance=True)
 
-    # 1) Host gws account mismatch -> exits 1 immediately with ZERO MCP calls
-    async def _wrong_acct() -> str:
-        return "someone-else@example.test"
+    # 1) Running bridge gws account mismatch -> exits 1 immediately with ZERO MCP calls
+    async def _wrong_acct() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "gcal_backend": "legacy_gws",
+            "calendar_id": CALENDAR_ID,
+            "host_gws_account": "someone-else@example.test",
+        }
 
     code_acct, body_acct = await probe.run_prod_readonly_check(
         owner_id=OWNER_ID,
         expected_calendar_id=CALENDAR_ID,
-        gws_account_resolver=create_autospec(_wrong_acct, side_effect=_wrong_acct),
+        bridge_runtime_resolver=create_autospec(_wrong_acct, side_effect=_wrong_acct),
         google_client=mcp_client,
     )
     assert code_acct != 0
@@ -2532,14 +2581,19 @@ async def test_probe_prod_readonly_check_aborts_before_mcp_on_account_or_calenda
     assert body_acct["account_matched"] is False
     assert mcp_client.call_mcp_tool.call_count == 0
 
-    # 2) Target sub-calendar mismatch -> exits 1 immediately with ZERO MCP calls
-    async def _right_acct() -> str:
-        return "owner@example.test"
+    # 2) Running bridge target sub-calendar mismatch -> exits 1 immediately with ZERO MCP calls
+    async def _wrong_cal() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "gcal_backend": "legacy_gws",
+            "calendar_id": "different-calendar@group.calendar.google.com",
+            "host_gws_account": "owner@example.test",
+        }
 
     code_cal, body_cal = await probe.run_prod_readonly_check(
         owner_id=OWNER_ID,
-        expected_calendar_id="different-calendar@group.calendar.google.com",
-        gws_account_resolver=create_autospec(_right_acct, side_effect=_right_acct),
+        expected_calendar_id=CALENDAR_ID,
+        bridge_runtime_resolver=create_autospec(_wrong_cal, side_effect=_wrong_cal),
         google_client=mcp_client,
     )
     assert code_cal != 0
@@ -2547,3 +2601,711 @@ async def test_probe_prod_readonly_check_aborts_before_mcp_on_account_or_calenda
     assert body_cal["account_matched"] is True
     assert body_cal["calendar_id_matched"] is False
     assert mcp_client.call_mcp_tool.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. Step 4 R3 regression tests (Codex #1-#8, Grok #1-#3, Decisions 1-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_drill_no_pref_calendar_uses_env_not_cli_and_blocks_all_three_purge_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #1 / Grok #1 / Decision 1: when connection lacks preferences.tracker_calendar_id,
+    guard resolves DALTON_GCAL_CALENDAR_ID (shared with cleanup), NEVER CLI --calendar-id,
+    and aborts before begin_disconnect / finish_disconnect / run_local_purge.
+    """
+    probe = _load_probe_module()
+    monkeypatch.setenv("DB_NAME", "langalpha_test")
+    monkeypatch.setenv(
+        "DALTON_TEST_GCAL_CALENDAR_IDS",
+        "registered-test-cal@group.calendar.google.com",
+    )
+    # Process env still points at the production calendar!
+    monkeypatch.setenv("DALTON_GCAL_CALENDAR_ID", "prod-real-calendar@group.calendar.google.com")
+
+    @asynccontextmanager
+    async def _noop_pool() -> Any:
+        yield None
+
+    monkeypatch.setattr(probe, "open_probe_db_pool", _noop_pool)
+    monkeypatch.setattr(
+        probe,
+        "_query_actual_database_name",
+        create_autospec(probe._query_actual_database_name, return_value="langalpha_test"),
+    )
+    # Test connection has write scope and NO preferences.tracker_calendar_id
+    no_pref_conn = dc_replace(
+        _make_integration_row(
+            user_id=TEST_OWNER_ID,
+            scopes=f"{GOOGLE_SCOPE_CALENDAR_LIST_RO} {GOOGLE_SCOPE_CALENDAR_EVENTS}",
+        ),
+        preferences={},
+    )
+    monkeypatch.setattr(
+        integrations_db,
+        "get_connection",
+        create_autospec(integrations_db.get_connection, return_value=no_pref_conn),
+    )
+
+    # Confirm guard & cleanup share the exact same target resolution helper
+    assert (
+        probe.resolve_effective_tracker_calendar_id(no_pref_conn)
+        == tc.resolve_tracker_calendar_target_id(no_pref_conn)
+        == "prod-real-calendar@group.calendar.google.com"
+    )
+
+    begin_mock = create_autospec(lifecycle_mod.begin_disconnect)
+    finish_mock = create_autospec(lifecycle_mod.finish_disconnect)
+    purge_mock = create_autospec(purge_mod.run_local_purge)
+    monkeypatch.setattr(lifecycle_mod, "begin_disconnect", begin_mock)
+    monkeypatch.setattr(lifecycle_mod, "finish_disconnect", finish_mock)
+    monkeypatch.setattr(purge_mod, "run_local_purge", purge_mock)
+
+    for dry_flag in (False, True):
+        code, body = await probe.run_calendar_purge_drill(
+            database_url="postgresql://user:pass@localhost:5432/langalpha_test",
+            owner_id=TEST_OWNER_ID,
+            calendar_id="registered-test-cal@group.calendar.google.com",
+            dry_run=dry_flag,
+        )
+        assert code != 0
+        assert body["guard_failed"] is True
+        assert any("not in the registered test sub-calendar list" in r for r in body["reasons"])
+        assert any("does not match --calendar-id" in r for r in body["reasons"])
+
+    assert begin_mock.await_count == 0
+    assert finish_mock.await_count == 0
+    assert purge_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sandbox_purge_uses_real_sandbox_backend_workspace_root_and_rejects_outside_paths() -> None:
+    """Codex #2 / Decision 5: clean_sandbox_tracker_event_ids uses a real pinned SandboxBackend's
+    workspace_dir for watchlist + scan enumeration (without an active turn), verifies returned
+    paths stay inside that workspace, and never touches decoy files at computer root.
+    """
+    from types import SimpleNamespace
+
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+    ws_root = "/home/daytona/richard-earnings"
+    comp_root = "/home/daytona"
+
+    files: dict[str, str] = {
+        f"{ws_root}/state/richard-earnings/watchlist.json": json.dumps(
+            {
+                "updated": "2026-11-14",
+                "confirmed": [{"ticker": "AFRM", "calendar_event_id": "evt-real-1"}],
+                "pending": [],
+                "reported": [],
+            }
+        ),
+        f"{ws_root}/state/richard-earnings/scans/2026-11-14/apply.json": json.dumps(
+            {"planned": [{"ticker": "AFRM", "old_event_id": "evt-real-old"}], "applied": []}
+        ),
+        f"{ws_root}/state/richard-earnings/scans/2026-11-14/roll.json": json.dumps(
+            {"moved": [{"ticker": "PDD", "calendar_event_id": "evt-real-roll"}]}
+        ),
+        # Decoy at computer root (what an un-normalized aglob_paths("...", "state/...") would hit!)
+        f"{comp_root}/state/richard-earnings/scans/2026-11-14/apply.json": json.dumps(
+            {"planned": [{"ticker": "DECOY", "old_event_id": "evt-decoy-keep"}], "applied": []}
+        ),
+    }
+
+    glob_calls: list[tuple[str, str]] = []
+    fake_sandbox = create_autospec(PTCSandbox, instance=True)
+    fake_sandbox.config = SimpleNamespace(
+        filesystem=SimpleNamespace(
+            working_directory=comp_root,
+            allowed_directories=[comp_root],
+            enable_path_validation=True,
+        )
+    )
+    fake_sandbox._work_dir = comp_root
+    fake_sandbox.sandbox_id = "sbx-real-backend-test"
+
+    async def _dl(path: str) -> bytes | None:
+        raw = files.get(path)
+        return raw.encode("utf-8") if raw is not None else None
+
+    async def _wt(path: str, content: str) -> bool:
+        files[path] = content
+        return True
+
+    async def _aglob(
+        pattern: str,
+        path: str = ".",
+        *,
+        allow_denied: bool = False,
+        hide_history: bool = False,
+    ) -> list[str]:
+        glob_calls.append((pattern, path))
+        # Simulate real PTCSandbox.aglob_files: relative path resolves against comp_root (no turn bound),
+        # while absolute path stays inside the requested folder.
+        base = path if path.startswith("/") else f"{comp_root}/{path.lstrip('./')}"
+        prefix = base.rstrip("/") + "/"
+        matches = [
+            fp
+            for fp in sorted(files)
+            if fp.startswith(prefix) and fp.endswith(f"/{pattern}")
+        ]
+        # Also inject an out-of-workspace path to verify containment filtering rejects it.
+        if pattern == "apply.json":
+            matches.append(f"{comp_root}/state/richard-earnings/scans/2026-11-14/apply.json")
+        return matches
+
+    fake_sandbox.adownload_file_bytes.side_effect = _dl
+    fake_sandbox.awrite_file_text.side_effect = _wt
+    fake_sandbox.aglob_files.side_effect = _aglob
+
+    real_backend = SandboxBackend(fake_sandbox, ws_root)
+    assert real_backend.workspace_dir == ws_root
+
+    cleaned, count = await tc.clean_sandbox_tracker_event_ids(
+        real_backend, mark_reconcile_needed=True
+    )
+    assert cleaned is True
+    assert count == 3
+    # Every glob call MUST pass the absolute pinned workspace scans path
+    assert glob_calls == [
+        ("apply.json", f"{ws_root}/state/richard-earnings/scans"),
+        ("roll.json", f"{ws_root}/state/richard-earnings/scans"),
+    ]
+    wl_after = json.loads(files[f"{ws_root}/state/richard-earnings/watchlist.json"])
+    assert wl_after["confirmed"][0]["calendar_event_id"] is None
+    assert wl_after["tracker_reconcile_needed"] is True
+    assert wl_after["tracker_reconcile_source"] == "backend"
+    apply_after = json.loads(files[f"{ws_root}/state/richard-earnings/scans/2026-11-14/apply.json"])
+    assert apply_after["planned"][0]["old_event_id"] is None
+    roll_after = json.loads(files[f"{ws_root}/state/richard-earnings/scans/2026-11-14/roll.json"])
+    assert roll_after["moved"][0]["calendar_event_id"] is None
+    # Decoy at computer root MUST remain completely untouched!
+    decoy_after = json.loads(files[f"{comp_root}/state/richard-earnings/scans/2026-11-14/apply.json"])
+    assert decoy_after["planned"][0]["old_event_id"] == "evt-decoy-keep"
+
+
+def test_richard_earnings_pending_slot_revoked_when_schedule_returns_to_old_date(
+    tmp_path: Path,
+) -> None:
+    """Codex #3 / Decision 4: when earnings moved A -> B (A cleanup failed) and later moved
+    back to A reusing a valid event, retrying pending_reconcile_slots revokes the stale
+    pending entry without deleting the valid confirmed event.
+    """
+    import argparse
+
+    mod = _load_richard_earnings_module()
+    ws = tmp_path / "ws"
+    (ws / "state" / "richard-earnings" / "scans" / "2026-11-14").mkdir(parents=True)
+    # Schedule is now confirmed back on 2026-11-20 BMO with evt-a-valid, while an older
+    # failed-cleanup slot for (AFRM, 2026-11-20, BMO, keep_event_id=evt-b-old) remains queued.
+    (ws / "state" / "richard-earnings" / "watchlist.json").write_text(
+        json.dumps(
+            {
+                "updated": "2026-11-12",
+                "pending_reconcile_slots": [
+                    {
+                        "ticker": "AFRM",
+                        "date": "2026-11-20",
+                        "timing": "BMO",
+                        "keep_event_id": "evt-b-old",
+                    }
+                ],
+                "confirmed": [
+                    {
+                        "ticker": "AFRM",
+                        "name": "Affirm",
+                        "date": "2026-11-20",
+                        "timing": "BMO",
+                        "quarter": "Q1 2027",
+                        "calendar_event_id": "evt-a-valid",
+                        "source": "https://ir.example.test",
+                        "confidence": "high",
+                    }
+                ],
+                "pending": [],
+                "reported": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ws / "state" / "richard-earnings" / "scans" / "2026-11-14" / "A.jsonl").write_text(
+        json.dumps(
+            {
+                "ticker": "AFRM",
+                "name": "Affirm",
+                "status": "announced",
+                "earnings_date": "2026-11-20",
+                "timing": "BMO",
+                "quarter_label": "Q1 2027",
+                "confidence": "high",
+                "source_url": "https://ir.example.test",
+                "evidence": "press release",
+                "notes": None,
+                "group": "A",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_research(**kw: Any) -> dict[str, Any]:
+        calls.append(dict(kw))
+        raise AssertionError(f"must not list or delete valid confirmed slot: {kw}")
+
+    orig_call = mod.call_research
+    orig_now = mod.now_et
+    try:
+        mod.now_et = create_autospec(
+            orig_now,
+            return_value=datetime(2026, 11, 14, 7, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+        mod.call_research = create_autospec(orig_call, side_effect=_fake_research)
+        res = mod.cmd_apply(argparse.Namespace(workspace_dir=str(ws)))
+    finally:
+        mod.call_research = orig_call
+        mod.now_et = orig_now
+
+    assert res["ok"] is True
+    assert calls == []
+    wl = json.loads((ws / "state" / "richard-earnings" / "watchlist.json").read_text(encoding="utf-8"))
+    assert "pending_reconcile_slots" not in wl
+    assert wl["confirmed"][0]["calendar_event_id"] == "evt-a-valid"
+
+
+@pytest.mark.asyncio
+async def test_legacy_gws_weekly_scan_reads_pg_reconcile_scrubs_history_and_acks_only_on_confirm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #4 / Grok #2 / Grok #3 / Decision 3:
+    1) Default legacy_gws keeps regular gcal ops direct (_gcal_run, 0 backend HTTP).
+    2) Independent read-only reconcile_status reads PostgreSQL tracker_reconcile_needed
+       even under legacy_gws.
+    3) cmd_self_test returns actual backend='legacy_gws', activates reconcile, and scrubs
+       both watchlist.json and historical scans/*/apply.json & roll.json.
+    4) cmd_apply refuses to clear local reconcile flag if ack lacks tracker_reconcile_cleared=True,
+       and clears both local & PG flags once backend /reconcile-ack succeeds.
+    """
+    import argparse
+
+    _configure_gate_env(monkeypatch, backend_mode="legacy_gws")
+    bridge = _build_local_bridge(tmp_path, monkeypatch)
+
+    pg_state = {"pending": True}
+
+    async def _fake_has_pending(_uid: str, *, conn: Any = None) -> bool:
+        return pg_state["pending"]
+
+    async def _fake_clear_pending(_uid: str, *, conn: Any = None) -> int:
+        pg_state["pending"] = False
+        return 1
+
+    monkeypatch.setattr(
+        integrations_db,
+        "has_pending_tracker_reconcile",
+        create_autospec(integrations_db.has_pending_tracker_reconcile, side_effect=_fake_has_pending),
+    )
+    monkeypatch.setattr(
+        integrations_db,
+        "clear_pending_tracker_reconcile",
+        create_autospec(integrations_db.clear_pending_tracker_reconcile, side_effect=_fake_clear_pending),
+    )
+    monkeypatch.setattr(
+        tc_router,
+        "authorize_tracker_calendar_execution",
+        create_autospec(
+            tc.authorize_tracker_calendar_execution,
+            return_value={"ok": True, "code": "ok"},
+        ),
+    )
+
+    app = _make_app()
+    transport = httpx.ASGITransport(app=app)
+    asgi_client = httpx.AsyncClient(transport=transport, base_url="http://backend")
+    bridge._gcal_http = asgi_client
+
+    async def _fake_exec_gws(argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
+        if "insert" in argv:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "id": "evt-legacy-reconciled-1",
+                        "summary": "Affirm (AFRM) Earnings — Q1 2027 [BMO]",
+                        "description": "Created by Dalton earnings tracker",
+                        "start": {"date": "2026-11-20"},
+                        "end": {"date": "2026-11-21"},
+                    }
+                ).encode("utf-8"),
+                b"",
+            )
+        return 0, json.dumps({"items": []}).encode("utf-8"), b""
+
+    monkeypatch.setattr(bridge, "_exec_gws", create_autospec(bridge._exec_gws, side_effect=_fake_exec_gws))
+
+    caller_tok = _signed_headers()["X-Dalton-Caller-Token"]
+
+    try:
+        # Step A: Bridge reconcile_status reads PG under legacy_gws
+        rec_rpc = await bridge.handle_tools_call(
+            1,
+            {"name": "research", "arguments": {"route": "gcal", "operation": "reconcile_status"}},
+            raw_caller_token=caller_tok,
+        )
+        rec_body = json.loads(rec_rpc["result"]["content"][0]["text"])
+        assert rec_body["ok"] is True
+        assert rec_body["data"]["tracker_reconcile_needed"] is True
+        assert rec_body["_sources"] == []
+
+        # Step B: Bridge health_check without ack runs directly on legacy_gws and reports backend
+        hc_rpc = await bridge.handle_tools_call(
+            2,
+            {"name": "research", "arguments": {"route": "gcal", "operation": "health_check"}},
+            raw_caller_token=caller_tok,
+        )
+        hc_body = json.loads(hc_rpc["result"]["content"][0]["text"])
+        assert hc_body["ok"] is True
+        assert hc_body["data"] == {"calendar_ok": True, "backend": "legacy_gws"}
+
+        # Step C: Bridge health_check(ack_reconcile=True) under legacy_gws calls backend /reconcile-ack
+        ack_rpc = await bridge.handle_tools_call(
+            3,
+            {
+                "name": "research",
+                "arguments": {"route": "gcal", "operation": "health_check", "ack_reconcile": True},
+            },
+            raw_caller_token=caller_tok,
+        )
+        ack_body = json.loads(ack_rpc["result"]["content"][0]["text"])
+        assert ack_body["ok"] is True
+        assert ack_body["data"]["calendar_ok"] is True
+        assert ack_body["data"]["backend"] == "legacy_gws"
+        assert ack_body["data"]["tracker_reconcile_cleared"] is True
+        assert pg_state["pending"] is False
+    finally:
+        await asgi_client.aclose()
+
+    # Step D: richard_earnings.py cmd_self_test under legacy_gws queries reconcile_status,
+    # scrubs watchlist + historical apply.json/roll.json, and cmd_apply refuses unconfirmed ack.
+    mod = _load_richard_earnings_module()
+    ws = tmp_path / "ws"
+    hist_dir = ws / "state" / "richard-earnings" / "scans" / "2026-11-07"
+    today_dir = ws / "state" / "richard-earnings" / "scans" / "2026-11-14"
+    hist_dir.mkdir(parents=True)
+    today_dir.mkdir(parents=True)
+    (ws / "state" / "richard-earnings" / "watchlist.json").write_text(
+        json.dumps(
+            {
+                "updated": "2026-11-07",
+                "confirmed": [
+                    {
+                        "ticker": "AFRM",
+                        "name": "Affirm",
+                        "date": "2026-11-20",
+                        "timing": "BMO",
+                        "quarter": "Q1 2027",
+                        "calendar_event_id": "stale-legacy-id",
+                        "source": "https://ir.example.test",
+                        "confidence": "high",
+                    }
+                ],
+                "pending": [],
+                "reported": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (hist_dir / "apply.json").write_text(
+        json.dumps({"planned": [{"ticker": "AFRM", "old_event_id": "stale-apply-id"}], "applied": [{"ticker": "AFRM", "event_id": "stale-legacy-id"}]}),
+        encoding="utf-8",
+    )
+    (hist_dir / "roll.json").write_text(
+        json.dumps({"moved": [{"ticker": "PDD", "calendar_event_id": "stale-roll-id"}]}),
+        encoding="utf-8",
+    )
+    (today_dir / "A.jsonl").write_text(
+        json.dumps(
+            {
+                "ticker": "AFRM",
+                "name": "Affirm",
+                "status": "announced",
+                "earnings_date": "2026-11-20",
+                "timing": "BMO",
+                "quarter_label": "Q1 2027",
+                "confidence": "high",
+                "source_url": "https://ir.example.test",
+                "evidence": "press release",
+                "notes": None,
+                "group": "A",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    unconfirmed_ack = True
+
+    def _script_research(**kw: Any) -> dict[str, Any]:
+        op = kw.get("operation")
+        if op == "health_check":
+            if kw.get("ack_reconcile"):
+                if unconfirmed_ack:
+                    # Simulate stale/unconfirmed ack lacking tracker_reconcile_cleared
+                    return {"ok": True, "status": "ok", "data": {"calendar_ok": True, "backend": "legacy_gws"}}
+                return {
+                    "ok": True,
+                    "status": "ok",
+                    "data": {"calendar_ok": True, "backend": "legacy_gws", "tracker_reconcile_cleared": True},
+                }
+            return {"ok": True, "status": "ok", "data": {"calendar_ok": True, "backend": "legacy_gws"}}
+        if op == "reconcile_status":
+            return {"ok": True, "status": "ok", "data": {"tracker_reconcile_needed": True, "backend": "legacy_gws"}}
+        if op == "list_events":
+            return {"ok": True, "status": "ok", "data": {"events": []}}
+        if op == "insert_event":
+            return {"ok": True, "status": "ok", "data": {"id": "evt-fresh-1"}}
+        raise AssertionError(f"unexpected {op}")
+
+    orig_call = mod.call_research
+    orig_now = mod.now_et
+    try:
+        mod.now_et = create_autospec(
+            orig_now,
+            return_value=datetime(2026, 11, 14, 7, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+        mod.call_research = create_autospec(orig_call, side_effect=_script_research)
+        ns = argparse.Namespace(workspace_dir=str(ws))
+        st = mod.cmd_self_test(ns)
+        assert st["ok"] is True
+        assert st["backend"] == "legacy_gws"
+        assert st["tracker_reconcile_needed"] is True
+
+        # Both watchlist AND historical scan files scrubbed!
+        wl_after_st = json.loads((ws / "state" / "richard-earnings" / "watchlist.json").read_text(encoding="utf-8"))
+        assert wl_after_st["confirmed"][0]["calendar_event_id"] is None
+        assert wl_after_st["tracker_reconcile_source"] == "backend"
+        hist_apply = json.loads((hist_dir / "apply.json").read_text(encoding="utf-8"))
+        assert hist_apply["planned"][0]["old_event_id"] is None
+        assert hist_apply["applied"][0]["event_id"] is None
+        hist_roll = json.loads((hist_dir / "roll.json").read_text(encoding="utf-8"))
+        assert hist_roll["moved"][0]["calendar_event_id"] is None
+
+        # Unconfirmed ack -> cmd_apply fails & keeps tracker_reconcile_needed locally!
+        r_unconfirmed = mod.cmd_apply(ns)
+        assert r_unconfirmed["ok"] is False
+        wl_kept = json.loads((ws / "state" / "richard-earnings" / "watchlist.json").read_text(encoding="utf-8"))
+        assert wl_kept["tracker_reconcile_needed"] is True
+
+        # Confirmed ack -> clears local flag cleanly
+        unconfirmed_ack = False
+        r_confirmed = mod.cmd_apply(ns)
+        assert r_confirmed["ok"] is True
+        wl_done = json.loads((ws / "state" / "richard-earnings" / "watchlist.json").read_text(encoding="utf-8"))
+        assert "tracker_reconcile_needed" not in wl_done
+        assert "tracker_reconcile_source" not in wl_done
+    finally:
+        mod.call_research = orig_call
+        mod.now_et = orig_now
+
+
+@pytest.mark.asyncio
+async def test_probe_prod_readonly_check_queries_running_bridge_runtime_info_before_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #6 / Decision 6: prod-readonly-check fetches actual account & calendar from the
+    running bridge's GET /internal/tracker-calendar/runtime-info, and aborts before MCP if
+    bridge is unreachable or disagrees with owner's connection (even if CLI --calendar-id matches).
+    """
+    probe = _load_probe_module()
+    bridge = _build_local_bridge(tmp_path, monkeypatch)
+    monkeypatch.setenv("DALTON_GCAL_CALENDAR_ID", "bridge-actual-cal@group.calendar.google.com")
+    monkeypatch.setenv("DALTON_BRIDGE_URL", "http://127.0.0.1:8960")
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", BRIDGE_TOKEN)
+
+    async def _fake_exec_gws(argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
+        if argv[1:3] == ["auth", "status"]:
+            return 0, json.dumps({"email": "owner@example.test"}).encode("utf-8"), b""
+        return 1, b"", b""
+
+    monkeypatch.setattr(bridge, "_exec_gws", create_autospec(bridge._exec_gws, side_effect=_fake_exec_gws))
+
+    code_rt, rt_payload = await bridge.handle_tracker_calendar_runtime_info()
+    assert code_rt == 200
+    assert rt_payload["ok"] is True
+    assert rt_payload["host_gws_account"] == "owner@example.test"
+    assert rt_payload["calendar_id"] == "bridge-actual-cal@group.calendar.google.com"
+    assert rt_payload["gcal_backend"] == "legacy_gws"
+
+    # Wire probe HTTP client to bridge runtime-info handler
+    http_client = create_autospec(httpx.AsyncClient, instance=True)
+
+    async def _fake_get(url: str, *, headers: dict[str, str] | None = None, timeout: Any = None) -> httpx.Response:
+        assert url == "http://127.0.0.1:8960/internal/tracker-calendar/runtime-info"
+        c, p = await bridge.handle_tracker_calendar_runtime_info()
+        return httpx.Response(c, json=p)
+
+    http_client.get.side_effect = _fake_get
+
+    @asynccontextmanager
+    async def _noop_pool() -> Any:
+        yield None
+
+    monkeypatch.setattr(probe, "open_probe_db_pool", _noop_pool)
+    # Owner row has CALENDAR_ID, CLI passes CALENDAR_ID, BUT running bridge has bridge-actual-cal!
+    ro_row = _make_integration_row(
+        scopes=f"{GOOGLE_SCOPE_CALENDAR_LIST_RO} {GOOGLE_SCOPE_CALENDAR_EVENTS_RO}",
+        calendar_id=CALENDAR_ID,
+    )
+    monkeypatch.setattr(
+        integrations_db,
+        "get_connection",
+        create_autospec(integrations_db.get_connection, return_value=ro_row),
+    )
+    mcp_client = create_autospec(GoogleCalendarMCPClient, instance=True)
+
+    code_mismatch, body_mismatch = await probe.run_prod_readonly_check(
+        owner_id=OWNER_ID,
+        expected_calendar_id=CALENDAR_ID,
+        http_client=http_client,
+        google_client=mcp_client,
+    )
+    assert code_mismatch != 0
+    assert body_mismatch["calendar_id_matched"] is False
+    assert mcp_client.call_mcp_tool.call_count == 0
+
+    # Unreachable bridge -> fails precheck before any MCP call
+    async def _unreachable() -> None:
+        return None
+
+    code_down, body_down = await probe.run_prod_readonly_check(
+        owner_id=OWNER_ID,
+        bridge_runtime_resolver=create_autospec(_unreachable, side_effect=_unreachable),
+        google_client=mcp_client,
+    )
+    assert code_down != 0
+    assert body_down["bridge_reachable"] is False
+    assert mcp_client.call_mcp_tool.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_drain_mail_resolves_research_home_from_host_config_and_checks_worker_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #7 / Decision 6: drain --target mail without --research-home resolves
+    DALTON_RESEARCH_HOME from actual host service config and ALWAYS checks worker.lock.
+    """
+    probe = _load_probe_module()
+    state_root = tmp_path / "md-state"
+    (state_root / "locks").mkdir(parents=True)
+    prepare_cfg = tmp_path / "prepare.json"
+    prepare_cfg.write_text(json.dumps({"state_root": str(state_root)}), encoding="utf-8")
+
+    research_home = tmp_path / "host-research-home"
+    images_dir = research_home / "state" / "research-images"
+    images_dir.mkdir(parents=True)
+    worker_lock = images_dir / "worker.lock"
+    worker_lock.write_text("", encoding="utf-8")
+
+    bridge_env = tmp_path / "researchdata-bridge.env"
+    bridge_env.write_text(f"DALTON_RESEARCH_HOME={research_home}\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.delenv("DALTON_RESEARCH_HOME", raising=False)
+
+    async def _zero(_ids: list[str]) -> int:
+        return 0
+
+    zero_mock = create_autospec(_zero, side_effect=_zero)
+
+    # Without passing research_home, holding worker.lock MUST keep drain waiting (exit 2)
+    with open(worker_lock, "r+b") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            code_held, body_held = await probe.run_drain(
+                target="mail",
+                automation_ids=[AUTO_ID],
+                wait_seconds=0,
+                poll_interval=0.05,
+                prepare_config_path=prepare_cfg,
+                research_home=None,
+                count_running_fn=zero_mock,
+            )
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    assert code_held == 2
+    assert "state/research-images/worker.lock" in body_held["active_locks"]
+
+    # Released worker.lock -> drains cleanly (exit 0)
+    code_ok, body_ok = await probe.run_drain(
+        target="mail",
+        automation_ids=[AUTO_ID],
+        wait_seconds=0,
+        poll_interval=0.05,
+        prepare_config_path=prepare_cfg,
+        research_home=None,
+        count_running_fn=zero_mock,
+    )
+    assert code_ok == 0
+    assert body_ok["drained"] is True
+
+
+@pytest.mark.asyncio
+async def test_probe_extract_database_name_libpq_and_dry_run_checks_actual_db_and_calendar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #8 / Decision 7: extract_database_name parses ?dbname= via libpq, and
+    --dry-run performs actual DB current_database() & connection calendar validation.
+    """
+    probe = _load_probe_module()
+    assert (
+        probe.extract_database_name("postgresql://u:p@localhost:5432/langalpha_test?dbname=langalpha")
+        == "langalpha"
+    )
+    assert probe.extract_database_name("host=localhost dbname=langalpha_test") == "langalpha_test"
+
+    monkeypatch.setenv("DB_NAME", "langalpha_test")
+    monkeypatch.setenv("DALTON_TEST_GCAL_CALENDAR_IDS", "reg-cal@group.calendar.google.com")
+    # ?dbname=langalpha overrides /langalpha_test -> rejected immediately
+    code_q, body_q = await probe.run_calendar_purge_drill(
+        database_url="postgresql://u:p@localhost:5432/langalpha_test?dbname=langalpha",
+        owner_id=TEST_OWNER_ID,
+        calendar_id="reg-cal@group.calendar.google.com",
+        dry_run=True,
+    )
+    assert code_q != 0
+    assert body_q["guard_failed"] is True
+
+    # --dry-run MUST query actual current_database() and reject if pool connects to prod DB
+    @asynccontextmanager
+    async def _noop_pool() -> Any:
+        yield None
+
+    monkeypatch.setattr(probe, "open_probe_db_pool", _noop_pool)
+    monkeypatch.setattr(
+        probe,
+        "_query_actual_database_name",
+        create_autospec(probe._query_actual_database_name, return_value="langalpha"),
+    )
+    test_conn = _make_integration_row(
+        user_id=TEST_OWNER_ID,
+        calendar_id="reg-cal@group.calendar.google.com",
+    )
+    monkeypatch.setattr(
+        integrations_db,
+        "get_connection",
+        create_autospec(integrations_db.get_connection, return_value=test_conn),
+    )
+    code_dry_prod, body_dry_prod = await probe.run_calendar_purge_drill(
+        database_url="postgresql://u:p@localhost:5432/langalpha_test",
+        owner_id=TEST_OWNER_ID,
+        calendar_id="reg-cal@group.calendar.google.com",
+        dry_run=True,
+    )
+    assert code_dry_prod != 0
+    assert body_dry_prod["guard_failed"] is True
+    assert any("actual pool database name" in r for r in body_dry_prod["reasons"])

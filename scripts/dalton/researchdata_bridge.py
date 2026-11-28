@@ -3204,7 +3204,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "gcal": {
         "tool": "research",
         "category": "research",
-        "operations": ["list_events", "insert_event", "delete_event", "health_check"],
+        "operations": ["list_events", "insert_event", "delete_event", "health_check", "reconcile_status"],
         "default_operation": "list_events",
         "operation_aliases": {},
         "accepted_params": [
@@ -3217,6 +3217,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "start",
             "end",
             "event_id",
+            "ack_reconcile",
         ],
         "accepted_nested_params": [],
         "required_params": {
@@ -3224,8 +3225,9 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "insert_event": ["summary", "description", "start", "end"],
             "delete_event": ["event_id"],
             "health_check": [],
+            "reconcile_status": [],
         },
-        "optional_params": ["query", "limit"],
+        "optional_params": ["query", "limit", "ack_reconcile"],
         "param_formats": {
             "query": "单个 ticker 或短串，1-64 位字母数字及 . _ -",
             "time_min": "ISO 时间或 YYYY-MM-DD；日期按 UTC 午夜。与 time_max 的窗口不超过 400 天",
@@ -3236,12 +3238,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "start": '{"date": "YYYY-MM-DD"} 或 {"dateTime": "...", "timeZone": "..."}',
             "end": "与 start 同一种形状，且晚于 start",
             "event_id": "5-128 位字母、数字、_ 或 -",
+            "ack_reconcile": "仅 health_check 可选布尔值，确认清除待核对标记",
         },
         "return_shape": (
             "{\"ok\": true, \"status\": \"ok\", \"data\": {...}, \"_sources\": [...]}. "
             "list_events 的事件在 data.events，只含 id、summary、description、start、end。"
             "insert_event 返回新事件 id。delete_event 在核对 tracker 标记后才删除。"
-            "health_check 返回 data.calendar_ok 布尔值且 _sources 为空。"
+            "health_check 返回 data.calendar_ok 布尔值与实际通道 data.backend 且 _sources 为空。"
+            "reconcile_status 返回只读待核对标记 data.tracker_reconcile_needed 且 _sources 为空。"
         ),
         "examples": [
             'research(route="gcal", operation="health_check")',
@@ -7006,6 +7010,7 @@ _GCAL_OP_KEYS = {
     "insert_event": {"summary", "description", "start", "end"},
     "delete_event": {"event_id"},
     "health_check": {"ack_reconcile"},
+    "reconcile_status": set(),
 }
 
 GCAL_CATALOG_ENTRY: dict[str, Any] = {
@@ -7015,7 +7020,7 @@ GCAL_CATALOG_ENTRY: dict[str, Any] = {
     "kind": "bridge_calendar",
     "name": "Richard earnings calendar",
     "description": "列、新建、删除与自检 Richard 财报日期事件。日历 ID 由服务端/宿主机配置。删除前必须取回事件并核对 tracker 标记。",
-    "operations": ["list_events", "insert_event", "delete_event", "health_check"],
+    "operations": ["list_events", "insert_event", "delete_event", "health_check", "reconcile_status"],
     "rules": [
         "不并入 all。",
         "日历 ID 不由调用方传入。",
@@ -7510,9 +7515,10 @@ def _gcal_missing(operation: str, arguments: dict[str, Any]) -> str | None:
         "insert_event": ("summary", "description", "start", "end"),
         "delete_event": ("event_id",),
         "health_check": (),
+        "reconcile_status": (),
     }.get(operation)
     if required is None:
-        return "gcal 只提供 list_events、insert_event、delete_event、health_check。"
+        return "gcal 只提供 list_events、insert_event、delete_event、health_check、reconcile_status。"
     missing = [key for key in required if arguments.get(key) is None]
     if missing:
         return f"{operation} 需要 {'、'.join(missing)}。"
@@ -12180,10 +12186,14 @@ class ResearchDataBridge:
         }
         res = await self._gcal_list(bin_path, calendar_id, probe_args, timeout_s)
         if res.get("ok") is True:
-            return {"ok": True, "status": "ok", "data": {"calendar_ok": True}}
+            return {
+                "ok": True,
+                "status": "ok",
+                "data": {"calendar_ok": True, "backend": "legacy_gws"},
+            }
         out = dict(res)
         out["ok"] = False
-        out["data"] = {"calendar_ok": False}
+        out["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
         return out
 
     async def _gcal_run(
@@ -12202,13 +12212,13 @@ class ResearchDataBridge:
         if not calendar_id:
             fail = _gcal_failure("source_missing", "source_missing", _GCAL_HINT_CALENDAR, "上游不可用")
             if operation == "health_check":
-                fail["data"] = {"calendar_ok": False}
+                fail["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
             return fail
         bin_path = self.cfg.gws_bin
         if not bin_path.is_file():
             fail = _gcal_failure("source_missing", "source_missing", _GCAL_HINT_MISSING, "上游不可用")
             if operation == "health_check":
-                fail["data"] = {"calendar_ok": False}
+                fail["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
             return fail
         if operation == "health_check":
             return await self._gcal_health_check(str(bin_path), calendar_id, timeout_s)
@@ -12224,7 +12234,7 @@ class ResearchDataBridge:
     ) -> tuple[int, dict[str, Any]]:
         """Private admin-only callback for backend ``DALTON_GCAL_BACKEND=legacy_gws`` (§5.3)."""
         operation = str(body.get("operation") or "").strip()
-        if operation not in _GCAL_OP_KEYS:
+        if operation not in ("list_events", "insert_event", "delete_event", "health_check"):
             return 400, {"ok": False, "error": "Unsupported tracker calendar operation."}
         raw_args = body.get("arguments")
         arguments = dict(raw_args) if isinstance(raw_args, dict) else {}
@@ -12238,11 +12248,11 @@ class ResearchDataBridge:
         except asyncio.TimeoutError:
             payload = _gcal_failure("timeout", "timeout", _GCAL_HINT_TIMEOUT, "上游不可用")
             if operation == "health_check":
-                payload["data"] = {"calendar_ok": False}
+                payload["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
         except OSError:
             payload = _gcal_failure("source_missing", "source_missing", _GCAL_HINT_MISSING, "上游不可用")
             if operation == "health_check":
-                payload["data"] = {"calendar_ok": False}
+                payload["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
         except Exception as exc:  # noqa: BLE001 - gcal failures stay on the tool envelope
             payload = _gcal_failure(
                 "error",
@@ -12252,9 +12262,192 @@ class ResearchDataBridge:
                 error=type(exc).__name__,
             )
             if operation == "health_check":
-                payload["data"] = {"calendar_ok": False}
+                payload["data"] = {"calendar_ok": False, "backend": "legacy_gws"}
         calendar_id = os.environ.get("DALTON_GCAL_CALENDAR_ID", "").strip()
         return 200, {"payload": payload, "calendar_id": calendar_id}
+
+    @staticmethod
+    def _extract_gws_account_from_dict(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("email", "user_email", "account_email", "account", "user", "active_account", "sub"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+            if isinstance(val, dict):
+                nested = ResearchDataBridge._extract_gws_account_from_dict(val)
+                if nested:
+                    return nested
+        return None
+
+    async def _resolve_bridge_gws_account(self, timeout_s: float = 15.0) -> str | None:
+        """Resolve the active Google account using the running bridge's own ``gws_bin`` and env."""
+        bin_path = self.cfg.gws_bin
+        if not bin_path.is_file():
+            return None
+        try:
+            rc, out_b, _err_b = await self._exec_gws([str(bin_path), "auth", "status"], timeout_s)
+            if rc == 0:
+                parsed = _gcal_parse_json(out_b.decode("utf-8", errors="replace"))
+                acct = self._extract_gws_account_from_dict(parsed)
+                if acct:
+                    return acct
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            rc2, out_b2, _err_b2 = await self._exec_gws(
+                [
+                    str(bin_path),
+                    "calendar",
+                    "calendars",
+                    "get",
+                    "--params",
+                    _gcal_json({"calendarId": "primary"}),
+                ],
+                timeout_s,
+            )
+            if rc2 == 0:
+                parsed2 = _gcal_parse_json(out_b2.decode("utf-8", errors="replace"))
+                if isinstance(parsed2, dict):
+                    cal_id = parsed2.get("id")
+                    if isinstance(cal_id, str) and cal_id.strip():
+                        return cal_id.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    async def handle_tracker_calendar_runtime_info(self) -> tuple[int, dict[str, Any]]:
+        """Admin-only read-only runtime info for migration probes (actual gws account, calendar ID, backend, research_home)."""
+        gcal_backend = os.environ.get("DALTON_GCAL_BACKEND", "").strip().lower() or "legacy_gws"
+        calendar_id = os.environ.get("DALTON_GCAL_CALENDAR_ID", "").strip()
+        host_gws_account = await self._resolve_bridge_gws_account()
+        return 200, {
+            "ok": True,
+            "gcal_backend": gcal_backend,
+            "calendar_id": calendar_id,
+            "host_gws_account": host_gws_account,
+            "gws_bin_exists": self.cfg.gws_bin.is_file(),
+            "research_home": str(self._research_home_root()),
+        }
+
+    async def _gcal_query_reconcile_status(
+        self,
+        eff_timeout: int,
+        raw_caller_token: str,
+    ) -> dict[str, Any]:
+        """Read-only query of PostgreSQL ``tracker_reconcile_needed`` via backend endpoint."""
+        total_timeout = min(max(float(eff_timeout), 1.0), 30.0)
+        url = f"{self.cfg.backend_internal_url.rstrip('/')}/api/v1/dalton/mcp/tracker-calendar/reconcile-status"
+        headers = {
+            "X-Dalton-Bridge-Token": self.cfg.admin_token,
+            "X-Dalton-Caller-Scope": "per-request",
+            "X-Dalton-Caller-Token": raw_caller_token,
+        }
+        import httpx
+
+        timeout_cfg = httpx.Timeout(
+            connect=min(5.0, total_timeout),
+            read=total_timeout,
+            write=total_timeout,
+            pool=min(5.0, total_timeout),
+        )
+        client = self._gcal_http
+        if client is not None:
+            resp = await client.get(url, headers=headers, timeout=timeout_cfg)
+        else:
+            async with httpx.AsyncClient(timeout=timeout_cfg, trust_env=False) as owned:
+                resp = await owned.get(url, headers=headers)
+        try:
+            parsed = resp.json()
+        except Exception:
+            return _gcal_failure(
+                "invalid_response",
+                "invalid_response",
+                "后端待核对状态接口返回了非 JSON 响应。",
+                "上游不可用",
+            )
+        if resp.status_code >= 400 or not isinstance(parsed, dict) or parsed.get("ok") is not True:
+            detail = parsed.get("detail") if isinstance(parsed, dict) else None
+            code = "not_authorized" if resp.status_code in (401, 403) else "upstream_error"
+            msg = "查询待核对状态失败。"
+            if isinstance(detail, dict):
+                code = str(detail.get("code") or code)
+                msg = str(detail.get("message") or msg)
+            elif isinstance(detail, str) and detail.strip():
+                msg = detail.strip()
+            category = "权限或额度" if resp.status_code in (401, 403) else "上游不可用"
+            return _gcal_failure(code, code, msg, category)
+        return {
+            "ok": True,
+            "status": "ok",
+            "data": {
+                "tracker_reconcile_needed": bool(parsed.get("tracker_reconcile_needed")),
+                "owner_configured": bool(parsed.get("owner_configured", True)),
+                "backend": parsed.get("backend"),
+            },
+        }
+
+    async def _gcal_ack_reconcile_on_backend(
+        self,
+        eff_timeout: int,
+        raw_caller_token: str,
+    ) -> dict[str, Any]:
+        """Clear PostgreSQL ``tracker_reconcile_needed`` via backend endpoint (works under legacy_gws too)."""
+        total_timeout = min(max(float(eff_timeout), 1.0), 30.0)
+        url = f"{self.cfg.backend_internal_url.rstrip('/')}/api/v1/dalton/mcp/tracker-calendar/reconcile-ack"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Dalton-Bridge-Token": self.cfg.admin_token,
+            "X-Dalton-Caller-Scope": "per-request",
+            "X-Dalton-Caller-Token": raw_caller_token,
+        }
+        import httpx
+
+        timeout_cfg = httpx.Timeout(
+            connect=min(5.0, total_timeout),
+            read=total_timeout,
+            write=total_timeout,
+            pool=min(5.0, total_timeout),
+        )
+        client = self._gcal_http
+        if client is not None:
+            resp = await client.post(url, json={}, headers=headers, timeout=timeout_cfg)
+        else:
+            async with httpx.AsyncClient(timeout=timeout_cfg, trust_env=False) as owned:
+                resp = await owned.post(url, json={}, headers=headers)
+        try:
+            parsed = resp.json()
+        except Exception:
+            return _gcal_failure(
+                "invalid_response",
+                "invalid_response",
+                "后端待核对确认接口返回了非 JSON 响应。",
+                "上游不可用",
+                data={"calendar_ok": False, "backend": "legacy_gws"},
+            )
+        if (
+            resp.status_code >= 400
+            or not isinstance(parsed, dict)
+            or parsed.get("ok") is not True
+            or parsed.get("tracker_reconcile_cleared") is not True
+        ):
+            detail = parsed.get("detail") if isinstance(parsed, dict) else None
+            code = "not_authorized" if resp.status_code in (401, 403) else "upstream_error"
+            msg = "后端确认清除待核对标记失败。"
+            if isinstance(detail, dict):
+                code = str(detail.get("code") or code)
+                msg = str(detail.get("message") or msg)
+            elif isinstance(detail, str) and detail.strip():
+                msg = detail.strip()
+            category = "权限或额度" if resp.status_code in (401, 403) else "上游不可用"
+            return _gcal_failure(
+                code,
+                code,
+                msg,
+                category,
+                data={"calendar_ok": False, "backend": "legacy_gws"},
+            )
+        return {"ok": True, "tracker_reconcile_cleared": True}
 
     async def _gcal_forward_to_backend(
         self,
@@ -12350,10 +12543,46 @@ class ResearchDataBridge:
         raw_backend = os.environ.get("DALTON_GCAL_BACKEND", "").strip().lower()
         backend_mode = raw_backend or "legacy_gws"
         try:
-            if backend_mode == "legacy_gws":
-                # Decision #1: default legacy_gws runs _gcal_run directly without
-                # touching the backend tracker-calendar gate or sending any HTTP.
-                payload = await self._gcal_run(arguments, operation, float(eff_timeout))
+            if operation == "reconcile_status":
+                extra = _gcal_reject_extras(operation, arguments)
+                if extra is not None:
+                    payload = extra
+                else:
+                    token = (raw_caller_token or "").strip()
+                    if not token:
+                        payload = _gcal_failure(
+                            "invalid_caller_token",
+                            "invalid_caller_token",
+                            "查询待核对状态需要有效的调用者身份令牌。",
+                            "权限或额度",
+                        )
+                    else:
+                        payload = await self._gcal_query_reconcile_status(eff_timeout, token)
+            elif backend_mode == "legacy_gws":
+                if operation == "health_check" and arguments.get("ack_reconcile") is True:
+                    token = (raw_caller_token or "").strip()
+                    if not token:
+                        payload = _gcal_failure(
+                            "invalid_caller_token",
+                            "invalid_caller_token",
+                            "清除待核对标记需要有效的调用者身份令牌。",
+                            "权限或额度",
+                            data={"calendar_ok": False, "backend": "legacy_gws"},
+                        )
+                    else:
+                        payload = await self._gcal_run(arguments, operation, float(eff_timeout))
+                        if payload.get("ok") is True:
+                            ack_res = await self._gcal_ack_reconcile_on_backend(eff_timeout, token)
+                            if ack_res.get("ok") is True:
+                                hc_data = payload.get("data")
+                                if isinstance(hc_data, dict):
+                                    hc_data["tracker_reconcile_cleared"] = True
+                            else:
+                                payload = ack_res
+                else:
+                    # Decision #1: regular legacy_gws calls run _gcal_run directly without
+                    # touching the backend tracker-calendar gate or sending any HTTP.
+                    payload = await self._gcal_run(arguments, operation, float(eff_timeout))
             elif backend_mode == "official_mcp":
                 token = (raw_caller_token or "").strip()
                 if not token:
@@ -26792,6 +27021,28 @@ async def _handle_client(
                 400: "Bad Request",
                 405: "Method Not Allowed",
                 409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # GET /internal/tracker-calendar/runtime-info. Admin token only; used by
+        # migration probes to inspect the running bridge's actual gws account,
+        # target calendar ID, active gcal backend, and research_home.
+        if path == "/internal/tracker-calendar/runtime-info":
+            if method != "GET":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            code, payload = await bridge.handle_tracker_calendar_runtime_info()
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
                 503: "Service Unavailable",
             }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)

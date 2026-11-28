@@ -74,7 +74,10 @@ def _signed_headers(
 
 
 @pytest_asyncio.fixture
-async def seeded_tracker_rows(test_db_pool: Any, dalton_schema: Any) -> dict[str, str]:
+async def seeded_tracker_rows(
+    patched_get_db_connection: Any,
+    dalton_schema: Any,
+) -> dict[str, str]:
     ids = {
         "owner_id": str(uuid4()),
         "workspace_id": str(uuid4()),
@@ -86,7 +89,7 @@ async def seeded_tracker_rows(test_db_pool: Any, dalton_schema: Any) -> dict[str
         "finished_exec_id": str(uuid4()),
         "other_auto_exec_id": str(uuid4()),
     }
-    async with test_db_pool.connection() as conn:
+    async with patched_get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -151,7 +154,7 @@ async def seeded_tracker_rows(test_db_pool: Any, dalton_schema: Any) -> dict[str
     try:
         yield ids
     finally:
-        async with test_db_pool.connection() as conn:
+        async with patched_get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "DELETE FROM automation_executions WHERE automation_execution_id = ANY(%s::uuid[])",
@@ -180,8 +183,10 @@ async def seeded_tracker_rows(test_db_pool: Any, dalton_schema: Any) -> dict[str
 @pytest.mark.asyncio
 async def test_tracker_calendar_gate_real_pg_authorization_rejections_and_success(
     seeded_tracker_rows: dict[str, str],
+    patched_get_db_connection: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert tc.get_db_connection is patched_get_db_connection
     ids = seeded_tracker_rows
     monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", BRIDGE_TOKEN)
     monkeypatch.setenv("DALTON_TRACKER_CALENDAR_OWNER_ID", ids["owner_id"])
