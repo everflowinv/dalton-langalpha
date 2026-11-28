@@ -73,6 +73,7 @@ export interface PersonalIntegrationsListResponse {
   connectors: PersonalIntegrationConnectorInfo[];
   connections: PersonalIntegrationConnection[];
   active_purges: PersonalIntegrationPurgeLedger[];
+  recent_purges?: PersonalIntegrationPurgeLedger[];
   has_personal_integrations: boolean;
 }
 

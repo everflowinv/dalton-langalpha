@@ -7,8 +7,9 @@ LangSmith or being written into stored thread transcripts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
+from uuid import UUID
 
 PERSONAL_INTEGRATION_TOOL_NAMES: frozenset[str] = frozenset(
     {"dalton_calendar", "dalton_mail"}
@@ -360,9 +361,213 @@ def redact_langsmith_chain_payload(payload: Any) -> Any:
     return out
 
 
+def graph_has_personal_integration_tool(graph: Any) -> bool:
+    """Return True if a compiled LangGraph / RunnableBinding mounts any personal-integration tool."""
+    cur = graph
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        tools_by_name = getattr(cur, "tools_by_name", None)
+        if isinstance(tools_by_name, Mapping) and any(
+            is_personal_integration_tool(name) for name in tools_by_name.keys()
+        ):
+            return True
+        nodes = getattr(cur, "nodes", None)
+        if isinstance(nodes, Mapping):
+            tools_node = nodes.get("tools")
+            if tools_node is not None and graph_has_personal_integration_tool(tools_node):
+                return True
+        next_cur = getattr(cur, "bound", None)
+        if next_cur is None:
+            next_cur = getattr(cur, "graph", None)
+        cur = next_cur
+    return False
+
+
+def is_personal_calendar_capability_enabled() -> bool:
+    """Return True when Dalton and at least one personal calendar capability are enabled."""
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        return False
+    caps = effective_capabilities()
+    return (
+        CapabilityId.GOOGLE_CALENDAR in caps
+        or CapabilityId.FEISHU_CALENDAR in caps
+    )
+
+
+def should_defer_langsmith_export(config: Mapping[str, Any] | None) -> bool:
+    """Whether a LangSmith tracer should buffer runs until turn end before exporting.
+
+    True for interactive turns where personal calendar capabilities are enabled and the
+    calendar tool is loaded (or default PTC interactive turns without an explicit
+    ``personal_calendar_tool_loaded=False``), and the thread is not already marked private.
+    """
+    if not isinstance(config, Mapping):
+        return False
+    cfg_part = (
+        config.get("configurable")
+        if isinstance(config.get("configurable"), Mapping)
+        else {}
+    )
+    meta_part = (
+        config.get("metadata")
+        if isinstance(config.get("metadata"), Mapping)
+        else {}
+    )
+    if cfg_part.get("has_personal_integration_data") or meta_part.get(
+        "has_personal_integration_data"
+    ):
+        return False
+    if not is_personal_calendar_capability_enabled():
+        return False
+
+    from src.dalton.tools.calendar_tools import _is_unattended_automation_turn
+
+    if _is_unattended_automation_turn(config):  # type: ignore[arg-type]
+        return False
+
+    loaded = cfg_part.get("personal_calendar_tool_loaded")
+    if loaded is None:
+        loaded = meta_part.get("personal_calendar_tool_loaded")
+    if loaded is False:
+        return False
+    if loaded is True:
+        return True
+
+    return bool(
+        meta_part.get("workflow_type") == "ptc_agent"
+        or (cfg_part.get("user_id") and cfg_part.get("thread_id"))
+    )
+
+
+class PersonalIntegrationTraceGate:
+    """Shared per-turn LangSmith trace buffer/suppression state for personal integrations.
+
+    - Already-private threads drop all runs immediately (`private=True`).
+    - Interactive turns where personal calendar is enabled & loaded buffer all
+      `create_run` / `update_run` operations (`defer=True`) from turn start.
+      If the turn touches personal calendar at any point, the entire buffered trace
+      is discarded without ever hitting LangSmith; if the turn finishes without
+      touching personal calendar, the buffered operations are flushed in order.
+    """
+
+    def __init__(self, *, private: bool = False, defer: bool = False) -> None:
+        self.private_flag: list[bool] = [bool(private)]
+        self.defer: bool = bool(defer) and not bool(private)
+        self._active_roots: set[UUID] = set()
+        self._buffer: list[tuple[str, Any, Any]] = []
+
+    @property
+    def is_private(self) -> bool:
+        return self.private_flag[0]
+
+    def mark_private(self) -> None:
+        self.private_flag[0] = True
+        self.defer = False
+        for _, _, run in self._buffer:
+            extra = getattr(run, "extra", None)
+            if isinstance(extra, dict):
+                extra["__disabled"] = True
+        self._buffer.clear()
+        self._active_roots.clear()
+
+    def enable_defer(self) -> None:
+        if not self.is_private:
+            self.defer = True
+
+    def on_trace_start(self, run: Any) -> None:
+        if (
+            self.is_private
+            or (
+                getattr(run, "run_type", None) == "tool"
+                and is_personal_integration_tool(getattr(run, "name", None))
+            )
+            or messages_contain_personal_integration_data(getattr(run, "inputs", None))
+        ):
+            self.mark_private()
+            run.extra["__disabled"] = True
+            return
+        if self.defer and getattr(run, "parent_run_id", None) is None:
+            run_id = getattr(run, "id", None)
+            if run_id is not None:
+                self._active_roots.add(run_id)
+
+    def on_llm_end(self, run: Any) -> None:
+        if self.is_private or llm_outputs_contain_personal_tool_call(
+            getattr(run, "outputs", None)
+        ):
+            self.mark_private()
+            run.extra["__disabled"] = True
+
+    def on_tool_finished(self, run: Any) -> None:
+        if self.is_private or is_personal_integration_tool(getattr(run, "name", None)):
+            self.mark_private()
+            run.extra["__disabled"] = True
+
+    def should_persist_immediately(self, tracer: Any, run: Any) -> bool:
+        if self.is_private:
+            run.extra["__disabled"] = True
+            return False
+        if self.defer:
+            if getattr(run, "parent_run_id", None) is None:
+                run_id = getattr(run, "id", None)
+                if run_id is not None:
+                    self._active_roots.add(run_id)
+            self._buffer.append(("create", tracer, run))
+            return False
+        return True
+
+    def should_update_immediately(self, tracer: Any, run: Any) -> bool:
+        if self.is_private:
+            run.extra["__disabled"] = True
+            return False
+        if self.defer:
+            self._buffer.append(("update", tracer, run))
+            return False
+        return True
+
+    def on_run_finished(
+        self,
+        run: Any,
+        *,
+        flush_create: Callable[[Any, Any], None],
+        flush_update: Callable[[Any, Any], None],
+    ) -> None:
+        run_id = getattr(run, "id", None)
+        if self.is_private:
+            self.mark_private()
+            return
+        if not self.defer:
+            return
+        is_root = getattr(run, "parent_run_id", None) is None or (
+            run_id is not None and run_id in self._active_roots
+        )
+        if not is_root:
+            return
+        if run_id is not None:
+            self._active_roots.discard(run_id)
+        if self._active_roots:
+            return
+        pending = list(self._buffer)
+        self._buffer.clear()
+        for op, tracer, buffered_run in pending:
+            if self.is_private:
+                return
+            if op == "create":
+                flush_create(tracer, buffered_run)
+            else:
+                flush_update(tracer, buffered_run)
+
+
 __all__ = [
     "PERSONAL_INTEGRATION_TOOL_NAMES",
+    "PersonalIntegrationTraceGate",
     "REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER",
+    "graph_has_personal_integration_tool",
+    "is_personal_calendar_capability_enabled",
     "is_personal_integration_tool",
     "llm_outputs_contain_personal_tool_call",
     "messages_contain_personal_integration_data",
@@ -375,4 +580,5 @@ __all__ = [
     "redact_langsmith_tool_outputs",
     "redact_personal_tool_args",
     "run_contains_personal_integration_tool",
+    "should_defer_langsmith_export",
 ]

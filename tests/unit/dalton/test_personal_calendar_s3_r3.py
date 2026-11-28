@@ -419,7 +419,7 @@ async def test_p0_backend_channel_gateway_personal_private_automation_fallback_a
         "evaluate_user_notify_eligibility",
         create_autospec(
             notify_dispatch_mod.evaluate_user_notify_eligibility,
-            return_value=(True, "ok", ["feishu:oc_group_1"]),
+            return_value=(True, "ok", ["feishu:chat:oc_group_1"]),
         ),
     )
     posted_notifications: list[dict[str, Any]] = []
@@ -430,9 +430,10 @@ async def test_p0_backend_channel_gateway_personal_private_automation_fallback_a
         card: Any = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        for t in (targets_arg if isinstance(targets_arg, list) else [targets_arg]):
+        ts = targets_arg if isinstance(targets_arg, list) else [targets_arg]
+        for t in ts:
             posted_notifications.append({"target": t, "text": text, "card": card})
-        return {"ok": True}
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in ts]}
 
     async def _always_true(*_a: Any, **_kw: Any) -> bool:
         return True
@@ -441,10 +442,10 @@ async def test_p0_backend_channel_gateway_personal_private_automation_fallback_a
         return None
 
     async def _routes(_uid: str | None) -> dict[str, list[str]]:
-        return {"custom": ["feishu:oc_group_1"], "general": ["feishu:oc_group_1"]}
+        return {"custom": ["feishu:chat:oc_group_1"], "general": ["feishu:chat:oc_group_1"]}
 
     async def _targets(_uid: str | None) -> list[str]:
-        return ["feishu:oc_group_1"]
+        return ["feishu:user:ou_alice"]
 
     async def _empty_overrides(_uid: str | None) -> dict[str, bool]:
         return {}
@@ -467,13 +468,14 @@ async def test_p0_backend_channel_gateway_personal_private_automation_fallback_a
         post_notify_fn=_fake_post_notify,
         frontend_url_fn=lambda: "https://app.example.com",
     )
-    dm_posted = [e for e in posted_notifications if e["target"] in ("feishu", "feishu:@me")]
-    grp_posted = [e for e in posted_notifications if e["target"] == "feishu:oc_group_1"]
+    dm_posted = [e for e in posted_notifications if e["target"] == "feishu:user:ou_alice"]
+    grp_posted = [e for e in posted_notifications if e["target"] == "feishu:chat:oc_group_1"]
     assert len(dm_posted) == 1
     assert "体检" in dm_posted[0]["text"]
     assert len(grp_posted) == 1
     assert grp_posted[0]["text"] == PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
-    assert grp_posted[0]["card"] is None
+    assert isinstance(grp_posted[0]["card"], dict)
+    assert "体检" not in json.dumps(grp_posted[0]["card"], ensure_ascii=False)
     assert "体检" not in grp_posted[0]["text"]
 
 
@@ -914,6 +916,7 @@ class _MiniState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_p1_write_state_split_dispatched_unconfirmed_reconciles_without_duplicate_write(
     monkeypatch: pytest.MonkeyPatch,
@@ -1104,6 +1107,7 @@ async def test_p1_write_state_split_dispatched_unconfirmed_reconciles_without_du
     assert len(created_calls) == 1  # CRITICAL: never duplicated!
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_p1_write_state_split_awaiting_google_form_rechecks_version_including_form_on_get_event(
     monkeypatch: pytest.MonkeyPatch,
@@ -1335,6 +1339,7 @@ async def test_p1_write_state_split_awaiting_google_form_rechecks_version_includ
 # ===========================================================================
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_p1_approval_resume_rechecks_saved_provider_capability(
     monkeypatch: pytest.MonkeyPatch,

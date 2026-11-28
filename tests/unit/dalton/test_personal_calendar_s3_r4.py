@@ -187,14 +187,6 @@ async def test_r4_unattended_automation_calls_to_calendar_rejected_at_entry(
         "config": unattended_cfg,
         "tool_call_id": f"tc-unattended-{action}",
     }
-    if action == "create_event":
-        kwargs.update(
-            {
-                "summary": "Automated Event",
-                "start_time": "2026-12-10T10:00:00+08:00",
-                "end_time": "2026-12-10T11:00:00+08:00",
-            }
-        )
 
     cmd = await tool_obj.coroutine(**kwargs)
     payload = _tool_payload(cmd)
@@ -524,6 +516,7 @@ def test_r4_subagent_transcript_sanitizes_manifest_description_and_body() -> Non
 # ===========================================================================
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_r4_google_form_saved_then_interrupted_rechecks_version_before_resumed_write(
     monkeypatch: pytest.MonkeyPatch,

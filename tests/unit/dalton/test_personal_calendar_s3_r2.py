@@ -519,6 +519,7 @@ async def test_private_surface_rejects_feishu_group_and_discord_channel_even_whe
 # ===========================================================================
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_dalton_calendar_write_real_langgraph_suspend_resume_consumes_original_approval_and_checks_version(
     monkeypatch: pytest.MonkeyPatch,
@@ -705,6 +706,7 @@ async def test_dalton_calendar_write_real_langgraph_suspend_resume_consumes_orig
     assert ver_payload["error"] == "event_version_changed"
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_dalton_calendar_google_write_multi_round_elicitation_real_langgraph_resume_preserves_request_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -1092,6 +1094,7 @@ def test_personal_thread_excluded_from_computer_transcript_mount_and_redacted_in
 # ===========================================================================
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_calendar_write_payload_parity_single_time_update_description_and_feishu_attendees_rejection(
     monkeypatch: pytest.MonkeyPatch,

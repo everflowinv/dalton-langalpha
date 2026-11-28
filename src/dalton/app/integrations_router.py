@@ -446,14 +446,22 @@ def _use_secure_cookie(request: Request) -> bool:
 async def list_personal_integrations_endpoint(
     session: CurrentIntegrationSession,
 ) -> JSONResponse:
-    """List personal integration capabilities, readiness, connections, and active revokes (mode='manage')."""
+    """List personal integration capabilities, readiness, connections, and purge/revoke ledgers (mode='manage')."""
     connections = await db.list_user_connections(session.user_id)
-    active_purges = await db.list_user_purge_ledgers(
-        session.user_id, active_only=True
+    recent_purges = await db.list_user_purge_ledgers(
+        session.user_id, active_only=False, limit=20
     )
+    active_purges = [
+        p
+        for p in recent_purges
+        if p.local_purge_status == LocalPurgeStatus.RUNNING
+        or p.remote_revoke_status
+        in (RemoteRevokeStatus.PENDING, RemoteRevokeStatus.FAILED_RETRYABLE)
+    ]
     has_existing = bool(connections or active_purges)
+    has_any_history = bool(connections or recent_purges)
     require_personal_integration_capability(
-        None, None, mode="manage", has_existing_records=has_existing
+        None, None, mode="manage", has_existing_records=has_any_history
     )
 
     active_caps = effective_capabilities()
@@ -487,6 +495,7 @@ async def list_personal_integrations_endpoint(
             "connectors": connectors,
             "connections": [_serialize_connection(c) for c in connections],
             "active_purges": [_serialize_purge_ledger(p) for p in active_purges],
+            "recent_purges": [_serialize_purge_ledger(p) for p in recent_purges],
             "has_personal_integrations": has_existing,
         },
         headers=_NO_STORE_HEADERS,

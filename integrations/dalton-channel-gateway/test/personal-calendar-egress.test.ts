@@ -517,4 +517,97 @@ describe("Personal integration channel egress guard (automation, fallback & retr
     expect(groupTexts[0]?.text).toBe(REDIRECT_NOTICE);
     expect(groupFiles).toHaveLength(0);
   });
+
+  it("private thread attachment DM redirect does not report partial or notify group when all attachments fail", async () => {
+    const runId = "55555555-6666-7777-8888-999999999992";
+    const groupTarget = "feishu:oc_group_attach_fail";
+
+    // Simulate every attachment download failing (no file uploaded, no link fallback delivered)
+    vi.mocked(h.backend.downloadWorkspaceFile).mockRejectedValue(
+      new Error("workspace storage unreachable"),
+    );
+
+    vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      if (
+        req.target === groupTarget &&
+        !req.delivery_key.endsWith(":personal_redirect_notice")
+      ) {
+        return {
+          claim_status: "denied",
+          status: "failed",
+          code: "personal_integration_private_only",
+          has_personal_integration_data: true,
+          redirect_dm_address: "feishu:@me",
+          message: "personal calendar thread cannot send attachments to group",
+        };
+      }
+      if (req.delivery_key.endsWith(":personal_redirect_notice")) {
+        return {
+          claim_status: "claimed",
+          platform: "feishu",
+          target_address: groupTarget,
+          is_current: true,
+          personal_private_redirect_notice: true,
+          forced_text: REDIRECT_NOTICE,
+        };
+      }
+      return {
+        claim_status: "claimed",
+        platform: "feishu",
+        target_address: "feishu:@me",
+        recipient_platform_user_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
+        is_current: true,
+      };
+    });
+
+    const redirectFn = (
+      h.app.orchestrator as unknown as {
+        executeDeliverableFallbackWithPersonalRedirect: (
+          p: Record<string, unknown>,
+        ) => Promise<{ status: string } | null>;
+      }
+    ).executeDeliverableFallbackWithPersonalRedirect.bind(h.app.orchestrator);
+
+    const res = await redirectFn({
+      deliveryKey: `deliverables:${runId}`,
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      workspaceId: "ws-1",
+      runId,
+      platform: "feishu",
+      targetAddress: groupTarget,
+      inboundMessageId: null,
+      files: [{ path: "calendar_notes.txt", workspace_id: "ws-1" }],
+      linkOnlyFiles: [],
+      threadScopeKey: null,
+      sourceScopeKey: null,
+      sourceGeneration: null,
+      activityOrigin: "automation",
+    });
+
+    // Orchestrator MUST NOT report settled/partial when all attachments failed
+    expect(res).toBeNull();
+
+    // Persisted delivery progress for the DM attempt MUST NOT be marked `partial` or `sent`
+    const dmProgress = h.backend.deliveryUpdates.filter(
+      (p) => p.delivery_key === `deliverables:${runId}:personal_dm`,
+    );
+    const finalDmProgress = dmProgress[dmProgress.length - 1];
+    expect(finalDmProgress).toBeDefined();
+    expect(finalDmProgress?.status).not.toBe("partial");
+    expect(finalDmProgress?.status).not.toBe("sent");
+    expect(["failed", "unknown"]).toContain(finalDmProgress?.status);
+
+    // Group MUST NOT receive "已发送到你的私聊" notice when no attachment actually succeeded
+    const groupTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === groupTarget,
+    );
+    expect(groupTexts).toHaveLength(0);
+    expect(
+      h.backend.deliveryClaims.some(
+        (c) => c.delivery_key === `fallback:${runId}:personal_redirect_notice`,
+      ),
+    ).toBe(false);
+  });
 });

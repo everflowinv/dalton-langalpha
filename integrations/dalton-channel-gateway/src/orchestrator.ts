@@ -10897,6 +10897,7 @@ export class ChannelGatewayOrchestrator {
         target: `${params.platform}:@me`,
         inboundMessageId: params.inboundMessageId,
         text: "本次结果含个人日历相关附件，已发送到你的私聊",
+        textIsAttachmentPreface: true,
         files: params.files,
         linkOnlyFiles: params.linkOnlyFiles,
         downloadMode: "deliverable",
@@ -10906,7 +10907,17 @@ export class ChannelGatewayOrchestrator {
         sourceGeneration: params.sourceGeneration,
         activityOrigin: params.activityOrigin,
       });
-      if (dmRes.status !== "sent" && dmRes.status !== "partial") {
+      const hasRequestedAttachments =
+        params.files.length > 0 || params.linkOnlyFiles.length > 0;
+      const anyAttachmentDelivered =
+        !hasRequestedAttachments ||
+        (dmRes.files ?? []).some(
+          (f) => f.status === "sent" || f.status === "linked",
+        );
+      if (
+        (dmRes.status !== "sent" && dmRes.status !== "partial") ||
+        !anyAttachmentDelivered
+      ) {
         return null;
       }
       return await this.deliveryService.executeDelivery({

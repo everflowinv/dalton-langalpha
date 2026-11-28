@@ -147,6 +147,8 @@ export interface ExecuteDeliveryOptions {
   linkFallbackOnDeliverableMismatch?: boolean;
   /** When true, emit web login deep links only (never download/upload binaries) for un-delivered DM deliverables. */
   forceLinkOnly?: boolean;
+  /** When true, `text` is only a companion preface for attached files; if all attachments fail, do not report `partial`. */
+  textIsAttachmentPreface?: boolean;
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
@@ -2028,7 +2030,11 @@ export class DeliveryService {
       }
     }
 
-    const somethingSucceeded = sentChunks > 0 || anyFileSucceeded;
+    const hasRequestedAttachments = files.length > 0 || linkOnlyFiles.length > 0;
+    const somethingSucceeded =
+      options.textIsAttachmentPreface && hasRequestedAttachments
+        ? anyFileSucceeded
+        : sentChunks > 0 || anyFileSucceeded;
     let finalStatus: AgentSendResponse["status"];
     let finalCode: AgentSendResponse["code"] = null;
     let finalMessage: string;

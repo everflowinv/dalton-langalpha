@@ -596,6 +596,7 @@ export function PersonalIntegrationsCard() {
   );
 
   // Keep the top banner in sync with polled purge records once a post-mutation query response lands.
+  // Never infer "revoked" from a missing ledger row or a `superseded` revoke status.
   const displayBanner = useMemo<{
     tone: 'info' | 'success' | 'warning' | 'error';
     text: string;
@@ -607,14 +608,28 @@ export function PersonalIntegrationsCard() {
     }
 
     const activePurges = data.active_purges ?? [];
+    const purgeById = new Map<string, PersonalIntegrationPurgeLedger>();
+    for (const p of data.recent_purges ?? []) {
+      purgeById.set(p.purge_id, p);
+    }
+    for (const p of activePurges) {
+      purgeById.set(p.purge_id, p);
+    }
+    const allKnownPurges = Array.from(purgeById.values());
+
     const trackedPurges =
       tracking.purgeIds.length > 0
-        ? activePurges.filter((p) => tracking.purgeIds.includes(p.purge_id))
-        : activePurges.filter(
+        ? tracking.purgeIds
+            .map((id) => purgeById.get(id))
+            .filter((p): p is PersonalIntegrationPurgeLedger => p !== undefined)
+        : allKnownPurges.filter(
             (p) =>
               p.provider === tracking.provider &&
               (!tracking.service || !p.service || p.service === tracking.service),
           );
+    const allTrackedFound =
+      tracking.purgeIds.length > 0 && trackedPurges.length === tracking.purgeIds.length;
+
     const hasPurgingConn = (data.connections ?? []).some(
       (c) =>
         c.provider === tracking.provider &&
@@ -627,6 +642,16 @@ export function PersonalIntegrationsCard() {
       (p) => p.remote_revoke_status === 'failed_retryable',
     );
     const hasPendingRemote = trackedPurges.some((p) => p.remote_revoke_status === 'pending');
+    const anyRemoteSuperseded = trackedPurges.some((p) => p.remote_revoke_status === 'superseded');
+    const allLocalCompleted =
+      allTrackedFound &&
+      trackedPurges.every(
+        (p) => p.local_purge_status === 'completed' || p.local_purge_status === 'not_required',
+      );
+    const allRemoteSucceeded =
+      allTrackedFound && trackedPurges.every((p) => p.remote_revoke_status === 'succeeded');
+    const allRemoteNotApplicable =
+      allTrackedFound && trackedPurges.every((p) => p.remote_revoke_status === 'not_applicable');
 
     if (tracking.kind === 'provider_all') {
       if (hasRunningLocal) {
@@ -647,9 +672,27 @@ export function PersonalIntegrationsCard() {
           text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
         };
       }
+      if (anyRemoteSuperseded) {
+        return {
+          tone: 'info',
+          text: '已断开原 Google 服务，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
+        };
+      }
+      if (allLocalCompleted && allRemoteSucceeded) {
+        return {
+          tone: 'success',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
+        };
+      }
+      if (allLocalCompleted && allRemoteNotApplicable) {
+        return {
+          tone: 'success',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成。',
+        };
+      }
       return {
-        tone: 'success',
-        text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
+        tone: 'info',
+        text: '已断开全部 Google 服务，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。',
       };
     }
 
@@ -660,9 +703,15 @@ export function PersonalIntegrationsCard() {
           text: '已切换为新账号，原账号留下的对话个人数据正在后台清理。',
         };
       }
+      if (allLocalCompleted) {
+        return {
+          tone: 'success',
+          text: '已切换为新账号，原账号留下的对话个人数据已清理完成。',
+        };
+      }
       return {
-        tone: 'success',
-        text: '已切换为新账号，原账号留下的对话个人数据已清理完成。',
+        tone: 'info',
+        text: '已切换为新账号，请稍后刷新确认原账号数据清理状态。',
       };
     }
 
@@ -674,9 +723,15 @@ export function PersonalIntegrationsCard() {
           text: '已在本地断开飞书连接，正在后台清理相关对话个人数据。' + suffix,
         };
       }
+      if (allLocalCompleted) {
+        return {
+          tone: 'info',
+          text: '已在本地断开飞书连接，相关对话个人数据已清理完成。' + suffix,
+        };
+      }
       return {
         tone: 'info',
-        text: '已在本地断开飞书连接，相关对话个人数据已清理完成。' + suffix,
+        text: '已在本地断开飞书连接，请稍后刷新确认相关对话个人数据清理状态。' + suffix,
       };
     }
 
@@ -698,12 +753,33 @@ export function PersonalIntegrationsCard() {
         text: '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。',
       };
     }
+    if (anyRemoteSuperseded) {
+      return {
+        tone: 'info',
+        text: '已断开原连接，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
+      };
+    }
+    if (allLocalCompleted && allRemoteSucceeded) {
+      return {
+        tone: 'success',
+        text: '已断开连接，关联个人数据已清理完成，Google 授权已撤销。',
+      };
+    }
+    if (
+      allLocalCompleted &&
+      (tracking.remoteMode !== 'remote_if_sole' || allRemoteNotApplicable)
+    ) {
+      return {
+        tone: 'success',
+        text: '已断开连接，关联个人数据已清理完成。',
+      };
+    }
     return {
-      tone: 'success',
+      tone: 'info',
       text:
         tracking.remoteMode === 'remote_if_sole'
-          ? '已断开连接，关联个人数据已清理完成，Google 授权已撤销。'
-          : '已断开连接，关联个人数据已清理完成。',
+          ? '已断开连接，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。'
+          : '已断开连接，请稍后刷新确认关联个人数据清理状态。',
     };
   }, [banner, data]);
 
@@ -714,7 +790,7 @@ export function PersonalIntegrationsCard() {
       (data?.active_purges?.length ?? 0) > 0,
   );
 
-  if (!anyCapEnabled && !hasExistingHistory && !isLoading) {
+  if (!anyCapEnabled && !hasExistingHistory && !displayBanner && !isLoading) {
     return null;
   }
 

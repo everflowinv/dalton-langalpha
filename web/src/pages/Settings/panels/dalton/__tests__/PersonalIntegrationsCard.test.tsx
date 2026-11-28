@@ -571,12 +571,20 @@ describe('PersonalIntegrationsCard', () => {
           has_personal_integrations: true,
         },
       })
-      // Refetch #3: all purges and remote revokes finished
+      // Refetch #3: all purges and remote revokes finished with explicit succeeded status
       .mockResolvedValueOnce({
         data: {
           connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
           connections: [],
           active_purges: [],
+          recent_purges: [
+            {
+              ...revokingPurge,
+              local_purge_status: 'completed',
+              remote_revoke_status: 'succeeded',
+              remote_completed_at: '2026-11-27T10:00:10Z',
+            },
+          ],
           has_personal_integrations: false,
         },
       });
@@ -628,5 +636,97 @@ describe('PersonalIntegrationsCard', () => {
       ),
     );
     expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent('正在后台');
+  });
+
+  it('does not claim Google authorization is revoked when tracked purge disappears or is superseded', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar']);
+    const runningPurge: PersonalIntegrationPurgeLedger = {
+      purge_id: 'p-google-track-1',
+      provider: 'google',
+      service: 'calendar',
+      provider_account_id: 'acct-google',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'completed',
+      remote_revoke_status: 'pending',
+      retry_count: 0,
+      next_retry_at: null,
+      last_remote_error: null,
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: '2026-11-27T10:00:02Z',
+      remote_completed_at: null,
+    };
+
+    h.apiGet
+      // Initial mount
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar')],
+          connections: [makeConnection('google', 'calendar')],
+          active_purges: [],
+          recent_purges: [],
+          has_personal_integrations: true,
+        },
+      })
+      // Refetch #1: tracked purge disappears from active_purges AND is absent from recent_purges
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar')],
+          connections: [],
+          active_purges: [],
+          recent_purges: [],
+          has_personal_integrations: false,
+        },
+      })
+      // Refetch #2: tracked purge returns explicit `superseded` status
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar')],
+          connections: [],
+          active_purges: [],
+          recent_purges: [
+            {
+              ...runningPurge,
+              remote_revoke_status: 'superseded',
+              remote_completed_at: '2026-11-27T10:00:08Z',
+            },
+          ],
+          has_personal_integrations: false,
+        },
+      });
+
+    h.apiDelete.mockResolvedValueOnce({
+      data: {
+        local_disconnected: true,
+        local_tokens_destroyed: true,
+        provider: 'google',
+        service: 'calendar',
+        purge_id: 'p-google-track-1',
+        local_purge_status: 'completed',
+        remote_revoke_status: 'pending',
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('Google 日历')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '断开连接' }));
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /断开并在 Google 撤销授权/ }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '暂未收到 Google 远端撤销的明确确认结果',
+      ),
+    );
+    expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent('已撤销');
+
+    // Refresh -> backend reports explicit `superseded` -> must NOT say "已撤销"
+    fireEvent.click(screen.getByRole('button', { name: '刷新连接状态' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '旧的 Google 远端撤销任务已终止',
+      ),
+    );
+    expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent('已撤销');
   });
 });

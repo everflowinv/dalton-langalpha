@@ -125,7 +125,12 @@ def _message_count(messages: list[Any]) -> str:
 
 
 class NonRetainingTracer(LangChainTracer):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        defer_personal_export: bool = False,  # DALTON-HOOK(personal-integrations)
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         # One per run tree and shared with its copies, so a model with no
         # pricing card logs its miss once per turn, as billing does.
@@ -135,8 +140,13 @@ class NonRetainingTracer(LangChainTracer):
         # tell whether they changed since. Shared with copies, which may close
         # a run another opened.
         self._posted_inputs: dict[UUID, Any] = {}
-        # DALTON-HOOK(personal-integrations): shared mutable flag suppressing LangSmith export for personal-integration threads
-        self._personal_private: list[bool] = [False]
+        # DALTON-HOOK(personal-integrations): shared per-turn gate buffering/suppressing LangSmith export for personal-calendar turns
+        from src.dalton.services.personal_integration_trace import (
+            PersonalIntegrationTraceGate,
+        )
+
+        self._personal_gate = PersonalIntegrationTraceGate(defer=defer_personal_export)
+        self._personal_private: list[bool] = self._personal_gate.private_flag
 
     def copy_with_metadata_defaults(
         self,
@@ -151,37 +161,34 @@ class NonRetainingTracer(LangChainTracer):
         )
         copy._pricer = self._pricer
         copy._posted_inputs = self._posted_inputs
-        copy._personal_private = self._personal_private  # DALTON-HOOK(personal-integrations)
+        # DALTON-HOOK(personal-integrations): share per-turn buffer/suppression gate across child copies
+        copy._personal_gate = self._personal_gate
+        copy._personal_private = self._personal_gate.private_flag
         return copy
 
+    def _finish_personal_trace_run(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): flush buffered runs once root run ends cleanly, or discard if touched
+        self._personal_gate.on_run_finished(
+            run,
+            flush_create=lambda t, r: LangChainTracer._persist_run_single(t, r),
+            flush_update=lambda _t, r: LangChainTracer._update_run_single(r),
+        )
+
     def _persist_run_single(self, run: Run) -> None:
-        # DALTON-HOOK(personal-integrations): skip entire LangSmith create_run export on personal-integration threads
-        if self._personal_private[0]:
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): buffer or skip LangSmith create_run export on personal-calendar turns
+        if not self._personal_gate.should_persist_immediately(self, run):
             return
         super()._persist_run_single(run)
 
     def _update_run_single(self, run: Run) -> None:
-        # DALTON-HOOK(personal-integrations): skip entire LangSmith update_run export on personal-integration threads
-        if self._personal_private[0]:
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): buffer or skip LangSmith update_run export on personal-calendar turns
+        if not self._personal_gate.should_update_immediately(self, run):
             return
         super()._update_run_single(run)
 
     def _start_trace(self, run: Run) -> None:
-        # DALTON-HOOK(personal-integrations): arm whole-trace LangSmith suppression as soon as personal-integration data enters
-        from src.dalton.services.personal_integration_trace import (
-            is_personal_integration_tool,
-            messages_contain_personal_integration_data,
-        )
-
-        if (
-            self._personal_private[0]
-            or (run.run_type == "tool" and is_personal_integration_tool(run.name))
-            or messages_contain_personal_integration_data(run.inputs)
-        ):
-            self._personal_private[0] = True
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): track root runs for deferred export and arm suppression on personal-integration data
+        self._personal_gate.on_trace_start(run)
         super()._start_trace(run)
         # On each run rather than in tracing_metadata, so the tracer stays
         # configured exactly as the one langchain_core would have built.
@@ -198,6 +205,10 @@ class NonRetainingTracer(LangChainTracer):
             # receive its inputs at its end.
             run.extra["inputs_is_truthy"] = True
 
+    def _end_trace(self, run: Run) -> None:
+        super()._end_trace(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
+
     def _on_chain_start(self, run: Run) -> None:
         if self._slim:
             if _is_graph_node(run):
@@ -209,10 +220,12 @@ class NonRetainingTracer(LangChainTracer):
     def _on_chain_end(self, run: Run) -> None:
         self._settle_chain_inputs(run)
         super()._on_chain_end(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
 
     def _on_chain_error(self, run: Run) -> None:
         self._settle_chain_inputs(run)
         super()._on_chain_error(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
 
     def _settle_chain_inputs(self, run: Run) -> None:
         """Send a chain's inputs again at its close only if they changed.
@@ -242,18 +255,14 @@ class NonRetainingTracer(LangChainTracer):
             self._stamp_cost(run)
         except Exception as e:
             logger.debug("LangSmith cost stamp failed: %s", e)
-        # DALTON-HOOK(personal-integrations): suppress LangSmith export when LLM outputs emit personal integration tool calls
-        from src.dalton.services.personal_integration_trace import (
-            llm_outputs_contain_personal_tool_call,
-        )
-
-        if self._personal_private[0] or llm_outputs_contain_personal_tool_call(run.outputs):
-            self._personal_private[0] = True
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): discard buffered trace when LLM emits personal integration tool calls
+        self._personal_gate.on_llm_end(run)
         super()._on_llm_end(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
 
     def _on_llm_error(self, run: Run) -> None:
         super()._on_llm_error(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
 
     def _stamp_cost(self, run: Run) -> None:
         """Write our cost for the call onto the usage of its output message.
@@ -305,27 +314,22 @@ class NonRetainingTracer(LangChainTracer):
 
     def _on_tool_end(self, run: Run) -> None:
         _settle_tool_run(run, None)
-        # DALTON-HOOK(personal-integrations): suppress LangSmith export for personal-integration and subsequent tool runs
-        from src.dalton.services.personal_integration_trace import (
-            is_personal_integration_tool,
-        )
-
-        if is_personal_integration_tool(run.name) or self._personal_private[0]:
-            self._personal_private[0] = True
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): discard buffered trace for personal-integration tool runs
+        self._personal_gate.on_tool_finished(run)
         super()._on_tool_end(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
+
+    def _on_tool_error(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): discard buffered trace on errored personal-integration tool runs
+        self._personal_gate.on_tool_finished(run)
+        super()._on_tool_error(run)
+        self._finish_personal_trace_run(run)  # DALTON-HOOK(personal-integrations)
 
     def _errored_tool_run(self, error: BaseException, run_id: UUID) -> Run:
         run = super()._errored_tool_run(error, run_id)
         _settle_tool_run(run, error)
-        # DALTON-HOOK(personal-integrations): suppress LangSmith export for errored personal-integration and subsequent tool runs
-        from src.dalton.services.personal_integration_trace import (
-            is_personal_integration_tool,
-        )
-
-        if is_personal_integration_tool(run.name) or self._personal_private[0]:
-            self._personal_private[0] = True
-            run.extra["__disabled"] = True
+        # DALTON-HOOK(personal-integrations): discard buffered trace for errored personal-integration tool runs
+        self._personal_gate.on_tool_finished(run)
         return run
 
 
@@ -460,13 +464,19 @@ def with_run_tracer(config: dict[str, Any]) -> dict[str, Any]:
     tracer = _ambient_equivalent()
     if tracer is None:
         return config
-    # DALTON-HOOK(personal-integrations): pre-arm redaction when config marks a personal-integration thread
+    # DALTON-HOOK(personal-integrations): pre-arm suppression on private threads, or buffer export on calendar-eligible interactive turns
+    from src.dalton.services.personal_integration_trace import (
+        should_defer_langsmith_export,
+    )
+
     cfg_part = config.get("configurable") if isinstance(config.get("configurable"), Mapping) else {}
     meta_part = config.get("metadata") if isinstance(config.get("metadata"), Mapping) else {}
     if cfg_part.get("has_personal_integration_data") or meta_part.get(
         "has_personal_integration_data"
     ):
-        tracer._personal_private[0] = True
+        tracer._personal_gate.mark_private()
+    elif should_defer_langsmith_export(config):
+        tracer._personal_gate.enable_defer()
     return {**config, "callbacks": [*(callbacks or []), tracer]}
 
 

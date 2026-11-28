@@ -34,6 +34,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
+from pydantic import WithJsonSchema
 
 from src.dalton.capabilities import (
     CapabilityId,
@@ -98,6 +99,26 @@ from src.tools.secretary._commands import InjectedToolCallId, hitl_confirm
 
 logger = logging.getLogger(__name__)
 
+CalendarReadActionLiteral = Literal[
+    "list_calendars",
+    "list_events",
+    "get_event",
+    "check_availability",
+]
+CalendarReadActionArg = Annotated[
+    str,
+    WithJsonSchema(
+        {
+            "type": "string",
+            "enum": [
+                "list_calendars",
+                "list_events",
+                "get_event",
+                "check_availability",
+            ],
+        }
+    ),
+]
 CalendarActionLiteral = Literal[
     "list_calendars",
     "list_events",
@@ -115,6 +136,7 @@ _READ_ACTIONS: frozenset[str] = frozenset(
 _WRITE_ACTIONS: frozenset[str] = frozenset(
     {"create_event", "update_event", "delete_event"}
 )
+CALENDAR_WRITE_DISABLED_MESSAGE = "当前版本只支持查看日程和空闲时间"
 _SETTINGS_INTEGRATIONS_PATH = "/settings?tab=integrations#dalton-personal-integrations"
 _MAX_ELICITATION_ROUNDS = 4
 _MAX_AVAILABILITY_PAGES = 20
@@ -201,7 +223,7 @@ _UNATTENDED_PLATFORMS: frozenset[str] = frozenset(
     {"automation", "system", "wakeup", "market_target"}
 )
 _UNATTENDED_ORIGINS: frozenset[str] = frozenset(
-    {"automation", "system", "wakeup", "market_target", "report"}
+    {"automation", "agent", "system", "wakeup", "market_target", "report"}
 )
 _UNATTENDED_QUERY_TYPES: frozenset[str] = frozenset({"system", "market_target", "wakeup"})
 UNATTENDED_CALENDAR_REFUSAL_MESSAGE = (
@@ -1187,7 +1209,7 @@ def create_calendar_tools(
 
     @tool("dalton_calendar")
     async def dalton_calendar(
-        action: CalendarActionLiteral,
+        action: CalendarReadActionArg,
         provider: CalendarProviderLiteral = "auto",
         calendar_id: str | None = None,
         event_id: str | None = None,
@@ -1197,32 +1219,19 @@ def create_calendar_tools(
         query: str | None = None,
         limit: int = 50,
         duration_minutes: int = 30,
-        summary: str | None = None,
-        description: str | None = None,
-        start_time: str | None = None,
-        end_time: str | None = None,
-        all_day: bool = False,
-        location: str | None = None,
-        attendees: list[str] | None = None,
-        reminders: list[dict[str, Any]] | None = None,
-        use_default_reminders: bool | None = None,
         config: RunnableConfig = None,  # type: ignore[assignment]
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> Command:
-        """读取或管理当前用户本人已连接的个人日历（支持 Google 日历与飞书日历）。
+        """查看当前用户本人已连接的个人日历（支持 Google 日历与飞书日历，当前版本为只读查询）。
 
         使用说明：
-        - 适用场景：仅在当前用户本人的私人 Home 会话、1:1 私聊，或仅本人可见的私密工作区中使用；自动任务、定时报告与渠道无人值守回合暂不支持调用个人日历。首次在某个对话里访问个人日历时，系统会将私密提示保存为本轮会话事件并在界面展示与回放。
-        - 平台选择（`provider`）：默认 `"auto"`。仅连接一个日历平台时自动选用；同时连接 Google 日历与飞书日历时，只读查询会自动合并两边结果并标注来源，写操作与按事件 ID 查询单个日程时请先向用户确认目标平台再指定 `"google"` 或 `"feishu"`。
-        - 支持的动作（`action`）：
-          - `"list_calendars"`：列出用户有权限查看的日历列表。
-          - `"list_events"`：查询指定时间范围（`time_min` 至 `time_max`，ISO 8601 时间格式，如 `2026-12-01T00:00:00+08:00`）内的日程，可附带 `query` 关键词筛选和 `timezone`（IANA 时区名，如 `Asia/Shanghai`、`America/New_York`）。若返回 `truncated=true`，说明时间窗内日程超出翻页上限未列全，需明确告知用户并建议缩小时间范围或加上关键词。
+        - 适用场景：仅在当前用户本人的私人 Home 会话、一对一私聊，或仅本人可见的私密工作区中使用。首次在某个对话里访问个人日历时，系统会将私密提示保存为本轮会话事件并在界面展示与回放。
+        - 平台选择（`provider`）：默认 `"auto"`。仅连接一个日历平台时自动选用；同时连接 Google 日历与飞书日历时，列出日历、列出日程和查询空闲会自动合并两边结果并标注来源；按事件编号查询单个日程时，先向用户确认目标平台再指定 `"google"` 或 `"feishu"`。
+        - 支持的只读动作（`action`）：
+          - `"list_calendars"`：列出当前用户有权限查看的日历列表。
+          - `"list_events"`：查询指定时间范围（`time_min` 至 `time_max`，ISO 8601 国际标准时间格式，如 `2026-12-01T00:00:00+08:00`）内的日程，可附带 `query` 关键词筛选和 `timezone`（IANA 互联网号码分配局时区名，如 `Asia/Shanghai`、`America/New_York`）。若返回 `truncated=true`，说明时间窗内日程超出翻页上限未列全，需明确告知用户并建议缩小时间范围或加上关键词。
           - `"get_event"`：按 `event_id` 读取单个日程详情。
-          - `"check_availability"`：查询 `time_min` 至 `time_max` 之间的忙碌时段与长度不少于 `duration_minutes` 分钟的空闲时段。当返回的 `availability.status` 为 `"unknown"` 时，必须明确告知用户无法确认空闲（存在需重新授权、读取失败或分页截断的日历），不要把空的 `free` 数组说成没有空档。
-          - `"create_event"`：新建日程（需提供 `summary`、`start_time`、`end_time`，可选 `description`、`location`、`attendees` 邮箱列表、`reminders` 如 `[{"method": "popup", "minutes": 15}]`、`all_day`）。
-          - `"update_event"`：修改已有日程（需提供 `event_id` 及待修改字段）。
-          - `"delete_event"`：删除已有日程（需提供 `event_id`）。
-        - 人工确认：所有写操作（新建、修改、删除）都会在网页端弹出确认卡片，待用户在界面核对并批准后执行；包含其他参会人时会要求二次确认。
+          - `"check_availability"`：查询 `time_min` 至 `time_max` 之间的忙碌时段与长度不少于 `duration_minutes` 分钟的空闲时段。当返回的 `availability.status` 为 `"unknown"` 时，需明确告知用户当前无法确认空闲（存在需重新授权、读取失败或分页截断的日历），并将空的 `free` 数组说明为状态未知而非没有空档。
         """
         act = str(action or "").strip().lower()
         if act not in _READ_ACTIONS and act not in _WRITE_ACTIONS:
@@ -1232,11 +1241,20 @@ def create_calendar_tools(
                 tool_call_id,
             )
 
-        # Batch 1 entry gate: personal calendar is interactive-conversation only (read & write).
+        # Batch 1 entry gate: personal calendar is interactive-conversation only.
         if _is_unattended_automation_turn(config):
             return _error_command(
                 "unattended_turn_unsupported",
                 UNATTENDED_CALENDAR_REFUSAL_MESSAGE,
+                tool_call_id,
+            )
+
+        # Batch 1 scope: read-only personal calendar; reject all write actions at entry
+        # before querying connections, refreshing tokens, or touching external APIs.
+        if act in _WRITE_ACTIONS:
+            return _error_command(
+                "write_actions_disabled",
+                CALENDAR_WRITE_DISABLED_MESSAGE,
                 tool_call_id,
             )
 
@@ -1278,30 +1296,6 @@ def create_calendar_tools(
             or (cfg.get("timezone") if isinstance(cfg, Mapping) else None)
             or "Asia/Shanghai"
         ).strip()
-
-        # ------------------------------------------------------------------
-        # FAST RESUME PATH FOR WRITE ACTIONS (LangGraph interrupt replay)
-        # Never recreate approval_id / TTL or re-pre-read on resume!
-        # ------------------------------------------------------------------
-        if act in _WRITE_ACTIONS and thread_id and tool_call_id:
-            write_stage_key = f"tc:{tool_call_id}:write"
-            existing_write = await db.get_action_approval_by_stage_key(
-                caller_user_id,
-                thread_id,
-                write_stage_key,
-                decrypt_state=True,
-            )
-            if existing_write is not None and existing_write.elicitation_state:
-                return await _resume_frozen_calendar_write(
-                    existing_write=existing_write,
-                    caller_user_id=caller_user_id,
-                    thread_id=thread_id,
-                    tool_call_id=tool_call_id,
-                    config=config,
-                    google_cli=_google_cli(),
-                    feishu_cli=_feishu_cli(),
-                    attach_notice=_attach_persisted_notice,
-                )
 
         # Resolve user's calendar connections (metadata only; tokens fetched via ensure_fresh_access_token)
         all_conns = await db.list_user_connections(caller_user_id)
@@ -1393,18 +1387,11 @@ def create_calendar_tools(
                 now_utc = datetime.now(UTC)
                 time_min = time_min or now_utc.isoformat()
                 time_max = time_max or (now_utc + timedelta(days=7)).isoformat()
-        elif act in ("get_event", "update_event", "delete_event"):
+        elif act == "get_event":
             if not event_id or not event_id.strip():
                 return _error_command(
                     "missing_event_id",
                     f"执行 {act} 需要提供 event_id。",
-                    tool_call_id,
-                )
-        elif act == "create_event":
-            if not summary or not summary.strip() or not start_time or not end_time:
-                return _error_command(
-                    "missing_required_fields",
-                    "新建日程需要提供 summary、start_time 和 end_time。",
                     tool_call_id,
                 )
 
@@ -1844,9 +1831,56 @@ def create_calendar_tools(
                     tool_call_id,
                 )
 
-        # ------------------------------------------------------------------
-        # WRITE ACTIONS (create_event, update_event, delete_event) -> HITL L1/L2
-        # ------------------------------------------------------------------
+        return _error_command(
+            "write_actions_disabled",
+            CALENDAR_WRITE_DISABLED_MESSAGE,
+            tool_call_id,
+        )
+
+    # Retained unreachable write-path scaffold for the next batch (closed in Batch 1 read-only).
+    async def _retained_unreachable_calendar_write(  # pragma: no cover
+        *,
+        act: str,
+        target_providers: list[str],
+        connected_rows: dict[str, IntegrationRow],
+        pre_surfaces: dict[str, PersonalSurfaceVerificationResult],
+        caller_user_id: str,
+        thread_id: str,
+        tz_name: str,
+        calendar_id: str | None,
+        event_id: str | None,
+        summary: str | None,
+        description: str | None,
+        start_time: str | None,
+        end_time: str | None,
+        all_day: bool,
+        location: str | None,
+        attendees: list[str] | None,
+        reminders: list[dict[str, Any]] | None,
+        use_default_reminders: bool | None,
+        config: RunnableConfig,
+        tool_call_id: str,
+    ) -> Command:
+        if thread_id and tool_call_id:
+            write_stage_key = f"tc:{tool_call_id}:write"
+            existing_write = await db.get_action_approval_by_stage_key(
+                caller_user_id,
+                thread_id,
+                write_stage_key,
+                decrypt_state=True,
+            )
+            if existing_write is not None and existing_write.elicitation_state:
+                return await _resume_frozen_calendar_write(
+                    existing_write=existing_write,
+                    caller_user_id=caller_user_id,
+                    thread_id=thread_id,
+                    tool_call_id=tool_call_id,
+                    config=config,
+                    google_cli=_google_cli(),
+                    feishu_cli=_feishu_cli(),
+                    attach_notice=_attach_persisted_notice,
+                )
+
         if _is_unattended_automation_turn(config):
             return _error_command(
                 "automation_turn_confirmation_forbidden",

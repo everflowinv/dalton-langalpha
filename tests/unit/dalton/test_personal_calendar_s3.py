@@ -978,19 +978,29 @@ async def test_dalton_calendar_dual_provider_read_merges_with_labels_and_write_a
     assert len(avail_res["availability"]["busy"]) == 2
     assert len(avail_res["availability"]["free"]) >= 2
 
-    # Write with auto asks user to pick a platform
+    # Single-event read with auto asks user to pick a platform
+    get_cmd = await tool_obj.coroutine(
+        action="get_event",
+        provider="auto",
+        event_id="g-1",
+        config=cfg,
+        tool_call_id="tc-get-auto",
+    )
+    get_res = _tool_payload(get_cmd)
+    assert get_res["needs_provider_choice"] is True
+    assert set(get_res["available_providers"]) == {"google", "feishu"}
+
+    # Batch 1 read-only: write actions are rejected at entry
     write_cmd = await tool_obj.coroutine(
         action="create_event",
         provider="auto",
-        summary="1:1",
-        start_time="2026-12-02T14:00:00+08:00",
-        end_time="2026-12-02T14:30:00+08:00",
         config=cfg,
         tool_call_id="tc-write",
     )
     write_res = _tool_payload(write_cmd)
-    assert write_res["needs_provider_choice"] is True
-    assert set(write_res["available_providers"]) == {"google", "feishu"}
+    assert write_res["ok"] is False
+    assert write_res["error"] == "write_actions_disabled"
+    assert write_res["message"] == "当前版本只支持查看日程和空闲时间"
 
 
 def test_dalton_calendar_check_availability_computes_busy_and_free_slots() -> None:
@@ -1022,6 +1032,7 @@ def test_dalton_calendar_check_availability_computes_busy_and_free_slots() -> No
     assert res["free"][1]["duration_minutes"] == 90
 
 
+@pytest.mark.skip(reason="Batch 1 personal calendar is read-only; write actions deferred to next batch")
 @pytest.mark.asyncio
 async def test_dalton_calendar_write_l1_and_l2_attendees_hitl_confirmation_flow(
     monkeypatch: pytest.MonkeyPatch,
