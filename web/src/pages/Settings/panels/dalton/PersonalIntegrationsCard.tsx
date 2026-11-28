@@ -5,11 +5,14 @@ import { ApiError } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import {
   DaltonInlineNotice,
+  DaltonItemRow,
+  DaltonKeyValueList,
   DaltonLoadingRow,
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
 } from '@/components/dalton/primitives';
+import { useBfcacheRestore } from '@/hooks/useBfcacheRestore';
 import {
   PERSONAL_INTEGRATION_CAPABILITIES,
   useCapabilities,
@@ -298,6 +301,7 @@ export function PersonalIntegrationsCard() {
   } | null>(null);
   const [pendingSwitch, setPendingSwitch] = useState<PendingAccountSwitchState | null>(null);
   const [disconnectDialog, setDisconnectDialog] = useState<DisconnectDialogState | null>(null);
+  const [isRedirecting, setIsRedirecting] = useState(false);
   const callbackHandledRef = useRef(false);
 
   const invalidate = () => {
@@ -436,10 +440,16 @@ export function PersonalIntegrationsCard() {
     onSuccess: (res) => {
       setPreSwitchTarget(null);
       if (res.authorize_url) {
-        window.location.assign(res.authorize_url);
+        setIsRedirecting(true);
+        try {
+          window.location.assign(res.authorize_url);
+        } catch {
+          setIsRedirecting(false);
+        }
       }
     },
     onError: (err) => {
+      setIsRedirecting(false);
       setPreSwitchTarget(null);
       const payload = extractApiErrorData(err);
       setBanner({
@@ -450,6 +460,12 @@ export function PersonalIntegrationsCard() {
             : '发起授权失败，请确认管理员已完成凭据配置后重试。',
       });
     },
+  });
+
+  useBfcacheRestore(() => {
+    setIsRedirecting(false);
+    authorizeMutation.reset();
+    invalidate();
   });
 
   const confirmSwitchMutation = useMutation({
@@ -832,6 +848,8 @@ export function PersonalIntegrationsCard() {
       id="dalton-personal-integrations"
       title="个人日历与邮箱连接"
       description="授权连接你的个人 Google 日历或飞书日历，在私密对话中查看日程和空闲时间。"
+      layout="padded"
+      bodyClassName="space-y-4"
       action={
         <DaltonRefreshButton
           onClick={() => void refetch()}
@@ -840,137 +858,158 @@ export function PersonalIntegrationsCard() {
         />
       }
     >
-      <div className="space-y-4">
-        {displayBanner && (
-          <DaltonInlineNotice tone={displayBanner.tone} testId="personal-integrations-banner">
-            {displayBanner.text}
-          </DaltonInlineNotice>
-        )}
+      {displayBanner && (
+        <DaltonInlineNotice tone={displayBanner.tone} testId="personal-integrations-banner">
+          {displayBanner.text}
+        </DaltonInlineNotice>
+      )}
 
-        {isLoading && <DaltonLoadingRow label="正在加载个人连接状态…" />}
+      {isLoading && <DaltonLoadingRow label="正在加载个人连接状态…" />}
 
-        {error && !isLoading && (
-          <DaltonInlineNotice tone="warning" testId="personal-integrations-error">
-            读取个人连接状态时遇到问题，可点击右上角刷新重试。
-          </DaltonInlineNotice>
-        )}
+      {error && !isLoading && (
+        <DaltonInlineNotice tone="warning" testId="personal-integrations-error">
+          读取个人连接状态时遇到问题，可点击右上角刷新重试。
+        </DaltonInlineNotice>
+      )}
 
-        {!isLoading && visibleRows.length > 0 && (
-          <div className="divide-y divide-(--color-border-muted)">
-            {visibleRows.map((row) => {
-              const badge = statusBadgeMeta(row.connection, row.connector);
-              const conn = row.connection;
-              const isBusy =
-                authorizeMutation.isPending ||
-                disconnectServiceMutation.isPending ||
-                disconnectAllGoogleMutation.isPending;
-              const credsReady = row.connector ? row.connector.credentials_ready : true;
-              const isReady = row.connector ? row.connector.ready : true;
-              const canConnect = row.capOn && isReady;
-              const googleSiblings =
-                conn?.provider === 'google'
-                  ? (data?.connections ?? []).filter(
-                      (c) =>
-                        c.provider === 'google' &&
-                        c.provider_account_id === conn.provider_account_id &&
-                        c.service !== conn.service,
-                    )
-                  : [];
+      {!isLoading && visibleRows.length > 0 && (
+        <DaltonKeyValueList>
+          {visibleRows.map((row) => {
+            const badge = statusBadgeMeta(row.connection, row.connector);
+            const conn = row.connection;
+            const isBusy =
+              authorizeMutation.isPending ||
+              isRedirecting ||
+              disconnectServiceMutation.isPending ||
+              disconnectAllGoogleMutation.isPending;
+            const credsReady = row.connector ? row.connector.credentials_ready : true;
+            const isReady = row.connector ? row.connector.ready : true;
+            const canConnect = row.capOn && isReady;
+            const googleSiblings =
+              conn?.provider === 'google'
+                ? (data?.connections ?? []).filter(
+                    (c) =>
+                      c.provider === 'google' &&
+                      c.provider_account_id === conn.provider_account_id &&
+                      c.service !== conn.service,
+                  )
+                : [];
+            const showConnect = !conn && row.capOn;
+            const showReauth = Boolean(
+              conn &&
+                row.capOn &&
+                (conn.status === 'needs_reauth' ||
+                  conn.status === 'refresh_ambiguous' ||
+                  conn.client_rotated ||
+                  isGmailPartialGrant(conn)),
+            );
+            const showSwitch = Boolean(
+              conn && row.capOn && row.provider === 'google' && conn.status === 'connected',
+            );
+            const showDisconnect = Boolean(
+              conn &&
+                conn.status !== 'disconnect_pending' &&
+                conn.status !== 'revoked_purging',
+            );
+            const hasActions = showConnect || showReauth || showSwitch || showDisconnect;
+            const showLangsmithNote = Boolean(
+              row.connector?.langsmith_tracing_enabled && row.service === 'calendar',
+            );
+            const showNotReadyNote = Boolean(
+              !conn && !isReady && row.capOn && !row.connector?.langsmith_tracing_enabled,
+            );
+            const hasMeta = Boolean(conn || showLangsmithNote || showNotReadyNote);
 
-              return (
-                <div
-                  key={row.key}
-                  data-testid={`personal-integration-row-${row.provider}-${row.service}`}
-                  className="py-3.5 first:pt-0 last:pb-0 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between"
-                >
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-sm font-medium text-(--color-text-primary)">
-                        {row.title}
-                      </span>
-                      <DaltonStatusBadge tone={badge.tone} label={badge.label} />
-                      {!row.capOn && conn && (
-                        <DaltonStatusBadge tone="neutral" label="历史连接" />
+            return (
+              <DaltonItemRow
+                key={row.key}
+                testId={`personal-integration-row-${row.provider}-${row.service}`}
+                title={
+                  <>
+                    <span>{row.title}</span>
+                    <DaltonStatusBadge tone={badge.tone} label={badge.label} />
+                    {!row.capOn && conn && (
+                      <DaltonStatusBadge tone="neutral" label="历史连接" />
+                    )}
+                    {conn && isGmailPartialGrant(conn) && (
+                      <DaltonStatusBadge tone="accent" label="只读授权" />
+                    )}
+                  </>
+                }
+                subtitle={row.subtitle}
+                meta={
+                  hasMeta ? (
+                    <span className="block space-y-0.5">
+                      {conn?.provider_email && (
+                        <span className="block">已连接账号：{conn.provider_email}</span>
+                      )}
+                      {conn?.last_refresh_at && (
+                        <span className="block">
+                          最近同步：{formatTimestamp(conn.last_refresh_at, locale)}
+                        </span>
+                      )}
+                      {conn?.client_rotated && (
+                        <span className="block text-(--color-warning)">
+                          管理员已更新 OAuth 客户端，点击「重新授权」即可原地续接并保留历史对话。
+                        </span>
+                      )}
+                      {conn && conn.status === 'needs_reauth' && !conn.client_rotated && (
+                        <span className="block text-(--color-warning)">
+                          {conn.last_error_code === 'missing_required_scopes'
+                            ? '请重新授权并勾选「日历事件」权限。'
+                            : '当前授权已失效，点击「重新授权」即可恢复使用。'}
+                        </span>
+                      )}
+                      {conn?.status === 'refresh_ambiguous' && (
+                        <span className="block text-(--color-warning)">
+                          上次刷新结果待确认，点击「重新授权」可立即恢复稳定连接。
+                        </span>
                       )}
                       {conn && isGmailPartialGrant(conn) && (
-                        <DaltonStatusBadge tone="accent" label="只读授权" />
+                        <span className="block">
+                          当前为只读授权，如需创建邮件草稿可重新授权并勾选草稿权限。
+                        </span>
                       )}
-                    </div>
-                    <p className="text-xs text-(--color-text-secondary)">{row.subtitle}</p>
-
-                    {conn && (
-                      <div className="text-xs text-(--color-text-tertiary) space-y-0.5">
-                        {conn.provider_email && <div>已连接账号：{conn.provider_email}</div>}
-                        {conn.last_refresh_at && (
-                          <div>最近同步：{formatTimestamp(conn.last_refresh_at, locale)}</div>
-                        )}
-                        {conn.client_rotated && (
-                          <div className="text-(--color-warning)">
-                            管理员已更新 OAuth 客户端，点击「重新授权」即可原地续接并保留历史对话。
-                          </div>
-                        )}
-                        {conn.status === 'needs_reauth' && !conn.client_rotated && (
-                          <div className="text-(--color-warning)">
-                            {conn.last_error_code === 'missing_required_scopes'
-                              ? '请重新授权并勾选「日历事件」权限。'
-                              : '当前授权已失效，点击「重新授权」即可恢复使用。'}
-                          </div>
-                        )}
-                        {conn.status === 'refresh_ambiguous' && (
-                          <div className="text-(--color-warning)">
-                            上次刷新结果待确认，点击「重新授权」可立即恢复稳定连接。
-                          </div>
-                        )}
-                        {isGmailPartialGrant(conn) && (
-                          <div>当前为只读授权，如需创建邮件草稿可重新授权并勾选草稿权限。</div>
-                        )}
-                      </div>
-                    )}
-
-                    {row.connector?.langsmith_tracing_enabled && row.service === 'calendar' && (
-                      <p className="text-xs text-(--color-warning)">
-                        当前部署开启了调用追踪，个人日历不可用
-                      </p>
-                    )}
-
-                    {!conn &&
-                      !isReady &&
-                      row.capOn &&
-                      !row.connector?.langsmith_tracing_enabled && (
-                        <p className="text-xs text-(--color-text-tertiary)">
+                      {showLangsmithNote && (
+                        <span className="block text-(--color-warning)">
+                          当前部署开启了调用追踪，个人日历不可用
+                        </span>
+                      )}
+                      {showNotReadyNote && (
+                        <span className="block">
                           {!credsReady
                             ? '管理员在「部署设置 → 集成凭据」完成配置后即可连接。'
                             : '管理员完成公开回调地址与服务端加密配置后即可连接。'}
-                        </p>
+                        </span>
                       )}
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    {!conn && row.capOn && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!canConnect || isBusy}
-                        onClick={() =>
-                          authorizeMutation.mutate({
-                            provider: row.provider,
-                            service: row.service,
-                          })
-                        }
-                      >
-                        连接
-                      </Button>
-                    )}
-
-                    {conn &&
-                      row.capOn &&
-                      (conn.status === 'needs_reauth' ||
-                        conn.status === 'refresh_ambiguous' ||
-                        conn.client_rotated ||
-                        isGmailPartialGrant(conn)) && (
+                    </span>
+                  ) : undefined
+                }
+                trailing={
+                  hasActions ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {showConnect && (
                         <Button
                           type="button"
                           size="sm"
+                          className="h-8 px-2 text-xs"
+                          disabled={!canConnect || isBusy}
+                          onClick={() =>
+                            authorizeMutation.mutate({
+                              provider: row.provider,
+                              service: row.service,
+                            })
+                          }
+                        >
+                          连接
+                        </Button>
+                      )}
+
+                      {showReauth && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="h-8 px-2 text-xs"
                           disabled={!canConnect || isBusy}
                           onClick={() =>
                             authorizeMutation.mutate({
@@ -983,14 +1022,12 @@ export function PersonalIntegrationsCard() {
                         </Button>
                       )}
 
-                    {conn &&
-                      row.capOn &&
-                      row.provider === 'google' &&
-                      conn.status === 'connected' && (
+                      {showSwitch && (
                         <Button
                           type="button"
                           size="sm"
                           variant="outline"
+                          className="h-8 px-2 text-xs"
                           disabled={!canConnect || isBusy}
                           onClick={() =>
                             setPreSwitchTarget({
@@ -1003,13 +1040,12 @@ export function PersonalIntegrationsCard() {
                         </Button>
                       )}
 
-                    {conn &&
-                      conn.status !== 'disconnect_pending' &&
-                      conn.status !== 'revoked_purging' && (
+                      {showDisconnect && conn && (
                         <Button
                           type="button"
                           size="sm"
                           variant="outline"
+                          className="h-8 px-2 text-xs"
                           disabled={isBusy}
                           onClick={() =>
                             setDisconnectDialog({
@@ -1021,74 +1057,76 @@ export function PersonalIntegrationsCard() {
                           断开连接
                         </Button>
                       )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                    </div>
+                  ) : undefined
+                }
+              />
+            );
+          })}
+        </DaltonKeyValueList>
+      )}
 
-        {retryablePurges.length > 0 && (
-          <div className="rounded-lg border border-(--color-border-muted) p-3 space-y-2">
-            <div className="text-xs font-medium text-(--color-text-primary)">
-              断开与远端撤销进度
-            </div>
-            {retryablePurges.map((purge) => {
-              const purgeProviderLabel = purge.provider === 'google' ? 'Google' : '飞书';
-              const statusText =
-                purge.local_purge_status === 'running'
-                  ? ` — 正在清理本地${purgeProviderLabel}对话个人数据`
-                  : purge.remote_revoke_status === 'failed_retryable'
-                    ? ` — 本地已清理，${purgeProviderLabel} 远端撤销待重试`
-                    : purge.remote_revoke_status === 'pending'
-                      ? ` — 本地已清理，正在后台撤销 ${purgeProviderLabel} 授权`
-                      : ` — ${purgeProviderLabel} 本地个人数据已清理`;
-              return (
-                <div
-                  key={purge.purge_id}
-                  data-testid={`personal-integration-purge-${purge.purge_id}`}
-                  className="flex flex-wrap items-center justify-between gap-2 text-xs text-(--color-text-secondary)"
-                >
-                  <span>
-                    {purgeProviderLabel}
-                    {purge.service ? ` · ${purge.service === 'calendar' ? '日历' : '邮箱'}` : ''}
-                    {statusText}
-                  </span>
-                  {purge.remote_revoke_status === 'failed_retryable' && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={retryRevokeMutation.isPending}
-                      onClick={() => retryRevokeMutation.mutate(purge.purge_id)}
-                    >
-                      <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                      重试远端撤销
-                    </Button>
-                  )}
-                </div>
-              );
-            })}
+      {retryablePurges.length > 0 && (
+        <div className="rounded-lg border border-(--color-border-muted) p-3 space-y-2">
+          <div className="text-xs font-medium text-(--color-text-primary)">
+            断开与远端撤销进度
           </div>
-        )}
-
-        <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs text-(--color-text-tertiary)">
-          <span className="inline-flex items-center gap-1.5">
-            <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-            个人连接数据仅在本人私密会话中使用，断开后会自动清除关联对话内容。
-          </span>
-          {privacyUrl && (
-            <a
-              href={privacyUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 underline hover:text-(--color-text-primary)"
-            >
-              隐私权政策
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          )}
+          {retryablePurges.map((purge) => {
+            const purgeProviderLabel = purge.provider === 'google' ? 'Google' : '飞书';
+            const statusText =
+              purge.local_purge_status === 'running'
+                ? ` — 正在清理本地${purgeProviderLabel}对话个人数据`
+                : purge.remote_revoke_status === 'failed_retryable'
+                  ? ` — 本地已清理，${purgeProviderLabel} 远端撤销待重试`
+                  : purge.remote_revoke_status === 'pending'
+                    ? ` — 本地已清理，正在后台撤销 ${purgeProviderLabel} 授权`
+                    : ` — ${purgeProviderLabel} 本地个人数据已清理`;
+            return (
+              <div
+                key={purge.purge_id}
+                data-testid={`personal-integration-purge-${purge.purge_id}`}
+                className="flex flex-wrap items-center justify-between gap-2 text-xs text-(--color-text-secondary)"
+              >
+                <span>
+                  {purgeProviderLabel}
+                  {purge.service ? ` · ${purge.service === 'calendar' ? '日历' : '邮箱'}` : ''}
+                  {statusText}
+                </span>
+                {purge.remote_revoke_status === 'failed_retryable' && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-8 gap-1 text-xs"
+                    disabled={retryRevokeMutation.isPending}
+                    onClick={() => retryRevokeMutation.mutate(purge.purge_id)}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>重试远端撤销</span>
+                  </Button>
+                )}
+              </div>
+            );
+          })}
         </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs text-(--color-text-tertiary)">
+        <span className="inline-flex items-center gap-1.5">
+          <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+          个人连接数据仅在本人私密会话中使用，断开后会自动清除关联对话内容。
+        </span>
+        {privacyUrl && (
+          <a
+            href={privacyUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 underline hover:text-(--color-text-primary)"
+          >
+            隐私权政策
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
       </div>
 
       {/* Pre-redirect Google account switch confirmation modal */}
@@ -1101,10 +1139,10 @@ export function PersonalIntegrationsCard() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
         >
           <div className="w-full max-w-md rounded-xl border border-(--color-border-muted) bg-(--color-bg-card) p-5 shadow-lg space-y-4">
-            <h3 className="text-base font-medium text-(--color-text-primary)">
+            <h3 className="text-sm font-medium text-(--color-text-primary)">
               确认更换 Google 账号
             </h3>
-            <p className="text-sm text-(--color-text-secondary)">
+            <p className="text-xs text-(--color-text-secondary)">
               换账号会清除旧账号在对话中留下的个人数据，随后跳转到 Google 选择并授权新账号。
             </p>
             <div className="flex justify-end gap-2">
@@ -1112,6 +1150,7 @@ export function PersonalIntegrationsCard() {
                 type="button"
                 variant="outline"
                 size="sm"
+                className="h-8 px-2 text-xs"
                 onClick={() => setPreSwitchTarget(null)}
               >
                 取消
@@ -1119,7 +1158,8 @@ export function PersonalIntegrationsCard() {
               <Button
                 type="button"
                 size="sm"
-                disabled={authorizeMutation.isPending}
+                className="h-8 px-2 text-xs"
+                disabled={authorizeMutation.isPending || isRedirecting}
                 onClick={() =>
                   authorizeMutation.mutate({
                     provider: preSwitchTarget.provider,
@@ -1145,7 +1185,7 @@ export function PersonalIntegrationsCard() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
         >
           <div className="w-full max-w-md rounded-xl border border-(--color-border-muted) bg-(--color-bg-card) p-5 shadow-lg space-y-4">
-            <h3 className="text-base font-medium text-(--color-text-primary)">
+            <h3 className="text-sm font-medium text-(--color-text-primary)">
               确认切换为新的 Google 账号
             </h3>
             <div className="rounded-lg border border-(--color-border-muted) p-3 text-xs space-y-1 text-(--color-text-secondary)">
@@ -1154,7 +1194,7 @@ export function PersonalIntegrationsCard() {
               )}
               {pendingSwitch.newEmail && <div>新账号：{pendingSwitch.newEmail}</div>}
             </div>
-            <p className="text-sm text-(--color-text-secondary)">
+            <p className="text-xs text-(--color-text-secondary)">
               确认后将断开原账号、清除原账号在对话中留下的个人数据，并立即启用新账号连接。
             </p>
             <div className="flex justify-end gap-2">
@@ -1162,6 +1202,7 @@ export function PersonalIntegrationsCard() {
                 type="button"
                 variant="outline"
                 size="sm"
+                className="h-8 px-2 text-xs"
                 disabled={confirmSwitchMutation.isPending}
                 onClick={() =>
                   confirmSwitchMutation.mutate({
@@ -1176,6 +1217,7 @@ export function PersonalIntegrationsCard() {
               <Button
                 type="button"
                 size="sm"
+                className="h-8 px-2 text-xs"
                 disabled={confirmSwitchMutation.isPending}
                 onClick={() =>
                   confirmSwitchMutation.mutate({
@@ -1202,7 +1244,7 @@ export function PersonalIntegrationsCard() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
         >
           <div className="w-full max-w-md rounded-xl border border-(--color-border-muted) bg-(--color-bg-card) p-5 shadow-lg space-y-4">
-            <h3 className="text-base font-medium text-(--color-text-primary)">
+            <h3 className="text-sm font-medium text-(--color-text-primary)">
               断开{' '}
               {
                 SERVICE_META[
@@ -1213,7 +1255,7 @@ export function PersonalIntegrationsCard() {
                 ].title
               }
             </h3>
-            <p className="text-sm text-(--color-text-secondary)">
+            <p className="text-xs text-(--color-text-secondary)">
               断开后会立即清除该连接在私密对话中留下的个人数据，清理完成后原对话可继续使用。
             </p>
 
@@ -1227,6 +1269,7 @@ export function PersonalIntegrationsCard() {
                     <Button
                       type="button"
                       size="sm"
+                      className="h-8 px-2 text-xs"
                       disabled={disconnectServiceMutation.isPending}
                       onClick={() =>
                         disconnectServiceMutation.mutate({
@@ -1241,6 +1284,7 @@ export function PersonalIntegrationsCard() {
                       type="button"
                       size="sm"
                       variant="outline"
+                      className="h-8 px-2 text-xs"
                       disabled={disconnectAllGoogleMutation.isPending}
                       onClick={() => disconnectAllGoogleMutation.mutate()}
                     >
@@ -1257,6 +1301,7 @@ export function PersonalIntegrationsCard() {
                     <Button
                       type="button"
                       size="sm"
+                      className="h-8 px-2 text-xs"
                       disabled={disconnectServiceMutation.isPending}
                       onClick={() =>
                         disconnectServiceMutation.mutate({
@@ -1271,6 +1316,7 @@ export function PersonalIntegrationsCard() {
                       type="button"
                       size="sm"
                       variant="outline"
+                      className="h-8 px-2 text-xs"
                       disabled={disconnectServiceMutation.isPending}
                       onClick={() =>
                         disconnectServiceMutation.mutate({
@@ -1303,6 +1349,7 @@ export function PersonalIntegrationsCard() {
                   <Button
                     type="button"
                     size="sm"
+                    className="h-8 px-2 text-xs"
                     disabled={disconnectServiceMutation.isPending}
                     onClick={() =>
                       disconnectServiceMutation.mutate({
@@ -1322,6 +1369,7 @@ export function PersonalIntegrationsCard() {
                 type="button"
                 variant="ghost"
                 size="sm"
+                className="h-8 px-2 text-xs"
                 onClick={() => setDisconnectDialog(null)}
               >
                 取消
