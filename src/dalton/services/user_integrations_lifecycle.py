@@ -9,7 +9,7 @@ Follows unidirectional lock ordering (§4.2(2)(3)):
 from __future__ import annotations
 
 from contextlib import ExitStack
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
@@ -101,6 +101,18 @@ class FinishDisconnectResult:
     remote_revoke_status: RemoteRevokeStatus
 
 
+def _fork_borrowed_max_turn(metadata: Any) -> int:
+    """Return ``turn_base - 1`` when ``metadata`` carries snapshot-fork borrow lineage, else ``-1``."""
+    if not isinstance(metadata, Mapping):
+        return -1
+    fork_meta = metadata.get("fork")
+    borrow_meta = fork_meta.get("borrow") if isinstance(fork_meta, Mapping) else None
+    raw_tb = borrow_meta.get("turn_base") if isinstance(borrow_meta, Mapping) else None
+    if isinstance(raw_tb, int) and not isinstance(raw_tb, bool) and raw_tb > 0:
+        return raw_tb - 1
+    return -1
+
+
 async def _lock_and_register_phase1_tx(
     conn: Any,
     *,
@@ -161,7 +173,7 @@ async def _lock_and_register_phase1_tx(
 
             await cur.execute(
                 """
-                SELECT personal_purged_turn_ranges
+                SELECT personal_purged_turn_ranges, metadata
                 FROM conversation_threads
                 WHERE conversation_thread_id = %s::uuid
                 FOR UPDATE
@@ -183,7 +195,11 @@ async def _lock_and_register_phase1_tx(
                 (tid, tid, max_touch_turn),
             )
             max_row = await cur.fetchone()
-            purge_start_max = max(first_turn, int(max_row["max_turn"]) if max_row else first_turn)
+            purge_start_max = max(
+                first_turn,
+                int(max_row["max_turn"]) if max_row else first_turn,
+                _fork_borrowed_max_turn(t_row.get("metadata")),
+            )
 
             merged = merge_turn_range(
                 t_row.get("personal_purged_turn_ranges"),
@@ -806,7 +822,7 @@ async def begin_disconnect_all_services(
                     overall_lo, overall_max_touch = thread_touch_bounds[tid]
                     await cur.execute(
                         """
-                        SELECT personal_purged_turn_ranges
+                        SELECT personal_purged_turn_ranges, metadata
                         FROM conversation_threads
                         WHERE conversation_thread_id = %s::uuid
                         FOR UPDATE
@@ -831,6 +847,7 @@ async def begin_disconnect_all_services(
                     purge_start_max = max(
                         overall_lo,
                         int(max_row["max_turn"]) if max_row else overall_lo,
+                        _fork_borrowed_max_turn(t_row.get("metadata")),
                     )
 
                     merged = merge_turn_range(
@@ -1178,7 +1195,7 @@ async def begin_feishu_webhook_revocation_batch(
                     overall_lo, overall_max_touch = thread_touch_bounds[tid]
                     await cur.execute(
                         """
-                        SELECT personal_purged_turn_ranges
+                        SELECT personal_purged_turn_ranges, metadata
                         FROM conversation_threads
                         WHERE conversation_thread_id = %s::uuid
                         FOR UPDATE
@@ -1203,6 +1220,7 @@ async def begin_feishu_webhook_revocation_batch(
                     purge_start_max = max(
                         overall_lo,
                         int(max_row["max_turn"]) if max_row else overall_lo,
+                        _fork_borrowed_max_turn(t_row.get("metadata")),
                     )
                     merged = merge_turn_range(
                         t_row.get("personal_purged_turn_ranges"),

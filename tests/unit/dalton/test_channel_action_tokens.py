@@ -5168,3 +5168,221 @@ async def test_r5_item1_watch_reconnect_skipped_target_returns_409_watch_busy(
     )
     assert res_unlocked["mode"] == "watch_reconnect"
     assert any(str(w["thread_id"]) == tid for w in res_unlocked["thread_watches"])
+
+
+@pytest.mark.asyncio
+async def test_bt2_parent_and_item_enforce_personal_integration_private_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BT2 parent and item attachment resend authorization enforces the same personal-integration
+    privacy check as normal delivery: private threads reject group targets and non-owner users
+    with terminal ``personal_integration_private_only``, while allowing the owner's verified 1:1 DM."""
+    db = _InMemoryBatch3DB()
+    _install_db(monkeypatch, db)
+
+    owner_uid = "u-alice"
+    other_uid = "u-bob"
+    priv_tid = str(uuid4())
+    ws_id = str(uuid4())
+    db.threads[priv_tid] = {
+        "conversation_thread_id": priv_tid,
+        "workspace_id": ws_id,
+        "user_id": owner_uid,
+        "owner_user_id": owner_uid,
+        "has_personal_integration_data": True,
+    }
+    db.identities[(owner_uid, "feishu")] = {"platform_user_id": "ou_alice"}
+    db.identities[(other_uid, "feishu")] = {"platform_user_id": "ou_bob"}
+    db.user_settings[owner_uid] = {
+        "apps": {
+            "feishu": {
+                "enabled": True,
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me", "feishu:oc_grp_priv"]},
+            }
+        }
+    }
+    db.user_settings[other_uid] = {
+        "apps": {
+            "feishu": {
+                "enabled": True,
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
+            }
+        }
+    }
+
+    # 1. BT2 parent targeting original group chat -> DENIED (personal_integration_private_only)
+    grp_parent_key = "deliverables-links:tool:run-priv-grp:c1"
+    grp_item_key = f"{grp_parent_key}:item:{cg_db.derive_bt2_item_hash(ws_id, 'report.pdf')}"
+    db.deliveries["tool:run-priv-grp:c1"] = {
+        "delivery_key": "tool:run-priv-grp:c1",
+        "user_id": owner_uid,
+        "thread_id": priv_tid,
+        "run_id": "run-priv-grp",
+        "platform": "feishu",
+        "target_address": "feishu:oc_grp_priv",
+        "is_current": False,
+        "status": "sent",
+        "bt2_enrolled": True,
+        "deliverable_manifest": [
+            {"item_key": grp_item_key, "workspace_id": ws_id, "path": "report.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:oc_grp_priv",
+            "workspace_id": ws_id,
+        },
+    }
+    res_grp_parent = await cg_db.authorize_and_claim_delivery(
+        delivery_key=grp_parent_key,
+        kind="fallback",
+        user_id=owner_uid,
+        thread_id=priv_tid,
+        run_id="run-priv-grp",
+        platform="feishu",
+        target="feishu:oc_grp_priv",
+        source_delivery_key="tool:run-priv-grp:c1",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_grp_parent["claim_status"] == "denied"
+    assert res_grp_parent["code"] == "personal_integration_private_only"
+    assert res_grp_parent["has_personal_integration_data"] is True
+    assert db.deliveries[grp_parent_key]["status"] == "failed"
+    assert db.deliveries[grp_parent_key]["error_code"] == "personal_integration_private_only"
+
+    # 2. BT2 item child under an existing group parent (thread became private after parent was created) -> DENIED
+    grp_parent_existing = "deliverables-links:tool:run-priv-item:c1"
+    grp_child_key = f"{grp_parent_existing}:item:{cg_db.derive_bt2_item_hash(ws_id, 'deck.pdf')}"
+    db.deliveries[grp_parent_existing] = {
+        "delivery_key": grp_parent_existing,
+        "user_id": owner_uid,
+        "thread_id": priv_tid,
+        "run_id": "run-priv-item",
+        "platform": "feishu",
+        "target_address": "feishu:oc_grp_priv",
+        "is_current": False,
+        "status": "in_flight",
+        "bt2_enrolled": True,
+        "deliverable_manifest": [
+            {"item_key": grp_child_key, "workspace_id": ws_id, "path": "deck.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:oc_grp_priv",
+            "workspace_id": ws_id,
+        },
+    }
+    res_grp_item = await cg_db.authorize_and_claim_delivery(
+        delivery_key=grp_child_key,
+        kind="fallback",
+        user_id=owner_uid,
+        platform="feishu",
+        target="feishu:oc_grp_priv",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_grp_item["claim_status"] == "denied"
+    assert res_grp_item["code"] == "personal_integration_private_only"
+    assert res_grp_item["has_personal_integration_data"] is True
+
+    # 3. BT2 parent & item for non-owner user even on DM -> DENIED
+    other_parent_key = "deliverables-links:tool:run-priv-other:c1"
+    other_item_key = f"{other_parent_key}:item:{cg_db.derive_bt2_item_hash(ws_id, 'memo.pdf')}"
+    db.deliveries["tool:run-priv-other:c1"] = {
+        "delivery_key": "tool:run-priv-other:c1",
+        "user_id": other_uid,
+        "thread_id": priv_tid,
+        "run_id": "run-priv-other",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "is_current": False,
+        "status": "sent",
+        "bt2_enrolled": True,
+        "dm_recipient_platform_user_id": "ou_bob",
+        "deliverable_manifest": [
+            {"item_key": other_item_key, "workspace_id": ws_id, "path": "memo.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "workspace_id": ws_id,
+        },
+    }
+    res_other_parent = await cg_db.authorize_and_claim_delivery(
+        delivery_key=other_parent_key,
+        kind="fallback",
+        user_id=other_uid,
+        thread_id=priv_tid,
+        run_id="run-priv-other",
+        platform="feishu",
+        target="feishu:@me",
+        source_delivery_key="tool:run-priv-other:c1",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_other_parent["claim_status"] == "denied"
+    assert res_other_parent["code"] == "personal_integration_private_only"
+
+    res_other_item = await cg_db.authorize_and_claim_delivery(
+        delivery_key=other_item_key,
+        kind="fallback",
+        user_id=other_uid,
+        platform="feishu",
+        target="feishu:@me",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_other_item["claim_status"] == "denied"
+    assert res_other_item["code"] == "personal_integration_private_only"
+
+    # 4. BT2 parent & item for owner's verified 1:1 DM -> ALLOWED
+    dm_parent_key = "deliverables-links:tool:run-priv-dm:c1"
+    dm_item_key = f"{dm_parent_key}:item:{cg_db.derive_bt2_item_hash(ws_id, 'own.pdf')}"
+    db.deliveries["tool:run-priv-dm:c1"] = {
+        "delivery_key": "tool:run-priv-dm:c1",
+        "user_id": owner_uid,
+        "thread_id": priv_tid,
+        "run_id": "run-priv-dm",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "is_current": False,
+        "status": "sent",
+        "bt2_enrolled": True,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "deliverable_manifest": [
+            {"item_key": dm_item_key, "workspace_id": ws_id, "path": "own.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "workspace_id": ws_id,
+        },
+    }
+    res_dm_parent = await cg_db.authorize_and_claim_delivery(
+        delivery_key=dm_parent_key,
+        kind="fallback",
+        user_id=owner_uid,
+        thread_id=priv_tid,
+        run_id="run-priv-dm",
+        platform="feishu",
+        target="feishu:@me",
+        source_delivery_key="tool:run-priv-dm:c1",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_dm_parent["claim_status"] == "claimed"
+
+    res_dm_item = await cg_db.authorize_and_claim_delivery(
+        delivery_key=dm_item_key,
+        kind="fallback",
+        user_id=owner_uid,
+        platform="feishu",
+        target="feishu:@me",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_dm_item["claim_status"] == "claimed"

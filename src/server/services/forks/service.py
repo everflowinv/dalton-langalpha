@@ -368,7 +368,7 @@ async def _write_thread(
     )
     # DALTON-HOOK(personal-integrations): inherit private flag, clipped purged ranges, and remapped touches on fork
     from src.dalton.services.purge_fence import copy_personal_integration_state_for_fork_tx
-    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=kept_turn_indexes, run_map=plan.run_map)
+    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=kept_turn_indexes, run_map=plan.run_map, lineage=lineage)
 
 
 async def _drop_unclaimed(thread_id: str) -> None:

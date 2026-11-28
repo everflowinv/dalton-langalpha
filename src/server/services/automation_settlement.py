@@ -222,14 +222,6 @@ async def settle(
             settled_tid, settled_rid, settled_delivery,
             settled, final_text,
         )
-        # DALTON-HOOK(dalton-notify): enqueue durable failure notice or bump recovery epoch inside settle tx
-        from src.dalton.notify.failure_receipts import on_automation_settle_in_tx
-
-        await on_automation_settle_in_tx(
-            conn, automation=automation, execution_id=execution_id, outcome_status=policy.status,
-            failure_reason=policy.failure_reason, error=error, delivery=settled_delivery,
-            thread_id=settled_tid, workspace_id=workspace_id,
-        )
         # DALTON-HOOK(automation-subscription-fallback): release signals only when executor's synchronous pre-START path settles 'failed'
         # DALTON-HOOK(automation-capacity-retry): also release pre-START claimed signals when a waiting execution is skipped
         settled_thread_id = thread_id or (
@@ -291,6 +283,16 @@ async def settle(
                     thread_id=settled_thread_id,
                     workspace_id=workspace_id,
                 )
+        # DALTON-HOOK(dalton-notify): enqueue durable failure notice or bump recovery epoch inside settle tx
+        # (when failure_notify_left handles a failed capacity-expiry settlement, receipt creation runs after target reconciliation so both paths dedup by (execution, target))
+        if not (failure_notify_left and policy.status == "failed"):
+            from src.dalton.notify.failure_receipts import on_automation_settle_in_tx
+
+            await on_automation_settle_in_tx(
+                conn, automation=automation, execution_id=execution_id, outcome_status=policy.status,
+                failure_reason=policy.failure_reason, error=error, delivery=settled_delivery,
+                thread_id=settled_tid, workspace_id=workspace_id,
+            )
 
     extra_settle_kwargs: Dict[str, Any] = {}
     if expected_run_id is not exec_db.UNSET_RUN_ID:
@@ -1197,6 +1199,7 @@ async def _resolve_execution_settlement(
             retry_read=retry_read,
             expected_run_id=expected_run_id,
             exec_row=exec_row,
+            reset_prestart_thread_status=reset_prestart_thread_status,
         )
     if timed_out:
         settled = await _settle_timeout_for_run(

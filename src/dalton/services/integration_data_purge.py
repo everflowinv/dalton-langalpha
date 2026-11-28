@@ -957,6 +957,7 @@ async def _purge_thread_checkpoints(
     run_turn_map: dict[str, int],
     suffix_run_ids: set[str],
     suffix_task_ids: set[str],
+    fork_turn_base: int | None = None,
 ) -> int:
     """Layer 1 checkpoint redaction for one thread (main namespace + suffix task namespaces)."""
     updated_count = 0
@@ -993,8 +994,17 @@ async def _purge_thread_checkpoints(
             elif ti is not None and ti > max_turn:
                 post_range_cp_ids.add(cid)
             else:
+                # Snapshot fork root checkpoint (`source == "fork"`) materializes borrowed
+                # turns [0 .. fork_turn_base - 1]: when min_turn falls within those borrowed
+                # turns (or fork_turn_base is unknown), classify it as suffix so personal
+                # integration messages copied into the fork snapshot are redacted.
+                if str(meta.get("source") or "") == "fork":
+                    if fork_turn_base is None or min_turn < fork_turn_base:
+                        suffix_cp_ids.add(cid)
+                    else:
+                        pre_touch_cp_ids.add(cid)
                 # Unresolved checkpoint: if min_turn == 0 treat as suffix; otherwise preserve unless summary overlaps
-                if min_turn == 0:
+                elif min_turn == 0:
                     suffix_cp_ids.add(cid)
                 else:
                     pre_touch_cp_ids.add(cid)
@@ -1864,7 +1874,7 @@ async def _purge_single_thread_layers(
             return False
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT workspace_id::text AS workspace_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                "SELECT workspace_id::text AS workspace_id, metadata FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
                 (tid,),
             )
             ws_row = await cur.fetchone()
@@ -1873,6 +1883,14 @@ async def _purge_single_thread_layers(
                 if ws_row and ws_row.get("workspace_id")
                 else None
             )
+            fork_turn_base: int | None = None
+            raw_t_meta = ws_row.get("metadata") if isinstance(ws_row, Mapping) else None
+            if isinstance(raw_t_meta, Mapping):
+                fork_meta = raw_t_meta.get("fork")
+                borrow_meta = fork_meta.get("borrow") if isinstance(fork_meta, Mapping) else None
+                raw_tb = borrow_meta.get("turn_base") if isinstance(borrow_meta, Mapping) else None
+                if isinstance(raw_tb, int) and not isinstance(raw_tb, bool):
+                    fork_turn_base = raw_tb
 
             await cur.execute(
                 """
@@ -1902,16 +1920,38 @@ async def _purge_single_thread_layers(
 
             suffix_task_ids: list[str] = []
             suffix_task_run_ids: list[str] = []
-            if suffix_run_ids:
-                await cur.execute(
-                    """
-                    SELECT task_id, task_run_id::text AS task_run_id
-                    FROM subagent_runs
-                    WHERE thread_id = %s::uuid
-                      AND parent_run_id = ANY(%s::uuid[])
-                    """,
-                    (tid, suffix_run_ids),
-                )
+            include_fork_copied_tasks = fork_turn_base is not None and min_turn < fork_turn_base
+            if suffix_run_ids or include_fork_copied_tasks:
+                if suffix_run_ids and include_fork_copied_tasks:
+                    await cur.execute(
+                        """
+                        SELECT task_id, task_run_id::text AS task_run_id
+                        FROM subagent_runs
+                        WHERE thread_id = %s::uuid
+                          AND (parent_run_id = ANY(%s::uuid[]) OR parent_run_id IS NULL)
+                        """,
+                        (tid, suffix_run_ids),
+                    )
+                elif suffix_run_ids:
+                    await cur.execute(
+                        """
+                        SELECT task_id, task_run_id::text AS task_run_id
+                        FROM subagent_runs
+                        WHERE thread_id = %s::uuid
+                          AND parent_run_id = ANY(%s::uuid[])
+                        """,
+                        (tid, suffix_run_ids),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT task_id, task_run_id::text AS task_run_id
+                        FROM subagent_runs
+                        WHERE thread_id = %s::uuid
+                          AND parent_run_id IS NULL
+                        """,
+                        (tid,),
+                    )
                 sr_rows = [dict(r) for r in await cur.fetchall()]
                 suffix_task_ids = sorted(
                     {str(r["task_id"]) for r in sr_rows if r.get("task_id")}
@@ -1941,6 +1981,7 @@ async def _purge_single_thread_layers(
                     run_turn_map=run_turn_map,
                     suffix_run_ids=set(suffix_run_ids),
                     suffix_task_ids=set(suffix_task_ids),
+                    fork_turn_base=fork_turn_base,
                 )
                 report.store_rows_deleted += await _purge_store_memories_for_thread(
                     cp_conn, tid
@@ -1971,6 +2012,7 @@ async def _purge_single_thread_layers(
                     run_turn_map=run_turn_map,
                     suffix_run_ids=set(suffix_run_ids),
                     suffix_task_ids=set(suffix_task_ids),
+                    fork_turn_base=fork_turn_base,
                 )
                 report.store_rows_deleted += await _purge_store_memories_for_thread(
                     app_cp_conn, tid

@@ -2544,3 +2544,359 @@ async def test_r8_purge_attempt_gen_and_thread_blocked_recheck_aborts_stale_work
             await render_mod.remove_conversation_file_from_backend(
                 None, "research/topics/conversations/2026-11-26.md", backend=stub_be
             )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_fork_preserves_personal_touches_and_purge_covers_fork_and_subsequent_fork():
+    """Snapshot fork (empty main-turn run_map) inherits personal-integration touches and
+    private flag across fork and fork-of-fork, and disconnect purge covers & redacts the
+    fork's materialized snapshot checkpoint."""
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+    from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+    from src.server.services.forks.model import BorrowedSegment, Borrowing, ForkLineage
+
+    uid = "user-fork-cal"
+    t0 = str(uuid.uuid4())
+    t1 = str(uuid.uuid4())
+    t2 = str(uuid.uuid4())
+    r1 = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    # Mini in-memory tables covering conversation_threads & dalton_thread_integration_touches
+    threads_tbl: dict[str, dict[str, object]] = {
+        t0: {
+            "has_personal_integration_data": True,
+            "personal_purged_turn_ranges": [],
+            "is_shared": False,
+            "workspace_shared_at": None,
+            "metadata": {},
+            "personal_purge_in_progress": False,
+            "personal_purge_generation": 0,
+        },
+        t1: {
+            "has_personal_integration_data": False,
+            "personal_purged_turn_ranges": [],
+            "is_shared": True,
+            "workspace_shared_at": now,
+            "metadata": {"fork": {"borrow": {"turn_base": 2}}},
+            "personal_purge_in_progress": False,
+            "personal_purge_generation": 0,
+        },
+        t2: {
+            "has_personal_integration_data": False,
+            "personal_purged_turn_ranges": [],
+            "is_shared": True,
+            "workspace_shared_at": now,
+            "metadata": {"fork": {"borrow": {"turn_base": 2}}},
+            "personal_purge_in_progress": False,
+            "personal_purge_generation": 0,
+        },
+    }
+    touches_tbl: list[dict[str, object]] = [
+        {
+            "thread_id": t0,
+            "response_id": r1,
+            "provider": "google",
+            "service": "calendar",
+            "auth_epoch": 1,
+            "turn_index": 1,
+            "user_id": uid,
+            "provider_account_id": "acct-1",
+            "touched_at": now,
+            "purged_at": None,
+        }
+    ]
+
+    class _ForkTouchCursor:
+        def __init__(self) -> None:
+            self._one: object = None
+            self._all: list[object] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params=None):
+            norm = " ".join(sql.split()).upper()
+            self._one = None
+            self._all = []
+            if "SELECT PG_ADVISORY_XACT_LOCK" in norm:
+                return
+            if "SELECT HAS_PERSONAL_INTEGRATION_DATA, PERSONAL_PURGED_TURN_RANGES FROM CONVERSATION_THREADS" in norm:
+                self._one = dict(threads_tbl[str(params[0])])
+                return
+            if "FROM DALTON_THREAD_INTEGRATION_TOUCHES" in norm and "GROUP BY THREAD_ID" in norm:
+                by_tid: dict[str, list[int]] = {}
+                for row in touches_tbl:
+                    if (
+                        row["user_id"] == params["user_id"]
+                        and row["provider"] == params["provider"]
+                        and (params["service"] is None or row["service"] == params["service"])
+                        and int(row["auth_epoch"]) <= int(params["auth_epoch_upto"])
+                        and row["purged_at"] is None
+                    ):
+                        by_tid.setdefault(str(row["thread_id"]), []).append(int(row["turn_index"]))
+                self._all = [
+                    {
+                        "thread_id": tid,
+                        "first_touched_turn_index": min(turns),
+                        "max_touched_turn_index": max(turns),
+                    }
+                    for tid, turns in sorted(by_tid.items())
+                ]
+                return
+            if "FROM DALTON_THREAD_INTEGRATION_TOUCHES" in norm and "TURN_INDEX <=" in norm:
+                src_tid, max_turn = str(params[0]), int(params[1])
+                self._all = [
+                    dict(r)
+                    for r in touches_tbl
+                    if str(r["thread_id"]) == src_tid and int(r["turn_index"]) <= max_turn
+                ]
+                return
+            if "UPDATE CONVERSATION_THREADS SET HAS_PERSONAL_INTEGRATION_DATA = TRUE" in norm:
+                clipped, dst_tid = params[0].obj, str(params[1])
+                threads_tbl[dst_tid]["has_personal_integration_data"] = True
+                threads_tbl[dst_tid]["personal_purged_turn_ranges"] = clipped
+                threads_tbl[dst_tid]["is_shared"] = False
+                threads_tbl[dst_tid]["workspace_shared_at"] = None
+                return
+            if "INSERT INTO DALTON_THREAD_INTEGRATION_TOUCHES" in norm:
+                rec = {
+                    "thread_id": str(params[0]),
+                    "response_id": str(params[1]),
+                    "provider": params[2],
+                    "service": params[3],
+                    "auth_epoch": int(params[4]),
+                    "turn_index": int(params[5]),
+                    "user_id": params[6],
+                    "provider_account_id": params[7],
+                    "touched_at": params[8],
+                    "purged_at": params[9],
+                }
+                pk = (rec["thread_id"], rec["response_id"], rec["provider"], rec["service"], rec["auth_epoch"])
+                if not any(
+                    (r["thread_id"], r["response_id"], r["provider"], r["service"], r["auth_epoch"]) == pk
+                    for r in touches_tbl
+                ):
+                    touches_tbl.append(rec)
+                return
+            if "SELECT PERSONAL_PURGED_TURN_RANGES, METADATA FROM CONVERSATION_THREADS" in norm:
+                self._one = dict(threads_tbl[str(params[0])])
+                return
+            if "SELECT GREATEST(" in norm:
+                self._one = {"max_turn": int(params[2])}
+                return
+            if "UPDATE CONVERSATION_THREADS SET PERSONAL_PURGE_IN_PROGRESS = TRUE" in norm:
+                merged, tid = params[0].obj, str(params[1])
+                threads_tbl[tid]["personal_purge_in_progress"] = True
+                threads_tbl[tid]["personal_purge_generation"] = int(threads_tbl[tid]["personal_purge_generation"]) + 1
+                threads_tbl[tid]["personal_purged_turn_ranges"] = merged
+                return
+            raise AssertionError(f"Unexpected SQL: {norm}")
+
+        async def fetchone(self):
+            return self._one
+
+        async def fetchall(self):
+            return list(self._all)
+
+    class _ForkTouchConn:
+        def __init__(self) -> None:
+            self._cur = _ForkTouchCursor()
+
+        def cursor(self, **_kwargs):
+            return self._cur
+
+    conn = _ForkTouchConn()
+
+    # 1. Snapshot fork T0 -> T1 at ThroughTurn(1) with EMPTY run_map (no main turns in run_map)
+    seg_t0 = BorrowedSegment(
+        thread_id=t0,
+        first_turn=0,
+        through_turn=1,
+        response_id=r1,
+        run_horizon=2,
+        runs_through=2,
+    )
+    lineage_t1 = ForkLineage(
+        kind="branch",
+        thread_id=t0,
+        cut="through_turn",
+        turn_index=1,
+        checkpoint_id="cp-cut-1",
+        copy_scratchpad=False,
+        tasks=0,
+        title="Fork 1",
+        at=now,
+        by=uid,
+        borrow=Borrowing(turn_base=2, checkpoint_id="cp-cut-1", ancestors=(seg_t0,)),
+    )
+    await copy_personal_integration_state_for_fork_tx(
+        conn,
+        source_thread_id=t0,
+        target_thread_id=t1,
+        cut=ThroughTurn(1),
+        kept_turn_indexes=[0, 1],
+        run_map={},
+        lineage=lineage_t1,
+    )
+    assert threads_tbl[t1]["has_personal_integration_data"] is True
+    assert threads_tbl[t1]["is_shared"] is False
+    t1_touches = [r for r in touches_tbl if r["thread_id"] == t1]
+    assert len(t1_touches) == 1
+    assert t1_touches[0]["response_id"] == r1
+    assert t1_touches[0]["turn_index"] == 1
+
+    # 2. Fork-of-fork T1 -> T2 at BeforeTurn(2) (kept_turn_indexes=[] because T1 has no own turns < 2,
+    #    but lineage.borrow.ancestors still borrows T0 turns 0..1)
+    lineage_t2 = ForkLineage(
+        kind="branch",
+        thread_id=t1,
+        cut="before_turn",
+        turn_index=2,
+        checkpoint_id="cp-cut-1",
+        copy_scratchpad=False,
+        tasks=0,
+        title="Fork 2",
+        at=now,
+        by=uid,
+        borrow=Borrowing(turn_base=2, checkpoint_id="cp-cut-1", ancestors=(seg_t0,)),
+    )
+    await copy_personal_integration_state_for_fork_tx(
+        conn,
+        source_thread_id=t1,
+        target_thread_id=t2,
+        cut=BeforeTurn(2),
+        kept_turn_indexes=[],
+        run_map={},
+        lineage=lineage_t2,
+    )
+    assert threads_tbl[t2]["has_personal_integration_data"] is True
+    assert threads_tbl[t2]["is_shared"] is False
+    t2_touches = [r for r in touches_tbl if r["thread_id"] == t2]
+    assert len(t2_touches) == 1
+    assert t2_touches[0]["response_id"] == r1
+
+    # 3. Disconnect Phase 1 covers T0, T1, AND T2
+    insert_ledger_spy = create_autospec(db.insert_purge_ledger, return_value=None)
+    with patch.object(lifecycle_mod.db, "insert_purge_ledger", new=insert_ledger_spy):
+        _, purged_map = await lifecycle_mod._lock_and_register_phase1_tx(
+            conn,
+            user_id=uid,
+            provider="google",
+            service="calendar",
+            oauth_client_id="cli-1",
+            provider_account_id="acct-1",
+            auth_epoch_upto=1,
+            trigger_reason="user_disconnect",
+            remote_revoke_status=RemoteRevokeStatus.PENDING,
+            encrypted_revoke_token=None,
+        )
+    assert set(purged_map.keys()) == {t0, t1, t2}
+    for tid in (t0, t1, t2):
+        assert threads_tbl[tid]["personal_purge_in_progress"] is True
+        assert threads_tbl[tid]["personal_purged_turn_ranges"] == [[1, 1]]
+
+    # 4. Checkpoint purge redacts T1's materialized snapshot checkpoint (`source == "fork"`)
+    serde = JsonPlusSerializer()
+    snap_msgs = _DeltaSnapshot(
+        [
+            HumanMessage(id="m0", content="hello"),
+            ToolMessage(
+                id="m1-cal",
+                content="Secret board meeting at 3pm",
+                tool_call_id="tc-cal-1",
+                name="google_calendar_list_events",
+            ),
+        ]
+    )
+    b_type, b_bytes = serde.dumps_typed(snap_msgs)
+    blob_store = {("", "messages", "v1"): (b_type, b_bytes)}
+
+    class _CpPurgeCursor:
+        def __init__(self) -> None:
+            self._all: list[object] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params=None):
+            norm = " ".join(sql.split()).upper()
+            self._all = []
+            if "FROM CHECKPOINTS" in norm:
+                self._all = [
+                    {
+                        "checkpoint_ns": "",
+                        "checkpoint_id": "cp-cut-1",
+                        "parent_checkpoint_id": None,
+                        "checkpoint": {"channel_versions": {"messages": "v1"}},
+                        "metadata": {"source": "fork", "step": 2, "parents": {}},
+                    }
+                ]
+            elif "FROM CHECKPOINT_WRITES" in norm:
+                self._all = []
+            elif "FROM CHECKPOINT_BLOBS" in norm:
+                self._all = [
+                    {
+                        "checkpoint_ns": ns,
+                        "channel": ch,
+                        "version": ver,
+                        "type": bt,
+                        "blob": bb,
+                    }
+                    for (ns, ch, ver), (bt, bb) in blob_store.items()
+                ]
+            elif "UPDATE CHECKPOINT_BLOBS" in norm:
+                bt, bb, _tid, ns, ch, ver = params
+                blob_store[(ns, ch, ver)] = (bt, bb)
+
+        async def fetchall(self):
+            return list(self._all)
+
+    class _CpPurgeConn:
+        def cursor(self, **_kwargs):
+            return _CpPurgeCursor()
+
+    updated = await purge_mod._purge_thread_checkpoints(
+        _CpPurgeConn(),
+        serde,
+        thread_id=t1,
+        min_turn=1,
+        max_turn=1,
+        run_turn_map={},
+        suffix_run_ids=set(),
+        suffix_task_ids=set(),
+        fork_turn_base=2,
+    )
+    assert updated == 1
+    redacted_snap = serde.loads_typed(blob_store[("", "messages", "v1")])
+    assert isinstance(redacted_snap, _DeltaSnapshot)
+    assert all("Secret board meeting" not in str(m.content) for m in redacted_snap.value)
+    assert any(PURGED_PLACEHOLDER in str(m.content) for m in redacted_snap.value)
+
+    # Conversely, if a clean fork (turn_base=2) only touched calendar later on own turn 2
+    # (min_turn=2 >= fork_turn_base=2), the pre-touch fork snapshot is preserved.
+    clean_snap = _DeltaSnapshot([HumanMessage(id="m0-clean", content="safe pre-touch")])
+    cb_type, cb_bytes = serde.dumps_typed(clean_snap)
+    blob_store[("", "messages", "v1")] = (cb_type, cb_bytes)
+    updated_clean = await purge_mod._purge_thread_checkpoints(
+        _CpPurgeConn(),
+        serde,
+        thread_id=t1,
+        min_turn=2,
+        max_turn=2,
+        run_turn_map={},
+        suffix_run_ids=set(),
+        suffix_task_ids=set(),
+        fork_turn_base=2,
+    )
+    assert updated_clean == 0
+    kept_snap = serde.loads_typed(blob_store[("", "messages", "v1")])
+    assert kept_snap.value[0].content == "safe pre-touch"

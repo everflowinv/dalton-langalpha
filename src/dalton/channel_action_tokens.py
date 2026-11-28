@@ -132,6 +132,7 @@ BT2_TERMINAL_FAILURE_CODES: frozenset[str] = frozenset(
         "not_allowed",
         "max_attempts_exceeded",
         "skipped_platform_disabled",
+        "personal_integration_private_only",
     }
 )
 ACTIVE_OR_ADVANCED_RUN_STATUSES: tuple[str, ...] = (

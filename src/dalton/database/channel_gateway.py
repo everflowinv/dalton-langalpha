@@ -1091,7 +1091,12 @@ async def lookup_bot_topic(
 
 
 BT2_TERMINAL_FAILURE_CODES: frozenset[str] = frozenset(
-    {"not_allowed", "max_attempts_exceeded", "skipped_platform_disabled"}
+    {
+        "not_allowed",
+        "max_attempts_exceeded",
+        "skipped_platform_disabled",
+        "personal_integration_private_only",
+    }
 )
 BT2_MAX_DELIVERY_ATTEMPTS: int = 8
 BT2_SOURCE_OR_PARENT_LEASE_SECONDS: int = 180
@@ -10753,7 +10758,12 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                 if not is_dm:
                     pinned_dm_recipient = None
 
-                async def _persist_bt2_terminal_denied(code: str = "not_allowed") -> dict[str, Any]:
+                async def _persist_bt2_terminal_denied(
+                    code: str = "not_allowed",
+                    *,
+                    message: str = BT2_DENIED_ERROR_MESSAGE,
+                    has_personal_integration_data: bool = False,
+                ) -> dict[str, Any]:
                     failed_fs = [
                         {
                             "workspace_id": m.get("workspace_id") or "",
@@ -10810,7 +10820,7 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                             resolved_target_address,
                             Jsonb(failed_fs),
                             code,
-                            BT2_DENIED_ERROR_MESSAGE,
+                            message,
                             resolved_scope,
                             resolved_gen,
                             resolved_activity_origin,
@@ -10836,12 +10846,56 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                         locked_bg_runs=locked_bg_runs,
                         error_code=code,
                     )
-                    return {
+                    denied_res: dict[str, Any] = {
                         "claim_status": "denied",
                         "status": "failed",
                         "code": code,
-                        "message": BT2_DENIED_ERROR_MESSAGE,
+                        "message": message,
                     }
+                    if has_personal_integration_data:
+                        denied_res["has_personal_integration_data"] = True
+                    return denied_res
+
+                # Personal-integration privacy gate (shared with normal I-6 delivery):
+                # BT2 parent and item attachment resends for private threads may ONLY go
+                # to the thread owner's verified 1:1 DM (never back to a group chat or another user).
+                resolved_privacy_thread_id = resolved_tid
+                if not resolved_privacy_thread_id and source_row and source_row.get("thread_id"):
+                    resolved_privacy_thread_id = normalize_uuid(source_row.get("thread_id"))
+                if not resolved_privacy_thread_id and parent_row and parent_row.get("thread_id"):
+                    resolved_privacy_thread_id = normalize_uuid(parent_row.get("thread_id"))
+                if not resolved_privacy_thread_id and resolved_exec_id:
+                    await cur.execute(
+                        """
+                        SELECT conversation_thread_id::text AS thread_id
+                        FROM automation_executions
+                        WHERE automation_execution_id = %s::uuid
+                        LIMIT 1
+                        """,
+                        (resolved_exec_id,),
+                    )
+                    bt2_exec_row = await cur.fetchone()
+                    if bt2_exec_row and bt2_exec_row.get("thread_id"):
+                        resolved_privacy_thread_id = normalize_uuid(bt2_exec_row.get("thread_id"))
+
+                bt2_priv_thread = False
+                if resolved_privacy_thread_id:
+                    bt2_priv_thread, bt2_priv_owner = await _read_thread_personal_privacy_in_tx(
+                        cur, resolved_privacy_thread_id
+                    )
+                    if bt2_priv_thread:
+                        if bt2_priv_owner and str(resolved_user_id or "").strip() != bt2_priv_owner:
+                            return await _persist_bt2_terminal_denied(
+                                "personal_integration_private_only",
+                                message="该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
+                                has_personal_integration_data=True,
+                            )
+                        if not is_dm:
+                            return await _persist_bt2_terminal_denied(
+                                "personal_integration_private_only",
+                                message="该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                                has_personal_integration_data=True,
+                            )
 
                 # Intentional scope limit (§3.5(2)): production-disabled platforms (e.g. Discord) background DM
                 # without original DM inbound recipient immediately settle as terminal not_allowed.
@@ -10873,6 +10927,24 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                 )
                 if not live_ok:
                     return await _persist_bt2_terminal_denied(live_code or "not_allowed")
+
+                if (
+                    bt2_priv_thread
+                    and not _is_dm_address(resolved_platform, resolved_target_address)
+                    and (
+                        not resolved_recip
+                        or resolved_target_address
+                        not in (
+                            f"{resolved_platform}:{resolved_recip}",
+                            f"{resolved_platform}:user:{resolved_recip}",
+                        )
+                    )
+                ):
+                    return await _persist_bt2_terminal_denied(
+                        "personal_integration_private_only",
+                        message="该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                        has_personal_integration_data=True,
+                    )
 
                 if is_dm and resolved_platform == "feishu" and not pinned_dm_recipient and resolved_recip:
                     pinned_dm_recipient = resolved_recip

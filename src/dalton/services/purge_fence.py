@@ -327,14 +327,21 @@ async def clip_purged_ranges_on_truncate_tx(
         return clipped
 
 
-def fork_max_inclusive_turn(cut: Any, kept_turn_indexes: Sequence[int]) -> int | None:
+def fork_max_inclusive_turn(
+    cut: Any,
+    kept_turn_indexes: Sequence[int],
+    *,
+    lineage: Any = None,
+) -> int | None:
     """Compute the inclusive upper turn bound for a Fork cut (same boundary as copied turns).
 
-    - No copied turns -> ``None`` (ranges become ``[]``).
+    - No copied or borrowed turns -> ``None`` (ranges become ``[]``).
     - ``ThroughTurn(k)`` -> ``k`` (includes turn ``k``).
     - ``BeforeTurn(k)`` -> ``k - 1`` (excludes turn ``k``).
     """
-    if not kept_turn_indexes:
+    borrow = getattr(lineage, "borrow", None) if lineage is not None else None
+    ancestors = getattr(borrow, "ancestors", None) if borrow is not None else None
+    if not kept_turn_indexes and not ancestors:
         return None
     cut_name = getattr(cut, "name", None)
     turn_index = int(getattr(cut, "turn_index", 0))
@@ -351,9 +358,10 @@ async def copy_personal_integration_state_for_fork_tx(
     cut: Any,
     kept_turn_indexes: Sequence[int],
     run_map: Mapping[str, str],
+    lineage: Any = None,
 ) -> None:
     """Propagate ``has_personal_integration_data``, clipped ``personal_purged_turn_ranges``,
-    and remapped ``dalton_thread_integration_touches`` onto a forked thread inside the fork tx.
+    and inherited ``dalton_thread_integration_touches`` onto a forked thread inside the fork tx.
     """
     if not is_dalton_enabled():
         return
@@ -377,7 +385,7 @@ async def copy_personal_integration_state_for_fork_tx(
         if src_row is None:
             return
 
-        max_turn = fork_max_inclusive_turn(cut, kept_turn_indexes)
+        max_turn = fork_max_inclusive_turn(cut, kept_turn_indexes, lineage=lineage)
         if max_turn is None or max_turn < 0:
             clipped_ranges: list[list[int]] = []
             touches: list[dict[str, Any]] = []
@@ -423,9 +431,10 @@ async def copy_personal_integration_state_for_fork_tx(
 
         for touch in touches:
             old_rid = str(touch["response_id"])
-            new_rid = run_map.get(old_rid)
-            if not new_rid:
-                continue
+            # Snapshot forks borrow main turns instead of duplicating conversation_responses,
+            # so ``run_map`` only remaps copied subagent task runs. Preserve ``old_rid`` for
+            # borrowed main-turn touches so disconnect/purge and fork-of-fork still cover dst_id.
+            target_rid = run_map.get(old_rid) or old_rid
             await cur.execute(
                 """
                 INSERT INTO dalton_thread_integration_touches (
@@ -441,7 +450,7 @@ async def copy_personal_integration_state_for_fork_tx(
                 """,
                 (
                     dst_id,
-                    str(new_rid),
+                    str(target_rid),
                     touch["provider"],
                     touch["service"],
                     int(touch["auth_epoch"]),

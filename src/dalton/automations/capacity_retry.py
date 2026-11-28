@@ -1264,7 +1264,35 @@ async def deliver_settled_failure_notification(execution_id: str) -> bool:
             current_delivery=current_delivery,
         )
 
+        # Coordinate with failure-notice receipts AFTER reconciling delivery targets so
+        # both paths share per-(execution, target) deduplication via extract_held_delivery_covered_targets.
+        from src.dalton.settings import is_failure_notice_enabled
+
+        if is_failure_notice_enabled() and policy.status == "failed":
+            from src.dalton.notify.failure_receipts import (
+                on_automation_settle_in_tx,
+                wake_failure_notice_dispatcher,
+            )
+
+            async with get_db_connection() as receipt_conn:
+                async with receipt_conn.transaction():
+                    await on_automation_settle_in_tx(
+                        receipt_conn,
+                        automation=automation,
+                        execution_id=execution_id,
+                        outcome_status=policy.status,
+                        failure_reason=policy.failure_reason,
+                        error=error,
+                        delivery=delivery,
+                        thread_id=thread_id,
+                        workspace_id=workspace_id,
+                    )
+            wake_failure_notice_dispatcher()
+
         if delivery is not None and delivery.held and policy.finish is not None:
+            finish_kw: dict[str, Any] = {}
+            if attempts >= FAILURE_NOTIFY_MAX_ATTEMPTS:
+                finish_kw["final_attempt"] = True
             finish = await automation_delivery.finish_run(
                 automation,
                 delivery.id,
@@ -1273,6 +1301,7 @@ async def deliver_settled_failure_notification(execution_id: str) -> bool:
                 final_text=None,
                 thread_id=thread_id,
                 run_id=None,
+                **finish_kw,
             )
             will_retry = finish.retry and attempts < FAILURE_NOTIFY_MAX_ATTEMPTS
             should_write = not recorded or _replaces_record(finish, answered)
@@ -1305,18 +1334,33 @@ async def deliver_settled_failure_notification(execution_id: str) -> bool:
                 )
             return True
 
-        delivery_result = await WebhookClient().fire_event(
-            policy.webhook,
-            automation,
-            execution_id,
-            thread_id,
-            workspace_id,
-            error=error,
-            run_id=None,
-            failure_reason=policy.failure_reason,
+        # Enforce the same personal-integration webhook privacy check as normal settlement.
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
         )
-        if delivery_result is None and delivery is not None and not delivery.held:
-            delivery_result = automation_delivery.unsent(delivery) or None
+
+        is_personal_private = bool(
+            thread_id and await is_thread_personal_private(str(thread_id))
+        )
+        if is_personal_private:
+            delivery_result = (
+                (automation_delivery.unsent(delivery) or None)
+                if delivery is not None and not delivery.held
+                else None
+            )
+        else:
+            delivery_result = await WebhookClient().fire_event(
+                policy.webhook,
+                automation,
+                execution_id,
+                thread_id,
+                workspace_id,
+                error=error,
+                run_id=None,
+                failure_reason=policy.failure_reason,
+            )
+            if delivery_result is None and delivery is not None and not delivery.held:
+                delivery_result = automation_delivery.unsent(delivery) or None
         await _update_failure_notification_state(
             execution_id,
             claim_token=claim_token,

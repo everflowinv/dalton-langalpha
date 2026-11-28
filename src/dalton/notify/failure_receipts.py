@@ -352,6 +352,13 @@ def extract_held_delivery_covered_targets(delivery: Any) -> set[tuple[str, str]]
             continue
         parsed = normalize_channel_target(str(addr))
         if parsed is None:
+            cleaned_addr = str(addr).strip()
+            low_addr = cleaned_addr.lower()
+            if cleaned_addr.startswith("feishu:ou_"):
+                parsed = ("feishu", f"feishu:user:{cleaned_addr[len('feishu:'):]}")
+            elif low_addr.startswith("weixin:dm:"):
+                parsed = ("weixin", "weixin:@me")
+        if parsed is None:
             continue
         ch, canon = parsed
         covered.add((ch, canon))

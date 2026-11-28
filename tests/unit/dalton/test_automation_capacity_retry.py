@@ -1648,3 +1648,328 @@ async def test_settle_abandoned_without_run_enables_prestart_thread_reset() -> N
     assert settle_spy.await_count == 2
     assert settle_spy.await_args_list[0].kwargs["reset_prestart_thread_status"] is True
     assert settle_spy.await_args_list[1].kwargs["reset_prestart_thread_status"] is True
+
+
+@pytest.mark.asyncio
+async def test_settle_abandoned_pending_settlement_recovery_resets_prestart_thread_status() -> None:
+    """When an execution failed pre-START and rolled back with ``pending_settlement``,
+    ``settle_abandoned`` routes through the ``pending_settlement`` recovery branch in
+    ``_resolve_execution_settlement`` and forwards ``reset_prestart_thread_status=True``
+    so the thread does not remain stuck in ``in_progress``."""
+    from src.dalton.notify import failure_receipts as fr_mod
+
+    settle_spy = create_autospec(settle_mod.settle, return_value=True)
+    recent_now = datetime.now(timezone.utc)
+    pending_rec = fr_mod.build_pending_settlement_record(
+        outcome=Outcome.FAILED_OURS.value,
+        failure_reason="server_error",
+        is_quota_limit=False,
+        schedule_policy="cron",
+        schedule_action="advance",
+        error="pre-START failure",
+        thread_id=_THREAD,
+        workspace_id=_HOME,
+        release_pre_start_signals=True,
+    )
+    abandoned_with_pending = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "status": "running",
+        "conversation_thread_id": _THREAD,
+        "conversation_response_id": None,
+        "started_at": recent_now,
+        "created_at": recent_now,
+        "delivery": {fr_mod.PENDING_SETTLEMENT_KEY: pending_rec},
+        "user_id": _USER,
+        "workspace_id": _HOME,
+    }
+    with (
+        patch.object(settle_mod, "settle", new=settle_spy),
+        patch.object(
+            settle_mod.exec_db,
+            "get_settling_run",
+            new=create_autospec(exec_db_mod.get_settling_run, return_value=None),
+        ),
+        patch(
+            "src.dalton.services.automation_subscription_fallback.apply_execution_fallback_notice",
+            new=create_autospec(
+                __import__(
+                    "src.dalton.services.automation_subscription_fallback",
+                    fromlist=["apply_execution_fallback_notice"],
+                ).apply_execution_fallback_notice,
+                return_value=(None, None),
+            ),
+        ),
+    ):
+        out = await settle_mod.settle_abandoned(_automation(), abandoned_with_pending, 300)
+
+    assert out is Outcome.FAILED_OURS
+    settle_spy.assert_awaited_once()
+    assert settle_spy.await_args.kwargs["reset_prestart_thread_status"] is True
+    assert settle_spy.await_args.kwargs["release_pre_start_signals"] is True
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_notify_webhook_enforces_personal_privacy() -> None:
+    """When a capacity-expired execution falls through to webhook delivery on a
+    personal-integration private thread, ``WebhookClient.fire_event`` is suppressed."""
+    from src.dalton.services import personal_integration_guard as pi_guard
+    from src.server.services import webhook_client as wh_mod
+
+    auto = _automation(delivery_config={"methods": ["webhook"]})
+    claimed = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "conversation_thread_id": _THREAD,
+        "conversation_response_id": None,
+        "error_message": "WriterGuardUnavailable",
+        "delivery": {
+            cr.FAILURE_NOTIFY_KEY: {
+                "status": "claimed",
+                "claim_token": "tok-priv-wh",
+                "execution_id": _EXEC,
+                "automation_id": _AUTO,
+                "user_id": _USER,
+                "thread_id": _THREAD,
+                "workspace_id": _HOME,
+                "outcome": Outcome.FAILED_OURS.value,
+                "error": "WriterGuardUnavailable",
+                "attempts": 1,
+                "recorded": False,
+                "answered": False,
+            }
+        },
+    }
+    unheld = delivery_mod.Delivery(
+        id=_EXEC,
+        targets=[delivery_mod.Target(entry="feishu", address=None, name=None, ok=False, message="No chat")],
+    )
+    wh_double = create_autospec(wh_mod.WebhookClient, instance=True)
+    wh_double.fire_event.return_value = [{"method": "webhook", "success": True}]
+    update_state_mock = create_autospec(cr._update_failure_notification_state, return_value=True)
+    priv_mock = create_autospec(pi_guard.is_thread_personal_private, return_value=True)
+
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=claimed)),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=unheld)),
+        patch.object(cr, "WebhookClient", return_value=wh_double),
+        patch.object(pi_guard, "is_thread_personal_private", new=priv_mock),
+    ):
+        ok = await cr.deliver_settled_failure_notification(_EXEC)
+
+    assert ok is True
+    priv_mock.assert_awaited_once_with(_THREAD)
+    wh_double.fire_event.assert_not_awaited()
+    update_state_mock.assert_awaited_once()
+    kw = update_state_mock.await_args.kwargs
+    assert kw["status"] == "done"
+    assert kw["delivery_result"][0]["success"] is False
+    assert kw["delivery_result"][0]["error"] == "No chat"
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_notify_passes_final_attempt_on_last_try() -> None:
+    """``deliver_settled_failure_notification`` passes ``final_attempt=True`` to
+    ``automation_delivery.finish_run`` on its final attempt so gateway seals ``finishing`` runs."""
+    auto = _automation(delivery_config={"methods": ["feishu"]})
+    held = delivery_mod.Delivery(
+        id=_EXEC,
+        targets=[delivery_mod.Target(entry="feishu", address="feishu:@me", name="DM", ok=True)],
+    )
+
+    def _claimed_for(attempts: int) -> dict[str, Any]:
+        return {
+            "automation_execution_id": _EXEC,
+            "automation_id": _AUTO,
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+            "error_message": "HTTPException: 503",
+            "delivery": {
+                cr.FAILURE_NOTIFY_KEY: {
+                    "status": "claimed",
+                    "claim_token": f"tok-att-{attempts}",
+                    "execution_id": _EXEC,
+                    "automation_id": _AUTO,
+                    "user_id": _USER,
+                    "thread_id": None,
+                    "workspace_id": _HOME,
+                    "outcome": Outcome.FAILED_OURS.value,
+                    "error": "HTTPException: 503",
+                    "attempts": attempts,
+                    "recorded": False,
+                    "answered": False,
+                }
+            },
+        }
+
+    finish_retry = create_autospec(
+        delivery_mod.finish_run,
+        return_value=delivery_mod.Finish(
+            [{"method": "feishu", "address": "feishu:@me", "name": "DM", "success": False, "via": None, "error": "503"}],
+            retry=True,
+            answered=False,
+        ),
+    )
+    update_state_mock = create_autospec(cr._update_failure_notification_state, return_value=True)
+
+    # Non-final attempt -> no final_attempt kwarg
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=_claimed_for(1))),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=held)),
+        patch.object(delivery_mod, "finish_run", new=finish_retry),
+    ):
+        assert await cr.deliver_settled_failure_notification(_EXEC) is True
+    assert "final_attempt" not in finish_retry.await_args.kwargs
+
+    # Final attempt -> final_attempt=True
+    finish_retry.reset_mock()
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=_claimed_for(cr.FAILURE_NOTIFY_MAX_ATTEMPTS))),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=held)),
+        patch.object(delivery_mod, "finish_run", new=finish_retry),
+    ):
+        assert await cr.deliver_settled_failure_notification(_EXEC) is True
+    assert finish_retry.await_args.kwargs.get("final_attempt") is True
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_notify_dedups_with_failure_receipts_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When failure receipts are enabled, capacity-expiry settlement defers receipt creation
+    until ``deliver_settled_failure_notification`` reconciles targets so both paths share
+    per-(execution, target) deduplication; when disabled, receipt code is untouched."""
+    from src.dalton.notify import failure_receipts as fr_mod
+
+    auto = _automation(delivery_config={"methods": ["feishu"]})
+    get_conn, _ = _make_recording_db(fetchone_results=[])
+
+    # 1. During settle(..., enqueue_failure_notify=True) with failure receipts ON,
+    #    leave_finish does NOT enqueue failure_receipts before targets are reconciled.
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    on_settle_spy = create_autospec(fr_mod.on_automation_settle_in_tx, return_value=None)
+    wake_spy = create_autospec(fr_mod.wake_failure_notice_dispatcher, return_value=None)
+    enqueue_cap_spy = create_autospec(cr.enqueue_settled_failure_notification, return_value=True)
+    deliver_cap_spy = create_autospec(cr.deliver_settled_failure_notification, return_value=True)
+
+    async def _fake_settle_execution(eid: str, *, in_transaction: Any = None, **_kw: Any) -> dict[str, Any]:
+        settled_row = {
+            "automation_execution_id": eid,
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+            "delivery": None,
+            "settled_from": "waiting",
+        }
+        async with get_conn() as tx_conn:
+            if in_transaction is not None:
+                await in_transaction(tx_conn, settled_row)
+        return settled_row
+
+    with (
+        patch.object(settle_mod.exec_db, "settle_execution", new=create_autospec(exec_db_mod.settle_execution, side_effect=_fake_settle_execution)),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr, "enqueue_settled_failure_notification", new=enqueue_cap_spy),
+        patch.object(cr, "deliver_settled_failure_notification", new=deliver_cap_spy),
+        patch.object(fr_mod, "on_automation_settle_in_tx", new=on_settle_spy),
+        patch.object(fr_mod, "wake_failure_notice_dispatcher", new=wake_spy),
+    ):
+        ok = await settle_mod.settle(
+            auto,
+            _EXEC,
+            Outcome.FAILED_OURS,
+            error="capacity exhausted",
+            enqueue_failure_notify=True,
+        )
+    assert ok is True
+    enqueue_cap_spy.assert_awaited_once()
+    on_settle_spy.assert_not_awaited()
+    deliver_cap_spy.assert_awaited_once_with(_EXEC)
+
+    # 2. Inside deliver_settled_failure_notification with switch ON, after reconciling
+    #    held target feishu:@me, on_automation_settle_in_tx receives that delivery so
+    #    feishu:user:ou_1 is covered (no duplicate DM) while uncovered DM targets remain.
+    held = delivery_mod.Delivery(
+        id=_EXEC,
+        targets=[delivery_mod.Target(entry="feishu", address="feishu:@me", name="DM", ok=True)],
+    )
+    covered = fr_mod.extract_held_delivery_covered_targets(held)
+    assert fr_mod._target_is_covered("feishu", "feishu:user:ou_1", covered) is True
+    assert fr_mod._target_is_covered("weixin", "weixin:user:wx_1", covered) is False
+
+    claimed = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "conversation_thread_id": None,
+        "conversation_response_id": None,
+        "error_message": "capacity exhausted",
+        "delivery": {
+            cr.FAILURE_NOTIFY_KEY: {
+                "status": "claimed",
+                "claim_token": "tok-dedup-1",
+                "execution_id": _EXEC,
+                "automation_id": _AUTO,
+                "user_id": _USER,
+                "thread_id": None,
+                "workspace_id": _HOME,
+                "outcome": Outcome.FAILED_OURS.value,
+                "error": "capacity exhausted",
+                "attempts": 1,
+                "recorded": False,
+                "answered": False,
+            }
+        },
+    }
+    finish_ok = create_autospec(
+        delivery_mod.finish_run,
+        return_value=delivery_mod.Finish(
+            [{"method": "feishu", "address": "feishu:@me", "name": "DM", "success": True, "via": "dm", "error": None}],
+            retry=False,
+            answered=True,
+        ),
+    )
+    update_state_mock = create_autospec(cr._update_failure_notification_state, return_value=True)
+    on_settle_spy.reset_mock()
+    wake_spy.reset_mock()
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=claimed)),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(cr, "get_db_connection", new=get_conn),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=held)),
+        patch.object(delivery_mod, "finish_run", new=finish_ok),
+        patch.object(fr_mod, "on_automation_settle_in_tx", new=on_settle_spy),
+        patch.object(fr_mod, "wake_failure_notice_dispatcher", new=wake_spy),
+    ):
+        assert await cr.deliver_settled_failure_notification(_EXEC) is True
+    on_settle_spy.assert_awaited_once()
+    assert on_settle_spy.await_args.kwargs["delivery"] is held
+    assert on_settle_spy.await_args.kwargs["execution_id"] == _EXEC
+    wake_spy.assert_called_once()
+
+    # 3. With switch OFF (default), deliver_settled_failure_notification skips receipt creation completely.
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    on_settle_spy.reset_mock()
+    wake_spy.reset_mock()
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=claimed)),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=held)),
+        patch.object(delivery_mod, "finish_run", new=finish_ok),
+        patch.object(fr_mod, "on_automation_settle_in_tx", new=on_settle_spy),
+        patch.object(fr_mod, "wake_failure_notice_dispatcher", new=wake_spy),
+    ):
+        assert await cr.deliver_settled_failure_notification(_EXEC) is True
+    on_settle_spy.assert_not_awaited()
+    wake_spy.assert_not_called()
