@@ -872,8 +872,11 @@ def _classify_exception(
         - `('indeterminate', ...)` on timeout, 429, 5xx, stream cut, or unknown mid-flight error
     """
     from src.dalton.llm.oauth_refresh import get_transient_oauth_refresh_error
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
 
-    if get_transient_oauth_refresh_error(exc) is not None:
+    # Only the unattended fallback reads this kind; with it off, a 401 keeps its
+    # original classification so ``assist_json`` still takes its existing fallback.
+    if is_unattended_quota_fallback_enabled() and get_transient_oauth_refresh_error(exc) is not None:
         return "failed", "oauth_refresh_unavailable"
 
     if isinstance(exc, DeadlineBeforeSendError):

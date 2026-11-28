@@ -1647,6 +1647,7 @@ async def test_transient_oauth_refresh_failure_on_401_does_not_trigger_fallback(
 ) -> None:
     """When a 401 triggers OAuth refresh and refresh hits a transient failure (503 / timeout /
     OAuthRefreshUnavailable), the re-raised 401 must NOT be classified as a switch trigger."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
     from src.server.services.llm import clients as llm_clients
 
     class _Fake401(Exception):
@@ -1968,3 +1969,23 @@ async def test_wakeup_non_subscription_held_model_error_keeps_account_default_fa
     assert cfg.llm.name == "gpt-6.2-sol-oauth"
     assert resolved_calls == ["my-custom-byok", None]
     assert fallback_records == []
+
+
+def test_switch_off_keeps_original_401_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the unattended fallback off, a 401 whose OAuth refresh failed transiently keeps
+    its original ``http_401`` kind, so ``assist_json`` takes its existing fallback as before."""
+    from src.dalton.llm import complete as complete_mod
+    from src.dalton.llm import oauth_refresh as oauth_refresh_mod
+
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "0")
+
+    class _Fake401(Exception):
+        def __init__(self) -> None:
+            super().__init__("Error code: 401 - invalid_api_key")
+            self.status_code = 401
+
+    exc = _Fake401()
+    monkeypatch.setattr(
+        oauth_refresh_mod, "get_transient_oauth_refresh_error", lambda e: object() if e is exc else None
+    )
+    assert complete_mod._classify_exception(exc)[1] != "oauth_refresh_unavailable"
