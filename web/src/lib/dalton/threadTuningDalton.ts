@@ -100,6 +100,7 @@ export function buildDeferredTuningConditions<V>(
 
 export type DaltonTuningHold<V> = {
   value: V;
+  preservedTransient?: boolean;
   clearToken?: symbol;
   restoreHeld?: DaltonTuningHold<V>;
   restoreDeferred?: DeferredTuningPick<V> | null;

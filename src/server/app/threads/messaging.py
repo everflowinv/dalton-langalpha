@@ -880,10 +880,10 @@ async def _handle_send_message(
             enabled_subagents=request.subagents_enabled,
             # DALTON-HOOK(cos-settings-tools): forward execution-level system-catalog flag on server firing requests
             **({"ignore_custom_models": True} if getattr(request, "llm_model_system_only", False) else {}),
-            # DALTON-HOOK(model-picker-races): preserve an explicitly requested built-in Antigravity variant on user/web requests
+            # DALTON-HOOK(model-picker-races): preserve built-in Antigravity variant on user/web requests (explicit or thread-following) so a stale client reasoning_effort never remaps Neon Low -> Neon High
             **(
                 {"preserve_antigravity_variant": True}
-                if (requested_model is not None and (not from_service or bool(request.platform)))
+                if (not from_service or bool(request.platform))
                 else {}
             ),
         )

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { ThreadTuning } from '@/components/ui/chat-input.types';
 // DALTON-HOOK(antigravity-series): gate shared/unresolved tuning deferral to Dalton builds and delegate clearLocal/rollback state to Dalton module
@@ -22,6 +22,7 @@ import {
   type NullHandleBinder,
 } from '@/lib/dalton/threadTuningDalton';
 import { isDaltonTransientRepatchError } from '@/lib/dalton/threadFieldSaveDalton'; // DALTON-HOOK(model-picker-races)
+import { threadFieldMutationKey } from '@/lib/threadFieldMutations'; // DALTON-HOOK(model-picker-races)
 import type { Thread } from '@/types/api';
 import { threadDetailQuery } from '../utils/threadQueries';
 import { useThreadFieldSave } from './useThreadFieldSave';
@@ -160,6 +161,9 @@ function useThreadOverride<F extends TuningField>({
   // DALTON-HOOK(model-picker-races): values stored by the create request for conditional post-create tuning repatch
   createdTuning?: CreatedThreadTuning | null;
 }) {
+  // DALTON-HOOK(model-picker-races): track active mutations for this thread field so optimistic cache writes never prematurely clear held before server confirmation
+  const queryClient = useQueryClient();
+  const fieldMutating = useIsMutating({ mutationKey: threadFieldMutationKey(liveThreadId ?? '', field) });
   // Undefined while there is no row: none yet, or one not read (loading, failed).
   const rowValue: Override<F> | undefined = liveThreadId && thread
     ? (thread[field] ?? null) as Override<F>
@@ -196,7 +200,13 @@ function useThreadOverride<F extends TuningField>({
     setDeferredPick(null);
   }
   // DALTON-HOOK(antigravity-series): in Dalton builds never drop an unsent deferredPick (or held while deferred / awaiting optimistic Antigravity clear settlement) just because it matches possibly-stale cached rowValue
-  const keepHeldForDalton = isDaltonBuild && (nextDeferredPick !== null || Boolean(nextHeld?.clearToken));
+  // DALTON-HOOK(model-picker-races): never clear held while a field save is in flight (cache holds onMutate's temporary optimistic value) or after a transient background save failure; release held on server confirmation
+  const isFieldMutating = Boolean(
+    liveThreadId && (fieldMutating > 0 || queryClient.isMutating({ mutationKey: threadFieldMutationKey(liveThreadId, field) }) > 0),
+  );
+  const keepHeldForDalton = isFieldMutating
+    || Boolean(nextHeld?.preservedTransient)
+    || (isDaltonBuild && (nextDeferredPick !== null || Boolean(nextHeld?.clearToken)));
   if (nextHeld && !keepHeldForDalton && rowValue !== undefined && rowValue === nextHeld.value) {
     nextHeld = null;
     setHeld(null);
@@ -218,9 +228,38 @@ function useThreadOverride<F extends TuningField>({
     // DALTON-HOOK(antigravity-series): also scrub a failed optimistic effort from an active clearLocal handle's restoreHeld
     // DALTON-HOOK(model-picker-races): preserve unsent local tuning pick when a background conditional save (repatch or deferred) hits a transient network/5xx error (409 still scrubs and follows server)
     onFailed: ({ value, background }, error) => {
-      if (isDaltonTransientRepatchError(background, error)) return;
+      if (isDaltonTransientRepatchError(background, error)) {
+        const keepTransient = (current: Hold<Override<F>>): Hold<Override<F>> => {
+          if (current?.clearToken) return current;
+          if (current && current.value === value) {
+            return current.preservedTransient ? current : { ...current, preservedTransient: true };
+          }
+          return current ?? { value, preservedTransient: true };
+        };
+        heldRef.current = keepTransient(heldRef.current);
+        setHeld(keepTransient);
+        return;
+      }
       heldRef.current = scrubFailedTuningHold(heldRef.current, value);
       setHeld((current) => scrubFailedTuningHold(current, value));
+    },
+    // DALTON-HOOK(model-picker-races): clear held when the server confirms a normalized value that differs from saveInfo.value, or clear preservedTransient once a subsequent save succeeds (matching values release once isFieldMutating drops to 0 with confirmed rowValue)
+    onSaved: (saved, saveInfo) => {
+      const savedThreadId = saved.thread_id || liveThreadId || '';
+      if (
+        savedThreadId
+        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(savedThreadId, field) }) <= 1
+      ) {
+        const serverValue = saved[field] !== undefined ? (saved[field] ?? null) : saveInfo.value;
+        const releaseOnConfirm = (current: Hold<Override<F>>): Hold<Override<F>> => {
+          if (!current || current.clearToken) return current;
+          if (current.value !== saveInfo.value) return current;
+          if (serverValue !== saveInfo.value) return null;
+          return current.preservedTransient ? { value: current.value } : current;
+        };
+        heldRef.current = releaseOnConfirm(heldRef.current);
+        setHeld(releaseOnConfirm);
+      }
     },
   });
 

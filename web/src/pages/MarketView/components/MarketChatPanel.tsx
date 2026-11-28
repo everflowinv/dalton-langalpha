@@ -480,12 +480,14 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
   // The Chief of Staff's turn may start on another Default than the account's.
   // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home), activeTurnModel, and createdThreadId like ChatView
+  // DALTON-HOOK(model-picker-races): forward createdTuning baseline for conditional first-turn Antigravity repatch
   const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
   const threadModel = useThreadModel({
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
     activeTurnModel: chat.activeTurnModel,
+    createdTuning: chat.createdThreadTuning,
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
     ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });

@@ -787,5 +787,131 @@ describe('useThreadTuning', () => {
       expect(view.result.current.tuning).toEqual({ reasoningEffort: 'high', fastMode: true });
       view.unmount();
     });
+
+    // DALTON-HOOK(model-picker-races): R4 Codex #3 — temporary optimistic cache writes while a background repatch/deferred PATCH is in flight MUST NOT clear held; delayed 503/network rejection preserves effort & fast_mode, and server confirmation clears held
+    it('R4 Codex #3: keeps held across mid-flight optimistic cache renders so delayed 503/network rejection preserves effort and fast_mode, and clears held only after server confirmation', async () => {
+      // 1) Post-create repatch with DELAYED rejection (Core & Dalton): optimistic cache write triggers mid-flight re-renders before rejection.
+      mocks.isDaltonBuild = false;
+      let rejectEffort!: (err: unknown) => void;
+      let rejectFast!: (err: unknown) => void;
+      const pendingEffort = new Promise<Thread>((_res, rej) => { rejectEffort = rej; });
+      const pendingFast = new Promise<Thread>((_res, rej) => { rejectFast = rej; });
+      mocks.updateThread
+        .mockReturnValueOnce(pendingEffort)
+        .mockReturnValueOnce(pendingFast);
+
+      const initialServerRow = row({ reasoning_effort: null, fast_mode: null });
+      const viewPostCreate = setup({ threadId: '__default__' }, null);
+      mocks.getThread.mockResolvedValue(initialServerRow);
+      await act(async () => {
+        await viewPostCreate.result.current.setReasoningEffort('low');
+        await viewPostCreate.result.current.setFastMode(true);
+      });
+
+      const createdBaseline = { threadId: THREAD, reasoningEffort: null, fastMode: null };
+      viewPostCreate.rerender({ threadId: THREAD, createdTuning: createdBaseline });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
+
+      // Verify onMutate wrote temporary optimistic values into cache AND force mid-flight re-render while PATCHes are still pending.
+      await waitFor(() => {
+        const cached = viewPostCreate.queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD));
+        expect(cached?.reasoning_effort).toBe('low');
+        expect(cached?.fast_mode).toBe(true);
+      });
+      viewPostCreate.rerender({ threadId: THREAD, createdTuning: createdBaseline });
+      expect(viewPostCreate.result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: true });
+
+      // Now reject both delayed requests (503 + network error); cache rolls back & refetches null/null.
+      await act(async () => {
+        rejectEffort(Object.assign(new Error('503'), { response: { status: 503 } }));
+        rejectFast(new TypeError('Failed to fetch'));
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        const cached = viewPostCreate.queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD));
+        expect(cached?.reasoning_effort).toBeNull();
+        expect(cached?.fast_mode).toBeNull();
+      });
+
+      // Local tuning selections MUST stay preserved despite mid-flight optimistic cache renders + rollback!
+      expect(viewPostCreate.result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: true });
+      viewPostCreate.unmount();
+
+      // 2) Deferred permission-recovery flush with DELAYED rejection after mid-flight optimistic renders.
+      mocks.updateThread.mockClear();
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = true;
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = false;
+
+      let rejectDefEffort!: (err: unknown) => void;
+      let rejectDefFast!: (err: unknown) => void;
+      const pendingDefEffort = new Promise<Thread>((_res, rej) => { rejectDefEffort = rej; });
+      const pendingDefFast = new Promise<Thread>((_res, rej) => { rejectDefFast = rej; });
+      mocks.updateThread
+        .mockReturnValueOnce(pendingDefEffort)
+        .mockReturnValueOnce(pendingDefFast);
+
+      const oldRow = row({ reasoning_effort: 'low', fast_mode: false });
+      mocks.getThread.mockResolvedValue(oldRow);
+
+      const viewDeferred = setup({ workspaceId: 'ws-personal' }, oldRow);
+      await act(async () => {
+        await viewDeferred.result.current.setReasoningEffort('high');
+        await viewDeferred.result.current.setFastMode(true);
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      mocks.sharedWorkspaces = [];
+      viewDeferred.rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
+
+      // Confirm temporary optimistic cache values landed and trigger mid-flight re-render while pending.
+      await waitFor(() => {
+        const cached = viewDeferred.queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD));
+        expect(cached?.reasoning_effort).toBe('high');
+        expect(cached?.fast_mode).toBe(true);
+      });
+      viewDeferred.rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+
+      // Reject both delayed requests -> cache rolls back to low/false.
+      await act(async () => {
+        rejectDefEffort(Object.assign(new Error('503'), { response: { status: 503 } }));
+        rejectDefFast(new TypeError('Failed to fetch'));
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        const cached = viewDeferred.queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD));
+        expect(cached?.reasoning_effort).toBe('low');
+        expect(cached?.fast_mode).toBe(false);
+      });
+
+      // Preserved!
+      expect(viewDeferred.result.current.tuning).toEqual({ reasoningEffort: 'high', fastMode: true });
+
+      // 3) Once a subsequent save succeeds on the server, held clears so future Tab B updates take effect.
+      mocks.updateThread.mockClear();
+      const confirmedHighRow = row({ reasoning_effort: 'high', fast_mode: false });
+      mocks.getThread.mockResolvedValue(confirmedHighRow);
+      let resolveSave!: (t: Thread) => void;
+      mocks.updateThread.mockReturnValueOnce(new Promise<Thread>((res) => { resolveSave = res; }));
+      let saveP!: Promise<boolean>;
+      act(() => {
+        saveP = viewDeferred.result.current.setReasoningEffort('high');
+      });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        resolveSave(confirmedHighRow);
+        expect(await saveP).toBe(true);
+      });
+      act(() => {
+        viewDeferred.queryClient.setQueryData(
+          queryKeys.threads.detail(THREAD),
+          row({ reasoning_effort: 'medium', fast_mode: false }),
+        );
+      });
+      await waitFor(() => expect(viewDeferred.result.current.tuning.reasoningEffort).toBe('medium'));
+      viewDeferred.unmount();
+    });
   });
 });

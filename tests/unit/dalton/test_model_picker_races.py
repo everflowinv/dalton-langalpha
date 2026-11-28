@@ -655,12 +655,13 @@ async def test_thread_resolver_and_resolve_llm_config_preserve_explicit_variant_
     identity = TurnIdentity(sender=USER_ID, owner=USER_ID, recorded_as=USER_ID)
     thread_row = {"llm_model": "gpt-6.2-sol", "reasoning_effort": "high", "fast_mode": False}
 
+    get_pref_mock = create_autospec(user_models.get_model_preference, return_value={})
     with (
         patch.object(setup_mod, "agent_config", _BaseCfg()),
         patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
         patch.object(llm_cfg, "require_policy", new=create_autospec(llm_cfg.require_policy, return_value=_fake_policy())),
         patch.object(llm_cfg, "policy_refuses", new=create_autospec(llm_cfg.policy_refuses, return_value=None)),
-        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value={})),
+        patch.object(user_models, "get_model_preference", new=get_pref_mock),
         patch.object(llm_cfg, "gate_models_by_policy", new=create_autospec(llm_cfg.gate_models_by_policy, side_effect=lambda _u, pref, _rm, **_kw: pref)),
         patch.object(llm_cfg, "gate_models_by_plan", new=create_autospec(llm_cfg.gate_models_by_plan, side_effect=lambda _b, _u, pref, _rm, **_kw: pref)),
         patch.object(llm_cfg, "plan_covers", new=create_autospec(llm_cfg.plan_covers, return_value=True)),
@@ -733,3 +734,110 @@ async def test_thread_resolver_and_resolve_llm_config_preserve_explicit_variant_
         cfg_std_same = await resolver_std_other("gpt-6.2-sol")
         assert cfg_std_same.llm.name == "gpt-6.2-sol"
         assert resolved_clients_calls[-1] == ("gpt-6.2-sol", "high")
+
+        # 6) R4 Codex #1: Thread-following web request (preserve_antigravity_variant=True,
+        #    request omitted llm_model -> resolved from thread row or default to Neon Low)
+        #    with stale reasoning_effort='high' MUST preserve Neon Low instead of remapping to Neon High.
+        ag_thread_row = {
+            "llm_model": "gemini-4-neon-low-oauth",
+            "reasoning_effort": None,
+            "fast_mode": False,
+        }
+        resolver_web_follow_ag = thread_agent.thread_resolver(
+            USER_ID,
+            THREAD_ID,
+            route,
+            identity=identity,
+            thread=ag_thread_row,
+            is_byok=False,
+            reasoning_effort="high",
+            preserve_antigravity_variant=True,
+        )
+        cfg_web_follow_ag = await resolver_web_follow_ag("gemini-4-neon-low-oauth")
+        assert cfg_web_follow_ag.llm.name == "gemini-4-neon-low-oauth"
+        assert resolved_clients_calls[-1] == ("gemini-4-neon-low-oauth", None)
+
+        # Also when request_model is None (account default is Neon Low) with preserve_antigravity_variant=True.
+        get_pref_mock.return_value = {"preferred_model": "gemini-4-neon-low-oauth"}
+        cfg_web_default_ag = await resolver_web_follow_ag(None)
+        assert cfg_web_default_ag.llm.name == "gemini-4-neon-low-oauth"
+        assert resolved_clients_calls[-1] == ("gemini-4-neon-low-oauth", None)
+
+
+# ---------------------------------------------------------------------------
+# R4 Codex #5: keep_named_model publishes thread_model when admitted turn updates llm_model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_keep_named_model_publishes_thread_model_only_when_conditional_write_changes_row():
+    """R4 Codex #5: after an admitted turn persists a named model onto
+    conversation_threads.llm_model, broadcast thread_model so other tabs that
+    opened the thread before admission refresh their cached detail."""
+    from src.server.handlers.chat import request_prep
+    from src.server.services.llm.thread_model import NamedModel
+
+    pub_model = create_autospec(thread_lifecycle_feed.publish_thread_model)
+    meta_mock = create_autospec(
+        threads_read.get_thread_auth_meta,
+        return_value={
+            "user_id": USER_ID,
+            "workspace_id": WS_ID,
+            "workspace_owner_id": USER_ID,
+        },
+    )
+
+    # 1) Conditional write changed llm_model (True) -> publishes thread_model.
+    remember_changed = AsyncMock(return_value=True)
+    with (
+        patch.object(request_prep, "remember_thread_llm_model", new=remember_changed),
+        patch.object(threads_read, "get_thread_auth_meta", new=meta_mock),
+        patch.object(thread_lifecycle_feed, "publish_thread_model", new=pub_model),
+    ):
+        await request_prep.keep_named_model(
+            THREAD_ID, NamedModel("gemini-4-neon-low-oauth", seen=None)
+        )
+
+    remember_changed.assert_awaited_once_with(
+        THREAD_ID, "gemini-4-neon-low-oauth", seen=None
+    )
+    pub_model.assert_awaited_once_with(
+        user_id=USER_ID,
+        thread_id=THREAD_ID,
+        workspace_id=WS_ID,
+        llm_model="gemini-4-neon-low-oauth",
+    )
+
+    # 2) Conditional write made no change (False: already same or another tab moved it) -> no broadcast.
+    pub_model.reset_mock()
+    remember_noop = AsyncMock(return_value=False)
+    with (
+        patch.object(request_prep, "remember_thread_llm_model", new=remember_noop),
+        patch.object(threads_read, "get_thread_auth_meta", new=meta_mock),
+        patch.object(thread_lifecycle_feed, "publish_thread_model", new=pub_model),
+    ):
+        await request_prep.keep_named_model(
+            THREAD_ID, NamedModel("gemini-4-neon-low-oauth", seen=None)
+        )
+    pub_model.assert_not_awaited()
+
+    # 3) Shared-workspace holder row -> no user-scoped thread_model broadcast.
+    pub_model.reset_mock()
+    holder_meta = create_autospec(
+        threads_read.get_thread_auth_meta,
+        return_value={
+            "user_id": "shared_ws:org-1:ws-1",
+            "workspace_id": WS_ID,
+            "workspace_owner_id": "shared_ws:org-1:ws-1",
+        },
+    )
+    with (
+        patch.object(request_prep, "remember_thread_llm_model", new=AsyncMock(return_value=True)),
+        patch.object(threads_read, "get_thread_auth_meta", new=holder_meta),
+        patch.object(thread_lifecycle_feed, "publish_thread_model", new=pub_model),
+        patch("src.server.database.shared_workspaces.is_holder", side_effect=lambda v: isinstance(v, str) and v.startswith("shared_ws:")),
+    ):
+        await request_prep.keep_named_model(
+            THREAD_ID, NamedModel("gemini-4-neon-low-oauth", seen=None)
+        )
+    pub_model.assert_not_awaited()

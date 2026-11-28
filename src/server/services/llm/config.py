@@ -811,14 +811,10 @@ async def resolve_llm_config(
                 else None
             )
             if isinstance(_ag_entry, dict) and _ag_entry.get("provider") == ANTIGRAVITY_PROVIDER:
-                # DALTON-HOOK(model-picker-races): when the caller explicitly selected a built-in Antigravity variant (web picker / queued send), preserve that variant's tier instead of remapping it with raw reasoning_effort
+                # DALTON-HOOK(model-picker-races): when a user/web request resolves to a built-in Antigravity variant (explicitly selected or inherited from the thread/default), preserve that variant's tier instead of remapping it with raw reasoning_effort
                 _ag_mapped = (
                     None
-                    if (
-                        preserve_antigravity_variant
-                        and request_model is not None
-                        and selection.effective_model == request_model
-                    )
+                    if preserve_antigravity_variant
                     else resolve_antigravity_effort_model(
                         selection.effective_model,
                         reasoning_effort,

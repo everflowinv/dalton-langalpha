@@ -482,7 +482,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const activeThreadId =
     currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
   // DALTON-HOOK(antigravity-series): pass workspaceId, activeTurnModel, and createdThreadId for shared guard, queued-send safety, and creation binding
-  // DALTON-HOOK(model-picker-races): always forward activeTurnModel so first-turn pre-admission failures preserve picks in Core builds too
+  // DALTON-HOOK(model-picker-races): always forward activeTurnModel & createdTuning so first-turn repatch guards model/effort in both Dalton and Core builds
   const threadModel = useThreadModel({
     threadId: activeThreadId,
     isLoading,
@@ -490,6 +490,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     chiefOfStaff: isHome,
     workspaceId,
     activeTurnModel: chat.activeTurnModel,
+    createdTuning: chat.createdThreadTuning,
     ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   threadModelSeqRef.current = threadModel;

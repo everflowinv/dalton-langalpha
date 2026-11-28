@@ -669,9 +669,19 @@ async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> No
     named (``wait_or_steer``'s ``on_model``).
     """
     if named_model:
-        await remember_thread_llm_model(
+        changed = await remember_thread_llm_model(
             thread_id, named_model.name, seen=named_model.seen
         )
+        # DALTON-HOOK(model-picker-races): publish thread_model when admitted-turn persistence changes llm_model so other open tabs refresh thread detail
+        if changed:
+            from src.dalton.llm.thread_model_dalton import (
+                publish_remembered_thread_model,
+            )
+
+            await publish_remembered_thread_model(
+                thread_id=thread_id,
+                llm_model=named_model.name,
+            )
 
 
 def build_turn_context(

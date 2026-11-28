@@ -10,6 +10,8 @@ import type { Thread } from '@/types/api';
 export interface ManualModelPick {
   model: string;
   seq: number;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
 }
 
 export interface DeferredSharedPick {
@@ -27,6 +29,8 @@ export interface DeferredSharedPick {
 export interface RepatchExpectedModel {
   known: boolean;
   model: string | null;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
 }
 
 export interface TrackedTurnPick {
@@ -216,11 +220,47 @@ export interface TurnPickRecordingRefs {
  */
 export function resolveRepatchExpectedModel(
   turnModel: ActiveTurnModelInfo | null,
+  effortBaseline?: { hasExpectedEffort: boolean; expectedEffort: string | null },
 ): RepatchExpectedModel {
   if (!turnModel || turnModel.modelUnknown || turnModel.model === null) {
     return { known: false, model: null };
   }
-  return { known: true, model: turnModel.model };
+  return {
+    known: true,
+    model: turnModel.model,
+    ...(effortBaseline?.hasExpectedEffort
+      ? { hasExpectedEffort: true, expectedEffort: effortBaseline.expectedEffort }
+      : {}),
+  };
+}
+
+/**
+ * Resolves the server `reasoning_effort` baseline last confirmed on this page
+ * before a turn-end reread, so an Antigravity background repatch (which clears
+ * `reasoning_effort` to `null`) never echoes a concurrent writer's newly reread
+ * effort as `expected_reasoning_effort`.
+ */
+export function resolveRepatchExpectedEffort(params: {
+  threadId: string;
+  createdTuning?: { threadId: string; reasoningEffort: string | null } | null;
+  pick?: ManualModelPick | null;
+  repatchExpected?: RepatchExpectedModel | null;
+  preRereadThread?: Thread | undefined;
+}): string | null {
+  const { threadId, createdTuning, pick, repatchExpected, preRereadThread } = params;
+  if (createdTuning && createdTuning.threadId === threadId) {
+    return createdTuning.reasoningEffort ?? null;
+  }
+  if (pick?.hasExpectedEffort) {
+    return pick.expectedEffort ?? null;
+  }
+  if (repatchExpected?.hasExpectedEffort) {
+    return repatchExpected.expectedEffort ?? null;
+  }
+  if (preRereadThread !== undefined) {
+    return preRereadThread.reasoning_effort ?? null;
+  }
+  return null;
 }
 
 /**
@@ -246,7 +286,13 @@ export function recordDaltonTurnPick(
   if (preserveUnsentSeq !== null) {
     refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
     if (refs.repatchExpectedRef) {
-      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(turnModel);
+      const currentPick = refs.manualPickRef.current;
+      const effortBaseline = currentPick?.hasExpectedEffort
+        ? { hasExpectedEffort: true, expectedEffort: currentPick.expectedEffort ?? null }
+        : snapshot.thread !== undefined
+          ? { hasExpectedEffort: true, expectedEffort: snapshot.thread.reasoning_effort ?? null }
+          : undefined;
+      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(turnModel, effortBaseline);
     }
   }
   return consumedPick;
@@ -444,9 +490,10 @@ export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
     const latest = resolveQueuedModelAndSeries(latestComposerOptions, antigravityEnabled);
 
     // 1) Queued message follows the thread's model (`model` is null/omitted):
-    //    its final target model is whatever the thread/composer now holds, so
-    //    adopt the live target model's tuning and NEVER carry an old model's
-    //    `reasoningEffort` onto a new model (especially an Antigravity variant).
+    //    when the flushed request omits `llm_model`, also omit `reasoningEffort`
+    //    so the server resolves the thread row's current model and effort
+    //    together and a stale tab never sends an old model's effort onto a
+    //    newly switched model (such as Antigravity Neon Low).
     if (!hasExplicitModel) {
       if (queued.seriesId !== null && latest.seriesId !== null && latest.seriesId === queued.seriesId) {
         const nextModel = latestComposerOptions.model !== undefined
@@ -479,7 +526,7 @@ export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
         ...(latestComposerOptions.antigravitySeriesId !== undefined
           ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
           : {}),
-        reasoningEffort: latest.seriesId !== null ? null : (latestComposerOptions.reasoningEffort ?? null),
+        reasoningEffort: null,
         ...(latestComposerOptions.fastMode !== undefined
           ? { fastMode: latestComposerOptions.fastMode }
           : {}),

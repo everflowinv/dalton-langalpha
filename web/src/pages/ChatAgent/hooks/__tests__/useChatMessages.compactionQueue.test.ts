@@ -683,15 +683,15 @@ describe('useChatMessages – queued send during compaction', () => {
     expect(result.current.activeTurnModel).toBeNull();
   });
 
-  // DALTON-HOOK(model-picker-races): Report Medium #5 — compaction-queued message reads live composer reasoningEffort/fastMode on flush in Dalton builds
-  it('reads latest composer reasoningEffort when flushing a compaction-queued message', async () => {
+  // DALTON-HOOK(model-picker-races): Report Medium #5 + R4 Codex #1 — compaction-queued message with explicit model reads live composer reasoningEffort/fastMode on flush in Dalton builds
+  it('reads latest composer reasoningEffort when flushing a compaction-queued message with explicit model', async () => {
     brandMock.isDaltonBuild = true;
     let liveEffort: string | null = 'high';
     let liveFast: boolean | null = true;
     const { result } = renderHookWithProviders(() =>
       useChatMessages('ws-test', 'thread-q-effort', {
         readComposerOptions: () => ({
-          model: null,
+          model: 'gpt-6.2-sol',
           displayModel: 'gpt-6.2-sol',
           antigravitySeriesId: null,
           reasoningEffort: liveEffort,
@@ -704,10 +704,10 @@ describe('useChatMessages – queued send during compaction', () => {
       result.current.setIsCompacting('summarize');
     });
 
-    // User queues message while composer is on High + fastMode: true.
+    // User queues message while composer is on gpt-6.2-sol + High + fastMode: true.
     await act(async () => {
       void result.current.handleSendMessage('queued during compact', null, null, {
-        model: null,
+        model: 'gpt-6.2-sol',
         displayModel: 'gpt-6.2-sol',
         antigravitySeriesId: null,
         reasoningEffort: 'high',
@@ -727,6 +727,7 @@ describe('useChatMessages – queued send during compaction', () => {
     await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
     expect(mockSendStream.mock.calls[0][0]).toBe('queued during compact');
     expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      llmModel: 'gpt-6.2-sol',
       reasoningEffort: 'low',
       fastMode: false,
     });
@@ -943,8 +944,8 @@ describe('useChatMessages – queued send during compaction', () => {
     });
   });
 
-  // DALTON-HOOK(model-picker-races): R3 Codex #2 — a thread-following compaction-queued message (model: null, standard high) must NOT carry old 'high' onto a new thread model (Antigravity Neon Low or another standard model)
-  it('R3 Codex #2: drops stale standard high effort when a thread-following compaction-queued message flushes after thread switches to Antigravity Neon Low or another standard model', async () => {
+  // DALTON-HOOK(model-picker-races): R3 Codex #2 + R4 Codex #1 — a thread-following compaction-queued message (model: null) ALWAYS omits reasoningEffort so even before Tab A's detail refreshes (after Tab B switched to Neon Low), old 'high' is never sent without a matching model
+  it('R4 Codex #1: omits reasoningEffort when flushing a thread-following compaction-queued message even before composer detail refreshes', async () => {
     brandMock.isDaltonBuild = true;
     let liveOptions = {
       model: null as string | null,
@@ -959,20 +960,14 @@ describe('useChatMessages – queued send during compaction', () => {
       }),
     );
 
-    // 1) Standard (model: null, high) -> thread switches to Antigravity Neon Low.
+    // 1) Tab A queues standard high (model: null). Tab B switches thread to Neon Low,
+    //    but Tab A flushes BEFORE its thread detail refreshes (liveOptions still shows gpt-6.2-sol + high).
     act(() => {
       result.current.setIsCompacting('summarize');
     });
     await act(async () => {
-      void result.current.handleSendMessage('queued follows thread -> ag', null, null, { ...liveOptions });
+      void result.current.handleSendMessage('queued stale detail -> ag', null, null, { ...liveOptions });
     });
-    liveOptions = {
-      model: null,
-      displayModel: 'gemini-4-neon-low-oauth',
-      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
-      reasoningEffort: null,
-      fastMode: false,
-    };
     await act(async () => {
       result.current.setIsCompacting(false);
     });
@@ -982,7 +977,30 @@ describe('useChatMessages – queued send during compaction', () => {
       reasoningEffort: null,
     });
 
-    // 2) Standard gpt-6.2-sol (model: null, high) -> thread switches to claude-opus-4-6 (low).
+    // 2) After detail refreshes to Antigravity Neon Low -> still omits llmModel & reasoningEffort.
+    liveOptions = {
+      model: null,
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+      fastMode: false,
+    };
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued follows thread -> ag', null, null, { ...liveOptions });
+    });
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2));
+    expect(mockSendStream.mock.calls[1][3]).toMatchObject({
+      llmModel: null,
+      reasoningEffort: null,
+    });
+
+    // 3) Thread-following (model: null) after detail refreshes to claude-opus-4-6 (low) -> also omits reasoningEffort so server resolves thread's current model + effort together.
     liveOptions = {
       model: null,
       displayModel: 'gpt-6.2-sol',
@@ -1006,10 +1024,10 @@ describe('useChatMessages – queued send during compaction', () => {
     await act(async () => {
       result.current.setIsCompacting(false);
     });
-    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2));
-    expect(mockSendStream.mock.calls[1][3]).toMatchObject({
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
       llmModel: null,
-      reasoningEffort: 'low',
+      reasoningEffort: null,
       fastMode: true,
     });
   });

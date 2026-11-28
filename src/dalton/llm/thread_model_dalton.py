@@ -139,3 +139,37 @@ async def publish_thread_model_switch_events(
             reasoning_effort=updated_thread.get("reasoning_effort"),
             fast_mode=updated_thread.get("fast_mode"),
         )
+
+
+async def publish_remembered_thread_model(
+    *,
+    thread_id: str,
+    llm_model: str,
+) -> None:
+    """Publish ``thread_model`` after ``remember_thread_llm_model`` commits a change.
+
+    Reads the thread's owner and workspace metadata (skipping shared-workspace
+    holder threads and gracefully no-oping when no DB pool is initialized in
+    isolated unit tests) so other open tabs refresh their cached thread detail.
+    """
+    from src.server.database.conversation import threads_read
+    from src.server.database.shared_workspaces import is_holder
+    from src.server.services.thread_lifecycle_feed import publish_thread_model
+
+    try:
+        meta = await threads_read.get_thread_auth_meta(thread_id)
+    except Exception:
+        return
+    if not isinstance(meta, Mapping):
+        return
+    user_id = meta.get("user_id")
+    workspace_owner_id = meta.get("workspace_owner_id")
+    if not user_id or is_holder(user_id) or is_holder(workspace_owner_id):
+        return
+    workspace_id = str(meta["workspace_id"]) if meta.get("workspace_id") else None
+    await publish_thread_model(
+        user_id=str(user_id),
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        llm_model=llm_model,
+    )

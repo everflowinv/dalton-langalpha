@@ -820,8 +820,8 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     expect(mockSendStream.mock.lastCall?.[3]).toMatchObject({ additionalContext: FILES });
   });
 
-  // DALTON-HOOK(model-picker-races): Report Medium #5 — a not_running-queued follow-up reads live composer reasoningEffort at flush time in Dalton builds
-  it('reads latest composer reasoningEffort when flushing a not_running queued message', async () => {
+  // DALTON-HOOK(model-picker-races): Report Medium #5 + R4 Codex #1 — a not_running-queued follow-up with explicit model reads live composer reasoningEffort at flush time in Dalton builds
+  it('reads latest composer reasoningEffort when flushing a not_running queued message with explicit model', async () => {
     brandMock.isDaltonBuild = true;
     const firstHang = deferred<{ disconnected: boolean }>();
     mockSendStream.mockImplementation(
@@ -840,7 +840,7 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     const { result } = renderHookWithProviders(() =>
       useChatMessages('ws-nr', null, {
         readComposerOptions: () => ({
-          model: null,
+          model: 'gpt-6.2-sol',
           displayModel: 'gpt-6.2-sol',
           antigravitySeriesId: null,
           reasoningEffort: liveEffort,
@@ -856,10 +856,10 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     });
     await waitFor(() => expect(result.current.isLoading).toBe(true));
 
-    // Follow-up steer sent with reasoningEffort: 'high' gets refused as not_running and queued.
+    // Follow-up steer sent with explicit gpt-6.2-sol + reasoningEffort: 'high' gets refused as not_running and queued.
     await act(async () => {
       await result.current.handleSendMessage('follow-up effort', null, null, {
-        model: null,
+        model: 'gpt-6.2-sol',
         displayModel: 'gpt-6.2-sol',
         antigravitySeriesId: null,
         reasoningEffort: 'high',
@@ -878,6 +878,7 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
     expect(mockSendStream.mock.calls[2][0]).toBe('follow-up effort');
     expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      llmModel: 'gpt-6.2-sol',
       reasoningEffort: 'low',
     });
   });
@@ -1063,8 +1064,8 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     });
   });
 
-  // DALTON-HOOK(model-picker-races): R3 Codex #2 — a thread-following queued steer (model: null, standard high) must NOT carry stale 'high' onto a thread that switched to Antigravity Neon Low or another standard model
-  it('R3 Codex #2: drops stale standard high effort when a thread-following not_running steer flushes after thread switched to Antigravity Neon Low', async () => {
+  // DALTON-HOOK(model-picker-races): R3 Codex #2 + R4 Codex #1 — a thread-following queued steer (model: null, standard high) omits reasoningEffort on flush even BEFORE Tab A's composer detail refreshes after Tab B switched to Antigravity Neon Low
+  it('R4 Codex #1: omits stale standard high effort when a thread-following not_running steer flushes before composer detail refreshes', async () => {
     brandMock.isDaltonBuild = true;
     const firstHang = deferred<{ disconnected: boolean }>();
     mockSendStream.mockImplementation(
@@ -1079,7 +1080,7 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
       },
     );
 
-    let liveOptions = {
+    const staleLiveOptions = {
       model: null as string | null,
       displayModel: 'gpt-6.2-sol' as string | null,
       antigravitySeriesId: null as string | null,
@@ -1088,7 +1089,7 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     };
     const { result } = renderHookWithProviders(() =>
       useChatMessages('ws-nr', null, {
-        readComposerOptions: () => liveOptions,
+        readComposerOptions: () => staleLiveOptions,
       }),
     );
 
@@ -1101,18 +1102,11 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
 
     // Queued while following thread's standard model (model: null) with high effort.
     await act(async () => {
-      await result.current.handleSendMessage('follow-up follows thread', null, null, { ...liveOptions });
+      await result.current.handleSendMessage('follow-up follows thread', null, null, { ...staleLiveOptions });
     });
 
-    // Thread switches to Antigravity Neon Low before turn ends.
-    liveOptions = {
-      model: null,
-      displayModel: 'gemini-4-neon-low-oauth',
-      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
-      reasoningEffort: null,
-      fastMode: false,
-    };
-
+    // Tab B switched thread to Neon Low, but Tab A's detail has NOT refreshed yet
+    // when the turn ends and the queued message flushes.
     firstHang.resolve({ disconnected: false });
     await act(async () => {
       await firstSend.catch(() => undefined);
