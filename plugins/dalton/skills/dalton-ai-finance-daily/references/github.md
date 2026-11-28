@@ -54,7 +54,7 @@ GitHub 材料是 `ai_finance_read` 的 `github` 资源。`version` 必须是 3�
 
 `upstream_clusters` 是过去 48 小时内、至少两个不同 owner 的 trending repo 共用同一个非通用 token 的线索。token 本身不直接写进日报。用 README 或上游官方页面核实后，才放进 `#### 跨日共性与新趋势`。48 小时内至少两个不同 owner 的 trending repo 共用一个此前没有独立播报过的上游，且 README 或上游官方页面已经独立确认时，在对应 signal 的 `signal_types` 加上 `upstream_primitive_adoption`。趋势小节的写法见 `signals.md`。这只增加趋势分析，不增加热点展示名额，也不把名额外仓库另列成清单。
 
-未能确认的聚类只计入「GitHub 状态」里未能确认的组数，不写入趋势。
+未确认的聚类只计入「GitHub 状态」中的未确认组数，趋势小节只收录已确认的聚类。
 
 ## 5. 栏目里的每一条
 

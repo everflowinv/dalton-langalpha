@@ -44,9 +44,9 @@ X 是 `news.md` 的成功条数。十四条全部失败时，同一节写“搜�
 
 H 是 `coverage.history_verified`，N 是 `coverage.checked_repositories`，T 是正文编号项目数，F 是其中首次入榜，C 是其中持续热点。同一节写明失败来源、`data_gaps`、待核验或待复核的数量，以及名额外观察数量。不列候补项目名称。没有缺口时写“无”。第三方榜单增量不作为正文数字。
 
-`GitHub 状态：本轮确认降温的已报项目逐个列名；没有则写无。48 小时上游聚类检出 K 组，确认 M 组、未能确认 K-M 组。`
+`GitHub 状态：本轮确认降温的已报项目逐个列名；没有则写无。48 小时上游聚类检出 K 组，已确认 M 组，未确认 K-M 组。`
 
-降温名单只来自 `cooled` 里已经报过的仓库。核验失败的仓库留在缺口，不写入这句的降温名单。K 是 `upstream_clusters` 的组数，M 是 README 或官方页面已经核实的组数。上游聚类只报告检出、确认、未能确认三个组数；确认降温的已报项目仍逐个列名。
+降温名单只收录 `cooled` 中已报过的仓库，核验失败的仓库计入缺口。K 是 `upstream_clusters` 的组数，M 是经 README 或上游官方页面确认的组数。上游聚类只报告检出、已确认、未确认三个组数。
 
 `业绩会：AlphaEngine Earnings Calls（type_id: IND_SECOND_5FA442AE），过去 24 小时无市场/行业/市值限制的 AI 关键词检索；命中 N 篇，按相关性排序后全文扫描 X 篇，80篇预算跳过 B 篇，失败 Z 篇；AI candidates C 篇中 signal S / watchlist W / reject R。`
 
