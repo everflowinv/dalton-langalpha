@@ -880,7 +880,7 @@ describe('AutomationNotifyTargets', () => {
       dalton_notify_routes: {
         'dalton-googl-earn-2026q1-t0': [
           'feishu:chat:oc_research_group',
-          'discord:channel:123456789012345678',
+          'discord:channel:test-channel-001',
         ],
       },
     });
@@ -923,7 +923,7 @@ describe('AutomationNotifyTargets', () => {
             'dalton-googl-earn-2026q1-t0': [
               'weixin:user:wx_user_01',
               'feishu:chat:oc_research_group',
-              'discord:channel:123456789012345678',
+              'discord:channel:test-channel-001',
             ],
           },
         },
@@ -942,7 +942,7 @@ describe('AutomationNotifyTargets', () => {
           dalton_notify_routes: {
             'dalton-googl-earn-2026q1-t0': [
               'feishu:chat:oc_research_group',
-              'discord:channel:123456789012345678',
+              'discord:channel:test-channel-001',
             ],
           },
         },
@@ -1040,24 +1040,24 @@ describe('AutomationNotifyTargets', () => {
       automation_id: 'auto-discord-only',
       name: 'Discord Report',
       dalton_notify_category: 'custom',
-      dalton_notify_route_targets: ['discord:channel:123456789012345678'],
+      dalton_notify_route_targets: ['discord:channel:test-channel-001'],
     };
 
     renderWithProviders(<AutomationNotifyTargets automation={customDiscordOnly} />);
     const btn = screen.getByRole('button', { name: '推送目标 Discord Report' });
     // Collapsed label counts discord:channel: as selected (NOT "Not pushed")
     expect(btn).not.toHaveTextContent('Not pushed');
-    expect(btn).toHaveTextContent('discord:channel:123456789012345678');
+    expect(btn).toHaveTextContent('discord:channel:test-channel-001');
 
     await act(async () => {
       fireEvent.click(btn);
     });
     // Must NOT appear under personal options; appears checked under Discord channels
     expect(
-      screen.queryByRole('checkbox', { name: '个人目标 discord:channel:123456789012345678' }),
+      screen.queryByRole('checkbox', { name: '个人目标 discord:channel:test-channel-001' }),
     ).not.toBeInTheDocument();
     const dcCheckbox = screen.getByRole('checkbox', {
-      name: 'Discord 频道 123456789012345678',
+      name: 'Discord 频道 test-channel-001',
     });
     expect(dcCheckbox).toHaveAttribute('aria-checked', 'true');
 
@@ -1074,7 +1074,7 @@ describe('AutomationNotifyTargets', () => {
           dalton_notify_routes: {
             'automation:auto-discord-only': [
               'weixin:user:wx_user_01',
-              'discord:channel:123456789012345678',
+              'discord:channel:test-channel-001',
             ],
           },
         },

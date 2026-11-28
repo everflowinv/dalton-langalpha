@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 from unittest.mock import create_autospec, patch
 
@@ -267,6 +269,7 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/dalton/docker_entrypoint_dalton.sh",
         "scripts/dalton/configure_minio.sh",
         "scripts/dalton/log_redaction.py",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
         "scripts/standalone/init.sh",
         "web/package.json",
         "docs-site/package.json",
@@ -349,6 +352,7 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/standalone/init.sh",
         "scripts/dalton/Dockerfile.dalton",
         "scripts/dalton/Dockerfile.postgres",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
         "docs-site/package.json",
         "docs-site/src/content/docs/getting-started.md",
         ".release_git_sha",
@@ -409,6 +413,259 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
     ):
         assert (ci_out / expected_ci).exists(), f"Missing CI export file: {expected_ci}"
     assert not (ci_out / "plugins/dalton_data").exists()
+
+
+def _seed_minimal_core_repo(repo: Path) -> None:
+    """Create a minimal git repo satisfying package_release.sh ALLOWLIST_REQUIRED + ALLOWLIST_CI."""
+    repo.mkdir(parents=True, exist_ok=True)
+    for rel in (
+        "LICENSE",
+        "README.md",
+        "Makefile",
+        "pyproject.toml",
+        "uv.lock",
+        "server.py",
+        "alembic.ini",
+        "config.yaml",
+        "config.core.yaml",
+        "agent_config.yaml",
+        "agent_config.core.yaml",
+        "docker-compose.yml",
+        "docker-compose.core.yml",
+        "docker-compose.ci.yml",
+        ".env.example",
+        ".env.core.example",
+        ".dockerignore",
+        "Dockerfile.sandbox",
+        "src/dalton/dalton.core.yaml",
+        "src/dalton/settings.py",
+        "libs/market-protocol/pyproject.toml",
+        "libs/chartkit/pyproject.toml",
+        "libs/edgar-engine/pyproject.toml",
+        "migrations/env.py",
+        "mcp_servers/_bootstrap.py",
+        "plugins/README.md",
+        "plugins/alternative_data/plugin.json",
+        "plugins/dalton/plugin.json",
+        "plugins/firecrawl/plugin.json",
+        "plugins/langalpha_deliverables/plugin.json",
+        "plugins/langalpha_market_data/plugin.json",
+        "plugins/langalpha_research/plugin.json",
+        "plugins/langalpha_service/plugin.json",
+        "plugins/yfinance/plugin.json",
+        "workflows/sample.md",
+        "config/dalton/.gitkeep",
+        "config/dalton/README.md",
+        "deploy/Dockerfile.backend",
+        "deploy/Dockerfile.dev",
+        "deploy/Dockerfile.web",
+        "deploy/standalone/Caddyfile",
+        "scripts/configure.sh",
+        "scripts/docker_entrypoint.sh",
+        "scripts/_errors.py",
+        "scripts/dalton/Dockerfile.dalton",
+        "scripts/dalton/Dockerfile.postgres",
+        "scripts/dalton/docker_entrypoint_dalton.sh",
+        "scripts/dalton/configure_minio.sh",
+        "scripts/dalton/log_redaction.py",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
+        "scripts/standalone/init.sh",
+        "web/package.json",
+        "docs-site/package.json",
+        "tests/fakes/fake_openai_server.py",
+        "tests/standalone/run_checks.sh",
+    ):
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("ok\n", encoding="utf-8")
+
+
+def _git_commit_all(repo: Path, msg: str = "seed") -> None:
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "ci@example.com"], cwd=str(repo), check=True
+        )
+        subprocess.run(["git", "config", "user.name", "CI"], cwd=str(repo), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=str(repo), check=True)
+
+
+def test_leak_scan_exempts_ci_test_paths_only_under_include_ci(tmp_path: Path) -> None:
+    """CI test-path exemptions apply only with include_ci=True; customer & prod paths never relax."""
+    checker_path = REPO_ROOT / "scripts" / "dalton" / "ops" / "check_core_release_package.py"
+    if not checker_path.is_file():
+        pytest.skip("Out-of-package checker is absent in exported Standalone Core trees")
+
+    spec = importlib.util.spec_from_file_location("check_core_release_package_under_test", checker_path)
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = checker
+    spec.loader.exec_module(checker)
+
+    export_dir = tmp_path / "export"
+    test_only_fixtures = {
+        "tests/standalone/checks/b3_skills_prompts_ui.py": 'PATTERN = r"everflowinv\\.com"\n',
+        "web/e2e/mobile-p1-layout.spec.js": "const id = 'oc_1234567890abcdef123456';\n",
+        "web/src/pages/Settings/__tests__/Notify.test.tsx": "const ch = 'discord:channel:123456789012345678';\n",
+        "web/src/utils/helper.test.ts": "const host = 'clapi.guidepoint.io';\n",
+        "web/src/utils/helper.test.tsx": "const domain = 'everflowinv.com';\n",
+        "web/src/utils/layout.spec.js": "const uid = 'ou_1234567890abcdef123456';\n",
+    }
+    for rel, content in test_only_fixtures.items():
+        fp = export_dir / rel
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+
+    # 1. CI test package (`include_ci=True`): hits strictly inside test-only paths pass
+    ci_report = checker.check_core_release_package(export_dir=export_dir, include_ci=True)
+    assert ci_report.ok is True, f"Expected CI test-only hits to be exempted: {ci_report.to_dict()}"
+    assert ci_report.whole_export_forbidden_regex_hits == []
+    assert ci_report.whole_export_commercial_hits == []
+
+    # 2. Customer package (`include_ci=False`, default): identical content STILL fails
+    customer_report = checker.check_core_release_package(export_dir=export_dir, include_ci=False)
+    assert customer_report.ok is False
+    customer_hit_paths = {
+        h["path"]
+        for h in (
+            customer_report.whole_export_forbidden_regex_hits
+            + customer_report.whole_export_commercial_hits
+        )
+    }
+    assert set(test_only_fixtures.keys()).issubset(customer_hit_paths)
+
+    # 3. Production & lookalike paths STILL fail even when `include_ci=True`
+    prod_leaks = {
+        "src/dalton/settings.py": 'INTERNAL = "everflowinv.com"\n',
+        "web/src/pages/Settings/Notify.tsx": "const ch = 'discord:channel:123456789012345678';\n",
+        "src/tests/standalone/not_root.py": 'INTERNAL = "everflowinv.com"\n',
+        "web/src/utils/helper.test.ts.bak": "const host = 'clapi.guidepoint.io';\n",
+        "web/src/__tests__": 'INTERNAL = "everflowinv.com"\n',
+    }
+    for rel, content in prod_leaks.items():
+        fp = export_dir / rel
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+
+    ci_prod_report = checker.check_core_release_package(export_dir=export_dir, include_ci=True)
+    assert ci_prod_report.ok is False
+    ci_prod_hit_paths = {
+        h["path"]
+        for h in (
+            ci_prod_report.whole_export_forbidden_regex_hits
+            + ci_prod_report.whole_export_commercial_hits
+        )
+    }
+    assert set(prod_leaks.keys()) == ci_prod_hit_paths
+
+
+def test_package_release_include_ci_vs_customer_and_prod_leak_gates(tmp_path: Path) -> None:
+    """End-to-end package_release.sh: --include-ci exempts test paths only; customer & prod fail."""
+    checker_path = REPO_ROOT / "scripts" / "dalton" / "ops" / "check_core_release_package.py"
+    if not checker_path.is_file():
+        pytest.skip("Out-of-package checker is absent in exported Standalone Core trees")
+
+    repo = tmp_path / "repo"
+    _seed_minimal_core_repo(repo)
+    (repo / "tests" / "standalone" / "checks").mkdir(parents=True, exist_ok=True)
+    (repo / "tests" / "standalone" / "checks" / "self_scan.py").write_text(
+        'DOMAIN = "everflowinv.com"\n', encoding="utf-8"
+    )
+    (repo / "web" / "src").mkdir(parents=True, exist_ok=True)
+    (repo / "web" / "src" / "sample.test.tsx").write_text(
+        "const d = 'everflowinv.com';\n", encoding="utf-8"
+    )
+    _git_commit_all(repo, "add test-only hits")
+
+    # 1. CI test package (`--include-ci`) passes when hits are confined to test-only paths
+    #    (covers both check_core_release_package.py and verify_release_tarball.py via --tar)
+    ci_tar = tmp_path / "ci-ok.tar.gz"
+    ci_ok = subprocess.run(
+        [
+            "bash",
+            str(PACKAGE_SCRIPT),
+            "--repo",
+            str(repo),
+            "--ref",
+            "HEAD",
+            "--include-ci",
+            "--output",
+            str(tmp_path / "ci-ok"),
+            "--tar",
+            str(ci_tar),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ci_ok.returncode == 0, f"CI package should pass:\n{ci_ok.stdout}\n{ci_ok.stderr}"
+    assert ci_tar.is_file() and ci_tar.stat().st_size > 0
+
+    # 1b. Running verify_release_tarball.py WITHOUT --include-ci on the CI tarball still fails
+    verify_script = REPO_ROOT / "scripts" / "standalone" / "verify_release_tarball.py"
+    commit_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    expected_top = f"dalton-core-{commit_sha[:9]}"
+    strict_verify = subprocess.run(
+        [sys.executable, str(verify_script), "--expected-top-dir", expected_top, str(ci_tar)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert strict_verify.returncode != 0, "Customer tarball verifier must not exempt CI test paths"
+    assert "tests/standalone/checks/self_scan.py" in strict_verify.stderr
+    assert "web/src/sample.test.tsx" in strict_verify.stderr
+
+    # 2. Customer package (no `--include-ci`) fails on the same `web/src/sample.test.tsx` content
+    customer_fail = subprocess.run(
+        [
+            "bash",
+            str(PACKAGE_SCRIPT),
+            "--repo",
+            str(repo),
+            "--ref",
+            "HEAD",
+            "--output",
+            str(tmp_path / "customer-fail"),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert customer_fail.returncode != 0, "Customer package must fail on non-stripped leak hit"
+    assert "web/src/sample.test.tsx" in customer_fail.stdout
+
+    # 3. CI test package (`--include-ci`) still fails when a production path leaks
+    (repo / "src" / "dalton" / "settings.py").write_text(
+        'LEAK = "everflowinv.com"\n', encoding="utf-8"
+    )
+    _git_commit_all(repo, "add prod leak")
+    ci_prod_fail = subprocess.run(
+        [
+            "bash",
+            str(PACKAGE_SCRIPT),
+            "--repo",
+            str(repo),
+            "--ref",
+            "HEAD",
+            "--include-ci",
+            "--output",
+            str(tmp_path / "ci-prod-fail"),
+            "--tar",
+            str(tmp_path / "ci-prod-fail.tar.gz"),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ci_prod_fail.returncode != 0, "CI package must still fail on production path leak"
+    assert "src/dalton/settings.py" in ci_prod_fail.stdout
 
 
 def test_package_release_rejects_existing_and_unsafe_output_dirs(
