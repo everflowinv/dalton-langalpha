@@ -14,11 +14,20 @@ import { PersonalIntegrationsCard } from '../PersonalIntegrationsCard';
 const h = vi.hoisted(() => ({
   profile: 'everflow' as 'everflow' | 'core',
   capabilities: new Set<CapabilityId>(['google_calendar', 'feishu_calendar']),
+  desktopShell: false,
   apiGet: vi.fn(),
   apiPost: vi.fn(),
   apiDelete: vi.fn(),
   apiPatch: vi.fn(),
 }));
+
+vi.mock('@/lib/desktop', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/desktop')>();
+  return {
+    ...actual,
+    isDesktopShell: () => h.desktopShell,
+  };
+});
 
 vi.mock('@/hooks/useLocale', () => ({
   useLocale: () => 'zh-CN',
@@ -139,10 +148,12 @@ describe('PersonalIntegrationsCard', () => {
     vi.clearAllMocks();
     h.profile = 'everflow';
     h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.desktopShell = false;
     window.history.replaceState(null, '', '/settings?tab=integrations');
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     window.history.replaceState(null, '', '/settings?tab=integrations');
   });
 
@@ -986,7 +997,7 @@ describe('PersonalIntegrationsCard', () => {
     await waitFor(() => expect(h.apiGet.mock.calls.length).toBeGreaterThan(getsBeforeRestore));
   });
 
-  it('resets pending authorizeMutation on bfcache pageshow restore even if mutation never settled', async () => {
+  it('ignores stale authorize completion after bfcache pageshow restore', async () => {
     h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
     h.apiGet.mockResolvedValue({
       data: {
@@ -996,7 +1007,13 @@ describe('PersonalIntegrationsCard', () => {
         has_personal_integrations: false,
       },
     });
-    h.apiPost.mockImplementationOnce(() => new Promise(() => {}));
+    let resolveStale!: (val: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
 
     renderCard();
 
@@ -1011,6 +1028,226 @@ describe('PersonalIntegrationsCard', () => {
     act(() => {
       window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
     });
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+
+    // Old in-flight authorize request finally resolves after bfcache restore:
+    // must neither re-disable buttons nor trigger a stale redirect.
+    await act(async () => {
+      resolveStale({
+        data: {
+          authorize_url: '#stale-oauth-redirect',
+          provider: 'google',
+          service: 'calendar',
+          intent: 'connect',
+          expires_in: 600,
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).not.toBe('#stale-oauth-redirect');
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('ignores stale authorize error after bfcache pageshow restore', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    let rejectStale!: (err: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectStale = reject;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+
+    await act(async () => {
+      rejectStale(new Error('network abort'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('personal-integrations-banner')).not.toBeInTheDocument();
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('re-enables connect buttons after grace timeout if browser navigation does not leave the page', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    h.apiPost.mockResolvedValueOnce({
+      data: {
+        authorize_url: '#cancelled-redirect',
+        provider: 'google',
+        service: 'calendar',
+        intent: 'connect',
+        expires_in: 600,
+      },
+    });
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    vi.useFakeTimers();
+
+    await act(async () => {
+      fireEvent.click(connectButtons[0]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#cancelled-redirect');
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Still within grace period -> stays disabled
+    act(() => {
+      vi.advanceTimersByTime(4_999);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Grace period elapses with no pagehide -> buttons recover so user can retry
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('keeps connect buttons disabled past grace timeout once pagehide confirms navigation started', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    h.apiPost.mockResolvedValueOnce({
+      data: {
+        authorize_url: '#leaving-redirect',
+        provider: 'google',
+        service: 'calendar',
+        intent: 'connect',
+        expires_in: 600,
+      },
+    });
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    vi.useFakeTimers();
+
+    await act(async () => {
+      fireEvent.click(connectButtons[0]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#leaving-redirect');
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+      vi.advanceTimersByTime(10_000);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('releases redirect lock immediately in desktop shell where external OAuth opens in system browser', async () => {
+    h.desktopShell = true;
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    let resolveAuthorize!: (val: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAuthorize = resolve;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    act(() => {
+      resolveAuthorize({
+        data: {
+          authorize_url: '#desktop-oauth-redirect',
+          provider: 'google',
+          service: 'calendar',
+          intent: 'connect',
+          expires_in: 600,
+        },
+      });
+    });
+
+    await waitFor(() => expect(window.location.hash).toBe('#desktop-oauth-redirect'));
     await waitFor(() => {
       for (const btn of connectButtons) {
         expect(btn).not.toBeDisabled();

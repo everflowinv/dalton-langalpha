@@ -19,6 +19,7 @@ import {
   type CapabilityId,
 } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
+import { isDesktopShell } from '@/lib/desktop';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -287,6 +288,12 @@ function resolvePrivacyPolicyUrl(profile: string): string | null {
   return custom || null;
 }
 
+/**
+ * How long a browser tab may take to leave for the OAuth provider before we
+ * treat the navigation as cancelled/blocked and unlock the action buttons.
+ */
+const REDIRECT_LEAVE_GRACE_MS = 5_000;
+
 export function PersonalIntegrationsCard() {
   const queryClient = useQueryClient();
   const locale = useLocale();
@@ -303,6 +310,22 @@ export function PersonalIntegrationsCard() {
   const [disconnectDialog, setDisconnectDialog] = useState<DisconnectDialogState | null>(null);
   const [isRedirecting, setIsRedirecting] = useState(false);
   const callbackHandledRef = useRef(false);
+  const authorizeSeqRef = useRef(0);
+  const redirectCleanupRef = useRef<(() => void) | null>(null);
+
+  const clearRedirectGuard = () => {
+    redirectCleanupRef.current?.();
+    redirectCleanupRef.current = null;
+  };
+
+  useEffect(
+    () => () => {
+      authorizeSeqRef.current += 1;
+      redirectCleanupRef.current?.();
+      redirectCleanupRef.current = null;
+    },
+    [],
+  );
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.personalIntegrations() });
@@ -426,6 +449,7 @@ export function PersonalIntegrationsCard() {
   }, []);
 
   const authorizeMutation = useMutation({
+    onMutate: () => ({ seq: ++authorizeSeqRef.current }),
     mutationFn: async (vars: {
       provider: PersonalIntegrationProvider;
       service: PersonalIntegrationService;
@@ -437,18 +461,65 @@ export function PersonalIntegrationsCard() {
       });
       return res;
     },
-    onSuccess: (res) => {
+    onSuccess: (res, _vars, onMutateResult) => {
+      if (onMutateResult?.seq !== authorizeSeqRef.current) return;
+      const seq = onMutateResult.seq;
       setPreSwitchTarget(null);
-      if (res.authorize_url) {
-        setIsRedirecting(true);
+      if (!res.authorize_url) return;
+
+      // In the desktop shell, will-navigate hands external OAuth URLs to the system browser
+      // and cancels in-window navigation, so this page stays open and should unlock immediately.
+      if (isDesktopShell()) {
+        clearRedirectGuard();
         try {
           window.location.assign(res.authorize_url);
         } catch {
+          // Ignore synchronous URL errors; finally ensures the buttons stay usable.
+        } finally {
           setIsRedirecting(false);
         }
+        return;
+      }
+
+      clearRedirectGuard();
+      setIsRedirecting(true);
+      let left = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        window.removeEventListener('pagehide', onPageHide);
+        if (redirectCleanupRef.current === cleanup) {
+          redirectCleanupRef.current = null;
+        }
+      };
+      const onPageHide = () => {
+        left = true;
+        cleanup();
+      };
+      redirectCleanupRef.current = cleanup;
+      window.addEventListener('pagehide', onPageHide, { once: true });
+      try {
+        window.location.assign(res.authorize_url);
+      } catch {
+        cleanup();
+        setIsRedirecting(false);
+        return;
+      }
+      if (!left) {
+        timer = setTimeout(() => {
+          cleanup();
+          if (!left && authorizeSeqRef.current === seq) {
+            setIsRedirecting(false);
+          }
+        }, REDIRECT_LEAVE_GRACE_MS);
       }
     },
-    onError: (err) => {
+    onError: (err, _vars, onMutateResult) => {
+      if (onMutateResult?.seq !== authorizeSeqRef.current) return;
+      clearRedirectGuard();
       setIsRedirecting(false);
       setPreSwitchTarget(null);
       const payload = extractApiErrorData(err);
@@ -463,6 +534,8 @@ export function PersonalIntegrationsCard() {
   });
 
   useBfcacheRestore(() => {
+    authorizeSeqRef.current += 1;
+    clearRedirectGuard();
     setIsRedirecting(false);
     authorizeMutation.reset();
     invalidate();
