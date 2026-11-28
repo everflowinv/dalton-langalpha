@@ -427,12 +427,23 @@ def _refresh_consensus_diff_caches(
     return sorted(set(refreshed))
 
 
+def _find_workspace_root_for_model(mpath: Path) -> Path | None:
+    """Locate the workspace root owning ``mpath`` (for modeling lock verification)."""
+    for parent in mpath.parents:
+        if (parent / ".agents" / "modeling-lock.json").exists():
+            return parent
+    if mpath.parent.name == "model":
+        return mpath.parent.parent
+    return None
+
+
 def write_consensus_snapshot(
     *,
     model_path: str | Path,
     consensus_data: dict[str, Any],
     sheet_name: str = "vs Consensus",
     coord_map_path: str | Path | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Write external consensus reference figures ONLY into the isolated snapshot sheet/zone.
 
@@ -750,6 +761,24 @@ def write_consensus_snapshot(
         new_sha = model_fingerprint.file_sha256(editing_copy)
         touched_sorted = sorted(set(touched_coords))
         snap_sorted = sorted(set(written_coords))
+        pub_rcpt = model_edit.publish_receipt_path(mpath)
+        rcpt_doc: dict[str, Any] | None = None
+        if pub_rcpt.is_file():
+            loaded_rcpt = json.loads(pub_rcpt.read_text(encoding="utf-8"))
+            if isinstance(loaded_rcpt, dict):
+                rcpt_doc = loaded_rcpt
+        explicit_run_id = run_id.strip() if (isinstance(run_id, str) and run_id.strip()) else None
+        inferred_run_id = (
+            str(rcpt_doc.get("run_id") or "").strip() or None if isinstance(rcpt_doc, dict) else None
+        )
+        eff_run_id = explicit_run_id or inferred_run_id
+        ws_root = _find_workspace_root_for_model(mpath)
+        if ws_root is not None:
+            model_edit.verify_modeling_lock_ownership(
+                ws_root,
+                eff_run_id,
+                allow_ancestor_run_id=(explicit_run_id is None and inferred_run_id is not None),
+            )
         post_cm_sha: str | None = None
         new_cm_text: str | None = None
         receipt_path: Path | None = None
@@ -780,10 +809,8 @@ def write_consensus_snapshot(
         # any crash or write error between model swap and receipt commit leaves
         # a verifiable, retryable transition record (and never silently swallows
         # receipt commit failures).
-        pub_rcpt = model_edit.publish_receipt_path(mpath)
         committed_rcpt_doc: dict[str, Any] | None = None
-        if pub_rcpt.is_file():
-            rcpt_doc = json.loads(pub_rcpt.read_text(encoding="utf-8"))
+        if rcpt_doc is not None:
             if isinstance(rcpt_doc, dict):
                 rcpt_sha = str(rcpt_doc.get("candidate_sha256") or "").strip().lower()
                 prior_pt = rcpt_doc.get("pending_transition")
@@ -1419,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
     p_snap.add_argument("--consensus", required=True)
     p_snap.add_argument("--sheet", default="vs Consensus")
     p_snap.add_argument("--coord-map", default=None, help="Optional coord_map.json to register written cells")
+    p_snap.add_argument("--run-id", default=None, help="Optional workflow run_id for modeling lock verification")
 
     p_diff = sub.add_parser("diff", help="Generate <R>/model_dump/consensus-diff.{json,md}")
     p_diff.add_argument("--model", required=True)
@@ -1430,12 +1458,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "write-snapshot":
         cdata = json.loads(Path(args.consensus).read_text(encoding="utf-8"))
-        res = write_consensus_snapshot(
-            model_path=args.model,
-            consensus_data=cdata,
-            sheet_name=args.sheet,
-            coord_map_path=args.coord_map,
-        )
+        try:
+            res = write_consensus_snapshot(
+                model_path=args.model,
+                consensus_data=cdata,
+                sheet_name=args.sheet,
+                coord_map_path=args.coord_map,
+                run_id=args.run_id,
+            )
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 

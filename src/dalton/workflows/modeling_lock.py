@@ -18,9 +18,11 @@ an unlocked overwrite of a new holder.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import shlex
 import time
 from typing import Any
 
@@ -41,10 +43,137 @@ DEFAULT_WRITER_EXIT_TIMEOUT_SECONDS = 10.0
 
 _MODEL_WRITER_ALIVE_SENTINEL = "__MODEL_WRITER_ALIVE__"
 _MODEL_WRITER_GONE_SENTINEL = "__MODEL_WRITER_GONE__"
-_MODEL_WRITER_PROBE_CMD = (
-    "pgrep -f 'dalton-model/scripts/(model_edit|model_consensus)\\.py' >/dev/null 2>&1 "
-    f"&& echo {_MODEL_WRITER_ALIVE_SENTINEL} || echo {_MODEL_WRITER_GONE_SENTINEL}"
+_MODEL_WRITER_PROBE_SELF_TAG = "__MODEL_WRITER_PROBE_SELF__"
+_MODEL_WRITER_SCRIPT_NAMES = frozenset(
+    {
+        "model_edit.py",
+        "model_consensus.py",
+        "model_check.py",
+    }
 )
+_MODEL_WRITER_OFFICE_NAMES = frozenset({"soffice", "soffice.bin"})
+
+
+def _build_probe_python_code(
+    *,
+    run_id: str | None = None,
+    proc_root: str = "/proc",
+) -> str:
+    """Return a self-contained Python snippet that scans active modeling writers.
+
+    Reads ``/proc/<pid>/cmdline`` directly without ``procps`` (``pgrep``/``ps``);
+    falls back to BSD ``/bin/ps`` only on macOS when ``proc_root == "/proc"`` and
+    ``/proc`` does not exist. Exits non-zero on any scan failure so callers fail
+    closed and keep the short lease intact.
+    """
+    want_run_id = str(run_id or "").strip()
+    return (
+        "import ctypes,ctypes.util,os,struct,sys\n"
+        f"TAG={_MODEL_WRITER_PROBE_SELF_TAG!r}\n"
+        f"ALIVE={_MODEL_WRITER_ALIVE_SENTINEL!r}\n"
+        f"GONE={_MODEL_WRITER_GONE_SENTINEL!r}\n"
+        f"RUN_ID={want_run_id!r}\n"
+        f"PROC_ROOT={proc_root!r}\n"
+        f"SCRIPTS={sorted(_MODEL_WRITER_SCRIPT_NAMES)!r}\n"
+        f"OFFICE={sorted(_MODEL_WRITER_OFFICE_NAMES)!r}\n"
+        "def match_argv(argv):\n"
+        "    if not argv:\n"
+        "        return False\n"
+        "    joined=' '.join(argv)\n"
+        "    if TAG in joined or ALIVE in joined or GONE in joined:\n"
+        "        return False\n"
+        "    is_script=any(os.path.basename(t) in SCRIPTS for t in argv)\n"
+        "    is_office=any(os.path.basename(t) in OFFICE for t in argv)\n"
+        "    if not (is_script or is_office):\n"
+        "        return False\n"
+        "    if RUN_ID and is_script:\n"
+        "        explicit_rid=''\n"
+        "        for i,tok in enumerate(argv):\n"
+        "            if tok=='--run-id' and i+1<len(argv):\n"
+        "                explicit_rid=argv[i+1].strip()\n"
+        "                break\n"
+        "            if tok.startswith('--run-id='):\n"
+        "                explicit_rid=tok.split('=',1)[1].strip()\n"
+        "                break\n"
+        "        if explicit_rid and explicit_rid!=RUN_ID:\n"
+        "            return False\n"
+        "    return True\n"
+        "my_pid,ppid=os.getpid(),os.getppid()\n"
+        "found=False\n"
+        "if os.path.isdir(PROC_ROOT):\n"
+        "    for name in os.listdir(PROC_ROOT):\n"
+        "        if not name.isdigit():\n"
+        "            continue\n"
+        "        pid=int(name)\n"
+        "        if pid==my_pid or pid==ppid:\n"
+        "            continue\n"
+        "        try:\n"
+        "            raw=open(os.path.join(PROC_ROOT,name,'cmdline'),'rb').read()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "        if not raw:\n"
+        "            continue\n"
+        "        argv=[p.decode('utf-8','replace') for p in raw.split(b'\\x00') if p]\n"
+        "        if match_argv(argv):\n"
+        "            found=True\n"
+        "            break\n"
+        "elif PROC_ROOT=='/proc' and sys.platform=='darwin':\n"
+        "    libc=ctypes.CDLL(ctypes.util.find_library('c'),use_errno=True)\n"
+        "    libproc=ctypes.CDLL(ctypes.util.find_library('proc'),use_errno=True)\n"
+        "    cnt=libproc.proc_listallpids(None,0)\n"
+        "    if cnt<=0:\n"
+        "        sys.exit(2)\n"
+        "    pids=(ctypes.c_int*(cnt+256))()\n"
+        "    cnt=libproc.proc_listallpids(pids,ctypes.sizeof(pids))\n"
+        "    if cnt<=0:\n"
+        "        sys.exit(2)\n"
+        "    me=os.getuid()\n"
+        "    info=ctypes.create_string_buffer(136)\n"
+        "    argmax=ctypes.c_int(0)\n"
+        "    asz=ctypes.c_size_t(ctypes.sizeof(argmax))\n"
+        "    amib=(ctypes.c_int*2)(1,8)\n"
+        "    buf_len=argmax.value if (libc.sysctl(amib,2,ctypes.byref(argmax),ctypes.byref(asz),None,0)==0 and argmax.value>0) else (1<<20)\n"
+        "    abuf=ctypes.create_string_buffer(buf_len)\n"
+        "    for pid in pids[:cnt]:\n"
+        "        if pid<=0 or pid==my_pid or pid==ppid:\n"
+        "            continue\n"
+        "        if libproc.proc_pidinfo(pid,3,0,info,136)!=136:\n"
+        "            continue\n"
+        "        (st,)=struct.unpack_from('=I',info.raw,4)\n"
+        "        if st==5:\n"
+        "            continue\n"
+        "        _pp,uid=struct.unpack_from('=II',info.raw,16)\n"
+        "        if uid!=me:\n"
+        "            continue\n"
+        "        sz=ctypes.c_size_t(len(abuf))\n"
+        "        mib=(ctypes.c_int*3)(1,49,pid)\n"
+        "        if libc.sysctl(mib,3,abuf,ctypes.byref(sz),None,0)!=0 or sz.value<4:\n"
+        "            continue\n"
+        "        data=ctypes.string_at(abuf,sz.value)\n"
+        "        argc=int.from_bytes(data[:4],sys.byteorder)\n"
+        "        rest=data[4:].partition(b'\\x00')[2]\n"
+        "        argv=[os.fsdecode(w) for w in rest.lstrip(b'\\x00').split(b'\\x00')[:argc] if w]\n"
+        "        if match_argv(argv):\n"
+        "            found=True\n"
+        "            break\n"
+        "else:\n"
+        "    sys.exit(2)\n"
+        "print(ALIVE if found else GONE)\n"
+    )
+
+
+def build_model_writer_probe_cmd(
+    *,
+    run_id: str | None = None,
+    python_bin: str = "python3",
+    proc_root: str = "/proc",
+) -> str:
+    """Build a ``procps``-free shell probe command for active modeling writers."""
+    code = _build_probe_python_code(run_id=run_id, proc_root=proc_root)
+    return f"{shlex.quote(python_bin)} -c {shlex.quote(code)}"
+
+
+_MODEL_WRITER_PROBE_CMD = build_model_writer_probe_cmd()
 
 # Per-(event-loop, scope-key) in-process mutex so concurrent launches on the
 # same worker (and CLI / unit tests without PostgreSQL) serialize cleanly.
@@ -85,11 +214,18 @@ def resolve_workflow_progress_path(
         return norm
     if needs_modeling_lock(workflow, params):
         return norm
+    if (
+        norm == ".progress.no-model.json"
+        or norm.endswith("/.progress.no-model.json")
+        or norm.endswith(".no-model.json")
+        or norm.endswith(".no-model")
+    ):
+        return norm
     if norm.endswith("/.progress.json"):
         return norm[: -len(".progress.json")] + ".progress.no-model.json"
     if norm == ".progress.json":
         return ".progress.no-model.json"
-    if norm.endswith(".json") and not norm.endswith(".no-model.json"):
+    if norm.endswith(".json"):
         return norm[: -len(".json")] + ".no-model.json"
     return f"{norm}.no-model"
 
@@ -438,6 +574,7 @@ class ModelingLockHeartbeat:
         interval_seconds: float | None = None,
         lock_path: str = MODELING_LOCK_PATH,
         now_fn: Any = time.time,
+        on_lease_lost: Any = None,
     ) -> None:
         self._backend = backend
         self._registry = registry
@@ -454,7 +591,18 @@ class ModelingLockHeartbeat:
             self._interval_seconds = max(float(interval_seconds), 0.01)
         self._lock_path = lock_path
         self._now_fn = now_fn
+        self._on_lease_lost = on_lease_lost
+        self._lease_lost = False
+        self._lease_lost_reason: str | None = None
         self._task: asyncio.Task[None] | None = None
+
+    @property
+    def lease_lost(self) -> bool:
+        return self._lease_lost
+
+    @property
+    def lease_lost_reason(self) -> str | None:
+        return self._lease_lost_reason
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -464,11 +612,29 @@ class ModelingLockHeartbeat:
             name=f"modeling_lock_heartbeat_{self._run_id}",
         )
 
+    async def _notify_lease_lost(self, reason: str) -> None:
+        if self._lease_lost:
+            return
+        self._lease_lost = True
+        self._lease_lost_reason = reason
+        cb = self._on_lease_lost
+        if callable(cb):
+            try:
+                res = cb(reason)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                logger.warning(
+                    "modeling lock lease-lost callback failed",
+                    extra={"run_id": self._run_id},
+                    exc_info=True,
+                )
+
     async def _run(self) -> None:
         try:
             while True:
                 await asyncio.sleep(self._interval_seconds)
-                await renew_modeling_lock(
+                renewed = await renew_modeling_lock(
                     self._backend,
                     registry=self._registry,
                     run_id=self._run_id,
@@ -478,15 +644,32 @@ class ModelingLockHeartbeat:
                     lock_path=self._lock_path,
                     now_fn=self._now_fn,
                 )
+                if not renewed:
+                    reason = (
+                        f"建模锁续约失败（run_id={self._run_id}），已停止后续写入并取消进行中的子任务"
+                    )
+                    logger.warning(
+                        "modeling lock heartbeat renewal failed; stopping run",
+                        extra={"run_id": self._run_id, "workflow": self._workflow},
+                    )
+                    await self._notify_lease_lost(reason)
+                    return
         except asyncio.CancelledError:
             return
-        except Exception:
-            logger.debug("modeling lock heartbeat loop exited", exc_info=True)
+        except Exception as error:
+            logger.warning(
+                "modeling lock heartbeat loop crashed; treating lease as lost",
+                extra={"run_id": self._run_id, "error_type": type(error).__name__},
+                exc_info=True,
+            )
+            await self._notify_lease_lost(
+                f"建模锁心跳异常（{type(error).__name__}，run_id={self._run_id}），已停止后续写入并取消进行中的子任务"
+            )
 
     async def stop(self) -> None:
         task = self._task
         self._task = None
-        if task is None or task.done():
+        if task is None or task.done() or task is asyncio.current_task():
             return
         task.cancel()
         try:
@@ -501,9 +684,11 @@ async def confirm_modeling_writers_exited(
     *,
     registry: Any,
     owner_task_id: str,
+    run_id: str | None = None,
     extra_tasks: list[Any] | None = None,
     backend: Any = None,
     check_sandbox_processes: bool = False,
+    probe_cmd: str | None = None,
     timeout: float | None = None,
     poll_interval: float = 0.2,
 ) -> bool:
@@ -565,37 +750,50 @@ async def confirm_modeling_writers_exited(
         if still_alive:
             return False
 
-    if check_sandbox_processes and backend is not None:
-        execute = getattr(backend, "aexecute", None)
-        if callable(execute):
-            while True:
-                remaining = deadline - time.monotonic()
-                probe_timeout = max(remaining, 0.05)
-                try:
-                    response = await asyncio.wait_for(
-                        execute(_MODEL_WRITER_PROBE_CMD),
-                        timeout=probe_timeout,
-                    )
-                except Exception:
-                    logger.warning(
-                        "modeling writer sandbox exit probe failed; deferring lock release to lease expiry",
-                        extra={"owner_task_id": owner_task_id},
-                        exc_info=True,
-                    )
-                    return False
-                raw_output = getattr(response, "output", None)
-                if not isinstance(raw_output, str):
-                    # Unconfigured test double without string shell output;
-                    # in-process writer confirmation above already succeeded.
-                    return True
-                exit_code = getattr(response, "exit_code", 1)
-                if _MODEL_WRITER_GONE_SENTINEL in raw_output and exit_code == 0:
-                    return True
-                if _MODEL_WRITER_ALIVE_SENTINEL in raw_output:
-                    if time.monotonic() >= deadline:
-                        return False
-                    await asyncio.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.01)))
-                    continue
+    if check_sandbox_processes:
+        execute = getattr(backend, "aexecute", None) if backend is not None else None
+        if not callable(execute):
+            logger.warning(
+                "modeling writer sandbox exit probe unavailable; deferring lock release to lease expiry",
+                extra={"owner_task_id": owner_task_id},
+            )
+            return False
+        eff_cmd = probe_cmd or build_model_writer_probe_cmd(run_id=run_id or owner_task_id)
+        while True:
+            remaining = deadline - time.monotonic()
+            probe_timeout = max(remaining, 0.05)
+            try:
+                response = await asyncio.wait_for(
+                    execute(eff_cmd),
+                    timeout=probe_timeout,
+                )
+            except Exception:
+                logger.warning(
+                    "modeling writer sandbox exit probe failed; deferring lock release to lease expiry",
+                    extra={"owner_task_id": owner_task_id},
+                    exc_info=True,
+                )
                 return False
+            raw_output = getattr(response, "output", None)
+            exit_code = getattr(response, "exit_code", 1)
+            if not isinstance(raw_output, str) or exit_code != 0:
+                logger.warning(
+                    "modeling writer sandbox exit probe returned error; deferring lock release to lease expiry",
+                    extra={"owner_task_id": owner_task_id, "exit_code": exit_code},
+                )
+                return False
+            lines = [ln.strip() for ln in raw_output.splitlines() if ln.strip()]
+            if _MODEL_WRITER_ALIVE_SENTINEL in lines:
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.01)))
+                continue
+            if lines == [_MODEL_WRITER_GONE_SENTINEL]:
+                return True
+            logger.warning(
+                "modeling writer sandbox exit probe output unexpected; deferring lock release to lease expiry",
+                extra={"owner_task_id": owner_task_id, "output_preview": raw_output[:200]},
+            )
+            return False
 
     return True

@@ -1750,7 +1750,7 @@ async function runModelingPipeline(ctx) {
   const stage2bPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/references/sanity-check.md。`,
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
-    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
+    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"${editRunIdArg}\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
     `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,
@@ -3879,7 +3879,7 @@ async function runModelingPipeline(ctx) {
   const stage2bPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/references/sanity-check.md。`,
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
-    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
+    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"${editRunIdArg}\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
     `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,
@@ -4717,7 +4717,9 @@ async function reviseModelForReport(ctx) {
 const { ticker: T, company: C, quarter: Q, workspace_dir: W } = args
 const D = args.release_date
 const R = `${W}/research/${D}-deep-${Q}`
-const progressPath = args.progress_path || `${R}/.progress.json`
+const hasModelPath = typeof args.model_path === 'string' && args.model_path.trim().length > 0
+const progressFileName = hasModelPath ? '.progress.json' : '.progress.no-model.json'
+const progressPath = args.progress_path || `${R}/${progressFileName}`
 const S = '.agents/skills/dalton-earnings-deep'
 const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；${C || T}（${T}）${Q}，发布日 ${D}。快讯稿在 ${W}/research/ 或 ${W}/drafts/ 下 flash-${Q}。`
 const OUT = {
@@ -4912,8 +4914,7 @@ if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
   return finish({
     blocked: review.summary || '审稿 block',
-    resume_hint:
-      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+    resume_hint: `修订报告后用启动时的同一组参数 + resume=<${progressFileName} 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发`,
   })
 }
 
@@ -5005,8 +5006,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
     incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
     return finish({
       blocked: reReview.summary || '复审 block',
-      resume_hint:
-        '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+      resume_hint: `修订报告后用启动时的同一组参数 + resume=<${progressFileName} 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发`,
     })
   }
   finalReview = reReview
@@ -6441,7 +6441,7 @@ async function runModelingPipeline(ctx) {
   const stage2bPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/references/sanity-check.md。`,
     `对已落盘的 ${C}（${T}）候选模型 ${candidatePath}${modelSha ? `（sha256：${modelSha}）` : ''} 执行一致预期快照写入与差异对照：`,
-    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
+    `1) 用 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model "${candidatePath}" --consensus "${consensusPath || 'data/consensus/<最新文件>.json'}" --coord-map "${coordMapPath}"${editRunIdArg}\` 把外部参考值写入独立快照区（不把一致预期硬编码为本方预测或结果公式依赖）。`,
     `2) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 生成 ${consensusMdPath} 与 ${consensusJsonPath}。`,
     `3) 若核心指标超阈值（营业总收入 ±5%、利润与稀释 EPS ±10%、近盈亏平衡 ±150bp），拆到分部与驱动假设做一次返工复核：自身假设遗漏或口径有误时，先对当前候选重提指纹（\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${candidatePath}" --ticker "${T}" --out "${consReworkFpPath}"\`）并取当前候选 64 位 SHA-256，再用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${candidatePath}" --ticker "${T}" --plan "<consensus_rework_plan.json>" --out "${candidatePath}" --in-place --workspace-dir "${W}" --fingerprint "${consReworkFpPath}" --prior-coord-map "${coordMapPath}" --coord-map-out "${coordMapPath}" --expected-baseline-sha256 "<当前候选64位SHA-256>" --mode "${effMode}"${editRunIdArg}\` 只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${candidatePath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新 ${consensusMdPath} 与 ${consensusJsonPath}；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。`,
     `返回 JSON：files（含 ${candidatePath}、${coordMapPath}、${consensusMdPath} 与 ${consensusJsonPath}）、summary、candidate_path、model_sha256（64 位）、recalc_status、consensus_status、consensus_diff_generated。`,

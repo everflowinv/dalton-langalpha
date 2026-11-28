@@ -12646,7 +12646,7 @@ async def test_p0b_r9_2_short_lease_heartbeat_startup_cancel_and_delayed_stop_lo
     )
 
     # 3. Heartbeat renews lease while driver is running!
-    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_TTL_SECONDS", 0.35)
+    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_TTL_SECONDS", 1.5)
     monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_HEARTBEAT_SECONDS", 0.06)
     monkeypatch.setattr(mlock, "DEFAULT_WRITER_EXIT_TIMEOUT_SECONDS", 0.06)
 
@@ -13374,3 +13374,753 @@ async def test_p0b_r9_4_snapshot_receipt_crash_between_writes_and_resume_chain_v
     assert len(tamper_probes) == 1 and tamper_probes[0]["run_matched"] is False
     res_tamper = json.loads((ws / ".agents/threads/9999aaaa/workflows/run-r9-tamper/result.json").read_text(encoding="utf-8"))
     assert res_tamper["ok"] is False and res_tamper["status"] == "failed_unusable"
+
+
+@pytest.mark.asyncio
+async def test_p0b_r10_1_nomodel_progress_path_single_resolution_from_tool_to_driver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R10 #1 (Grok 高):
+    1) ``resolve_workflow_progress_path`` is idempotent for ``.progress.no-model.json``;
+    2) Only one call site remains between ``tool.py`` and ``driver.py``;
+    3) Launching non-modeled ``earnings-deep-update`` end-to-end through
+       ``create_run_workflow_tool`` into the real ``WorkflowDriver`` writes
+       ``.progress.no-model.json`` (never ``.progress.no-model.json.no-model``);
+    4) Skill docs, closing hint, and non-modeled workflow ``resume_hint`` reference
+       ``.progress.no-model.json``."""
+    import asyncio
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import BackgroundSubagentMiddleware
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import WorkflowDriver
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        PrebuiltWorkflowRegistry,
+        read_assembled_workflow_file,
+    )
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.workflows import modeling_lock as mlock
+
+    # 1. Idempotency of resolve_workflow_progress_path
+    base_prog = "research/2026-11-27-deep-FY26Q3/.progress.json"
+    nomodel_prog = "research/2026-11-27-deep-FY26Q3/.progress.no-model.json"
+    once = mlock.resolve_workflow_progress_path("earnings-deep-update", {"model_path": None}, base_prog)
+    twice = mlock.resolve_workflow_progress_path("earnings-deep-update", {"model_path": None}, once)
+    assert once == nomodel_prog
+    assert twice == nomodel_prog
+    assert mlock.resolve_workflow_progress_path("earnings-deep-update", {"model_path": None}, ".progress.no-model.json") == ".progress.no-model.json"
+    assert mlock.resolve_workflow_progress_path("earnings-deep-update", {"model_path": "model/PDD-model-v01.xlsx"}, base_prog) == base_prog
+
+    # 2. End-to-end from create_run_workflow_tool -> real WorkflowDriver -> disk write
+    ws = tmp_path / "ws_r10_nomodel_prog"
+    ws.mkdir(parents=True, exist_ok=True)
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+
+    deep_js = (
+        "export const meta = { name: 'earnings-deep-update', description: 'deep' }\n"
+        "await agent('write draft', { label: '八节点评' })\n"
+        "return { ok: true }\n"
+    )
+    prebuilt = create_autospec(PrebuiltWorkflowRegistry, instance=True)
+    prebuilt.get.side_effect = {"earnings-deep-update": deep_js}.get
+    prebuilt.names.side_effect = lambda: ["earnings-deep-update"]
+
+    created_drivers: list[WorkflowDriver] = []
+    real_driver_cls = WorkflowDriver
+
+    def _capture_driver(spec: Any) -> WorkflowDriver:
+        drv = real_driver_cls(spec)
+        created_drivers.append(drv)
+        return drv
+
+    spawned_tasks: list[asyncio.Task[Any]] = []
+
+    async def _run_driver_spawn(_mw: Any, _run_task: Any, coro_fn: Any, **_kw: Any) -> None:
+        task = asyncio.create_task(coro_fn())
+        spawned_tasks.append(task)
+
+    monkeypatch.setattr(wf_tool_mod, "WorkflowDriver", _capture_driver)
+    monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", _run_driver_spawn)
+    monkeypatch.setattr(
+        "src.config.settings.get_workflow_orchestration_config",
+        lambda: WorkflowOrchestrationConfig(enabled=True, child_timeout=15.0, run_timeout=30.0),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.as_of.resolve_launch_as_of",
+        lambda _b, _n, p, _j: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.subject_kind.resolve_launch_subject_kind",
+        lambda _n, p, _c: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.company_routing.resolve_launch_company_routing",
+        lambda *_a, **_kw: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        wf_tool_mod,
+        "get_config",
+        lambda: {"metadata": {"run_id": "turn-r10-1"}, "configurable": {"user_id": "u-1", "workspace_id": "ws-r10-1"}},
+    )
+
+    mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+    mw.registry = BackgroundTaskRegistry()
+    mw.checkpointer = None
+
+    async def _admit(*_a: Any, **_kw: Any) -> str:
+        return ""
+
+    async def _abort(task: Any, _err: BaseException) -> None:
+        task.mark_cancelled("abort")
+
+    mw.admit_task_run.side_effect = _admit
+    mw._abort_admitted_run.side_effect = _abort
+
+    dispatcher = create_autospec(SubagentDispatcher, instance=True)
+    dispatcher.middleware = mw
+    dispatcher.registry = mw.registry
+    dispatcher.subagent_types = ["general-purpose"]
+
+    async def _dispatch_child(
+        *,
+        subagent_type: str,
+        description: str,
+        prompt: str,
+        run_id: str | None = None,
+        owner_task_id: str | None = None,
+        base_configurable: dict[str, Any] | None = None,
+        time_limit: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        t = await mw.registry.register(
+            tool_call_id=f"child-{len(created_drivers)}-{description}",
+            description=description,
+            prompt=prompt,
+            subagent_type=subagent_type,
+            run_id=run_id,
+            owner_task_id=owner_task_id,
+        )
+        t.per_call_records = []
+
+        async def _work() -> str:
+            t.terminal_status = "completed"
+            return "ok"
+
+        t.asyncio_task = asyncio.create_task(_work())
+        return t
+
+    dispatcher.dispatch.side_effect = _dispatch_child
+
+    tool = wf_tool_mod.create_run_workflow_tool(
+        dispatcher=dispatcher,
+        backend=backend,
+        thread_id="thr-r10-nomodel",
+        short_thread_id="r10nm111",
+        store=None,
+        user_id="u-1",
+        prebuilt_workflows=prebuilt,
+    )
+
+    for idx, passed_prog in enumerate((base_prog, nomodel_prog), start=1):
+        reply = await tool.coroutine(
+            workflow="earnings-deep-update",
+            params={
+                "ticker": "PDD",
+                "company": "PDD Holdings",
+                "quarter": "FY26Q3",
+                "workspace_dir": ".",
+                "release_date": "2026-11-27",
+                "model_path": None,
+                "progress_path": passed_prog,
+            },
+            tool_call_id=f"call-r10-nomodel-{idx}",
+        )
+        assert "started" in str(reply).lower() or "workflow" in str(reply).lower()
+        await spawned_tasks[-1]
+
+        drv = created_drivers[-1]
+        assert drv._journal.progress_path == nomodel_prog
+        assert (ws / nomodel_prog).is_file()
+        assert not (ws / f"{nomodel_prog}.no-model").exists()
+        assert not (ws / base_prog).exists()
+        prog_doc = json.loads((ws / nomodel_prog).read_text(encoding="utf-8"))
+        assert prog_doc["run_id"] == drv.wf_task_id
+        assert prog_doc["status"] == "completed"
+
+    # 3. Skill docs and workflow script align on .progress.no-model.json
+    skill_text = (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-earnings-deep" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert ".progress.no-model.json" in skill_text
+    real_deep_js = read_assembled_workflow_file(REPO_ROOT / "workflows" / "earnings-deep-update" / "workflow.js")
+    assert ".progress.no-model.json" in real_deep_js
+
+
+@pytest.mark.asyncio
+async def test_p0b_r10_2_procps_free_writer_probe_real_shell_missing_binary_alive_and_exited(
+    tmp_path: Path,
+) -> None:
+    """R10 #2 (Codex P1 + Grok 高):
+    1) Sandbox writer probe does not depend on ``pgrep``/``procps`` and has no
+       ``|| echo GONE`` fallback;
+    2) Real shell runs cover:
+       - missing binary / non-zero exit / unexpected output -> fail closed (False);
+       - real running processes (``model_edit.py``, ``model_consensus.py``,
+         ``model_check.py``, ``soffice``) -> alive (False, lock kept);
+       - exited processes -> gone (True, lock may release);
+       - ``/proc/*/cmdline`` directory scan matching all 4 writer types and
+         respecting explicit ``--run-id`` isolation."""
+    import os
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from src.dalton.workflows import modeling_lock as mlock
+
+    assert "pgrep" not in mlock._MODEL_WRITER_PROBE_CMD
+    assert "|| echo" not in mlock._MODEL_WRITER_PROBE_CMD
+
+    def _make_shell_backend(env_override: dict[str, str] | None = None) -> Any:
+        backend = create_autospec(SandboxBackend, instance=True)
+        backend.workspace_dir = str(tmp_path)
+
+        async def _aexec(cmd: str) -> Any:
+            proc = subprocess.run(
+                ["/bin/bash", "-c", cmd],
+                cwd=tmp_path,
+                env=env_override,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return _NS(exit_code=proc.returncode, output=proc.stdout)
+
+        backend.aexecute.side_effect = _aexec
+        return backend
+
+    # Case 1: Missing binary (explicit nonexistent binary AND empty PATH so python3 is absent)
+    shell_backend = _make_shell_backend()
+    missing_bin_cmd = mlock.build_model_writer_probe_cmd(
+        run_id="run-r10-probe",
+        python_bin="nonexistent_dalton_probe_bin_xyz",
+    )
+    assert (
+        await mlock.confirm_modeling_writers_exited(
+            registry=None,
+            owner_task_id="run-r10-probe",
+            run_id="run-r10-probe",
+            backend=shell_backend,
+            check_sandbox_processes=True,
+            probe_cmd=missing_bin_cmd,
+            timeout=0.05,
+        )
+        is False
+    )
+
+    empty_path_backend = _make_shell_backend(env_override={"PATH": ""})
+    assert (
+        await mlock.confirm_modeling_writers_exited(
+            registry=None,
+            owner_task_id="run-r10-probe",
+            run_id="run-r10-probe",
+            backend=empty_path_backend,
+            check_sandbox_processes=True,
+            probe_cmd=mlock.build_model_writer_probe_cmd(run_id="run-r10-probe"),
+            timeout=0.05,
+        )
+        is False
+    )
+
+    # Non-zero exit (unreadable/missing proc_root) & unexpected stdout both fail closed
+    bad_proc_cmd = mlock.build_model_writer_probe_cmd(
+        run_id="run-r10-probe",
+        python_bin=sys.executable,
+        proc_root=str(tmp_path / "no_such_proc_dir"),
+    )
+    assert (
+        await mlock.confirm_modeling_writers_exited(
+            registry=None,
+            owner_task_id="run-r10-probe",
+            run_id="run-r10-probe",
+            backend=shell_backend,
+            check_sandbox_processes=True,
+            probe_cmd=bad_proc_cmd,
+            timeout=0.05,
+        )
+        is False
+    )
+    assert (
+        await mlock.confirm_modeling_writers_exited(
+            registry=None,
+            owner_task_id="run-r10-probe",
+            run_id="run-r10-probe",
+            backend=shell_backend,
+            check_sandbox_processes=True,
+            probe_cmd="echo unexpected_output_only",
+            timeout=0.05,
+        )
+        is False
+    )
+
+    # Case 2: Real OS subprocesses — alive -> False; after exit -> True
+    fake_bin_dir = tmp_path / "fake_writers"
+    fake_bin_dir.mkdir(parents=True, exist_ok=True)
+    sleeper_body = "import time\ntime.sleep(30)\n"
+    for script_name in ("model_edit.py", "model_consensus.py", "model_check.py"):
+        (fake_bin_dir / script_name).write_text(sleeper_body, encoding="utf-8")
+    fake_soffice = fake_bin_dir / "soffice"
+    fake_soffice.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    fake_soffice.chmod(0o755)
+
+    real_probe_cmd = mlock.build_model_writer_probe_cmd(
+        run_id="run-r10-live",
+        python_bin=sys.executable,
+    )
+
+    spawn_cases = [
+        [sys.executable, str(fake_bin_dir / "model_edit.py"), "apply", "--run-id", "run-r10-live"],
+        [sys.executable, str(fake_bin_dir / "model_consensus.py"), "write-snapshot"],
+        [sys.executable, str(fake_bin_dir / "model_check.py"), "check", "--run-id", "run-r10-live"],
+        [str(fake_soffice), "--headless", "--convert-to", "xlsx"],
+    ]
+    for argv in spawn_cases:
+        child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            assert (
+                await mlock.confirm_modeling_writers_exited(
+                    registry=None,
+                    owner_task_id="run-r10-live",
+                    run_id="run-r10-live",
+                    backend=shell_backend,
+                    check_sandbox_processes=True,
+                    probe_cmd=real_probe_cmd,
+                    timeout=0.08,
+                    poll_interval=0.02,
+                )
+                is False
+            ), f"Expected ALIVE while {argv} is running"
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
+        assert (
+            await mlock.confirm_modeling_writers_exited(
+                registry=None,
+                owner_task_id="run-r10-live",
+                run_id="run-r10-live",
+                backend=shell_backend,
+                check_sandbox_processes=True,
+                probe_cmd=real_probe_cmd,
+                timeout=0.2,
+                poll_interval=0.02,
+            )
+            is True
+        ), f"Expected GONE after {argv} exited"
+
+    # Case 3: Real shell scan of /proc/*/cmdline layout (Linux sandbox path)
+    fake_proc = tmp_path / "fake_proc"
+    fake_proc.mkdir(parents=True, exist_ok=True)
+    proc_probe_cmd = mlock.build_model_writer_probe_cmd(
+        run_id="run-r10-proc",
+        python_bin=sys.executable,
+        proc_root=str(fake_proc),
+    )
+
+    # Another run's explicit --run-id does NOT block run-r10-proc
+    other_pid_dir = fake_proc / "42001"
+    other_pid_dir.mkdir(parents=True, exist_ok=True)
+    (other_pid_dir / "cmdline").write_bytes(
+        b"python3\x00.agents/skills/dalton-model/scripts/model_edit.py\x00apply\x00--run-id\x00run-other-999\x00"
+    )
+    assert (
+        await mlock.confirm_modeling_writers_exited(
+            registry=None,
+            owner_task_id="run-r10-proc",
+            run_id="run-r10-proc",
+            backend=shell_backend,
+            check_sandbox_processes=True,
+            probe_cmd=proc_probe_cmd,
+            timeout=0.1,
+        )
+        is True
+    )
+
+    # Each target writer in /proc/<pid>/cmdline reports ALIVE until removed
+    proc_writer_entries = [
+        ("42010", b"python3\x00.agents/skills/dalton-model/scripts/model_edit.py\x00--run-id=run-r10-proc\x00"),
+        ("42011", b"python3\x00.agents/skills/dalton-model/scripts/model_consensus.py\x00write-snapshot\x00"),
+        ("42012", b"python3\x00.agents/skills/dalton-model/scripts/model_check.py\x00--run-id\x00run-r10-proc\x00"),
+        ("42013", b"/usr/lib/libreoffice/program/soffice.bin\x00--headless\x00--convert-to\x00xlsx\x00"),
+    ]
+    for pid_s, raw_cmd in proc_writer_entries:
+        pdir = fake_proc / pid_s
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "cmdline").write_bytes(raw_cmd)
+        assert (
+            await mlock.confirm_modeling_writers_exited(
+                registry=None,
+                owner_task_id="run-r10-proc",
+                run_id="run-r10-proc",
+                backend=shell_backend,
+                check_sandbox_processes=True,
+                probe_cmd=proc_probe_cmd,
+                timeout=0.05,
+                poll_interval=0.01,
+            )
+            is False
+        ), f"Expected /proc scan ALIVE for {raw_cmd!r}"
+        os.unlink(pdir / "cmdline")
+        pdir.rmdir()
+        assert (
+            await mlock.confirm_modeling_writers_exited(
+                registry=None,
+                owner_task_id="run-r10-proc",
+                run_id="run-r10-proc",
+                backend=shell_backend,
+                check_sandbox_processes=True,
+                probe_cmd=proc_probe_cmd,
+                timeout=0.1,
+            )
+            is True
+        )
+
+
+@pytest.mark.asyncio
+async def test_p0b_r10_3_heartbeat_renew_failure_stops_driver_and_publish_rechecks_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R10 #3 (Codex P1):
+    1) When heartbeat lease renewal fails, ``WorkflowDriver`` immediately cancels
+       in-flight writer child tasks, stops dispatching any further write steps,
+       and fails the run;
+    2) Before publishing/replacing a model workbook (``model_edit.apply_edit_plan``
+       initial publish, recalc write-back, and ``model_consensus.write_consensus_snapshot``),
+       lock ownership is re-verified and writes are refused once the lock is lost."""
+    import asyncio
+    import time
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunError,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.workflows import modeling_lock as mlock
+
+    # --- Part A: Heartbeat renew failure cancels active child and blocks next step ---
+    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_TTL_SECONDS", 2.0)
+    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_HEARTBEAT_SECONDS", 0.04)
+    monkeypatch.setattr(mlock, "DEFAULT_WRITER_EXIT_TIMEOUT_SECONDS", 0.2)
+
+    ws = tmp_path / "ws_r10_hb_loss"
+    ws.mkdir(parents=True, exist_ok=True)
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    fail_lock_writes = {"enabled": False}
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        if fail_lock_writes["enabled"] and path == mlock.MODELING_LOCK_PATH:
+            return False
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    async def _aexec_gone(_cmd: str) -> Any:
+        return _NS(exit_code=0, output=mlock._MODEL_WRITER_GONE_SENTINEL)
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+    backend.aexecute.side_effect = _aexec_gone
+
+    two_step_js = (
+        "export const meta = { name: 'company-model', description: 'cm-hb' }\n"
+        "try { await agent('step 1 write', { label: '模型构建与落盘' }) } catch (e) {}\n"
+        "await agent('step 2 write', { label: '一致预期对照' })\n"
+        "return { ok: true }\n"
+    )
+    two_step_meta = compile_check(two_step_js)
+
+    reg = BackgroundTaskRegistry()
+    step1_entered = asyncio.Event()
+    step1_cancelled = asyncio.Event()
+    dispatched_labels: list[str] = []
+
+    class _Disp:
+        subagent_types = frozenset({"general-purpose"})
+
+        async def dispatch(
+            self,
+            *,
+            subagent_type: str,
+            description: str,
+            prompt: str,
+            run_id: str | None = None,
+            owner_task_id: str | None = None,
+            base_configurable: dict[str, Any] | None = None,
+            time_limit: float | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            dispatched_labels.append(description)
+            t = await reg.register(
+                tool_call_id=f"hb-child-{len(dispatched_labels)}",
+                description=description,
+                prompt=prompt,
+                subagent_type=subagent_type,
+                run_id=run_id,
+                owner_task_id=owner_task_id,
+            )
+            t.per_call_records = []
+
+            async def _work() -> str:
+                step1_entered.set()
+                try:
+                    await asyncio.sleep(30.0)
+                except asyncio.CancelledError:
+                    step1_cancelled.set()
+                    raise
+                t.terminal_status = "completed"
+                return "ok"
+
+            t.asyncio_task = asyncio.create_task(_work())
+            return t
+
+    rt = _NS(
+        task_id="run-r10-hb-loss",
+        display_id="run-r10-hb-loss",
+        task_run_id=None,
+        spawned_run_id="run-r10-hb-loss",
+        terminal_status=None,
+        stop_at=None,
+        keep_straggler=lambda _w: None,
+    )
+    drv = WorkflowDriver(
+        WorkflowRunSpec(
+            run_task=rt,
+            registry=reg,
+            dispatcher=_Disp(),
+            backend=backend,
+            thread_id="thr-r10-hb",
+            short_thread_id="r10hb111",
+            script=two_step_js,
+            script_args={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+            meta=two_step_meta,
+            source="prebuilt",
+            base_configurable={"workspace_id": "ws-r10-3"},
+            caps=WorkflowOrchestrationConfig(enabled=True, child_timeout=15.0, run_timeout=30.0),
+        )
+    )
+
+    run_task = asyncio.create_task(drv.run())
+    await asyncio.wait_for(step1_entered.wait(), timeout=5.0)
+    # Trigger heartbeat renewal failure while step 1 is in flight
+    fail_lock_writes["enabled"] = True
+
+    with pytest.raises(WorkflowRunError, match="续约失败"):
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert step1_cancelled.is_set(), "In-flight writer child must be cancelled when heartbeat renewal fails"
+    assert dispatched_labels == ["模型构建与落盘"], f"Must not dispatch step 2 after lease loss: {dispatched_labels}"
+    status_doc = json.loads((ws / ".agents/threads/r10hb111/workflows/run-r10-hb-loss/status.json").read_text(encoding="utf-8"))
+    assert status_doc["status"] == "failed"
+
+    # --- Part B: Publish-time lock ownership re-verification ---
+    ws_pub = tmp_path / "ws_r10_pub_lock"
+    ws_pub.mkdir(parents=True, exist_ok=True)
+    base_p = ws_pub / "model" / "PDD-model-v01.xlsx"
+    base_p.parent.mkdir(parents=True, exist_ok=True)
+    _write_simple_valid_model(base_p)
+    fp_obj = mfp.build_fingerprint(base_p, ticker="PDD")
+    lock_file = ws_pub / mlock.MODELING_LOCK_PATH
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Lock taken over by run-new -> run-old publish refused, file NOT created
+    lock_file.write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-new",
+                "workflow": "company-model",
+                "expires_at": time.time() + 600.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cand_refused = ws_pub / "model" / "PDD-model-v02.xlsx"
+    with pytest.raises(ValueError, match="held by another run"):
+        medit.apply_edit_plan(
+            baseline_path=base_p,
+            ticker="PDD",
+            plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1234}]},
+            output_path=cand_refused,
+            workspace_dir=ws_pub,
+            fingerprint=fp_obj,
+            skip_recalc=True,
+            mode="update",
+            run_id="run-old",
+        )
+    assert not cand_refused.exists()
+
+    # 2. Expired lease -> run-old publish refused
+    lock_file.write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-old",
+                "workflow": "company-model",
+                "expires_at": time.time() - 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="lease expired"):
+        medit.apply_edit_plan(
+            baseline_path=base_p,
+            ticker="PDD",
+            plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1234}]},
+            output_path=cand_refused,
+            workspace_dir=ws_pub,
+            fingerprint=fp_obj,
+            skip_recalc=True,
+            mode="update",
+            run_id="run-old",
+        )
+    assert not cand_refused.exists()
+
+    # 3. Active unexpired lock owned by run-old -> publish SUCCEEDS
+    lock_file.write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-old",
+                "workflow": "company-model",
+                "expires_at": time.time() + 600.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cm_p = ws_pub / "research" / "r10" / "model_dump" / "coord_map.json"
+    ed = medit.apply_edit_plan(
+        baseline_path=base_p,
+        ticker="PDD",
+        plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1234}]},
+        output_path=cand_refused,
+        workspace_dir=ws_pub,
+        fingerprint=fp_obj,
+        coord_map_out=cm_p,
+        skip_recalc=True,
+        mode="update",
+        run_id="run-old",
+    )
+    assert cand_refused.is_file()
+    sha_after_publish = ed["candidate_sha256"]
+
+    # 4. Consensus snapshot write also re-verifies lock ownership before replacing model
+    cons_data = {
+        "ticker": "PDD",
+        "as_of_date": "2026-11-27",
+        "source_type": "Market Consensus",
+        "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 1300.0}],
+    }
+    lock_file.write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-takeover",
+                "workflow": "company-model",
+                "expires_at": time.time() + 600.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="held by another run"):
+        mcons.write_consensus_snapshot(
+            model_path=cand_refused,
+            consensus_data=cons_data,
+            coord_map_path=cm_p,
+        )
+    assert mfp.file_sha256(cand_refused) == sha_after_publish
+
+    # 5. Lock lost DURING recalc -> recalc write-back refuses to swap model
+    lock_file.write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-recalc-owner",
+                "workflow": "company-model",
+                "expires_at": time.time() + 600.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cand_recalc = ws_pub / "model" / "PDD-model-v03.xlsx"
+    real_recalc_mod = medit._load_module(
+        "_dalton_xlsx_recalc_r10_test",
+        medit._locate_xlsx_script("recalc.py"),
+    )
+
+    def _steal_lock_during_soffice(src: Path, out_dir: Path, _timeout: int) -> Path:
+        lock_file.write_text(
+            json.dumps(
+                {
+                    "status": "locked",
+                    "run_id": "run-stole-mid-recalc",
+                    "workflow": "company-model",
+                    "expires_at": time.time() + 600.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / (src.stem + ".xlsx")
+        shutil.copyfile(src, out_file)
+        return out_file
+
+    fake_recalc = create_autospec(real_recalc_mod, instance=False)
+    fake_recalc.read_package.side_effect = real_recalc_mod.read_package
+    fake_recalc.computed_values.side_effect = real_recalc_mod.computed_values
+    fake_recalc.collect_formulas.side_effect = real_recalc_mod.collect_formulas
+    fake_recalc.refresh_charts.side_effect = real_recalc_mod.refresh_charts
+    fake_recalc.MAX_LISTED = real_recalc_mod.MAX_LISTED
+    fake_recalc.shutil = _NS(which=lambda _name: "/usr/bin/soffice")
+    fake_recalc.soffice_calculate.side_effect = _steal_lock_during_soffice
+
+    with pytest.raises(ValueError, match="held by another run"):
+        medit.apply_edit_plan(
+            baseline_path=base_p,
+            ticker="PDD",
+            plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1500}]},
+            output_path=cand_recalc,
+            workspace_dir=ws_pub,
+            fingerprint=fp_obj,
+            skip_recalc=False,
+            mode="update",
+            run_id="run-recalc-owner",
+            recalc_mod_override=fake_recalc,
+        )

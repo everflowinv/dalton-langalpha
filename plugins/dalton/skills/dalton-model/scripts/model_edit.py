@@ -34,6 +34,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import time
 from typing import Any
 import uuid
 import zipfile
@@ -88,6 +89,144 @@ def _safe_run_token(run_id: str | None) -> str:
         return ""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", run_id.strip()).strip("._-")
     return cleaned[:48]
+
+
+_MODELING_LOCK_REL = Path(".agents") / "modeling-lock.json"
+
+
+def _is_resume_ancestor(ws_root: Path, holder_run_id: str, candidate_ancestor_id: str) -> bool:
+    """Return True if ``candidate_ancestor_id`` is on ``holder_run_id``'s workspace resume chain."""
+    threads_dir = ws_root / ".agents" / "threads"
+    if not threads_dir.is_dir():
+        return False
+    start_dirs = [
+        p
+        for p in threads_dir.glob(f"*/workflows/{holder_run_id}")
+        if p.is_dir() and p.resolve().is_relative_to(ws_root)
+    ]
+    visited: set[Path] = set()
+    queue = list(start_dirs)
+    hops = 0
+    while queue and hops < 32:
+        cur = queue.pop(0).resolve()
+        if cur in visited or not cur.is_relative_to(ws_root):
+            continue
+        visited.add(cur)
+        hops += 1
+        next_dirs: list[str] = []
+        for meta_name, rid_key in (("resume.json", "task_id"), ("status.json", "run_id")):
+            mf = cur / meta_name
+            if mf.is_file():
+                try:
+                    md = json.loads(mf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(md, dict):
+                    rid = str(md.get(rid_key) or "").strip()
+                    if rid == candidate_ancestor_id:
+                        return True
+                    rfrom = str(md.get("resumed_from") or "").strip()
+                    if rfrom:
+                        next_dirs.append(rfrom)
+        if cur.name == candidate_ancestor_id:
+            return True
+        jdir = cur / "journal"
+        if jdir.is_dir():
+            for jf in sorted(jdir.glob("*.json")):
+                try:
+                    jd = json.loads(jf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                for ent in (jd.get("dispatches") or []) if isinstance(jd, dict) else []:
+                    if isinstance(ent, dict):
+                        rfrom = str(ent.get("resumed_from") or "").strip()
+                        if rfrom:
+                            next_dirs.append(rfrom)
+                            break
+        for rel in next_dirs:
+            nxt = Path(rel)
+            if not nxt.is_absolute():
+                nxt = ws_root / nxt
+            try:
+                nxt_res = nxt.resolve()
+            except OSError:
+                continue
+            if nxt_res.is_dir() and nxt_res.is_relative_to(ws_root):
+                if nxt_res.name == candidate_ancestor_id:
+                    return True
+                if nxt_res not in visited:
+                    queue.append(nxt_res)
+    return False
+
+
+def verify_modeling_lock_ownership(
+    workspace_root: Path,
+    run_id: str | None,
+    *,
+    now: float | None = None,
+    allow_ancestor_run_id: bool = False,
+) -> None:
+    """Re-verify workspace modeling lock ownership immediately before publishing a model.
+
+    When ``<workspace_root>/.agents/modeling-lock.json`` exists:
+    - If ``run_id`` is provided, the lock must be ``status == "locked"``, owned by
+      ``run_id`` (or a resumed descendant when ``allow_ancestor_run_id=True``),
+      and unexpired; otherwise raises ``ValueError`` refusing the write.
+    - If ``run_id`` is omitted (manual invocation), an active unexpired workflow
+      lock also refuses the write.
+    When no lock file exists (standalone/manual workspace), returns cleanly.
+    """
+    ws_root = Path(workspace_root).expanduser().resolve()
+    lock_file = ws_root / _MODELING_LOCK_REL
+    if not lock_file.exists():
+        return
+    cur_now = time.time() if now is None else float(now)
+    try:
+        doc = json.loads(lock_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"Refusing model publish: workspace modeling lock {lock_file} is unreadable ({type(exc).__name__})"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"Refusing model publish: workspace modeling lock {lock_file} is invalid"
+        )
+
+    status = str(doc.get("status") or "").strip()
+    holder = str(doc.get("run_id") or "").strip()
+    expires_at = doc.get("expires_at")
+    expired = (
+        isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and cur_now >= float(expires_at)
+    )
+
+    want_run_id = str(run_id or "").strip()
+    if want_run_id:
+        if status != "locked":
+            raise ValueError(
+                f"Refusing model publish for run {want_run_id}: modeling lock is not held "
+                f"(status={status!r}, holder={holder!r})"
+            )
+        if expired:
+            raise ValueError(
+                f"Refusing model publish for run {want_run_id}: modeling lock lease expired"
+            )
+        if holder != want_run_id:
+            if not (
+                allow_ancestor_run_id
+                and holder
+                and _is_resume_ancestor(ws_root, holder, want_run_id)
+            ):
+                raise ValueError(
+                    f"Refusing model publish for run {want_run_id}: modeling lock is held by another run ({holder!r})"
+                )
+        return
+
+    if status == "locked" and not expired:
+        raise ValueError(
+            f"Refusing model publish without --run-id while modeling lock is held by run {holder!r}"
+        )
 
 
 def publish_receipt_path(model_path: str | Path) -> Path:
@@ -1394,6 +1533,14 @@ def apply_edit_plan(
     )
     pre_cm_text: str | None = None
     pre_recalc_cm_sha: str | None = None
+    # Re-verify workspace modeling lock ownership right before writing receipts or
+    # publishing the staged workbook so a run that lost its lease never writes.
+    try:
+        verify_modeling_lock_ownership(ws_root, norm_run_id)
+    except ValueError:
+        editing_tmp.unlink(missing_ok=True)
+        raise
+
     if cp_resolved is not None:
         cp_resolved.parent.mkdir(parents=True, exist_ok=True)
         pre_cm = _merge_coord_maps(prior_coord_map, coord_map) if prior_coord_map is not None else coord_map
@@ -1449,6 +1596,11 @@ def apply_edit_plan(
         staged_skip = cand.with_name(f".{cand.name}.{edit_uid}.skiprecalc.tmp")
         shutil.copyfile(cand, staged_skip)
         model_xlsx_hooks.set_full_calc_on_load(staged_skip, True)
+        try:
+            verify_modeling_lock_ownership(ws_root, norm_run_id)
+        except ValueError:
+            staged_skip.unlink(missing_ok=True)
+            raise
         if in_place and cp_resolved is not None:
             staged_skip_sha = model_fingerprint.file_sha256(staged_skip)
             if staged_skip_sha != pre_recalc_sha:
@@ -1471,7 +1623,12 @@ def apply_edit_plan(
             "full_calc_on_load_enabled": True,
         }
     else:
-        def _record_before_recalc_swap(staged_path: Path) -> None:
+        def _before_recalc_swap(staged_path: Path) -> None:
+            try:
+                verify_modeling_lock_ownership(ws_root, norm_run_id)
+            except ValueError:
+                staged_path.unlink(missing_ok=True)
+                raise
             if in_place and cp_resolved is not None:
                 staged_sha = model_fingerprint.file_sha256(staged_path)
                 if staged_sha != pre_recalc_sha:
@@ -1491,7 +1648,7 @@ def apply_edit_plan(
             int(recalc_timeout),
             set(),
             keep_cache_spec,
-            on_before_replace=_record_before_recalc_swap if (in_place and cp_resolved is not None) else None,
+            on_before_replace=_before_recalc_swap,
         )
         # For default-template builds: if recalculation failed or left unmatched target formulas,
         # keep fullCalcOnLoad=1 so Excel recalculates immediately on open; if it succeeded cleanly,
@@ -1506,6 +1663,11 @@ def apply_edit_plan(
                 recalc_res["full_calc_on_load_enabled"] = True
             else:
                 _preserve_calcpr_from_donor(staged_post, donor_path)
+            try:
+                verify_modeling_lock_ownership(ws_root, norm_run_id)
+            except ValueError:
+                staged_post.unlink(missing_ok=True)
+                raise
             post_post_sha = model_fingerprint.file_sha256(staged_post)
             if in_place and cp_resolved is not None and post_post_sha != pre_post_sha:
                 record_candidate_transition(

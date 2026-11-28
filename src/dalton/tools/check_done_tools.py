@@ -1354,7 +1354,7 @@ async def _collect_review_records(
             # An unfinished run may be the current one; falling back to an
             # older finished run could accept a pass the new run has revised.
             raise _CannotVerify(
-                "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 里的 run_id）"
+                "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 或无模型运行的 .progress.no-model.json 里的 run_id）"
             )
         run_dir = await _latest_run_dir(backend, workflow, thread_id)
         if run_dir is None:
@@ -1383,7 +1383,7 @@ async def _find_run_review_pass(
         # before the helper existed.
         all_dirs, _finished = await _thread_run_dirs(backend, thread_id)
         if all_dirs - _finished:
-            return False, "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 里的 run_id）"
+            return False, "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 或无模型运行的 .progress.no-model.json 里的 run_id）"
         run_dir = await _latest_run_dir(backend, workflow, thread_id)
         if run_dir is None:
             return False, "找不到本次 workflow 的 run 目录（无 run_id 且无 status.json），无法核对审稿"
@@ -4437,7 +4437,7 @@ def create_check_done_tools(
     ) -> str:
         """对照完成契约核对一次 workflow 或多步 skill 是否全部完成，汇报完成前必须调用。
 
-        `workflow` 传工作流名（`"initial-coverage"`、`"full-coverage"`、`"bullbear-doc"`、`"earnings-deep-update"`、`"company-model"`、`"weekly-coverage-review"`、`"topic-research"` 之一）或多步技能名（`"dalton-earnings-preview"`、`"dalton-earnings-flash"`、`"dalton-stock-move"`、`"dalton-filing-review"`、`"dalton-thesis-delta"`、`"dalton-sector-delta"`、`"dalton-call"`、`"dalton-publish"`、`"dalton-earnings-calendar"` 之一，`params` 按该技能收尾段所列），`params` 用启动时的同一组参数；`run_id` 传本次运行的任务 ID（`.progress.json` 的 `run_id`），不传则取本线程最近一次同名工作流的运行记录。
+        `workflow` 传工作流名（`"initial-coverage"`、`"full-coverage"`、`"bullbear-doc"`、`"earnings-deep-update"`、`"company-model"`、`"weekly-coverage-review"`、`"topic-research"` 之一）或多步技能名（`"dalton-earnings-preview"`、`"dalton-earnings-flash"`、`"dalton-stock-move"`、`"dalton-filing-review"`、`"dalton-thesis-delta"`、`"dalton-sector-delta"`、`"dalton-call"`、`"dalton-publish"`、`"dalton-earnings-calendar"` 之一，`params` 按该技能收尾段所列），`params` 用启动时的同一组参数；`run_id` 传本次运行的任务 ID（`.progress.json` 或无模型 `earnings-deep-update` 运行 `.progress.no-model.json` 的 `run_id`），不传则取本线程最近一次同名工作流的运行记录。
         `workflow.enabled` 关闭、按技能说明手动执行时，`params` 加 `"manual": true`，审稿改为核对技能指定的 `review.json`。
         只读不改：重查文件、哈希、校验脚本、知识层版本、`verdict`、本次运行的审稿 `pass` 与两轮语言审查记录。`done=false` 时先按 `missing` 补齐再查；补不了的只能汇报“未完成”。
         Returns: JSON `{done, missing, warnings}`，`missing` 为中文缺项说明与下一步操作。

@@ -609,18 +609,14 @@ def create_run_workflow_tool(
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None
-        # DALTON-HOOK(modeling-lock): isolate non-modeled earnings-deep-update
-        # progress markers from concurrent modeled runs in the same research dir.
+        # DALTON-HOOK(modeling-lock): acquire the per-workspace modeling lock at entry.
         from src.dalton.workflows.modeling_lock import (
             ModelingLockBusy,
             acquire_modeling_lock,
             modeling_lock_ttl,
             needs_modeling_lock,
             release_modeling_lock,
-            resolve_workflow_progress_path,
         )
-
-        progress_path = resolve_workflow_progress_path(meta.name, params, progress_path)
 
         # One bounded launch description for every sink. `meta.description`
         # is capped at extraction precisely because it is copied into the

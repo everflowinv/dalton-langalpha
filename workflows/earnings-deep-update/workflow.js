@@ -8,7 +8,9 @@ export const meta = {
 const { ticker: T, company: C, quarter: Q, workspace_dir: W } = args
 const D = args.release_date
 const R = `${W}/research/${D}-deep-${Q}`
-const progressPath = args.progress_path || `${R}/.progress.json`
+const hasModelPath = typeof args.model_path === 'string' && args.model_path.trim().length > 0
+const progressFileName = hasModelPath ? '.progress.json' : '.progress.no-model.json'
+const progressPath = args.progress_path || `${R}/${progressFileName}`
 const S = '.agents/skills/dalton-earnings-deep'
 const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；${C || T}（${T}）${Q}，发布日 ${D}。快讯稿在 ${W}/research/ 或 ${W}/drafts/ 下 flash-${Q}。`
 const OUT = {
@@ -203,8 +205,7 @@ if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
   return finish({
     blocked: review.summary || '审稿 block',
-    resume_hint:
-      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+    resume_hint: `修订报告后用启动时的同一组参数 + resume=<${progressFileName} 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发`,
   })
 }
 
@@ -296,8 +297,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
     incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
     return finish({
       blocked: reReview.summary || '复审 block',
-      resume_hint:
-        '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+      resume_hint: `修订报告后用启动时的同一组参数 + resume=<${progressFileName} 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发`,
     })
   }
   finalReview = reReview
