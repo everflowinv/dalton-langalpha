@@ -5756,3 +5756,35 @@ def test_r6_item3_host_direct_yaml_capabilities_with_and_without_pyyaml_and_requ
     )
     assert res_complex_fallback["cli_rc"] != 0
     assert "capability_disabled" in str(res_complex_fallback["cli_out"].get("error") or "")
+
+
+def test_bridge_keeps_routes_served_when_host_python_cannot_evaluate_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """11-28 D6 outage: on the host Python, effective_capabilities() imports the backend
+    settings stack (src.config -> ptc_agent) and raised ModuleNotFoundError on every call,
+    so every researchdata request failed. The bridge must fall back to serving routes."""
+    from src.dalton.capabilities import BRIDGE_ROUTE_CAPABILITY_MAP
+
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_bridge_host_python_caps", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+    repo_env = tmp_path / "everflow.env"
+    repo_env.write_text("APP_ENV=dalton\n", encoding="utf-8")
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    bridge = bridge_mod.ResearchDataBridge(bridge_mod.BridgeConfig())
+
+    caps_mod = bridge_mod._import_dalton_capabilities()
+
+    def _raise(*_a, **_k):
+        raise ModuleNotFoundError("No module named 'ptc_agent'")
+
+    monkeypatch.setattr(caps_mod, "effective_capabilities", _raise)
+    assert bridge._effective_capabilities_cached() is None
+    for route_id in sorted(BRIDGE_ROUTE_CAPABILITY_MAP):
+        assert bridge._is_route_capability_disabled(route_id) is False
