@@ -519,7 +519,8 @@ export interface ExecutionStateTracker {
 export interface AuthorizedPlanDeliveryOptions {
   /** When present, the shared loop uses this plan and does not fetch a data-task plan. */
   rawPlan?: unknown;
-  claimKind?: "data_task" | "automation_notify";
+  claimKind?: "data_task" | "automation_notify" | "failure_notice";
+  claimToken?: string | null;
   liveCheckPurpose?: string;
 }
 
@@ -1213,6 +1214,10 @@ export class DataTaskNotificationService {
       };
     }
     const claimKind = options?.claimKind ?? "data_task";
+    const claimToken =
+      typeof options?.claimToken === "string" && options.claimToken.trim().length > 0
+        ? options.claimToken.trim()
+        : null;
     const liveCheckPurpose =
       options?.liveCheckPurpose ?? "data_task_notification";
     const suppliedPlan = Object.prototype.hasOwnProperty.call(
@@ -1508,6 +1513,7 @@ export class DataTaskNotificationService {
           platform,
           has_non_empty_text: hasNonEmptyText,
           total_chunks: totalChunks,
+          ...(claimToken ? { claim_token: claimToken } : {}),
         });
       } catch (claimErr) {
         if (isStaleGatewayEpochError(claimErr)) {

@@ -14,6 +14,13 @@ import {
   type PendingChartDeliveryReceipt,
 } from "./chart-snapshots.js";
 import { DeliveryService } from "./delivery-service.js";
+import type { DataTaskNotificationResponse } from "./data-task-notification-types.js";
+import type {
+  DataTaskNotificationService,
+  ExecutionStateTracker,
+} from "./data-task-notifications.js";
+import { isStaleGatewayEpochError } from "./gateway-lease.js";
+import { createSequentialQueue, type SequentialQueue } from "./shared/keyed-queue.js";
 import {
   type AgentAutomationOutputPutRequest,
   type AgentAutomationOutputPutResponse,
@@ -48,6 +55,8 @@ export class AgentRoutesHandler {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly deliveryService: DeliveryService;
+  private readonly dataTaskNotifications?: DataTaskNotificationService;
+  private readonly failureNoticeQueue: SequentialQueue;
   private readonly webBaseUrl: string;
 
   /**
@@ -70,11 +79,14 @@ export class AgentRoutesHandler {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
     deliveryService: DeliveryService;
+    dataTaskNotifications?: DataTaskNotificationService;
     webBaseUrl: string;
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
     this.deliveryService = options.deliveryService;
+    this.dataTaskNotifications = options.dataTaskNotifications;
+    this.failureNoticeQueue = createSequentialQueue({ taskTimeoutMs: 180_000 });
     this.webBaseUrl = options.webBaseUrl.replace(/\/+$/, "");
   }
 
@@ -890,13 +902,15 @@ export class AgentRoutesHandler {
         { callerHoldsExecutionLock: true },
       );
 
-      if (detailed.replayPending || detailed.chartsInFlight) {
+      if (detailed.replayPending || detailed.chartsInFlight || detailed.noticeRetryable) {
         return {
           status: 503,
           data: {
-            detail: detailed.chartsInFlight
-              ? "Automation charts or widgets are still being delivered; retry finish to settle."
-              : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            detail: detailed.noticeRetryable
+              ? "Automation status notice delivery encountered a transient error; retry finish to settle."
+              : detailed.chartsInFlight
+                ? "Automation charts or widgets are still being delivered; retry finish to settle."
+                : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
             retryable: true,
             targets: detailed.targets,
           },
@@ -959,6 +973,7 @@ export class AgentRoutesHandler {
     targets: AgentAutomationRunFinishTargetRow[];
     replayPending: boolean;
     chartsInFlight: boolean;
+    noticeRetryable: boolean;
     replayRetryable: boolean;
     replayHttpStatus: number | null;
   }> {
@@ -1065,6 +1080,7 @@ export class AgentRoutesHandler {
           autoWidgets.length > 0);
 
       let chartsInFlight = false;
+      let noticeRetryable = false;
 
       const deliverAutomationChartsForTarget = async (
         t: AutomationRunTargetRecord,
@@ -1245,6 +1261,14 @@ export class AgentRoutesHandler {
             error: null,
           });
         } else {
+          const isTransientNoticeFailure =
+            noticeRes.status === "unknown" ||
+            noticeRes.code === "unavailable" ||
+            noticeRes.code === "rate_limited" ||
+            noticeRes.code === "in_flight";
+          if (isTransientNoticeFailure) {
+            noticeRetryable = true;
+          }
           results.push({
             ...t,
             reached: false,
@@ -1254,7 +1278,7 @@ export class AgentRoutesHandler {
         }
       }
 
-      if (!replayTargetMissing && !chartsInFlight) {
+      if (!replayTargetMissing && !chartsInFlight && !noticeRetryable) {
         const finalized = await this.backend.finishAutomationRun(
           executionId,
           {
@@ -1288,6 +1312,7 @@ export class AgentRoutesHandler {
         })),
         replayPending: replayTargetMissing,
         chartsInFlight,
+        noticeRetryable,
         replayRetryable,
         replayHttpStatus,
       };
@@ -1295,6 +1320,173 @@ export class AgentRoutesHandler {
       if (acquiredHere) {
         this.activeFinishExecutors.delete(executionId);
       }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §3.3 POST /internal/failure-notices (leased claim_token delivery)
+  // -------------------------------------------------------------------------
+  async handleFailureNotice(rawBody: unknown): Promise<{
+    status: number;
+    data: DataTaskNotificationResponse;
+  }> {
+    const UUID_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const ALLOWED_KEYS = new Set(["target_receipt_id", "claim_token"]);
+    const isPlainObj = (val: unknown): val is Record<string, unknown> =>
+      typeof val === "object" && val !== null && !Array.isArray(val);
+    const failedBody = (
+      receiptId: string,
+      code: string,
+      message: string,
+      status: DataTaskNotificationResponse["status"] = "failed",
+    ): DataTaskNotificationResponse => ({
+      ok: false,
+      status,
+      code,
+      message,
+      run_id: receiptId,
+      target: "",
+      platform: null,
+      items_total: 0,
+      items_sent: 0,
+      items: [],
+    });
+
+    if (!isPlainObj(rawBody)) {
+      return {
+        status: 400,
+        data: failedBody("", "invalid_request", "Request body must be a JSON object."),
+      };
+    }
+    const extraKeys = Object.keys(rawBody).filter((k) => !ALLOWED_KEYS.has(k));
+    if (extraKeys.length > 0) {
+      return {
+        status: 400,
+        data: failedBody(
+          typeof rawBody.target_receipt_id === "string" ? rawBody.target_receipt_id : "",
+          "invalid_request",
+          `Forbidden caller fields in failure notice request: ${extraKeys.join(", ")}`,
+        ),
+      };
+    }
+    const receiptId =
+      typeof rawBody.target_receipt_id === "string"
+        ? rawBody.target_receipt_id.trim().toLowerCase()
+        : "";
+    const claimToken =
+      typeof rawBody.claim_token === "string"
+        ? rawBody.claim_token.trim().toLowerCase()
+        : "";
+    if (!receiptId || !UUID_RE.test(receiptId) || !claimToken || !UUID_RE.test(claimToken)) {
+      return {
+        status: 400,
+        data: failedBody(
+          receiptId,
+          "invalid_request",
+          "target_receipt_id and claim_token must both be valid UUIDs.",
+        ),
+      };
+    }
+    if (!this.dataTaskNotifications) {
+      return {
+        status: 503,
+        data: failedBody(
+          receiptId,
+          "unavailable",
+          "Failure notice delivery loop is not configured on this gateway.",
+        ),
+      };
+    }
+
+    const tracker: ExecutionStateTracker = {
+      claimedAnyItem: false,
+      resolvedPlatform: null,
+      itemsTotal: 0,
+      itemsSent: 0,
+      outcomes: [],
+    };
+    let captured:
+      | { status: number; data: DataTaskNotificationResponse }
+      | undefined;
+
+    try {
+      const queueOutcome = await this.failureNoticeQueue.enqueue(
+        receiptId,
+        async () => {
+          if (typeof this.backend.authorizeFailureNoticePlan !== "function") {
+            throw new Error(
+              "BackendClient does not implement authorizeFailureNoticePlan",
+            );
+          }
+          const rawPlan = await this.backend.authorizeFailureNoticePlan({
+            target_receipt_id: receiptId,
+            claim_token: claimToken,
+          });
+          const requested =
+            isPlainObj(rawPlan) && typeof rawPlan.requested_target === "string"
+              ? rawPlan.requested_target
+              : "";
+          captured = await this.dataTaskNotifications!.deliverAuthorizedPlan(
+            receiptId,
+            requested,
+            tracker,
+            {
+              rawPlan,
+              claimKind: "failure_notice",
+              claimToken,
+              liveCheckPurpose: "failure_notice",
+            },
+          );
+        },
+      );
+      if (queueOutcome === "completed" && captured !== undefined) {
+        return captured;
+      }
+      const uncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: uncertain ? "unknown" : "failed",
+          code: uncertain ? "delivery_uncertain" : "unavailable",
+          message: uncertain
+            ? "Failure notice timed out after claiming delivery; state is uncertain."
+            : "Failure notice timed out before claiming any item.",
+          run_id: receiptId,
+          target: "",
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      const uncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : uncertain
+            ? "Backend communication failed after claiming delivery; state is uncertain."
+            : "Backend communication failed before claiming delivery.";
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: uncertain ? "unknown" : "failed",
+          code: uncertain ? "delivery_uncertain" : "unavailable",
+          message,
+          run_id: receiptId,
+          target: "",
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
     }
   }
 

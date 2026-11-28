@@ -446,7 +446,8 @@ export interface I6AuthorizeAndClaimRequest {
     | "automation"
     | "notice"
     | "data_task"
-    | "automation_notify";
+    | "automation_notify"
+    | "failure_notice";
   user_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
@@ -462,6 +463,7 @@ export interface I6AuthorizeAndClaimRequest {
   activity_origin?: DeliveryActivityOrigin | null;
   retry_dedup_by_target?: boolean;
   payload_digest?: string | null;
+  claim_token?: string | null;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -2161,7 +2163,11 @@ export class HttpBackendClient implements BackendClient {
     );
     const includeGatewayEpoch =
       inferredPlatform === "weixin" || inferredPlatform === null;
-    if (req.kind === "data_task" || req.kind === "automation_notify") {
+    if (
+      req.kind === "data_task" ||
+      req.kind === "automation_notify" ||
+      req.kind === "failure_notice"
+    ) {
       const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
         "POST",
         "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
@@ -2227,7 +2233,8 @@ export class HttpBackendClient implements BackendClient {
     if (
       typeof req.delivery_key === "string" &&
       (req.delivery_key.startsWith("data_task:") ||
-        req.delivery_key.startsWith("automation_notify:"))
+        req.delivery_key.startsWith("automation_notify:") ||
+        req.delivery_key.startsWith("failure_notice:"))
     ) {
       const { data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
         "POST",
@@ -3255,6 +3262,28 @@ export class HttpBackendClient implements BackendClient {
         cache: "no-store",
         strictJson: true,
         operationLabel: "authorizeAutomationNotificationPlan",
+      },
+    );
+    return data;
+  }
+
+  async authorizeFailureNoticePlan(req: {
+    target_receipt_id: string;
+    claim_token: string;
+  }): Promise<DataTaskAuthorizePlanResponse> {
+    const { data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/failure-notices/plan",
+      {
+        body: {
+          target_receipt_id: req.target_receipt_id,
+          claim_token: req.claim_token,
+        },
+        timeoutMs: 15_000,
+        redirect: "error",
+        cache: "no-store",
+        strictJson: true,
+        operationLabel: "authorizeFailureNoticePlan",
       },
     );
     return data;

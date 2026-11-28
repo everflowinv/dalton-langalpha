@@ -829,6 +829,22 @@ class ExecutionDeliverySummary(BaseModel):
     targets: List[ExecutionDeliveryTarget] = Field(default_factory=list)
 
 
+# DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary attached on read
+class FailureNoticeSummary(BaseModel):
+    """Compact durable failure-notice receipt state from ``dalton_failure_notices``."""
+
+    notice_id: str
+    subject_kind: str
+    status: str
+    failure_reason: Optional[str] = None
+    total_targets: int = 0
+    sent_count: int = 0
+    failed_count: int = 0
+    retrying_count: int = 0
+    last_error_code: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
 class AutomationExecutionResponse(BaseModel):
     """One execution: a history row, and an automation's newest run."""
 
@@ -850,6 +866,8 @@ class AutomationExecutionResponse(BaseModel):
     delivery_result: Optional[List[Dict[str, Any]]] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery status across notify ledger and delivery_result
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary
+    failure_notice: Optional[FailureNoticeSummary] = None
     created_at: datetime
     # When the user took this failed run out of Needs attention.
     dismissed_at: Optional[datetime] = None

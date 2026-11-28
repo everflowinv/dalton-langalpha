@@ -2741,6 +2741,9 @@ async def test_card_limit_not_allowed_stops_retrying_and_records_execution_undel
             if "UPDATE automation_executions" in sql and params:
                 excerpt_updates.append(str(params[0]))
 
+        async def fetchone(self):
+            return {"status": "completed"}
+
         async def fetchall(self):
             return []
 
@@ -2912,6 +2915,7 @@ async def test_sync_terminal_undelivered_execution_queries_valid_d014_columns_an
         captured_sql.append((" ".join(str(sql).split()), params))
 
     cursor_double.execute.side_effect = _fake_execute
+    cursor_double.fetchone.return_value = {"status": "completed"}
     cursor_double.fetchall.return_value = [
         {
             "channel": "feishu",

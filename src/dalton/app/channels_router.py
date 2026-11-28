@@ -11,6 +11,7 @@ import logging
 import os
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
+from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse

@@ -264,6 +264,7 @@ export function createGatewayApp(options: {
     backend,
     adapters,
     deliveryService,
+    dataTaskNotifications,
     webBaseUrl: config.webBaseUrl,
   });
   const orchestrator = new ChannelGatewayOrchestrator({
@@ -471,6 +472,30 @@ export function createGatewayApp(options: {
           return;
         }
         const result = await automationNotifications.handle(body);
+        sendJson(res, result.status, result.data);
+        return;
+      }
+
+      if (method === "POST" && pathname === "/internal/failure-notices") {
+        let body: unknown;
+        try {
+          body = await readJsonBody<unknown>(req);
+        } catch {
+          sendJson(res, 400, {
+            ok: false,
+            status: "failed",
+            code: "invalid_json",
+            message: "Malformed JSON request body.",
+            run_id: "",
+            target: "",
+            platform: null,
+            items_total: 0,
+            items_sent: 0,
+            items: [],
+          });
+          return;
+        }
+        const result = await agentRoutes.handleFailureNotice(body);
         sendJson(res, result.status, result.data);
         return;
       }
