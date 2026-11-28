@@ -1748,6 +1748,74 @@ def build_researchdata_plugin_instruction() -> str:
 INTERNAL_LIBRARY_ROUTES: frozenset[str] = frozenset(
     {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all", "sales-mail"}
 )
+
+# Batch 3b routes hosted by `dalton-research-host` (:8951). After cutover
+# (`DALTON_RESEARCH_HOST_URL` configured in a non-core deployment), legacy
+# `research(route=...)` calls transparently forward to `/mcp/<connector>`
+# instead of returning `route_migrated`.
+RESEARCH_HOST_FORWARD_ROUTES: dict[str, str] = {
+    "guidepoint": "guidepoint",
+    "company-wiki": "company-wiki",
+    "sales-notes": "sales-notes",
+    "tmtb": "tmtb",
+    "funda-ai": "funda-ai",
+    "all": "federated",
+    "sales-mail": "federated",
+}
+
+RESEARCH_HOST_FORWARD_INGEST_TARGETS: dict[str, str] = {
+    "wiki": "wiki",
+    "sales-notes": "sales-notes",
+}
+
+RESEARCH_HOST_FORWARD_DESCRIPTION_NOTE: str = (
+    "\n注：guidepoint、company-wiki、sales-notes、tmtb、funda-ai、all（及 sales-mail）"
+    "已由研究宿主服务承载，本入口照常可用并自动透明转发至研究宿主。"
+)
+
+RESEARCH_HOST_FORWARD_CATALOG_RULE: str = (
+    "已由研究宿主服务承载，经本入口自动透明转发至研究宿主。"
+)
+
+RESEARCH_IMAGE_PREVIEW_MAX_BYTES: int = 5 * 1024 * 1024
+
+_SALES_MAIL_MIGRATION_META: dict[str, str] = {
+    "deprecated_route": "sales-mail",
+    "engine": "research_library",
+    "result_format": "document_v1",
+    "replacement": "sales-notes / tmtb / all",
+    "note": "旧名称只作转发；返回 document_id/snippet，用 read 读取正文，不再返回旧分块 JSON。",
+}
+
+_LOCAL_LIBRARY_SOURCE_IDS: frozenset[str] = frozenset(
+    {"company-wiki", "sales-notes", "tmtb", "funda-ai"}
+)
+
+
+def _normalize_research_host_url(raw_url: str) -> str:
+    """Normalize a ``DALTON_RESEARCH_HOST_URL`` for direct host-side HTTP forwarding.
+
+    When the bridge runs on the Mac host (outside Docker), ``host.docker.internal``
+    in shared repo ``.env`` is mapped to loopback ``127.0.0.1`` so it reaches
+    ``com.dalton.research-host`` directly.
+    """
+    cleaned = str(raw_url or "").strip().rstrip("/")
+    if not cleaned or (cleaned.startswith("${") and cleaned.endswith("}")):
+        return ""
+    in_docker = os.path.exists("/.dockerenv")
+    if "{HOST_IP}" in cleaned:
+        cleaned = cleaned.replace("{HOST_IP}", "host.docker.internal" if in_docker else "127.0.0.1")
+    parsed = urllib.parse.urlsplit(cleaned)
+    if (
+        parsed.scheme
+        and (parsed.hostname or "").lower() == "host.docker.internal"
+        and not in_docker
+    ):
+        netloc = f"127.0.0.1:{parsed.port}" if parsed.port else "127.0.0.1"
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+        ).rstrip("/")
+    return cleaned
 # Routes whose gateway (data_gateway.py) accepts query/start/end only (the
 # library ones add `document`) and refuses `--ticker`; the bridge folds a
 # ticker into the query instead of letting the call die upstream.
@@ -6253,6 +6321,12 @@ def _is_empty_non_community_payload(
     status = str(payload.get("status") or "").strip().lower()
     if status in ("no_match", "empty"):
         return True
+    if route == "all" and any(
+        isinstance((payload.get(k) or {}).get("results"), list)
+        and len(payload[k]["results"]) > 0
+        for k in ("alphaengine", "guidepoint")
+    ):
+        return False
     for container in (payload, data_dict, sc_dict if isinstance(sc_dict, dict) else {}):
         if not isinstance(container, dict):
             continue
@@ -8435,6 +8509,9 @@ class ResearchDataBridge:
         self._host_abort_before_gate_release: bool = False
         self._discord_http: Any = None
         self._gcal_http: Any = None
+        self._research_host_http: Any = None
+        self._research_host_concurrency: _FairConcurrencyLimiter | None = None
+        self._cached_tools_rh_forward: bool | None = None
         self._discord_sleep: Any = asyncio.sleep
         self._alphaengine_cache: _ae_cache.AlphaEngineSearchCache | None = None
         self._inflight_searches: dict[str, dict[str, Any]] = {}
@@ -8486,11 +8563,15 @@ class ResearchDataBridge:
     def research_drain_status(self) -> dict[str, Any]:
         """Return bridge research/ingest drain flag and live concurrency counters (§6.4b (1) #2)."""
         conc_snap = self._get_concurrency().status_snapshot()
+        rh_limiter = getattr(self, "_research_host_concurrency", None)
+        rh_snap = rh_limiter.status_snapshot() if rh_limiter is not None else {}
         return {
             "ok": True,
             "draining": bool(getattr(self, "_research_draining", False)),
-            "inflight": int(conc_snap.get("global_inflight", 0)),
-            "queued": int(conc_snap.get("total_queued", 0)),
+            "inflight": int(conc_snap.get("global_inflight", 0))
+            + int(rh_snap.get("global_inflight", 0)),
+            "queued": int(conc_snap.get("total_queued", 0))
+            + int(rh_snap.get("total_queued", 0)),
             "ingest_inflight": int(getattr(self, "_ingest_inflight", 0)),
         }
 
@@ -8608,6 +8689,927 @@ class ResearchDataBridge:
                 target, environ=self._effective_capability_env()
             )
         )
+
+    def _resolve_research_host_url(self) -> str:
+        """Return normalized ``dalton-research-host`` base URL when cutover is active.
+
+        Only recognizes ``DALTON_RESEARCH_HOST_URL`` (never
+        ``DALTON_RESEARCH_HOST_BASE_URL`` alone) and returns ``""`` for Core
+        profile, keeping pre-cutover & Core behavior untouched.
+        """
+        env = self._effective_capability_env()
+        app_env = str(env.get("APP_ENV") or "").strip().lower()
+        profile = str(env.get("DALTON_PROFILE") or "").strip().lower()
+        if app_env == "core" or profile == "core":
+            return ""
+        return _normalize_research_host_url(
+            str(env.get("DALTON_RESEARCH_HOST_URL") or "")
+        )
+
+    def _resolve_research_host_token(self) -> str:
+        env = self._effective_capability_env()
+        return str(env.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
+
+    def _resolve_research_admin_token(self) -> str:
+        env = self._effective_capability_env()
+        return str(env.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
+
+    def _is_research_host_forwarding_active(self) -> bool:
+        return bool(self._resolve_research_host_url())
+
+    @staticmethod
+    def _research_host_connector_for_route(tool_name: str, route: str) -> str | None:
+        if tool_name != "research":
+            return None
+        cleaned = str(route or "").strip().lower()
+        return RESEARCH_HOST_FORWARD_ROUTES.get(cleaned)
+
+    def _should_forward_route_to_research_host(self, tool_name: str, route: str) -> bool:
+        if self._research_host_connector_for_route(tool_name, route) is None:
+            return False
+        return self._is_research_host_forwarding_active()
+
+    def _get_research_host_concurrency(self) -> _FairConcurrencyLimiter:
+        limiter = getattr(self, "_research_host_concurrency", None)
+        if limiter is None:
+            cfg = getattr(self, "cfg", None)
+            limiter = _FairConcurrencyLimiter(
+                max_inflight=int(getattr(cfg, "max_inflight", 6) or 6),
+                max_inflight_per_caller=int(
+                    getattr(cfg, "max_inflight_per_caller", 2) or 2
+                ),
+                automation_reserved=int(
+                    getattr(cfg, "automation_reserved", 2)
+                    if getattr(cfg, "automation_reserved", None) is not None
+                    else 2
+                ),
+                max_inflight_unsigned=int(
+                    getattr(cfg, "max_inflight_unsigned", 1) or 1
+                ),
+            )
+            self._research_host_concurrency = limiter
+        return limiter
+
+    @staticmethod
+    def _build_research_host_mcp_request(
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+        *,
+        online_all_sources: tuple[str, ...] = (),
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Map a legacy ``research(route=...)`` call to ``(connector_id, tool_name, arguments)``."""
+        cleaned_route = str(route or "").strip().lower()
+        connector_id = RESEARCH_HOST_FORWARD_ROUTES[cleaned_route]
+        fwd_args: dict[str, Any] = {
+            k: v
+            for k, v in call_args.items()
+            if k not in ("route", "operation", "action", "timeout", "mode")
+            and v is not None
+        }
+        if cleaned_route == "guidepoint":
+            tool_name = operation or "search_library"
+            fwd_args["timeout"] = int(eff_timeout)
+        elif cleaned_route == "sales-mail":
+            tool_name = "sales_mail"
+            fwd_args["operation"] = operation or "search"
+        else:
+            tool_name = operation or "search"
+        if (
+            cleaned_route == "all"
+            and tool_name == "search"
+            and online_all_sources
+            and isinstance(fwd_args.get("params"), dict)
+        ):
+            raw_sources = fwd_args["params"].get("sources")
+            if isinstance(raw_sources, list) and raw_sources:
+                cleaned_sources = [
+                    str(s).strip() for s in raw_sources if isinstance(s, str) and str(s).strip()
+                ]
+                if cleaned_sources and all(
+                    s in _LOCAL_LIBRARY_SOURCE_IDS for s in cleaned_sources
+                ):
+                    expanded = list(
+                        dict.fromkeys([*cleaned_sources, *online_all_sources])
+                    )
+                    fwd_args["params"] = {**fwd_args["params"], "sources": expanded}
+        return connector_id, tool_name, fwd_args
+
+    def _load_legacy_route_entry(self, route: str) -> dict[str, Any]:
+        """Load the legacy ``config/data_sources.json`` route entry (including hidden routes)."""
+        code_root = self._research_code_root()
+        cache: tuple[Path, dict[str, dict[str, Any]]] | None = getattr(
+            self, "_legacy_route_registry_cache", None
+        )
+        routes_map: dict[str, dict[str, Any]]
+        if cache is not None and cache[0] == code_root:
+            routes_map = cache[1]
+        else:
+            routes_map = {}
+            reg_path = code_root / "config" / "data_sources.json"
+            try:
+                raw_reg = json.loads(reg_path.read_text(encoding="utf-8"))
+                for item in raw_reg.get("routes") or []:
+                    if isinstance(item, dict) and item.get("id"):
+                        routes_map[str(item["id"])] = item
+            except (OSError, ValueError):
+                routes_map = {}
+            self._legacy_route_registry_cache = (code_root, routes_map)
+        found = routes_map.get(route)
+        if isinstance(found, dict):
+            return copy.deepcopy(found)
+        return {"id": route, "category": "research"}
+
+    @staticmethod
+    def _build_legacy_request_meta(
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        """Build the legacy ``data_gateway.py`` ``request`` metadata dict."""
+        req_meta: dict[str, Any] = {"route": route}
+        if operation:
+            req_meta["operation"] = operation
+        for key in (
+            "ticker",
+            "query",
+            "series",
+            "concept",
+            "item",
+            "document",
+            "form",
+            "dataset",
+            "start",
+            "end",
+            "as_of",
+            "vintage",
+        ):
+            val = call_args.get(key)
+            if val is not None and val != "":
+                req_meta[key] = val
+        params = call_args.get("params")
+        if isinstance(params, Mapping) and params:
+            req_meta["params_json"] = json.dumps(dict(params), ensure_ascii=False)
+        raw_limit = call_args.get("limit")
+        req_meta["limit"] = (
+            int(raw_limit)
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 3
+        )
+        req_meta["timeout"] = int(eff_timeout)
+        return req_meta
+
+    @staticmethod
+    def _build_legacy_guidepoint_parameters(call_args: Mapping[str, Any]) -> dict[str, Any]:
+        """Build ``parameters`` matching ``data_gateway.native_request`` for ``guidepoint``."""
+        raw_p = call_args.get("params")
+        gp_params: dict[str, Any] = dict(raw_p) if isinstance(raw_p, Mapping) else {}
+        query = call_args.get("query")
+        if isinstance(query, str) and query.strip():
+            gp_params["query"] = query
+        raw_limit = call_args.get("limit")
+        limit = (
+            int(raw_limit)
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 3
+        )
+        gp_params.setdefault("size", min(limit, 30))
+        if call_args.get("start"):
+            gp_params["start_date"] = call_args["start"]
+        if call_args.get("end"):
+            gp_params["end_date"] = call_args["end"]
+        return gp_params
+
+    def _build_research_host_plan_payload(
+        self,
+        *,
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        """Return the legacy ``mode='plan'`` preview payload (``executed: False``) without calling research-host."""
+        cleaned_route = str(route or "").strip().lower()
+        route_entry = self._load_legacy_route_entry(cleaned_route)
+        eff_op = operation or (
+            "search_library"
+            if cleaned_route == "guidepoint"
+            else (
+                str(route_entry["operations"][0])
+                if isinstance(route_entry.get("operations"), list)
+                and route_entry["operations"]
+                else "search"
+            )
+        )
+        req_meta = self._build_legacy_request_meta(
+            cleaned_route, eff_op, call_args, eff_timeout
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if cleaned_route == "guidepoint":
+            return {
+                "ok": True,
+                "status": "planned",
+                "executed": False,
+                "route": route_entry,
+                "argv": None,
+                "request": req_meta,
+                "operation": eff_op,
+                "parameters": self._build_legacy_guidepoint_parameters(call_args),
+                "gateway_at": now_iso,
+            }
+
+        code_root = self._research_code_root()
+        raw_p = call_args.get("params")
+        params: dict[str, Any] = dict(raw_p) if isinstance(raw_p, Mapping) else {}
+        enabled_sources = self._enabled_local_library_sources()
+        target = "all" if cleaned_route == "sales-mail" else cleaned_route
+        if cleaned_route == "sales-mail":
+            sm_valid = ("sales-notes", "tmtb")
+            if "sources" not in params:
+                if eff_op in ("search", "list"):
+                    params["sources"] = [
+                        s for s in sm_valid if s in enabled_sources
+                    ] or list(sm_valid)
+                elif eff_op == "read":
+                    doc_str = str(call_args.get("document") or "").strip()
+                    prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                    if prefix == "tmtb":
+                        params["sources"] = ["tmtb"]
+                    elif prefix in ("mail", "digest"):
+                        params["sources"] = ["sales-notes"]
+                    else:
+                        params["sources"] = [
+                            s for s in sm_valid if s in enabled_sources
+                        ] or list(sm_valid)
+            if eff_op in ("search", "list"):
+                eff_sources = params.get("sources") or list(sm_valid)
+                default_layer = "all" if "sales-notes" in eff_sources else "raw"
+                params = {"layer": default_layer, "media": "text", **params}
+        cmd: list[str] = [
+            "bash",
+            str(code_root / "scripts" / "research_library.sh"),
+            target,
+            f"--operation={eff_op}",
+            f"--limit={req_meta['limit']}",
+            "--params-json=" + json.dumps(params, ensure_ascii=False),
+            "--allowed-sources=" + ",".join(enabled_sources),
+        ]
+        for field in ("query", "document", "start", "end"):
+            val = call_args.get(field)
+            if val:
+                cmd.append(f"--{field}={val}")
+        plan_out: dict[str, Any] = {
+            "ok": True,
+            "status": "planned",
+            "executed": False,
+            "route": route_entry,
+            "argv": cmd,
+            "request": req_meta,
+            "gateway_at": now_iso,
+        }
+        if cleaned_route == "sales-mail":
+            plan_out["migration"] = dict(_SALES_MAIL_MIGRATION_META)
+        return plan_out
+
+    def _restore_legacy_research_host_payload(
+        self,
+        *,
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore a flat research-host payload back to the pre-cutover ``data_gateway`` envelope.
+
+        Keeps ``data.document`` / ``data.results`` (and Guidepoint's
+        ``data.structuredContent.data``) in their pre-cutover positions instead of
+        hoisting them to top level, while retaining top-level ``alphaengine``,
+        ``guidepoint``, and ``source_status`` on federated ``route='all'`` searches.
+        """
+        cleaned_route = str(route or "").strip().lower()
+        route_entry = self._load_legacy_route_entry(cleaned_route)
+        eff_op = operation or (
+            "search_library" if cleaned_route == "guidepoint" else "search"
+        )
+        req_meta = self._build_legacy_request_meta(
+            cleaned_route, eff_op, call_args, eff_timeout
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        upstream_sources = (
+            list(payload["_sources"])
+            if isinstance(payload.get("_sources"), list) and payload["_sources"]
+            else None
+        )
+        ok_flag = bool(payload.get("ok", True))
+        status_val = str(payload.get("status") or ("ok" if ok_flag else "error"))
+
+        if cleaned_route == "guidepoint":
+            if not ok_flag and "data" not in payload and "results" not in payload:
+                return dict(payload)
+            gp_data = payload.get("data")
+            if not isinstance(gp_data, dict):
+                rows = (
+                    list(payload["results"])
+                    if isinstance(payload.get("results"), list)
+                    else []
+                )
+                gp_data = {"structuredContent": {"data": rows}}
+            elif "structuredContent" not in gp_data and isinstance(
+                payload.get("results"), list
+            ):
+                gp_data = {
+                    **gp_data,
+                    "structuredContent": {"data": list(payload["results"])},
+                }
+            restored_gp: dict[str, Any] = {
+                "ok": ok_flag,
+                "status": status_val,
+                "executed": True,
+                "route": route_entry,
+                "argv": None,
+                "request": req_meta,
+                "operation": eff_op,
+                "parameters": self._build_legacy_guidepoint_parameters(call_args),
+                "data": gp_data,
+                "gateway_at": now_iso,
+            }
+            if upstream_sources is not None:
+                restored_gp["_sources"] = upstream_sources
+            for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                if err_k in payload:
+                    restored_gp[err_k] = payload[err_k]
+            return restored_gp
+
+        # Defensive guard: if payload is already in the legacy data-envelope shape, keep it
+        existing_data = payload.get("data")
+        if isinstance(existing_data, dict) and (
+            "document" in existing_data or "results" in existing_data
+        ):
+            return dict(payload)
+
+        has_body = (
+            "document" in payload
+            or "results" in payload
+            or "alphaengine" in payload
+            or "guidepoint" in payload
+        )
+        if not ok_flag and not has_body:
+            return dict(payload)
+
+        if cleaned_route == "all" and eff_op == "search":
+            ae_block = payload.get("alphaengine")
+            gp_block = payload.get("guidepoint")
+            top_source_status = payload.get("source_status")
+            inner_all: dict[str, Any] = {
+                k: v
+                for k, v in payload.items()
+                if k
+                not in (
+                    "_sources",
+                    "_declared_sources",
+                    "alphaengine",
+                    "guidepoint",
+                    "source_status",
+                )
+            }
+            inner_all.setdefault("local_only", True)
+            if isinstance(top_source_status, dict):
+                local_status = {
+                    k: v
+                    for k, v in top_source_status.items()
+                    if k not in ("alphaengine", "guidepoint")
+                }
+                if local_status:
+                    inner_all["source_status"] = local_status
+            restored_all: dict[str, Any] = {
+                "ok": ok_flag,
+                "status": status_val,
+                "executed": True,
+                "route": route_entry,
+                "request": req_meta,
+                "data": inner_all,
+                "gateway_at": now_iso,
+            }
+            if isinstance(top_source_status, dict):
+                restored_all["source_status"] = dict(top_source_status)
+            if isinstance(ae_block, dict):
+                ae_copy = dict(ae_block)
+                ae_copy.setdefault("route", "alphaengine")
+                restored_all["alphaengine"] = ae_copy
+            if isinstance(gp_block, dict):
+                gp_copy = dict(gp_block)
+                gp_copy.setdefault("route", "guidepoint")
+                restored_all["guidepoint"] = gp_copy
+            if upstream_sources is not None:
+                restored_all["_sources"] = upstream_sources
+            if not ok_flag:
+                for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                    if err_k in payload:
+                        restored_all[err_k] = payload[err_k]
+            return restored_all
+
+        inner_lib: dict[str, Any] = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("_sources", "_declared_sources")
+        }
+        restored_lib: dict[str, Any] = {
+            "ok": ok_flag,
+            "status": status_val,
+            "executed": True,
+            "route": route_entry,
+            "request": req_meta,
+            "data": inner_lib,
+            "gateway_at": now_iso,
+        }
+        if cleaned_route == "sales-mail":
+            restored_lib["migration"] = dict(_SALES_MAIL_MIGRATION_META)
+        if upstream_sources is not None:
+            restored_lib["_sources"] = upstream_sources
+        if not ok_flag:
+            for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                if err_k in payload:
+                    restored_lib[err_k] = payload[err_k]
+        return restored_lib
+
+    def _load_research_host_image_block(
+        self,
+        restored_payload: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Read host preview file into an MCP ``image`` block for image reads.
+
+        Mirrors legacy ``researchdata_mcp.py`` path containment under
+        ``<research_home>/state/research-images/assets`` and 5 MiB size limit.
+        """
+        if not restored_payload.get("ok"):
+            return None, None
+        data_obj = restored_payload.get("data")
+        if not isinstance(data_obj, Mapping):
+            return None, None
+        doc = data_obj.get("document")
+        if not isinstance(doc, Mapping) or doc.get("media_type") != "image":
+            return None, None
+        raw_preview = doc.get("preview_path")
+        if not isinstance(raw_preview, str) or not raw_preview.strip():
+            return None, "invalid image asset path"
+        try:
+            assets_root = (
+                self._research_home_root() / "state" / "research-images" / "assets"
+            ).resolve()
+            preview = Path(raw_preview).expanduser().resolve()
+        except OSError:
+            return None, "invalid image asset path"
+        if not preview.is_relative_to(assets_root):
+            return None, "invalid image asset path"
+        try:
+            st = preview.stat()
+            if st.st_size > RESEARCH_IMAGE_PREVIEW_MAX_BYTES:
+                return None, "image preview too large"
+            img_bytes = preview.read_bytes()
+        except OSError as exc:
+            return None, f"image preview unreadable: {type(exc).__name__}"
+        if len(img_bytes) > RESEARCH_IMAGE_PREVIEW_MAX_BYTES:
+            return None, "image preview too large"
+        mime_type = str(doc.get("preview_mime") or "image/jpeg").strip() or "image/jpeg"
+        return {
+            "type": "image",
+            "mimeType": mime_type,
+            "data": base64.b64encode(img_bytes).decode("ascii"),
+        }, None
+
+    async def _post_research_host_json(
+        self,
+        url: str,
+        *,
+        json_body: dict[str, Any],
+        headers: dict[str, str],
+        timeout_s: float,
+    ) -> Any:
+        import httpx
+
+        eff_timeout = max(0.1, float(timeout_s))
+        timeout_cfg = httpx.Timeout(
+            connect=min(5.0, eff_timeout),
+            read=eff_timeout,
+            write=eff_timeout,
+            pool=min(5.0, eff_timeout),
+        )
+        client = getattr(self, "_research_host_http", None)
+        if client is not None:
+            return await asyncio.wait_for(
+                client.post(url, json=json_body, headers=headers, timeout=timeout_cfg),
+                timeout=eff_timeout,
+            )
+        async with httpx.AsyncClient(timeout=timeout_cfg, trust_env=False) as owned:
+            return await asyncio.wait_for(
+                owned.post(url, json=json_body, headers=headers),
+                timeout=eff_timeout,
+            )
+
+    @staticmethod
+    def _extract_research_host_mcp_payload(
+        body: Any,
+    ) -> tuple[dict[str, Any] | None, bool, str | None]:
+        """Extract ``(payload_dict, is_error, rpc_error_msg)`` from a research-host MCP reply."""
+        if not isinstance(body, dict):
+            return None, True, "Invalid non-object response"
+        if isinstance(body.get("error"), dict):
+            err_obj = body["error"]
+            msg = str(err_obj.get("message") or err_obj or "JSON-RPC error").strip()
+            return None, True, msg
+        if "error" in body and body.get("error") is not None and "result" not in body:
+            return None, True, str(body["error"]).strip()
+        result_obj = body.get("result")
+        if isinstance(result_obj, dict):
+            is_err = bool(result_obj.get("isError", False))
+            sc = result_obj.get("structuredContent")
+            if isinstance(sc, dict):
+                return dict(sc), is_err, None
+            for blk in result_obj.get("content") or []:
+                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                    try:
+                        cand = json.loads(blk["text"])
+                        if isinstance(cand, dict):
+                            return dict(cand), is_err, None
+                    except ValueError:
+                        continue
+            return None, True, "Unrecognized MCP tool result content"
+        if "ok" in body or "error_code" in body:
+            return dict(body), not bool(body.get("ok", False)), None
+        return None, True, "Missing JSON-RPC result"
+
+    @staticmethod
+    def _extract_research_host_mcp_result(
+        body: Any,
+    ) -> tuple[dict[str, Any] | None, bool, str | None, list[dict[str, Any]]]:
+        """Extract ``(payload_dict, is_error, rpc_error_msg, extra_image_blocks)`` from a research-host MCP reply."""
+        payload, is_err, rpc_err = ResearchDataBridge._extract_research_host_mcp_payload(
+            body
+        )
+        extra_blocks: list[dict[str, Any]] = []
+        if isinstance(body, dict) and isinstance(body.get("result"), dict):
+            for blk in body["result"].get("content") or []:
+                if (
+                    isinstance(blk, dict)
+                    and blk.get("type") == "image"
+                    and isinstance(blk.get("data"), str)
+                    and isinstance(blk.get("mimeType"), str)
+                ):
+                    extra_blocks.append(
+                        {
+                            "type": "image",
+                            "mimeType": blk["mimeType"],
+                            "data": blk["data"],
+                        }
+                    )
+        return payload, is_err, rpc_err, extra_blocks
+
+    @staticmethod
+    def _wrap_research_host_mcp_reply(
+        req_id: Any,
+        payload: dict[str, Any],
+        *,
+        is_error: bool,
+        extra_content_blocks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": json.dumps(payload, ensure_ascii=False),
+            }
+        ]
+        if extra_content_blocks:
+            content.extend(dict(b) for b in extra_content_blocks)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id if req_id is not None else 1,
+            "result": {
+                "content": content,
+                "structuredContent": dict(payload),
+                "isError": bool(is_error),
+            },
+        }
+
+    async def _forward_research_host_mcp(
+        self,
+        *,
+        req_id: Any,
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+        remaining_budget_s: float,
+        raw_caller_token: str | None,
+        corr_id: str,
+    ) -> dict[str, Any]:
+        """Transparently forward a migrated ``research`` route to ``dalton-research-host`` (:8951).
+
+        Never falls back to legacy local execution when ``research-host`` is unavailable.
+        """
+        import httpx
+
+        base_url = self._resolve_research_host_url()
+        online_all_sources: list[str] = []
+        if str(route or "").strip().lower() == "all":
+            if not self._is_route_capability_disabled("alphaengine"):
+                online_all_sources.append("alphaengine")
+            if not self._is_route_capability_disabled("guidepoint"):
+                online_all_sources.append("guidepoint")
+        connector_id, rh_tool_name, fwd_args = self._build_research_host_mcp_request(
+            route,
+            operation,
+            call_args,
+            eff_timeout,
+            online_all_sources=tuple(online_all_sources),
+        )
+        url = f"{base_url}/mcp/{connector_id}"
+        host_token = self._resolve_research_host_token()
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Dalton-Request-Timeout-Ms": str(max(100, int(remaining_budget_s * 1000))),
+        }
+        if host_token:
+            headers["Authorization"] = f"Bearer {host_token}"
+        caller_tok = str(raw_caller_token or "").strip()
+        if caller_tok:
+            headers["X-Dalton-Caller-Scope"] = "per-request"
+            headers["X-Dalton-Caller-Token"] = caller_tok
+
+        rpc_body = {
+            "jsonrpc": "2.0",
+            "id": req_id if req_id is not None else 1,
+            "method": "tools/call",
+            "params": {"name": rh_tool_name, "arguments": fwd_args},
+        }
+        try:
+            resp = await self._post_research_host_json(
+                url,
+                json_body=rpc_body,
+                headers=headers,
+                timeout_s=remaining_budget_s,
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            logger.warning(
+                "research-host forward timeout corr=%s connector=%s route=%s tool=%s timeout_s=%d",
+                corr_id,
+                connector_id,
+                route,
+                rh_tool_name,
+                eff_timeout,
+            )
+            return self._wrap_research_host_mcp_reply(
+                req_id,
+                {
+                    "ok": False,
+                    "status": "timeout",
+                    "error_code": "research_host_timeout",
+                    "connector": connector_id,
+                    "error": (
+                        f"research-host connector '{connector_id}' timed out after {eff_timeout}s"
+                    ),
+                },
+                is_error=True,
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning(
+                "research-host forward unavailable corr=%s connector=%s route=%s err=%s",
+                corr_id,
+                connector_id,
+                route,
+                type(exc).__name__,
+            )
+            return self._wrap_research_host_mcp_reply(
+                req_id,
+                {
+                    "ok": False,
+                    "status": "upstream_unavailable",
+                    "error_code": "research_host_unavailable",
+                    "connector": connector_id,
+                    "error": (
+                        f"research-host connector '{connector_id}' unavailable ({type(exc).__name__})"
+                    ),
+                },
+                is_error=True,
+            )
+
+        status_code = int(getattr(resp, "status_code", 0) or 0)
+        parsed_body: Any = None
+        try:
+            parsed_body = resp.json()
+        except Exception:
+            parsed_body = None
+
+        if status_code == 200:
+            payload, is_err, rpc_err, extra_blocks = self._extract_research_host_mcp_result(
+                parsed_body
+            )
+            if payload is not None:
+                restored = self._restore_legacy_research_host_payload(
+                    route=route,
+                    operation=operation,
+                    call_args=call_args,
+                    eff_timeout=eff_timeout,
+                    payload=payload,
+                )
+                reply_is_err = is_err or (restored.get("ok") is False)
+                if not extra_blocks and not reply_is_err:
+                    img_block, img_err = self._load_research_host_image_block(restored)
+                    if img_err is not None:
+                        return self._wrap_research_host_mcp_reply(
+                            req_id,
+                            {
+                                "ok": False,
+                                "status": "error",
+                                "error_code": "research_host_image_error",
+                                "connector": connector_id,
+                                "error": img_err,
+                            },
+                            is_error=True,
+                        )
+                    if img_block is not None:
+                        extra_blocks = [img_block]
+                return self._wrap_research_host_mcp_reply(
+                    req_id,
+                    restored,
+                    is_error=reply_is_err,
+                    extra_content_blocks=extra_blocks or None,
+                )
+            return self._wrap_research_host_mcp_reply(
+                req_id,
+                {
+                    "ok": False,
+                    "status": "upstream_error",
+                    "error_code": "research_host_invalid_response",
+                    "connector": connector_id,
+                    "error": (
+                        f"research-host connector '{connector_id}' returned invalid MCP response"
+                        + (f": {rpc_err}" if rpc_err else "")
+                    ),
+                },
+                is_error=True,
+            )
+
+        if status_code == 401:
+            return self._wrap_research_host_mcp_reply(
+                req_id,
+                {
+                    "ok": False,
+                    "status": "unauthorized",
+                    "error_code": "research_host_unauthorized",
+                    "upstream_http_status": 401,
+                    "connector": connector_id,
+                    "error": (
+                        f"research-host connector '{connector_id}' rejected authentication "
+                        "(HTTP 401); check DALTON_RESEARCH_HOST_TOKEN."
+                    ),
+                },
+                is_error=True,
+            )
+
+        payload_err, _is_err, rpc_err = self._extract_research_host_mcp_payload(parsed_body)
+        if status_code in (403, 503) and payload_err is not None:
+            out_err = dict(payload_err)
+            out_err["ok"] = False
+            out_err.setdefault("connector", connector_id)
+            err_code = str(out_err.get("error_code") or "").strip()
+            if status_code == 403 and err_code == "capability_disabled":
+                out_err["http_status"] = 403
+            elif status_code == 503 and err_code in ("service_draining", "lock_not_acquired"):
+                out_err["http_status"] = 503
+            else:
+                out_err["upstream_http_status"] = status_code
+            raw_msg = str(out_err.get("error") or "").strip()
+            if connector_id not in raw_msg:
+                out_err["error"] = (
+                    f"research-host connector '{connector_id}' returned HTTP {status_code}: {raw_msg}"
+                    if raw_msg
+                    else f"research-host connector '{connector_id}' returned HTTP {status_code}"
+                )
+            return self._wrap_research_host_mcp_reply(req_id, out_err, is_error=True)
+
+        detail = ""
+        upstream_err_code = ""
+        if isinstance(payload_err, dict):
+            detail = str(payload_err.get("error") or payload_err.get("detail") or "").strip()
+            upstream_err_code = str(payload_err.get("error_code") or "").strip()
+        elif isinstance(parsed_body, dict):
+            detail = str(parsed_body.get("error") or parsed_body.get("detail") or "").strip()
+            upstream_err_code = str(parsed_body.get("error_code") or "").strip()
+        elif rpc_err:
+            detail = rpc_err
+        else:
+            raw_txt = str(getattr(resp, "text", "") or "").strip()
+            if raw_txt:
+                detail = sanitize_stderr_text(raw_txt, max_len=200)
+        err_payload: dict[str, Any] = {
+            "ok": False,
+            "status": "upstream_error" if status_code >= 500 else "error",
+            "error_code": upstream_err_code or "research_host_http_error",
+            "upstream_http_status": status_code,
+            "connector": connector_id,
+            "error": (
+                f"research-host connector '{connector_id}' returned HTTP {status_code}: {detail}"
+                if detail
+                else f"research-host connector '{connector_id}' returned HTTP {status_code}"
+            ),
+        }
+        return self._wrap_research_host_mcp_reply(req_id, err_payload, is_error=True)
+
+    async def _forward_research_host_ingest(
+        self,
+        target_name: str,
+        body: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Forward ``/wiki/ingest`` or ``/sales-notes/ingest`` to ``dalton-research-host``."""
+        import httpx
+
+        base_url = self._resolve_research_host_url()
+        rh_target = RESEARCH_HOST_FORWARD_INGEST_TARGETS[target_name]
+        admin_token = self._resolve_research_admin_token()
+        if not admin_token:
+            return 503, {
+                "ok": False,
+                "status": "config_error",
+                "error_code": "research_host_admin_token_missing",
+                "connector": rh_target,
+                "error": (
+                    f"research-host ingest '{rh_target}' unavailable: "
+                    "DALTON_RESEARCH_ADMIN_TOKEN is not configured."
+                ),
+            }
+        url = f"{base_url}/ingest/{rh_target}"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {admin_token}",
+            "X-Dalton-Research-Admin-Token": admin_token,
+        }
+        timeout_s = float(
+            getattr(self.cfg, "wiki_ingest_timeout_s", WIKI_INGEST_TIMEOUT_S)
+            or WIKI_INGEST_TIMEOUT_S
+        )
+        self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
+        try:
+            resp = await self._post_research_host_json(
+                url,
+                json_body=body,
+                headers=headers,
+                timeout_s=timeout_s,
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            return 504, {
+                "ok": False,
+                "status": "timeout",
+                "error_code": "research_host_timeout",
+                "connector": rh_target,
+                "error": (
+                    f"research-host ingest '{rh_target}' timed out after {int(timeout_s)}s."
+                ),
+            }
+        except (httpx.HTTPError, OSError) as exc:
+            return 502, {
+                "ok": False,
+                "status": "upstream_unavailable",
+                "error_code": "research_host_unavailable",
+                "connector": rh_target,
+                "error": (
+                    f"research-host ingest '{rh_target}' unavailable ({type(exc).__name__})."
+                ),
+            }
+        finally:
+            self._ingest_inflight = max(0, int(getattr(self, "_ingest_inflight", 1)) - 1)
+
+        status_code = int(getattr(resp, "status_code", 502) or 502)
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            out = dict(parsed)
+            if status_code >= 500:
+                out.setdefault("ok", False)
+                out.setdefault("connector", rh_target)
+                raw_msg = str(out.get("error") or "").strip()
+                if rh_target not in raw_msg and "research-host" not in raw_msg:
+                    out["error"] = (
+                        f"research-host ingest '{rh_target}' returned HTTP {status_code}: {raw_msg}"
+                        if raw_msg
+                        else f"research-host ingest '{rh_target}' returned HTTP {status_code}"
+                    )
+            return status_code, out
+        return (status_code if status_code >= 400 else 502), {
+            "ok": False,
+            "status": "upstream_error",
+            "error_code": "research_host_invalid_response",
+            "connector": rh_target,
+            "error": (
+                f"research-host ingest '{rh_target}' returned non-JSON HTTP {status_code}."
+            ),
+        }
 
     @staticmethod
     def _extract_cnhk_deadline_remaining_s(
@@ -8846,7 +9848,11 @@ class ResearchDataBridge:
     async def get_filtered_tools(self) -> list[dict[str, Any]]:
         """Fetch `tools/list` from `researchdata_mcp.py` and strip handoff routes."""
         await self.ensure_initialized()
-        if self._cached_tools is not None:
+        rh_forward_active = self._is_research_host_forwarding_active()
+        if (
+            self._cached_tools is not None
+            and getattr(self, "_cached_tools_rh_forward", None) in (None, rh_forward_active)
+        ):
             return self._cached_tools
 
         reqs = [{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}]
@@ -8883,7 +9889,13 @@ class ResearchDataBridge:
             if tool_name == "research":
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.RESEARCH_DESCRIPTION_SUFFIX.strip() not in desc:
-                    tool_copy["description"] = desc + self.RESEARCH_DESCRIPTION_SUFFIX
+                    desc = desc + self.RESEARCH_DESCRIPTION_SUFFIX
+                if (
+                    rh_forward_active
+                    and RESEARCH_HOST_FORWARD_DESCRIPTION_NOTE.strip() not in desc
+                ):
+                    desc = desc + RESEARCH_HOST_FORWARD_DESCRIPTION_NOTE
+                tool_copy["description"] = desc
                 if isinstance(props, dict) and isinstance(props.get("params"), dict):
                     p_desc = str(props["params"].get("description") or "").rstrip()
                     if "1-30000" not in p_desc and "1–30000" not in p_desc:
@@ -9183,6 +10195,7 @@ class ResearchDataBridge:
             filtered.append(tool_copy)
 
         self._cached_tools = filtered
+        self._cached_tools_rh_forward = rh_forward_active
         return filtered
 
     def _should_fanout_alphaengine(
@@ -14392,6 +15405,11 @@ class ResearchDataBridge:
             return self._make_tool_result_response(req_id, validation_err, is_error=True)
 
         # Route `catalog` first so `catalog(route=...)` works for all routes (including community and market-regime)
+        forward_to_research_host = (
+            tool_name != "catalog"
+            and bool(route)
+            and self._should_forward_route_to_research_host(tool_name, route)
+        )
         if tool_name == "catalog":
             if route and route not in ROUTE_CONTRACT_SPECS:
                 err_cat: dict[str, Any] = {
@@ -14412,7 +15430,16 @@ class ResearchDataBridge:
                     req_id, err_cat, is_error=True
                 )
         else:
-            if route and self._is_route_migrated(route):
+            if route and self._is_route_capability_disabled(route):
+                return self._make_capability_disabled_response(
+                    req_id,
+                    tool_name,
+                    route,
+                    operation,
+                    norm_params_view,
+                    f"Route '{route}' is disabled by deployment capability configuration.",
+                )
+            if route and self._is_route_migrated(route) and not forward_to_research_host:
                 err_migrated: dict[str, Any] = {
                     "_declared_sources": [],
                     "_sources": [],
@@ -14428,15 +15455,6 @@ class ResearchDataBridge:
                 )
                 return self._make_tool_result_response(
                     req_id, err_migrated, is_error=True
-                )
-            if route and self._is_route_capability_disabled(route):
-                return self._make_capability_disabled_response(
-                    req_id,
-                    tool_name,
-                    route,
-                    operation,
-                    norm_params_view,
-                    f"Route '{route}' is disabled by deployment capability configuration.",
                 )
             if route and route in handoff:
                 err_payload: dict[str, Any] = {
@@ -14719,7 +15737,7 @@ class ResearchDataBridge:
         ae_enabled = not self._is_route_capability_disabled("alphaengine")
         gp_enabled = not self._is_route_capability_disabled("guidepoint")
 
-        if tool_name == "research" and route == "sales-mail":
+        if not forward_to_research_host and tool_name == "research" and route == "sales-mail":
             _sales_mail_valid_sources = ("sales-notes", "tmtb")
             enabled_sales_mail = [
                 s
@@ -14815,7 +15833,7 @@ class ResearchDataBridge:
                         pruned_sm_params["layer"] = "raw"
                     call_args["params"] = pruned_sm_params
 
-        if tool_name == "research" and route == "all":
+        if not forward_to_research_host and tool_name == "research" and route == "all":
             enabled_local = self._enabled_local_library_sources()
             local_enabled = bool(enabled_local)
             p_all = call_args.get("params") if isinstance(call_args.get("params"), dict) else {}
@@ -14945,7 +15963,11 @@ class ResearchDataBridge:
                     req_id, unmapped_payload, is_error=True
                 )
 
-        do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
+        do_fanout = (
+            False
+            if forward_to_research_host
+            else self._should_fanout_alphaengine(tool_name, arguments)
+        )
         ae_args: dict[str, Any] | None = None
         ae_limit_clamped: list[int] | None = None
         gp_args: dict[str, Any] | None = None
@@ -14978,7 +16000,12 @@ class ResearchDataBridge:
                     norm_params_view,
                     "All sources for route 'all' are disabled by deployment capability configuration.",
                 )
-        if tool_name == "research" and route == "all" and isinstance(call_args.get("params"), dict):
+        if (
+            not forward_to_research_host
+            and tool_name == "research"
+            and route == "all"
+            and isinstance(call_args.get("params"), dict)
+        ):
             # Guidepoint-only nested keys (`keywords`, `recency_bias`, `start_date`, `end_date`)
             # and cache-refresh `fresh` are never sent to the local 4-library gateway.
             local_strip_keys = ("keywords", "recency_bias", "start_date", "end_date", "fresh")
@@ -15023,7 +16050,73 @@ class ResearchDataBridge:
         ae_task: asyncio.Task[dict[str, Any]] | None = None
         call_queue_stats: dict[str, int] = {}
         try:
-            if is_cached_direct:
+            if forward_to_research_host:
+                if str(call_args.get("mode") or "fetch").strip().lower() == "plan":
+                    plan_payload = self._build_research_host_plan_payload(
+                        route=route,
+                        operation=operation,
+                        call_args=call_args,
+                        eff_timeout=eff_timeout,
+                    )
+                    resps = [
+                        self._wrap_research_host_mcp_reply(
+                            req_id,
+                            plan_payload,
+                            is_error=not bool(plan_payload.get("ok", True)),
+                        )
+                    ]
+                else:
+                    connector_id = (
+                        self._research_host_connector_for_route(tool_name, route)
+                        or route
+                    )
+                    try:
+                        async with self._get_research_host_concurrency().acquire_call(
+                            caller_key,
+                            caller_display,
+                            is_automation=is_automation,
+                            timeout_s=float(eff_timeout),
+                            stats=call_queue_stats,
+                        ):
+                            if test_delay_s > 0.0:
+                                rem_delay = max(
+                                    0.1, float(eff_timeout) - (time.monotonic() - t0)
+                                )
+                                await asyncio.wait_for(
+                                    asyncio.sleep(test_delay_s),
+                                    timeout=rem_delay,
+                                )
+                            remaining_budget_s = max(
+                                0.1, deadline_mono - time.monotonic()
+                            )
+                            rh_reply = await self._forward_research_host_mcp(
+                                req_id=req_id,
+                                route=route,
+                                operation=operation,
+                                call_args=call_args,
+                                eff_timeout=eff_timeout,
+                                remaining_budget_s=remaining_budget_s,
+                                raw_caller_token=raw_caller_token,
+                                corr_id=corr_id,
+                            )
+                            resps = [rh_reply]
+                    except asyncio.TimeoutError:
+                        resps = [
+                            self._wrap_research_host_mcp_reply(
+                                req_id,
+                                {
+                                    "ok": False,
+                                    "status": "timeout",
+                                    "error_code": "research_host_timeout",
+                                    "connector": connector_id,
+                                    "error": (
+                                        f"research-host connector '{connector_id}' timed out after {eff_timeout}s"
+                                    ),
+                                },
+                                is_error=True,
+                            )
+                        ]
+            elif is_cached_direct:
                 cached_op = (
                     _ae_cache.OP_TRANSCRIPT
                     if route == "transcript"
@@ -16039,6 +17132,14 @@ class ResearchDataBridge:
                                 r_item["param_formats"] = dict(c_spec["param_formats"])
                                 r_item["return_shape"] = c_spec["return_shape"]
                                 r_item["examples"] = list(c_spec["examples"])
+                            if (
+                                self._is_research_host_forwarding_active()
+                                and rid in RESEARCH_HOST_FORWARD_ROUTES
+                            ):
+                                r_rules = list(r_item.get("rules") or [])
+                                if RESEARCH_HOST_FORWARD_CATALOG_RULE not in r_rules:
+                                    r_rules.append(RESEARCH_HOST_FORWARD_CATALOG_RULE)
+                                r_item["rules"] = r_rules
                         payload["routes"] = kept_routes
                         payload["route_count"] = len(payload["routes"])
 
@@ -16073,6 +17174,10 @@ class ResearchDataBridge:
                         )
 
                     declared = source_identity.declare(tool_name, arguments, payload)
+                    if forward_to_research_host:
+                        upstream_sources = payload.get("_sources")
+                        if isinstance(upstream_sources, list) and upstream_sources:
+                            declared = list(upstream_sources)
                     if ae_outcome is not None and ae_args is not None:
                         declared = self._merge_alphaengine_into_all(
                             payload, declared, ae_outcome, ae_args
@@ -18274,19 +19379,21 @@ class ResearchDataBridge:
                 "error_code": "service_draining",
                 "error": "Bridge is draining; retry shortly.",
             }
-        if self._is_ingest_migrated("wiki"):
-            return 410, {
-                "ok": False,
-                "status": "route_migrated",
-                "error_code": "route_migrated",
-                "error": "Endpoint /wiki/ingest has migrated to dalton-research-host /ingest/wiki.",
-            }
         if self._is_route_capability_disabled("company-wiki"):
             return 403, {
                 "ok": False,
                 "status": "capability_disabled",
                 "error_code": "capability_disabled",
                 "error": "Endpoint /wiki/ingest is disabled by deployment capability configuration.",
+            }
+        if self._is_ingest_migrated("wiki"):
+            if self._is_research_host_forwarding_active():
+                return await self._forward_research_host_ingest("wiki", body)
+            return 410, {
+                "ok": False,
+                "status": "route_migrated",
+                "error_code": "route_migrated",
+                "error": "Endpoint /wiki/ingest has migrated to dalton-research-host /ingest/wiki.",
             }
         self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
         try:
@@ -19301,19 +20408,21 @@ class ResearchDataBridge:
                 "error_code": "service_draining",
                 "error": "Bridge is draining; retry shortly.",
             }
-        if self._is_ingest_migrated("sales-notes"):
-            return 410, {
-                "ok": False,
-                "status": "route_migrated",
-                "error_code": "route_migrated",
-                "error": "Endpoint /sales-notes/ingest has migrated to dalton-research-host /ingest/sales-notes.",
-            }
         if self._is_route_capability_disabled("sales-notes"):
             return 403, {
                 "ok": False,
                 "status": "capability_disabled",
                 "error_code": "capability_disabled",
                 "error": "Endpoint /sales-notes/ingest is disabled by deployment capability configuration.",
+            }
+        if self._is_ingest_migrated("sales-notes"):
+            if self._is_research_host_forwarding_active():
+                return await self._forward_research_host_ingest("sales-notes", body)
+            return 410, {
+                "ok": False,
+                "status": "route_migrated",
+                "error_code": "route_migrated",
+                "error": "Endpoint /sales-notes/ingest has migrated to dalton-research-host /ingest/sales-notes.",
             }
         self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
         try:
@@ -27025,6 +28134,8 @@ async def _handle_client(
                         getattr(exc, "exit_code", None),
                     )
             conc_snap = bridge._get_concurrency().status_snapshot()
+            rh_limiter = getattr(bridge, "_research_host_concurrency", None)
+            rh_snap = rh_limiter.status_snapshot() if rh_limiter is not None else {}
             health_payload = {
                 "ok": not bool(getattr(bridge, "_research_draining", False)),
                 "status": "draining" if bool(getattr(bridge, "_research_draining", False)) else "ok",
@@ -27035,9 +28146,9 @@ async def _handle_client(
                 "max_inflight_unsigned": getattr(bridge.cfg, "max_inflight_unsigned", 1),
                 "automation_reserved": getattr(bridge.cfg, "automation_reserved", 2),
                 "fanout_grace_s": getattr(bridge.cfg, "fanout_grace_s", 20.0),
-                "inflight": conc_snap["global_inflight"],
-                "queued": conc_snap["total_queued"],
-                "global_queued": conc_snap["global_queued"],
+                "inflight": conc_snap["global_inflight"] + int(rh_snap.get("global_inflight", 0)),
+                "queued": conc_snap["total_queued"] + int(rh_snap.get("total_queued", 0)),
+                "global_queued": conc_snap["global_queued"] + int(rh_snap.get("global_queued", 0)),
                 "ingest_inflight": int(getattr(bridge, "_ingest_inflight", 0)),
                 "orphan_upstream": bridge._count_orphan_upstream(),
                 "callers": conc_snap["callers"],
@@ -27328,8 +28439,16 @@ async def _handle_client(
             status_label = {
                 200: "OK",
                 400: "Bad Request",
+                401: "Unauthorized",
+                403: "Forbidden",
+                409: "Conflict",
                 410: "Gone",
+                413: "Payload Too Large",
+                422: "Unprocessable Entity",
+                500: "Internal Server Error",
+                502: "Bad Gateway",
                 503: "Service Unavailable",
+                504: "Gateway Timeout",
             }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
             return
@@ -27353,8 +28472,16 @@ async def _handle_client(
             status_label = {
                 200: "OK",
                 400: "Bad Request",
+                401: "Unauthorized",
+                403: "Forbidden",
+                409: "Conflict",
                 410: "Gone",
+                413: "Payload Too Large",
+                422: "Unprocessable Entity",
+                500: "Internal Server Error",
+                502: "Bad Gateway",
                 503: "Service Unavailable",
+                504: "Gateway Timeout",
             }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
             return
