@@ -363,9 +363,14 @@ async def test_step1_three_way_capability_env_and_route_migrated_consistency(
         assert r_sn_ing.json()["error_code"] == "capability_disabled"
     await pre_rt.shutdown()
 
-    # 3. Post-cutover: adding DALTON_RESEARCH_HOST_URL to shared repo .env flips ALL 3 ends & closes bridge routes
+    # 3. Post-cutover: adding DALTON_RESEARCH_HOST_URL to shared repo .env flips ALL 3 ends;
+    #    research-host routes & ingest transparently forward to :8951 while non-research-host routes
+    #    (e.g. sec) still report route_migrated and disabled capabilities still return 403.
     repo_env.write_text(
-        repo_env.read_text(encoding="utf-8") + "DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951\n",
+        repo_env.read_text(encoding="utf-8")
+        + "DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951\n"
+        + "DALTON_RESEARCH_HOST_TOKEN=rh-tok-1\n"
+        + "DALTON_RESEARCH_ADMIN_TOKEN=rh-adm-1\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
@@ -385,19 +390,49 @@ async def test_step1_three_way_capability_env_and_route_migrated_consistency(
     assert is_bridge_ingest_migrated_to_connector("sales-notes", environ=cfg.capability_env) is True
 
     bridge = bridge_mod.ResearchDataBridge(cfg)
+    mock_http = create_autospec(httpx.AsyncClient, instance=True, spec_set=True)
+    gp_http_resp = httpx.Response(
+        200,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps({"ok": True, "status": "ok", "results": [{"id": "gp-1"}]})}],
+                "structuredContent": {"ok": True, "status": "ok", "results": [{"id": "gp-1"}]},
+                "isError": False,
+            },
+        },
+    )
+    wiki_ing_resp = httpx.Response(
+        200,
+        json={"ok": True, "status": "ingested", "doc_id": "wiki:1"},
+    )
+    mock_http.post.side_effect = [gp_http_resp, wiki_ing_resp]
+    bridge._research_host_http = mock_http
+
     mcp_resp = await bridge.handle_tools_call(
         1,
         {"name": "research", "arguments": {"route": "guidepoint", "operation": "search_library", "query": "cloud"}},
     )
-    assert mcp_resp["result"]["isError"] is True
+    assert mcp_resp["result"]["isError"] is False
     mcp_body = json.loads(mcp_resp["result"]["content"][0]["text"])
-    assert mcp_body["error_code"] == "route_migrated"
+    assert mcp_body["ok"] is True
+    assert mock_http.post.call_args_list[0].args[0].endswith("/mcp/guidepoint")
+
+    sec_resp = await bridge.handle_tools_call(
+        2,
+        {"name": "finance", "arguments": {"route": "sec", "operation": "list-filings", "ticker": "NVDA"}},
+    )
+    assert sec_resp["result"]["isError"] is True
+    sec_body = json.loads(sec_resp["result"]["content"][0]["text"])
+    assert sec_body["error_code"] == "route_migrated"
 
     w_code, w_body = await bridge.handle_wiki_ingest({"target_type": "company", "target": "NVDA", "content_type": "note", "content": "hi"})
-    assert w_code == 410 and w_body["error_code"] == "route_migrated"
+    assert w_code == 200 and w_body["ok"] is True
+    assert mock_http.post.call_args_list[1].args[0].endswith("/ingest/wiki")
 
     s_code, s_body = await bridge.handle_sales_notes_ingest({"institution": "MS", "title": "Note", "content": "hi"})
-    assert s_code == 410 and s_body["error_code"] == "route_migrated"
+    assert s_code == 403 and s_body["error_code"] == "capability_disabled"
 
 
 @pytest.mark.asyncio
