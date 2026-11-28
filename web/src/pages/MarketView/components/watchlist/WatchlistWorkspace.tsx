@@ -295,9 +295,15 @@ export function WatchlistWorkspace({
 
   const handleSelectSymbol = useCallback(
     (symbol: string) => {
-      navigate(buildMarketViewUrl({ symbol }), { state: { fromWatchlist: true } });
+      navigate(
+        buildMarketViewUrl({
+          symbol,
+          ...(scope === 'workspace' && selectedWorkspaceId ? { workspaceId: selectedWorkspaceId } : {}),
+        }),
+        { state: { fromWatchlist: true } },
+      );
     },
-    [navigate],
+    [navigate, scope, selectedWorkspaceId],
   );
 
   const handleRequestTierChange = useCallback(

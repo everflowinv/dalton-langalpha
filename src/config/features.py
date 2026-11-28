@@ -225,12 +225,13 @@ FEATURES: dict[str, FeatureSpec] = {
     "drive": FeatureSpec(
         key="drive",
         label="Drive",
+        # DALTON-HOOK(drive-long-history): match DriveHistoryConfig defaults (30 days, up to 10 earlier versions)
         description=(
             "A folder of your own files that you and your agent both read and "
             "edit, from any workspace. A file you mark as a memo keeps every "
-            "version, with who changed it and why. Any other file can be put "
-            "back as it was before its last save for 7 days, and deleted files "
-            "wait in the trash for up to 14 days."
+            "version, with who changed it and why. Any other file keeps up to "
+            "10 earlier versions for 30 days, and deleted files wait in the "
+            "trash for up to 14 days."
         ),
         enabled=True,
         gate=FeatureGate.OPT_IN,
@@ -244,8 +245,8 @@ FEATURES: dict[str, FeatureSpec] = {
             off_if="your files belong to one workspace each.",
             good_to_know=(
                 "The agent may change these files at any time. Each change shows "
-                "who made it. Only a memo keeps its earlier versions to compare "
-                "and restore; any other file keeps one copy, from before its last save."
+                "who made it. A memo keeps every earlier version; any other file "
+                "keeps up to 10 earlier versions for 30 days."
             ),
         ),
     ),

@@ -134,6 +134,8 @@ const mocks = vi.hoisted(() => ({
     symbol: string;
     activeWorkspaceId?: string | null;
     onReturnToChat?: () => void;
+    onScopeChange?: (scope: 'all' | 'workspace') => void;
+    onWorkspaceChange?: (id: string) => void;
   }>,
   activeWorkspaceObj: { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false } as Record<string, unknown>,
   isColleague: false,
@@ -252,6 +254,8 @@ vi.mock('../components/MarketChatPanel', () => ({
     symbol: string;
     activeWorkspaceId?: string | null;
     onReturnToChat?: () => void;
+    onScopeChange?: (scope: 'all' | 'workspace') => void;
+    onWorkspaceChange?: (id: string) => void;
   }) => {
     mocks.capturedChatProps.push({
       watchlistContext: props.watchlistContext,
@@ -259,6 +263,8 @@ vi.mock('../components/MarketChatPanel', () => ({
       symbol: props.symbol,
       activeWorkspaceId: props.activeWorkspaceId,
       onReturnToChat: props.onReturnToChat,
+      onScopeChange: props.onScopeChange,
+      onWorkspaceChange: props.onWorkspaceChange,
     });
     return (
       <div
@@ -1718,6 +1724,98 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     act(() => { onReturn!(); });
     await waitFor(() => {
       expect(screen.getByTestId('loc-display').textContent).toBe('/chat/t/thread-alpha');
+    });
+  });
+
+  it('restores Home scope when switching back to a tab without ws, and syncs ws URL when picking workspace in Watchlist', async () => {
+    const homeChartTab = '/market?symbol=AAPL';
+    const wsChartTab = '/market?symbol=NVDA&ws=ws-beta';
+    const watchlistHomeTab = '/market';
+
+    function TabSwitcher() {
+      const nav = useNavigate();
+      return (
+        <div>
+          <button type="button" data-testid="go-home-chart" onClick={() => nav(homeChartTab)}>home-chart</button>
+          <button type="button" data-testid="go-ws-chart" onClick={() => nav(wsChartTab)}>ws-chart</button>
+          <button type="button" data-testid="go-watchlist-home" onClick={() => nav(watchlistHomeTab)}>watchlist-home</button>
+        </div>
+      );
+    }
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.workspaces.home(), { workspace_id: 'home-ws', is_home: true });
+    qc.setQueryData(['portfolioHoldings'], [{ symbol: 'NVDA' }]);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[homeChartTab]}>
+          <LocationProbe />
+          <TabSwitcher />
+          <Routes>
+            <Route path="/market" element={<MarketView />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Starts on Home chart tab (no ws in URL).
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+
+    // Switch to workspace chart tab -> moves to ws-beta.
+    fireEvent.click(screen.getByTestId('go-ws-chart'));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-beta');
+    });
+
+    // Switch back to Home chart tab (no ws) -> must restore Home, not stay on ws-beta.
+    fireEvent.click(screen.getByTestId('go-home-chart'));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+    expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL');
+
+    // Switch to workspace chart tab again, then to Home watchlist (/market) -> must restore Home.
+    fireEvent.click(screen.getByTestId('go-ws-chart'));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-beta');
+    });
+    fireEvent.click(screen.getByTestId('go-watchlist-home'));
+    await waitFor(() => {
+      expect(screen.getByTestId('watchlist-workspace')).toBeTruthy();
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+
+    // Switching workspace inside Watchlist updates the URL `?ws=` via pickWorkspace/pickScope.
+    act(() => { mocks.capturedChatProps.at(-1)?.onWorkspaceChange?.('ws-1'); });
+    await waitFor(() => {
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market?ws=ws-1');
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-1');
+    });
+
+    // Switching back to Home inside Watchlist removes `?ws=` from the URL.
+    act(() => { mocks.capturedChatProps.at(-1)?.onScopeChange?.('all'); });
+    await waitFor(() => {
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market');
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+  });
+
+  it('stamps ws onto the tab URL when restoring a saved workspace preference so tab switches remember it', async () => {
+    savePref('mode', 'ptc');
+    renderAt(['/market?symbol=AAPL']);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL&ws=ws-1');
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-1');
     });
   });
 });

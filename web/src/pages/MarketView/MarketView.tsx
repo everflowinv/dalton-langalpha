@@ -295,20 +295,14 @@ function MarketViewInner() {
   const pickScope = useCallback((next: ComposerScope) => {
     moveScope({ scope: next });
     if (next === 'all') {
-      urlWorkspaceRef.current = null;
-      urlScopeRef.current = null;
       editSearchParams((params) => { params.delete('ws'); }, { replace: true });
     } else if (selectedWorkspaceId) {
-      urlWorkspaceRef.current = selectedWorkspaceId;
-      urlScopeRef.current = 'workspace';
       editSearchParams((params) => { params.set('ws', selectedWorkspaceId); }, { replace: true });
     }
   }, [moveScope, editSearchParams, selectedWorkspaceId]);
   // Picking a workspace is picking its side too, as the toolbar does next.
   const pickWorkspace = useCallback((id: string) => {
     moveScope({ workspaceId: id, scope: 'workspace' });
-    urlWorkspaceRef.current = id;
-    urlScopeRef.current = 'workspace';
     editSearchParams((params) => { params.set('ws', id); }, { replace: true });
   }, [moveScope, editSearchParams]);
   const moveFromRoute = useEffectEvent(moveScope);
@@ -424,16 +418,23 @@ function MarketViewInner() {
       setSelectedInterval(route.timeframe);
     }
     // Workspace and scope as one move, as the picker makes it. Kept in the tab
-    // URL so switching between two MarketView tabs restores each tab's workspace.
+    // URL so switching between two MarketView tabs restores each tab's workspace
+    // (absent `ws` / `scope` means Home).
+    let followWorkspace = false;
     if (route.workspaceId !== urlWorkspaceRef.current || route.scope !== urlScopeRef.current) {
       urlWorkspaceRef.current = route.workspaceId;
       urlScopeRef.current = route.scope;
-      if (route.workspaceId || route.scope) {
-        moveFromRoute({
-          ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
-          ...(route.scope ? { scope: route.scope } : {}),
-        });
-      }
+      followWorkspace = navigationType !== NavigationType.Replace;
+    }
+    if (followWorkspace) {
+      moveFromRoute({
+        ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
+        scope: route.scope ?? 'all',
+      });
+    } else if (scope === 'workspace' && selectedWorkspaceId && !workspacePending && route.workspaceId !== selectedWorkspaceId) {
+      editSearchParams((params) => { params.set('ws', selectedWorkspaceId); }, { replace: true });
+    } else if (scope === 'all' && route.workspaceId !== null) {
+      editSearchParams((params) => { params.delete('ws'); }, { replace: true });
     }
     setChatReturnPath(route.returnTo);
     // A comment a phone opened from the chat comes forward on the chart the
@@ -454,7 +455,7 @@ function MarketViewInner() {
         return next;
       }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, showWatchlistView, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
+  }, [searchParams, selectedStock, showWatchlistView, scope, selectedWorkspaceId, workspacePending, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);
@@ -758,8 +759,8 @@ function MarketViewInner() {
       </h1>
       {/* DALTON-HOOK(watchlist): render full personal watchlist at `/market` when no `?symbol=` is present */}
       {showWatchlistView ? daltonWatchlist.renderDaltonWatchlistWorkspace({
-        scope, onScopeChange: setScope, activeWorkspaceId, workspaces: selectableWorkspaces,
-        selectedWorkspaceId, workspacePending, onWorkspaceChange: selectWorkspace,
+        scope, onScopeChange: pickScope, activeWorkspaceId, workspaces: selectableWorkspaces,
+        selectedWorkspaceId, workspacePending, onWorkspaceChange: pickWorkspace,
         chatPanelWidth, onDragStart: handleDragStart, onJumpToChart: handleJumpToChart,
       }) : isMobile ? (
         <div className="market-mobile-layout">

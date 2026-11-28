@@ -375,7 +375,7 @@ describe("drive memos", () => {
     const text = out.join("");
     expect(text.split("\n").filter((l) => /^[123]\s/.test(l))).toHaveLength(3);
     expect(text).toContain("Who changed what and why: la drive record _cli/m.md");
-    expect(text).not.toContain("keeps one earlier copy");
+    expect(text).not.toContain("keeps up to 10 earlier versions");
     expect(text).not.toContain("history clear");
   });
 

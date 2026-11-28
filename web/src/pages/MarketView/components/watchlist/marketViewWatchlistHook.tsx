@@ -97,7 +97,7 @@ export function navigateDaltonChartJump(
   currentSearchParams?: URLSearchParams,
 ): void {
   if (!isDaltonBuild) return;
-  const currentRoute = !fromWatchlistView && currentSearchParams
+  const currentRoute = currentSearchParams
     ? readMarketViewRoute(currentSearchParams)
     : null;
   const nextState = fromWatchlistView

@@ -50,6 +50,23 @@ export interface CollectedHtmlWidgetRef {
 }
 
 /**
+ * Resolve the stable identifier for an `html_widget` deep link (`?widget=`).
+ * Matches `MessageContentSegments.tsx`: prefer ShowWidget's persistent `payload.widget_id`,
+ * falling back to the event's `artifact_id` (tool call ID) when absent.
+ */
+export function resolveHtmlWidgetDeepLinkId(
+  envelope: Record<string, unknown>,
+  inner: Record<string, unknown>,
+): string {
+  const widgetId = typeof inner.widget_id === "string" ? inner.widget_id.trim() : "";
+  if (widgetId) return widgetId;
+  const envelopeId =
+    typeof envelope.artifact_id === "string" ? envelope.artifact_id.trim() : "";
+  if (envelopeId) return envelopeId;
+  return typeof inner.artifact_id === "string" ? inner.artifact_id.trim() : "";
+}
+
+/**
  * Canonical composite key `(chart_id, layer_id)` for deduplicating chart layers and matching
  * persisted snapshots across charts that reuse the same `layer_id`.
  */
@@ -370,12 +387,7 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
             });
           }
         } else if (artifactType === "html_widget") {
-          const artifactId =
-            typeof data.artifact_id === "string"
-              ? data.artifact_id.trim()
-              : typeof inner.widget_id === "string"
-                ? inner.widget_id.trim()
-                : "";
+          const artifactId = resolveHtmlWidgetDeepLinkId(data, inner);
           if (artifactId) {
             widgetsMap.set(artifactId, {
               artifactId,

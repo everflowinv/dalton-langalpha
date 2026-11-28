@@ -645,7 +645,7 @@ describe("drive history and usage", () => {
     expect(text).toContain("current");
     expect(text).toContain("2026-12-20 10:00");
     expect(text).toContain("2026-12-19 10:00");
-    expect(text).toContain("_cli/m.bin keeps one earlier copy, for 7 days after a save. To keep every version, mark it as a memo: la drive memo mark _cli/m.bin");
+    expect(text).toContain("_cli/m.bin keeps up to 10 earlier versions for 30 days. To keep every version, mark it as a memo: la drive memo mark _cli/m.bin");
   });
 
   it("says a file too large for history keeps none", async () => {

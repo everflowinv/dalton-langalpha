@@ -239,7 +239,8 @@ export const drive: Command[] = [
   }),
   driveCommand({
     words: ["drive", "history"],
-    summary: "list a file's versions, newest first; a file keeps its last earlier copy for 7 days, a memo keeps every version",
+    // DALTON-HOOK(drive-long-history): reflect DriveHistoryConfig defaults (30 days, up to 10 earlier versions)
+    summary: "list a file's versions, newest first; a file keeps up to 10 earlier versions for 30 days, a memo keeps every version",
     operands: ["path"],
     flags: { space: SPACE },
     async run(ctx) {
@@ -254,7 +255,7 @@ export const drive: Command[] = [
         `${base(ctx)}/versions`,
         { query: { path } },
       );
-      // Whatever the server lists is shown: a memo keeps every version, a plain file at most a few for the week after the one-copy rule began.
+      // Whatever the server lists is shown: a memo keeps every version, a plain file up to 10 earlier versions for 30 days.
       // The closing line depends on whether the file ever was a memo (a former one keeps its record).
       const memo = listing.memo != null;
       const { versions } = listing;
@@ -274,7 +275,8 @@ export const drive: Command[] = [
         } else if (memo) {
           lines.push(`Who changed what and why: la drive record ${sh(path)}`);
         } else {
-          lines.push(`${path} keeps one earlier copy, for 7 days after a save. To keep every version, mark it as a memo: la drive memo mark ${sh(path)}`);
+          // DALTON-HOOK(drive-long-history): match DriveHistoryConfig (30 days, up to 10 earlier versions)
+          lines.push(`${path} keeps up to 10 earlier versions for 30 days. To keep every version, mark it as a memo: la drive memo mark ${sh(path)}`);
         }
         return lines.join("\n");
       });
