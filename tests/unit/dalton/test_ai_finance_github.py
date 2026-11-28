@@ -289,7 +289,8 @@ def test_tokens_stored_before_new_stopwords_are_filtered_again():
 
 
 def test_homepage_top_level_domain_is_dropped_but_a_real_net_name_is_kept():
-    assert trending._homepage_name("https://www.foo.net/docs") == "www foo"
+    assert trending._homepage_name("https://www.foo.net/docs") == "www foo  docs"
+    assert trending._homepage_name("http://[::1") == ""
     assert trending._homepage_name("https://foo.vercel.app") == "foo"
     items_hosted = [
         {"full_name": "vercel-labs/agent-kit", "description": "x"},
@@ -311,3 +312,21 @@ def test_a_real_shared_upstream_still_clusters():
         {"full_name": "jarrodwatts/jev-trader", "description": "Onchain trading agent"},
     ]
     assert [c["upstream_token"] for c in trending.upstream_clusters(items, {"snapshots": []})] == ["jev"]
+
+
+def test_homepage_paths_still_name_a_shared_upstream():
+    items = [
+        {"full_name": "alice/qwen-agent", "description": "x"},
+        {"full_name": "bob/demo", "description": "y", "github": {"homepage": "https://huggingface.co/Qwen/Qwen3-8B"}},
+    ]
+    assert [c["upstream_token"] for c in trending.upstream_clusters(items, {"snapshots": []})] == ["qwen"]
+
+
+def test_a_dotnet_name_seen_yesterday_still_clusters_today():
+    now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+    state = {"snapshots": [{
+        "captured_at": "2026-11-27T20:00:00+00:00",
+        "repos": {"alice/ml-net-tools": {"name_tokens": ["net", "tools"], "mention_tokens": ["net", "tools"]}},
+    }]}
+    items = [{"full_name": "bob/sample", "description": "built on ML.NET"}]
+    assert [c["upstream_token"] for c in trending.upstream_clusters(items, state, now=now)] == ["net"]

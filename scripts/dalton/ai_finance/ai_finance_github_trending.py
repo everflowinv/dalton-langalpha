@@ -182,12 +182,18 @@ def _homepage_name(url: str) -> str:
     `foo.net` -> `foo`; `foo.vercel.app` -> `foo` (otherwise `vercel` would group a
     hosted page with the owner `vercel-labs`).
     """
-    host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:  # malformed address (e.g. unbalanced brackets): no tokens, no crash
+        return ""
+    # The path keeps project names such as huggingface.co/Qwen/... or github.com/deepseek-ai/...
+    path = parsed.path.replace("/", " ")
     for suffix in HOSTING_SUFFIXES:
         if host == suffix or host.endswith("." + suffix):
-            return host[: -len(suffix)].strip(".").replace(".", " ")
+            return f"{host[: -len(suffix)].strip('.').replace('.', ' ')} {path}".strip()
     labels = [label for label in host.split(".") if label]
-    return " ".join(labels[:-1] if len(labels) > 1 else labels)
+    return f"{' '.join(labels[:-1] if len(labels) > 1 else labels)} {path}".strip()
 
 
 def mention_tokens(item: dict[str, Any]) -> set[str]:
