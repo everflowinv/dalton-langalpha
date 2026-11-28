@@ -1,19 +1,20 @@
 # Dalton 用户可调设置登记表（Chief of Staff 能力守卫清单）
 #
-# 新增或调整任何用户可调设置时，在此登记并明确研究总监（Chief of Staff）的处理方式：
+# 本文件专供开发期与守卫测试（tests/unit/dalton/test_settings_registry.py）使用。
+# 新增或调整用户可调设置时，在此登记并写明研究总监（Chief of Staff）的处理方式：
 # - tool:<工具名或虚拟文件>  已支持通过研究总监工具或虚拟数据文件修改
-# - missing                  应由研究总监支持修改，当前尚未提供工具
-# - excluded:<原因>          有意不由研究总监代改（如凭据、账单/预算、管理员配置、安全授权、前端视觉偏好）
+# - missing                  计划由研究总监支持修改，当前待补充工具
+# - excluded:<原因>          由网页端、服务端或管理员维护（如凭据、账单/预算、管理员配置、安全授权、设备本地或界面视觉偏好）
 #
 # 形态（profiles）取值来自 src.dalton.profile.DeploymentProfile（everflow / core）；
-# 能力门控（capability）取值来自 src.dalton.capabilities.CapabilityId。
-# 守卫测试：tests/unit/dalton/test_settings_registry.py
+# 能力门控（capability）取值来自 src.dalton.capabilities.CapabilityId；
+# route_fields 列出对应 Dalton PUT/PATCH 接口 Pydantic 请求体中由本条目覆盖的可写字段。
 
 version: 1
 
 settings:
   # ===========================================================================
-  # 1. 用户资料（users 表，UserUpdate）
+  # 1. 用户资料（users 表，UserUpdate）与设备本地通用偏好
   # ===========================================================================
   - key: user.name
     stored_in: users.name
@@ -66,7 +67,13 @@ settings:
   - key: user.font_size
     stored_in: 浏览器 localStorage（fontScale，仅限当前设备）
     web_entry: 设置 → 通用与外观 → 字体大小
-    cos: excluded:设备本地显示比例，仅在浏览器设置页调整
+    cos: excluded:设备本地显示比例，仅保存在当前设备
+    profiles: [everflow, core]
+
+  - key: user.share_link_open
+    stored_in: 浏览器 localStorage（shareLinkOpen，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 桌面端打开 /a/ 分享链接方式
+    cos: excluded:设备本地链接打开方式偏好，仅保存在当前设备
     profiles: [everflow, core]
 
   # ===========================================================================
@@ -82,6 +89,12 @@ settings:
     stored_in: user_preferences.risk_preference.risk_tolerance
     web_entry: 设置 → 投资画像（自由文本兼容字段）
     cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.risk_preference.tolerance
+    stored_in: user_preferences.risk_preference.tolerance
+    web_entry: 历史兼容只读字段（已由 risk_level / risk_tolerance 替代）
+    cos: excluded:历史引导检测兼容别名，由 risk_level 与 risk_tolerance 替代
     profiles: [everflow, core]
 
   - key: user_preferences.investment_preference.investor_type
@@ -343,7 +356,7 @@ settings:
   - key: user_preferences.model_preference.dalton_extract_model
     stored_in: user_preferences.model_preference.dalton_extract_model（默认见 src/dalton/dalton.yaml conversations.extractor_model）
     web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 研究记忆整理模型
-    cos: missing
+    cos: excluded:即将随对话卡片抽取一起删除
     profiles: [everflow]
     capability: conversation_archive
 
@@ -360,14 +373,15 @@ settings:
     cos: tool:dalton_notify_settings
     profiles: [everflow]
     capability: channel_gateway
-    note: 当前工具支持确认后新增个人目标（add_personal_target），删除目标在网页设置页完成
+    note: 仅内部成员及管理员可用（min_tier=non_external）；工具支持确认后新增个人目标（add_personal_target），删除目标在网页设置页完成
 
   - key: user_preferences.model_preference.dalton_notify_overrides
     stored_in: user_preferences.model_preference.dalton_notify_overrides
     web_entry: 设置 → 消息与渠道 → 自动推送与接收账号（及自动化任务推送开关）
-    cos: tool:dalton_notify_settings
+    cos: missing
     profiles: [everflow]
     capability: channel_gateway
+    note: dalton_notify_settings 仅在 set_route 设置非空目标时附带将对应键置为 true，尚不支持单独关闭某任务的推送开关
 
   - key: user_preferences.model_preference.dalton_notify_target_labels
     stored_in: user_preferences.model_preference.dalton_notify_target_labels
@@ -375,6 +389,7 @@ settings:
     cos: tool:dalton_notify_settings
     profiles: [everflow]
     capability: channel_gateway
+    note: 仅内部成员及管理员可用（min_tier=non_external）
 
   - key: user_preferences.model_preference.dalton_notify_routes
     stored_in: user_preferences.model_preference.dalton_notify_routes
@@ -382,6 +397,7 @@ settings:
     cos: tool:dalton_notify_settings
     profiles: [everflow]
     capability: channel_gateway
+    note: 仅内部成员及管理员可用（min_tier=non_external）
 
   # ===========================================================================
   # 4. 用户偏好 — 其他偏好（user_preferences.other_preference）
@@ -413,13 +429,19 @@ settings:
   - key: user_preferences.other_preference.auto_approve_handoffs
     stored_in: user_preferences.other_preference.auto_approve_handoffs
     web_entry: 设置 → 对话与助手 → 交给分析师前不再询问
-    cos: excluded:安全授权开关，须由本人在设置页明确开启或关闭，避免智能体绕过人工确认
+    cos: excluded:安全授权开关，由本人在设置页明确开启或关闭，保持人工确认边界
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.auto_approve_workspace_creation
     stored_in: user_preferences.other_preference.auto_approve_workspace_creation
     web_entry: 设置 → 对话与助手 → 创建工作区前不再询问
-    cos: excluded:安全授权开关，须由本人在设置页明确开启或关闭，避免智能体绕过人工确认
+    cos: excluded:安全授权开关，由本人在设置页明确开启或关闭，保持人工确认边界
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.app_scopes
+    stored_in: user_preferences.other_preference.app_scopes
+    web_entry: 嵌入式应用权限授权弹窗（/a/ 应用桥接权限）
+    cos: excluded:应用权限由用户本人确认授予或收回
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.own_context_in_shared_workspaces
@@ -443,7 +465,7 @@ settings:
   - key: user_preferences.other_preference.account_setup_completed_at
     stored_in: user_preferences.other_preference.account_setup_completed_at
     web_entry: 托管引导完成时间（服务端只读标记）
-    cos: excluded:服务端记录的账户引导完成时间戳，仅由服务端写入
+    cos: excluded:服务端记录的账户引导完成时间戳，由服务端维护
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.dalton_team_base_url_classes
@@ -455,67 +477,67 @@ settings:
   - key: user_preferences.other_preference.theme
     stored_in: user_preferences.other_preference.theme
     web_entry: 设置 → 通用与外观 → 主题（浅色/深色/跟随系统）
-    cos: excluded:前端界面外观偏好，仅在设置页调整
+    cos: excluded:前端界面外观偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.card_style
     stored_in: user_preferences.other_preference.card_style
     web_entry: 设置 → 通用与外观 → 卡片样式
-    cos: excluded:前端界面外观偏好，仅在设置页调整
+    cos: excluded:前端界面外观偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.turn_display
     stored_in: user_preferences.other_preference.turn_display
     web_entry: 设置 → 对话与助手 → 回复过程展示
-    cos: excluded:前端对话界面显示方式，仅在设置页调整
+    cos: excluded:前端对话界面显示方式，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.response_streaming_mode
     stored_in: user_preferences.other_preference.response_streaming_mode
     web_entry: 设置 → 对话与助手 → 回复流式输出方式
-    cos: excluded:前端对话界面流式渲染习惯，仅在设置页调整
+    cos: excluded:前端对话界面流式渲染习惯，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.tool_call_layout
     stored_in: user_preferences.other_preference.tool_call_layout
     web_entry: 设置 → 对话与助手 → 工具调用展示样式
-    cos: excluded:前端对话界面布局偏好，仅在设置页调整
+    cos: excluded:前端对话界面布局偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.turn_end_scroll
     stored_in: user_preferences.other_preference.turn_end_scroll
     web_entry: 设置 → 对话与助手 → 回复结束滚动位置
-    cos: excluded:前端对话界面滚动习惯，仅在设置页调整
+    cos: excluded:前端对话界面滚动习惯，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.composer_tray
     stored_in: user_preferences.other_preference.composer_tray
     web_entry: 设置 → 对话与助手 → 输入框工具栏位置
-    cos: excluded:前端输入框布局偏好，仅在设置页调整
+    cos: excluded:前端输入框布局偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.voice_input_enabled
     stored_in: user_preferences.other_preference.voice_input_enabled
     web_entry: 设置 → 对话与助手 → 语音输入
-    cos: excluded:前端麦克风交互开关，依赖浏览器权限，仅在设置页调整
+    cos: excluded:前端麦克风交互开关，依赖浏览器权限，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.artifact_comment_destination
     stored_in: user_preferences.other_preference.artifact_comment_destination
     web_entry: 设置 → 对话与助手 → 评论去向
-    cos: excluded:前端文档划词评论交互偏好，仅在设置页调整
+    cos: excluded:前端文档划词评论交互偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.artifact_comment_enter
     stored_in: user_preferences.other_preference.artifact_comment_enter
     web_entry: 设置 → 对话与助手 → 评论框回车行为
-    cos: excluded:前端键盘快捷键偏好，仅在设置页调整
+    cos: excluded:前端键盘快捷键偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.artifact_answers
     stored_in: user_preferences.other_preference.artifact_answers
     web_entry: 设置 → 对话与助手 → 评论回答展示位置
-    cos: excluded:前端文档评论回复展示偏好，仅在设置页调整
+    cos: excluded:前端文档评论回复展示偏好，由用户在设置页调整
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.onboarding
@@ -527,7 +549,7 @@ settings:
   - key: user_preferences.other_preference.dashboard
     stored_in: user_preferences.other_preference.dashboard
     web_entry: 仪表盘页面 → 卡片拖拽布局
-    cos: excluded:前端仪表盘可视化网格布局，仅在仪表盘页面操作
+    cos: excluded:前端仪表盘可视化网格布局，由用户在仪表盘页面操作
     profiles: [everflow, core]
 
   - key: user_preferences.other_preference.custom_dashboards
@@ -561,7 +583,7 @@ settings:
     profiles: [everflow, core]
 
   # ===========================================================================
-  # 5. 对话线程设置（conversation_threads，ThreadUpdateRequest 等）
+  # 5. 对话线程设置（conversation_threads，ThreadUpdateRequest / Visibility / Share）
   # ===========================================================================
   - key: thread.llm_model
     stored_in: conversation_threads.llm_model
@@ -608,23 +630,41 @@ settings:
   - key: thread.shared_with_workspace
     stored_in: conversation_threads.shared_with_workspace
     web_entry: 共享工作区对话输入区隐私切换 / 聊天顶部隐私栏
-    cos: excluded:共享工作区对话对他人可见性边界，须由本人在界面切换
+    cos: excluded:共享工作区对话可见性边界，由本人在界面切换
     profiles: [everflow, core]
 
   - key: thread.is_shared
     stored_in: conversation_threads.is_shared
     web_entry: 对话右上角 → 分享对话面板
-    cos: excluded:外部分享开关涉及公开访问安全边界，须由本人在分享面板操作
+    cos: excluded:外部分享开关涉及公开访问安全边界，由本人在分享面板操作
     profiles: [everflow, core]
 
-  - key: thread.share_permissions
-    stored_in: conversation_threads.share_permissions（audience / allow_files / allow_download / root_path）
-    web_entry: 对话右上角 → 分享对话面板（受众与文件权限）
-    cos: excluded:分享链接受众与文件浏览下载权限涉及数据泄露边界，须由本人在分享面板操作
+  - key: thread.share_permissions.allow_files
+    stored_in: conversation_threads.share_permissions.allow_files
+    web_entry: 对话右上角 → 分享对话面板 → 允许查看工作区文件
+    cos: excluded:分享链接文件浏览权限涉及数据边界，由本人在分享面板操作
+    profiles: [everflow, core]
+
+  - key: thread.share_permissions.allow_download
+    stored_in: conversation_threads.share_permissions.allow_download
+    web_entry: 对话右上角 → 分享对话面板 → 允许下载工作区文件
+    cos: excluded:分享链接文件下载权限涉及数据边界，由本人在分享面板操作
+    profiles: [everflow, core]
+
+  - key: thread.share_permissions.root_path
+    stored_in: conversation_threads.share_permissions.root_path
+    web_entry: 对话右上角 → 分享对话面板 → 允许访问的工作区子目录
+    cos: excluded:分享链接可访问目录范围涉及数据边界，由本人在分享面板操作
+    profiles: [everflow, core]
+
+  - key: thread.share_permissions.audience
+    stored_in: conversation_threads.share_permissions.audience
+    web_entry: 对话右上角 → 分享对话面板 → 分享受众（公开或组织内成员）
+    cos: excluded:分享链接受众范围涉及公开访问安全边界，由本人在分享面板操作
     profiles: [everflow, core]
 
   # ===========================================================================
-  # 6. 自动化任务设置（automations，AutomationCreate / AutomationUpdate / CompanyScriptUpdate）
+  # 6. 自动化任务设置（automations，AutomationCreate / Update / CompanyScriptUpdate / 虚拟文件）
   # ===========================================================================
   - key: automation.name
     stored_in: automations.name
@@ -637,6 +677,13 @@ settings:
     web_entry: 侧栏「自动化」→ 新建/编辑任务 → 描述
     cos: tool:edit_file(.agents/user/automations/*.json)
     profiles: [everflow, core]
+
+  - key: automation.status
+    stored_in: automations.status（公司数据脚本存于 dalton_data_task_defs.enabled / paused_by_user）
+    web_entry: 侧栏「自动化」→ 暂停/恢复任务（POST /api/v1/automations/{automation_id}/pause、/resume）
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+    note: 个人自动化通过编辑 JSON 文件中的 status（active/paused）暂停或恢复；公司数据脚本经 dalton_system_jobs 启停
 
   - key: automation.trigger_type
     stored_in: automations.trigger_type
@@ -720,16 +767,23 @@ settings:
     profiles: [everflow, core]
 
   - key: automation.metadata
-    stored_in: automations.metadata（定时报告投递对象为 metadata.report_profile）
+    stored_in: automations.metadata（服务端审计、覆盖单元与扩展元数据容器）
+    web_entry: 侧栏「自动化」→ 受管任务元数据（报告投递子键见 automation.metadata.report_profile）
+    cos: excluded:通用服务端与受管任务元数据容器，由服务端维护；定时报告发送对象见 automation.metadata.report_profile
+    profiles: [everflow, core]
+
+  - key: automation.metadata.report_profile
+    stored_in: automations.metadata.report_profile
     web_entry: 侧栏「自动化」→ 定时报告任务详情 → 报告发送对象
     cos: tool:dalton_report_delivery
-    profiles: [everflow, core]
-    note: 报告发送对象（report_profile）通过 dalton_report_delivery 配置，其余服务端审计与覆盖单元元数据由服务端管理
+    profiles: [everflow]
+    capability: fund_automations
+    note: 仅内部成员及管理员可用（min_tier=non_external）；在启用 fund_automations 能力时由研究总监挂载
 
   - key: automation.additional_context
     stored_in: automations.additional_context
     web_entry: 侧栏「自动化」→ 新建/编辑任务 → 附加上下文与附件
-    cos: excluded:包含前端上传的多模态附件、图表快照与上下文结构，需在网页自动化表单中附加
+    cos: excluded:包含前端上传的多模态附件、图表快照与上下文结构，由用户在网页自动化表单中附加
     profiles: [everflow, core]
 
   # ===========================================================================
@@ -793,42 +847,51 @@ settings:
   - key: computer.browser.window
     stored_in: computers.config.browser_window
     web_entry: 设置 → 电脑 → 在 Mac 屏幕显示浏览器窗口
-    cos: excluded:本机桌面窗口显示选项，仅由本机所有者在桌面端操作
+    cos: excluded:本机桌面窗口显示选项，由本机所有者在桌面端操作
     profiles: [everflow, core]
 
   - key: computer.browser.signins
     stored_in: computers.config.browser_signins
     web_entry: 设置 → 电脑 → 保留浏览器登录态 / 退出全部站点
-    cos: excluded:涉及浏览器 Cookie 与第三方站点登录凭据保留，禁止智能体代改
+    cos: excluded:涉及浏览器 Cookie 与第三方站点登录凭据保留，由本人在网页端管理
     profiles: [everflow, core]
 
   # ===========================================================================
-  # 8. Dalton 专属设置接口（src/dalton/app/* 与 src/dalton/monitors/router.py）
+  # 8. Dalton 专属设置接口（挂载于 src.server.app.setup.app 的 Dalton 路由）
   # ===========================================================================
   - key: dalton.budget
-    stored_in: dalton_user_budgets（daily_cap_usd / default_task_cap_usd / timezone）
+    stored_in: dalton_budget_config（daily_cap_usd / default_task_cap_usd / timezone）
     web_entry: 设置 → 用量与预算 → 个人每日美元预算
-    cos: excluded:涉及个人每日美元花费上限与成本风控，不由智能体自行调整
+    cos: excluded:涉及个人每日美元花费上限与成本风控，由本人在设置页管理
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/budget
+    route_fields:
+      - daily_cap_usd
+      - default_task_cap_usd
+      - timezone
 
   - key: dalton.budget.task_caps
-    stored_in: dalton_task_caps（scope_kind / scope_id / cap_usd）
+    stored_in: dalton_budget_task_caps（scope_kind / scope_id / cap_usd）
     web_entry: 设置 → 用量与预算 → 个人每日美元预算 → 按工作区覆盖单任务上限
-    cos: excluded:涉及单任务美元花费上限与成本风控，不由智能体自行调整
+    cos: excluded:涉及单任务美元花费上限与成本风控，由本人在设置页管理
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}
+    route_fields:
+      - cap_usd
 
   - key: dalton.workspace.sharing
     stored_in: dalton_workspace_sharing（cos_access / web_access）
     web_entry: 对应工作区对话列表顶部 → 共享设置 → 访问级别
-    cos: excluded:跨成员工作区读写与可见权限边界，须由工作区所有者在网页端授权
+    cos: excluded:跨成员工作区读写与可见权限边界，由工作区所有者在网页端授权
     profiles: [everflow]
     capability: colleague_sharing
     routes:
       - PUT /api/v1/dalton/workspaces/{workspace_id}/sharing
+    route_fields:
+      - cos_access
+      - web_access
 
   - key: dalton.workspace.team_memory
     stored_in: dalton_workspace_settings.team_memory_enabled
@@ -838,15 +901,19 @@ settings:
     capability: conversation_archive
     routes:
       - PUT /api/v1/dalton/workspaces/{workspace_id}/settings
+    route_fields:
+      - team_memory_enabled
 
   - key: dalton.sharing.cos_rw_enabled
-    stored_in: dalton_user_sharing_settings.cos_rw_enabled
+    stored_in: dalton_user_sharing.cos_rw_enabled
     web_entry: 设置 → 对话与助手 → 工作区协同共享
-    cos: excluded:允许同事研究总监向本人工作区派活的安全授权开关，须由本人在设置页切换
+    cos: excluded:允许同事研究总监向本人工作区派活的安全授权开关，由本人在设置页切换
     profiles: [everflow]
     capability: colleague_sharing
     routes:
       - PUT /api/v1/dalton/sharing/user-settings
+    route_fields:
+      - cos_rw_enabled
 
   - key: dalton.user.home_team_memory
     stored_in: dalton_user_settings.home_team_memory_enabled
@@ -856,6 +923,8 @@ settings:
     capability: conversation_archive
     routes:
       - PUT /api/v1/dalton/user-settings
+    route_fields:
+      - home_team_memory_enabled
 
   - key: dalton.automation.managed
     stored_in: automations 表（受覆盖单元管理的 dalton-* 自动化任务）
@@ -864,14 +933,25 @@ settings:
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/automations/{name}
+    route_fields:
+      - workspace_id
+      - entry
+      - spec
+    note: 需启用 autonomy；由工作区所有者、覆盖单元主责分析师或管理员修改
 
   - key: dalton.earnings.calendar_mirror
-    stored_in: dalton_user_earnings_calendar_mirrors
+    stored_in: dalton_earnings_calendar_mirror
     web_entry: 个人财报日历自动镜像同步
     cos: tool:dalton_publish_earnings_calendar
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/earnings/calendar/mirror
+    route_fields:
+      - ledger
+      - updated
+      - entries
+      - reported
+    note: 需启用 autonomy
 
   - key: dalton.feishu.read_scopes
     stored_in: dalton_feishu_read_scopes
@@ -881,9 +961,11 @@ settings:
     capability: feishu_docs
     routes:
       - PUT /api/v1/dalton/feishu/read-scopes
+    route_fields:
+      - scopes
 
   - key: dalton.team_models.model
-    stored_in: dalton_team_model_catalog
+    stored_in: dalton_team_model_catalog.payload
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录
     cos: excluded:管理员专用团队模型目录配置，涉及定价、评分、退役与全员可用性
     profiles: [everflow, core]
@@ -891,7 +973,7 @@ settings:
       - PUT /api/v1/dalton/team-models/{model_key}
 
   - key: dalton.team_models.provider_variant
-    stored_in: dalton_team_model_provider_variants
+    stored_in: dalton_team_model_catalog.payload（provider_variants；凭据存于 dalton_catalog_provider_credentials）
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（供应商变体）
     cos: excluded:管理员专用模型供应商变体与路由配置
     profiles: [everflow, core]
@@ -899,7 +981,7 @@ settings:
       - PUT /api/v1/dalton/team-models/provider-variants/{provider_slug}
 
   - key: dalton.team_models.curated
-    stored_in: dalton_team_model_curated_setup
+    stored_in: dalton_team_model_catalog.payload（curated）
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（入门推荐模型）
     cos: excluded:管理员专用入门推荐模型列表配置
     profiles: [everflow, core]
@@ -913,6 +995,9 @@ settings:
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/watchlist/tier-policies/{tier}
+    route_fields:
+      - override_user_pause
+    note: 需启用 autonomy 与个人覆盖列表（allow_personal_watchlist）
 
   - key: dalton.coverage_unit
     stored_in: dalton_coverage_units（行业/公司覆盖单元与工作区绑定）
@@ -920,6 +1005,7 @@ settings:
     cos: tool:dalton_coverage_unit
     profiles: [everflow]
     capability: colleague_sharing
+    note: 仅内部成员及管理员在 coverage_units.enabled 开启时可写
 
   - key: dalton.system_jobs
     stored_in: dalton_data_task_defs（公司公共数据任务定时排期与启停开关）
@@ -927,28 +1013,52 @@ settings:
     cos: tool:dalton_system_jobs
     profiles: [everflow]
     capability: data_jobs
+    note: 公司数据任务（data:<job_key>）由内部成员及管理员在研究总监角色下修改
 
   - key: dalton.monitors.settings
-    stored_in: dalton_monitors（标题、可见范围与发布设置）
+    stored_in: dalton_monitors（title / category / visibility / keep_updated）与 dalton_monitor_members
     web_entry: 侧栏「监控面板」→ 面板设置
     cos: tool:dalton_monitor
     profiles: [everflow, core]
     routes:
       - PATCH /api/v1/dalton/monitors/{slug}
+    route_fields:
+      - title
+      - category
+      - visibility
+      - member_user_ids
+      - keep_updated
+    note: 需启用 artifact_publishing；外部成员限于 own 可见范围，public 可见性由管理员在网页面板设置中开启
+
+  - key: dalton.monitors.sort_order
+    stored_in: dalton_monitors.sort_order
+    web_entry: 侧栏「监控面板」→ 面板设置 → 排序权重
+    cos: missing
+    profiles: [everflow, core]
+    routes:
+      - PATCH /api/v1/dalton/monitors/{slug}
+    route_fields:
+      - sort_order
+    note: PATCH /api/v1/dalton/monitors/{slug} 支持保存 sort_order，dalton_monitor 工具当前未开放该参数
 
   - key: dalton.monitors.shared_document
-    stored_in: dalton_monitors（工作区分享文档元数据与可见范围）
+    stored_in: dalton_shared_documents（title / visibility / keep_updated）与 dalton_shared_document_members
     web_entry: 工作区文件发布/分享面板
-    cos: excluded:公开与团队分享文档可见范围边界，须由用户在分享面板操作
+    cos: excluded:公开与团队分享文档可见范围边界，由用户在分享面板操作
     profiles: [everflow, core]
     routes:
       - PATCH /api/v1/dalton/monitors/shared-documents/by-artifact/{artifact_id}
+    route_fields:
+      - title
+      - visibility
+      - member_user_ids
+      - keep_updated
 
   # ===========================================================================
   # 9. 渠道与外部集成（channels / integrations）
   # ===========================================================================
   - key: channels.settings
-    stored_in: dalton_channel_user_settings（default / chats / preferred / automation_output / agent_messages）
+    stored_in: dalton_channel_user_settings.apps（default / chats / preferred / automation_output / agent_messages）
     web_entry: 设置 → 消息与渠道（默认工作区、首选会话、自动化输出与允许主动发送的群）
     cos: tool:edit_file(.agents/user/channels/channels.json)
     profiles: [everflow]
@@ -956,39 +1066,48 @@ settings:
     routes:
       - PUT /api/v1/dalton/channels/settings
       - PUT /api/v1/dalton/channels/internal/settings
+    route_fields:
+      - settings
+      - automation_output_update
+      - workspace_id
+      - platform
+      - address
 
   - key: channels.weixin.admin_config
-    stored_in: dalton_weixin_channel_config（enabled / allow_external）
+    stored_in: dalton_channel_weixin_config（enabled / allow_external）
     web_entry: 设置 → 团队管理 → 团队渠道与运维 → 团队微信渠道管理
     cos: excluded:管理员专用团队微信接入开关与外部成员接入策略
     profiles: [everflow]
     capability: channel_weixin
     routes:
       - PUT /api/v1/dalton/channels/weixin/admin/config
+    route_fields:
+      - enabled
+      - allow_external
 
   - key: channels.weixin.binding
-    stored_in: dalton_weixin_accounts（个人微信 iLink 扫码绑定与登录态）
+    stored_in: dalton_channel_weixin_accounts（个人微信 iLink 扫码绑定，令牌存于 dalton_channel_weixin_account_tokens）
     web_entry: 设置 → 消息与渠道 → 我的微信绑定
-    cos: excluded:涉及个人微信扫码鉴权与会话令牌，须由本人在网页端扫码绑定或解绑
+    cos: excluded:涉及个人微信扫码鉴权与会话令牌，由本人在网页端扫码绑定或解绑
     profiles: [everflow]
     capability: channel_weixin
 
   - key: channels.feishu_discord.binding
-    stored_in: dalton_channel_bindings（飞书与 Discord 个人账号绑定）
+    stored_in: dalton_channel_identities（飞书与 Discord 个人账号绑定）
     web_entry: 设置 → 消息与渠道 → 飞书与 Discord 账号绑定
-    cos: excluded:涉及绑定码身份核验与账号解绑，须由本人在网页端完成
+    cos: excluded:涉及绑定码身份核验与账号解绑，由本人在网页端完成
     profiles: [everflow]
     capability: channel_gateway
 
   - key: channels.feishu.groups
-    stored_in: dalton_channel_feishu_groups（团队飞书群绑定与报告接收权限）
+    stored_in: dalton_internal_feishu_groups（团队飞书群绑定与报告接收权限）
     web_entry: 设置 → 团队管理 → 团队渠道与运维 → 飞书团队群
     cos: excluded:团队共享群绑定管理，由内部成员或管理员在网页端维护
     profiles: [everflow]
     capability: channel_feishu
 
   - key: channels.discord.channels
-    stored_in: dalton_channel_discord_channels（团队 Discord 频道绑定与报告接收权限）
+    stored_in: dalton_channel_user_settings.apps.discord.chats（团队 Discord 频道绑定）
     web_entry: 设置 → 团队管理 → 团队渠道与运维 → Discord 频道
     cos: excluded:管理员专用团队 Discord 频道绑定配置
     profiles: [everflow]
@@ -996,26 +1115,26 @@ settings:
 
   - key: integrations.trading_permission
     stored_in: user_trading_permissions（Dalton 构建锁定为 no_trading）
-    web_entry: 当前版本不开放交易权限设置页
-    cos: excluded:涉及实盘交易自动下单授权协议且当前版本禁用，严禁智能体修改
+    web_entry: 当前版本保持只读锁定（no_trading）
+    cos: excluded:涉及实盘交易自动下单授权协议，由平台策略固定锁定
     profiles: [everflow, core]
 
   - key: integrations.user_api_keys
     stored_in: user_api_keys（加密存储）
     web_entry: 设置 → 模型 → 模型访问（自带 API Key）
-    cos: excluded:用户私有 API 密钥凭据，禁止经对话上下文读写
+    cos: excluded:用户私有 API 密钥凭据，由本人在设置页维护
     profiles: [everflow, core]
 
   - key: integrations.user_oauth_tokens
     stored_in: user_oauth_tokens（加密存储）
     web_entry: 设置 → 模型 → 模型访问（订阅账号 OAuth 登录）
-    cos: excluded:第三方账号 OAuth 登录凭据，须由本人在浏览器完成授权
+    cos: excluded:第三方账号 OAuth 登录凭据，由本人在浏览器完成授权
     profiles: [everflow, core]
 
   - key: integrations.vault_secrets
     stored_in: user_vault_secrets（加密存储）
     web_entry: 侧栏「插件」→ 密钥（Vault）
-    cos: excluded:敏感密钥保管库，禁止智能体通过对话工具写入或导出
+    cos: excluded:敏感密钥保管库，由本人在插件页维护
     profiles: [everflow, core]
 
   - key: integrations.mcp_servers
@@ -1048,77 +1167,77 @@ settings:
   - key: deployment_settings.SANDBOX_PROVIDER
     stored_in: deployment_settings（name = 'SANDBOX_PROVIDER'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 代码运行环境
-    cos: excluded:部署级沙箱运行时选择，仅限自部署管理员在服务器设置页配置
+    cos: excluded:部署级沙箱运行时选择，由自部署管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.LOCAL_INSTALL_GROUPS
     stored_in: deployment_settings（name = 'LOCAL_INSTALL_GROUPS'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 本地安装组件组
-    cos: excluded:部署级本地依赖安装组配置，仅限自部署管理员在服务器设置页配置
+    cos: excluded:部署级本地依赖安装组配置，由自部署管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.SETUP_COMPLETED
     stored_in: deployment_settings（name = 'SETUP_COMPLETED'，pgcrypto 加密）
     web_entry: 自部署首次配置向导完成标记
-    cos: excluded:部署级初始化完成标记，仅由首次配置向导写入
+    cos: excluded:部署级初始化完成标记，由首次配置向导写入
     profiles: [core]
 
   - key: deployment_settings.FMP_API_KEY
     stored_in: deployment_settings（name = 'FMP_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 市场数据密钥
-    cos: excluded:部署级第三方数据供应商 API 密钥，禁止智能体读写
+    cos: excluded:部署级第三方数据供应商 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.TAVILY_API_KEY
     stored_in: deployment_settings（name = 'TAVILY_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    cos: excluded:部署级网络搜索 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.SERPER_API_KEY
     stored_in: deployment_settings（name = 'SERPER_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    cos: excluded:部署级网络搜索 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.BOCHA_API_KEY
     stored_in: deployment_settings（name = 'BOCHA_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    cos: excluded:部署级网络搜索 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.EXA_API_KEY
     stored_in: deployment_settings（name = 'EXA_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    cos: excluded:部署级网络搜索 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.PARALLEL_API_KEY
     stored_in: deployment_settings（name = 'PARALLEL_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    cos: excluded:部署级网络搜索 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.DEEPSEEK_API_KEY
     stored_in: deployment_settings（name = 'DEEPSEEK_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
-    cos: excluded:部署级第三方 API 密钥，禁止智能体读写
+    cos: excluded:部署级第三方 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.FIRECRAWL_API_KEY
     stored_in: deployment_settings（name = 'FIRECRAWL_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 网页抓取密钥
-    cos: excluded:部署级网页抓取 API 密钥，禁止智能体读写
+    cos: excluded:部署级网页抓取 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.DAYTONA_API_KEY
     stored_in: deployment_settings（name = 'DAYTONA_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 云沙箱密钥
-    cos: excluded:部署级云沙箱供应商 API 密钥，禁止智能体读写
+    cos: excluded:部署级云沙箱供应商 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
 
   - key: deployment_settings.E2B_API_KEY
     stored_in: deployment_settings（name = 'E2B_API_KEY'，pgcrypto 加密）
     web_entry: 自部署引导 / 设置 → 服务器 → 云沙箱密钥
-    cos: excluded:部署级云沙箱供应商 API 密钥，禁止智能体读写
+    cos: excluded:部署级云沙箱供应商 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
