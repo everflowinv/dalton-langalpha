@@ -57,21 +57,21 @@ How messages sent on connected chat apps (Feishu, Discord, personal WeChat) map 
 
 ## Feishu
 
-- **Direct messages (DM):** Messages from the same sender reuse one active conversation (`feishu:@me`), continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (or the session resets after inactivity).
+- **Direct messages (DM):** Messages from the same sender reuse one active conversation (`feishu:@me`), continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (after a long idle period a workspace selection expires, and the next message returns to Home in a fresh thread).
 - **Group chats:** Mention the app to start a new topic conversation; the starter can continue replying inside that topic thread with or without mentioning the app again. Mention the app in the main group chat to start a separate topic conversation.
-- **Commands:** `/workspace`, `/workspace <name|id>`, `/<workspace name>`, `/main`, `/new`, `/stop`, `/bind <CODE>`, and `/unbind` work in Feishu (mention the app when sending a command in the main group chat).
+- **Commands:** `/workspace`, `/workspace <name|id>`, `/<workspace name>`, `/main`, `/new`, and `/stop` work in Feishu. In a group, send them inside the topic thread of the conversation they should act on (`/stop` in the topic whose answer is running). Send `/bind <CODE>` and `/unbind` in a DM with the app.
 - **Agent sends:** Messages sent to `feishu:@me` arrive in the user's DM; messages sent to a group (`feishu:<chat_id>`) arrive in that group or its active topic thread.
 
 ## Discord
 
-- **Direct messages (DM):** Messages from the same sender reuse one active conversation (`discord:@me`), continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (or the session resets after inactivity).
+- **Direct messages (DM):** Messages from the same sender reuse one active conversation (`discord:@me`), continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (after a long idle period a workspace selection expires, and the next message returns to Home in a fresh thread).
 - **Server channels:** Mention the app in a channel to start a conversation in a thread; the person who started that thread can continue replying inside it without mentioning the app again.
-- **Commands:** Text commands (`/workspace`, `/workspace <name|id>`, `/<workspace name>`, `/main`, `/new`, `/stop`, `/bind <CODE>`, `/unbind`) and Discord native slash commands (`/workspace`, `/new`, `/stop`) both work.
+- **Commands:** Text commands (`/workspace`, `/workspace <name|id>`, `/<workspace name>`, `/main`, `/new`, `/stop`) and Discord native slash commands (`/workspace`, `/new`, `/stop`) both work; in a server channel, send them inside the thread they should act on. Send `/bind <CODE>` and `/unbind` in a DM with the app.
 - **Agent sends:** Messages sent to `discord:@me` arrive in the user's DM; messages sent to a server channel (`discord:<guild>/<channel>`) arrive in that channel or thread.
 
 ## Personal WeChat
 
-- **Direct messages (`weixin:@me`):** Messages from the linked user reuse one active conversation, continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (or the session resets after inactivity).
+- **Direct messages (`weixin:@me`):** Messages from the linked user reuse one active conversation, continuing the same thread until you send `/new` or switch places with `/workspace` or `/main` (after a long idle period a workspace selection expires, and the next message returns to Home in a fresh thread).
 - **Commands:** `/workspace`, `/workspace <name|id>`, `/<workspace name>`, `/main`, `/new`, `/stop`, and `/unbind` work in the DM.
 - **Agent sends:** Messages sent to `weixin:@me` appear directly in the user's DM alongside the chat's own messages.
 
