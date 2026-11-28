@@ -44,6 +44,7 @@ import {
   collectPublishedChartLayers,
   collectReportSourceChartLayers,
   deliverTurnChartsAndWidgets,
+  isDmTargetAddress,
   parseChartSnapshotsList,
 } from "./chart-snapshots.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
@@ -399,6 +400,7 @@ export class ChannelGatewayOrchestrator {
     PendingChartDeliveryReceipt
   >();
   private static readonly MAX_SETTLED_DELIVERABLE_KEYS = 2_000;
+  private readonly deliveredPersonalFirstTouchThreads = new Set<string>();
   private readonly logger = createSubsystemLogger("orchestrator");
   private readonly activeInboundUploadControllers = new Map<
     AbortController,
@@ -4802,6 +4804,30 @@ export class ChannelGatewayOrchestrator {
         continue;
       }
 
+      if (sse.event === "personal_integration_notice") {
+        sawTurnAccepted = true;
+        if (typeof payload.thread_id === "string") {
+          currentThreadId = payload.thread_id;
+        }
+        const noticeMsg =
+          typeof payload.message === "string" ? payload.message.trim() : "";
+        if (noticeMsg && currentThreadId) {
+          await this.deliverPersonalFirstTouchNotice({
+            userId,
+            threadId: currentThreadId,
+            runId: currentRunId,
+            platform: event.platform,
+            chatType: event.chatType,
+            targetAddress: event.chatAddress,
+            inboundMessageId: event.messageId,
+            threadScopeKey: event.threadScopeKey,
+            sourceGeneration: resolved.generation,
+            message: noticeMsg,
+          });
+        }
+        continue;
+      }
+
       if (sse.event === "tool_calls") {
         sawTurnAccepted = true;
         if (this.isMainAgentLane(payload.agent)) {
@@ -7379,6 +7405,30 @@ export class ChannelGatewayOrchestrator {
           continue;
         }
 
+        if (sse.event === "personal_integration_notice") {
+          const noticeMsg =
+            typeof payload.message === "string" ? payload.message.trim() : "";
+          const noticeTid =
+            typeof payload.thread_id === "string" && payload.thread_id
+              ? payload.thread_id
+              : params.threadId;
+          if (noticeMsg && noticeTid) {
+            await this.deliverPersonalFirstTouchNotice({
+              userId: params.userId,
+              threadId: noticeTid,
+              runId: params.runId,
+              platform: params.platform,
+              chatType: isDmTargetAddress(params.targetAddress) ? "dm" : "group",
+              targetAddress: params.targetAddress,
+              inboundMessageId: params.inboundMessageId ?? null,
+              threadScopeKey: params.scopeKey ?? null,
+              sourceGeneration: params.generation ?? null,
+              message: noticeMsg,
+            });
+          }
+          continue;
+        }
+
         if (sse.event === "artifact") {
           this.collectArtifactChartOrWidget(
             payload,
@@ -8630,6 +8680,29 @@ export class ChannelGatewayOrchestrator {
           if (sse.event === "stream_gap" || sse.event === "error") {
             sawStreamErrorOrGap = true;
             break;
+          }
+
+          if (sse.event === "personal_integration_notice") {
+            const noticeMsg =
+              typeof payload.message === "string" ? payload.message.trim() : "";
+            const noticeTid =
+              typeof payload.thread_id === "string" && payload.thread_id
+                ? payload.thread_id
+                : handle.threadId;
+            if (noticeMsg && noticeTid) {
+              await this.deliverPersonalFirstTouchNotice({
+                userId: handle.userId,
+                threadId: noticeTid,
+                runId,
+                platform: handle.platform,
+                chatType: isDmTargetAddress(handle.targetAddress) ? "dm" : "group",
+                targetAddress: handle.targetAddress,
+                threadScopeKey: handle.scopeKey,
+                sourceGeneration: handle.generation,
+                message: noticeMsg,
+              });
+            }
+            continue;
           }
 
           if (sse.event === "artifact") {
@@ -10720,51 +10793,24 @@ export class ChannelGatewayOrchestrator {
         }
       }
 
-      const res = await this.deliveryService.executeDelivery({
+      const finalRes = await this.executeDeliverableFallbackWithPersonalRedirect({
         deliveryKey,
-        kind: "fallback",
         userId: params.userId,
         threadId: params.threadId,
         workspaceId: sorted[0]?.workspace_id ?? null,
         runId: params.runId,
         platform: params.platform,
-        target: params.targetAddress,
+        targetAddress: params.targetAddress,
         inboundMessageId: params.inboundMessageId ?? null,
-        text: "",
         files: filesToAttach,
         linkOnlyFiles,
-        downloadMode: "deliverable",
-        linkFallbackOnDeliverableMismatch: true,
         threadScopeKey: params.threadScopeKey ?? null,
         sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
         sourceGeneration: params.sourceGeneration ?? null,
         activityOrigin: params.activityOrigin ?? null,
       });
-      let finalRes = res;
-      if (
-        res.code === "personal_integration_private_only" &&
-        !params.targetAddress.trim().toLowerCase().endsWith(":@me")
-      ) {
-        finalRes = await this.deliveryService.executeDelivery({
-          deliveryKey: `${deliveryKey}:personal_dm`,
-          kind: "fallback",
-          userId: params.userId,
-          threadId: params.threadId,
-          workspaceId: sorted[0]?.workspace_id ?? null,
-          runId: params.runId,
-          platform: params.platform,
-          target: `${params.platform}:@me`,
-          inboundMessageId: params.inboundMessageId ?? null,
-          text: "",
-          files: filesToAttach,
-          linkOnlyFiles,
-          downloadMode: "deliverable",
-          linkFallbackOnDeliverableMismatch: true,
-          threadScopeKey: params.threadScopeKey ?? null,
-          sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
-          sourceGeneration: params.sourceGeneration ?? null,
-          activityOrigin: params.activityOrigin ?? null,
-        });
+      if (!finalRes) {
+        return false;
       }
       const settled = finalRes.status === "sent" || finalRes.status === "partial";
       if (settled) {
@@ -10793,6 +10839,94 @@ export class ChannelGatewayOrchestrator {
         this.inFlightDeliverableSettlements.delete(deliveryKey);
       }
     }
+  }
+
+  private async executeDeliverableFallbackWithPersonalRedirect(params: {
+    deliveryKey: string;
+    userId: string;
+    threadId: string | null;
+    workspaceId: string | null;
+    runId: string;
+    platform: ChannelPlatform;
+    targetAddress: string;
+    inboundMessageId: string | null;
+    files: Array<{ path: string; workspace_id: string | null }>;
+    linkOnlyFiles: Array<{
+      path: string;
+      workspace_id: string | null;
+      filename: string;
+      reason: string;
+    }>;
+    threadScopeKey: string | null;
+    sourceScopeKey: string | null;
+    sourceGeneration: number | null;
+    activityOrigin: DeliveryActivityOrigin | null;
+  }): Promise<AgentSendResponse | null> {
+    const res = await this.deliveryService.executeDelivery({
+      deliveryKey: params.deliveryKey,
+      kind: "fallback",
+      userId: params.userId,
+      threadId: params.threadId,
+      workspaceId: params.workspaceId,
+      runId: params.runId,
+      platform: params.platform,
+      target: params.targetAddress,
+      inboundMessageId: params.inboundMessageId,
+      text: "",
+      files: params.files,
+      linkOnlyFiles: params.linkOnlyFiles,
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+      threadScopeKey: params.threadScopeKey,
+      sourceScopeKey: params.sourceScopeKey,
+      sourceGeneration: params.sourceGeneration,
+      activityOrigin: params.activityOrigin,
+    });
+    if (
+      res.code === "personal_integration_private_only" &&
+      !params.targetAddress.trim().toLowerCase().endsWith(":@me")
+    ) {
+      const dmRes = await this.deliveryService.executeDelivery({
+        deliveryKey: `${params.deliveryKey}:personal_dm`,
+        kind: "fallback",
+        userId: params.userId,
+        threadId: params.threadId,
+        workspaceId: params.workspaceId,
+        runId: params.runId,
+        platform: params.platform,
+        target: `${params.platform}:@me`,
+        inboundMessageId: params.inboundMessageId,
+        text: "本次结果含个人日历相关附件，已发送到你的私聊",
+        files: params.files,
+        linkOnlyFiles: params.linkOnlyFiles,
+        downloadMode: "deliverable",
+        linkFallbackOnDeliverableMismatch: true,
+        threadScopeKey: params.threadScopeKey,
+        sourceScopeKey: params.sourceScopeKey,
+        sourceGeneration: params.sourceGeneration,
+        activityOrigin: params.activityOrigin,
+      });
+      if (dmRes.status !== "sent" && dmRes.status !== "partial") {
+        return null;
+      }
+      return await this.deliveryService.executeDelivery({
+        deliveryKey: `fallback:${params.runId}:personal_redirect_notice`,
+        kind: "fallback",
+        userId: params.userId,
+        threadId: params.threadId,
+        workspaceId: params.workspaceId,
+        runId: params.runId,
+        platform: params.platform,
+        target: params.targetAddress,
+        inboundMessageId: params.inboundMessageId,
+        text: "本次结果含个人日历内容，已发送到你的私聊",
+        threadScopeKey: params.threadScopeKey,
+        sourceScopeKey: params.sourceScopeKey,
+        sourceGeneration: params.sourceGeneration,
+        activityOrigin: params.activityOrigin,
+      });
+    }
+    return res;
   }
 
   private collectArtifactChartOrWidget(
@@ -11283,6 +11417,61 @@ export class ChannelGatewayOrchestrator {
     // may still resubmit them or send their own notice.
     this.processingFeedback.settleRunPrimary(currentRunId, failOutcome);
     this.processingFeedback.settleRun(currentRunId, "failed");
+  }
+
+  private async deliverPersonalFirstTouchNotice(params: {
+    userId: string;
+    threadId: string | null;
+    runId?: string | null;
+    platform: ChannelPlatform;
+    chatType?: string | null;
+    targetAddress: string;
+    inboundMessageId?: string | null;
+    threadScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    message: string;
+  }): Promise<boolean> {
+    const threadId = (params.threadId ?? "").trim();
+    const text = params.message.trim();
+    if (!threadId || !text) {
+      return false;
+    }
+    // Deliver ONLY in the owner's verified 1:1 DM (never in groups/channels).
+    const isDm =
+      params.chatType === "dm" && isDmTargetAddress(params.targetAddress);
+    if (!isDm) {
+      return false;
+    }
+    if (this.deliveredPersonalFirstTouchThreads.has(threadId)) {
+      return true;
+    }
+    const ok = await this.sendNoticeDelivery({
+      deliveryKey: `notice:personal_first_touch:${threadId}`,
+      userId: params.userId,
+      threadId,
+      runId: params.runId ?? null,
+      platform: params.platform,
+      target: `${params.platform}:@me`,
+      inboundMessageId: params.inboundMessageId ?? null,
+      text,
+      threadScopeKey: params.threadScopeKey ?? null,
+      sourceScopeKey: params.threadScopeKey ?? null,
+      sourceGeneration: params.sourceGeneration ?? null,
+      activityOrigin: "conversation",
+    });
+    if (ok) {
+      if (
+        this.deliveredPersonalFirstTouchThreads.size >=
+        ChannelGatewayOrchestrator.MAX_SETTLED_DELIVERABLE_KEYS
+      ) {
+        const oldest = this.deliveredPersonalFirstTouchThreads.values().next().value;
+        if (oldest !== undefined) {
+          this.deliveredPersonalFirstTouchThreads.delete(oldest);
+        }
+      }
+      this.deliveredPersonalFirstTouchThreads.add(threadId);
+    }
+    return ok;
   }
 
   private async sendNoticeDelivery(options: {

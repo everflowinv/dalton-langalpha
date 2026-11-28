@@ -135,7 +135,7 @@ class NonRetainingTracer(LangChainTracer):
         # tell whether they changed since. Shared with copies, which may close
         # a run another opened.
         self._posted_inputs: dict[UUID, Any] = {}
-        # DALTON-HOOK(personal-integrations): shared mutable flag for redacting personal calendar/mail payloads in this trace tree
+        # DALTON-HOOK(personal-integrations): shared mutable flag suppressing LangSmith export for personal-integration threads
         self._personal_private: list[bool] = [False]
 
     def copy_with_metadata_defaults(
@@ -154,34 +154,34 @@ class NonRetainingTracer(LangChainTracer):
         copy._personal_private = self._personal_private  # DALTON-HOOK(personal-integrations)
         return copy
 
+    def _persist_run_single(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): skip entire LangSmith create_run export on personal-integration threads
+        if self._personal_private[0]:
+            run.extra["__disabled"] = True
+            return
+        super()._persist_run_single(run)
+
+    def _update_run_single(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): skip entire LangSmith update_run export on personal-integration threads
+        if self._personal_private[0]:
+            run.extra["__disabled"] = True
+            return
+        super()._update_run_single(run)
+
     def _start_trace(self, run: Run) -> None:
-        # DALTON-HOOK(personal-integrations): redact private personal-integration tool inputs and ALL subsequent tool/LLM/chain inputs before LangSmith export
+        # DALTON-HOOK(personal-integrations): arm whole-trace LangSmith suppression as soon as personal-integration data enters
         from src.dalton.services.personal_integration_trace import (
             is_personal_integration_tool,
             messages_contain_personal_integration_data,
-            redact_langsmith_chain_payload,
-            redact_langsmith_generic_tool_inputs,
-            redact_langsmith_llm_inputs,
-            redact_langsmith_tool_inputs,
         )
 
-        if run.run_type == "tool":
-            if is_personal_integration_tool(run.name):
-                self._personal_private[0] = True
-                run.inputs = redact_langsmith_tool_inputs(run.inputs, run.name)
-            elif self._personal_private[0] or messages_contain_personal_integration_data(
-                run.inputs
-            ):
-                self._personal_private[0] = True
-                run.inputs = redact_langsmith_generic_tool_inputs(run.inputs, run.name)
-        elif run.run_type == "llm":
-            if self._personal_private[0] or messages_contain_personal_integration_data(run.inputs):
-                self._personal_private[0] = True
-                run.inputs = redact_langsmith_llm_inputs(run.inputs)
-        elif run.run_type == "chain":
-            if self._personal_private[0] or messages_contain_personal_integration_data(run.inputs):
-                self._personal_private[0] = True
-                run.inputs = redact_langsmith_chain_payload(run.inputs)
+        if (
+            self._personal_private[0]
+            or (run.run_type == "tool" and is_personal_integration_tool(run.name))
+            or messages_contain_personal_integration_data(run.inputs)
+        ):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
         super()._start_trace(run)
         # On each run rather than in tracing_metadata, so the tracer stays
         # configured exactly as the one langchain_core would have built.
@@ -208,25 +208,10 @@ class NonRetainingTracer(LangChainTracer):
 
     def _on_chain_end(self, run: Run) -> None:
         self._settle_chain_inputs(run)
-        # DALTON-HOOK(personal-integrations): redact chain payloads once personal integration data entered this trace
-        if self._personal_private[0]:
-            from src.dalton.services.personal_integration_trace import (
-                redact_langsmith_chain_payload,
-            )
-
-            run.inputs = redact_langsmith_chain_payload(run.inputs)
-            run.outputs = redact_langsmith_chain_payload(run.outputs)
         super()._on_chain_end(run)
 
     def _on_chain_error(self, run: Run) -> None:
         self._settle_chain_inputs(run)
-        # DALTON-HOOK(personal-integrations): redact chain inputs on error when personal integration data entered this trace
-        if self._personal_private[0]:
-            from src.dalton.services.personal_integration_trace import (
-                redact_langsmith_chain_payload,
-            )
-
-            run.inputs = redact_langsmith_chain_payload(run.inputs)
         super()._on_chain_error(run)
 
     def _settle_chain_inputs(self, run: Run) -> None:
@@ -257,27 +242,17 @@ class NonRetainingTracer(LangChainTracer):
             self._stamp_cost(run)
         except Exception as e:
             logger.debug("LangSmith cost stamp failed: %s", e)
-        # DALTON-HOOK(personal-integrations): redact LLM inputs/outputs after cost stamping when trace holds OR first emits personal integration tool calls
+        # DALTON-HOOK(personal-integrations): suppress LangSmith export when LLM outputs emit personal integration tool calls
         from src.dalton.services.personal_integration_trace import (
             llm_outputs_contain_personal_tool_call,
-            redact_langsmith_llm_inputs,
-            redact_langsmith_llm_outputs,
         )
 
         if self._personal_private[0] or llm_outputs_contain_personal_tool_call(run.outputs):
             self._personal_private[0] = True
-            run.inputs = redact_langsmith_llm_inputs(run.inputs)
-            run.outputs = redact_langsmith_llm_outputs(run.outputs)
+            run.extra["__disabled"] = True
         super()._on_llm_end(run)
 
     def _on_llm_error(self, run: Run) -> None:
-        # DALTON-HOOK(personal-integrations): redact LLM inputs on error when trace holds personal integration data
-        if self._personal_private[0]:
-            from src.dalton.services.personal_integration_trace import (
-                redact_langsmith_llm_inputs,
-            )
-
-            run.inputs = redact_langsmith_llm_inputs(run.inputs)
         super()._on_llm_error(run)
 
     def _stamp_cost(self, run: Run) -> None:
@@ -330,49 +305,27 @@ class NonRetainingTracer(LangChainTracer):
 
     def _on_tool_end(self, run: Run) -> None:
         _settle_tool_run(run, None)
-        # DALTON-HOOK(personal-integrations): redact private personal-integration and subsequent tool payloads before LangSmith export
+        # DALTON-HOOK(personal-integrations): suppress LangSmith export for personal-integration and subsequent tool runs
         from src.dalton.services.personal_integration_trace import (
             is_personal_integration_tool,
-            redact_langsmith_generic_tool_inputs,
-            redact_langsmith_tool_inputs,
-            redact_langsmith_tool_outputs,
         )
 
-        is_personal_tool = is_personal_integration_tool(run.name)
-        if is_personal_tool or self._personal_private[0]:
+        if is_personal_integration_tool(run.name) or self._personal_private[0]:
             self._personal_private[0] = True
-            run.inputs = (
-                redact_langsmith_tool_inputs(run.inputs, run.name)
-                if is_personal_tool
-                else redact_langsmith_generic_tool_inputs(run.inputs, run.name)
-            )
-            run.outputs = redact_langsmith_tool_outputs(run.outputs)
+            run.extra["__disabled"] = True
         super()._on_tool_end(run)
 
     def _errored_tool_run(self, error: BaseException, run_id: UUID) -> Run:
         run = super()._errored_tool_run(error, run_id)
         _settle_tool_run(run, error)
-        # DALTON-HOOK(personal-integrations): redact private personal-integration and subsequent tool payloads on error
+        # DALTON-HOOK(personal-integrations): suppress LangSmith export for errored personal-integration and subsequent tool runs
         from src.dalton.services.personal_integration_trace import (
-            REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
             is_personal_integration_tool,
-            redact_langsmith_generic_tool_inputs,
-            redact_langsmith_tool_inputs,
-            redact_langsmith_tool_outputs,
         )
 
-        is_personal_tool = is_personal_integration_tool(run.name)
-        if is_personal_tool or self._personal_private[0]:
+        if is_personal_integration_tool(run.name) or self._personal_private[0]:
             self._personal_private[0] = True
-            run.inputs = (
-                redact_langsmith_tool_inputs(run.inputs, run.name)
-                if is_personal_tool
-                else redact_langsmith_generic_tool_inputs(run.inputs, run.name)
-            )
-            if run.outputs is not None:
-                run.outputs = redact_langsmith_tool_outputs(run.outputs)
-            if run.error:
-                run.error = REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+            run.extra["__disabled"] = True
         return run
 
 

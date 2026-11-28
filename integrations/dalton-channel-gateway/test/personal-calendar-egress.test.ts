@@ -71,6 +71,8 @@ describe("Personal integration channel egress guard (automation, fallback & retr
         claim_status: "claimed",
         platform: "feishu",
         target_address: "feishu:@me",
+        recipient_platform_user_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
         is_current: true,
       };
     });
@@ -288,6 +290,8 @@ describe("Personal integration channel egress guard (automation, fallback & retr
         claim_status: "claimed",
         platform: "feishu",
         target_address: "feishu:@me",
+        recipient_platform_user_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
         is_current: true,
       };
     });
@@ -315,5 +319,202 @@ describe("Personal integration channel egress guard (automation, fallback & retr
     expect(groupMessages).toHaveLength(1);
     expect(groupMessages[0]?.text).toBe(REDIRECT_NOTICE);
     expect(groupMessages[0]?.text).not.toContain("医疗复诊");
+  });
+
+  it("delivers personal_integration_notice once per thread in verified 1:1 DM (including on cancelled approval) and never in group", async () => {
+    const firstTouchMsg =
+      "提示：本对话已接入你的个人日历私密数据，仅限创建者本人访问；后续若断开该连接，将从本轮起向后清除同线程产生的后续对话内容，纯研究讨论建议另开新线程。";
+    const dmThreadId = "44444444-5555-6666-7777-888888888881";
+
+    // Simulate a Feishu 1:1 DM turn that emits personal_integration_notice twice (e.g. live + replay)
+    // and then hits a write approval interrupt (even if the user later cancels the approval).
+    vi.mocked(h.backend.appendThreadMessages).mockResolvedValueOnce({
+      isSse: true,
+      status: 200,
+      events: (async function* () {
+        yield {
+          event: "metadata",
+          data: JSON.stringify({
+            thread_id: dmThreadId,
+            run_id: RUN_ID,
+            turn_index: 0,
+          }),
+        };
+        yield {
+          event: "personal_integration_notice",
+          data: JSON.stringify({
+            thread_id: dmThreadId,
+            agent: "main",
+            service: "calendar",
+            provider: "google",
+            turn_index: 0,
+            message: firstTouchMsg,
+          }),
+        };
+        yield {
+          event: "personal_integration_notice",
+          data: JSON.stringify({
+            thread_id: dmThreadId,
+            agent: "main",
+            service: "calendar",
+            provider: "google",
+            turn_index: 0,
+            message: firstTouchMsg,
+          }),
+        };
+        yield {
+          event: "interrupt",
+          data: JSON.stringify({
+            thread_id: dmThreadId,
+            run_id: RUN_ID,
+            interrupt_id: "int-cal-cancel",
+            action_requests: [
+              {
+                type: "dalton_calendar_update_event",
+                name: "dalton_calendar",
+                description: "确认修改日程",
+                dm_notice: "请前往网页端确认修改日程",
+              },
+            ],
+          }),
+        };
+      })(),
+    });
+
+    await h.feishuAdapter.emitInbound({
+      platform: "feishu",
+      messageId: "msg-dm-first-touch-1",
+      platformUserId: "ou_alice",
+      chatType: "dm",
+      chatId: "oc_dm_alice",
+      chatAddress: "feishu:@me",
+      threadScopeKey: "dm:ou_alice",
+      text: "帮我改一下明天的日程",
+    });
+
+    const noticeClaims = h.backend.deliveryClaims.filter(
+      (c) => c.delivery_key === `notice:personal_first_touch:${dmThreadId}`,
+    );
+    expect(noticeClaims).toHaveLength(1);
+    expect(noticeClaims[0]?.target).toBe("feishu:@me");
+
+    const dmNotices = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === "feishu:@me" && m.text === firstTouchMsg,
+    );
+    expect(dmNotices).toHaveLength(1);
+
+    // Group chat must NEVER receive personal_integration_notice
+    const groupThreadId = "44444444-5555-6666-7777-888888888882";
+    const delivered = await (
+      h.app.orchestrator as unknown as {
+        deliverPersonalFirstTouchNotice: (p: Record<string, unknown>) => Promise<boolean>;
+      }
+    ).deliverPersonalFirstTouchNotice({
+      userId: USER_ID,
+      threadId: groupThreadId,
+      runId: RUN_ID,
+      platform: "feishu",
+      chatType: "group",
+      targetAddress: "feishu:oc_group_alpha",
+      message: firstTouchMsg,
+    });
+    expect(delivered).toBe(false);
+    expect(
+      h.backend.deliveryClaims.some(
+        (c) => c.delivery_key === `notice:personal_first_touch:${groupThreadId}`,
+      ),
+    ).toBe(false);
+  });
+
+  it("private thread attachment fallback redirects files with explanation to DM and posts only sanitized notice to group", async () => {
+    const runId = "55555555-6666-7777-8888-999999999991";
+    const groupTarget = "feishu:oc_group_attach";
+
+    vi.mocked(h.backend.downloadWorkspaceFile).mockResolvedValueOnce({
+      content: Buffer.from("calendar summary", "utf8"),
+      mimeType: "text/plain",
+    });
+
+    vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      if (
+        req.target === groupTarget &&
+        !req.delivery_key.endsWith(":personal_redirect_notice")
+      ) {
+        return {
+          claim_status: "denied",
+          status: "failed",
+          code: "personal_integration_private_only",
+          has_personal_integration_data: true,
+          redirect_dm_address: "feishu:@me",
+          message: "personal calendar thread cannot send attachments to group",
+        };
+      }
+      if (req.delivery_key.endsWith(":personal_redirect_notice")) {
+        return {
+          claim_status: "claimed",
+          platform: "feishu",
+          target_address: groupTarget,
+          is_current: true,
+          personal_private_redirect_notice: true,
+          forced_text: REDIRECT_NOTICE,
+        };
+      }
+      return {
+        claim_status: "claimed",
+        platform: "feishu",
+        target_address: "feishu:@me",
+        recipient_platform_user_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
+        is_current: true,
+      };
+    });
+
+    const redirectFn = (
+      h.app.orchestrator as unknown as {
+        executeDeliverableFallbackWithPersonalRedirect: (
+          p: Record<string, unknown>,
+        ) => Promise<{ status: string } | null>;
+      }
+    ).executeDeliverableFallbackWithPersonalRedirect.bind(h.app.orchestrator);
+
+    const res = await redirectFn({
+      deliveryKey: `deliverables:${runId}`,
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      workspaceId: "ws-1",
+      runId,
+      platform: "feishu",
+      targetAddress: groupTarget,
+      inboundMessageId: null,
+      files: [{ path: "calendar_notes.txt", workspace_id: "ws-1" }],
+      linkOnlyFiles: [],
+      threadScopeKey: null,
+      sourceScopeKey: null,
+      sourceGeneration: null,
+      activityOrigin: "automation",
+    });
+    expect(res?.status).toBe("sent");
+
+    // DM receives both the attachment and the explanation text
+    const dmTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === "feishu:@me",
+    );
+    const dmFiles = h.feishuAdapter.sentFiles.filter(
+      (f) => f.targetAddress === "feishu:@me",
+    );
+    expect(dmTexts.some((m) => m.text.includes("个人日历相关附件"))).toBe(true);
+    expect(dmFiles).toHaveLength(1);
+    expect(dmFiles[0]?.filename).toBe("calendar_notes.txt");
+
+    // Group receives ONLY the sanitized redirect notice and ZERO attachments
+    const groupTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === groupTarget,
+    );
+    const groupFiles = h.feishuAdapter.sentFiles.filter(
+      (f) => f.targetAddress === groupTarget,
+    );
+    expect(groupTexts).toHaveLength(1);
+    expect(groupTexts[0]?.text).toBe(REDIRECT_NOTICE);
+    expect(groupFiles).toHaveLength(0);
   });
 });

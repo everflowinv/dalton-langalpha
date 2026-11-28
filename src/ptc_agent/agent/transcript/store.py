@@ -182,6 +182,7 @@ def build_directory(
     """
     # DALTON-HOOK(personal-integrations): propagate personal-integration taint across multi-turn segments
     from src.dalton.services.personal_integration_trace import (
+        REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
         run_contains_personal_integration_tool,
     )
 
@@ -249,7 +250,14 @@ def build_directory(
             entry.get("personal_tainted")
         )
         entries.append(entry)
-    manifest = {"schema": SCHEMA_VERSION, **(header or {}), "segments": entries}
+    # DALTON-HOOK(personal-integrations): redact subagent manifest description when transcript carries personal integration data
+    manifest_header = dict(header or {})
+    if (
+        (personal_tainted or first_personal_segment is not None)
+        and manifest_header.get("description")
+    ):
+        manifest_header["description"] = REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+    manifest = {"schema": SCHEMA_VERSION, **manifest_header, "segments": entries}
     return Directory(
         manifest=dump_manifest(manifest),
         files={entry["file"]: (entry["sha256"], entry["bytes"]) for entry in entries},

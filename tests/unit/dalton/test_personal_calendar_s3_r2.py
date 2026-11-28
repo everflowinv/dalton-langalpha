@@ -1354,7 +1354,7 @@ def test_langsmith_tracer_redacts_personal_calendar_tool_and_subsequent_llm_payl
     fake_client = MagicMock()
     tracer = NonRetainingTracer(client=fake_client)
 
-    # 1. dalton_calendar tool run
+    # 1. dalton_calendar tool run -> suppresses entire LangSmith export (neither create_run nor update_run called)
     tool_run = Run(
         id=uuid4(),
         name="dalton_calendar",
@@ -1371,15 +1371,17 @@ def test_langsmith_tracer_redacts_personal_calendar_tool_and_subsequent_llm_payl
         },
         extra={},
         serialized={},
+        client=fake_client,
     )
     tracer._start_trace(tool_run)
-    assert "Private Board Dinner" not in json.dumps(tool_run.inputs, ensure_ascii=False)
-    assert tool_run.inputs["action"] == "create_event"
+    tracer._on_tool_start(tool_run)
     tracer._on_tool_end(tool_run)
-    assert "Private Board Dinner" not in json.dumps(tool_run.outputs, ensure_ascii=False)
-    assert tool_run.outputs["redacted"] is True
+    assert tracer._personal_private[0] is True
+    assert tool_run.extra.get("__disabled") is True
+    assert fake_client.create_run.call_count == 0
+    assert fake_client.update_run.call_count == 0
 
-    # 2. Subsequent LLM run on a copied tracer in the same trace tree
+    # 2. Subsequent LLM run on a copied tracer in the same trace tree is ALSO completely suppressed
     child_tracer = tracer.copy_with_metadata_defaults(metadata={"step": "2"})
     llm_run = Run(
         id=uuid4(),
@@ -1420,14 +1422,14 @@ def test_langsmith_tracer_redacts_personal_calendar_tool_and_subsequent_llm_payl
         },
         extra={},
         serialized={},
+        client=fake_client,
     )
     child_tracer._start_trace(llm_run)
-    assert "Private Board Dinner" not in json.dumps(llm_run.inputs, ensure_ascii=False)
+    child_tracer._on_llm_start(llm_run)
     child_tracer._on_llm_end(llm_run)
-    assert "Private Board Dinner" not in json.dumps(llm_run.outputs, ensure_ascii=False)
-    # Token usage preserved after redaction
-    usage = llm_run.outputs["generations"][0][0]["message"]["kwargs"]["usage_metadata"]
-    assert usage["total_tokens"] == 120
+    assert llm_run.extra.get("__disabled") is True
+    assert fake_client.create_run.call_count == 0
+    assert fake_client.update_run.call_count == 0
 
 
 # ===========================================================================

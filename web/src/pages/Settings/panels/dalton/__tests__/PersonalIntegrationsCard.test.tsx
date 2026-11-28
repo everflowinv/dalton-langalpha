@@ -518,4 +518,115 @@ describe('PersonalIntegrationsCard', () => {
       }),
     ).toBe(true);
   });
+
+  it('updates top banner automatically from running/revoking to completed as polled purge records finish', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'google_gmail']);
+    const runningPurge: PersonalIntegrationPurgeLedger = {
+      purge_id: 'p-all-1',
+      provider: 'google',
+      service: 'calendar',
+      provider_account_id: 'acct-google',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'running',
+      remote_revoke_status: 'pending',
+      retry_count: 0,
+      next_retry_at: null,
+      last_remote_error: null,
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: null,
+      remote_completed_at: null,
+    };
+    const revokingPurge: PersonalIntegrationPurgeLedger = {
+      ...runningPurge,
+      local_purge_status: 'completed',
+      remote_revoke_status: 'pending',
+      local_completed_at: '2026-11-27T10:00:05Z',
+    };
+
+    h.apiGet
+      // Initial mount
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [makeConnection('google', 'calendar'), makeConnection('google', 'mail')],
+          active_purges: [],
+          has_personal_integrations: true,
+        },
+      })
+      // Post-disconnect refetch #1: local purge still running
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [],
+          active_purges: [runningPurge],
+          has_personal_integrations: true,
+        },
+      })
+      // Refetch #2: local purge completed, remote revoke pending
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [],
+          active_purges: [revokingPurge],
+          has_personal_integrations: true,
+        },
+      })
+      // Refetch #3: all purges and remote revokes finished
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [],
+          active_purges: [],
+          has_personal_integrations: false,
+        },
+      });
+
+    h.apiDelete.mockResolvedValueOnce({
+      data: {
+        provider: 'google',
+        services: ['calendar', 'mail'],
+        purges: [
+          {
+            purge_id: 'p-all-1',
+            provider: 'google',
+            service: 'calendar',
+            local_purge_status: 'running',
+            remote_revoke_status: 'pending',
+          },
+        ],
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('Google 日历')).toBeInTheDocument();
+    const disconnectBtns = screen.getAllByRole('button', { name: '断开连接' });
+    fireEvent.click(disconnectBtns[0]);
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /断开全部 Google 服务并在 Google 撤销授权/ }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '正在后台清理关联本地个人数据',
+      ),
+    );
+    expect(await screen.findByTestId('personal-integration-purge-p-all-1')).toBeInTheDocument();
+
+    // Trigger next poll/refresh: local purge done, remote revoke pending
+    fireEvent.click(screen.getByRole('button', { name: '刷新连接状态' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '关联本地个人数据已清理完成，正在后台撤销 Google 授权',
+      ),
+    );
+
+    // Trigger next poll/refresh: all background purge & revoke done -> banner flips to completed!
+    fireEvent.click(screen.getByRole('button', { name: '刷新连接状态' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销',
+      ),
+    );
+    expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent('正在后台');
+  });
 });

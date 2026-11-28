@@ -79,7 +79,7 @@ def normalize_feishu_event(
     tz_name: str = "UTC",
 ) -> dict[str, Any]:
     """Normalize a Feishu Calendar v4 event object into the unified tool representation."""
-    return {
+    normalized: dict[str, Any] = {
         "provider": "feishu",
         "provider_label": "[飞书日历]",
         "calendar_id": calendar_id,
@@ -99,6 +99,10 @@ def normalize_feishu_event(
         "reminders": list(raw.get("reminders") or []),
         "html_link": raw.get("app_link"),
     }
+    idem_key = str(raw.get("idempotency_key") or "").strip()
+    if idem_key:
+        normalized["idempotency_key"] = idem_key
+    return normalized
 
 
 def build_feishu_event_body(
@@ -201,6 +205,7 @@ class FeishuCalendarClientProtocol(Protocol):
         body: Mapping[str, Any],
         attendees: Sequence[str] | None = None,
         tz_name: str = "UTC",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def update_event(
@@ -407,12 +412,19 @@ class FeishuCalendarClient:
         body: Mapping[str, Any],
         attendees: Sequence[str] | None = None,
         tz_name: str = "UTC",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        params = (
+            {"idempotency_key": str(idempotency_key).strip()}
+            if idempotency_key and str(idempotency_key).strip()
+            else None
+        )
         data = await self._request(
             "POST",
             f"/calendars/{calendar_id}/events",
             access_token=access_token,
             operation="create_event",
+            params=params,
             json_body=body,
         )
         ev = data.get("event") if isinstance(data.get("event"), Mapping) else data

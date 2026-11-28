@@ -10,6 +10,66 @@ interface PersonalIntegrationApprovalCardProps {
   data: ToolApprovalState;
   onApprove?: (extra?: ToolApprovalDecisionExtra) => void;
   onReject?: (message?: string, extra?: ToolApprovalDecisionExtra) => void;
+  resultLost?: boolean;
+  toolResultContent?: unknown;
+}
+
+function parseUnconfirmedWriteNotice(
+  toolResultContent: unknown,
+  resultLost: boolean | undefined,
+): string | null {
+  if (toolResultContent !== undefined && toolResultContent !== null) {
+    let parsed: Record<string, unknown> | null = null;
+    if (typeof toolResultContent === 'string') {
+      try {
+        const obj = JSON.parse(toolResultContent);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          parsed = obj as Record<string, unknown>;
+        }
+      } catch {
+        parsed = null;
+      }
+    } else if (typeof toolResultContent === 'object' && !Array.isArray(toolResultContent)) {
+      parsed = toolResultContent as Record<string, unknown>;
+    }
+    if (parsed && parsed.error === 'write_result_unconfirmed') {
+      return typeof parsed.message === 'string' && parsed.message.trim()
+        ? parsed.message.trim()
+        : '日程写入请求已发出但结果未确认，请前往你的日历中核对确认，避免重复操作。';
+    }
+  }
+  if (resultLost) {
+    return '日程写入请求已发出但未收到确认结果，请前往你的日历中核对确认，避免重复操作。';
+  }
+  return null;
+}
+
+function extractAttendeeEmails(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    let email = '';
+    if (typeof item === 'string') {
+      email = item.trim();
+    } else if (item && typeof item === 'object') {
+      const rec = item as Record<string, unknown>;
+      if (rec.self === true) continue;
+      email =
+        typeof rec.email === 'string'
+          ? rec.email.trim()
+          : typeof rec.third_party_email === 'string'
+            ? rec.third_party_email.trim()
+            : '';
+    }
+    if (!email) continue;
+    const low = email.toLowerCase();
+    if (!seen.has(low)) {
+      seen.add(low);
+      out.push(email);
+    }
+  }
+  return out;
 }
 
 interface ElicitationSchemaProperty {
@@ -85,6 +145,8 @@ export function PersonalIntegrationApprovalCard({
   data,
   onApprove,
   onReject,
+  resultLost,
+  toolResultContent,
 }: PersonalIntegrationApprovalCardProps): React.ReactElement {
   const actionType = data.actionType || data.toolName;
   const isElicitation = actionType === 'dalton_google_mcp_elicitation';
@@ -190,6 +252,44 @@ export function PersonalIntegrationApprovalCard({
     }
     return null;
   }, [remindersArray, useDefaultReminders]);
+
+  const unconfirmedWriteNotice = useMemo(
+    () => (isApproved && !isElicitation ? parseUnconfirmedWriteNotice(toolResultContent, resultLost) : null),
+    [isApproved, isElicitation, toolResultContent, resultLost],
+  );
+
+  const hasAttendeesChange =
+    args.attendees_set === true ||
+    Array.isArray(args.attendees) ||
+    Boolean(normalizedPayload && 'attendees' in normalizedPayload);
+  const targetAttendees = useMemo(() => {
+    if (Array.isArray(args.attendees)) return extractAttendeeEmails(args.attendees);
+    if (Array.isArray(normalizedPayload?.attendees)) {
+      return extractAttendeeEmails(normalizedPayload.attendees);
+    }
+    return [];
+  }, [args.attendees, normalizedPayload]);
+  const beforeAttendees = useMemo(() => {
+    if (Array.isArray(args.before_attendees)) return extractAttendeeEmails(args.before_attendees);
+    return extractAttendeeEmails(beforeEvent?.attendees);
+  }, [args.before_attendees, beforeEvent]);
+  const addedAttendees = useMemo(() => {
+    if (Array.isArray(args.attendees_added)) return extractAttendeeEmails(args.attendees_added);
+    if (!hasAttendeesChange) return [];
+    if (actionType === 'dalton_calendar_create_event') return targetAttendees;
+    const beforeLow = new Set(beforeAttendees.map((e) => e.toLowerCase()));
+    return targetAttendees.filter((e) => !beforeLow.has(e.toLowerCase()));
+  }, [args.attendees_added, hasAttendeesChange, actionType, targetAttendees, beforeAttendees]);
+  const removedAttendees = useMemo(() => {
+    if (Array.isArray(args.attendees_removed)) return extractAttendeeEmails(args.attendees_removed);
+    if (!hasAttendeesChange || actionType !== 'dalton_calendar_update_event') return [];
+    const targetLow = new Set(targetAttendees.map((e) => e.toLowerCase()));
+    return beforeAttendees.filter((e) => !targetLow.has(e.toLowerCase()));
+  }, [args.attendees_removed, hasAttendeesChange, actionType, targetAttendees, beforeAttendees]);
+  const attendeesCleared =
+    hasAttendeesChange &&
+    actionType === 'dalton_calendar_update_event' &&
+    (args.attendees_cleared === true || targetAttendees.length === 0);
 
   const title = ACTION_TITLES[actionType] || '确认个人日历操作';
 
@@ -371,6 +471,32 @@ export function PersonalIntegrationApprovalCard({
           提醒：{reminderLabel}
         </div>
       )}
+      {hasAttendeesChange &&
+        (actionType === 'dalton_calendar_update_event' || targetAttendees.length > 0) && (
+          <div
+            data-testid="calendar-approval-attendees"
+            className="text-(--color-text-secondary) space-y-0.5"
+          >
+            {attendeesCleared ? (
+              <div>
+                参会人变更：清空全部参会人
+                {removedAttendees.length > 0 ? `（将移除：${removedAttendees.join('、')}）` : ''}
+              </div>
+            ) : actionType === 'dalton_calendar_create_event' ? (
+              <div>参会人：{targetAttendees.join('、')}</div>
+            ) : (
+              <>
+                {addedAttendees.length > 0 && (
+                  <div>新增参会人：{addedAttendees.join('、')}</div>
+                )}
+                {removedAttendees.length > 0 && (
+                  <div>移除参会人：{removedAttendees.join('、')}</div>
+                )}
+                <div>变更后参会人：{targetAttendees.join('、')}</div>
+              </>
+            )}
+          </div>
+        )}
       {beforeEvent && (
         <div className="pt-1 border-t border-(--color-border-muted) text-(--color-text-tertiary) space-y-0.5">
           {typeof beforeEvent.summary === 'string' && (
@@ -412,13 +538,30 @@ export function PersonalIntegrationApprovalCard({
     <ResolveSwap
       resolved={isApproved || isRejected}
       settled={
-        <SettledStep
-          verdict={isApproved ? 'approved' : 'rejected'}
-          reason={isRejected ? data.reason : null}
-          label={isApproved ? `已确认：${title}` : `已取消：${title}`}
-        >
-          {detailContent}
-        </SettledStep>
+        <div className="space-y-2">
+          <SettledStep
+            verdict={isApproved ? 'approved' : 'rejected'}
+            reason={isRejected ? data.reason : null}
+            label={
+              unconfirmedWriteNotice
+                ? `写入结果待确认：${title}`
+                : isApproved
+                  ? `已确认：${title}`
+                  : `已取消：${title}`
+            }
+          >
+            {detailContent}
+          </SettledStep>
+          {unconfirmedWriteNotice && (
+            <div
+              data-testid="calendar-write-unconfirmed-notice"
+              className="rounded-md p-2.5 text-xs bg-amber-500/10 text-(--color-text-primary) flex items-start gap-1.5"
+            >
+              <ShieldAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+              <span>{unconfirmedWriteNotice}</span>
+            </div>
+          )}
+        </div>
       }
     >
       <div data-testid="personal-integration-approval-card" className="space-y-3">

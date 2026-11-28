@@ -28,6 +28,8 @@ interface ToolApprovalCardProps {
    *  will ever state the outcome. Only meaningful for an order, whose end
    *  state the ledger still holds. */
   resultLost?: boolean;
+  // DALTON-HOOK(personal-integrations): raw tool_call_result content so unconfirmed calendar writes warn the user
+  toolResultContent?: unknown;
 }
 
 /**
@@ -42,7 +44,7 @@ interface ToolApprovalCardProps {
  * the person is deciding on a trade, not on whether a JSON frame is right, and
  * that card is drawn in the shape of the receipt the order becomes.
  */
-function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost }: ToolApprovalCardProps): React.ReactElement | null {
+function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost, toolResultContent }: ToolApprovalCardProps): React.ReactElement | null {
   const { t } = useTranslation();
   const [reason, setReason] = useState('');
   const vendorLabel = useDirectToolVendorLabel(data?.server || '');
@@ -69,7 +71,15 @@ function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost
 
   // DALTON-HOOK(personal-integrations): render dedicated calendar/mail L1/L2 & Google MCP elicitation card
   if (data.actionType && DALTON_INTEGRATION_APPROVAL_TYPES.has(data.actionType)) {
-    return <PersonalIntegrationApprovalCard data={data} onApprove={onApprove} onReject={onReject} />;
+    return (
+      <PersonalIntegrationApprovalCard
+        data={data}
+        onApprove={onApprove}
+        onReject={onReject}
+        resultLost={resultLost}
+        toolResultContent={toolResultContent}
+      />
+    );
   }
 
   const { status, server, tool, args } = data;

@@ -271,7 +271,15 @@ def normalize_google_event(raw: Mapping[str, Any], *, calendar_id: str) -> dict[
             elif isinstance(att, str) and att.strip():
                 attendees.append({"email": att.strip()})
 
-    return {
+    ext_props = raw.get("extendedProperties")
+    ext_dict = dict(ext_props) if isinstance(ext_props, Mapping) else None
+    idem_key = str(raw.get("idempotency_key") or "").strip() or None
+    if not idem_key and isinstance(ext_dict, Mapping):
+        priv = ext_dict.get("private")
+        if isinstance(priv, Mapping):
+            idem_key = str(priv.get("dalton_idempotency_key") or "").strip() or None
+
+    normalized: dict[str, Any] = {
         "provider": "google",
         "provider_label": "[Google 日历]",
         "calendar_id": calendar_id,
@@ -287,6 +295,11 @@ def normalize_google_event(raw: Mapping[str, Any], *, calendar_id: str) -> dict[
         "reminders": raw.get("reminders") or raw.get("overrideReminders"),
         "html_link": raw.get("htmlLink"),
     }
+    if ext_dict is not None:
+        normalized["extendedProperties"] = ext_dict
+    if idem_key:
+        normalized["idempotency_key"] = idem_key
+    return normalized
 
 
 def compute_free_busy_slots(
@@ -554,6 +567,7 @@ def build_google_event_write_args(
     reminders: Sequence[Mapping[str, Any]] | None = None,
     use_default_reminders: bool | None = None,
     event_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Build official Google Calendar MCP ``create_event`` / ``update_event`` arguments (§3.1(3), §5.1)."""
     args: dict[str, Any] = {"calendarId": calendar_id}
@@ -598,6 +612,10 @@ def build_google_event_write_args(
         args["useDefaultReminders"] = False
     elif use_default_reminders is not None:
         args["useDefaultReminders"] = bool(use_default_reminders)
+    if idempotency_key and str(idempotency_key).strip():
+        args["extendedProperties"] = {
+            "private": {"dalton_idempotency_key": str(idempotency_key).strip()}
+        }
     return args
 
 

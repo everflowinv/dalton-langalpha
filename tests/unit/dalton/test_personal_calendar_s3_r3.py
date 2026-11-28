@@ -768,12 +768,11 @@ async def test_p1_langsmith_redacts_first_personal_llm_call_subsequent_tools_and
     )
     tracer._on_llm_end(llm_run)
     assert tracer._personal_private[0] is True
-    out_json = json.dumps(llm_run.outputs, ensure_ascii=False)
-    assert "SECRET_QUERY" not in out_json
-    assert "体检" not in out_json
-    assert REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER in out_json
+    assert llm_run.extra.get("__disabled") is True
+    assert sent_creates == []
+    assert sent_updates == []
 
-    # (b) Subsequent normal tool (bash) inputs, outputs, and error must ALL be redacted!
+    # (b) Subsequent normal tool (bash) and errored tool must NEVER export create_run or update_run!
     bash_run_id = uuid4()
     bash_run = Run(
         id=bash_run_id,
@@ -786,15 +785,9 @@ async def test_p1_langsmith_redacts_first_personal_llm_call_subsequent_tools_and
         client=fake_ls_client,
     )
     tracer._start_trace(bash_run)
-    create_json = json.dumps(bash_run.inputs, ensure_ascii=False)
-    assert "SECRET_CALENDAR_MEETING_3PM" not in create_json
-    assert REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER in create_json
-
+    tracer._on_tool_start(bash_run)
     bash_run.outputs = {"output": "SECRET_CALENDAR_MEETING_3PM"}
     tracer._on_tool_end(bash_run)
-    tool_out_json = json.dumps(bash_run.outputs, ensure_ascii=False)
-    assert "SECRET_CALENDAR_MEETING_3PM" not in tool_out_json
-    assert REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER in tool_out_json
 
     err_run_id = uuid4()
     bash_err_run = Run(
@@ -811,9 +804,10 @@ async def test_p1_langsmith_redacts_first_personal_llm_call_subsequent_tools_and
     settled_err_run = tracer._errored_tool_run(
         ValueError("failed parsing SECRET_ATTENDEE_EMAIL"), err_run_id
     )
-    assert "SECRET_ATTENDEE_EMAIL" not in str(settled_err_run.error or "")
-    assert REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER in str(settled_err_run.error or "")
-    assert "SECRET_ATTENDEE_EMAIL" not in json.dumps(settled_err_run.inputs, ensure_ascii=False)
+    tracer._on_tool_error(settled_err_run)
+    assert settled_err_run.extra.get("__disabled") is True
+    assert sent_creates == []
+    assert sent_updates == []
 
     # (c) New turn pre-seeds has_personal_integration_data=True via build_graph_config -> with_run_tracer
     from src.server.models.chat import ChatRequest
@@ -954,6 +948,7 @@ async def test_p1_write_state_split_dispatched_unconfirmed_reconciles_without_du
                     "start": {"dateTime": "2026-12-08T19:00:00+08:00"},
                     "end": {"dateTime": "2026-12-08T21:00:00+08:00"},
                     "status": "confirmed",
+                    "idempotency_key": created_calls[0].get("idempotency_key"),
                 }
             ],
             "has_more": False,

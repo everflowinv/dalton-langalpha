@@ -410,6 +410,12 @@ async def _verify_channel_dm_surface_tx(
     scope_key = str(rec.get("thread_scope_key") or "").strip()
     target_address = str(rec.get("target_address") or "").strip()
 
+    if src_table == "background_runs":
+        raise PersonalSurfaceDeniedError(
+            "unattended_turn_unsupported",
+            "个人日历只能在你本人的对话里使用，自动任务暂不支持。",
+        )
+
     if src_table == "inbound_events":
         rec_chat_type = str(rec.get("chat_type") or "").strip().lower()
         if rec_chat_type != "dm":

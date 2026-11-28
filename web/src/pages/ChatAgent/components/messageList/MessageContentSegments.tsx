@@ -630,6 +630,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               data={ta}
               resultPending={resultPending}
               resultLost={resultLost}
+              toolResultContent={approvedCall?.toolCallResult?.content} // DALTON-HOOK(personal-integrations)
               onApprove={answers && onApproveToolCall && interruptId ? (extra) => onApproveToolCall(approvalId, interruptId, position, attemptId, extra) : undefined}
               onReject={answers && onRejectToolCall && interruptId ? (message?: string, extra?) => onRejectToolCall(approvalId, interruptId, position, message, attemptId, extra) : undefined}
             />

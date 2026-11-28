@@ -30,7 +30,24 @@ import {
   type PersonalIntegrationProvider,
   type PersonalIntegrationPurgeLedger,
   type PersonalIntegrationService,
+  type PersonalIntegrationsListResponse,
 } from '@/lib/dalton/personalIntegrationsApi';
+
+interface BannerPurgeTracking {
+  kind: 'service' | 'provider_all' | 'switch' | 'retry_revoke';
+  provider: PersonalIntegrationProvider;
+  service?: PersonalIntegrationService;
+  purgeIds: string[];
+  baselineData: PersonalIntegrationsListResponse | undefined;
+  feishuSuffix?: string;
+  remoteMode?: 'remote_if_sole' | 'local_only';
+}
+
+interface BannerState {
+  tone: 'info' | 'success' | 'warning' | 'error';
+  text: string;
+  tracking?: BannerPurgeTracking;
+}
 
 interface PendingAccountSwitchState {
   confirmationToken: string;
@@ -139,10 +156,7 @@ export function PersonalIntegrationsCard() {
   const anyCapEnabled = hasCapability(PERSONAL_INTEGRATION_CAPABILITIES);
   const { data, isLoading, isFetching, error, refetch } = usePersonalIntegrationsQuery(true);
 
-  const [banner, setBanner] = useState<{
-    tone: 'info' | 'success' | 'warning' | 'error';
-    text: string;
-  } | null>(null);
+  const [banner, setBanner] = useState<BannerState | null>(null);
   const [preSwitchTarget, setPreSwitchTarget] = useState<{
     provider: PersonalIntegrationProvider;
     service: PersonalIntegrationService;
@@ -320,6 +334,13 @@ export function PersonalIntegrationsCard() {
         setBanner({
           tone: 'success',
           text: '已切换为新账号，原账号留下的对话个人数据正在后台清理。',
+          tracking: {
+            kind: 'switch',
+            provider: res.provider,
+            service: res.service,
+            purgeIds: res.purge_id ? [res.purge_id] : [],
+            baselineData: data,
+          },
         });
       } else if (res.status === 'cancelled') {
         setBanner({ tone: 'info', text: '已取消换账号，继续保留原账号连接。' });
@@ -348,16 +369,27 @@ export function PersonalIntegrationsCard() {
         vars.connection.service,
         vars.mode,
       );
-      return { res, prevStatus: vars.connection.status, provider: vars.connection.provider };
+      return {
+        res,
+        prevStatus: vars.connection.status,
+        provider: vars.connection.provider,
+        service: vars.connection.service,
+        mode: vars.mode,
+      };
     },
-    onSuccess: ({ res, prevStatus, provider }) => {
+    onSuccess: ({ res, prevStatus, provider, service, mode }) => {
       setDisconnectDialog(null);
       const localPurgeStatus = res.local_purge_status;
+      const remoteRevokeStatus = res.remote_revoke_status;
+      const purgeIds = res.purge_id ? [res.purge_id] : [];
       if (provider === 'feishu') {
         const ambiguousNote =
           prevStatus === 'refresh_ambiguous'
             ? ' 此前连接处于待确认刷新状态，飞书侧可能留存最长 30 天刷新令牌，建议前往飞书客户端移除应用授权。'
             : '';
+        const feishuSuffix =
+          '短期访问令牌最长在 7,200 秒内自然失效，可随时在飞书客户端移除应用授权。' +
+          ambiguousNote;
         const purgeSentence =
           localPurgeStatus === 'running'
             ? '已在本地断开飞书连接，正在后台清理相关对话个人数据。'
@@ -366,21 +398,54 @@ export function PersonalIntegrationsCard() {
               : '已在本地断开飞书连接并启动关联对话个人数据清理。';
         setBanner({
           tone: 'info',
-          text:
-            purgeSentence +
-            '短期访问令牌最长在 7,200 秒内自然失效，可随时在飞书客户端移除应用授权。' +
-            ambiguousNote,
+          text: purgeSentence + feishuSuffix,
+          tracking:
+            localPurgeStatus === 'running' || !localPurgeStatus
+              ? {
+                  kind: 'service',
+                  provider,
+                  service,
+                  purgeIds,
+                  baselineData: data,
+                  feishuSuffix,
+                  remoteMode: mode,
+                }
+              : undefined,
         });
       } else {
         const googleText =
           localPurgeStatus === 'running'
             ? '已断开连接，正在后台清理关联对话个人数据。'
-            : localPurgeStatus === 'completed' || localPurgeStatus === 'not_required'
-              ? '已断开连接，关联个人数据已清理完成。'
-              : '已断开连接并启动关联个人数据清理。';
+            : remoteRevokeStatus === 'failed_retryable'
+              ? '已断开连接，关联个人数据已清理完成，Google 远端撤销待重试。'
+              : remoteRevokeStatus === 'pending'
+                ? '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。'
+                : localPurgeStatus === 'completed' || localPurgeStatus === 'not_required'
+                  ? '已断开连接，关联个人数据已清理完成。'
+                  : '已断开连接并启动关联个人数据清理。';
+        const needsTracking =
+          localPurgeStatus === 'running' ||
+          remoteRevokeStatus === 'pending' ||
+          remoteRevokeStatus === 'failed_retryable' ||
+          !localPurgeStatus;
         setBanner({
-          tone: 'success',
+          tone:
+            remoteRevokeStatus === 'failed_retryable'
+              ? 'warning'
+              : localPurgeStatus === 'running' || remoteRevokeStatus === 'pending'
+                ? 'info'
+                : 'success',
           text: googleText,
+          tracking: needsTracking
+            ? {
+                kind: 'service',
+                provider,
+                service,
+                purgeIds,
+                baselineData: data,
+                remoteMode: mode,
+              }
+            : undefined,
         });
       }
       invalidate();
@@ -402,23 +467,39 @@ export function PersonalIntegrationsCard() {
     onSuccess: (res) => {
       setDisconnectDialog(null);
       const purges = Array.isArray(res?.purges) ? res.purges : [];
+      const purgeIds = purges
+        .map((p) => p.purge_id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
       const hasRunningLocal = purges.some((p) => p.local_purge_status === 'running');
       const hasRetryableRemote = purges.some((p) => p.remote_revoke_status === 'failed_retryable');
       const hasPendingRemote = purges.some((p) => p.remote_revoke_status === 'pending');
+      const tracking: BannerPurgeTracking | undefined =
+        hasRunningLocal || hasRetryableRemote || hasPendingRemote
+          ? {
+              kind: 'provider_all',
+              provider: 'google',
+              purgeIds,
+              baselineData: data,
+              remoteMode: 'remote_if_sole',
+            }
+          : undefined;
       if (hasRunningLocal) {
         setBanner({
           tone: 'info',
           text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
+          tracking,
         });
       } else if (hasRetryableRemote) {
         setBanner({
           tone: 'warning',
           text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
+          tracking,
         });
       } else if (hasPendingRemote) {
         setBanner({
-          tone: 'success',
+          tone: 'info',
           text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
+          tracking,
         });
       } else {
         setBanner({
@@ -514,6 +595,118 @@ export function PersonalIntegrationsCard() {
     [data?.active_purges],
   );
 
+  // Keep the top banner in sync with polled purge records once a post-mutation query response lands.
+  const displayBanner = useMemo<{
+    tone: 'info' | 'success' | 'warning' | 'error';
+    text: string;
+  } | null>(() => {
+    if (!banner) return null;
+    const tracking = banner.tracking;
+    if (!tracking || !data || data === tracking.baselineData) {
+      return banner;
+    }
+
+    const activePurges = data.active_purges ?? [];
+    const trackedPurges =
+      tracking.purgeIds.length > 0
+        ? activePurges.filter((p) => tracking.purgeIds.includes(p.purge_id))
+        : activePurges.filter(
+            (p) =>
+              p.provider === tracking.provider &&
+              (!tracking.service || !p.service || p.service === tracking.service),
+          );
+    const hasPurgingConn = (data.connections ?? []).some(
+      (c) =>
+        c.provider === tracking.provider &&
+        (!tracking.service || c.service === tracking.service) &&
+        (c.status === 'disconnect_pending' || c.status === 'revoked_purging'),
+    );
+    const hasRunningLocal =
+      hasPurgingConn || trackedPurges.some((p) => p.local_purge_status === 'running');
+    const hasRetryableRemote = trackedPurges.some(
+      (p) => p.remote_revoke_status === 'failed_retryable',
+    );
+    const hasPendingRemote = trackedPurges.some((p) => p.remote_revoke_status === 'pending');
+
+    if (tracking.kind === 'provider_all') {
+      if (hasRunningLocal) {
+        return {
+          tone: 'info',
+          text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
+        };
+      }
+      if (hasRetryableRemote) {
+        return {
+          tone: 'warning',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
+        };
+      }
+      if (hasPendingRemote) {
+        return {
+          tone: 'info',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
+        };
+      }
+      return {
+        tone: 'success',
+        text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
+      };
+    }
+
+    if (tracking.kind === 'switch') {
+      if (hasRunningLocal) {
+        return {
+          tone: 'info',
+          text: '已切换为新账号，原账号留下的对话个人数据正在后台清理。',
+        };
+      }
+      return {
+        tone: 'success',
+        text: '已切换为新账号，原账号留下的对话个人数据已清理完成。',
+      };
+    }
+
+    if (tracking.provider === 'feishu') {
+      const suffix = tracking.feishuSuffix ?? '';
+      if (hasRunningLocal) {
+        return {
+          tone: 'info',
+          text: '已在本地断开飞书连接，正在后台清理相关对话个人数据。' + suffix,
+        };
+      }
+      return {
+        tone: 'info',
+        text: '已在本地断开飞书连接，相关对话个人数据已清理完成。' + suffix,
+      };
+    }
+
+    if (hasRunningLocal) {
+      return {
+        tone: 'info',
+        text: '已断开连接，正在后台清理关联对话个人数据。',
+      };
+    }
+    if (hasRetryableRemote) {
+      return {
+        tone: 'warning',
+        text: '已断开连接，关联个人数据已清理完成，Google 远端撤销待重试。',
+      };
+    }
+    if (hasPendingRemote) {
+      return {
+        tone: 'info',
+        text: '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。',
+      };
+    }
+    return {
+      tone: 'success',
+      text:
+        tracking.remoteMode === 'remote_if_sole'
+          ? '已断开连接，关联个人数据已清理完成，Google 授权已撤销。'
+          : '已断开连接，关联个人数据已清理完成。',
+    };
+  }, [banner, data]);
+
   const privacyUrl = resolvePrivacyPolicyUrl(profile);
   const hasExistingHistory = Boolean(
     data?.has_personal_integrations ||
@@ -539,9 +732,9 @@ export function PersonalIntegrationsCard() {
       }
     >
       <div className="space-y-4">
-        {banner && (
-          <DaltonInlineNotice tone={banner.tone} testId="personal-integrations-banner">
-            {banner.text}
+        {displayBanner && (
+          <DaltonInlineNotice tone={displayBanner.tone} testId="personal-integrations-banner">
+            {displayBanner.text}
           </DaltonInlineNotice>
         )}
 

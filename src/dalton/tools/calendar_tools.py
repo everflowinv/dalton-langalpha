@@ -27,6 +27,7 @@ import json
 import logging
 from typing import Annotated, Any, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -196,22 +197,63 @@ def _auth_error_command(
     )
 
 
+_UNATTENDED_PLATFORMS: frozenset[str] = frozenset(
+    {"automation", "system", "wakeup", "market_target"}
+)
+_UNATTENDED_ORIGINS: frozenset[str] = frozenset(
+    {"automation", "system", "wakeup", "market_target", "report"}
+)
+_UNATTENDED_QUERY_TYPES: frozenset[str] = frozenset({"system", "market_target", "wakeup"})
+UNATTENDED_CALENDAR_REFUSAL_MESSAGE = (
+    "个人日历只能在你本人的对话里使用，自动任务暂不支持。"
+)
+
+
 def _is_unattended_automation_turn(config: RunnableConfig | None) -> bool:
     if not isinstance(config, Mapping):
         return False
     cfg = config.get("configurable")
-    if not isinstance(cfg, Mapping):
-        return False
-    if str(cfg.get("automation_execution_id") or "").strip():
-        return True
-    if str(cfg.get("platform") or "").strip().lower() == "automation":
-        return True
-    surface = cfg.get("surface")
-    if (
-        isinstance(surface, Mapping)
-        and str(surface.get("platform") or "").strip().lower() == "automation"
-    ):
-        return True
+    if isinstance(cfg, Mapping):
+        if (
+            str(cfg.get("automation_execution_id") or "").strip()
+            or str(cfg.get("turn_origin_automation_id") or "").strip()
+            or str(cfg.get("automation_id") or "").strip()
+            or str(cfg.get("report_command_id") or "").strip()
+        ):
+            return True
+        if (
+            cfg.get("wake_turn") is True
+            or cfg.get("unwatched") is True
+            or cfg.get("unattended") is True
+            or bool(cfg.get("automation_delivery"))
+        ):
+            return True
+        if str(cfg.get("platform") or "").strip().lower() in _UNATTENDED_PLATFORMS:
+            return True
+        if str(cfg.get("query_type") or "").strip().lower() in _UNATTENDED_QUERY_TYPES:
+            return True
+        if str(cfg.get("origin") or "").strip().lower() in _UNATTENDED_ORIGINS:
+            return True
+        if str(cfg.get("run_origin") or "").strip().lower() in _UNATTENDED_ORIGINS:
+            return True
+        surface = cfg.get("surface")
+        if (
+            isinstance(surface, Mapping)
+            and str(surface.get("platform") or "").strip().lower() in _UNATTENDED_PLATFORMS
+        ):
+            return True
+    meta = config.get("metadata")
+    if isinstance(meta, Mapping):
+        if (
+            str(meta.get("automation_id") or "").strip()
+            or str(meta.get("automation_execution_id") or "").strip()
+            or meta.get("unwatched") is True
+        ):
+            return True
+        if str(meta.get("origin") or "").strip().lower() in _UNATTENDED_ORIGINS:
+            return True
+        if str(meta.get("query_type") or "").strip().lower() in _UNATTENDED_QUERY_TYPES:
+            return True
     return False
 
 
@@ -365,6 +407,7 @@ def _normalize_calendar_write_request(
     existing_event: Mapping[str, Any] | None,
     owner_email: str | None,
     account_email: str | None,
+    idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
     """Build ONE canonical normalized write specification used for BOTH card rendering and execution.
 
@@ -446,6 +489,7 @@ def _normalize_calendar_write_request(
                 attendees=cleaned_attendees,
                 reminders=reminders,
                 use_default_reminders=use_default_reminders,
+                idempotency_key=idempotency_key if action == "create_event" else None,
             )
             if action == "update_event":
                 mutable_keys = set(write_payload.keys()) - {"calendarId", "eventId"}
@@ -492,6 +536,7 @@ def _normalize_calendar_write_request(
         card_reminders = write_payload.get("overrideReminders")
         card_use_default_rem = write_payload.get("useDefaultReminders")
         card_attendees = write_payload.get("attendees")
+        attendees_set = "attendees" in write_payload
         description_set = "description" in write_payload
         location_set = "location" in write_payload
         reminders_set = (
@@ -507,9 +552,40 @@ def _normalize_calendar_write_request(
         card_reminders = write_payload.get("reminders")
         card_use_default_rem = None
         card_attendees = cleaned_attendees if action == "create_event" else None
+        attendees_set = action == "create_event" and cleaned_attendees is not None
         description_set = "description" in write_payload
         location_set = "location" in write_payload
         reminders_set = "reminders" in write_payload
+
+    before_attendees = (
+        _extract_external_attendees(existing_event.get("attendees"), owner_email=owner_email)
+        if existing_event is not None
+        else []
+    )
+    target_attendees_clean = (
+        [str(e).strip() for e in (card_attendees or []) if str(e).strip()]
+        if attendees_set
+        else []
+    )
+    if attendees_set:
+        if action == "create_event":
+            attendees_added = list(target_attendees_clean)
+            attendees_removed: list[str] = []
+            attendees_cleared = False
+        else:
+            before_low = {e.lower() for e in before_attendees}
+            target_low = {e.lower() for e in target_attendees_clean}
+            attendees_added = [
+                e for e in target_attendees_clean if e.lower() not in before_low
+            ]
+            attendees_removed = [
+                e for e in before_attendees if e.lower() not in target_low
+            ]
+            attendees_cleared = len(target_attendees_clean) == 0
+    else:
+        attendees_added = []
+        attendees_removed = []
+        attendees_cleared = False
 
     if action == "delete_event" and existing_event is not None:
         card_summary = existing_event.get("summary") or ""
@@ -546,6 +622,11 @@ def _normalize_calendar_write_request(
         "use_default_reminders": card_use_default_rem,
         "reminders_set": reminders_set,
         "attendees": card_attendees,
+        "attendees_set": attendees_set,
+        "attendees_added": attendees_added,
+        "attendees_removed": attendees_removed,
+        "attendees_cleared": attendees_cleared,
+        "before_attendees": before_attendees,
         "external_attendees": ext_attendees,
         "before": dict(existing_event) if isinstance(existing_event, Mapping) else None,
         "normalized_payload": dict(write_payload),
@@ -661,6 +742,7 @@ async def _call_google_mcp_with_elicitation(
     before_dispatch: Any = None,
     on_elicitation_pause: Any = None,
     before_resumed_call: Any = None,
+    replay_resumed_elics: Any = None,
 ) -> tuple[dict[str, Any] | None, Command | None]:
     """Invoke Google Calendar MCP with durable multi-round ``input_required`` elicitation (§3.1, §5.2).
 
@@ -698,7 +780,9 @@ async def _call_google_mcp_with_elicitation(
             )
             approved, resume = hitl_confirm("dalton_google_mcp_elicitation", action_payload)
 
-            # Already completed in a prior resume before a later round paused -> advance without re-calling MCP
+            # Already completed in a prior resume before a later round or interrupted before dispatch:
+            # if no next elicitation round exists yet, we are about to dispatch the resumed call,
+            # so ALWAYS run before_resumed_call (event version check) before continuing!
             if existing.status == "succeeded" and isinstance(
                 state.get("submitted_responses"), Mapping
             ):
@@ -708,6 +792,20 @@ async def _call_google_mcp_with_elicitation(
                     for k, v in state["submitted_responses"].items()
                     if isinstance(v, Mapping)
                 }
+                next_stage_key = f"{stage_prefix}:elic:{round_idx + 1}"
+                next_existing = await db.get_action_approval_by_stage_key(
+                    caller_user_id,
+                    surface.thread_id,
+                    next_stage_key,
+                    decrypt_state=False,
+                )
+                if next_existing is None:
+                    if before_resumed_call is not None:
+                        recheck_err = await before_resumed_call(round_idx, active_token)
+                        if recheck_err is not None:
+                            return None, recheck_err
+                elif replay_resumed_elics is not None:
+                    await replay_resumed_elics(round_idx)
                 continue
 
             err_cmd, next_state, next_merged, next_token = await _settle_elicitation_resume(
@@ -1114,7 +1212,7 @@ def create_calendar_tools(
         """读取或管理当前用户本人已连接的个人日历（支持 Google 日历与飞书日历）。
 
         使用说明：
-        - 适用场景：仅在当前用户本人的私人 Home 会话、1:1 私聊，或仅本人可见的私密工作区中使用；首次在某个对话里访问个人日历时，系统会将私密提示保存为本轮会话事件并在界面展示与回放。
+        - 适用场景：仅在当前用户本人的私人 Home 会话、1:1 私聊，或仅本人可见的私密工作区中使用；自动任务、定时报告与渠道无人值守回合暂不支持调用个人日历。首次在某个对话里访问个人日历时，系统会将私密提示保存为本轮会话事件并在界面展示与回放。
         - 平台选择（`provider`）：默认 `"auto"`。仅连接一个日历平台时自动选用；同时连接 Google 日历与飞书日历时，只读查询会自动合并两边结果并标注来源，写操作与按事件 ID 查询单个日程时请先向用户确认目标平台再指定 `"google"` 或 `"feishu"`。
         - 支持的动作（`action`）：
           - `"list_calendars"`：列出用户有权限查看的日历列表。
@@ -1131,6 +1229,14 @@ def create_calendar_tools(
             return _error_command(
                 "invalid_action",
                 f"不支持的日历动作 '{action}'。",
+                tool_call_id,
+            )
+
+        # Batch 1 entry gate: personal calendar is interactive-conversation only (read & write).
+        if _is_unattended_automation_turn(config):
+            return _error_command(
+                "unattended_turn_unsupported",
+                UNATTENDED_CALENDAR_REFUSAL_MESSAGE,
                 tool_call_id,
             )
 
@@ -1847,6 +1953,9 @@ def create_calendar_tools(
                     tool_call_id,
                 )
 
+        approval_id = str(uuid4())
+        idempotency_key = f"dalton-cal:{approval_id}"
+
         # Build ONE canonical normalized write spec used for BOTH confirmation card & execution (Row 6)
         spec, norm_err = _normalize_calendar_write_request(
             provider=p,
@@ -1866,6 +1975,7 @@ def create_calendar_tools(
             existing_event=existing_event,
             owner_email=conn_row.provider_email,
             account_email=conn_row.provider_email,
+            idempotency_key=idempotency_key if act == "create_event" else None,
         )
         if norm_err is not None or spec is None:
             code, msg = norm_err or ("invalid_payload", "日程写入参数无效。")
@@ -1882,7 +1992,6 @@ def create_calendar_tools(
         )
 
         action_type = f"dalton_calendar_{act}"
-        approval_id = str(uuid4())
         event_id_clean = event_id.strip() if event_id else None
         payload_sha = canonical_payload_sha256(
             {
@@ -1928,7 +2037,7 @@ def create_calendar_tools(
         frozen_state: dict[str, Any] = {
             "kind": "calendar_write",
             "write_phase": "pending_approval",
-            "idempotency_key": f"dalton-cal:{approval_id}",
+            "idempotency_key": idempotency_key,
             "provider": p,
             "calendar_id": cal_id,
             "action": act,
@@ -2029,36 +2138,244 @@ def _normalize_iso_day_window(
     return lo.isoformat(), hi.isoformat()
 
 
-def _event_matches_idempotency_or_payload(
+def _event_matches_idempotency_key(
     ev: Mapping[str, Any],
     *,
     idempotency_key: str,
-    summary: str | None,
-    start_time: str | None,
-    end_time: str | None,
 ) -> bool:
-    """Match a remote event against an idempotency key or frozen ``(summary, start, end)``."""
+    """Match a remote created event STRICTLY by platform unique identifier (never fuzzy title/time)."""
+    key = str(idempotency_key or "").strip()
+    if not key:
+        return False
     ev_idem = str(ev.get("idempotency_key") or "").strip()
-    if ev_idem and ev_idem == idempotency_key:
+    if ev_idem and ev_idem == key:
         return True
     ext = ev.get("extendedProperties")
     if isinstance(ext, Mapping):
         priv = ext.get("private")
         if isinstance(priv, Mapping):
-            if str(priv.get("dalton_idempotency_key") or "").strip() == idempotency_key:
+            if str(priv.get("dalton_idempotency_key") or "").strip() == key:
                 return True
-    target_summary = str(summary or "").strip()
-    if not target_summary:
+    return False
+
+
+def _parse_comparable_epoch(value: str | None, *, tz_name: str) -> int | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:
+        tz = UTC
+    norm = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        dt = datetime.fromisoformat(norm)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp())
+
+
+def _remote_bound_matches(
+    remote_ev: Mapping[str, Any],
+    field: str,
+    *,
+    expected_str: str,
+    tz_name: str,
+    all_day: bool,
+) -> bool:
+    rem_val, rem_all_day = _event_bound_value(remote_ev, field)
+    if rem_val is None:
+        # Handle raw Feishu timestamp fallback
+        bound = remote_ev.get(field)
+        if isinstance(bound, Mapping) and bound.get("timestamp") is not None:
+            rem_val = str(bound["timestamp"])
+        else:
+            return False
+    if all_day:
+        return rem_all_day and str(rem_val)[:10] == str(expected_str)[:10]
+    if rem_all_day:
         return False
-    if str(ev.get("summary") or "").strip() != target_summary:
-        return False
-    ev_start, _ = _event_bound_value(ev, "start")
-    ev_end, _ = _event_bound_value(ev, "end")
-    if start_time and ev_start and str(ev_start)[:16] != str(start_time)[:16]:
-        return False
-    if end_time and ev_end and str(ev_end)[:16] != str(end_time)[:16]:
-        return False
-    return True
+    rem_ts = _parse_comparable_epoch(rem_val, tz_name=tz_name)
+    exp_ts = _parse_comparable_epoch(expected_str, tz_name=tz_name)
+    return rem_ts is not None and exp_ts is not None and rem_ts == exp_ts
+
+
+def _remote_event_matches_approved_update(
+    remote_ev: Mapping[str, Any],
+    *,
+    provider: str,
+    write_payload: Mapping[str, Any],
+    tz_name: str,
+) -> bool:
+    """Confirm an unconfirmed update_event ONLY when EVERY approved field matches ``remote_ev``."""
+    checked = 0
+
+    if "summary" in write_payload:
+        checked += 1
+        if str(remote_ev.get("summary") or "").strip() != str(write_payload["summary"] or "").strip():
+            return False
+
+    if "description" in write_payload:
+        checked += 1
+        if str(remote_ev.get("description") or "") != str(write_payload["description"] or ""):
+            return False
+
+    if "location" in write_payload:
+        checked += 1
+        raw_loc = write_payload["location"]
+        exp_loc = (
+            str(raw_loc.get("name") or "").strip()
+            if isinstance(raw_loc, Mapping)
+            else str(raw_loc or "").strip()
+        )
+        if str(remote_ev.get("location") or "").strip() != exp_loc:
+            return False
+
+    if provider == "google":
+        eff_tz = str(write_payload.get("timeZone") or tz_name or "UTC")
+        is_all_day = bool(write_payload.get("allDay"))
+        if "startTime" in write_payload:
+            checked += 1
+            if not _remote_bound_matches(
+                remote_ev,
+                "start",
+                expected_str=str(write_payload["startTime"]),
+                tz_name=eff_tz,
+                all_day=is_all_day,
+            ):
+                return False
+        if "endTime" in write_payload:
+            checked += 1
+            if not _remote_bound_matches(
+                remote_ev,
+                "end",
+                expected_str=str(write_payload["endTime"]),
+                tz_name=eff_tz,
+                all_day=is_all_day,
+            ):
+                return False
+        if "attendees" in write_payload:
+            checked += 1
+            exp_emails = {
+                str(e).strip().lower()
+                for e in (write_payload.get("attendees") or [])
+                if str(e).strip()
+            }
+            rem_raw = remote_ev.get("attendees")
+            if not isinstance(rem_raw, Sequence) or isinstance(rem_raw, (str, bytes)):
+                return False
+            all_rem: set[str] = set()
+            non_self_rem: set[str] = set()
+            for item in rem_raw:
+                if isinstance(item, Mapping):
+                    email = str(item.get("email") or "").strip().lower()
+                    if not email:
+                        continue
+                    all_rem.add(email)
+                    if not item.get("self"):
+                        non_self_rem.add(email)
+                elif isinstance(item, str) and item.strip():
+                    email = item.strip().lower()
+                    all_rem.add(email)
+                    non_self_rem.add(email)
+            if all_rem != exp_emails and non_self_rem != exp_emails:
+                return False
+        if "overrideReminders" in write_payload:
+            checked += 1
+            exp_rems = sorted(
+                (
+                    str(r.get("method") or "popup").strip().lower(),
+                    int(r.get("minutes", 10)),
+                )
+                for r in (write_payload.get("overrideReminders") or [])
+                if isinstance(r, Mapping)
+            )
+            rem_obj = remote_ev.get("reminders")
+            if isinstance(rem_obj, Mapping):
+                if rem_obj.get("useDefault") is True:
+                    return False
+                raw_ovr = rem_obj.get("overrides")
+                if not isinstance(raw_ovr, Sequence) or isinstance(raw_ovr, (str, bytes)):
+                    raw_ovr = []
+                got_rems = sorted(
+                    (
+                        str(r.get("method") or "popup").strip().lower(),
+                        int(r.get("minutes", 10)),
+                    )
+                    for r in raw_ovr
+                    if isinstance(r, Mapping)
+                )
+            elif isinstance(rem_obj, Sequence) and not isinstance(rem_obj, (str, bytes)):
+                got_rems = sorted(
+                    (
+                        str(r.get("method") or "popup").strip().lower(),
+                        int(r.get("minutes", 10)),
+                    )
+                    for r in rem_obj
+                    if isinstance(r, Mapping)
+                )
+            else:
+                return False
+            if got_rems != exp_rems:
+                return False
+        elif "useDefaultReminders" in write_payload:
+            checked += 1
+            exp_default = bool(write_payload["useDefaultReminders"])
+            rem_obj = remote_ev.get("reminders")
+            if not isinstance(rem_obj, Mapping) or "useDefault" not in rem_obj:
+                return False
+            if bool(rem_obj["useDefault"]) != exp_default:
+                return False
+    else:
+        for body_key, ev_field in (("start_time", "start"), ("end_time", "end")):
+            if body_key in write_payload:
+                checked += 1
+                bound_val = write_payload[body_key]
+                if not isinstance(bound_val, Mapping):
+                    return False
+                if bound_val.get("date"):
+                    if not _remote_bound_matches(
+                        remote_ev,
+                        ev_field,
+                        expected_str=str(bound_val["date"]),
+                        tz_name=tz_name,
+                        all_day=True,
+                    ):
+                        return False
+                elif bound_val.get("timestamp") is not None:
+                    if not _remote_bound_matches(
+                        remote_ev,
+                        ev_field,
+                        expected_str=str(bound_val["timestamp"]),
+                        tz_name=str(bound_val.get("timezone") or tz_name or "UTC"),
+                        all_day=False,
+                    ):
+                        return False
+                else:
+                    return False
+        if "reminders" in write_payload:
+            checked += 1
+            exp_mins = sorted(
+                int(r.get("minutes", 10))
+                for r in (write_payload.get("reminders") or [])
+                if isinstance(r, Mapping)
+            )
+            rem_list = remote_ev.get("reminders")
+            if not isinstance(rem_list, Sequence) or isinstance(rem_list, (str, bytes)):
+                return False
+            got_mins = sorted(
+                int(r["minutes"])
+                for r in rem_list
+                if isinstance(r, Mapping) and "minutes" in r
+            )
+            if got_mins != exp_mins:
+                return False
+
+    return checked > 0
 
 
 async def _reconcile_unconfirmed_calendar_write(
@@ -2127,12 +2444,9 @@ async def _reconcile_unconfirmed_calendar_write(
                 (
                     ev
                     for ev in remote_events
-                    if _event_matches_idempotency_or_payload(
+                    if _event_matches_idempotency_key(
                         ev,
                         idempotency_key=idempotency_key,
-                        summary=summary_hint,
-                        start_time=start_hint or None,
-                        end_time=end_hint or None,
                     )
                 ),
                 None,
@@ -2162,8 +2476,10 @@ async def _reconcile_unconfirmed_calendar_write(
                 )
             return _error_command(
                 "write_result_unconfirmed",
-                "上次新建日程请求已发出但本地状态未确认，且远端查询暂未命中该日程；为避免重复创建未自动重发，请检查日历后再决定是否重试。",
+                "新建日程请求已发出但未能核实是否生效，为避免重复创建未自动重发；请前往你的日历中确认后再决定是否重试。",
                 tool_call_id,
+                status="unconfirmed",
+                check_calendar=True,
                 approval_id=approval_id,
                 idempotency_key=idempotency_key,
             )
@@ -2186,13 +2502,12 @@ async def _reconcile_unconfirmed_calendar_write(
                     event_id=str(event_id),
                     tz_name=tz_name,
                 )
-            remote_updated = str(remote_ev.get("updated") or "")
-            summary_matches = (
-                "summary" in write_payload
-                and str(remote_ev.get("summary") or "").strip()
-                == str(write_payload.get("summary") or "").strip()
-            )
-            if (pre_read_marker and remote_updated and remote_updated != str(pre_read_marker)) or summary_matches:
+            if _remote_event_matches_approved_update(
+                remote_ev,
+                provider=provider,
+                write_payload=write_payload,
+                tz_name=tz_name,
+            ):
                 result_payload = {
                     "ok": True,
                     "action": "update_event",
@@ -2217,8 +2532,10 @@ async def _reconcile_unconfirmed_calendar_write(
                 )
             return _error_command(
                 "write_result_unconfirmed",
-                "上次修改日程请求已发出但结果未确认，为避免重复写入未自动重发，请检查日历后再决定是否重试。",
+                "修改日程请求已发出但未能核实全部变更是否生效，为避免重复写入未自动重发；请前往你的日历中确认后再决定是否重试。",
                 tool_call_id,
+                status="unconfirmed",
+                check_calendar=True,
                 approval_id=approval_id,
                 idempotency_key=idempotency_key,
             )
@@ -2277,24 +2594,30 @@ async def _reconcile_unconfirmed_calendar_write(
                 )
             return _error_command(
                 "write_result_unconfirmed",
-                "上次删除日程请求已发出但结果未确认，为避免重复操作未自动重发，请检查日历后再决定是否重试。",
+                "上次删除日程请求已发出但结果未确认，为避免重复操作未自动重发；请前往你的日历中确认后再决定是否重试。",
                 tool_call_id,
+                status="unconfirmed",
+                check_calendar=True,
                 approval_id=approval_id,
                 idempotency_key=idempotency_key,
             )
     except (GoogleCalendarAPIError, FeishuCalendarAPIError, GoogleMCPElicitationRequired) as exc:
         return _error_command(
             "write_result_unconfirmed",
-            f"上次日程写入结果未确认，远端核实失败（{exc}）；为避免重复写入未自动重发，请检查日历后再试。",
+            f"上次日程写入结果未确认，远端核实失败（{exc}）；为避免重复写入未自动重发，请前往你的日历中确认后再试。",
             tool_call_id,
+            status="unconfirmed",
+            check_calendar=True,
             approval_id=approval_id,
             idempotency_key=idempotency_key,
         )
 
     return _error_command(
         "write_result_unconfirmed",
-        "上次日程写入请求结果未确认，为避免重复写入已中止，请检查日历后再试。",
+        "上次日程写入请求结果未确认，为避免重复写入已中止；请前往你的日历中确认后再试。",
         tool_call_id,
+        status="unconfirmed",
+        check_calendar=True,
         approval_id=approval_id,
         idempotency_key=idempotency_key,
     )
@@ -2732,6 +3055,28 @@ async def _execute_confirmed_calendar_write(
                     f"tc:{tool_call_id}:vercheck_r{round_idx}", resumed_tok
                 )
 
+            async def _replay_resumed_vercheck_elics(round_idx: int) -> None:
+                prior_r_elics = await db.list_action_approvals_by_stage_prefix(
+                    caller_user_id,
+                    thread_id,
+                    f"tc:{tool_call_id}:vercheck_r{round_idx}:elic:",
+                    decrypt_state=True,
+                )
+                for r_row in prior_r_elics:
+                    r_state = r_row.elicitation_state or {}
+                    r_payload = _build_elicitation_hitl_payload(
+                        approval_id=r_row.approval_id,
+                        caller_user_id=caller_user_id,
+                        tool_call_id=tool_call_id,
+                        confirm_token=str(r_state.get("confirm_token") or ""),
+                        payload_sha=r_row.payload_sha256,
+                        input_requests=r_row.input_requests_map or {},
+                        mcp_tool_name=str(r_state.get("mcp_tool_name") or "get_event"),
+                        mcp_arguments=r_state.get("mcp_arguments") or {},
+                        dm_meta=r_state.get("dm_meta"),
+                    )
+                    hitl_confirm("dalton_google_mcp_elicitation", r_payload)
+
             mcp_res, err_cmd = await _call_google_mcp_with_elicitation(
                 google_client=google_cli,
                 caller_user_id=caller_user_id,
@@ -2746,6 +3091,7 @@ async def _execute_confirmed_calendar_write(
                 before_dispatch=_mark_write_dispatched_unconfirmed,
                 on_elicitation_pause=_mark_awaiting_google_form,
                 before_resumed_call=_recheck_before_resumed_write,
+                replay_resumed_elics=_replay_resumed_vercheck_elics,
             )
             if err_cmd is not None:
                 if mutable_frozen.get("write_phase") != "write_dispatched_unconfirmed":
@@ -2791,6 +3137,7 @@ async def _execute_confirmed_calendar_write(
                     body=write_payload,
                     attendees=frozen_attendees,
                     tz_name=tz_name,
+                    idempotency_key=idempotency_key,
                 )
                 result_payload = {
                     "ok": True,
