@@ -583,6 +583,10 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
+  # Model picker race small-fixes (R1-1, R1-2, Antigravity effort leakage, thread_model SSE,
+  # switch_thread_model atomic effort clear, conditional CAS guards for background auto-saves,
+  # mobile MarketView effort clear, queued-send live effort read, preferences cross-tab broadcast).
+  "model-picker-races"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
