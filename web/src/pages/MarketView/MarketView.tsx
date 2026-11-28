@@ -174,13 +174,8 @@ function MarketViewInner() {
   const [chatExpanded, setChatExpanded] = useState(false);
 
   const [prefillMessage, setPrefillMessage] = useState<string>('');
-  // The composer's scope, stored under its old pref name and values so a
-  // saved pick still reads: 'fast' is the Chief of Staff, 'ptc' the selected
-  // workspace.
-  const [scope, setScope] = useState<ComposerScope>(() => {
-    if (openingRoute.scope) return openingRoute.scope;
-    return loadPref<string>('mode', 'fast') === 'ptc' ? 'workspace' : 'all';
-  });
+  // DALTON-HOOK(watchlist): tab URL is the sole source of truth — absent ws/scope opens Home
+  const [scope, setScope] = useState<ComposerScope>(() => openingRoute.scope ?? 'all');
   // Workspaces for the selector. The shared query, not a local
   // fetch — a rename elsewhere invalidates this key, and a copy in local state
   // would keep showing the old name until the page remounts. The list is
@@ -420,21 +415,16 @@ function MarketViewInner() {
     // Workspace and scope as one move, as the picker makes it. Kept in the tab
     // URL so switching between two MarketView tabs restores each tab's workspace
     // (absent `ws` / `scope` means Home).
-    let followWorkspace = false;
+    // DALTON-HOOK(watchlist): mount and tab navigation follow the tab URL alone without backfilling ?ws= from prefs
     if (route.workspaceId !== urlWorkspaceRef.current || route.scope !== urlScopeRef.current) {
       urlWorkspaceRef.current = route.workspaceId;
       urlScopeRef.current = route.scope;
-      followWorkspace = navigationType !== NavigationType.Replace;
-    }
-    if (followWorkspace) {
-      moveFromRoute({
-        ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
-        scope: route.scope ?? 'all',
-      });
-    } else if (scope === 'workspace' && selectedWorkspaceId && !workspacePending && route.workspaceId !== selectedWorkspaceId) {
-      editSearchParams((params) => { params.set('ws', selectedWorkspaceId); }, { replace: true });
-    } else if (scope === 'all' && route.workspaceId !== null) {
-      editSearchParams((params) => { params.delete('ws'); }, { replace: true });
+      if (navigationType !== NavigationType.Replace) {
+        moveFromRoute({
+          ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
+          scope: route.scope ?? 'all',
+        });
+      }
     }
     setChatReturnPath(route.returnTo);
     // A comment a phone opened from the chat comes forward on the chart the
@@ -455,7 +445,7 @@ function MarketViewInner() {
         return next;
       }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, showWatchlistView, scope, selectedWorkspaceId, workspacePending, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
+  }, [searchParams, selectedStock, showWatchlistView, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);

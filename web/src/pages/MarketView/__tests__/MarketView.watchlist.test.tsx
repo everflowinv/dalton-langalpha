@@ -434,11 +434,10 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
   });
 
   it('withholds watchlistContext from MarketChatPanel in shared/colleague sessions', async () => {
-    savePref('mode', 'ptc');
     mocks.isColleague = true;
     mocks.activeWorkspaceObj = { workspace_id: 'ws-shared', name: 'Team WS', is_shared: true };
 
-    renderAt(['/market']);
+    renderAt(['/market?ws=ws-shared']);
     expect(await screen.findByTestId('watchlist-row-NVDA')).toBeTruthy();
     const chatPanel = screen.getByTestId('market-chat-panel');
     expect(chatPanel.getAttribute('data-has-watchlist-ctx')).toBe('false');
@@ -1808,14 +1807,70 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     });
   });
 
-  it('stamps ws onto the tab URL when restoring a saved workspace preference so tab switches remember it', async () => {
-    savePref('mode', 'ptc');
-    renderAt(['/market?symbol=AAPL']);
+  it('stays in Home without writing ?ws= after unmounting when global preference is workspace', async () => {
+    function RouteNav() {
+      const nav = useNavigate();
+      return (
+        <div>
+          <button type="button" data-testid="go-chat" onClick={() => nav('/chat/t/other')}>chat</button>
+          <button type="button" data-testid="go-home-chart" onClick={() => nav('/market?symbol=AAPL')}>home-chart</button>
+          <button type="button" data-testid="go-home-watchlist" onClick={() => nav('/market')}>home-watchlist</button>
+        </div>
+      );
+    }
 
+    savePref('mode', 'ptc');
+    savePref('selectedWorkspaceId', 'ws-1');
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.workspaces.home(), { workspace_id: 'home-ws', is_home: true });
+    qc.setQueryData(['portfolioHoldings'], [{ symbol: 'NVDA' }]);
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/market?symbol=NVDA&ws=ws-1']}>
+          <LocationProbe />
+          <RouteNav />
+          <Routes>
+            <Route path="/market" element={<MarketView />} />
+            <Route path="/chat/*" element={<div data-testid="chat-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // First mounted on a workspace chart tab -> workspace scope (and pref saved as 'ptc').
     await waitFor(() => {
-      expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL&ws=ws-1');
       expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
       expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-1');
     });
+
+    // Navigate away so MarketView unmounts while global preference remains workspace ('ptc').
+    fireEvent.click(screen.getByTestId('go-chat'));
+    expect(await screen.findByTestId('chat-route')).toBeTruthy();
+
+    // Re-open a Home chart URL (no ?ws=) -> must stay in Home and never write ?ws= into the URL.
+    mocks.capturedChatProps = [];
+    fireEvent.click(screen.getByTestId('go-home-chart'));
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart')).toBeTruthy();
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+    expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL');
+    expect(screen.getByTestId('loc-display').textContent).not.toContain('ws=');
+
+    // Unmount again and open Home watchlist (/market, no ?ws=) with pref set to workspace -> stays Home, no ?ws=.
+    savePref('mode', 'ptc');
+    fireEvent.click(screen.getByTestId('go-chat'));
+    expect(await screen.findByTestId('chat-route')).toBeTruthy();
+    mocks.capturedChatProps = [];
+    fireEvent.click(screen.getByTestId('go-home-watchlist'));
+    await waitFor(() => {
+      expect(screen.getByTestId('watchlist-workspace')).toBeTruthy();
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+    expect(screen.getByTestId('loc-display').textContent).toBe('/market');
+    expect(screen.getByTestId('loc-display').textContent).not.toContain('ws=');
   });
 });

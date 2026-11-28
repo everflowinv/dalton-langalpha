@@ -47,12 +47,13 @@ interface PendingRouteSync {
 }
 
 /**
- * Which thread the market chat shows. URL `?thread=` wins, then localStorage
- * keyed by (workspace, symbol), then a new chat. Tab / route navigations
- * restore the target URL's `?thread=` (even across workspaces or between two
- * threads on the same symbol & workspace). In-tab user symbol switches restore
- * the last thread seen for the symbol in this workspace; in-tab workspace/scope
- * changes and explicit new chats start a clean slate and drop `?thread`.
+ * Which thread the market chat shows. On mount and across tab / route
+ * navigations (including follow-up symbol/workspace alignment), the tab URL is
+ * the sole source of truth: `?thread=` opens that thread and an absent
+ * `?thread=` always mounts a fresh chat (never falling back to localStorage).
+ * In-tab user symbol switches restore the last thread seen for the symbol in
+ * this workspace; in-tab workspace/scope changes and explicit new chats start
+ * a clean slate and drop `?thread`.
  */
 export function useMarketThreadRoute(workspaceId: string | null, symbol: string): MarketThreadRoute {
   const location = useLocation();
@@ -60,8 +61,9 @@ export function useMarketThreadRoute(workspaceId: string | null, symbol: string)
   const [searchParams] = useSearchParams();
   const editSearchParams = useEditSearchParams();
   const initialRoute = readMarketViewRoute(searchParams);
+  // DALTON-HOOK(watchlist): tab URL is the sole source of truth — absent ?thread= opens a fresh chat
   const [opened, setOpened] = useState<Opened>(() => ({
-    init: initialRoute.threadId || (getMarketThreadId(workspaceId, symbol) ?? '__default__'),
+    init: initialRoute.threadId || '__default__',
   }));
 
   const dropThreadParam = useCallback(
@@ -113,13 +115,10 @@ export function useMarketThreadRoute(workspaceId: string | null, symbol: string)
 
       if (urlThreadId) {
         setOpened((cur) => (cur.init === urlThreadId ? cur : { init: urlThreadId }));
-      } else if (switchedWorkspace) {
-        setOpened(freshChat());
-      } else if (symbolChanged) {
-        const restored = getMarketThreadId(workspaceId, symbol);
-        setOpened({ init: restored ?? '__default__' });
       } else {
-        setOpened((cur) => (cur.init.startsWith('__default__') ? cur : freshChat()));
+        // DALTON-HOOK(watchlist): absent ?thread= on a target tab always remounts a fresh chat
+        // (even when route stayed on __default__ while ChatBody already created a real thread)
+        setOpened(freshChat());
       }
       return;
     }
@@ -135,11 +134,10 @@ export function useMarketThreadRoute(workspaceId: string | null, symbol: string)
 
       if (pending.threadId) {
         setOpened((cur) => (cur.init === pending.threadId ? cur : { init: pending.threadId! }));
-      } else if (switchedWorkspace) {
-        setOpened(freshChat());
-      } else if (symbolChanged) {
-        const restored = getMarketThreadId(workspaceId, symbol);
-        setOpened({ init: restored ?? '__default__' });
+      } else {
+        // DALTON-HOOK(watchlist): follow-up alignment after tab switch honors only the tab URL's thread;
+        // absent ?thread= stays a fresh chat without reading localStorage
+        setOpened((cur) => (cur.init.startsWith('__default__#') ? cur : freshChat()));
       }
       return;
     }
@@ -154,7 +152,7 @@ export function useMarketThreadRoute(workspaceId: string | null, symbol: string)
     if (symbolChanged) {
       routeSyncRef.current = null;
       const restored = getMarketThreadId(workspaceId, symbol);
-      setOpened({ init: restored ?? '__default__' });
+      setOpened(restored ? { init: restored } : freshChat());
       if (!restored) dropThreadParam();
     }
   }, [location.key, navigationType, searchParams, workspaceId, symbol, dropThreadParam]);
