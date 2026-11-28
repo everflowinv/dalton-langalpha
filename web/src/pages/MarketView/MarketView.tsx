@@ -292,7 +292,10 @@ function MarketViewInner() {
     if (next === 'all') {
       editSearchParams((params) => { params.delete('ws'); }, { replace: true });
     } else if (selectedWorkspaceId) {
-      editSearchParams((params) => { params.set('ws', selectedWorkspaceId); }, { replace: true });
+      // DALTON-HOOK(watchlist): do not overwrite a ?ws= already written by pickWorkspace in the same tick
+      editSearchParams((params) => {
+        if (!params.get('ws')) params.set('ws', selectedWorkspaceId);
+      }, { replace: true });
     }
   }, [moveScope, editSearchParams, selectedWorkspaceId]);
   // Picking a workspace is picking its side too, as the toolbar does next.

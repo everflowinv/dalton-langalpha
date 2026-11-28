@@ -7,6 +7,7 @@ import React from 'react';
 import type { NavigateFunction, SetURLSearchParams } from 'react-router';
 import { ArrowLeft } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
+import { displaySpelling } from '@/lib/bars';
 import { buildMarketViewUrl, readMarketViewRoute, type MarketViewRouteParams } from '../../utils/marketRoute';
 import { WatchlistWorkspace, type WatchlistWorkspaceProps } from './WatchlistWorkspace';
 
@@ -100,6 +101,10 @@ export function navigateDaltonChartJump(
   const currentRoute = currentSearchParams
     ? readMarketViewRoute(currentSearchParams)
     : null;
+  const sameSymbol =
+    !fromWatchlistView &&
+    Boolean(currentRoute?.symbol) &&
+    displaySpelling(currentRoute!.symbol!) === displaySpelling(symbol);
   const nextState = fromWatchlistView
     ? {
         ...(locationState && typeof locationState === 'object'
@@ -113,6 +118,7 @@ export function navigateDaltonChartJump(
       symbol,
       ...(timeframe ? { timeframe } : {}),
       ...(currentRoute?.workspaceId ? { workspaceId: currentRoute.workspaceId } : {}),
+      ...(sameSymbol && currentRoute?.threadId ? { threadId: currentRoute.threadId } : {}),
       ...(currentRoute?.returnTo ? { returnTo: currentRoute.returnTo } : {}),
     }),
     {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type React from 'react';
@@ -132,11 +132,26 @@ const mocks = vi.hoisted(() => ({
     watchlistContext?: string | null;
     scope: string;
     symbol: string;
+    interval?: string;
     activeWorkspaceId?: string | null;
+    selectedWorkspaceId?: string | null;
+    workspaces?: Array<{ workspace_id: string; name: string }>;
     onReturnToChat?: () => void;
     onScopeChange?: (scope: 'all' | 'workspace') => void;
     onWorkspaceChange?: (id: string) => void;
+    onJumpToChart?: (symbol: string, timeframe: string) => void;
   }>,
+  chatPanelExtra: null as ((props: {
+    scope: 'all' | 'workspace';
+    symbol: string;
+    interval?: string;
+    activeWorkspaceId?: string | null;
+    selectedWorkspaceId?: string | null;
+    workspaces?: Array<{ workspace_id: string; name: string }>;
+    onScopeChange?: (scope: 'all' | 'workspace') => void;
+    onWorkspaceChange?: (id: string) => void;
+    onJumpToChart?: (symbol: string, timeframe: string) => void;
+  }) => React.ReactNode) | null,
   activeWorkspaceObj: { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false } as Record<string, unknown>,
   isColleague: false,
   previewMutateMock: vi.fn(),
@@ -250,28 +265,38 @@ vi.mock('../components/MarketChart', () => ({
 vi.mock('../components/MarketChatPanel', () => ({
   default: (props: {
     watchlistContext?: string | null;
-    scope: string;
+    scope: 'all' | 'workspace';
     symbol: string;
+    interval?: string;
     activeWorkspaceId?: string | null;
+    selectedWorkspaceId?: string | null;
+    workspaces?: Array<{ workspace_id: string; name: string }>;
     onReturnToChat?: () => void;
     onScopeChange?: (scope: 'all' | 'workspace') => void;
     onWorkspaceChange?: (id: string) => void;
+    onJumpToChart?: (symbol: string, timeframe: string) => void;
   }) => {
     mocks.capturedChatProps.push({
       watchlistContext: props.watchlistContext,
       scope: props.scope,
       symbol: props.symbol,
+      interval: props.interval,
       activeWorkspaceId: props.activeWorkspaceId,
+      selectedWorkspaceId: props.selectedWorkspaceId,
+      workspaces: props.workspaces,
       onReturnToChat: props.onReturnToChat,
       onScopeChange: props.onScopeChange,
       onWorkspaceChange: props.onWorkspaceChange,
+      onJumpToChart: props.onJumpToChart,
     });
     return (
       <div
         data-testid="market-chat-panel"
         data-has-watchlist-ctx={String(Boolean(props.watchlistContext))}
         data-has-return={String(Boolean(props.onReturnToChat))}
-      />
+      >
+        {mocks.chatPanelExtra ? mocks.chatPanelExtra(props) : null}
+      </div>
     );
   },
 }));
@@ -297,6 +322,10 @@ vi.mock('../hooks/useStockQuoteModel', () => ({ useStockQuoteModel: () => ({}) }
 vi.mock('../hooks/useChartLegendSlots', () => ({ useChartLegendSlots: () => ({ toolbarLead: null }) }));
 vi.mock('../hooks/useRestoredWorkspace', async () => {
   const { useState } = await import('react');
+  const defaultWorkspaces = [
+    { workspace_id: 'ws-1', name: 'Workspace 1' },
+    { workspace_id: 'ws-2', name: 'Workspace 2' },
+  ];
   return {
     useRestoredWorkspace: ({ linkedId }: { linkedId?: string | null }) => {
       const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(linkedId || 'ws-1');
@@ -304,14 +333,20 @@ vi.mock('../hooks/useRestoredWorkspace', async () => {
         selectedWorkspaceId,
         pending: false,
         select: setSelectedWorkspaceId,
-        workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }],
+        workspaces: defaultWorkspaces,
       };
     },
   };
 });
 vi.mock('@/hooks/useWorkspaces', () => ({
   useWorkspaces: () => ({
-    data: { workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }], total: 1 },
+    data: {
+      workspaces: [
+        { workspace_id: 'ws-1', name: 'Workspace 1' },
+        { workspace_id: 'ws-2', name: 'Workspace 2' },
+      ],
+      total: 2,
+    },
     isFetchedAfterMount: true,
     isSuccess: true,
   }),
@@ -324,7 +359,13 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => ({
 }));
 
 import { SidebarRevealContext } from '@/components/Sidebar/sidebarRevealContext';
+import { useToolbarItems } from '@/components/ui/chat-input.toolbar';
+import type { Workspace as ComposerWorkspace } from '@/components/ui/chat-input.types';
+import { InlineChartLayerCard } from '@/pages/ChatAgent/components/charts/InlineChartLayerCard';
+import { ChartSurfaceContext } from '@/pages/ChatAgent/contexts/ChartSurfaceContext';
 import MarketView from '../MarketView';
+import { useMarketThreadRoute } from '../hooks/useMarketThreadRoute';
+import { resetLayerViewForTesting } from '../stores/layerViewStore';
 import { savePref } from '../utils/prefs';
 
 function LocationProbe() {
@@ -361,12 +402,14 @@ function renderAt(initialEntries: string[], marketStatus: MarketStatusInput = nu
 describe('MarketView personal watchlist route & deep-link navigation', () => {
   beforeEach(() => {
     mocks.capturedChatProps = [];
+    mocks.chatPanelExtra = null;
     mocks.isColleague = false;
     mocks.activeWorkspaceObj = { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false };
     mocks.metricsOverride = null;
     mocks.liveQuotes = {};
     mocks.liveQuotesLoading = false;
     mocks.useQuotesMock.mockClear();
+    resetLayerViewForTesting();
     localStorage.clear();
     sessionStorage.clear();
   });
@@ -1872,5 +1915,169 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     });
     expect(screen.getByTestId('loc-display').textContent).toBe('/market');
     expect(screen.getByTestId('loc-display').textContent).not.toContain('ws=');
+  });
+
+  it('r6: picking ws-2 from Home via the real toolbar updates both page and URL to ws-2 when ws-1 was last selected', async () => {
+    function RealScopeToolbar(props: {
+      scope: 'all' | 'workspace';
+      workspaces?: Array<{ workspace_id: string; name: string }>;
+      selectedWorkspaceId?: string | null;
+      onScopeChange?: (scope: 'all' | 'workspace') => void;
+      onWorkspaceChange?: (id: string) => void;
+    }) {
+      const items = useToolbarItems({
+        subagentsAllowed: null,
+        onToggleSubagents: () => {},
+        watchMode: false,
+        setWatchMode: () => {},
+        marketWatchEnabled: false,
+        workspaces: (props.workspaces ?? []) as ComposerWorkspace[],
+        selectedWorkspaceId: props.selectedWorkspaceId,
+        onWorkspaceChange: props.onWorkspaceChange,
+        scope: props.scope,
+        onScopeChange: props.onScopeChange,
+      });
+      const scopeItem = items.find((i) => i.id === 'scope');
+      return <div data-testid="real-scope-toolbar">{scopeItem?.inline({ measureOnly: false })}</div>;
+    }
+
+    mocks.chatPanelExtra = (props) => <RealScopeToolbar {...props} />;
+
+    renderAt(['/market?symbol=AAPL']);
+
+    // Starts in Home (no ?ws=), while previously selected workspace is ws-1.
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart')).toBeTruthy();
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(mocks.capturedChatProps.at(-1)?.selectedWorkspaceId).toBe('ws-1');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('home-ws');
+    });
+    expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL');
+
+    // Open the real composer scope picker and select ws-2 (triggers onWorkspaceChange('ws-2') then onScopeChange('workspace')).
+    const toolbar = screen.getByTestId('real-scope-toolbar');
+    fireEvent.click(within(toolbar).getByRole('button'));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('menuitemradio', { name: 'Workspace 2' }));
+
+    // Both page state and tab URL must land on ws-2 (never overwritten back to ws-1).
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
+      expect(mocks.capturedChatProps.at(-1)?.selectedWorkspaceId).toBe('ws-2');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-2');
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL&ws=ws-2');
+    });
+
+    // Switch back to Home, then re-pick the now-selected ws-2 (only onScopeChange('workspace') fires).
+    fireEvent.click(within(screen.getByTestId('real-scope-toolbar')).getByRole('button'));
+    const dialogHome = await screen.findByRole('dialog');
+    const homeRadio = within(dialogHome).getAllByRole('menuitemradio')[0];
+    fireEvent.click(homeRadio);
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('all');
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL');
+    });
+
+    fireEvent.click(within(screen.getByTestId('real-scope-toolbar')).getByRole('button'));
+    const dialogAgain = await screen.findByRole('dialog');
+    fireEvent.click(within(dialogAgain).getByRole('menuitemradio', { name: 'Workspace 2' }));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.scope).toBe('workspace');
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-2');
+      expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=AAPL&ws=ws-2');
+    });
+  });
+
+  it('r6: clicking a same-symbol different-timeframe layer card keeps ?thread= and restores the thread after refresh (remount)', async () => {
+    function RealLayerCardAndThreadProbe(props: {
+      symbol: string;
+      interval?: string;
+      activeWorkspaceId?: string | null;
+      onJumpToChart?: (symbol: string, timeframe: string) => void;
+    }) {
+      const threadRoute = useMarketThreadRoute(props.activeWorkspaceId ?? null, props.symbol);
+      const surface = {
+        chartPresent: true,
+        activeSymbol: props.symbol,
+        activeTimeframe: props.interval,
+        onJumpToChart: props.onJumpToChart,
+      };
+      const sameSymbolCard = {
+        symbol: 'NVDA',
+        timeframe: '4hour',
+        workspaceId: props.activeWorkspaceId ?? undefined,
+        layers: [{ layer_id: 'l-4h', title: '4H Support', summary: 'Key support' }],
+      };
+      const crossSymbolCard = {
+        symbol: 'AAPL',
+        timeframe: '1hour',
+        workspaceId: props.activeWorkspaceId ?? undefined,
+        layers: [{ layer_id: 'l-aapl', title: 'AAPL Breakout', summary: 'Breakout' }],
+      };
+      return (
+        <ChartSurfaceContext.Provider value={surface}>
+          <span data-testid="active-thread-id">{threadRoute.threadId}</span>
+          <div data-testid="same-symbol-layer-card">
+            <InlineChartLayerCard card={sameSymbolCard as never} />
+          </div>
+          <div data-testid="cross-symbol-layer-card">
+            <InlineChartLayerCard card={crossSymbolCard as never} />
+          </div>
+        </ChartSurfaceContext.Provider>
+      );
+    }
+
+    mocks.chatPanelExtra = (props) => <RealLayerCardAndThreadProbe {...props} />;
+
+    const firstRender = renderAt(['/market?symbol=NVDA&tf=1day&ws=ws-1&thread=th-existing']);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart').getAttribute('data-symbol')).toBe('NVDA');
+      expect(screen.getByTestId('market-chart').getAttribute('data-interval')).toBe('1day');
+      expect(screen.getByTestId('active-thread-id').textContent).toBe('th-existing');
+    });
+
+    // Click the same-symbol, different-timeframe layer card (NVDA · 4h).
+    fireEvent.click(within(screen.getByTestId('same-symbol-layer-card')).getByRole('button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart').getAttribute('data-symbol')).toBe('NVDA');
+      expect(screen.getByTestId('market-chart').getAttribute('data-interval')).toBe('4hour');
+      expect(screen.getByTestId('active-thread-id').textContent).toBe('th-existing');
+      const loc = screen.getByTestId('loc-display').textContent ?? '';
+      const params = new URLSearchParams(loc.split('?')[1]);
+      expect(params.get('symbol')).toBe('NVDA');
+      expect(params.get('tf')).toBe('4hour');
+      expect(params.get('ws')).toBe('ws-1');
+      expect(params.get('thread')).toBe('th-existing');
+    });
+
+    const urlAfterSwitch = screen.getByTestId('loc-display').textContent!;
+
+    // Simulate a full refresh: unmount, clear localStorage so only the URL can restore the thread, and remount.
+    firstRender.unmount();
+    localStorage.clear();
+    resetLayerViewForTesting();
+
+    renderAt([urlAfterSwitch]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart').getAttribute('data-symbol')).toBe('NVDA');
+      expect(screen.getByTestId('market-chart').getAttribute('data-interval')).toBe('4hour');
+      expect(screen.getByTestId('active-thread-id').textContent).toBe('th-existing');
+    });
+    expect(new URLSearchParams((screen.getByTestId('loc-display').textContent ?? '').split('?')[1]).get('thread')).toBe('th-existing');
+
+    // Cross-symbol layer card jump keeps current behavior (drops ?thread= from URL).
+    fireEvent.click(within(screen.getByTestId('cross-symbol-layer-card')).getByRole('button'));
+    await waitFor(() => {
+      expect(screen.getByTestId('market-chart').getAttribute('data-symbol')).toBe('AAPL');
+      expect(screen.getByTestId('market-chart').getAttribute('data-interval')).toBe('1hour');
+      const params = new URLSearchParams((screen.getByTestId('loc-display').textContent ?? '').split('?')[1]);
+      expect(params.get('symbol')).toBe('AAPL');
+      expect(params.get('tf')).toBe('1hour');
+      expect(params.get('ws')).toBe('ws-1');
+      expect(params.get('thread')).toBeNull();
+    });
   });
 });
