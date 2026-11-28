@@ -486,15 +486,24 @@ class RunSSEProducer:
             _tool_usage_context.set(self.tool_tracker)
             logger.debug(f"[RunSSEProducer] Tool usage tracking ContextVar set for thread_id={self.thread_id}")
 
-        # DALTON-HOOK(personal-integrations): pre-check whether this thread already carries personal integration data
-        if not getattr(self, "_personal_integration_sse_redacted", False):
+        # DALTON-HOOK(personal-integrations): pre-check whether this thread already carries personal
+        # integration data. Only the SSE event log reads the flag, so skip the lookup when that log is
+        # off; a failed lookup logs ids and types only instead of ending the turn.
+        if SSE_EVENT_LOG_ENABLED and not getattr(self, "_personal_integration_sse_redacted", False):
             from src.dalton.services.personal_integration_guard import (
                 is_thread_sse_log_redacted,
             )
 
-            self._personal_integration_sse_redacted = await is_thread_sse_log_redacted(
-                self.thread_id
-            )
+            try:
+                self._personal_integration_sse_redacted = await is_thread_sse_log_redacted(
+                    self.thread_id
+                )
+            except Exception:
+                logger.warning(
+                    "[RunSSEProducer] personal-private lookup failed; SSE log keeps ids and types only",
+                    exc_info=True,
+                )
+                self._personal_integration_sse_redacted = True
 
         _stream_span = _otel_tracer.start_span(
             "chat.turn.stream",

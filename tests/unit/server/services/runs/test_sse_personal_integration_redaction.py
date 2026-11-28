@@ -214,3 +214,47 @@ async def test_sse_log_keeps_full_payload_for_non_private_thread(
 
     assert normal_reply in "\n".join(emitted)
     assert normal_reply in "\n".join(capture.messages)
+
+
+def _one_reply_graph(text: str) -> _FakeGraph:
+    return _FakeGraph(
+        [((), "messages", (AIMessageChunk(content=text, id="ai-msg-x"), {"langgraph_node": "model"}))]
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_private_lookup_when_sse_log_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the SSE event log off the turn never queries the thread's private state."""
+    monkeypatch.setattr(sse_mod, "SSE_EVENT_LOG_ENABLED", False)
+    calls: list[str] = []
+
+    async def _lookup(thread_id: str, **_kw: Any) -> bool:
+        calls.append(thread_id)
+        return False
+
+    monkeypatch.setattr(guard_mod, "is_thread_personal_private", _lookup)
+    producer = RunSSEProducer(thread_id=str(uuid4()), run_id=str(uuid4()))
+    emitted = [frame async for frame in producer.stream_workflow(_one_reply_graph("普通回答"), {}, {})]
+
+    assert "普通回答" in "\n".join(emitted)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_private_lookup_keeps_turn_and_redacts_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A database error in the lookup keeps the turn running and logs ids and types only."""
+
+    async def _pool_timeout(_thread_id: str, **_kw: Any) -> bool:
+        raise TimeoutError("pool timeout")
+
+    monkeypatch.setattr(guard_mod, "is_thread_personal_private", _pool_timeout)
+    capture = _attach_sse_log_capture()
+    try:
+        producer = RunSSEProducer(thread_id=str(uuid4()), run_id=str(uuid4()))
+        emitted = [frame async for frame in producer.stream_workflow(_one_reply_graph("下午的安排"), {}, {})]
+    finally:
+        sse_mod.sse_logger.removeHandler(capture)
+
+    assert "下午的安排" in "\n".join(emitted)
+    assert capture.messages
+    assert all("data:" not in m for m in capture.messages)
