@@ -1657,6 +1657,10 @@ def parse_args(argv):
 
 
 def execute(argv):
+    if "--preserve-calcpr" in argv:  # DALTON-HOOK(xlsx-preserve-calcpr)
+        import runpy
+        p = next(c for b in (Path(__file__).resolve().parents[2], *Path(__file__).resolve().parents[4:5]) for c in (b / "dalton-model/scripts/model_xlsx_hooks.py", b / "dalton/skills/dalton-model/scripts/model_xlsx_hooks.py") if c.is_file())
+        return runpy.run_path(str(p))["execute_preserve_calcpr"](sys.modules[__name__], argv)
     filename, operation, flags, axis, at, count, delete, copy_from = parse_args(argv)
     source = Path(filename).expanduser().resolve()
     destination = Path(flags.get("--out", str(source))).expanduser().resolve()

@@ -22,6 +22,7 @@ WORKFLOW_CONTRACTS = [
     "full-coverage",
     "bullbear-doc",
     "earnings-deep-update",
+    "company-model",
     "weekly-coverage-review",
     "topic-research",
 ]

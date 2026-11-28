@@ -60,7 +60,20 @@ from src.dalton.workflows.journal import (
     digest_paths,
     engine_safe,
     missing_declared_artifacts,
-    prompt_digest,
+)
+# DALTON-HOOK(modeling-lock): per-workspace modeling lock helpers owned by
+# Dalton; driver enforces acquisition for direct callers, runs short-lease
+# heartbeat, binds server run context, and confirms writer exit before release.
+from src.dalton.workflows.modeling_lock import (
+    ModelingLockBusy,
+    ModelingLockHeartbeat,
+    acquire_modeling_lock,
+    bind_script_run_context,
+    confirm_modeling_writers_exited,
+    modeling_lock_ttl,
+    needs_modeling_lock,
+    release_modeling_lock,
+    resolve_workflow_progress_path,
 )
 
 logger = structlog.get_logger(__name__)
@@ -118,6 +131,9 @@ class WorkflowRunSpec:
     # launching skill can find an interrupted run and resume it. Resolved
     # from ``params.progress_path`` at launch.
     progress_path: str | None = None
+    # DALTON-HOOK(modeling-lock): whether RunWorkflow already acquired the
+    # workspace modeling lock on behalf of this run.
+    modeling_lock_held: bool = False
 
 
 class WorkflowRunError(RuntimeError):
@@ -266,7 +282,89 @@ class WorkflowDriver:
             run_id=self.wf_task_id,
             workflow=spec.meta.name,
             journal_source=spec.journal_source,
-            progress_path=spec.progress_path,
+            # DALTON-HOOK(modeling-lock): isolate non-modeled earnings-deep-update
+            # progress files from concurrent modeled runs.
+            progress_path=resolve_workflow_progress_path(
+                spec.meta.name, spec.script_args, spec.progress_path
+            ),
+        )
+        # DALTON-HOOK(modeling-lock): track lock ownership, lease heartbeat,
+        # lease-loss abort state, cancelled writer tasks, and avoid clobbering
+        # holder progress on refusal.
+        self._modeling_lock_held = bool(spec.modeling_lock_held)
+        self._modeling_lock_heartbeat: ModelingLockHeartbeat | None = None
+        self._modeling_lock_lost_error: str | None = None
+        self._script_task: asyncio.Task[Any] | None = None
+        self._cancelled_child_tasks: list[BackgroundTask] = []
+        self._children_cancelled = False
+        self._skip_progress_on_finalize = False
+
+    def _start_modeling_lock_heartbeat(self) -> None:
+        # DALTON-HOOK(modeling-lock): renew the short modeling lock lease while running.
+        if not self._modeling_lock_held or self._modeling_lock_heartbeat is not None:
+            return
+        self._modeling_lock_heartbeat = ModelingLockHeartbeat(
+            self.spec.backend,
+            registry=self.spec.registry,
+            run_id=self.wf_task_id,
+            workflow=self.spec.meta.name,
+            workspace_id=(self.spec.base_configurable or {}).get("workspace_id"),
+            ttl_seconds=modeling_lock_ttl(self.spec.caps),
+            on_lease_lost=self._on_modeling_lock_lost,
+        )
+        self._modeling_lock_heartbeat.start()
+
+    async def _on_modeling_lock_lost(self, reason: str) -> None:
+        # DALTON-HOOK(modeling-lock): heartbeat renewal failed — stop admitting
+        # new dispatches, cancel in-flight writer tasks, and abort the script.
+        if self._modeling_lock_lost_error is not None:
+            return
+        self._modeling_lock_lost_error = reason
+        self._stopping = True
+        logger.warning(
+            "Modeling lock renewal failed; cancelling in-flight children and stopping run",
+            wf_task_id=self.wf_task_id,
+            reason=reason,
+        )
+        await self._cancel_children(reason=reason)
+        script_task = self._script_task
+        if script_task is not None and not script_task.done():
+            script_task.cancel()
+
+    async def _stop_modeling_lock_heartbeat(self) -> None:
+        # DALTON-HOOK(modeling-lock): stop lease renewal before exit or release.
+        hb = self._modeling_lock_heartbeat
+        self._modeling_lock_heartbeat = None
+        if hb is not None:
+            await hb.stop()
+
+    async def _release_modeling_lock(self) -> None:
+        # DALTON-HOOK(modeling-lock): idempotent release of this run's lock
+        # after stopping heartbeat and confirming modeling writer exit.
+        await self._stop_modeling_lock_heartbeat()
+        if not self._modeling_lock_held:
+            return
+        self._modeling_lock_held = False
+        writers_exited = await confirm_modeling_writers_exited(
+            registry=self.spec.registry,
+            owner_task_id=self.wf_task_id,
+            run_id=self.wf_task_id,
+            extra_tasks=list(self._cancelled_child_tasks),
+            backend=self.spec.backend,
+            check_sandbox_processes=self._children_cancelled,
+        )
+        if not writers_exited:
+            logger.warning(
+                "Modeling writer exit unconfirmed; keeping short-lease lock until expiry",
+                wf_task_id=self.wf_task_id,
+            )
+            return
+        await release_modeling_lock(
+            self.spec.backend,
+            registry=self.spec.registry,
+            run_id=self.wf_task_id,
+            workflow=self.spec.meta.name,
+            workspace_id=(self.spec.base_configurable or {}).get("workspace_id"),
         )
 
     async def run(self, _request: Any = None) -> str:
@@ -284,53 +382,123 @@ class WorkflowDriver:
         self._started_at = time.time()
         self.spec.run_task.stop_at = self._started_at + caps.run_timeout
         try:
-            await self._emitter.emit(
-                "run_started",
-                name=self.spec.meta.name,
-                description=self.spec.meta.description,
-                source=self.spec.source,
-            )
-            async with asyncio.timeout(caps.run_timeout):
-                outcome = await run_workflow_script(
-                    self.spec.script,
-                    self.spec.script_args,
-                    host=self,
-                    limits=WorkflowLimits(
-                        memory_limit_mb=caps.memory_limit_mb,
-                        cpu_budget_s=caps.cpu_budget_s,
-                    ),
+            try:
+                await self._emitter.emit(
+                    "run_started",
+                    name=self.spec.meta.name,
+                    description=self.spec.meta.description,
+                    source=self.spec.source,
                 )
-            # Terminal bookkeeping runs outside the deadline — a run that
-            # beat the timeout must not have its finalize killed by it.
-            terminal = await self._finish_outcome(outcome)
-        except asyncio.CancelledError as cancel:
-            # A stop for running past its time limit ends the run as its own
-            # clock would, unless a user's stop reached the run too: it
-            # stamps the run cancelled, and wins.
-            user_stop = self.spec.run_task.terminal_status == "cancelled"
-            if user_stop or not is_time_limit_cancel(cancel):
-                await self._shielded(self._on_cancelled())
-                raise
-            asyncio.current_task().uncancel()
-            error = await self._shielded(
-                self._fail(f"Run timed out after {caps.run_timeout}s")
-            )
-            raise WorkflowRunError(error) from None
-        except TimeoutError:
-            terminal = _Terminal(error=f"Run timed out after {caps.run_timeout}s")
-        except Exception as error:
-            logger.error(
-                "Workflow driver crashed",
-                wf_task_id=self.wf_task_id,
-                error=str(error),
-                exc_info=True,
-            )
-            terminal = _Terminal(error=str(error))
+                # DALTON-HOOK(modeling-lock): enforce per-workspace modeling
+                # exclusivity even when WorkflowDriver is invoked directly
+                # outside RunWorkflow; on contention do not enter modeling.
+                lock_busy_error: str | None = None
+                if not self._modeling_lock_held and needs_modeling_lock(
+                    self.spec.meta.name, self.spec.script_args
+                ):
+                    try:
+                        await acquire_modeling_lock(
+                            self.spec.backend,
+                            registry=self.spec.registry,
+                            run_id=self.wf_task_id,
+                            workflow=self.spec.meta.name,
+                            thread_id=self.spec.thread_id,
+                            workspace_id=(self.spec.base_configurable or {}).get(
+                                "workspace_id"
+                            ),
+                            ttl_seconds=modeling_lock_ttl(caps),
+                        )
+                        self._modeling_lock_held = True
+                    except ModelingLockBusy as lock_err:
+                        self._skip_progress_on_finalize = True
+                        lock_busy_error = str(lock_err)
 
-        if terminal.error is None:
-            await self._finalize("completed", result_preview=terminal.result_preview)
-            return terminal.summary
-        raise WorkflowRunError(await self._fail(terminal.error))
+                if lock_busy_error is not None:
+                    terminal = _Terminal(error=lock_busy_error)
+                else:
+                    # DALTON-HOOK(modeling-lock): start lease heartbeat, bind
+                    # server run identity, and run the script inside a task that
+                    # heartbeat lease-loss can cancel immediately.
+                    self._start_modeling_lock_heartbeat()
+                    script_args = bind_script_run_context(
+                        self.spec.script_args,
+                        run_id=self.wf_task_id,
+                        run_dir=self.base_rel,
+                        resumed_from=self.spec.journal_source,
+                    )
+                    script_task = asyncio.create_task(
+                        run_workflow_script(
+                            self.spec.script,
+                            script_args,
+                            host=self,
+                            limits=WorkflowLimits(
+                                memory_limit_mb=caps.memory_limit_mb,
+                                cpu_budget_s=caps.cpu_budget_s,
+                            ),
+                        ),
+                        name=f"workflow_script_{self.wf_task_id}",
+                    )
+                    self._script_task = script_task
+                    outcome: WorkflowOutcome | None = None
+                    try:
+                        async with asyncio.timeout(caps.run_timeout):
+                            outcome = await script_task
+                    except asyncio.CancelledError:
+                        if (
+                            self._modeling_lock_lost_error is not None
+                            and not _stop_targets_this_run()
+                        ):
+                            outcome = None
+                        else:
+                            raise
+                    finally:
+                        self._script_task = None
+                        if not script_task.done():
+                            script_task.cancel()
+                            try:
+                                await script_task
+                            except BaseException:
+                                pass
+                    if self._modeling_lock_lost_error is not None:
+                        terminal = _Terminal(error=self._modeling_lock_lost_error)
+                    else:
+                        assert outcome is not None
+                        # Terminal bookkeeping runs outside the deadline — a run that
+                        # beat the timeout must not have its finalize killed by it.
+                        terminal = await self._finish_outcome(outcome)
+            except asyncio.CancelledError as cancel:
+                # A stop for running past its time limit ends the run as its own
+                # clock would, unless a user's stop reached the run too: it
+                # stamps the run cancelled, and wins.
+                user_stop = self.spec.run_task.terminal_status == "cancelled"
+                if user_stop or not is_time_limit_cancel(cancel):
+                    await self._shielded(self._on_cancelled())
+                    raise
+                asyncio.current_task().uncancel()
+                error = await self._shielded(
+                    self._fail(f"Run timed out after {caps.run_timeout}s")
+                )
+                raise WorkflowRunError(error) from None
+            except TimeoutError:
+                terminal = _Terminal(error=f"Run timed out after {caps.run_timeout}s")
+            except Exception as error:
+                logger.error(
+                    "Workflow driver crashed",
+                    wf_task_id=self.wf_task_id,
+                    error=str(error),
+                    exc_info=True,
+                )
+                terminal = _Terminal(error=str(error))
+
+            if terminal.error is None:
+                await self._finalize("completed", result_preview=terminal.result_preview)
+                return terminal.summary
+            raise WorkflowRunError(await self._fail(terminal.error))
+        finally:
+            # DALTON-HOOK(modeling-lock): safety net heartbeat stop & release if
+            # an exception escaped before _finalize ran.
+            if self._modeling_lock_held or self._modeling_lock_heartbeat is not None:
+                await self._shielded(self._release_modeling_lock())
 
     async def _shielded(self, cleanup: Coroutine[Any, Any, Any]) -> Any:
         """Run a stop's terminal bookkeeping past a cancel of the run, so the
@@ -457,6 +625,9 @@ class WorkflowDriver:
 
     async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
         """Dispatch one subagent for the JavaScript ``agent()`` helper."""
+        # DALTON-HOOK(modeling-lock): refuse any new step once modeling lock renewal fails.
+        if self._modeling_lock_lost_error is not None:
+            raise WorkflowHostError(self._modeling_lock_lost_error)
         # Ahead of validation so a run at its cap says so, whatever else is
         # wrong with the call.
         if self._cap_reached():
@@ -619,7 +790,7 @@ class WorkflowDriver:
                 "seq": seq,
                 "label": label,
                 "phase": phase,
-                "prompt_sha256": prompt_digest(rec["prompt"]),
+                "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                 "status": "pending",
                 "recorded_at": time.time(),
             }
@@ -627,6 +798,10 @@ class WorkflowDriver:
 
         async with sem:
             try:
+                # DALTON-HOOK(modeling-lock): re-check after acquiring the concurrency
+                # semaphore so a lease loss while queued never dispatches a child.
+                if self._modeling_lock_lost_error is not None:
+                    raise WorkflowHostError(self._modeling_lock_lost_error)
                 # Children carry the LAUNCHING turn's run stamp — the same
                 # stamp a Task-tool subagent of that turn would get — so the
                 # standard turn collector claims, drains, and bills them.
@@ -757,7 +932,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": "partial",
                     "result": engine_safe(result_value),
                     "result_kind": "parsed" if schema is not None else "text",
@@ -780,7 +955,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": "ok",
                     "result": result_value,
                     "result_kind": "parsed" if schema is not None else "text",
@@ -803,7 +978,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": run.status,
                     "error": run.to_record()["error"],
                     "recorded_at": time.time(),
@@ -958,9 +1133,19 @@ class WorkflowDriver:
 
     async def _cancel_children(self, *, reason: str) -> int:
         self._stopping = True
+        # DALTON-HOOK(modeling-lock): snapshot in-flight child tasks before
+        # _emit_child_cancelled clears _inflight so release confirms they exited.
+        if self._inflight:
+            self._children_cancelled = True
+            for rec in self._inflight.values():
+                task = rec.get("task")
+                if task is not None:
+                    self._cancelled_child_tasks.append(task)
         cancelled = await self.spec.registry.cancel_owner_children(
             self.wf_task_id, reason=reason
         )
+        if cancelled > 0:
+            self._children_cancelled = True
         # Their own coroutines unwind after this run's terminal frame is already
         # snapshotted, so the last word on each child has to be said here.
         for seq in sorted(self._inflight):
@@ -1016,7 +1201,11 @@ class WorkflowDriver:
         await self._write_json("status.json", payload)
         # DALTON-HOOK(workflow-journal): the terminal progress write is what
         # retires the marker the launching skill resumes from.
-        await self._journal.write_progress(status)
+        # DALTON-HOOK(modeling-lock): skip touching shared progress when this
+        # run was turned away by another active holder, and release our lock.
+        if not self._skip_progress_on_finalize:
+            await self._journal.write_progress(status)
+        await self._release_modeling_lock()
         await self._emitter.persist_snapshot()
 
     async def _write_json(self, path: str, value: Any) -> bool:

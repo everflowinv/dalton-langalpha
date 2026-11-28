@@ -30,7 +30,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import posixpath
+import shlex
 from typing import Any
 
 from src.dalton.autonomy.probes.cnhk import (
@@ -50,11 +52,17 @@ from src.dalton.settings import is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
-# 公司级 workflow：契约 params_required 里带 ticker 的那四个（topic-research
+# 公司级 workflow：契约 params_required 里带 ticker 的五个（topic-research
 # 按专题、weekly-coverage-review 在 Home 跑，都不是公司级）。名单由
 # tests/unit/dalton/test_company_routing.py 对照全部契约钉住。
 COMPANY_WORKFLOWS = frozenset(
-    {"initial-coverage", "full-coverage", "bullbear-doc", "earnings-deep-update"}
+    {
+        "initial-coverage",
+        "full-coverage",
+        "bullbear-doc",
+        "earnings-deep-update",
+        "company-model",
+    }
 )
 
 # 身份解析只读文档的 ticker 字段，枚举就只投影这一列（第 2 轮 agy 6）。
@@ -113,6 +121,111 @@ def _workspace_dir_escapes(workspace_dir: Any, root: Any = None) -> bool:
         return False
     normalized = posixpath.normpath(cleaned)
     return normalized == ".." or normalized.startswith("../")
+
+
+def _model_path_in_workspace(model_path: Any, root: Any = None) -> bool:
+    """Lexical pre-check: ``model_path`` is non-empty, ends with ``.xlsx``,
+    and resolves inside ``model/`` under the current workspace."""
+    if not isinstance(model_path, str):
+        return False
+    cleaned = model_path.strip()
+    if not cleaned or "\x00" in cleaned or "\\" in cleaned:
+        return False
+    if not cleaned.lower().endswith(".xlsx"):
+        return False
+    anchor = str(root).rstrip("/") if isinstance(root, str) and str(root).strip() else ""
+    if anchor:
+        absolute = cleaned if cleaned.startswith("/") else posixpath.join(anchor, cleaned)
+        normalized = posixpath.normpath(absolute)
+        model_prefix = posixpath.join(anchor, "model") + "/"
+        return normalized.startswith(model_prefix) and normalized != model_prefix.rstrip("/")
+    if cleaned.startswith("/"):
+        return False
+    normalized = posixpath.normpath(cleaned)
+    return (
+        normalized.startswith("model/")
+        and normalized != "model"
+        and not normalized.startswith("../")
+    )
+
+
+async def _model_path_verified_on_disk(
+    model_path: Any,
+    workspace_root: Any = None,
+    backend: Any = None,
+) -> bool:
+    """Real-path check for sector single-track pass-through:
+    ``model_path`` must exist as a regular file, resolve (after symlinks)
+    inside ``<workspace_root>/model/``, and end with ``.xlsx``."""
+    if not _model_path_in_workspace(model_path, workspace_root):
+        return False
+    cleaned = str(model_path).strip()
+    anchor = (
+        str(workspace_root).rstrip("/")
+        if isinstance(workspace_root, str) and str(workspace_root).strip()
+        else ""
+    )
+
+    execute = getattr(backend, "aexecute", None) if backend is not None else None
+    if execute is not None:
+        root_arg = anchor or "."
+        py_check = (
+            "import os,sys;"
+            "r=os.path.realpath(sys.argv[1]);"
+            "p=os.path.realpath(sys.argv[2] if os.path.isabs(sys.argv[2]) else os.path.join(r,sys.argv[2]));"
+            "m=os.path.join(r,'model')+os.sep;"
+            "ok=os.path.isfile(p) and p.startswith(m) and p.lower().endswith('.xlsx');"
+            "print('OK' if ok else 'NO')"
+        )
+        cd_prefix = f"cd {shlex.quote(anchor)} && " if anchor else ""
+        cmd = (
+            f"{cd_prefix}python3 -c {shlex.quote(py_check)} "
+            f"{shlex.quote(root_arg)} {shlex.quote(cleaned)}"
+        )
+        try:
+            resp = await execute(cmd)
+        except Exception as error:
+            logger.warning(
+                "sector model_path sandbox verification failed; refusing single-track pass-through",
+                exc_info=error,
+            )
+            return False
+        return (
+            int(getattr(resp, "exit_code", 1)) == 0
+            and str(getattr(resp, "output", "")).strip() == "OK"
+        )
+
+    if anchor and os.path.isdir(anchor):
+        real_root = os.path.realpath(anchor)
+        cand = cleaned if os.path.isabs(cleaned) else os.path.join(real_root, cleaned)
+        real_cand = os.path.realpath(cand)
+        real_model_prefix = os.path.join(real_root, "model") + os.sep
+        return (
+            os.path.isfile(real_cand)
+            and real_cand.startswith(real_model_prefix)
+            and real_cand.lower().endswith(".xlsx")
+        )
+    return False
+
+
+async def _is_sector_company_model_in_place(
+    workflow: str | None,
+    params: dict[str, Any],
+    is_sector: bool,
+    workspace_root: Any = None,
+    backend: Any = None,
+) -> bool:
+    """行业工作区整本建模单列放行规则（启动与 check_done 共用，设计 §3.4）。
+
+    仅当 workflow == "company-model"、当前工作区为行业工作区（is_sector == True），
+    且 params.model_path 真实存在、解析符号链接后仍落在当前工作区的 model/ 下且后缀为 .xlsx 时返回 True；
+    在非行业工作区或未传合法本工作区 model_path 时照常走目标公司工作区路由。
+    """
+    if workflow != "company-model" or not is_sector:
+        return False
+    return await _model_path_verified_on_disk(
+        params.get("model_path"), workspace_root=workspace_root, backend=backend
+    )
 
 
 def _is_sector_workspace(
@@ -359,6 +472,7 @@ async def resolve_launch_company_routing(
     configurable: dict[str, Any] | None,
     *,
     workspace_root: Any = None,
+    backend: Any = None,
 ) -> str | None:
     """公司级 workflow 启动前的路由检查；返回值是附在启动回执后的提示
     （None 表示照常、无提示），路由不符抛 ``CompanyRoutingRefused``。
@@ -389,6 +503,13 @@ async def resolve_launch_company_routing(
                 identity is not None
                 and identity.source == SOURCE_HISTORICAL_DUPLICATE
             )
+            if await _is_sector_company_model_in_place(
+                workflow, params, is_sector, workspace_root, backend=backend
+            ):
+                # 行业工作区传入本工作区整本 model_path：校验 workspace_dir 后就地放行，
+                # 跳过成员公司独立工作区反查（设计 §3.4）。
+                _guard_workspace_dir(params, ticker, workspace_root)
+                return None
             if (
                 identity is not None
                 and identity.is_company
@@ -471,6 +592,7 @@ async def routing_hint_for_check(
     *,
     workflow: str | None = None,
     workspace_root: Any = None,
+    backend: Any = None,
 ) -> str | None:
     """``dalton_check_done`` 的路由指引：只对公司级流程生效（与启动检查同
     一份名单，第 2 轮 agy 5——topic-research 多传一个 ticker 不该被误判成
@@ -504,6 +626,10 @@ async def routing_hint_for_check(
                 identity is not None
                 and identity.source == SOURCE_HISTORICAL_DUPLICATE
             )
+            if await _is_sector_company_model_in_place(
+                workflow, params, is_sector, workspace_root, backend=backend
+            ):
+                return _dir_hint(params, workspace_root)
             if (
                 identity is not None
                 and identity.is_company

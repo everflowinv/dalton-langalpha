@@ -567,6 +567,12 @@ class ChatRequest(BaseModel):
         description="Newest run sequence read with the pause a HITL answer "
         "resumes. Server-stamped.",
     )
+    # DALTON-HOOK(cos-verbatim-forward): server-stamped approval-bound ptc_agent dispatch payloads read during HITL validation
+    approved_dispatch_payloads: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Approval-bound ptc_agent dispatch payloads extracted during "
+        "HITL resume validation. Server-stamped.",
+    )
 
     # Localization and context
     locale: Optional[str] = Field(

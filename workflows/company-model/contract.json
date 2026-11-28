@@ -1,0 +1,33 @@
+{
+  "name": "company-model",
+  "description": "公司财务建模的完成契约：核对终态账本、模型文件可读性与哈希、已完成阶段证据或失败阶段记录，以及知识层 models 登记（对应 dalton-model SKILL 的交付物）。",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "建模与核验",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-model-{ticker}/model_dump/model-verification.json",
+          "min_bytes": 50
+        }
+      ],
+      "validators": [
+        {
+          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{as_of}-model-{ticker} --expected-workflow company-model",
+          "pass_when": "exit_zero",
+          "description": "按终态账本核对候选模型可读性、哈希、已完成阶段证据与失败阶段记录（pass 与 delivered_with_open_issues 均放行）"
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "models"
+    ],
+    "knowledge_source": "tool"
+  }
+}

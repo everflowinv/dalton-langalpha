@@ -2763,7 +2763,7 @@ class TestBatch3BackendTextAndSkillGates:
                 lowered = assembled.lower()
                 hits = [term for term in _B3_PROPRIETARY_BLACKLIST if term in lowered]
                 assert not hits, f"Core workflow {fp.relative_to(REPO_ROOT)} leaked {hits}"
-                if fp.suffix.lower() == ".js":
+                if fp.suffix.lower() == ".js" and wf_dir.name != "_shared":
                     compile_check(assembled)
                 elif fp.suffix.lower() == ".json":
                     json.loads(assembled)

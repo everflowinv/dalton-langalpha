@@ -12151,9 +12151,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 开始前：检查未完成的 run（中断续跑）
 
-- 读 `research/<D>-deep-<quarter>/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
-- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-deep-<quarter>/.progress.json"`，让中断后的 run 可被发现与续跑。
+- 读 `research/<D>-deep-<quarter>/.progress.json`（带模型运行）或 `research/<D>-deep-<quarter>/.progress.no-model.json`（无模型运行，`model_path` 为 `null`），以及 `research/` 下其他 `*/.progress.json`、`*/.progress.no-model.json`，看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<对应进度文件里的 run_id>")` 续跑（带模型读 `.progress.json`，无模型读 `.progress.no-model.json`）；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-deep-<quarter>/.progress.json"`（无模型运行由宿主自动隔离写入 `research/<D>-deep-<quarter>/.progress.no-model.json`），让中断后的 run 可被发现与续跑。
 
 ## Step 1：组装参数并启动 `earnings-deep-update` Workflow
 
@@ -12168,7 +12168,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | `release_date` | 官方财报发布日期 `YYYY-MM-DD`（如 `"2026-10-28"`） |
 | `model_path` | 启动前按 `.agents/skills/dalton-model/SKILL.md` 第 1 步确定原模型：优先用用户本次上传或指定的模型文件（如 `sources/` 下的文件），其次取 `data/models.json` 中 `current`（当前版本）对应的已登记路径（如 `"model/META-model-v01.xlsx"`）；`model/` 与 `models/` 并存或有多份文件时，按第 1 步核对内容与交付记录，无法判断时询问用户。**尚无模型时传 `null`**（workflow 跳过模型更新支线，仅执行点评、对账与校准） |
 | `preview_predictions` | 前瞻预测文件路径（如 `"research/2026-10-23-preview-FY26Q3/predictions.json"`）；若本次财报前无前瞻预测文件，传 `null` |
-| `progress_path` | 固定传 `"research/<D>-deep-<quarter>/.progress.json"`（`<D>` 即 `release_date`），让中断后的 run 可被发现与续跑 |
+| `progress_path` | 固定传 `"research/<D>-deep-<quarter>/.progress.json"`（`<D>` 即 `release_date`；无模型运行由宿主自动隔离落盘为同目录 `.progress.no-model.json`），让中断后的 run 可被发现与续跑 |
 | `sector_overlay` | 若标的属于半导体/硬件行业（NVDA、AVGO、AMD、MRVL、TSM、ASML、MU、QCOM、ARM、INTC、TXN、LRCX、AMAT、KLAC、ADI、ON、MCHP、SMCI、ANET、CRDO、ALAB 等），传 `"hardware"` 以叠加 [`references/hardware-overlay.md`](references/hardware-overlay.md)；其他行业传 `null` |
 
 ---
@@ -12191,11 +12191,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及、未写入公告的指引在正文用自然中文说明（如“管理层在电话会上口头表示，未写入公告”）；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
 
 2. **支线 B —— Excel 模型更新（`model_path` 非空时运行）**：
-   - 先读 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md`（对照一致预期时按需读 `.agents/skills/dalton-model/references/sanity-check.md`），在原模型 `model_path` 上滚动维护：原件与已有版本保持只读，沿用原模型的结构、预测方法与格式（可先运行 `python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型路径> --out research/<D>-deep-<quarter>/style_profile.json` 提取格式画像）。
-   - 输出财报披露行项与模型行项的映射表到 `research/<D>-deep-<quarter>/mapping.md`。
-   - 将当季实际披露值写入对应期间、按需扩展预测期并校准远期驱动假设：工作区尚无 `model/<TICKER>-model-v*.xlsx` 时另存为 `model/<TICKER>-model-v01.xlsx`，已有版本时另存为下一版（如已有 `v01` 则另存为 `v02`），并在变更记录（工作簿最前面的 `README & Changelog` 工作表，或原模型已有的 `Change Log` 工作表）写明本次补充的实际值、驱动假设调整及原因。
-   - 运行公式重算（`python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径>`）、部件对比（`python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff <原模型路径> <新版本路径>`）与提示性扫描（`python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径>`），逐条核对扫描提示：属问题的修正模型并重算；结合公司实际属合理建模处理、扫描超时或执行失败、以及 `Checks`（勾稽检查）表个别条目未显示 `OK` 的情况，均在变更记录写明原因后继续推进。
-   - 运行 `python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file research/<D>-deep-<quarter>/model_lineage.json --output <新版本路径> --baseline <原模型路径>` 记录输入与输出文件路径及哈希，并输出新旧版本每股收益（`EPS`）变动拆解（`EPS walk`）与估值对比至 `research/<D>-deep-<quarter>/model-delta.md`（若后续审稿修订更新了模型，须用最终模型版本同步更新 `model-delta.md`）。
+   - 调用共享建模流水线（`dalton-model` 规范与 `rollforward.md`、`sanity-check.md`）：先运行 `model_fingerprint.py` 提取起点模型指纹并输出财报披露行项与模型行项的映射表到 `research/<D>-deep-<quarter>/mapping.md`。
+   - 保持原件与历史版本只读，按单公司递增 `vNN` 或行业整本沿原文件名递增版本的规则，通过 `model_edit.py apply` 受控原地编辑当季实际值与远期驱动假设（落盘前先恢复母本缓存，再在临时副本用 LibreOffice 复算并仅合并非错误值），更新变更记录（`README & Changelog` 或原表既有 `Change Log`）。
+   - 先独立完成本方预测，再用 `model_consensus.py write-snapshot` 与 `diff` 在免语言审查目录 `research/<D>-deep-<quarter>/model_dump/` 生成一致预期差异表 `consensus-diff.md/.json`（超阈值项拆源复核一次并写明理由）。
+   - 首查运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-deep-<quarter> --candidate <当前候选路径> --baseline <起点模型> --fingerprint research/<D>-deep-<quarter>/model_dump/<TICKER>-fingerprint.json --coord-map research/<D>-deep-<quarter>/model_dump/coord_map.json --workflow earnings-deep-update --mode update --fix-round 0` 只检查本轮改动范围，输出 `model_dump/model-check.md`、`model_dump/model-verification.json` 与（存在未决项时）`model_dump/remaining-issues.md`；仅「本轮可修」条目交回建模方修改（最多两轮），每轮修改后用同一组完整参数执行复查（递增 `--fix-round`）：`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-deep-<quarter> --candidate <当前候选路径> --baseline <起点模型> --fingerprint research/<D>-deep-<quarter>/model_dump/<TICKER>-fingerprint.json --coord-map research/<D>-deep-<quarter>/model_dump/coord_map.json --workflow earnings-deep-update --mode update --fix-round <1|2>`；若检查、复算或变动拆解超时，运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir research/<D>-deep-<quarter> --candidate <当前候选路径> --baseline <起点模型> --kind modeling --failed-stages <失败阶段列表，如 check,consensus> --workflow earnings-deep-update --mode update` 写入降级账本并以「带问题交付」继续推进（手动路径省略 `--run-id`）。
+   - 输出新旧版本每股收益（`EPS`）变动拆解（`EPS walk`）与估值对比至 `research/<D>-deep-<quarter>/model-delta.md`（已生成的 `mapping.md` 与 `model-delta.md` 照常执行两轮语言审查，`model_dump/` 下机器报告免语言审查）。
 
 ### 阶段 2：前瞻对账与 Thesis 财报后校准
 
@@ -12217,7 +12217,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 3：草稿期审稿与生成 `knowledge-revision.json`
 
-1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查超预期/低于预期〔beat/miss〕口径、摘要与各节是否有独立判断、核心论点〔thesis〕信号是否被股价涨跌替代、对账是否诚实面对错判、正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论〔逐条表格留在内部文件〕，以及“`## 引用` 节存在且每个 `[引用N]` 都能在其中找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后重新计算哈希、重新审稿并覆盖该文件。修订时若需改动模型，按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md` 保持原件只读、在当前模型上另存为下一版，运行 `python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径>` 重算与 `python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径>` 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录后继续），再运行 `python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file research/<D>-deep-<quarter>/model_lineage.json --output <新版本路径> --baseline <修订前模型路径>` 记录输入与输出；随后用最终模型版本同步更新 `research/<D>-deep-<quarter>/model-delta.md` 及草稿中的模型引用与受影响数字，重新计算草稿哈希并送审，再生成 `knowledge-revision.json`。
+1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查超预期/低于预期〔beat/miss〕口径、摘要与各节是否有独立判断、核心论点〔thesis〕信号是否被股价涨跌替代、对账是否诚实面对错判、正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论〔逐条表格留在内部文件〕，以及“`## 引用` 节存在且每个 `[引用N]` 都能在其中找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后重新计算哈希、重新审稿并覆盖该文件。修订时若需联动改动模型，统一经由共享报告改模入口（`model_edit.py` 按版本链另存下一版并保缓存复算、`model_consensus.py diff` 刷新差异表、`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-deep-<quarter> --candidate <新候选路径> --baseline <上一版本路径> --fingerprint research/<D>-deep-<quarter>/model_dump/<TICKER>-rev-fingerprint.json --coord-map research/<D>-deep-<quarter>/model_dump/coord_map.json --workflow earnings-deep-update --mode update --kind report_revision --append-revision` 单遍检查并在账本追加 `report_revision` 轮次；超时则运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir research/<D>-deep-<quarter> --candidate <当前候选路径> --baseline <上一版本路径> --kind report_revision --failed-stages <失败阶段列表，如 report_revision> --workflow earnings-deep-update --mode update` 补写降级账本），同步更新 `research/<D>-deep-<quarter>/model-delta.md`（若已生成）与草稿中的模型引用及受影响数字，重新计算草稿哈希并送审，再生成 `knowledge-revision.json`。
 2. **生成知识层修订草案**：汇总全部产出与审稿意见，按 PK.2 Schema 生成 `research/<D>-deep-<quarter>/knowledge-revision.json`。
 
 ---
@@ -12232,7 +12232,7 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - `doc="drivers"`：追加当季核心财务与经营 KPI 最新实际读数；
    - `doc="management"`：补填 `guidance_history[].actual` 与 `outcome`；若连续两季同类指标同向偏差，更新 `guidance_style` / `credibility_notes`；
    - `doc="lessons"`：将前瞻对账中“错/部分”条目的错因与适用边界追加为经验教训；
-   - `doc="models"`：只要新模型文件可读，无论重算（`recalc.py`）或提示性扫描（`model_scan.py --recalc`）是否超时、报错或留有提示项，均按 `.agents/skills/dalton-model/SKILL.md` 第 7 步先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记新版本路径、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向新版本，同时把重算与提示性扫描状态记入变更记录与 `reason` 字段（`research/<D>-deep-<quarter>/model_lineage.json` 作为输入输出文件记录留存）。若未产出可读的新模型版本，在修订说明中写明“模型未更新”，并在 `agenda_ops` 中排入人工跟进待办。
+   - `doc="models"`：只要终态账本 `research/<D>-deep-<quarter>/model_dump/model-verification.json` 指向的新模型文件可读（`pass` 或 `delivered_with_open_issues`），均按 `.agents/skills/dalton-model/SKILL.md` 先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记最终模型路径、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向新版本；若模型终态为「带问题交付」，在回复顶部原样附上 `model_dump/remaining-issues.md` 的内容。若未产出可读的新模型版本，在修订说明中写明“模型未更新”，并在 `agenda_ops` 中排入人工跟进待办。
 2. **调用 `knowledge_append_verdict` 写入事件五词终判与议程**：
    - 写入财报终判（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，`trigger.kind="earnings"`，`trigger.ref` 填 `tp1` 信号 id 或 `"manual"`）；
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
@@ -12242,7 +12242,7 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
    - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-deep-<quarter>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
-   - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>"})`（与启动时的参数一致；有模型时 `model_path` 传实际路径如 `"model/META-model-v01.xlsx"`，没有模型时传 `null`）；
+   - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<有模型取 research/<D>-deep-<quarter>/.progress.json 里的 run_id；无模型取 research/<D>-deep-<quarter>/.progress.no-model.json 里的 run_id>, params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>"})`（与启动时的参数一致；有模型时 `model_path` 传实际路径如 `"model/META-model-v01.xlsx"`，没有模型时传 `null`）；
    - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="earnings-deep-update", params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>", "manual": true})`（有模型时 `model_path` 传实际路径，没有模型时传 `null`），审稿结论按 `research/<D>-deep-<quarter>/review.json` 核对；
    - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
 5. **发布/推送（完成契约通过后）**：
@@ -14309,9 +14309,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 本 skill 是 Dalton 买方完整覆盖（P3 深度覆盖阶段）的启动与发布控制器。目标是针对已完成初次覆盖（或 PM 直接指定深度覆盖）的标的，一次运行产出：
 1. **数字底表（`research/<D>-fc/facts.md`）**：含 `<!-- FACTS-LEDGER ... -->` 机器可读账本，作为全文唯一目标公司财务数字来源与发布核验基准；
 2. **公司专属 12 问研究提纲（`research/<D>-fc/questions.md`）** 与 **A/B/C/D 四条取证支线底稿（`ea.md`、`eb.md`、`ec.md`、`ed.md`）**；
-3. **带动态公式的 Excel 财务与估值模型（`model/<TICKER>-model-v<NN>.xlsx`）**：工作区已有用户模型或历史版本时，按 `.agents/skills/dalton-model/SKILL.md` 保持原件只读，在原模型上滚动维护并另存为下一版，补齐预测期及 `Facts`（数字底表镜像）、`Guidance vs Actual`（12 季指引兑现表）、`Street vs House`（本方与市场预期对比表）、`Checks`（勾稽检查表）；尚无模型时按 `references/model-spec.md` 的 15 页规格新建，统一采用 `dalton-model` 的格式规范与提示性扫描；
+3. **带动态公式的 Excel 财务与估值模型（`model/<TICKER>-model-v<NN>.xlsx`）**：通过共享建模流水线产出；工作区已有用户模型或历史版本时，按 `.agents/skills/dalton-model/SKILL.md` 保持原件只读，在原模型上受控原地滚动维护并另存为下一版，补齐预测期及 `Facts`（数字底表镜像）、`Guidance vs Actual`（12 季指引兑现表）、`Street vs House`（本方与市场预期对比表）、`Checks`（勾稽检查表）；尚无模型时按默认模板与 `references/model-spec.md` 的 15 页规格新建，完成一致预期对照、本轮范围检查与最多两轮修改回路，在 `research/<D>-fc/model_dump/` 落盘终态账本与检查报告；
 4. **深度投资备忘录（`drafts/<D>-memo.md`）**：写给基金经理看（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用），12 问研究提纲（含每问 `A / B / C / D` 自评档位）留在 `questions.md` 工作底稿、不进正文；
-5. **只读审模型（按 `.agents/skills/dalton-model/SKILL.md` 与 `model_scan.py --recalc` 提示性扫描）与独立审稿（`dalton-reviewer`）**，修订后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
+5. **独立审稿（`dalton-reviewer`）与共享报告改模修订**：修订备忘录时若需联动改模，统一走共享报告改模入口并追加 `report_revision` 账本轮次，完成后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
 
 ---
 
@@ -14369,13 +14369,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - `eb.md`：按 `references/branch-b-sellside-expert.md`（AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点）；
      - `ec.md`：按 `references/branch-c-primary.md`（4 期报告 MD&A/Risk Factors diff、4 期电话会措辞漂移、招股书承诺对照、**C4 过去 12 个季度指引 vs 实际可信度表**、8-K 与内部人交易）；
      - `ed.md`：按 `references/branch-d-offstreet.md`（X、雪球、员工评价、社区情绪、招聘信号、13F、ToC 产品体验表或 ToB 从业者信号表）。
-   - **阶段 2（建模，串行在最前）**：按 `.agents/skills/dalton-model/SKILL.md` 与 `references/model-spec.md` 产出模型至 `model/<TICKER>-model-v<NN>.xlsx`（原件只读；尚无 `model/` 版本时存为 `v01`，已有版本时另存为下一版；已有原模型时在其上滚动维护并补齐预测期及 `Facts`、`Guidance vs Actual`、`Street vs House`、`Checks`，尚无模型时按 15 页规格新建并调用 `.agents/skills/dalton-model/scripts/model_style.py` 写格式）。完成后运行 `.agents/skills/xlsx/scripts/recalc.py` 重算与 `.agents/skills/dalton-model/scripts/model_scan.py --recalc` 提示性扫描，将结果及扫描超时、执行失败、保留不改的提示项或 `Checks` 未显示 `OK` 的原因记入 `Checks` 表与工作簿最前面的 `README & Changelog` 工作表（下称「变更记录」）后继续推进，再运行 `model_style.py lineage` 在 `research/<D>-fc/model_lineage.json` 记录输入输出路径与哈希。确认模型文件存在且可正常打开后进入写作——估值与基准预测数字均来自模型。
+   - **阶段 2（建模流水线，串行在最前）**：调用共享建模流水线（`.agents/skills/dalton-model/SKILL.md` 与 `references/model-spec.md`）产出模型至 `model/<TICKER>-model-v<NN>.xlsx`：先经 `model_fingerprint.py` 提取指纹，再由 `model_edit.py` 受控原地编辑、落盘前原子恢复母本缓存并由 LibreOffice 临时副本复算写回；先独立预测再用 `model_consensus.py` 写独立快照区并生成差异表；经 `model_check.py check` 对本轮改动范围做四分类检查，仅「本轮可修」交回修改（最多两轮），机器报告与终态账本 `model-verification.json` 统一落盘免语言审查目录 `research/<D>-fc/model_dump/`。凡产出可读候选（`pass` 或 `delivered_with_open_issues`）均顺畅进入写作，仅无可读候选时停在成稿之前。
    - **阶段 3（单一写手成稿与第 1 轮语言审查）**：一位写手通读 `questions.md`（12 问研究提纲）、四条支线底稿（含文末逐题证据小结）、`facts.md` 与模型输出，同步更新 `questions.md` 每问 `A / B / C / D` 自评档位（只写在底稿、不进备忘录正文），并按 `references/memo-writing.md` 一次写成整篇备忘录（成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处） → 跑 `validate_memo.py --mode full` 到 0 FAIL → 第 1 轮语言审查（`check_language` round=1，按清单修改）→ 复跑校验。
-   - **阶段 4（只读审模型与独立审稿并行）**：按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/sanity-check.md` 对本次最终模型做只读核查（原件只读；运行 `python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <模型路径>` 获取提示清单，结合公司实际与一致预期逐条复核；扫描超时或执行失败时如实记录状态，直接基于工作簿完成核查），输出 `research/<D>-fc/model-check.md` ∥ `dalton-reviewer` 审备忘录。
-   - **阶段 5（一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时按审稿意见与 `model-check.md` 做一轮修订（备忘录与模型；若修订模型，按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md` 保持原件只读并另存为下一版，重算后运行 `model_scan.py --recalc` 提示性扫描并核对，更新变更记录与 `model_lineage.json`；每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）后复审；随后对终稿做第 2 轮语言审查（`check_language` round=2，按清单修改并复核，绑定终稿哈希），并生成 `research/<D>-fc/knowledge-revision.json`。
+   - **阶段 4（独立审稿）**：派 `dalton-reviewer` 审阅备忘录（连同底表、支线底稿、最终模型与 `model_dump/` 下已生成的检查报告）。
+   - **阶段 5（共享改模、一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时，先经共享报告改模入口处理联动改模（`model_edit.py` 另存下一版并保缓存复算、`model_consensus.py diff` 刷新差异表、`model_check.py check --kind report_revision --append-revision` 单遍检查并追加账本轮次；超时则由短子任务 `model_check.py write-ledger` 写降级账本，同步更新 `.memo-model.json`），再结合实存模型报告修订备忘录并复审；随后对给人读的底稿笔记（`facts.md`、`questions.md`、`ea.md`–`ed.md`，跳过 `model_dump/`）与终稿备忘录完成第 2 轮语言审查，并生成 `research/<D>-fc/knowledge-revision.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2 → 3 → 4 → 5 的顺序手动完成各阶段产物与脚本校验（语言审查两轮、修订一轮，顺序同阶段 3–5；成稿和每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）。派 `dalton-reviewer` 审稿（含修订后复审）时：（1）先算 `drafts/<D>-memo.md` 的 sha256；（2）把该哈希写入审稿提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存为 `research/<D>-fc/review.json`，并写入 `draft_sha256` 字段（复审时覆盖为最新一轮；改稿后必须重新计算哈希、重新审稿）。备忘录主稿语言审查两轮：成稿并跑 `validate_memo.py --mode full` 到 0 FAIL 后调用 `check_language(draft_path=<草稿>, round=1)` 按清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），复跑校验，再派 `dalton-reviewer` 首次审稿；一轮修订结束后对终稿调用 `check_language(round=2)` 完成终稿语言修改，草稿有改动就再跑一次 round=2 复核（记录追加在同一 json），然后做最后一次审稿（pass 的 JSON 存 review.json）。`research/<D>-fc/` 下给人读的底稿笔记（`facts.md`、`questions.md`、`ea.md`–`ed.md`、`model-check.md`）各做两轮 `check_language`（第 1 轮按清单改，第 2 轮复核，有改动则再跑一次 round=2 确认）；不审 json/xlsx 等机器文件与 `.audit/.annotated/.language` 侧车。收尾按第三节第 5 步以 `manual: true` 调用 `dalton_check_done`。**在途的旧结构运行**（备忘录还是「零、12 问 + 一至十章」的旧版双轨稿）：按旧规则完成并收尾——`validate_memo.py` 会自动识别旧结构并按旧规则校验（`--part` 仍可用），不要把旧稿改写成新结构。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2 → 3 → 4 → 5 的顺序手动完成各阶段产物与脚本校验（语言审查两轮、修订一轮，顺序同阶段 3–5；成稿和每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）。建模阶段依次运行 `model_fingerprint.py`、`model_edit.py`、`model_consensus.py`，首查运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-fc --candidate <当前候选路径> --baseline <起点模型或默认模板> --fingerprint research/<D>-fc/model_dump/<TICKER>-fingerprint.json --coord-map research/<D>-fc/model_dump/coord_map.json --workflow full-coverage --mode <build|update> --fix-round 0` 落盘 `research/<D>-fc/model_dump/model-verification.json`；定点修复后用同一组完整参数执行复查（递增 `--fix-round`）：`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-fc --candidate <当前候选路径> --baseline <起点模型或默认模板> --fingerprint research/<D>-fc/model_dump/<TICKER>-fingerprint.json --coord-map research/<D>-fc/model_dump/coord_map.json --workflow full-coverage --mode <build|update> --fix-round <1|2>`；审稿修订联动改模后运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir research/<D>-fc --candidate <新候选路径> --baseline <上一版本路径> --fingerprint research/<D>-fc/model_dump/<TICKER>-rev-fingerprint.json --coord-map research/<D>-fc/model_dump/coord_map.json --workflow full-coverage --mode <build|update> --kind report_revision --append-revision`；若检查或复算异常，运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir research/<D>-fc --candidate <当前候选路径> --baseline <起点模型或默认模板> --kind <modeling|report_revision> --failed-stages <失败阶段列表，如 check,consensus> --workflow full-coverage --mode <build|update>` 补写降级账本（手动路径省略 `--run-id`）。派 `dalton-reviewer` 审稿（含修订后复审）时：（1）先算 `drafts/<D>-memo.md` 的 sha256；（2）把该哈希写入审稿提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存为 `research/<D>-fc/review.json`，并写入 `draft_sha256` 字段（复审时覆盖为最新一轮；改稿后必须重新计算哈希、重新审稿）。备忘录主稿语言审查两轮：成稿并跑 `validate_memo.py --mode full` 到 0 FAIL 后调用 `check_language(draft_path=<草稿>, round=1)` 按清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），复跑校验，再派 `dalton-reviewer` 首次审稿；一轮修订结束后对终稿调用 `check_language(round=2)` 完成终稿语言修改，草稿有改动就再跑一次 round=2 复核（记录追加在同一 json），然后做最后一次审稿（pass 的 JSON 存 review.json）。`research/<D>-fc/` 下给人读的底稿笔记（`facts.md`、`questions.md`、`ea.md`–`ed.md`）各做两轮 `check_language`（第 1 轮按清单改，第 2 轮复核，有改动则再跑一次 round=2 确认）；跳过 `model_dump/` 下的机器报告、json/xlsx 文件与 `.audit/.annotated/.language` 侧车。收尾按第三节第 5 步以 `manual: true` 调用 `dalton_check_done`。**在途的旧结构运行**（备忘录还是「零、12 问 + 一至十章」的旧版双轨稿）：按旧规则完成并收尾——`validate_memo.py` 会自动识别旧结构并按旧规则校验（`--part` 仍可用），不要把旧稿改写成新结构。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -14395,7 +14395,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
   - **`drivers`**：更新核心业务驱动树变量、模型敏感度与高频跟踪指标；
   - **`management`**：写入 C4 支线整理的 12 季指引兑现历史（`guidance_history`）与指引风格定性结论（`guidance_style`：保守/中性/激进、收入还是利润更保守、全年修正节奏）；
   - **`lessons`**：若完整覆盖推翻了初次覆盖中的某项早期判断，记录一条经验教训（错误类型、适用条件、反例与证据）；
-  - **`models`**：按 `.agents/skills/dalton-model/SKILL.md` 第 7 步先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记本次最终模型路径（如 `model/<TICKER>-model-v<NN>.xlsx`，取 workflow 返回的 `model` 字段或 `model/` 下最新版本）、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向最新版本号（`research/<D>-fc/model_lineage.json` 作为输入输出文件记录留存）；
+  - **`models`**：按 `.agents/skills/dalton-model/SKILL.md` 先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记本次最终模型路径（取 workflow 返回的 `model` 字段，与 `research/<D>-fc/model_dump/model-verification.json` 终态一致）、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向最新版本号；若模型终态为「带问题交付」，在向 PM 汇报的回复最顶部原样列出 `model_dump/remaining-issues.md` 内容；
   - **`company`**：将 `coverage_stage` 更新为 `"full"`。
 - 调用 **`knowledge_append_verdict`**：
   - 对照初次覆盖的 thesis 给出正式五词结论（通常为 `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `NEW_THESIS` / `THESIS_BROKEN` / `NO_CHANGE`）；
@@ -14426,7 +14426,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 ### 第 5 步：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="full-coverage", run_id=<`research/<D>-fc/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动 `RunWorkflow` 时的参数一致）。
-- 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-fc/review.json` 核对。
+- 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "mode": "<build|update>", "manual": true})`，审稿结论按 `research/<D>-fc/review.json` 核对。
 - `done=false` 时按 `missing` 逐条补齐（缺文件补文件、`facts.py check`/`validate_memo`/模型文件可读性核对未通过时修到通过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
 - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 
@@ -20292,89 +20292,120 @@ FUNDA AI 按主题并入同一套栏目，引用末尾标「（FUNDA AI）」。
 --- FILE: dalton-model/SKILL.md ---
 ---
 name: dalton-model
-description: "建立或维护公司财务模型（Excel）：在用户模型上滚动更新或按基金格式新建，并对照一致预期（consensus）。用户要求建模型、更新模型、加季度、改预测、核对模型、对比一致预期时使用。"
+description: "建立或维护公司财务模型（Excel）：在用户模型上滚动更新或按基金标准格式新建，并对照一致预期（consensus）。用户要求建模型、更新模型、加季度、改预测、核对模型、对比一致预期时使用。"
 ---
 
 # 公司财务建模（`dalton-model`）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 
-每家公司的指标、正负号习惯、财年和业务结构不同：下面给出默认做法和示例，遇到不适用时按公司实际调整，并在工作簿最前面的 `README & Changelog` 工作表（下称「变更记录」）写明原因。与基金通用标准 `.agents/skills/dalton-conventions/references/model-standards.md` 的关系：维护原模型时，期间跨度、表头和最右备注列写法沿用原模型；新建模型时，表头和最右备注列按 `.agents/skills/dalton-model/references/format-spec.md`，历史覆盖跨度、空值留空和一手披露取数按 `model-standards.md`。
+每家公司的指标、正负号习惯、财年和业务结构各有不同：下面给出标准做法和示例，遇到差异时按公司实际调整，并在工作簿最前面的 `README & Changelog` 工作表（下称「变更记录」）写明原因。与基金通用标准 `.agents/skills/dalton-conventions/references/model-standards.md` 的分工：维护原模型时，期间跨度、表头和最右备注列沿用原模型；新建模型时，基于内置默认模板 `.agents/skills/dalton-model/assets/default_model_template.xlsx` 与 `.agents/skills/dalton-model/references/format-spec.md` 搭建，历史覆盖跨度、空值留空和一手披露取数按 `model-standards.md` 执行。
 
-## 一、四条必须做到的要求
+## 一、必须做到的建模约定
 
-1. **预测期的金额由公式算出。** 收入、成本、费用、利润这些金额行，在预测期写公式，例如 `=GMV（商品交易总额）× take rate（货币化率，即平台收入占交易额比例）`、`=去年同期×(1+增速)`、`=收入×利润率`、`=各分部之和`。
-   - 调整**预测数值**：改驱动假设（增速、take rate、利润率、费用率、税率），让公式自己算出新结果。
-   - 调整**建模方法**（重新分部、补一条勾稽关系、换一个驱动）：可以改公式结构，在变更记录写明。
-   - 管理层直接给了金额指引（例如明年 CapEx〔资本开支〕指引 100 亿）：在对应区块或表下方单设输入格填入该金额（套驱动假设格式，在最右备注列写来源），预测行用公式引用该输入格。
-   - 原模型里是公式的预测行，更新后仍是公式。
-2. **由季度汇总的年度列全部用公式算出，驱动假设只放在预测季度列和无季度拆分的远期年度列。** 该类年度列按指标性质计算：
-   - 流量（收入、成本、利润、现金流）：四个季度相加；
-   - 时点余额（现金、债务、期末股本）：取财年最后一个季度；
-   - 比率（增速、利润率、take rate、占比）：用本年度列的分子和分母重新计算；
-   - 年度 EPS（每股收益）：年度利润 ÷ 年度加权平均稀释股数（与公司披露口径一致）；
-   - 用户数、活跃商家等 KPI（关键经营指标）：按公司披露口径计算（取第四季度期末数、四季度均值或披露的年度去重数）。
-3. **与一致预期或卖方预测的重大差异要查明原因。** 我们的预测与一致预期（consensus）或主要卖方预测差距较大时，拆到分部、驱动假设、费用、利息、股本找出差异来源：有可核实的新信息支撑就保留判断并写明理由；发现自身驱动假设有遗漏或口径错误就修正假设。是否调整仅取决于是否有可核实的新信息或具体的假设问题。
-4. **用户提供了原模型，就在原模型基础上维护。** 沿用原模型的结构、预测方法和格式；原模型文件保持只读，修改版另存为 `model/` 下的新版本文件。
+1. **预测期金额全部由公式算出。** 收入、成本、费用、利润等金额行在预测期使用公式，例如 `=GMV（商品交易总额）× take rate（货币化率）`、`=去年同期×(1+增速)`、`=收入×利润率`、`=各分部之和`。
+   - 调整**预测数值**：修改驱动假设格（增速、take rate、利润率、费用率、税率），由公式重新算出结果。
+   - 调整**建模方法**（重新分部、补一条勾稽关系、换一个驱动）：修改公式结构并在变更记录写明原因。
+   - 管理层直接给出金额指引（例如明年 CapEx〔资本开支〕指引 100 亿）：在对应区块或表下方单设输入格填入该金额（套驱动假设格式，在最右备注列写明来源），预测行用公式引用该输入格。
+   - 原模型中原先为公式的预测行，更新后保持为公式。
+2. **预测期间跨度与季度汇总年度列规则。**
+   - 预测跨度：季度预测逐季覆盖本财年剩余季度及下一完整财年全部四个季度（如当前 `FY26` 覆盖至 `4Q27E`）；年度预测在下一财年之后再覆盖至少两个完整财年（如 `2026E–2028E`），单向向后扩展并完整保留原模型历史列。
+   - 同表已有对应四财季列的年度列全部由公式算出，驱动假设放在预测季度列和无季度拆分的远期年度列：
+     - 流量（收入、成本、利润、现金流）：四个季度相加；
+     - 时点余额（现金、债务、期末股本）：取财年最后一个季度；
+     - 比率（增速、利润率、take rate、占比）：用本年度列的分子和分母重新计算；
+     - 年度 EPS（每股收益）：年度利润 ÷ 年度加权平均稀释股数（与公司披露口径一致）；
+     - 用户数、活跃商家等 KPI（关键经营指标）：按公司披露口径计算（第四季度期末数、四季度均值或披露的年度去重数）。
+3. **先独立建模，再对照一致预期。**
+   - 先依据一手财报、管理层指引与研究判断独立设定分部和费用驱动假设，由公式算出本方预测。
+   - 外部一致预期与卖方预测可以写入工作簿单独标注的参考快照区（如 `vs Consensus` 市场快照列），本方预测公式保持独立，与外部快照区隔离。
+   - 本方预测与一致预期差距较大（默认总收入 `±5%`、利润与稀释 EPS `±10%`，近盈亏平衡改按利润率 `±150bp`）时，拆到分部、驱动假设、费用、利息和股本查明原因：发现自身假设遗漏或口径有误时，返回调整驱动假设并重算；有可核实研究依据支撑时，保留判断并在对照表与变更记录写明一句具体理由。
+4. **原模型保持只读，按版本链递增保存。**
+   - 用户提供了原模型或工作区已有模型时，在原模型基础上原地维护，原件保持只读，修改版另存至 `model/`：
+     - 单公司模型命名为 `model/<TICKER>-model-v<NN>.xlsx`（首次为 `v01`，后续取最大版本号加一）；
+     - 多公司行业整本模型保留整本结构，沿用原文件名格式递增版本号或日期（如 `model/China_Ecommerce_v03.xlsx` → `model/China_Ecommerce_v04.xlsx`），一轮只更新目标公司所属工作表与变更记录，保持其他公司工作表原样。
 
-## 二、操作步骤
+## 二、标准执行流程（`company-model` 工作流）
 
-**第 1 步　确定原模型和任务范围**
-- 看用户这次给了什么文件、要求做什么（补实际值？加预测期？改驱动假设？从头建？）。
-- 已有模型：优先用用户本次指定的文件；其次取 `data/models.json` 中 `current` 对应 `versions[]` 同 `id` 条目的 `path`，并结合工作区此前交付版本核对内容。多份文件无法判断哪份是最新原模型且影响交付时，询问用户。随后读取 `.agents/skills/dalton-model/references/rollforward.md`。
-- 没有模型：读取 `.agents/skills/dalton-model/references/forecast-rules.md` 的「版面样板」，按基金默认格式新建。
-- 单公司和行业工作区的模型均放在工作区 `model/` 目录：单公司命名为 `model/<TICKER>-model-v<NN>.xlsx`；行业整本模型保留多公司整本结构，沿用原文件名格式递增版本号或日期。
-- `model/` 和 `models/` 各有一份时：SHA-256 哈希相同视为同一副本（以 `model/` 为准）；哈希不同时按文件内容和交付记录判断最新原模型，无法判断时询问用户。
+单次建模或滚动更新默认通过 `company-model` 工作流执行，串联「准备与基线指纹 → 受控原地编辑与一致预期对照 → 本轮范围检查与最多两轮修改 → 终态账本与交付」。
 
-**第 2 步　读材料**
-- 公司最近的年报和季报（美股年报 10-K、季报 10-Q、外国发行人年报 20-F，或港股、A 股定期报告）：分部披露、KPI、管理层指引、股东回报计划。
-- 公司历次业绩新闻稿和业绩会给出的季度 / 全年指引，以及之后的实际值：记进模型的指引记录（做法见 `forecast-rules.md`「管理层指引」），用来判断公司给指引偏保守还是偏乐观。
-- 主要卖方报告或模型：他们拆哪些驱动、市场在争论什么、一致预期大概在哪里。
-- 维护原模型时：读懂原模型的工作表结构、哪些行是公式、用什么驱动预测、哪些地方相互勾稽、格式习惯。
+### 启动前准备
 
-**第 3 步　搭建或更新预测**（读取 `.agents/skills/dalton-model/references/forecast-rules.md`）
-- 顺序：收入（重点）→ 成本和费用 → 营业利润 → 利息、税、少数股东至归母净利润 → 股本与 EPS → 现金流 → 资产负债表（现金、债务）→ 汇总表。
-- 每新增一行先确定单元格类型（历史实际值、历史估算、驱动假设、直接输入的金额、同表公式、跨表引用公式、衍生比率）。
+1. **解锁 `RunWorkflow`**：先用 Read 工具读取 `.agents/skills/run-workflow/SKILL.md`。
+2. **确认参数与断点续跑**：
+   - 检查 `research/<as_of>-model-<TICKER>/.progress.json`，若存在未结束的运行记录，用原参数加 `resume="<.progress.json 里的 run_id>"` 续跑。
+   - 全新启动时调用 `RunWorkflow(workflow="company-model", params={...})`，参数如下：
 
-**第 4 步　写格式**（读取 `.agents/skills/dalton-model/references/format-spec.md`）
-- 有原模型：运行 `python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型路径>` 提取格式画像，照原模型同一区块、同一用途单元格写格式。
-- 新建模型：使用基金默认格式（可调用 `.agents/skills/dalton-model/scripts/model_style.py` 的 `apply_cell_style`）。
+| 参数名 | 说明 |
+|---|---|
+| `ticker` | 本轮唯一目标公司股票代码（如 `"PDD"`、`"JD"`、`"META"`），必填 |
+| `company` | 公司名称（可选） |
+| `workspace_dir` | 当前工作区路径（一般传 `"."`），必填 |
+| `as_of` | 基准日期 `YYYY-MM-DD`（如 `"2026-11-27"`），必填 |
+| `progress_path` | 固定传 `"research/{as_of}-model-{ticker}/.progress.json"`，启动必填，供账本写入 `run_id` 与断点续跑 |
+| `mode` | 可选：`"auto"`（默认，有起点模型则更新，无则新建）、`"build"` 或 `"update"` |
+| `model_path` | 可选：起点模型路径；行业工作区维护多公司整本时必传本工作区整本路径，单公司也可指定上传或已登记文件 |
+| `expected_baseline_sha256` | 可选：多公司整本按家串行更新时，传入上一家完成后的 64 位 `SHA-256` |
+| `consensus_thresholds` | 可选：按公司特征调整的一致预期差异阈值 |
 
-**第 5 步　重算并自查**
-- 重算公式：运行 `python3 .agents/skills/xlsx/scripts/recalc.py <新版本模型路径>` 重算并回写缓存值（只读核查原模型时复制到临时文件重算）。
-- 扫描核对：运行 `python3 .agents/skills/dalton-model/scripts/model_scan.py <新版本模型路径>`，逐条检查输出的预测期数字常数、可能的期间错配、外部链接与插件函数、`#REF!`（断裂引用错误）、循环引用及重算错误。属问题的修改模型并重新重算；属合理建模处理的在变更记录写明原因。
-- 自己再核对几件事：年度 = 季度汇总是否成立；集团利润与分部之和能否对上（对不上的差额是什么）；现金和股本的滚存是否连贯；EPS 与净利润、股数是否一致。
-- 基础检查：金额单位一致（千还是百万）、币种一致（人民币报表与美元 ADS〔美国存托股〕EPS 的换算）、每股普通股还是每份 ADS；估值页（如有）的目标年份、倍数对应的 EPS、净现金已指向更新后的预测。
+3. **多公司行业整本串行更新**：在行业工作区需要更新多家公司时，按一家公司一轮串行调用 `company-model`；前一家完成后，将返回的 `candidate_path` 与 `model_sha256` 传给下一轮的 `model_path` 与 `expected_baseline_sha256`，逐家累进整本版本号。
 
-**第 6 步　对照一致预期与卖方预测**（读取 `.agents/skills/dalton-model/references/sanity-check.md`）
+### 阶段说明与脚本工具（工作流内部与手动降级共用）
 
-**第 7 步　交付**
-- 保存新版本至 `model/`（如 `model/PDD-model-v03.xlsx`；行业整本按原文件名递增版本或日期）。
-- 登记新版本：先调用 `knowledge_read(doc="models")` 取 `latest_version_no` 作为 `base_version`（无记录时传 `null`），再调用 `knowledge_update(doc="models", ...)` 登记新版本（字段遵循 `dalton-knowledge` 的模型登记数据结构（schema）：`versions[]` 追加条目，必填 `id`〔形如 `v03`〕、`path`〔形如 `model/PDD-model-v03.xlsx`〕、`created_at`、`reason`，可附 `recalculated` 与 `key_outputs`，并将 `current` 指向新版本 `id`）。`python3 .agents/skills/dalton-model/scripts/model_style.py lineage ...` 写出的 `model_lineage.json` 只是附加的普通记录（记录输入输出路径与哈希），不代替知识层登记。
-  - `knowledge_update(doc="models", base_version=..., ops=[...])` 的 `ops` 形状：`[{"op": "append", "path": "/versions", "value": {"id": "v03", "path": "model/PDD-model-v03.xlsx", "created_at": "...", "reason": "...", "recalculated": true}}, {"op": "set", "path": "/current", "value": "v03"}]`；工作区第一次登记模型（`knowledge_read` 显示还没有 `models` 文档）时，改用一条 `create`：`base_version=null`，`ops=[{"op": "create", "path": "/", "value": {"schema_version": 1, "versions": [{...第一版条目...}], "current": "v01"}}]`（完整操作语法与写入样例见 `.agents/skills/dalton-knowledge/SKILL.md` 与 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
-- 更新变更记录（无 `README & Changelog` 工作表时新建并放在最前面）：写明版本号、日期、所基于的原模型文件、补充的实际值、新增期间、修改的关键驱动假设及理由、结构调整、与一致预期的主要差异及理由、扫描提示中保留不改的重要条目及原因。
-- 回复用户时用几句话说清：关键预测（收入、利润、EPS）、和上一版相比变了什么、和一致预期差在哪里。
+1. **确定起点与提取指纹**：
+   - 优先采用用户本次指定或上传的文件，其次取 `data/models.json` 中 `current` 对应的已登记路径；`model/` 与 `models/` 并存时先比对 `SHA-256`，一致则以 `model/` 为准，不同时按内容与交付记录确认。
+   - 运行 `python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <起点模型或默认模板> --ticker <TICKER> --out research/<as_of>-model-<TICKER>/model_dump/<TICKER>-fingerprint.json` 提取基线指纹、行项类型映射与样式画像。
+   - 收集一手财报、历次指引与市场一致预期原始数据（落盘 `data/consensus/<YYYY-MM-DD_HHMM>.json`）。
+2. **受控原地编辑与母本缓存保护**：
+   - 读取 `.agents/skills/dalton-model/references/forecast-rules.md`、`rollforward.md` 与 `format-spec.md`。
+   - 首次落盘前先运行 `python3 .agents/skills/dalton-model/scripts/model_edit.py next-path --workspace-dir . --ticker <TICKER>`（有起点模型时补 `--baseline <起点模型>`）绑定本轮输出路径 `<新候选路径>`，再统一通过 `python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <起点模型> --ticker <TICKER> --plan <edit_plan.json> --out <新候选路径> --workspace-dir . --fingerprint <fingerprint.json> --coord-map-out <R>/model_dump/coord_map.json --mode <build|update>`（有基线哈希约束时补 `--expected-baseline-sha256 <起点64位SHA-256>`）执行扩列（保持原 `<calcPr>`）、只改目标单元格、在候选落盘前先从母本恢复非目标公司表与外链/插件/未改公式缓存，再在临时副本用 LibreOffice 复算并仅合并非错误计算值。
+3. **一致预期快照与差异对照**（详见 `.agents/skills/dalton-model/references/sanity-check.md`）：
+   - 运行 `python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model <当前候选路径> --consensus <consensus.json> --coord-map <R>/model_dump/coord_map.json` 将外部参考值写入独立快照区，运行 `python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model <当前候选路径> --ticker <TICKER> --research-dir <R> --consensus <consensus.json>` 在 `<R>/model_dump/` 生成 `consensus-diff.md` 与 `consensus-diff.json`。
+   - 超阈值项拆源复核一次：若需调整自身驱动假设，先对 `<当前候选路径>` 重提指纹并取其当前 64 位 SHA-256，再用下述第 4 步相同的增量 `model_edit.py apply` 命令（`--baseline <当前候选路径> --out <当前候选路径> --in-place --prior-coord-map <R>/model_dump/coord_map.json --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <当前候选64位SHA-256>`）只改驱动假设并合并坐标映射，随后按最新模型哈希重跑 `model_consensus.py diff` 刷新差异表；有可核实独立依据则保留并在对照表与变更记录写明一句具体理由。
+4. **本轮范围检查与最多两轮修改回路**：
+   - 运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <当前候选路径> --baseline <起点模型> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --mode <build|update> --fix-round <0|1|2>`，在免语言审查目录 `<R>/model_dump/` 输出 `model-check.md`、`model-review-pack.md`、`model-verification.json` 与（存在未决项时）`remaining-issues.md`。
+   - 检查只对本轮改动单元格、转实际值列、新增期间列与预测区做判定，结果分为「本轮可修 / 基线遗留 / 缺证据 / 不适用」四类，仅「本轮可修」交回建模方定点修改，最多两轮。定点修改必须以当前候选为基础应用增量（切勿把增量计划重新应用到起点原模型）：
+     1) 对当前候选重提指纹：`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <当前候选路径> --ticker <TICKER> --out <R>/model_dump/<TICKER>-fix<N>-fingerprint.json`；
+     2) 以当前候选同时作为 `--baseline` 与 `--out` 执行增量修改：`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <当前候选路径> --ticker <TICKER> --plan <fix_plan.json> --out <当前候选路径> --in-place --workspace-dir . --fingerprint <R>/model_dump/<TICKER>-fix<N>-fingerprint.json --prior-coord-map <R>/model_dump/coord_map.json --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <当前候选64位SHA-256> --mode <build|update>`；
+     3) 按最新模型哈希重跑 `python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model <当前候选路径> --ticker <TICKER> --research-dir <R> --consensus <consensus.json>` 刷新 `consensus-diff.md/.json`，再用与本步首查同一组完整参数执行复查（仅递增 `--fix-round`）：`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <当前候选路径> --baseline <起点模型> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --mode <build|update> --fix-round <1|2>`。
+   - 凡盘上存在可读候选模型，无论零问题通过（`pass`）还是两轮后留有未决项或检查/复算超时降级（`delivered_with_open_issues`），均生成终态账本并顺畅交付。
 
-## 三、常见错误与正确做法
+### 工作流关闭时的手动降级路径
+
+若当前环境关闭了 `workflow.enabled`（工具列表原本无 `RunWorkflow`），主智能体按上述 1–4 步顺序手动执行各脚本（第 2 步首次落盘用起点模型生成 `<当前候选路径>`；第 3 步一致预期返工与第 4 步最多两轮定点修改均使用第 4 步的增量 `model_edit.py apply` 命令对 `<当前候选路径>` 重提指纹、`--in-place`、`--prior-coord-map` 与 `--expected-baseline-sha256` 原地叠加并刷新差异表；若检查或复算异常，运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir <R> --candidate <候选路径> --kind modeling --failed-stages <失败阶段列表，如 check,consensus> --workflow company-model --mode <build|update>`〔可按需补充 `--baseline <起点模型>`、`--reason "<原因>"`；手动路径省略 `--run-id` 使账本 `run_id` 保持 `null`〕落盘降级账本与未决清单），并在收尾调用 `dalton_check_done` 时传 `"manual": true`。若 `workflow.enabled` 开启但工具列表暂未出现 `RunWorkflow`，先用 Read 工具读取 `.agents/skills/run-workflow/SKILL.md` 后重试。
+
+## 三、收尾登记、完成核对与回复格式
+
+1. **知识层模型登记**：
+   - 先调用 `knowledge_read(doc="models")` 取 `latest_version_no` 作为 `base_version`（尚无记录时传 `null`），再调用 `knowledge_update(doc="models", ...)` 登记本次最终模型路径、`id`（如 `v03`）、`created_at`、`reason`、`recalculated` 与关键输出单元格 `key_outputs`，并将 `current` 指向新版本。
+   - `knowledge_update(doc="models", base_version=..., ops=[...])` 的常规追加形状：`[{"op": "append", "path": "/versions", "value": {"id": "v03", "path": "model/PDD-model-v03.xlsx", "created_at": "...", "reason": "...", "recalculated": true}}, {"op": "set", "path": "/current", "value": "v03"}]`；首次建档时用 `base_version=null` 与 `op="create"` 写入 `{"schema_version": 1, "versions": [...], "current": "v01"}`（完整语法见 `.agents/skills/dalton-knowledge/SKILL.md`）。
+2. **完成契约核对（汇报完成前必做）**：
+   - 工作流路径：调用 `dalton_check_done(workflow="company-model", run_id=<.progress.json 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": ".", "as_of": "<YYYY-MM-DD>", "model_path": "<如有起点模型则传入>"})`。
+   - 手动降级路径：不传 `run_id`，在 `params` 中加 `"manual": true`。
+   - `<R>/model_dump/` 下的机器报告免语言审查，核对器直接按终态账本核验模型可读性、哈希与阶段证据。
+3. **回复用户的固定顺序**：
+   - **当终态为「带问题交付」（`delivered_with_open_issues`）时，在回复最顶部原样列出 `<R>/model_dump/remaining-issues.md` 的全部条目**（未消的本轮可修项，或降级阶段名称与候选模型哈希前 12 位）。
+   - **模型文件链接 + 约 10 行关键数字变更摘要**（基于最新模型与 `consensus-diff.json`）：新版本路径与基线哈希前 8 位、核心指标新旧版本与一致预期对比简表、本轮调整的关键驱动假设及每项明显差异的一句理由。
+   - **折叠附于回复末尾的检查报告摘要**：四类问题统计表、复算引擎说明（注明单引擎复算）与扩展条件格式变动提示（如有）。
+
+## 四、常见错误与正确做法
 
 | 错误 | 看起来是什么样 | 正确做法 |
 |---|---|---|
-| 把公式改成了数字 | 原来 `=GMV×take rate` 的收入行，更新后变成一串固定数字 | 保留公式，只改 GMV 增速和 take rate 假设 |
-| 由季度汇总的年度列留着假设 | 2027E 年度收入是四季之和，下面的 2027E 增速却是一个手填的 15% | 年度增速写成 `=2027E收入/2026E收入-1`，用衍生比率格式 |
-| 套用了别的格式 | 表头深蓝 `1F4E79`、字号 10、浅灰底，和原模型不一样 | 照原模型或基金默认格式（Arial 8、亮蓝表头 `3366FF`、驱动假设格浅米黄 `FFFFC8`） |
-| 偏离一致预期没检查 | 2028E 净利润明显高于一致预期，没有说明来源 | 拆差异来源，确认有依据再保留，并写理由 |
-| 集团和分部脱节 | 集团营业利润单独预测，与分部营业利润之和对不上 | 集团营业利润 = 分部之和 + 总部及抵销（单列），或在对不上时写明差额 |
-| 现金和股本不联动 | 净现金很多却没有利息收入增长；回购了但股数不变 | 利息随现金滚存；回购和股权激励改变股数（见 `.agents/skills/dalton-model/references/forecast-rules.md` 净现金公司示例） |
-| 一次性项目混进了基数 | 某年有大额裁员费用或税务补提，下一年直接按那年的利润率或税率外推 | 历史期把一次性项目单列，用扣除后的正常化水平作驱动参照；已知的未来一次性项目单独一行（见 `forecast-rules.md` 一次性项目一节） |
-| 收购贡献混进内生增长 | 去年完成收购，今年收入增速 40%，直接按 40% 外推 | 拆出内生增长和收购贡献分别预测；协同效应按公司披露单列；待交割的交易按预计交割时间和支付方式处理现金、债务、股数（见 `forecast-rules.md` 收购与出售一节） |
-| 外部插件公式留在模型里 | Capital IQ、Bloomberg（第三方金融终端插件）公式在无插件环境下显示 `#NAME?`（函数名无法识别错误） | 在单独输入格填入带来源和日期的数值，原单元格用公式引用该输入格 |
+| 把公式改成了数字 | 原来 `=GMV×take rate` 的收入行变成固定数字 | 保留公式，只改 GMV 增速和 take rate 假设 |
+| 由季度汇总的年度列留着假设 | 2027E 收入是四季之和，增速却手填 15% | 年度增速写成 `=2027E收入/2026E收入-1`，套衍生比率格式 |
+| 把一致预期直接写进结果格 | 预测利润行直接填入市场均值或引用外部快照格 | 独立驱动算出本方预测，外部快照放独立对照区并保持公式隔离 |
+| 套用了别的格式 | 表头深蓝、字号 10，与原模型不一致 | 照原模型或内置默认模板（Arial 8、亮蓝表头 `3366FF`、假设格浅米黄 `FFFFC8`） |
+| 整本重写破坏缓存与窗格 | 用脚本从头写出整本 `.xlsx`，冻结窗格错位、非目标公司缓存清空 | 经 `model_edit.py` 原地只改目标格，落盘前恢复母本缓存 |
+| 集团和分部脱节 | 集团营业利润与分部之和差额巨大且无调节项 | 集团营业利润 = 分部之和 + 总部及抵销（单列），差额有据可查 |
+| 现金和股本不联动 | 净现金很多却无利息增长，回购后股数保持原值 | 利息随现金滚存，回购与股权激励同步反映在股数滚存中 |
 
 ## 参考文件
 
-- `.agents/skills/dalton-model/references/forecast-rules.md`：版面样板、公式写法、各部分怎么预测、净现金公司示例、判断依据。
-- `.agents/skills/dalton-model/references/format-spec.md`：基金格式手册（每类单元格怎么写，附样例与 `apply_cell_style` 角色说明）。
-- `.agents/skills/dalton-model/references/rollforward.md`：在原模型上滚动维护的详细步骤。
-- `.agents/skills/dalton-model/references/sanity-check.md`：一致预期和卖方预测的取数、对照和差异分析。
+- `.agents/skills/dalton-model/references/forecast-rules.md`：版面样板、公式写法、各部分预测方法与净现金公司示例。
+- `.agents/skills/dalton-model/references/format-spec.md`：基金格式手册、内置默认模板与 `apply_cell_style` 角色说明。
+- `.agents/skills/dalton-model/references/rollforward.md`：在原模型上滚动维护与受控原地编辑的详细步骤。
+- `.agents/skills/dalton-model/references/sanity-check.md`：一致预期取数、独立快照区、差异表与返工复核说明。
 
 --- FILE: dalton-model/references/forecast-rules.md ---
 # 建模指引：版面、公式与各部分怎么预测
@@ -20608,8 +20639,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 每写一个单元格，先确定它属于哪一类（下表第一列），再套用对应的格式：
 
-1. **用户提供了原模型**：在原模型**同一区块里找用途相同的单元格**，复制它的完整样式（新增预测季度列参照已有预测季度列，新增年度汇总列参照已有年度汇总列）。原模型的习惯和下表不同时，以原模型为准（例如原模型历史年度的汇总公式用蓝字，就沿用）。
-2. **新建模型或找不到参照**：用下表的默认格式。
+1. **用户提供了原模型**：先运行 `model_fingerprint.py` 提取基线指纹与样式画像，在原模型**同一区块里找用途相同的单元格**，复制它的完整样式（新增预测季度列参照已有预测季度列，新增年度汇总列参照已有年度汇总列）。原模型的习惯和下表不同时，以原模型为准（例如原模型历史年度的汇总公式用蓝字，就沿用）。
+2. **新建模型或找不到参照**：以内置标准格式模板 `.agents/skills/dalton-model/assets/default_model_template.xlsx` 为起点（含标准页签骨架与独立 `vs Consensus` 快照区），配合下表默认格式经 `model_edit.py` 填入内容。
 
 `.agents/skills/dalton-model/scripts/model_style.py` 提供两类工具：
 - 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill`、`blocks`（各分节标题行号与底色）等。维护原模型时，先用 `profile` 输出的 `blocks` 找到当前工作表同类分节标题行，再用 `clone_period_column_style` 或直接复制参照单元格的完整样式；画像中的 `section_styles` 只识别基金默认的三种分节底色，原工作表使用了其他自定义分节颜色时，直接复制 `blocks` 中同类标题格的样式。
@@ -20692,87 +20723,86 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 --- FILE: dalton-model/references/rollforward.md ---
 # 在原模型上滚动维护
 
-起点原模型按 `.agents/skills/dalton-model/SKILL.md` 第 1 步确定；原模型文件保持只读，先将原模型复制到 `model/` 下的新版本路径（例如 `model/PDD-model-v03.xlsx`），后续所有修改均在新版本文件上完成。
+起点原模型按 `.agents/skills/dalton-model/SKILL.md` 确定；原模型文件保持只读，所有修改统一经由 `model_edit.py` 在 `model/` 下的新版本路径完成（单公司如 `model/PDD-model-v03.xlsx`，多公司行业整本沿用原文件名递增版本或日期）。
 
 ## 步骤
 
-**1. 读懂原模型**
-- 运行 `python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型路径>` 提取格式画像，梳理各工作表用途、预测驱动公式、跨表引用与三表勾稽关系，沿用原模型原有规律。
-- 同时检查原模型是否含 `openpyxl`（Python 表格读写库）保存时会丢弃的部件——嵌入矢量图（EMF/WMF）、绘图与部分图表、扩展条件格式与迷你图（`<extLst>` / `x14`）及数据验证；若有，插列扩列优先用 `.agents/skills/xlsx/scripts/insert.py`，局部改值可按 `.agents/skills/xlsx/SKILL.md` 用 `lxml`（XML 解析库）定点修改工作表 XML，减少 `openpyxl` 整本保存带来的部件丢失。
+**1. 提取基线指纹并读懂原模型**
+- 运行 `python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <原模型路径> --ticker <TICKER> --out <R>/model_dump/<TICKER>-fingerprint.json`，提取工作表顺序、期间轴、财年截止月、语义优先的行项类型映射、冻结窗格、样式画像、既有外链与插件格。
+- 检查起点健康度：确认原模型预测期保持公式链、冻结窗格正常；遇到原模型本身已被整本重写损坏的情况时，及时告警并回退至上一未损坏版本。
+- 梳理目标公司工作表的驱动公式、跨表引用与三表勾稽关系；多公司行业整本中只改目标公司所属工作表与变更记录，其余公司工作表保持原状。
 
-**2. 补实际值**（新披露的季度）
-- 将新披露季度的列头去掉预测后缀（例如 `3Q26E` 改为 `3Q26`）；参照前几个历史季度直接填数的行（各收入分项、成本、费用、KPI〔关键经营指标〕），把该季原预测公式替换为公司披露的实际值（套历史实际值格式）。
-- 该季原有的驱动假设行（浅米黄底的增速、take rate〔货币化率〕等）：改为由当季实际金额反算的衍生比率公式（斜体、无底色、无边框）；需留存对比时，把原假设值记入最右备注列。
-- **保留**合计、比率、引用和勾稽公式：收入合计仍是 `=SUM(...)`，毛利率仍是公式，跨表引用仍是引用。只有原来放驱动假设或直接录入实际值的位置才换成实际数字。
-- 公司只披露累计数（半年、前三季、全年）时，单季按累计数之差计算（例如 `Q4 = 全年 − 前三季`），在最右备注列注明「披露衍生值（如 `FY − 9M`）」及两期财报出处（见 `.agents/skills/dalton-conventions/references/model-standards.md`）。累计数相减只适用于可加总的流量（收入、成本、利润、现金流）；单季 EPS（每股收益）、加权平均稀释股数、去重用户数等按各自定义取得或重新计算。
-- 未披露的细分项：填入估算值（套历史估算格式，最右备注列写来源），或留空并在最右备注列写原因。
-- 实际值与上一版预测差距大的重要项目，在变更记录（`README & Changelog` 工作表）写一句原因。
-- 指引记录：补上本次新披露的实际值和兑现情况（年报或第四季度业绩时，季度和全年的都补），再把这次业绩新闻稿或业绩会给出的新指引各记一行（没有指引记录的，按 `forecast-rules.md`「管理层指引」补建）。
+**2. 补实际值（新披露的季度）**
+- 将新披露季度的列头去掉预测后缀（例如 `3Q26E` 改为 `3Q26`）；参照前几个历史季度直接填数的明细行（各收入分项、成本、费用、KPI〔关键经营指标〕），通过 `model_edit.py` 将该季原预测公式替换为公司披露的实际值（套历史实际值格式），编辑器自动登记至 `coord_map.json` 的 `rollover_actual_cells` 以在检查时自动放行。
+- 该季原有的驱动假设行（浅米黄底的增速、take rate〔货币化率〕等）改为由当季实际金额反算的衍生比率公式（斜体、无底色、无边框）；需留存对比时，把原假设值记入最右备注列。
+- **保留全部小计、合计、比率、跨表引用与勾稽公式**：收入合计保持 `=SUM(...)`，毛利率保持公式，跨表引用保持引用。
+- 公司只披露累计数（半年、前三季、全年）时，单季流量按累计数差分计算（如 `Q4 = 全年 − 前三季`），在最右备注列注明「披露衍生值（如 `FY − 9M`）」及两期财报出处；单季 EPS（每股收益）、加权平均稀释股数、去重用户数按各自定义取得或重新计算。
+- 未披露的细分项填入估算值（套历史估算格式，最右备注列写明来源），或留空并在最右备注列写明原因。
+- 实际值与上一版预测差距大的重要项目，在变更记录（`README & Changelog` 或原表既有 `Change Log` 工作表）写一句原因。
+- 指引记录：补上本次新披露的实际值与兑现情况，并把本季业绩新闻稿或业绩会给出的新指引各记一行。
 
-**3. 加预测期**
-- 新增季度列时，按公式用途选参照列：同比驱动的行参照去年同季列，环比驱动的行参照上一季列。
-- 新增季度让某一年变成「由季度汇总的年度列」（例如加了 `1Q27E–4Q27E` 之后的 `2027E`）：把这一年的金额改成季度汇总公式，比率改成用本年度金额重算，将原来该年度的驱动假设移到对应季度列上。
-- 无季度拆分的远期年度列（例如原模型的 `2028E` 仅在年度区）：除本次任务明确要求为该年拆分季度外，继续在该年度列直接放驱动假设。
-- 新增远期年度列（例如 `2029E`）：同样直接在年度列放驱动假设（套驱动假设格式）。
-- 新增季度和已有季度之间隔着一个只有年度的年份时（例如原模型 2026 有季度、2027 只有年度，用户要求加 2028 的季度）：先把中间那一年拆成季度，再往后加，同比和环比公式才能接到正确的期间。拆分时按指标性质重现原年度预测：流量（收入、成本、订单量、现金流）四季之和等于原年度数；现金、债务、股数等余额按季度滚存，第四季对齐原年末数；日均量按天数加权；利润率、take rate 不拆，由各季金额算出（各季用参照年各自的季节性，不共用一个年度利润率）；业务仍在快速增长时，季度分布保留增长趋势。在回复里说明补了这一年的季度。用户明确只扩展指定季度时，可以在辅助计算区补出比较期间。
-- 原表已有 CAGR（复合年增长率）列时，将公式起止年份和幂指数年数顺延至新预测窗口。
-- 原表已有估值页（Valuation、SOTP〔分部加总估值〕）时，核对目标年份、估值倍数对应的 EPS 及净现金引用已指向更新后的预测列；估值倍数套驱动假设格式，目标价写公式。
-- 插入行列可运行 `python3 .agents/skills/xlsx/scripts/insert.py columns ... --out <新版本路径>`（先用 `--dry-run` 看影响范围）：逐条核查输出的 `warnings`，并在末尾列右侧扩列后显式更新横向 `SUM` 等汇总区间、图表及条件格式范围使其覆盖新列。
+**3. 扩展预测期与受控原地编辑**
+- 期间跨度：季度预测逐季覆盖至下一完整财年 `Q4`（如当前 `FY26` 覆盖至 `4Q27E`），年度预测覆盖至下下财年（至少 3 个完整财年，如 `2026E–2028E`），单向向后扩展并完整保留存量历史列。
+- 新增季度列按公式用途选参照列：同比驱动参照去年同季列，环比驱动参照上一季列；新增季度使某年成为季度汇总年度列时，该年金额改写为季度汇总公式、比率用本年度分子分母重算，驱动假设移到对应季度列。
+- 无季度拆分的远期年度列及新增远期年度列，直接在年度列放驱动假设（套驱动假设格式）。
+- 新增季度和已有季度之间隔着只有年度的年份时，先把中间年份按指标性质拆成季度（流量四季之和等于原年度、余额按季滚存对齐年末、日均量按天数加权、利润率与 take rate 由各季金额算出并保留季节性），再向后扩展，并在回复中说明。
+- 顺延已有 CAGR（复合年增长率）列、估值页（Valuation、SOTP〔分部加总估值〕）的目标年份与预测列引用，以及末尾扩列后的横向 `SUM` 与条件格式区间。
+- 全部扩列与改格操作写入编辑计划 JSON，先运行 `python3 .agents/skills/dalton-model/scripts/model_edit.py next-path --workspace-dir . --ticker <TICKER> --baseline <原模型路径>` 确定 `<新版本路径>`，再执行首次滚动落盘：`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <原模型路径> --ticker <TICKER> --plan <edit_plan.json> --out <新版本路径> --workspace-dir . --fingerprint <fingerprint.json> --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <原模型64位SHA-256> --mode update`：脚本先以保持 `<calcPr>` 模式调用 `insert.py` 扩行列并留存缓存母本，再由受控 `openpyxl` 只改目标格，候选落盘前先调用 `restore_donor_cache` 原子恢复非目标公司表、外链、插件、既有循环格与未改公式格的原始缓存，随后确认可读并写入坐标图，再在临时副本用 LibreOffice 复算并仅合并非错误计算值。
 
-**4. 调整预测**
-- 发现原模型的预测期金额格填了固定数字：能按原拆解区恢复计算关系的改写为公式；属于管理层指引等有依据直接输入的，在对应区块或表下方单设输入格（套驱动假设格式，最右备注列写来源），原预测行改为引用该输入格，并在变更记录写明。
+**4. 调整预测与外部依赖处理**
+- 发现原模型预测期金额格为常数时：能按拆解区恢复计算关系的改写为公式；属管理层直接金额指引的，单设输入格（套驱动假设格式、最右备注列写来源）并由预测行公式引用，在变更记录写明。
+- 外部终端插件（Capital IQ `_xll.ciqfunctions...`、Bloomberg `BQL`/`BDH`）与既有外部工作簿链接：
+  - 影响本轮核心预测结果的，在独立输入格填入带来源和日期的数值，原格用公式引用该输入格；
+  - 其余不涉及本轮目标预测的外链与插件格，由 `model_edit.py` 与 `recalc.py` 的母本缓存保护机制原样保留原始缓存值，避免错误值覆盖。
+- 同一工作簿内的跨表引用和命名区域照常保留。
 
-**5. 外部依赖**（Capital IQ〔标普金融终端〕插件 `_xll.ciqfunctions...`、Bloomberg〔彭博终端〕函数 `BQL`〔查询函数〕与 `BDH`〔历史数据函数〕、外部工作簿链接）
-- 这类公式在无插件环境里无法刷新，重算会显示 `#NAME?`（函数名无法识别错误）或停留在旧缓存值。
-- 影响核心预测结果的：把需要的数值放到单独的输入单元格（最右备注列注明来源和取数日期），原单元格用公式引用它；原模型文件保留只读，日后可用插件刷新。
-- 不影响核心预测结果的（例如仅供参考的可比公司表）：保留原样，在最右备注列写「需插件刷新」。
-- 取不到可靠数值：在受影响的结果旁标明缺失原因。
-- `.agents/skills/xlsx/scripts/recalc.py` 默认拒绝含外部工作簿链接的文件：先在新版本文件中将外链替换为独立输入格引用并清理外链，再运行重算。
-- 同一工作簿内的跨表引用和命名区域（例如汇率）照常保留，属于工作簿内部引用。
+**5. 对照一致预期与本轮范围检查**
+- 先独立完成本方预测，再按 `.agents/skills/dalton-model/references/sanity-check.md` 运行 `model_consensus.py write-snapshot` 与 `model_consensus.py diff` 生成 `<R>/model_dump/consensus-diff.md/.json`；超阈值项拆源复核一次并补充理由。
+- 运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <新版本路径> --baseline <原模型路径> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --mode update --fix-round 0`（消费工作流手动运行时将 `--workflow` 设为对应工作流名，如 `full-coverage` 或 `earnings-deep-update`），检查仅针对本轮改动范围做判定：
+  - 仅「本轮可修」条目交回修改，最多两轮；定点修改（以及第 5 步超阈值一致预期返工）必须以当前候选 `<新版本路径>` 为基础增量叠加，不可把增量计划重新应用到 `<原模型路径>`：先运行 `python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <新版本路径> --ticker <TICKER> --out <R>/model_dump/<TICKER>-fix<N>-fingerprint.json` 对当前候选重提指纹，再执行 `python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <新版本路径> --ticker <TICKER> --plan <fix_plan.json> --out <新版本路径> --in-place --workspace-dir . --fingerprint <R>/model_dump/<TICKER>-fix<N>-fingerprint.json --prior-coord-map <R>/model_dump/coord_map.json --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <当前候选64位SHA-256> --mode update` 合并坐标映射并保留前序写入的实际值与扩列，每轮修改后按最新哈希重跑 `python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model <新版本路径> --ticker <TICKER> --research-dir <R> --consensus <consensus.json>` 刷新 `consensus-diff.md/.json`，再用与首查同一组完整参数执行复查（将 `--fix-round` 递增为 `1` 或 `2`）：`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <新版本路径> --baseline <原模型路径> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --mode update --fix-round <1|2>`（若检查或复算异常，运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir <R> --candidate <新版本路径> --baseline <原模型路径> --kind modeling --failed-stages <失败阶段列表，如 check,consensus> --workflow company-model --mode update` 补写降级账本）；
+  - 基线遗留、缺证据与不适用条目如实记入报告备查；
+  - 扩展条件格式（`<extLst>` / `x14`）变动在检查报告末尾如实提示。
 
-**6. 重算和自查**
-- 重算与扫描：见 `.agents/skills/dalton-model/SKILL.md` 第 5 步。
-- **保存与重算后核对部件变动**：凡用 `openpyxl` 保存过新版本（含写完公式、变更记录并重算之后），对最终文件运行 `python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff <原模型路径> <新版本路径>`；`parts-diff` 比较的是**部件路径和各表的规则数量**（数量相同的规则替换、同一部件内的内容变化超出此项比较范围）。若有部件丢失且无法通过 XML 定点修改保留，在变更记录和回复中写明丢失的内容及所在工作表（原模型文件保持只读）。
-
-**7. 记录与交付**：在 `README & Changelog` 工作表写明本次所有改动并按 `.agents/skills/dalton-model/SKILL.md` 第 7 步登记新版本。
+**6. 记录与交付**
+- 在 `README & Changelog`（或原 `Change Log`）写明版本号、日期、基线文件、补充的实际值、新增期间、修改的驱动假设及理由、结构调整与一致预期差异理由，再按 `.agents/skills/dalton-model/SKILL.md` 完成 `knowledge_update(doc="models")` 登记与 `dalton_check_done` 核对。
 
 ## 注意
 
-- 保留原模型的全部工作表，位置保持不变（移动工作表可能改变跨工作表区间公式包含的范围）；确有必要移动时，先检查有没有引用跨越它的公式，并在变更记录说明。
-- 原模型中违反四条核心要求之处（例如由季度汇总的年度列填了固定数字）：修正为公式并在变更记录列出。
-- 发现原模型的计算错误（例如合计公式多加或漏加了一行）：在本次任务范围内、能确认是错误的，在新版本里修正，核对下游受影响的利润、EPS、估值，并在变更记录和回复里告诉用户改了哪里、影响多大。涉及任务范围外的工作表、指标定义或原作者的判断时不改，记录发现和影响，在回复里请用户确认。
+- 保持原模型全部工作表及相对顺序稳定；确需调整顺序时，先核查跨表区间公式影响并在变更记录写明。
+- 任务范围内可确认的原模型计算错误（如合计漏行）在新版本修正并说明影响范围；任务范围外的工作表或原作者定义保持原状，记录发现并请用户确认。
 
 --- FILE: dalton-model/references/sanity-check.md ---
 # 对照一致预期与卖方预测
 
-目的：找出我们的预测与一致预期（consensus）或卖方预测差在哪里、原因是什么，据此决定保留判断并写明理由，还是修正假设。
+目的：先独立完成本方驱动建模，再对照市场一致预期（consensus）与卖方预测，找出核心差异及其来源，据此决定修正自身驱动假设，或保留判断并写明具体理由。
 
-## 1. 取数
+## 1. 先独立建模，再取数与隔离落格
 
+- **顺序原则**：先依据一手财报、管理层指引与研究认知设定分部与费用驱动假设，由公式算出本方收入、利润与 EPS（每股收益），再获取外部一致预期做对照。外部一致预期作为独立参考快照写入对照区，本方预测结果格与驱动公式始终与外部快照格保持隔离。
 - **一致预期**：在 `execute_code`（Python 代码执行工具）中先调 `researchdata.catalog()`，再调 `researchdata.finance(route="estimates", ticker=T)`，取本季、下季、本财年、下一财年的收入和 EPS（每股收益），以及分析师人数、高低区间。按指标逐个看 `field_status` 和数值：某个指标缺失不影响使用其他指标。返回里的 `implied_model` 是由一致预期 EPS 反推的利润（税率默认取最近一季），引用时仅标为「由一致预期 EPS 折算」作参考；营业利润和净利润预期另查卖方报告，模型税率保持独立假设。
 - **更远的年份、营业利润、净利润、分部数据**：通常只能从卖方报告或卖方模型里取，往往只有个别卖方。找卖方报告：用 `researchdata.research(route="alphaengine", ...)` 按公司名检索近期卖方报告（先查 `catalog(route="alphaengine")` 确认参数）；在对照表「来源类型」列填「个别卖方（机构名与日期）」；未查到时「外部预期」列留空，在「差异说明」列写「无公开预期」。
 - **先对齐口径再比较**：核对财年截止日（对应到模型的具体期间列）、币种、会计口径（报表 GAAP / IFRS〔公认会计准则 / 国际财务报告准则〕还是调整后 Non-GAAP〔非公认会计准则〕；模型缺同口径时，先沿用公司调节表的 SBC〔股权激励费用〕、摊销、投资损益等增设口径换算行）、每股还是每 ADS（美国存托股），以及外部数据是否已反映最新财报；换算对齐后再算差异，无法核实口径的在「差异说明」列注明。
-- 原始数据存到 `data/consensus/<YYYY-MM-DD_HHMM>.json`，对照表里写来源和取数日期。
+- 原始数据存到 `data/consensus/<YYYY-MM-DD_HHMM>.json`，对照表里写明来源和取数日期。
 
-## 2. 对照表
+## 2. 写入独立快照区并生成差异表
 
-写入工作簿（原模型已有对照区则沿用其位置；新建模型建 `vs Consensus` 工作表，或放在汇总表下方）：
+- **写入快照区**：运行 `python3 .agents/skills/dalton-model/scripts/model_consensus.py write-snapshot --model <候选模型路径> --consensus data/consensus/<文件名>.json --coord-map <R>/model_dump/coord_map.json`（原模型已有对照区则沿用其位置，新建模型写入 `vs Consensus` 独立快照区）：
 
 | 期间 | 指标 | 我们 | 外部预期 | 差异 | 主要卖方区间/代表值（可选） | 来源类型 | 差异说明 |
 |---|---|---|---|---|---|---|---|
 
-- 「我们」列用公式引用主模型结果格，「外部预期」列填蓝字无底色输入值（`role="external_input"`），「差异」列写公式计算；来源类型统一填「市场一致预期」「个别卖方（注明机构与日期）」或「由一致预期 EPS 折算」。
-- 差异按指标选表示方法：金额类用差额和百分比；利润率用百分点；每股指标用每股差额；接近盈亏平衡或由盈转亏时用绝对差额，并写明盈利方向（百分比在这里会误导）。
+- 「我们」列用公式引用主模型结果格，「外部预期」列填蓝字无底色输入值（`role="external_input"`，属于独立快照区），「差异」列写公式计算；来源类型统一填「市场一致预期」「个别卖方（注明机构与日期）」或「由一致预期 EPS 折算」。
+- **生成差异报告**：运行 `python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model <候选模型路径> --ticker <TICKER> --research-dir <R> --consensus data/consensus/<文件名>.json`，在免语言审查目录 `<R>/model_dump/` 生成绑定当前模型哈希的 `consensus-diff.md` 与 `consensus-diff.json`。每次改模重算后（含报告审稿触发的联动改模），按最新模型哈希重新运行 `diff` 刷新差异表。
+- 差异按指标选表示方法：金额类用差额和百分比；利润率用百分点；每股指标用每股差额；接近盈亏平衡或由盈转亏时（营业利润率或净利率绝对值低于 `3.0%`）改按利润率绝对差额（默认阈值 `±150bp`）判定并写明盈利方向。
 
-## 3. 差异分析
+## 3. 差异阈值、返工复核与理由说明
 
-- **哪些算重大**：结合该指标对估值和股价的影响、差异是否超出卖方预测的高低区间、市场对这个指标的关注程度综合判断。用户点名的指标（例如「JD 2028E 净利润看着太高」）一律按重大差异处理。
-- **拆来源**：哪个分部、哪个驱动假设（量、价、take rate〔货币化率〕、利润率）、哪项费用、利息或股本假设、口径差异。可以逐项把我们的假设换成市场的隐含水平，看差距收窄多少。
-- **决定保留或修改**（是否调整仅依据可核实的新信息或具体假设问题）：
-  - 有可核实的新信息（新数据、渠道调研、对管理层指引的不同解读）支持我们的判断 → 保留，写明理由；
-  - 发现自己的假设有具体问题（漏了一项费用、口径用错、季节性错了）→ 修改；
-  - 暂时判断不了 → 写明最可能的分歧来源，以及哪个假设变化多少就能解释这个差距。
-- 理由写在对照表的「差异说明」列，并在 `README & Changelog` 工作表汇总主要差异。
+- **默认复核阈值**：营业总收入 `±5.0%`、利润与稀释 EPS `±10.0%`（近盈亏平衡按利润率 `±150bp`，主要分部收入参考 `±8.0%`，关键期间费用率参考 `±200bp`）；用户点名的指标一律按重大差异处理。
+- **拆源复核**：逐项拆到分部、驱动假设（量、价、take rate〔货币化率〕、利润率）、费用、利息或股本，以及口径差异。
+- **返工调整或保留判断**（超阈值时执行 1 次返工复核）：
+  - 发现自身假设遗漏或口径有误（漏算费用、口径混用、季节性偏差）→ 只修改底层驱动假设格，通过 `model_edit.py` 重算并刷新差异表；
+  - 有可核实的新信息（一手数据、渠道调研、对管理层指引的独立解读）支持本方判断 → 保留判断，并在对照表「差异说明」列及 `README & Changelog` 为每项超阈值差异写明一句具体理由；
+  - 暂时无法完全验证 → 写明最可能的分歧来源，以及哪个假设变化多少能够解释该差距。
 
 
 ===== SKILL: dalton-onboarding =====

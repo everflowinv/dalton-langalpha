@@ -6,6 +6,7 @@ validation so malformed or unclosed markers fail loudly with the file path:
   ``<!-- DALTON_CAP:<expr> -->...<!-- /DALTON_CAP -->``
   ``<!-- DALTON_CAP:<expr> -->...<!-- DALTON_CAP_ELSE -->...<!-- /DALTON_CAP -->``
 - JavaScript (`.js`):
+  ``/* DALTON_INCLUDE:_shared/<file>.js */`` (inlined recursively before capability pruning, confined to ``workflows/_shared/`` with cycle detection)
   ``/* DALTON_CAP:<expr> */.../* /DALTON_CAP */``
   ``/* DALTON_CAP:<expr> */.../* DALTON_CAP_ELSE */.../* /DALTON_CAP */``
 - JSON (`.json`): keeps valid JSON on disk; applies structured capability pruning for
@@ -58,10 +59,17 @@ _JS_TOKEN_RE = re.compile(
     r"/\*\s*(?P<kind>/DALTON_CAP|DALTON_CAP_ELSE|DALTON_CAP:(?P<expr>.*?))\s*\*/",
     re.DOTALL,
 )
+_JS_INCLUDE_RE = re.compile(
+    r"/\*\s*DALTON_INCLUDE:(?P<target>.*?)\s*\*/",
+    re.DOTALL,
+)
 
 # Detect stray/malformed marker prefixes that failed to match a valid token
 # (e.g., missing closing `-->` / `*/`, or wrong spacing/casing).
 _STRAY_MARKER_RE = re.compile(r"(?:/?DALTON_CAP(?:_ELSE|:)?)", re.IGNORECASE)
+_STRAY_INCLUDE_RE = re.compile(r"DALTON_INCLUDE", re.IGNORECASE)
+
+_DEFAULT_WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "workflows"
 
 # Strip developer-only DALTON hook HTML comments from assembled markdown so they never reach the model.
 _DALTON_HOOK_HTML_COMMENT_RE = re.compile(
@@ -460,15 +468,116 @@ def assemble_markdown_text(
     return out
 
 
+def _resolve_workflows_root(path: Path | str | None) -> Path:
+    """Resolve the ``workflows/`` root directory for JS ``DALTON_INCLUDE`` targets."""
+    if path is not None:
+        p = Path(path)
+        candidates = (p.resolve(),) if p.is_absolute() or p.exists() else (p,)
+        for cand in candidates:
+            for parent in cand.parents:
+                if (parent / "_shared").is_dir() or parent.name == "workflows":
+                    return parent
+    return _DEFAULT_WORKFLOWS_DIR
+
+
+def _check_stray_include(
+    chunk: str, chunk_start: int, full_text: str, path: Path | str | None
+) -> None:
+    m = _STRAY_INCLUDE_RE.search(chunk)
+    if m is not None:
+        loc = _format_loc(path, full_text, chunk_start + m.start())
+        snippet = chunk[max(0, m.start() - 8) : min(len(chunk), m.end() + 24)].strip()
+        raise ContentAssemblyError(
+            f"{loc}: malformed or unclosed DALTON_INCLUDE marker near {snippet!r}"
+        )
+
+
+def _expand_js_includes(
+    text: str,
+    *,
+    path: Path | str | None = None,
+    workflows_root: Path | None = None,
+    _stack: tuple[Path, ...] = (),
+) -> str:
+    """Recursively inline ``/* DALTON_INCLUDE:_shared/*.js */`` fragments before capability pruning."""
+    if "DALTON_INCLUDE" not in text and "dalton_include" not in text.lower():
+        return text
+
+    wf_root = (workflows_root or _resolve_workflows_root(path)).resolve()
+    shared_root = (wf_root / "_shared").resolve()
+    current_stack = _stack
+    if not current_stack and path is not None:
+        p = Path(path)
+        if p.exists():
+            current_stack = (p.resolve(),)
+
+    out_parts: list[str] = []
+    cursor = 0
+    for match in _JS_INCLUDE_RE.finditer(text):
+        start, end = match.span()
+        between = text[cursor:start]
+        if between:
+            _check_stray_include(between, cursor, text, path)
+            out_parts.append(between)
+
+        loc = _format_loc(path, text, start)
+        target = (match.group("target") or "").strip()
+        if (
+            not target
+            or "\\" in target
+            or "\x00" in target
+            or target.startswith("/")
+            or ".." in Path(target).parts
+            or not target.startswith("_shared/")
+            or not target.endswith(".js")
+        ):
+            raise ContentAssemblyError(
+                f"{loc}: invalid DALTON_INCLUDE target {target!r} "
+                "(must be a relative path under _shared/*.js)"
+            )
+        inc_path = (wf_root / target).resolve()
+        if not inc_path.is_relative_to(shared_root) or inc_path.suffix.lower() != ".js":
+            raise ContentAssemblyError(
+                f"{loc}: DALTON_INCLUDE target escapes workflows/_shared/: {target!r}"
+            )
+        if not inc_path.is_file():
+            raise ContentAssemblyError(
+                f"{loc}: DALTON_INCLUDE target not found: {target!r} ({inc_path})"
+            )
+        if inc_path in current_stack:
+            chain = " -> ".join(p.name for p in (*current_stack, inc_path))
+            raise ContentAssemblyError(
+                f"{loc}: circular DALTON_INCLUDE detected ({chain})"
+            )
+
+        raw_inc = inc_path.read_text(encoding="utf-8")
+        expanded_inc = _expand_js_includes(
+            raw_inc,
+            path=inc_path,
+            workflows_root=wf_root,
+            _stack=(*current_stack, inc_path),
+        )
+        out_parts.append(expanded_inc)
+        cursor = end
+
+    tail = text[cursor:]
+    if tail:
+        _check_stray_include(tail, cursor, text, path)
+        out_parts.append(tail)
+
+    return "".join(out_parts)
+
+
 def assemble_js_text(
     text: str,
     *,
     path: Path | str | None = None,
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
-    """Assemble JavaScript workflow content with ``/* DALTON_CAP:... */`` blocks."""
+    """Assemble JavaScript workflow content: expand ``DALTON_INCLUDE`` then prune ``DALTON_CAP``."""
     active_caps = effective_capabilities() if capabilities is None else capabilities
-    return _assemble_stacked(text, _JS_TOKEN_RE, active_caps, path=path)
+    expanded = _expand_js_includes(text, path=path)
+    return _assemble_stacked(expanded, _JS_TOKEN_RE, active_caps, path=path)
 
 
 def assemble_json_text(

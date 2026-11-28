@@ -587,6 +587,16 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
+  # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
+  # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
+  "xlsx-preserve-calcpr"
+  "xlsx-recalc-keep-cache"
+  # Modeling v2 P0-b: Chief of Staff delegate_to_analyst appends latest user verbatim
+  # request when omitted from question, and guides serial per-company modeling dispatch.
+  "cos-verbatim-forward"
+  # Modeling v2 P0-b: per-workspace exclusive modeling lock at RunWorkflow / WorkflowDriver
+  # entry for company-model, earnings-deep-update (with model_path), and full-coverage.
+  "modeling-lock"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

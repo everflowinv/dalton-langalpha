@@ -6,8 +6,8 @@
 
 每写一个单元格，先确定它属于哪一类（下表第一列），再套用对应的格式：
 
-1. **用户提供了原模型**：在原模型**同一区块里找用途相同的单元格**，复制它的完整样式（新增预测季度列参照已有预测季度列，新增年度汇总列参照已有年度汇总列）。原模型的习惯和下表不同时，以原模型为准（例如原模型历史年度的汇总公式用蓝字，就沿用）。
-2. **新建模型或找不到参照**：用下表的默认格式。
+1. **用户提供了原模型**：先运行 `model_fingerprint.py` 提取基线指纹与样式画像，在原模型**同一区块里找用途相同的单元格**，复制它的完整样式（新增预测季度列参照已有预测季度列，新增年度汇总列参照已有年度汇总列）。原模型的习惯和下表不同时，以原模型为准（例如原模型历史年度的汇总公式用蓝字，就沿用）。
+2. **新建模型或找不到参照**：以内置标准格式模板 `.agents/skills/dalton-model/assets/default_model_template.xlsx` 为起点（含标准页签骨架与独立 `vs Consensus` 快照区），配合下表默认格式经 `model_edit.py` 填入内容。
 
 `.agents/skills/dalton-model/scripts/model_style.py` 提供两类工具：
 - 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill`、`blocks`（各分节标题行号与底色）等。维护原模型时，先用 `profile` 输出的 `blocks` 找到当前工作表同类分节标题行，再用 `clone_period_column_style` 或直接复制参照单元格的完整样式；画像中的 `section_styles` 只识别基金默认的三种分节底色，原工作表使用了其他自定义分节颜色时，直接复制 `blocks` 中同类标题格的样式。

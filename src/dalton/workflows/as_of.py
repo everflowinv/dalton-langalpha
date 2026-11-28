@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 # The workflows whose research anchor is a US trading day: their contracts key
 # every artifact path off ``as_of``. topic-research keeps its deliberate
 # date-free "latest" mode; weekly's ``end`` is the screen's own input.
-US_AS_OF_WORKFLOWS = frozenset({"initial-coverage", "full-coverage", "bullbear-doc"})
+US_AS_OF_WORKFLOWS = frozenset(
+    {"initial-coverage", "full-coverage", "bullbear-doc", "company-model"}
+)
 
 
 def last_completed_trading_day(market: str, now: datetime) -> str | None:

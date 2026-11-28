@@ -229,6 +229,8 @@ async def dispatch(
     preapproved: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    # DALTON-HOOK(cos-verbatim-forward): accept caller state to attach latest user verbatim request.
+    state: dict | None = None,
 ) -> Command:
     """Start ``question`` as a background turn of a workspace's own agent.
 
@@ -242,6 +244,12 @@ async def dispatch(
     runs at where the model has no such level.
     """
     import aiohttp
+
+    # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payload by tool_call_id on resume, else attach verbatim user request.
+    from src.dalton.cos_verbatim import resolve_dispatch_question
+    question = resolve_dispatch_question(
+        question, state, config=config, tool_call_id=tool_call_id
+    )
 
     model = (model or "").strip() or None
 
@@ -378,6 +386,14 @@ async def dispatch(
 
         if not approved:
             return decline_handoff_command(response, tool_call_id)
+
+        # DALTON-HOOK(cos-verbatim-forward): require approval-bound payload on HITL resume; stop with retryable error if missing.
+        from src.dalton.cos_verbatim import resolve_approved_dispatch_question
+        question, payload_err = resolve_approved_dispatch_question(
+            question, config=config, tool_call_id=tool_call_id
+        )
+        if payload_err is not None:
+            return error_command(payload_err, tool_call_id)
 
         # The card's report-back switch, when the user moved it. A resume
         # that names no overrides keeps what the call asked for.

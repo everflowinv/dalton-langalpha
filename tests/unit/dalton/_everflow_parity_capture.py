@@ -586,7 +586,7 @@ def _assemble_all_workflows_fulltext() -> str:
     """Assemble full text of all repository-shipped ``workflows/**`` (.js / .json only)."""
     registry = PrebuiltWorkflowRegistry(root=REPO_ROOT)
     workflow_names = registry.names()
-    assert len(workflow_names) == 6, f"Expected 6 prebuilt workflows, got {workflow_names}"
+    assert len(workflow_names) == 7, f"Expected 7 prebuilt workflows, got {workflow_names}"
 
     workflows_dir = REPO_ROOT / "workflows"
     sections: list[str] = []

@@ -2185,6 +2185,30 @@ def is_near_empty_retry_enabled() -> bool:
     )
 
 
+BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH = (
+    "plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx"
+)
+WORKSPACE_CUSTOM_MODEL_TEMPLATE_RELPATH = (
+    ".agents/modeling_cache/custom_default_template.xlsx"
+)
+
+
+def get_dalton_model_default_template_path() -> str:
+    """Return optional custom default model template path from ``DALTON_MODEL_DEFAULT_TEMPLATE_PATH``.
+
+    Returns empty string when unset; profile-neutral (uses ``resolve_profile()``) and never
+    hardcodes any Everflow-private path.
+    """
+    _ = resolve_profile()
+    return os.getenv("DALTON_MODEL_DEFAULT_TEMPLATE_PATH", "").strip()
+
+
+def resolve_default_model_template_path() -> Path:
+    """Resolve active default model template path: configured override if set, else bundled asset."""
+    configured = get_dalton_model_default_template_path()
+    if configured:
+        return Path(configured).expanduser()
+    return REPO_ROOT / BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH
 
 
 def get_redis_diag_ops_dir() -> Path:

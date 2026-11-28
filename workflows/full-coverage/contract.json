@@ -70,17 +70,15 @@
       "name": "建模（串行，失败即停）",
       "artifacts": [
         {
-          "path": "model/{ticker}-model-v*.xlsx",
-          "glob": true,
-          "min_count": 1,
-          "min_bytes": 1000
+          "path": "research/{as_of}-fc/model_dump/model-verification.json",
+          "min_bytes": 50
         }
       ],
       "validators": [
         {
-          "command": "python3 .agents/skills/dalton-model/scripts/model_readable.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\"",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{as_of}-fc --expected-workflow full-coverage",
           "pass_when": "exit_zero",
-          "description": "核对最终版模型文件（修订后为递增版本）存在且可由 openpyxl 正常打开读取（不因提示性扫描阻断）"
+          "description": "按终态账本核对最终版模型可读性、哈希、已完成阶段证据与失败阶段记录（pass 与 delivered_with_open_issues 均放行）"
         }
       ]
     },
@@ -101,13 +99,7 @@
       ]
     },
     {
-      "name": "审模型与独立审稿",
-      "artifacts": [
-        {
-          "path": "research/{as_of}-fc/model-check.md",
-          "min_bytes": 100
-        }
-      ],
+      "name": "独立审稿",
       "review": {
         "agent": "dalton-reviewer",
         "verdicts": [
