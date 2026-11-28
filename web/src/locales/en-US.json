@@ -4428,8 +4428,7 @@
         "background": "Background",
         "assist": "Lightweight assist",
         "audit": "Figure audit",
-        "reviewer": "Independent reviewer",
-        "extract": "Memory extract"
+        "reviewer": "Independent reviewer"
       },
       "expandModels": "Show models ({{count}})",
       "collapseModels": "Hide models",

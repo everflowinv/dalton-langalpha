@@ -4406,8 +4406,7 @@
         "background": "后台任务",
         "assist": "轻量辅助",
         "audit": "数据核验",
-        "reviewer": "独立复核",
-        "extract": "记忆整理"
+        "reviewer": "独立复核"
       },
       "expandModels": "查看可用模型（{{count}}）",
       "collapseModels": "收起模型列表",
