@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -89,7 +90,8 @@ UPSTREAM_STOPWORDS = {
     "vision", "voice", "web", "workflow",
     # Address parts and generic words that grouped unrelated repos (11-28 report:
     # com, org, github, software, community, design, daily, pro ...).
-    "com", "org", "net", "io", "www", "http", "https", "github", "gitlab", "html",
+    "com", "org", "io", "www", "http", "https", "github", "gitlab", "html",
+    "and", "for", "the", "with", "your", "rust", "java", "golang", "swift", "kotlin",
     "anything", "best", "build", "builder", "community", "control",
     "daily", "design", "downloader", "easy", "engineer", "engineering", "guide",
     "learn", "manager", "modern", "online", "pro", "protocol", "simple", "software",
@@ -166,6 +168,13 @@ def name_tokens(item: dict[str, Any]) -> set[str]:
     return _tokens(str(item.get("full_name") or "").replace("/", " "))
 
 
+def _homepage_name(url: str) -> str:
+    """Host labels of a homepage without its top-level domain (`foo.net` -> `foo`)."""
+    host = urlparse(url if "://" in url else f"https://{url}").hostname or ""
+    labels = [label for label in host.split(".") if label]
+    return " ".join(labels[:-1] if len(labels) > 1 else labels)
+
+
 def mention_tokens(item: dict[str, Any]) -> set[str]:
     """Tokens from name, description, topics and homepage host."""
     parts = [
@@ -173,7 +182,7 @@ def mention_tokens(item: dict[str, Any]) -> set[str]:
         str(item.get("description") or ""),
         " ".join(str(tag) for tag in item.get("trendshift_tags") or []),
         " ".join(str(tag) for tag in (item.get("github") or {}).get("topics") or []),
-        str((item.get("github") or {}).get("homepage") or ""),
+        _homepage_name(str((item.get("github") or {}).get("homepage") or "")),
     ]
     return _tokens(" ".join(parts))
 

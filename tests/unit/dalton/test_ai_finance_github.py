@@ -281,10 +281,20 @@ def test_tokens_stored_before_new_stopwords_are_filtered_again():
     now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
     state = {"snapshots": [{
         "captured_at": "2026-11-28T00:00:00+00:00",
-        "repos": {"carol/com-tool": {"name_tokens": ["com"], "mention_tokens": ["com"]}},
+        "repos": {"carol/jev-tool": {"name_tokens": ["com", "jev"], "mention_tokens": ["com", "jev", "github"]}},
     }]}
-    items = [{"full_name": "dave/com-kit", "description": "x"}]
-    assert trending.upstream_clusters(items, state, now=now) == []
+    seen = trending.recent_repo_tokens(state, 48.0, now)["carol/jev-tool"]
+    assert seen["name_tokens"] == {"jev"}
+    assert seen["mention_tokens"] == {"jev"}
+
+
+def test_homepage_top_level_domain_is_dropped_but_a_real_net_name_is_kept():
+    assert trending._homepage_name("https://www.foo.net/docs") == "www foo"
+    items = [
+        {"full_name": "alice/ml-net-tools", "description": "x"},
+        {"full_name": "bob/sample", "description": "built on ML.NET"},
+    ]
+    assert [c["upstream_token"] for c in trending.upstream_clusters(items, {"snapshots": []})] == ["net"]
 
 
 def test_a_real_shared_upstream_still_clusters():
