@@ -20,7 +20,10 @@ import {
   type ActiveTurnModel,
 } from '@/lib/dalton/turnAdmission';
 // DALTON-HOOK(antigravity-series): created-thread detection for first-send model/tuning carry-over
-import { createdThreadIdFromSend } from '@/lib/dalton/threadTuningDalton';
+// DALTON-HOOK(model-picker-races): track create-request tuning baseline for conditional post-create tuning repatch
+import { createdThreadIdForTuning, createdThreadIdFromSend, type CreatedThreadTuning } from '@/lib/dalton/threadTuningDalton';
+// DALTON-HOOK(model-picker-races): resolve live composer tuning/Antigravity variant on queued sends and sanitize Antigravity effort via useCapabilities()
+import { useDaltonQueuedSendTuning } from '@/lib/dalton/threadModelDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-identifiers)
 import { holdReload } from '@/lib/reloadHolds';
@@ -204,6 +207,8 @@ export function useChatMessages(
 ) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // DALTON-HOOK(model-picker-races): Dalton queued-send tuning merger & Antigravity effort sanitizer gated on VITE_DALTON_UI + useCapabilities()
+  const { resolveQueuedOptions, sanitizeSendEffort } = useDaltonQueuedSendTuning();
   // A refused token can be the saved one or a computer's, a cloud computer's
   // refusal may mean the user's choice for it changed, and a Claude plan's
   // limit is news to the plan they report: all are read again.
@@ -253,8 +258,11 @@ export function useChatMessages(
   });
   const [isLoading, setIsLoading] = useState(false);
   // DALTON-HOOK(antigravity-series): track active turn model, created thread id, & per-requestKey first-submitted pick in Dalton builds
+  // DALTON-HOOK(model-picker-races): track createdThreadTuning baseline for conditional post-create tuning repatch (both Dalton and Core builds)
   const [activeTurnModel, setActiveTurnModel] = useState<ActiveTurnModel | null>(null);
   const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+  const [createdThreadTuning, setCreatedThreadTuning] = useState<CreatedThreadTuning | null>(null);
+  const precreatedTuningIdRef = useRef<string | null>(null);
   const renderedThreadIdRef = useRef(threadId);
   renderedThreadIdRef.current = threadId;
   const turnModelTrackerRef = useRef(createTurnModelTracker());
@@ -262,6 +270,10 @@ export function useChatMessages(
     const resolved = typeof next === 'function' ? next(renderedThreadIdRef.current) : next;
     const created = createdThreadIdFromSend(renderedThreadIdRef.current, resolved); // DALTON-HOOK(antigravity-series)
     if (created) setCreatedThreadId(created);
+    const createdForTuning = createdThreadIdForTuning(renderedThreadIdRef.current, resolved);
+    if (createdForTuning && precreatedTuningIdRef.current !== createdForTuning) {
+      setCreatedThreadTuning({ threadId: createdForTuning, reasoningEffort: null, fastMode: null });
+    }
     setThreadId(resolved);
   }, []);
   useEffect(() => {
@@ -1048,6 +1060,9 @@ export function useChatMessages(
         }
         // DALTON-HOOK(antigravity-series): clear createdThreadId when navigation/workspace change switches threads
         if (isDaltonBuild) setCreatedThreadId(null);
+        // DALTON-HOOK(model-picker-races): clear createdThreadTuning when leaving or switching threads
+        setCreatedThreadTuning(null);
+        precreatedTuningIdRef.current = null;
         setThreadId(newThreadId);
       }
 
@@ -2914,7 +2929,8 @@ export function useChatMessages(
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
   // DALTON-HOOK(antigravity-series): preserve modelPickSeq across queued/steered/resent sends so turn-end only clears the pick actually sent
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, modelPickSeq, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, sharedWithWorkspace, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews, onTaken }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  // DALTON-HOOK(model-picker-races): carry displayModel & antigravitySeriesId across queued sends for displayed-model & series comparison
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, modelPickSeq, displayModel, antigravitySeriesId, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, sharedWithWorkspace, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews, onTaken }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     // A new chat's placeholder is no thread a send can be found in.
     const tookIn = (tid: string | null | undefined) => {
       if (tid && tid !== '__default__') onTaken?.(tid);
@@ -3002,7 +3018,7 @@ export function useChatMessages(
         additionalContext,
         attachmentMeta,
         // The draft rides along, for a stop to give back as the composer held it.
-        modelOptions: { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, artifactComments, keepFullContext, chartViews, draft },
+        modelOptions: { model, ...(isDaltonBuild ? { modelPickSeq, displayModel, antigravitySeriesId } : {}), reasoningEffort, fastMode, widgetSnapshots, artifactComments, keepFullContext, chartViews, draft },
         messageId: queuedMessage.id as string,
         requestKey,
         onAccepted,
@@ -3035,7 +3051,7 @@ export function useChatMessages(
       // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
       // only when a composer is behind it.
       // DALTON-HOOK(antigravity-series): preserve modelPickSeq across queued not_running sends
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq, displayModel, antigravitySeriesId } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
       tookIn(threadId);
       return outcome ?? true;
     }
@@ -3046,7 +3062,7 @@ export function useChatMessages(
     // If agent is already streaming, send as steering message
     if (isLoading) {
       // The steer takes its request before its first wait.
-      const steered = handleSendSteering(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      const steered = handleSendSteering(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq, displayModel, antigravitySeriesId } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
       tookIn(threadId);
       return steered;
     }
@@ -3094,15 +3110,13 @@ export function useChatMessages(
     }
 
     // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this turn (admitted flips true only once the server confirms the run started)
+    // DALTON-HOOK(model-picker-races): track activeTurnModel admission in Core builds too so first-turn pre-admission failures (e.g. 503) never discard the user's later pick
     const confirmActiveTurnModel = () => {
-      if (!isDaltonBuild) return;
       setActiveTurnModel((prev) => (
         prev && !prev.admitted ? { ...prev, admitted: true } : prev
       ));
     };
-    if (isDaltonBuild) {
-      setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null, admitted: false });
-    }
+    setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null, admitted: false });
     setIsLoading(true);
     setMessageError(null);
     setFallbackSuggestion(null);
@@ -3167,6 +3181,11 @@ export function useChatMessages(
       threadIdRef,
       // DALTON-HOOK(antigravity-series): record createdThreadId when ensureThreadId mints the first thread
       setThreadId: setThreadIdFromSend,
+      // DALTON-HOOK(model-picker-races): capture tuning values stored by POST /threads for conditional post-create tuning repatch
+      onThreadCreated: (info) => {
+        precreatedTuningIdRef.current = info.threadId;
+        setCreatedThreadTuning(info);
+      },
       wasStoppedRef,
       signal: abortController.signal,
     }).finally(releaseCreate);
@@ -3243,7 +3262,8 @@ export function useChatMessages(
         locale: userLocale,
         timezone: userTimezone,
         llmModel: model || null,
-        reasoningEffort: reasoningEffort || null,
+        // DALTON-HOOK(model-picker-races): strip standard reasoningEffort when sending an Antigravity variant
+        reasoningEffort: sanitizeSendEffort({ model, displayModel, antigravitySeriesId, reasoningEffort }),
         fastMode: fastMode ?? null,
         keepFullContext,
         platform,
@@ -3475,7 +3495,9 @@ export function useChatMessages(
     // handoff to an automatic resend parks it, its definite not-taken puts it
     // back — and settleQueued resolves the queueing call's deferred boolean,
     // which deletes nothing on its own.
-    void handleSendMessage(message, additionalContext, attachmentMeta, { ...modelOptions, onAccepted: queuedAccepted, onHandedOff: queuedHandedOff, onNotTaken: queuedNotTaken }, { shown: { userId: messageId } })
+    // DALTON-HOOK(model-picker-races): refresh tuning / intra-series Antigravity variant from live composer at flush time (gated on VITE_DALTON_UI + useCapabilities)
+    const flushedOptions = resolveQueuedOptions(modelOptions, readComposerOptions?.());
+    void handleSendMessage(message, additionalContext, attachmentMeta, { ...flushedOptions, onAccepted: queuedAccepted, onHandedOff: queuedHandedOff, onNotTaken: queuedNotTaken }, { shown: { userId: messageId } })
       .then(settleQueued);
     // Fires on isCompacting transitions. The send handler is captured from
     // the render where isCompacting went false — that render is the correct
@@ -3542,7 +3564,9 @@ export function useChatMessages(
     // DALTON-HOOK(composer-drafts): the flushed send's outcome settles the
     // queueing call's deferred boolean; its own callbacks (acceptance,
     // not-taken) riding the queued options do the real settling.
-    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } })
+    // DALTON-HOOK(model-picker-races): refresh tuning / intra-series Antigravity variant from live composer at flush time (gated on VITE_DALTON_UI + useCapabilities)
+    const flushedOptions = resolveQueuedOptions(next.modelOptions, readComposerOptions?.());
+    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, flushedOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } })
       .then((sent) => next.settleQueued?.(sent));
     // Fires when the view goes idle, a steer is answered or the workspace
     // arrives. The send handler is captured from that render, which is the
@@ -4708,8 +4732,10 @@ export function useChatMessages(
     forkDivider,
     isLoading,
     // DALTON-HOOK(antigravity-series): expose activeTurnModel & createdThreadId for Dalton turn-pick & tuning handle binding
+    // DALTON-HOOK(model-picker-races): expose createdThreadTuning baseline for conditional post-create tuning repatch
     activeTurnModel,
     createdThreadId,
+    createdThreadTuning,
     marketWatch,
     hasActiveSubagents,
     awaitingReportBack,

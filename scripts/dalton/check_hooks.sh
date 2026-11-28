@@ -609,6 +609,10 @@ ALLOWED_HOOKS=(
   # quota burst 429, credit-gate 503) in Postgres via wait_reason='capacity_limit' up to 15m,
   # and reset conversation_threads.current_status on pre-START automation failure/exit.
   "automation-capacity-retry"
+  # Model picker race small-fixes (R1-1, R1-2, Antigravity effort leakage, thread_model SSE,
+  # switch_thread_model atomic effort clear, conditional CAS guards for background auto-saves,
+  # mobile MarketView effort clear, queued-send live effort read, preferences cross-tab broadcast).
+  "model-picker-races"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

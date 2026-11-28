@@ -641,6 +641,116 @@ describe('threadLifecycleFeed — thread_tuning', () => {
   });
 });
 
+// DALTON-HOOK(model-picker-races): Report High #2 — thread_model SSE event refreshes stale tabs and respects in-flight saves
+describe('threadLifecycleFeed — thread_model', () => {
+  it('rereads an open thread whose llm_model moved, and skips one that already agrees', async () => {
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    queryClient.setQueryData(queryKeys.threads.detail('t1'), { thread_id: 't1', llm_model: 'gemini-4-neon-high-oauth' });
+    queryClient.setQueryData(queryKeys.threads.detail('t2'), { thread_id: 't2', llm_model: 'gemini-4-neon-low-oauth' });
+    queryClient.setQueryData(queryKeys.threads.detail('t3'), { thread_id: 't3', llm_model: 'gpt-6.2-sol' });
+
+    invalidate.mockClear();
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_model',
+      thread_id: 't1',
+      workspace_id: 'w1',
+      llm_model: 'gemini-4-neon-low-oauth',
+    });
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_model',
+      thread_id: 't2',
+      workspace_id: 'w1',
+      llm_model: 'gemini-4-neon-low-oauth',
+    });
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_model',
+      thread_id: 't3',
+      workspace_id: 'w1',
+      llm_model: null,
+    });
+    await flush(400);
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t1') });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t2') });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t3') });
+  });
+
+  it("only marks the row stale while this tab's own model save on it is in flight", async () => {
+    const getThread = vi.fn().mockResolvedValue({ thread_id: 't1', llm_model: 'gemini-4-neon-high-oauth' });
+    const key = queryKeys.threads.detail('t1');
+    const observer = new QueryObserver(queryClient, { queryKey: key, queryFn: getThread, staleTime: Infinity });
+    const unsubscribe = observer.subscribe(() => {});
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    getThread.mockClear();
+
+    const save = new MutationObserver(queryClient, {
+      mutationKey: threadFieldMutationKey('t1', 'llm_model'),
+      mutationFn: () => new Promise(() => {}),
+    });
+    void save.mutate();
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_model',
+      thread_id: 't1',
+      workspace_id: 'w1',
+      llm_model: 'gemini-4-neon-low-oauth',
+    });
+    await flush(400);
+
+    expect(getThread).not.toHaveBeenCalled();
+    expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+    unsubscribe();
+  });
+
+  // DALTON-HOOK(model-picker-races): R4 Codex #5 — Tab B opens a newly created thread before Tab A's first send is admitted (reads llm_model: null), receives run_started + thread_model from keep_named_model, and refreshes thread detail to Tab A's model
+  it('R4 Codex #5: refreshes Tab B thread detail from null to admitted model when thread_model arrives alongside run_started', async () => {
+    const key = queryKeys.threads.detail('t-new-admit');
+    const getThread = vi.fn()
+      .mockResolvedValueOnce({ thread_id: 't-new-admit', llm_model: null, reasoning_effort: null })
+      .mockResolvedValueOnce({ thread_id: 't-new-admit', llm_model: 'gemini-4-neon-low-oauth', reasoning_effort: null });
+    const observer = new QueryObserver(queryClient, { queryKey: key, queryFn: getThread, staleTime: Infinity });
+    const unsubscribe = observer.subscribe(() => {});
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    expect(queryClient.getQueryData<{ llm_model: string | null }>(key)?.llm_model).toBeNull();
+    expect(getThread).toHaveBeenCalledTimes(1);
+
+    // run_started alone does not refetch thread detail; thread_model published by keep_named_model triggers detail refetch.
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'run_started',
+      thread_id: 't-new-admit',
+      workspace_id: 'w1',
+      run_id: 'r1',
+      run_seq: 1,
+      status: 'running',
+    });
+    await flush(400);
+    expect(getThread).toHaveBeenCalledTimes(1);
+
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_model',
+      thread_id: 't-new-admit',
+      workspace_id: 'w1',
+      llm_model: 'gemini-4-neon-low-oauth',
+    });
+    await flush(400);
+
+    expect(getThread).toHaveBeenCalledTimes(2);
+    expect(queryClient.getQueryData<{ llm_model: string | null }>(key)?.llm_model).toBe('gemini-4-neon-low-oauth');
+    unsubscribe();
+  });
+});
+
 describe('threadLifecycleFeed — cache-only list refetch', () => {
   it('explicitly fetches an invalidated list whose only observers opt in', async () => {
     // The nav tree's page-0 queries observe with `enabled: false`, which

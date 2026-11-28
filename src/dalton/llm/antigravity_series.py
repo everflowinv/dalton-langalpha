@@ -349,6 +349,45 @@ def resolve_antigravity_effort_model(
     return raw_variants[chosen], chosen
 
 
+def is_builtin_antigravity_variant(
+    model_name: str | None,
+    *,
+    model_config: Any = None,
+    model_pref: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True when ``model_name`` is a built-in suffixed Antigravity variant.
+
+    A built-in Antigravity variant encodes reasoning effort in its model key
+    (e.g. ``gemini-4-neon-low-oauth``) and is not shadowed by a user custom
+    model of the same name.
+    """
+    if not isinstance(model_name, str) or not model_name:
+        return False
+    parsed = parse_antigravity_series(model_name)
+    if parsed is None or parsed[1] is None:
+        return False
+    if isinstance(model_pref, Mapping):
+        customs = model_pref.get("custom_models")
+        if isinstance(customs, list):
+            for entry in customs:
+                if isinstance(entry, Mapping) and entry.get("name") == model_name:
+                    return False
+
+    llm_cfg = _extract_llm_config(model_config)
+    if llm_cfg is None:
+        try:
+            from src.llms.llm import LLM
+
+            llm_cfg = _extract_llm_config(LLM.get_model_config())
+        except Exception:
+            llm_cfg = None
+    if llm_cfg is None:
+        return False
+
+    entry = llm_cfg.get(model_name)
+    return isinstance(entry, Mapping) and entry.get("provider") == ANTIGRAVITY_PROVIDER
+
+
 def quota_cooldown_target(
     provider: str,
     model_name: str,

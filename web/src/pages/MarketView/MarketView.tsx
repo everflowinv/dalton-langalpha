@@ -21,6 +21,8 @@ import { INTERVALS } from './utils/chartConstants';
 import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRoute';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
+// DALTON-HOOK(model-picker-races): clear local standard reasoning effort when mobile FAB switches to an Antigravity variant
+import { useDaltonModelPickerWithEffortClear } from '@/lib/dalton/threadModelDalton';
 import type { Workspace } from '@/types/api';
 import type { StockSearchHit } from '@/lib/marketUtils';
 import type { Freshness } from '@/types/market';
@@ -254,6 +256,8 @@ function MarketViewInner() {
   const subagents = useThreadSubagents({ threadId: null });
   // The thread's own effort and fast mode, held here for the same reason.
   const tuning = useThreadTuning({ threadId: null });
+  // DALTON-HOOK(model-picker-races): mirror ChatView/MarketChatPanel — clear local standard effort when mobile FAB picks an Antigravity variant
+  const handlePickMobileModel = useDaltonModelPickerWithEffortClear(threadModel.pickModel, tuning.clearLocalEffort);
   // What the FAB's composer says about its next send, as every thread host's does.
   const notices = useComposerNotices({
     threadId: null,
@@ -796,7 +800,8 @@ function MarketViewInner() {
               onScopeChange={pickScope}
               model={threadModel.model}
               sendModel={threadModel.sendModel}
-              onPickModel={threadModel.pickModel}
+              // DALTON-HOOK(model-picker-races): clear stale standard effort when mobile FAB switches to an Antigravity variant
+              onPickModel={handlePickMobileModel}
               subagentsAllowed={subagents.allowed}
               onToggleSubagents={subagents.setAllowed}
               tuning={tuning.tuning}

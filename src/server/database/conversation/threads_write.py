@@ -703,6 +703,10 @@ async def update_thread_fields(
     fast_mode: Any = _UNSET,
     # DALTON-HOOK(agent-switch-model): allow atomic metadata merge alongside column updates
     metadata_merge: Any = _UNSET,
+    # DALTON-HOOK(model-picker-races): optional expected-value CAS guards for background auto-saves
+    expected_llm_model: Any = _UNSET,
+    expected_reasoning_effort: Any = _UNSET,
+    expected_fast_mode: Any = _UNSET,
 ) -> Optional[Dict[str, Any]]:
     """Dynamic update of user-editable thread fields (title, pin, archive,
     model, subagent switch, effort, fast mode).
@@ -755,6 +759,19 @@ async def update_thread_fields(
     if not sets:
         return None
 
+    # DALTON-HOOK(model-picker-races): build optional IS NOT DISTINCT FROM CAS WHERE predicates
+    where_clauses: List[str] = ["conversation_thread_id = %s"]
+    where_params: List[Any] = [conversation_thread_id]
+    if expected_llm_model is not _UNSET:
+        where_clauses.append("llm_model IS NOT DISTINCT FROM %s")
+        where_params.append(expected_llm_model)
+    if expected_reasoning_effort is not _UNSET:
+        where_clauses.append("reasoning_effort IS NOT DISTINCT FROM %s")
+        where_params.append(expected_reasoning_effort)
+    if expected_fast_mode is not _UNSET:
+        where_clauses.append("fast_mode IS NOT DISTINCT FROM %s")
+        where_params.append(expected_fast_mode)
+
     try:
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -762,10 +779,10 @@ async def update_thread_fields(
                     f"""
                     UPDATE conversation_threads
                     SET {", ".join(sets)}
-                    WHERE conversation_thread_id = %s
+                    WHERE {" AND ".join(where_clauses)}
                     RETURNING {_sql._THREAD_COLUMNS}, last_seen_run_seq
                 """,
-                    (*params, conversation_thread_id),
+                    (*params, *where_params),
                 )
 
                 result = await cur.fetchone()

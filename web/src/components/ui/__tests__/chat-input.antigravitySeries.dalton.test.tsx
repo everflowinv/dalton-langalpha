@@ -10,6 +10,11 @@ import { queryKeys } from '@/lib/queryKeys';
 import type { CustomModelEntry, ProviderModelsData } from '@/components/model/types';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  isDaltonBuild: true,
+}));
+
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
   getModelMetadata: vi.fn().mockResolvedValue({}),
@@ -324,5 +329,69 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     expect(h.removeManyFavorites).toHaveBeenCalledTimes(1);
     expect(h.removeManyFavorites).toHaveBeenCalledWith(['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth']);
     expect(h.removeFavorite).not.toHaveBeenCalled();
+  });
+
+  // DALTON-HOOK(model-picker-races): Report High #1 — global default reasoning_effort='high' must NOT leak onto an Antigravity Low send
+  it('omits standard reasoningEffort (null) when sending an Antigravity variant even if account default reasoning_effort is high', () => {
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-low-oauth',
+        reasoning_effort: 'high',
+      },
+      other_preference: {},
+    };
+    const onSend = vi.fn();
+    const inputRef = { current: null as import('../chat-input').ChatInputHandle | null };
+    const { container } = renderComposer({
+      ref: inputRef,
+      model: 'gemini-4-neon-low-oauth',
+      sendModel: 'gemini-4-neon-low-oauth',
+      tuning: { reasoningEffort: null, fastMode: null },
+      onSend,
+    });
+
+    const modelPill = container.querySelector('button[data-pill="model"]')!;
+    expect(modelPill).toHaveTextContent('Gemini 4 Neon');
+    expect(modelPill).toHaveTextContent('Low');
+
+    // getModelOptions() must report reasoningEffort: null (variant key itself carries 'low') plus displayModel & antigravitySeriesId.
+    expect(inputRef.current?.getModelOptions()).toMatchObject({
+      model: 'gemini-4-neon-low-oauth',
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+    });
+
+    // Sending a message must pass reasoningEffort: null (never 'high') so backend does not remap Low -> High.
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'hello neon low' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({
+      model: 'gemini-4-neon-low-oauth',
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+    });
+    expect(onSend.mock.calls[0][0].modelOptions).not.toHaveProperty('reasoningEffortOverride');
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-H3 — getModelOptions() exposes displayModel even when sendModel is null (following thread row) so queued Antigravity sends never inherit a standard model's effort
+  it('exposes displayModel and null antigravitySeriesId on getModelOptions() when following a standard model row with sendModel=null', () => {
+    const inputRef = { current: null as import('../chat-input').ChatInputHandle | null };
+    renderComposer({
+      ref: inputRef,
+      model: 'gpt-6.2-sol',
+      sendModel: null,
+      tuning: { reasoningEffort: 'high', fastMode: false },
+    });
+
+    expect(inputRef.current?.getModelOptions()).toMatchObject({
+      model: null,
+      displayModel: 'gpt-6.2-sol',
+      antigravitySeriesId: null,
+      reasoningEffort: 'high',
+      fastMode: false,
+    });
   });
 });

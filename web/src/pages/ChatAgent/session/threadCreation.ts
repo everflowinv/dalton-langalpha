@@ -37,6 +37,8 @@ export interface EnsureThreadIdArgs {
   /** Kept in sync so in-flight closures see the real id immediately. */
   threadIdRef: { current: string };
   setThreadId: (threadId: string) => void;
+  // DALTON-HOOK(model-picker-races): report the tuning values stored by POST /threads for conditional post-create tuning repatch
+  onThreadCreated?: (info: { threadId: string; reasoningEffort: string | null; fastMode: boolean | null }) => void;
   /** Re-checked after the round-trip — a stop during pre-create already
    *  finalized the UI, so starting the run would resurrect it. */
   wasStoppedRef: { current: boolean };
@@ -65,6 +67,7 @@ export async function ensureThreadId({
   queryClient,
   threadIdRef,
   setThreadId,
+  onThreadCreated,
   wasStoppedRef,
   signal,
 }: EnsureThreadIdArgs): Promise<EnsureThreadIdResult> {
@@ -93,6 +96,12 @@ export async function ensureThreadId({
     if (signal.aborted || wasStoppedRef.current) return { threadId, aborted: true };
     effectiveThreadId = created.thread_id;
     threadIdRef.current = created.thread_id;
+    // DALTON-HOOK(model-picker-races): capture the tuning values stored by POST /threads ahead of setThreadId
+    onThreadCreated?.({
+      threadId: created.thread_id,
+      reasoningEffort: created.reasoning_effort !== undefined ? created.reasoning_effort : (reasoningEffortOverride ?? null),
+      fastMode: created.fast_mode !== undefined ? created.fast_mode : (fastModeOverride ?? null),
+    });
     // Same flip the first SSE frame performs on the legacy path — drives
     // ChatView's navigate(replace) + reconcile invalidate, just earlier.
     setThreadId(created.thread_id);

@@ -97,6 +97,9 @@ export interface ModelOptions {
   model: string | null;
   // DALTON-HOOK(antigravity-series): sequence of the active manual model pick carried from composer
   modelPickSeq?: number | null;
+  // DALTON-HOOK(model-picker-races): composer's displayed model & resolved Antigravity series id (Dalton builds only, never sent over wire)
+  displayModel?: string | null;
+  antigravitySeriesId?: string | null;
   /** This turn's level, as the composer shows it; null names none, and the
    *  server runs the thread's own, else Settings. */
   reasoningEffort: string | null;

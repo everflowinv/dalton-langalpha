@@ -768,6 +768,17 @@ async def switch_thread_model(
             changed=False,
         )
 
+    # DALTON-HOOK(model-picker-races): delegate Antigravity effort clear & SSE broadcast to Dalton module
+    from src.dalton.llm.thread_model_dalton import (
+        apply_antigravity_effort_clear,
+        publish_thread_model_switch_events,
+    )
+
+    extra_fields: dict[str, Any] = {}
+    clear_effort = await apply_antigravity_effort_clear(
+        user_id, model, extra_fields, model_pref=model_pref
+    )
+
     if defer_handoff:
         # DALTON-HOOK(cos-settings-tools): carry per-run (model, system_only) candidate pairs and parallel run_ids into the pending handoff marker
         marker = build_pending_model_handoff_marker(
@@ -781,6 +792,7 @@ async def switch_thread_model(
             thread_id,
             llm_model=model,
             metadata_merge={PENDING_MODEL_HANDOFF_KEY: marker},
+            **extra_fields,
         )
         if not updated_thread:
             raise HTTPException(
@@ -791,6 +803,12 @@ async def switch_thread_model(
             if updated_thread.get("workspace_id")
             else None
         )
+        await publish_thread_model_switch_events(
+            user_id=user_id,
+            thread_id=thread_id,
+            updated_thread=updated_thread,
+            cleared_effort=clear_effort,
+        )
         return ThreadModelSwitchResult(
             thread=updated_thread,
             workspace_id=workspace_id,
@@ -800,7 +818,7 @@ async def switch_thread_model(
         )
 
     updated_thread = await threads_write.update_thread_fields(
-        thread_id, llm_model=model
+        thread_id, llm_model=model, **extra_fields
     )
     if not updated_thread:
         raise HTTPException(
@@ -811,6 +829,12 @@ async def switch_thread_model(
         str(updated_thread["workspace_id"])
         if updated_thread.get("workspace_id")
         else None
+    )
+    await publish_thread_model_switch_events(
+        user_id=user_id,
+        thread_id=thread_id,
+        updated_thread=updated_thread,
+        cleared_effort=clear_effort,
     )
     if _immediate_handoff_runner is None:
         logger.warning(
