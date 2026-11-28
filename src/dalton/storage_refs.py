@@ -2778,6 +2778,7 @@ class ReconcileReport:
     warnings: tuple[ReconcileIssue, ...] = ()
     skipped_pending: dict[str, int] = field(default_factory=dict)
     known_missing: tuple[ReconcileIssue, ...] = ()
+    expired_by_rule: tuple[ReconcileIssue, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2787,10 +2788,12 @@ class ReconcileReport:
             "error_count": len(self.errors),
             "warning_count": len(self.warnings),
             "known_missing_count": len(self.known_missing),
+            "expired_by_rule_count": len(self.expired_by_rule),
             "skipped_pending": dict(self.skipped_pending),
             "errors": [e.to_dict() for e in self.errors],
             "warnings": [w.to_dict() for w in self.warnings],
             "known_missing": [k.to_dict() for k in self.known_missing],
+            "expired_by_rule": [e.to_dict() for e in self.expired_by_rule],
         }
 
 
@@ -2821,6 +2824,7 @@ async def enumerate_snapshot_refs(
     now: datetime | None = None,
     asr_bucket_target: tuple[str, str] | None = None,
     asr_bucket_role: str | None = None,
+    skip_expired_asr: bool = True,
 ) -> SnapshotRefInventory:
     """Enumerate all live object references and terminal ASR job IDs inside the caller's DB snapshot.
 
@@ -3632,7 +3636,7 @@ async def enumerate_snapshot_refs(
                     if st_s == "awaiting_upload" and not (upload_completed or submit_attempted):
                         pending_asr += 1
                         continue
-                    if is_terminal_asr_source_audio_expired(
+                    if skip_expired_asr and is_terminal_asr_source_audio_expired(
                         status=st_s,
                         source_object_key=clean_okey,
                         completed_at=completed_at,
@@ -3992,6 +3996,136 @@ def _validate_and_extract_known_missing(
     return manifest_km_list
 
 
+def _format_s3_exception_summary(exc: BaseException, *, operation: str = "") -> str:
+    """Format an S3/Botocore exception using safe metadata only (never raw SDK text or body)."""
+    parts: list[str] = []
+    if operation:
+        parts.append(f"op={operation}")
+    parts.append(f"type={type(exc).__name__}")
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, Mapping):
+        err = resp.get("Error")
+        if isinstance(err, Mapping):
+            code = str(err.get("Code") or "").strip()
+            if code:
+                parts.append(f"code={code}")
+        meta = resp.get("ResponseMetadata")
+        if isinstance(meta, Mapping):
+            http_status = meta.get("HTTPStatusCode")
+            if http_status is not None and str(http_status).strip():
+                parts.append(f"http_status={http_status}")
+            req_id = str(meta.get("RequestId") or "").strip()
+            if req_id:
+                parts.append(f"request_id={req_id}")
+    return ", ".join(parts)
+
+
+def _is_sdk_exception(exc: BaseException) -> bool:
+    mod = type(exc).__module__ or ""
+    if mod.startswith(("botocore", "boto3")):
+        return True
+    return isinstance(getattr(exc, "response", None), Mapping)
+
+
+def _index_expired_by_rule_objects(
+    expired_by_rule_objects: Sequence[Any] | None,
+) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+    """Index expired-by-rule entries by ``(bucket, key) -> [(consumer, row_id, rule_id), ...]``."""
+    out: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    if not expired_by_rule_objects:
+        return out
+    for item in expired_by_rule_objects:
+        bucket = ""
+        key = ""
+        consumer = ""
+        row_id = ""
+        rule_id = RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE
+        if isinstance(item, Mapping):
+            bucket = str(item.get("bucket") or "").strip()
+            key = str(item.get("key") or "").strip().lstrip("/")
+            consumer = str(item.get("consumer") or "").strip()
+            row_id = str(item.get("row_id") or "").strip()
+            rule_id = str(item.get("rule_id") or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE).strip()
+        elif hasattr(item, "bucket") and hasattr(item, "key"):
+            bucket = str(getattr(item, "bucket") or "").strip()
+            key = str(getattr(item, "key") or "").strip().lstrip("/")
+            consumer = str(getattr(item, "consumer", "") or "").strip()
+            row_id = str(getattr(item, "row_id", "") or "").strip()
+            rule_id = str(
+                getattr(item, "rule_id", RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE)
+                or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE
+            ).strip()
+        if bucket and key:
+            out.setdefault((bucket, key), []).append((consumer, row_id, rule_id))
+    return out
+
+
+def _validate_and_extract_expired_by_rule(
+    *,
+    manifest_path: Path,
+    manifest_data: Mapping[str, Any],
+    backup_set_path: Path | None = None,
+) -> list[dict[str, str]]:
+    """Return expired-by-rule objects strictly from this backup set's manifest.
+
+    Excludes any object actually present in ``manifest_data['objects']`` and verifies
+    that ``backup_set_path`` (when provided) does not inject extra foreign entries.
+    """
+    raw_manifest_objects = manifest_data.get("objects")
+    manifest_present_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_objects, list):
+        for entry in raw_manifest_objects:
+            if not isinstance(entry, Mapping):
+                continue
+            b = str(entry.get("bucket") or "").strip()
+            k = str(entry.get("key") or "").strip().lstrip("/")
+            if b and k:
+                manifest_present_pairs.add((b, k))
+
+    raw_manifest_exp = manifest_data.get("expired_by_rule_objects")
+    manifest_exp_list: list[dict[str, str]] = []
+    manifest_exp_seen: set[tuple[str, str, str, str]] = set()
+    manifest_exp_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_exp, list):
+        for item in raw_manifest_exp:
+            if not isinstance(item, Mapping):
+                continue
+            b = str(item.get("bucket") or "").strip()
+            k = str(item.get("key") or "").strip().lstrip("/")
+            c = str(item.get("consumer") or "").strip()
+            rid = str(item.get("row_id") or "").strip()
+            rule_id = str(item.get("rule_id") or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE).strip()
+            if not b or not k:
+                continue
+            if (b, k) in manifest_present_pairs:
+                continue
+            dedup = (b, k, c, rid)
+            if dedup not in manifest_exp_seen:
+                manifest_exp_seen.add(dedup)
+                manifest_exp_pairs.add((b, k))
+                rec = {"bucket": b, "key": k, "consumer": c, "rule_id": rule_id}
+                if rid:
+                    rec["row_id"] = rid
+                manifest_exp_list.append(rec)
+
+    if backup_set_path is not None:
+        set_data = json.loads(backup_set_path.read_text(encoding="utf-8"))
+        if not isinstance(set_data, dict):
+            raise ValueError("backup-set JSON must be an object")
+        raw_set_exp = set_data.get("expired_by_rule_objects")
+        if isinstance(raw_set_exp, list):
+            set_exp_pairs = _index_known_missing_objects(raw_set_exp)
+            extra_in_set = sorted(set_exp_pairs - manifest_exp_pairs)
+            if extra_in_set:
+                sample = ", ".join(f"{b}/{k}" for b, k in extra_in_set[:5])
+                raise ValueError(
+                    "backup-set expired_by_rule_objects contains entries not registered in "
+                    f"manifest: {sample}"
+                )
+
+    return manifest_exp_list
+
+
 def reconcile_inventory_against_manifest(
     inventory: SnapshotRefInventory,
     manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
@@ -4002,6 +4136,7 @@ def reconcile_inventory_against_manifest(
     source_asr_jobs_dir: Path | None = None,
     require_raw_response_job_ids: set[str] | frozenset[str] | None = None,
     known_missing_objects: Sequence[Any] | None = None,
+    expired_by_rule_objects: Sequence[Any] | None = None,
     target_s3_clients: Mapping[str, Any] | None = None,
     target_bucket_objects: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
     verify_target_buckets: bool = False,
@@ -4026,9 +4161,15 @@ def reconcile_inventory_against_manifest(
     index, duplicate_pairs = _index_manifest_objects_with_duplicates(manifest_objects)
     # Only actual missing objects (not present in manifest_objects) can ever count as known missing
     known_missing_set = _index_known_missing_objects(known_missing_objects) - set(index.keys())
+    expired_by_rule_index = {
+        pair: entries
+        for pair, entries in _index_expired_by_rule_objects(expired_by_rule_objects).items()
+        if pair not in index
+    }
     errors: list[ReconcileIssue] = []
     warnings: list[ReconcileIssue] = []
     known_missing_issues: list[ReconcileIssue] = []
+    expired_by_rule_issues: list[ReconcileIssue] = []
     checked_refs = 0
 
     for dup_bucket, dup_key in duplicate_pairs:
@@ -4102,7 +4243,7 @@ def reconcile_inventory_against_manifest(
                             object_key=tb,
                             detail=(
                                 f"Failed querying restore target bucket {tb!r}: "
-                                f"{type(exc).__name__}: {exc}"
+                                f"{_format_s3_exception_summary(exc, operation='ListObjectsV2')}"
                             ),
                         )
                     )
@@ -4157,6 +4298,32 @@ def reconcile_inventory_against_manifest(
                 warnings.append(km_issue)
                 known_missing_issues.append(km_issue)
                 continue
+            if not ref.require_present and (bucket_name, full_key) in expired_by_rule_index:
+                matched_rule_id = next(
+                    (
+                        exp_rule_id
+                        for exp_consumer, exp_row_id, exp_rule_id in expired_by_rule_index[
+                            (bucket_name, full_key)
+                        ]
+                        if (not exp_consumer or exp_consumer == ref.consumer)
+                        and (not exp_row_id or exp_row_id == ref.row_id)
+                    ),
+                    None,
+                )
+                if matched_rule_id is not None:
+                    expired_by_rule_issues.append(
+                        ReconcileIssue(
+                            consumer=ref.consumer,
+                            code="expired_by_rule_object",
+                            row_id=ref.row_id,
+                            object_key=f"{bucket_name}/{full_key}",
+                            detail=(
+                                f"Referenced object was expired by managed rule {matched_rule_id!r} "
+                                "at backup snapshot time (registered in manifest expired_by_rule_objects)"
+                            ),
+                        )
+                    )
+                    continue
             errors.append(
                 ReconcileIssue(
                     consumer=ref.consumer,
@@ -4452,6 +4619,7 @@ def reconcile_inventory_against_manifest(
         warnings=tuple(warnings),
         skipped_pending=dict(inventory.skipped_pending),
         known_missing=tuple(known_missing_issues),
+        expired_by_rule=tuple(expired_by_rule_issues),
     )
 
 
@@ -4704,6 +4872,17 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_CHECK_FAILED
     if args.command == "reconcile":
         try:
+            from src.dalton.consistent_backup import (
+                UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE,
+                UnsupportedStorageTopologyError,
+                validate_env_storage_topology,
+            )
+
+            validate_env_storage_topology(
+                os.environ,
+                rewrite_container_minio=bool(args.rewrite_container_minio),
+            )
+
             manifest_path = Path(args.manifest)
             manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
             objects = (
@@ -4713,18 +4892,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not isinstance(objects, list):
                 raise ValueError("manifest JSON must contain an 'objects' list")
-            if args.refs_json:
-                refs_data = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
-                inventory = SnapshotRefInventory.from_dict(refs_data)
-            else:
-                async def _enum() -> SnapshotRefInventory:
-                    conn = await _open_cli_readonly_connection()
-                    try:
-                        return await enumerate_snapshot_refs(conn)
-                    finally:
-                        await conn.close()
-
-                inventory = asyncio.run(_enum())
 
             targets = resolve_bucket_targets_from_env()
             if args.main_bucket:
@@ -4733,9 +4900,43 @@ def main(argv: list[str] | None = None) -> int:
                 targets["asr"] = (args.aux_bucket, args.aux_prefix.strip("/"))
                 targets["chat_upload"] = (args.aux_bucket, args.aux_prefix.strip("/"))
 
+            main_target_bucket = targets.get("main", ("", ""))[0].strip()
+            if main_target_bucket:
+                shared_aux = [
+                    role
+                    for role in ("asr", "chat_upload")
+                    if targets.get(role, ("", ""))[0].strip() == main_target_bucket
+                ]
+                if shared_aux:
+                    raise UnsupportedStorageTopologyError(
+                        f"{UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE}：主桶与辅存储 ({', '.join(shared_aux)}) "
+                        f"位于同一桶名 ({main_target_bucket})；仅支持单一 MinIO 端点且主桶与辅桶名称不同的布局"
+                    )
+
+            if args.refs_json:
+                refs_data = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
+                inventory = SnapshotRefInventory.from_dict(refs_data)
+            else:
+                async def _enum() -> SnapshotRefInventory:
+                    conn = await _open_cli_readonly_connection()
+                    try:
+                        # Do NOT recompute 7-day transcription expiration against restore day;
+                        # reconcile strictly against this backup set's recorded expired_by_rule_objects.
+                        return await enumerate_snapshot_refs(conn, skip_expired_asr=False)
+                    finally:
+                        await conn.close()
+
+                inventory = asyncio.run(_enum())
+
             known_missing_entries: list[dict[str, str]] = []
+            expired_by_rule_entries: list[dict[str, str]] = []
             if isinstance(manifest_data, dict):
                 known_missing_entries = _validate_and_extract_known_missing(
+                    manifest_path=manifest_path,
+                    manifest_data=manifest_data,
+                    backup_set_path=Path(args.backup_set) if args.backup_set else None,
+                )
+                expired_by_rule_entries = _validate_and_extract_expired_by_rule(
                     manifest_path=manifest_path,
                     manifest_data=manifest_data,
                     backup_set_path=Path(args.backup_set) if args.backup_set else None,
@@ -4760,13 +4961,20 @@ def main(argv: list[str] | None = None) -> int:
                 asr_jobs_dir=Path(args.asr_dir) if args.asr_dir else None,
                 source_asr_jobs_dir=Path(args.source_asr_dir) if args.source_asr_dir else None,
                 known_missing_objects=known_missing_entries,
+                expired_by_rule_objects=expired_by_rule_entries,
                 target_s3_clients=target_clients,
                 verify_target_buckets=bool(args.verify_target_buckets),
             )
             print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
             return EXIT_CLEAN if report.ok else EXIT_REFERENCES_FOUND
         except Exception as exc:
-            print(f"[storage_refs] ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if _is_sdk_exception(exc):
+                print(
+                    f"[storage_refs] ERROR: {_format_s3_exception_summary(exc)}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[storage_refs] ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
             return EXIT_CHECK_FAILED
     return EXIT_CHECK_FAILED
 

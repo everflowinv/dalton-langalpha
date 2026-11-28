@@ -97,8 +97,15 @@ _ASR_EXCLUDED_FILE_SUFFIXES = (".lock", ".tmp", ".part", ".downloading")
 _VALID_ADDRESSING_STYLES = frozenset({"virtual", "path", "auto"})
 
 
+UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE = "当前备份不支持该存储布局"
+
+
 class ConsistentBackupError(RuntimeError):
     """Base error raised by the consistent backup protocol."""
+
+
+class UnsupportedStorageTopologyError(ConsistentBackupError):
+    """Raised when storage configuration violates the supported single-endpoint distinct main/aux bucket topology."""
 
 
 class BackupTimeoutError(ConsistentBackupError, TimeoutError):
@@ -286,6 +293,129 @@ def _spec_endpoint_identity(spec: BucketArchiveSpec) -> str:
 def _physical_bucket_identity(spec: BucketArchiveSpec) -> tuple[str, str]:
     """Identify a physical bucket by normalized ``(endpoint, bucket_name)``."""
     return (_spec_endpoint_identity(spec), spec.bucket.strip())
+
+
+def validate_storage_topology(specs: Sequence[BucketArchiveSpec]) -> None:
+    """Enforce the narrowed supported backup/restore storage topology at entry.
+
+    Supported topology (production & Core default):
+    - Single MinIO/S3 endpoint across all configured buckets (one canonical endpoint spelling).
+    - Distinct bucket names between main storage (``main``) and secondary storage (``asr`` / ``chat_upload``).
+    - No bucket name reused across multiple endpoints.
+
+    Raises :class:`UnsupportedStorageTopologyError` with ``当前备份不支持该存储布局`` on violation.
+    """
+    active = [sp for sp in specs if sp.bucket.strip()]
+    if not active:
+        return
+
+    main_buckets: set[str] = set()
+    aux_buckets: set[str] = set()
+    endpoints_by_bucket: dict[str, set[str]] = {}
+    all_endpoints: set[str] = set()
+
+    for sp in active:
+        b = sp.bucket.strip()
+        ep = _spec_endpoint_identity(sp)
+        all_endpoints.add(ep)
+        endpoints_by_bucket.setdefault(b, set()).add(ep)
+        roles = {str(r).strip().lower() for r in sp.roles}
+        if "main" in roles:
+            main_buckets.add(b)
+        if roles & {"asr", "chat_upload"}:
+            aux_buckets.add(b)
+
+    shared_main_aux = sorted(main_buckets & aux_buckets)
+    if shared_main_aux:
+        raise UnsupportedStorageTopologyError(
+            f"{UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE}：主桶与辅存储（转写 / 聊天附件）位于同一桶名 "
+            f"({', '.join(shared_main_aux)})；仅支持单一 MinIO 端点且主桶与辅桶名称不同的布局"
+        )
+
+    same_bucket_multi_ep = sorted(
+        (b, sorted(ep or "<default>" for ep in eps))
+        for b, eps in endpoints_by_bucket.items()
+        if len(eps) > 1
+    )
+    if same_bucket_multi_ep:
+        details = "; ".join(f"{b}: {', '.join(eps)}" for b, eps in same_bucket_multi_ep)
+        raise UnsupportedStorageTopologyError(
+            f"{UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE}：同名桶位于不同端点或端点写法不一致 ({details})；"
+            "仅支持单一 MinIO 端点且主桶与辅桶名称不同的布局"
+        )
+
+    if len(all_endpoints) > 1:
+        ep_list = ", ".join(sorted(ep or "<default>" for ep in all_endpoints))
+        raise UnsupportedStorageTopologyError(
+            f"{UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE}：检测到多个端点或端点写法不同无法区分物理桶 ({ep_list})；"
+            "仅支持单一 MinIO 端点且主桶与辅桶名称不同的布局"
+        )
+
+
+def validate_env_storage_topology(
+    env: Mapping[str, str] | None = None,
+    *,
+    apply_core_defaults: bool = False,
+    rewrite_container_minio: bool = False,
+) -> None:
+    """Validate storage topology directly from environment variables without creating S3 clients."""
+    em = os.environ if env is None else env
+
+    def _norm_ep(raw_ep: str) -> str:
+        cleaned = (raw_ep or "").strip().rstrip("/")
+        if rewrite_container_minio and cleaned:
+            return _rewrite_container_minio_endpoint(cleaned, em)
+        return cleaned
+
+    probe_specs: list[BucketArchiveSpec] = []
+    cfg = resolve_storage_config(env=em, apply_core_defaults=apply_core_defaults)
+    if cfg.is_storage_enabled and cfg.bucket_name:
+        main_ep = _norm_ep(cfg.endpoint_url or "")
+        probe_specs.append(
+            BucketArchiveSpec(
+                bucket=cfg.bucket_name.strip(),
+                roles=("main",),
+                key_prefix=(em.get("STORAGE_KEY_PREFIX") or "").strip().strip("/"),
+                endpoint=main_ep,
+            )
+        )
+
+    asr_bucket = (em.get("DALTON_ASR_STORAGE_BUCKET_NAME") or "").strip()
+    asr_ep = ""
+    if asr_bucket:
+        asr_ep = _norm_ep(em.get("DALTON_ASR_STORAGE_ENDPOINT_URL") or "http://minio:9000")
+        probe_specs.append(
+            BucketArchiveSpec(
+                bucket=asr_bucket,
+                roles=("asr",),
+                key_prefix=(em.get("DALTON_ASR_STORAGE_KEY_PREFIX") or "").strip().strip("/"),
+                endpoint=asr_ep,
+            )
+        )
+
+    chat_bucket = (em.get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
+    if chat_bucket:
+        chat_ep_raw = (em.get("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "").strip()
+        chat_ep = _norm_ep(chat_ep_raw or "http://minio:9000")
+        probe_specs.append(
+            BucketArchiveSpec(
+                bucket=chat_bucket,
+                roles=("chat_upload",),
+                key_prefix=(em.get("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or "").strip().strip("/"),
+                endpoint=chat_ep,
+            )
+        )
+    elif asr_bucket:
+        probe_specs.append(
+            BucketArchiveSpec(
+                bucket=asr_bucket,
+                roles=("chat_upload",),
+                key_prefix=(em.get("DALTON_ASR_STORAGE_KEY_PREFIX") or "").strip().strip("/"),
+                endpoint=asr_ep,
+            )
+        )
+
+    validate_storage_topology(probe_specs)
 
 
 def deduplicate_selections(
@@ -578,6 +708,18 @@ def resolve_runtime_bucket_specs(
     elif asr_resolved_key is not None and asr_resolved_key in specs_by_key:
         if "chat_upload" not in specs_by_key[asr_resolved_key]["roles"]:
             specs_by_key[asr_resolved_key]["roles"].append("chat_upload")
+
+    probe_specs = [
+        BucketArchiveSpec(
+            bucket=item["bucket"],
+            roles=tuple(dict.fromkeys(item["roles"])),
+            key_prefix=item["prefix"],
+            s3_client=None,
+            endpoint=item["endpoint"] or "",
+        )
+        for item in specs_by_key.values()
+    ]
+    validate_storage_topology(probe_specs)
 
     out: list[BucketArchiveSpec] = []
     for item in specs_by_key.values():
@@ -2088,6 +2230,7 @@ async def run_consistent_backup(
       txn, releases both GC advisory locks (or closes the control session), and propagates.
     """
     log = target_logger or logger
+    validate_storage_topology(bucket_specs)
     eff_lock_timeout = (
         float(lock_phase_timeout_s)
         if lock_phase_timeout_s is not None
@@ -3307,6 +3450,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "reconcile-restored-inflight-states":
         from src.server.database.pool import open_session_connection
 
+        validate_env_storage_topology(
+            os.environ,
+            rewrite_container_minio=not Path("/.dockerenv").exists(),
+        )
         inspector = None if args.skip_object_check else _default_chat_upload_inspector
         ws_inspector = None if args.skip_object_check else _default_workspace_upload_inspector
         asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None

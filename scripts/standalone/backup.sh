@@ -2050,14 +2050,19 @@ MINIO_OBJECT_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv
 MINIO_TOTAL_BYTES="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["total_bytes"])' "$MINIO_MANIFEST_FILE")"
 
 # Persist missing-referenced-objects alert once on the host (never inside the ephemeral container).
+# Alert write failure must NEVER block publishing a verified backup set.
+HOST_ALERTS_FALLBACK="${OUTPUT_DIR}/backup-alerts.log"
 HOST_ALERTS_FILE="${DALTON_BACKUP_ALERTS_FILE:-}"
 if [[ -z "$HOST_ALERTS_FILE" && -f "$ENV_FILE" ]]; then
   HOST_ALERTS_FILE="$(read_env_file_var "$ENV_FILE" "DALTON_BACKUP_ALERTS_FILE" "")"
 fi
 if [[ -z "$HOST_ALERTS_FILE" || "$HOST_ALERTS_FILE" == *.json || "$HOST_ALERTS_FILE" == *.JSON ]]; then
-  HOST_ALERTS_FILE="${OUTPUT_DIR}/backup-alerts.log"
+  HOST_ALERTS_FILE="$HOST_ALERTS_FALLBACK"
 fi
-MISSING_ALERT_WRITTEN="$(python3 - "$MINIO_MANIFEST_FILE" "$HOST_ALERTS_FILE" "$BACKUP_NAME" <<'PY'
+MISSING_ALERT_STATUS=""
+MISSING_ALERT_RC=0
+set +e
+MISSING_ALERT_STATUS="$(python3 - "$MINIO_MANIFEST_FILE" "$HOST_ALERTS_FILE" "$BACKUP_NAME" "$HOST_ALERTS_FALLBACK" <<'PY'
 import datetime as dt
 import json
 import os
@@ -2067,11 +2072,12 @@ from pathlib import Path
 manifest_path = Path(sys.argv[1])
 alerts_path = Path(os.path.expanduser(sys.argv[2]))
 backup_name = sys.argv[3]
+fallback_path = Path(os.path.expanduser(sys.argv[4]))
 
 data = json.loads(manifest_path.read_text(encoding="utf-8"))
 raw_missing = data.get("missing_referenced_objects") if isinstance(data, dict) else None
 if not isinstance(raw_missing, list) or not raw_missing:
-    print("0")
+    print("NONE\t0")
     raise SystemExit(0)
 
 seen = set()
@@ -2088,7 +2094,7 @@ for item in raw_missing:
     unique_items.append((b, k, c))
 
 if not unique_items:
-    print("0")
+    print("NONE\t0")
     raise SystemExit(0)
 
 total = len(unique_items)
@@ -2101,15 +2107,57 @@ line = (
     f"backup={backup_name} Tolerated {total} missing snapshot-referenced object(s) "
     f"(full list in manifest.json): {sample}{suffix}\n"
 )
-alerts_path.parent.mkdir(parents=True, exist_ok=True)
-fd = os.open(alerts_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-with os.fdopen(fd, "a", encoding="utf-8") as fh:
-    fh.write(line)
-print(str(total))
+
+def _append_line(dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(line)
+
+try:
+    _append_line(alerts_path)
+    print(f"OK\t{total}\t{alerts_path}")
+except OSError as primary_exc:
+    if fallback_path != alerts_path:
+        try:
+            _append_line(fallback_path)
+            print(
+                f"FALLBACK\t{total}\t{fallback_path}\t{alerts_path}\t{type(primary_exc).__name__}"
+            )
+            raise SystemExit(0)
+        except OSError as fb_exc:
+            print(
+                f"FAILED\t{total}\t{alerts_path}\t{type(primary_exc).__name__}\t"
+                f"{fallback_path}\t{type(fb_exc).__name__}"
+            )
+            raise SystemExit(0)
+    print(f"FAILED\t{total}\t{alerts_path}\t{type(primary_exc).__name__}")
 PY
 )"
-if [[ "$MISSING_ALERT_WRITTEN" =~ ^[0-9]+$ ]] && (( MISSING_ALERT_WRITTEN > 0 )); then
-  warn "Recorded MISSING_REFERENCED_OBJECTS alert (${MISSING_ALERT_WRITTEN} object(s)) to ${HOST_ALERTS_FILE}; full list stays in manifest.json."
+MISSING_ALERT_RC=$?
+set -e
+if [[ "$MISSING_ALERT_RC" -ne 0 ]]; then
+  err "Failed to record MISSING_REFERENCED_OBJECTS alert to ${HOST_ALERTS_FILE} (exit=${MISSING_ALERT_RC}); continuing backup publication; full list stays in manifest.json."
+else
+  IFS=$'\t' read -r ALERT_STATE ALERT_COUNT ALERT_DEST ALERT_EXTRA1 ALERT_EXTRA2 ALERT_EXTRA3 <<< "$MISSING_ALERT_STATUS"
+  case "$ALERT_STATE" in
+    OK)
+      if [[ "$ALERT_COUNT" =~ ^[0-9]+$ ]] && (( ALERT_COUNT > 0 )); then
+        warn "Recorded MISSING_REFERENCED_OBJECTS alert (${ALERT_COUNT} object(s)) to ${ALERT_DEST}; full list stays in manifest.json."
+      fi
+      ;;
+    FALLBACK)
+      err "Failed to write MISSING_REFERENCED_OBJECTS alert to ${ALERT_EXTRA1} (${ALERT_EXTRA2}); fell back to ${ALERT_DEST}."
+      warn "Recorded MISSING_REFERENCED_OBJECTS alert (${ALERT_COUNT} object(s)) to ${ALERT_DEST}; full list stays in manifest.json."
+      ;;
+    FAILED)
+      if [[ -n "${ALERT_EXTRA2:-}" ]]; then
+        err "Failed to write MISSING_REFERENCED_OBJECTS alert (${ALERT_COUNT} object(s)) to ${ALERT_DEST} (${ALERT_EXTRA1}) and fallback ${ALERT_EXTRA2} (${ALERT_EXTRA3}); continuing backup publication; full list stays in manifest.json."
+      else
+        err "Failed to write MISSING_REFERENCED_OBJECTS alert (${ALERT_COUNT} object(s)) to ${ALERT_DEST} (${ALERT_EXTRA1}); continuing backup publication; full list stays in manifest.json."
+      fi
+      ;;
+  esac
 fi
 
 if [[ "$VERIFY" -eq 1 ]]; then

@@ -521,9 +521,12 @@ def test_r3_physical_primary_bucket_zero_tolerance_across_all_prefixes(
         },
     )
 
-    # Same endpoint + same custom bucket name 'dalton-storage', different prefixes ('main' vs 'aux')
-    # -> aux prefix MUST inherit primary bucket zero-tolerance!
-    with pytest.raises(consistent_backup.MissingReferencedObjectsError) as exc_info:
+    # R4 narrowed topology: main + aux sharing the same bucket name (same endpoint or different
+    # endpoint) is now rejected at entry with UnsupportedStorageTopologyError.
+    with pytest.raises(
+        consistent_backup.UnsupportedStorageTopologyError,
+        match="当前备份不支持该存储布局",
+    ):
         asyncio.run(
             consistent_backup.run_consistent_backup(
                 conn=_make_autospec_async_db_conn(_query_handler),
@@ -542,48 +545,84 @@ def test_r3_physical_primary_bucket_zero_tolerance_across_all_prefixes(
                         roles=("asr", "chat_upload"),
                         key_prefix="aux",
                         s3_client=s3_shared,
-                        endpoint="http://127.0.0.1:9000/",  # trailing slash normalizes to same endpoint!
+                        endpoint="http://127.0.0.1:9000/",
                     ),
                 ],
                 object_sink=consistent_backup.MirrorPoolSink(tmp_path / "pool-fail"),
                 max_missing_referenced_objects=50,
             )
         )
-    assert exc_info.value.bucket == "dalton-storage"
-    assert "aux/chat-uploads/ws1/up-miss/missing.pdf" in exc_info.value.missing_keys
 
-    # Same bucket name 'dalton-storage' on a DIFFERENT endpoint -> secondary bucket -> tolerated!
     s3_aux_other_ep = _make_autospec_s3_client(
         versioning_by_bucket={"dalton-storage": True},
         objects_by_bucket={"dalton-storage": {}},
     )
-    res_diff_ep = asyncio.run(
+    with pytest.raises(
+        consistent_backup.UnsupportedStorageTopologyError,
+        match="当前备份不支持该存储布局",
+    ):
+        asyncio.run(
+            consistent_backup.run_consistent_backup(
+                conn=_make_autospec_async_db_conn(_query_handler),
+                pg_dump_path=tmp_path / "pg2.dump",
+                pg_dump_fn=_make_pg_dump_spy(),
+                bucket_specs=[
+                    consistent_backup.BucketArchiveSpec(
+                        bucket="dalton-storage",
+                        roles=("main",),
+                        key_prefix="main",
+                        s3_client=s3_shared,
+                        endpoint="http://127.0.0.1:9000",
+                    ),
+                    consistent_backup.BucketArchiveSpec(
+                        bucket="dalton-storage",
+                        roles=("asr", "chat_upload"),
+                        key_prefix="aux",
+                        s3_client=s3_aux_other_ep,
+                        endpoint="http://127.0.0.1:9001",
+                    ),
+                ],
+                object_sink=consistent_backup.MirrorPoolSink(tmp_path / "pool-ok"),
+                max_missing_referenced_objects=50,
+            )
+        )
+
+    # Supported topology (single endpoint + distinct main/aux bucket names): aux missing is tolerated
+    # while main remains zero-tolerance.
+    s3_distinct = _make_autospec_s3_client(
+        versioning_by_bucket={"dalton-storage": True, "dalton-asr": True},
+        objects_by_bucket={
+            "dalton-storage": {f"main/blobs/u1/{_sha(main_blob)}": main_blob},
+            "dalton-asr": {},
+        },
+    )
+    res_supported = asyncio.run(
         consistent_backup.run_consistent_backup(
             conn=_make_autospec_async_db_conn(_query_handler),
-            pg_dump_path=tmp_path / "pg2.dump",
+            pg_dump_path=tmp_path / "pg3.dump",
             pg_dump_fn=_make_pg_dump_spy(),
             bucket_specs=[
                 consistent_backup.BucketArchiveSpec(
                     bucket="dalton-storage",
                     roles=("main",),
                     key_prefix="main",
-                    s3_client=s3_shared,
+                    s3_client=s3_distinct,
                     endpoint="http://127.0.0.1:9000",
                 ),
                 consistent_backup.BucketArchiveSpec(
-                    bucket="dalton-storage",
+                    bucket="dalton-asr",
                     roles=("asr", "chat_upload"),
                     key_prefix="aux",
-                    s3_client=s3_aux_other_ep,
-                    endpoint="http://127.0.0.1:9001",
+                    s3_client=s3_distinct,
+                    endpoint="http://127.0.0.1:9000/",
                 ),
             ],
-            object_sink=consistent_backup.MirrorPoolSink(tmp_path / "pool-ok"),
+            object_sink=consistent_backup.MirrorPoolSink(tmp_path / "pool-supported"),
             max_missing_referenced_objects=50,
         )
     )
-    assert res_diff_ep.reconcile_report.ok is True
-    assert len(res_diff_ep.missing_referenced_objects) == 1
+    assert res_supported.reconcile_report.ok is True
+    assert len(res_supported.missing_referenced_objects) == 1
 
 
 # ---------------------------------------------------------------------------

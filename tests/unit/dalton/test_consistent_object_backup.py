@@ -1369,7 +1369,8 @@ def test_thin_forwarders_launchd_templates_deploy_main_compat_and_standalone_wra
     assert proc.returncode == 0, proc.stderr
     assert "set=20261127-030000" in proc.stdout
 
-    # 4. Standalone Core wrapper resolves mixed external main + built-in aux buckets cleanly
+    # 4. Standalone Core wrapper resolves single-endpoint distinct main + aux buckets cleanly
+    #    and rejects multi-endpoint layouts at entry (R4 narrowed topology).
     fake_clients: list[dict[str, Any]] = []
 
     def _fake_factory(**kw: Any) -> Any:
@@ -1380,7 +1381,7 @@ def test_thin_forwarders_launchd_templates_deploy_main_compat_and_standalone_wra
         env={
             "DALTON_PROFILE": "core",
             "STORAGE_PROVIDER": "s3",
-            "STORAGE_ENDPOINT_URL": "https://s3.external.example",
+            "STORAGE_ENDPOINT_URL": "http://minio:9000",
             "STORAGE_BUCKET_NAME": "corp-main",
             "STORAGE_ACCESS_KEY_ID": "ak1",
             "STORAGE_SECRET_ACCESS_KEY": "sk1",
@@ -1396,6 +1397,25 @@ def test_thin_forwarders_launchd_templates_deploy_main_compat_and_standalone_wra
         ("corp-main", ("main",)),
         ("chat-uploads", ("chat_upload",)),
     }
+    with pytest.raises(
+        consistent_backup.UnsupportedStorageTopologyError,
+        match="当前备份不支持该存储布局",
+    ):
+        standalone_cb.resolve_standalone_bucket_specs(
+            env={
+                "DALTON_PROFILE": "core",
+                "STORAGE_PROVIDER": "s3",
+                "STORAGE_ENDPOINT_URL": "https://s3.external.example",
+                "STORAGE_BUCKET_NAME": "corp-main",
+                "STORAGE_ACCESS_KEY_ID": "ak1",
+                "STORAGE_SECRET_ACCESS_KEY": "sk1",
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://minio:9000",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+                "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "ak2",
+                "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "sk2",
+            },
+            client_factory=_fake_factory,
+        )
 
 
 def test_prod_db_offsite_backup_set_mode_subprocess_e2e(tmp_path: Path) -> None:
@@ -5073,14 +5093,14 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
     import re
     import types
 
-    main_blob = b"main-workspace-blob-payload"
+    main_blob = b"asr-source-audio-payload"
     main_sha = _sha(main_blob)
     chat_file = b"chat-upload-under-prefix-payload"
     chat_sha = _sha(chat_file)
 
-    shared_bucket = "shared-dalton-bucket"
+    shared_bucket = "shared-dalton-aux-bucket"
     chat_prefix = "chat-ns"
-    main_key = f"blobs/u1/{main_sha}"
+    main_key = "transcriptions/ws1/job-1/source/clip.m4a"
     chat_logical_key = "chat-uploads/ws1/up1/report.pdf"
     chat_full_key = f"{chat_prefix}/{chat_logical_key}"
 
@@ -5089,12 +5109,12 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
     s3_shared.seed_object(shared_bucket, chat_full_key, chat_file, content_type="application/pdf")
 
     env = {
-        "STORAGE_PROVIDER": "s3",
-        "STORAGE_ENDPOINT_URL": "http://minio:9000",
-        "STORAGE_BUCKET_NAME": shared_bucket,
-        "STORAGE_KEY_PREFIX": "",
-        "STORAGE_ACCESS_KEY_ID": "ak",
-        "STORAGE_SECRET_ACCESS_KEY": "sk",
+        "STORAGE_PROVIDER": "none",
+        "DALTON_ASR_STORAGE_ENDPOINT_URL": "http://minio:9000",
+        "DALTON_ASR_STORAGE_BUCKET_NAME": shared_bucket,
+        "DALTON_ASR_STORAGE_KEY_PREFIX": "",
+        "DALTON_ASR_STORAGE_ACCESS_KEY_ID": "ak",
+        "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY": "sk",
         "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://minio:9000",
         "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": shared_bucket,
         "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX": chat_prefix,
@@ -5107,7 +5127,7 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
         rewrite_container_minio=False,
         client_factory=lambda **_kw: s3_shared,
     )
-    # Confirm two overlapping specs exist for the same (endpoint, bucket)
+    # Confirm two overlapping specs exist for the same secondary (endpoint, bucket)
     assert len(specs) == 2
     assert {s.key_prefix for s in specs} == {"", chat_prefix}
     assert {s.bucket for s in specs} == {shared_bucket}
@@ -5120,11 +5140,11 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
             return (True, True)
         if s.startswith("SELECT to_regclass"):
             tbl = params[0] if params else ""
-            if tbl in ("public.workspace_file_blobs", "public.dalton_chat_file_uploads"):
+            if tbl in ("public.dalton_transcription_jobs", "public.dalton_chat_file_uploads"):
                 return (tbl,)
             return (None,)
-        if "FROM workspace_file_blobs" in s:
-            return [("u1", main_sha, len(main_blob), False)]
+        if "FROM dalton_transcription_jobs" in s:
+            return [("job-1", "transcribing", main_key, len(main_blob), main_sha, {"upload": {"completed": True}}, None, None, None)]
         if "FROM dalton_chat_file_uploads" in s:
             return [("up1", "ready", chat_logical_key, len(chat_file), chat_sha)]
         return []
@@ -5979,12 +5999,12 @@ def test_r7_weekly_minio_baseline_dedups_overlapping_bucket_specs(tmp_path: Path
     s3.seed_object(shared_bucket, chat_full_key, chat_blob, content_type="application/pdf")
 
     env = {
-        "STORAGE_PROVIDER": "s3",
-        "STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
-        "STORAGE_BUCKET_NAME": shared_bucket,
-        "STORAGE_KEY_PREFIX": "",
-        "STORAGE_ACCESS_KEY_ID": "ak",
-        "STORAGE_SECRET_ACCESS_KEY": "sk",
+        "STORAGE_PROVIDER": "none",
+        "DALTON_ASR_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+        "DALTON_ASR_STORAGE_BUCKET_NAME": shared_bucket,
+        "DALTON_ASR_STORAGE_KEY_PREFIX": "",
+        "DALTON_ASR_STORAGE_ACCESS_KEY_ID": "ak",
+        "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY": "sk",
         "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
         "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": shared_bucket,
         "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX": chat_prefix,

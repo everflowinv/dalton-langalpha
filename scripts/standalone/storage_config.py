@@ -338,6 +338,29 @@ def resolve_effective_storage(
         )
         conflicts.append(details)
 
+    topology_conflicts: list[str] = []
+    general_bucket = str(targets.get("general", {}).get("bucket") or "").strip()
+    if general_bucket:
+        shared_aux = [
+            name
+            for name in ("asr", "chat_upload")
+            if str(targets.get(name, {}).get("bucket") or "").strip() == general_bucket
+        ]
+        if shared_aux:
+            topology_conflicts.append(
+                f"主桶 (general={general_bucket!r}) 与辅存储 ({', '.join(shared_aux)}) 使用了同一桶名"
+            )
+    services_by_bucket: dict[str, set[str]] = {}
+    for _name, t in targets.items():
+        b_name = str(t.get("bucket") or "").strip()
+        if b_name:
+            services_by_bucket.setdefault(b_name, set()).add(str(t.get("service_id") or ""))
+    for b_name, sids in sorted(services_by_bucket.items()):
+        if len(sids) > 1:
+            topology_conflicts.append(
+                f"同名桶 {b_name!r} 配置在多个端点 ({', '.join(sorted(sids))})"
+            )
+
     primary_bucket = ""
     primary_key_prefix = ""
     if "chat_upload" in targets:
@@ -356,6 +379,8 @@ def resolve_effective_storage(
         "service_ids": distinct_services,
         "single_service_ok": len(distinct_services) <= 1,
         "conflicts": conflicts,
+        "topology_ok": len(distinct_services) <= 1 and not topology_conflicts,
+        "topology_conflicts": topology_conflicts,
         "primary_bucket": primary_bucket,
         "primary_key_prefix": primary_key_prefix,
         "targets": {
@@ -649,11 +674,22 @@ def _cmd_check_env(args: argparse.Namespace) -> int:
 
     if not cfg["single_service_ok"]:
         print(
-            f"{prefix}ERROR: Multiple object storage services detected: {'; '.join(cfg['conflicts'])}",
+            f"{prefix}ERROR: 当前备份不支持该存储布局：Multiple object storage services detected: {'; '.join(cfg['conflicts'])}",
             file=sys.stderr,
         )
         print(
             f"{prefix}ERROR: v1 only supports a single object storage service; configure all application buckets on the same storage service.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not cfg.get("topology_ok", True):
+        print(
+            f"{prefix}ERROR: 当前备份不支持该存储布局：{'; '.join(cfg.get('topology_conflicts') or [])}",
+            file=sys.stderr,
+        )
+        print(
+            f"{prefix}ERROR: 仅支持单一 MinIO 端点且主桶与辅桶名称不同的存储布局。",
             file=sys.stderr,
         )
         return 1

@@ -55,6 +55,27 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 
+def _format_sdk_error(exc: BaseException, *, operation: str) -> str:
+    """Format an S3/Botocore exception using safe metadata only (never raw SDK text/body)."""
+    parts = [f"op={operation}", f"type={type(exc).__name__}"]
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        err = resp.get("Error")
+        if isinstance(err, dict):
+            code = str(err.get("Code") or "").strip()
+            if code:
+                parts.append(f"code={code}")
+        meta = resp.get("ResponseMetadata")
+        if isinstance(meta, dict):
+            http_status = meta.get("HTTPStatusCode")
+            if http_status is not None and str(http_status).strip():
+                parts.append(f"http_status={http_status}")
+            req_id = str(meta.get("RequestId") or "").strip()
+            if req_id:
+                parts.append(f"request_id={req_id}")
+    return ", ".join(parts)
+
+
 def _ensure_private_bucket(
     client: object,
     *,
@@ -72,11 +93,30 @@ def _ensure_private_bucket(
             create_kwargs: dict[str, object] = {"Bucket": bucket}
             if region and region != "us-east-1":
                 create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-            client.create_bucket(**create_kwargs)  # type: ignore[attr-defined]
+            try:
+                client.create_bucket(**create_kwargs)  # type: ignore[attr-defined]
+            except Exception as create_exc:
+                print(
+                    f"[minio-init] ERROR creating bucket '{bucket}': "
+                    f"{_format_sdk_error(create_exc, operation='CreateBucket')}",
+                    file=sys.stderr,
+                )
+                return 1
             print(f"[minio-init] Created bucket '{bucket}'.", flush=True)
         else:
-            print(f"[minio-init] ERROR checking bucket '{bucket}': {exc}", file=sys.stderr)
+            print(
+                f"[minio-init] ERROR checking bucket '{bucket}': "
+                f"{_format_sdk_error(exc, operation='HeadBucket')}",
+                file=sys.stderr,
+            )
             return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR checking bucket '{bucket}': "
+            f"{_format_sdk_error(exc, operation='HeadBucket')}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Ensure no anonymous public policy is attached.
     try:
@@ -85,18 +125,28 @@ def _ensure_private_bucket(
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code != "NoSuchBucketPolicy":
             print(
-                f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+                f"[minio-init] ERROR clearing bucket policy on '{bucket}': "
+                f"{_format_sdk_error(exc, operation='DeleteBucketPolicy')}",
                 file=sys.stderr,
             )
             return 1
     except Exception as exc:
         print(
-            f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR clearing bucket policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='DeleteBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
 
-    client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    try:
+        client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR verifying bucket '{bucket}': "
+            f"{_format_sdk_error(exc, operation='HeadBucket')}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
     return 0
 
@@ -119,7 +169,8 @@ def _ensure_main_avatars_policy(
         )
     except Exception as exc:
         print(
-            f"[minio-init] ERROR setting avatars read-only policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR setting avatars read-only policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='PutBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
@@ -128,7 +179,8 @@ def _ensure_main_avatars_policy(
         resp = client.get_bucket_policy(Bucket=bucket)  # type: ignore[attr-defined]
     except Exception as exc:
         print(
-            f"[minio-init] ERROR verifying avatars read-only policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR verifying avatars read-only policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
@@ -170,13 +222,15 @@ def _ensure_secondary_lifecycle(
             resp = {}
         else:
             print(
-                f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
+                f"[minio-init] ERROR reading lifecycle rules on '{bucket}': "
+                f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
                 file=sys.stderr,
             )
             return 1
     except Exception as exc:
         print(
-            f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
+            f"[minio-init] ERROR reading lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
             file=sys.stderr,
         )
         return 1
@@ -198,7 +252,8 @@ def _ensure_secondary_lifecycle(
         )
     except Exception as exc:
         print(
-            f"[minio-init] ERROR setting lifecycle rules on '{bucket}': {exc}",
+            f"[minio-init] ERROR setting lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='PutBucketLifecycleConfiguration')}",
             file=sys.stderr,
         )
         return 1
@@ -207,7 +262,8 @@ def _ensure_secondary_lifecycle(
         verify_resp = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
     except Exception as exc:
         print(
-            f"[minio-init] ERROR verifying lifecycle rules on '{bucket}': {exc}",
+            f"[minio-init] ERROR verifying lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
             file=sys.stderr,
         )
         return 1
