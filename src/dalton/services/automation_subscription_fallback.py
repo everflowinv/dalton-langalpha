@@ -391,21 +391,107 @@ async def resolve_automation_turn_llm_config(
     ignore_custom_models: bool = False,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve an automation first turn's LLM config with subscription fallback."""
-    async def _resolve(model_name: str | None) -> Any:
-        return await resolve_llm_config(
-            base_config,
-            user_id,
-            model_name,
-            is_byok,
-            reasoning_effort=reasoning_effort,
-            fast_mode=fast_mode,
-            thread_id=thread_id,
-            enabled_subagents=enabled_subagents,
-            workspace_id=workspace_id,
-            identity=identity,
-            role=role,
+    from contextlib import nullcontext
+
+    from src.dalton.llm.unattended_fallback import (
+        UnattendedTurnContext,
+        bind_unattended_turn_context,
+        format_unattended_quota_notice,
+        inspect_subscription_availability,
+        resolve_unattended_fallback_chain,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    unattended_on = is_unattended_quota_fallback_enabled()
+    ctx = (
+        UnattendedTurnContext(
+            is_unattended=True,
+            subject_user_id=user_id,
+            source_kind="automation",
             ignore_custom_models=ignore_custom_models,
+            thread_id=thread_id,
+            role=str(role or "analyst"),
         )
+        if unattended_on
+        else None
+    )
+
+    async def _resolve(model_name: str | None) -> Any:
+        with bind_unattended_turn_context(ctx) if ctx is not None else nullcontext():
+            return await resolve_llm_config(
+                base_config,
+                user_id,
+                model_name,
+                is_byok,
+                reasoning_effort=reasoning_effort,
+                fast_mode=fast_mode,
+                thread_id=thread_id,
+                enabled_subagents=enabled_subagents,
+                workspace_id=workspace_id,
+                identity=identity,
+                role=role,
+                ignore_custom_models=ignore_custom_models,
+            )
+
+    # Pre-dispatch structured cooldown check when unattended quota fallback is enabled.
+    if unattended_on:
+        try:
+            pre_prefs = await user_models.get_model_preference(user_id)
+        except Exception:
+            pre_prefs = {}
+        default_pre_prefs = (
+            _strip_custom_models(pre_prefs) if ignore_custom_models else pre_prefs
+        )
+        probe_model = request_model or thread_model.effective_default_model(
+            default_pre_prefs
+        )
+        if probe_model:
+            avail = await inspect_subscription_availability(
+                user_id,
+                probe_model,
+                prefs=default_pre_prefs,
+                ignore_custom_models=ignore_custom_models,
+            )
+            if not avail.available:
+                cands = resolve_unattended_fallback_chain(
+                    user_prefs=pre_prefs,
+                    primary_model=probe_model,
+                    skip_cooldown_keys=[avail.cooldown_key] if avail.cooldown_key else (),
+                    user_id=user_id,
+                    ignore_custom_models=ignore_custom_models,
+                )
+                for cand in cands:
+                    cand_avail = await inspect_subscription_availability(
+                        user_id,
+                        cand,
+                        prefs=default_pre_prefs,
+                        ignore_custom_models=ignore_custom_models,
+                    )
+                    if not cand_avail.available:
+                        continue
+                    try:
+                        cfg = await _resolve(cand)
+                    except Exception:
+                        continue
+                    chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
+                    kind = (
+                        "oauth_auth_unavailable"
+                        if avail.kind == "auth_unavailable"
+                        else "subscription_quota_exhausted"
+                    )
+                    record = {
+                        "original_model": probe_model,
+                        "fallback_model": chosen,
+                        "provider": avail.provider,
+                        "reason": avail.refusal_code or kind,
+                        "notice": format_unattended_quota_notice(
+                            kind,
+                            model_name=probe_model,
+                            reset_at=avail.reset_at,
+                            fallback_model=chosen,
+                        ),
+                    }
+                    return cfg, record
 
     with capture_resolved_effective_model() as captured_model:
         try:
@@ -450,7 +536,14 @@ async def resolve_ptc_turn_llm_config(
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve LLM config for ``ptc_run`` with automation subscription fallback when eligible."""
     ignore_custom = bool(getattr(request, "llm_model_system_only", False))
-    if is_automation_executor_turn(request, run_metadata):
+    from src.dalton.llm.unattended_fallback import is_unattended_turn
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    unattended_eligible = is_automation_executor_turn(request, run_metadata) or (
+        is_unattended_quota_fallback_enabled()
+        and is_unattended_turn(request, run_metadata=run_metadata)
+    )
+    if unattended_eligible:
         config, fallback_record = await resolve_automation_turn_llm_config(
             base_config,
             user_id,

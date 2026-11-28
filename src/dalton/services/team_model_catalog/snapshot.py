@@ -396,6 +396,134 @@ async def resolve_live_route_fingerprint(
     )
 
 
+def extract_snapshot_route_fingerprint(
+    snapshot: Mapping[str, Any] | None,
+    model_key: str,
+) -> RouteFingerprint | None:
+    """Extract the 6-tuple :class:`RouteFingerprint` recorded for ``model_key`` in ``snapshot``."""
+    if not isinstance(snapshot, Mapping) or not model_key:
+        return None
+    models = snapshot.get("models")
+    if not isinstance(models, Mapping):
+        return None
+    snap_entry = models.get(model_key)
+    if not isinstance(snap_entry, Mapping):
+        return None
+    snap_prov = str(snap_entry.get("provider") or "").strip()
+    snap_mid = str(snap_entry.get("model_id") or model_key).strip()
+    snap_billing = str(snap_entry.get("billing") or "cash").strip().lower() or "cash"
+    variants = snapshot.get("variants")
+    v_entry = variants.get(snap_prov) if isinstance(variants, Mapping) else None
+    snap_pinfo = (
+        snap_entry.get("provider_info")
+        if isinstance(snap_entry.get("provider_info"), Mapping)
+        else {}
+    )
+    snap_url = _canonical_url_or_none(
+        snap_entry.get("canonical_bound_url")
+        or snap_entry.get("bound_base_url")
+        or (
+            v_entry.get("canonical_bound_url") or v_entry.get("bound_base_url")
+            if isinstance(v_entry, Mapping)
+            else None
+        )
+        or snap_pinfo.get("base_url")
+    )
+    snap_fp_raw = snap_entry.get("key_fingerprint") or (
+        v_entry.get("key_fingerprint") if isinstance(v_entry, Mapping) else None
+    )
+    snap_fp = str(snap_fp_raw).strip() if snap_fp_raw else None
+    return RouteFingerprint(
+        model_key=model_key,
+        provider=snap_prov,
+        model_id=snap_mid,
+        bound_base_url=snap_url,
+        key_fingerprint=snap_fp,
+        billing=snap_billing,
+    )
+
+
+def diff_route_fingerprints(
+    snap_route: RouteFingerprint,
+    live_route: RouteFingerprint,
+) -> dict[str, dict[str, Any]]:
+    """Return field-level diffs across all 6 route fingerprint fields."""
+    snap_url = _canonical_url_or_none(snap_route.bound_base_url)
+    live_url = _canonical_url_or_none(live_route.bound_base_url)
+    snap_fp = str(snap_route.key_fingerprint).strip() if snap_route.key_fingerprint else None
+    live_fp = str(live_route.key_fingerprint).strip() if live_route.key_fingerprint else None
+    diffs: dict[str, dict[str, Any]] = {}
+    if live_route.model_key != snap_route.model_key:
+        diffs["model_key"] = {"snapshot": snap_route.model_key, "live": live_route.model_key}
+    if live_route.provider.lower() != snap_route.provider.lower():
+        diffs["provider"] = {"snapshot": snap_route.provider, "live": live_route.provider}
+    if live_route.model_id != snap_route.model_id:
+        diffs["model_id"] = {"snapshot": snap_route.model_id, "live": live_route.model_id}
+    if snap_url != live_url:
+        diffs["bound_base_url"] = {"snapshot": snap_url, "live": live_url}
+    if snap_fp != live_fp:
+        diffs["key_fingerprint"] = {"snapshot": snap_fp, "live": live_fp}
+    if live_route.billing != snap_route.billing:
+        diffs["billing"] = {"snapshot": snap_route.billing, "live": live_route.billing}
+    return diffs
+
+
+async def verify_candidate_route_against_snapshot(
+    model_key: str,
+    resolved_route: RouteFingerprint | Mapping[str, Any],
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    is_subagent: bool = False,
+    run_row: Mapping[str, Any] | None = None,
+    conn: Any = None,
+    allow_unrecorded: bool = False,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Compare a candidate model's live :class:`RouteFingerprint` against the turn snapshot.
+
+    Used before activating a fallback candidate at runtime or during wakeup/retry resume:
+    - When no snapshot exists (legacy run), returns ``(True, {})``.
+    - When ``model_key`` is recorded in ``snapshot["models"]``, verifies all 6 fields and
+      returns ``(not diffs, diffs)``.
+    - When ``model_key`` is absent from ``snapshot["models"]``, returns ``(True, {})`` if
+      ``allow_unrecorded=True`` else ``(False, {"model_key": ...})``.
+    """
+    snap: Mapping[str, Any] | None = snapshot if isinstance(snapshot, Mapping) else None
+    if snap is None:
+        row: dict[str, Any] | None = dict(run_row) if isinstance(run_row, Mapping) else None
+        if row is None and run_id:
+            row = await _fetch_persisted_run_row(
+                str(run_id),
+                thread_id=thread_id,
+                is_subagent=is_subagent,
+                conn=conn,
+            )
+        if row is not None:
+            container_key = "replay_facts" if is_subagent else "metadata"
+            container = row.get(container_key)
+            if isinstance(container, Mapping):
+                existing = container.get("effective_catalog_snapshot")
+                if isinstance(existing, Mapping) and existing.get("schema") == TURN_SNAPSHOT_SCHEMA:
+                    snap = existing
+    if snap is None:
+        snap = get_active_catalog_snapshot()
+    if not isinstance(snap, Mapping):
+        return True, {}
+    models = snap.get("models")
+    if not isinstance(models, Mapping) or not models:
+        return True, {}
+
+    live = _coerce_route_fingerprint(resolved_route)
+    snap_route = extract_snapshot_route_fingerprint(snap, model_key)
+    if snap_route is None:
+        if allow_unrecorded:
+            return True, {}
+        return False, {"model_key": {"snapshot": None, "live": live.model_key or model_key}}
+    diffs = diff_route_fingerprints(snap_route, live)
+    return (len(diffs) == 0), diffs
+
+
 async def verify_resume_route(
     run_id: str | None,
     resolved_route: RouteFingerprint | Mapping[str, Any],
@@ -409,7 +537,8 @@ async def verify_resume_route(
     """Compare ``resolved_route`` against the interrupted run's persisted snapshot before client creation.
 
     - Legacy runs with no persisted ``effective_catalog_snapshot`` proceed unchanged (returns ``None``).
-    - When a persisted snapshot exists for the original run's model, verifies all 6 route fields:
+    - When a persisted snapshot exists for the original run's model (or an unattended run's
+      recorded ``active_fallback_route``), verifies all 6 route fields:
       ``(model_key, provider, model_id, bound_base_url, key_fingerprint, billing)``.
     - Raises HTTP 400 (``catalog_route_changed``) on any mismatch so the caller never sends requests
       under a mutated catalog route or attempts to reconstruct a stale client.
@@ -441,61 +570,31 @@ async def verify_resume_route(
         return None
 
     live = _coerce_route_fingerprint(resolved_route)
-    orig_model_key = (
-        _extract_primary_model_key_from_run(row, is_subagent=is_subagent, snapshot=snap)
-        if row is not None
-        else (next(iter(models.keys())) if len(models) == 1 else live.model_key or None)
-    )
+    orig_model_key: str | None = None
+    if row is not None:
+        container_key = "replay_facts" if is_subagent else "metadata"
+        container = row.get(container_key)
+        if isinstance(container, Mapping):
+            active_fb = container.get("active_fallback_route")
+            if isinstance(active_fb, Mapping):
+                fb_mk = _extract_model_key_value(active_fb.get("model_key"))
+                if fb_mk and fb_mk in models:
+                    orig_model_key = fb_mk
+        if not orig_model_key:
+            orig_model_key = _extract_primary_model_key_from_run(
+                row, is_subagent=is_subagent, snapshot=snap
+            )
+    else:
+        orig_model_key = next(iter(models.keys())) if len(models) == 1 else live.model_key or None
     if not orig_model_key:
         return None
 
-    snap_entry = models.get(orig_model_key)
-    if not isinstance(snap_entry, Mapping):
+    snap_route = extract_snapshot_route_fingerprint(snap, orig_model_key)
+    if snap_route is None:
         # Original run was not on a snapshotted team catalog model (e.g. personal custom model).
         return None
 
-    snap_prov = str(snap_entry.get("provider") or "").strip()
-    snap_mid = str(snap_entry.get("model_id") or orig_model_key).strip()
-    snap_billing = str(snap_entry.get("billing") or "cash").strip().lower() or "cash"
-
-    variants = snap.get("variants")
-    v_entry = variants.get(snap_prov) if isinstance(variants, Mapping) else None
-    snap_pinfo = (
-        snap_entry.get("provider_info")
-        if isinstance(snap_entry.get("provider_info"), Mapping)
-        else {}
-    )
-    snap_url = _canonical_url_or_none(
-        snap_entry.get("canonical_bound_url")
-        or snap_entry.get("bound_base_url")
-        or (
-            v_entry.get("canonical_bound_url") or v_entry.get("bound_base_url")
-            if isinstance(v_entry, Mapping)
-            else None
-        )
-        or snap_pinfo.get("base_url")
-    )
-    snap_fp_raw = snap_entry.get("key_fingerprint") or (
-        v_entry.get("key_fingerprint") if isinstance(v_entry, Mapping) else None
-    )
-    snap_fp = str(snap_fp_raw).strip() if snap_fp_raw else None
-
-    live_url = _canonical_url_or_none(live.bound_base_url)
-    live_fp = str(live.key_fingerprint).strip() if live.key_fingerprint else None
-
-    diffs: dict[str, dict[str, Any]] = {}
-    if live.model_key != orig_model_key:
-        diffs["model_key"] = {"snapshot": orig_model_key, "live": live.model_key}
-    if live.provider.lower() != snap_prov.lower():
-        diffs["provider"] = {"snapshot": snap_prov, "live": live.provider}
-    if live.model_id != snap_mid:
-        diffs["model_id"] = {"snapshot": snap_mid, "live": live.model_id}
-    if snap_url != live_url:
-        diffs["bound_base_url"] = {"snapshot": snap_url, "live": live_url}
-    if snap_fp != live_fp:
-        diffs["key_fingerprint"] = {"snapshot": snap_fp, "live": live_fp}
-    if live.billing != snap_billing:
-        diffs["billing"] = {"snapshot": snap_billing, "live": live.billing}
+    diffs = diff_route_fingerprints(snap_route, live)
 
     if diffs:
         resolved_run_id = str(
@@ -1052,11 +1151,17 @@ def _extract_candidate_models_from_run(
             extracted = _extract_model_key_value(container.get(field_name))
             if extracted:
                 keys.append(extracted)
-        fallbacks = container.get("fallback_models")
-        if isinstance(fallbacks, list):
-            for fb in fallbacks:
-                if isinstance(fb, str) and fb.strip():
-                    keys.append(fb.strip())
+        for list_field in ("fallback_models", "unattended_fallback_models"):
+            fallbacks = container.get(list_field)
+            if isinstance(fallbacks, list):
+                for fb in fallbacks:
+                    if isinstance(fb, str) and fb.strip():
+                        keys.append(fb.strip())
+        active_fb = container.get("active_fallback_route")
+        if isinstance(active_fb, Mapping):
+            fb_mk = _extract_model_key_value(active_fb.get("model_key"))
+            if fb_mk:
+                keys.append(fb_mk)
     for field_name in ("model", "llm_model"):
         extracted = _extract_model_key_value(run_row.get(field_name))
         if extracted:

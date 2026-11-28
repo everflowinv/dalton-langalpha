@@ -1782,7 +1782,7 @@ def test_rolling_upgrade_effective_seq_and_d06y_alembic_chain_from_d060(
     cfg = AlembicConfig(str(alembic_ini))
     cfg.set_main_option("script_location", str(script_loc))
     script_dir = ScriptDirectory.from_config(cfg)
-    assert script_dir.get_heads() == ["d061"]
+    assert script_dir.get_heads() == ["d062"]
     rev = script_dir.get_revision("d061")
     assert rev is not None and rev.down_revision == "d060"
 

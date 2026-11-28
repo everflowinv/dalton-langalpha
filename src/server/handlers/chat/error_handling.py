@@ -143,6 +143,11 @@ def classify_error(e: Exception) -> dict:
         or "connection refused" in str(e).lower()
     )
 
+    # DALTON-HOOK(quota-exhaustion): terminal quota/subscription refusals skip outer same-model auto-retry
+    from src.dalton.llm.unattended_fallback import is_terminal_quota_refusal
+    if is_terminal_quota_refusal(e):
+        return {"is_recoverable": False, "is_non_recoverable": False, "error_type": None}
+
     # API errors (transient server errors, rate limits, etc.)
     error_str = str(e).lower()
     error_type_name = type(e).__name__.lower()
@@ -396,6 +401,11 @@ async def handle_workflow_error(
             )
             return False
         if (result.run or {}).get("status") != "cancelled":
+            # DALTON-HOOK(quota-exhaustion): schedule mid-turn wakeup checkpoint resume on terminal quota exhaustion
+            from src.dalton.llm.unattended_fallback import maybe_schedule_wakeup_mid_turn_resume
+            await maybe_schedule_wakeup_mid_turn_resume(
+                exc=e, thread_id=thread_id, user_id=user_id, run_handle=run_handle, request=request
+            )
             return False
         return True
 

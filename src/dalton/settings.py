@@ -2224,3 +2224,34 @@ def get_monitor_multi_binding_publish_mode() -> Literal["per_panel", "all_or_not
             return val  # type: ignore[return-value]
     return "per_panel"
 
+
+def is_unattended_quota_fallback_enabled() -> bool:
+    """Switch for unattended-turn subscription quota fallback & wakeup deferral (default ``False``).
+
+    Reads ``DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED`` -> YAML
+    ``autonomy.unattended_quota_fallback_enabled`` -> ``False``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED",
+        "autonomy",
+        "unattended_quota_fallback_enabled",
+        default=False,
+    )
+
+
+def allow_cash_fallback_on_unattended() -> bool:
+    """Switch allowing unattended quota fallback to spill into cash-billed models (default ``False``).
+
+    When ``False`` (default), unattended fallback is strictly confined to ``$0``
+    OAuth subscription models. When ``True``, cash fallback is gated atomically
+    through ``acquire_cash_lease_tx``. Reads
+    ``DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED`` -> YAML
+    ``autonomy.allow_cash_fallback_on_unattended`` -> ``False``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED",
+        "autonomy",
+        "allow_cash_fallback_on_unattended",
+        default=False,
+    )
+

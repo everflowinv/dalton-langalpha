@@ -366,6 +366,10 @@ async def _deliver(wake: _Wake) -> _Exit:
     plan_hold: dict[str, Any] = {}
 
     async def _plan_limited(detail: dict[str, Any]) -> None:
+        # DALTON-HOOK(quota-exhaustion): preserve exhausted_failed marker for Dalton wakeup shared cap
+        if detail.get("type") == "dalton_wakeup_quota_exhausted":
+            plan_hold.update(exhausted_failed=True, reason=detail.get("reason"))
+            return
         plan_hold.update(
             reset_at=detail["held_until"], window=detail.get("window"), known=detail.get("held_known", True),
             credential=detail.get("held_credential"), model_id=detail.get("held_model"),
@@ -431,6 +435,11 @@ async def _deliver(wake: _Wake) -> _Exit:
             "wakeup": {"v": 1, "notices": notices},
             "request_key": request_key(job_id),
         }
+        # DALTON-HOOK(quota-exhaustion): stamp root_job_id/attempts onto wakeup request when enabled
+        from src.dalton.llm.unattended_fallback import annotate_wakeup_request_body
+        annotate_wakeup_request_body(
+            body, job_id=job_id, attempts=attempts, payload=wake.payload, created_at=wake.job.get("created_at")
+        )
 
         outcome, run_id = await post_notification_turn(
             thread_id=thread_id,
@@ -505,6 +514,10 @@ async def _deliver(wake: _Wake) -> _Exit:
         if outcome == "plan_limited":
             if await _adopt_own_wake(wake):
                 return "settled"
+            # DALTON-HOOK(quota-exhaustion): settle cleanly when shared deferral limit/24h/auth cap is exhausted
+            if plan_hold.get("exhausted_failed"):
+                logger.warning(f"{_LOG} Wake for {subject} on thread {thread_id} exhausted quota deferral cap; settling")
+                return "release"
             # Held until the plan resets, then woken, rather than for the
             # thread's next turn, which may not come for days.
             if await outbox_db.hold_alert_for_plan(job_id, attempts=attempts, plan_hold=plan_hold):
@@ -555,3 +568,6 @@ def register_wakeup_executors() -> None:
     from src.server.services.hook_outbox import register_hook_executor
 
     register_hook_executor(HOOK_TYPE, execute_wakeup)
+    # DALTON-HOOK(quota-exhaustion): register cross-worker wakeup checkpoint-resume executor
+    from src.dalton.llm.unattended_fallback import WAKEUP_QUOTA_RESUME_HOOK, execute_wakeup_quota_resume
+    register_hook_executor(WAKEUP_QUOTA_RESUME_HOOK, execute_wakeup_quota_resume)

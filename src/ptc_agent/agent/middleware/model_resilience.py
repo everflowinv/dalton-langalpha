@@ -1972,12 +1972,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
         always has.
         """
         billing = _stamped(model, "billing_type")
+        # DALTON-HOOK(automation-subscription-fallback): permit unattended quota_or_auth_only fallbacks across payers/oauth
+        from src.dalton.llm.unattended_fallback import is_quota_or_auth_only_client
         if billing == "oauth":
-            return []
+            return [(name, client) for name, client in fallbacks if is_quota_or_auth_only_client(client)]
         if billing is None:
             return fallbacks
         return [(name, client) for name, client in fallbacks
-                if _stamped(client, "billing_type") == billing]
+                if _stamped(client, "billing_type") == billing or is_quota_or_auth_only_client(client)]
 
     def _classify(self, exc: Exception) -> tuple[int | None, bool]:
         status = extract_status_code(exc)
@@ -2133,6 +2135,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         tried_any = False
         primary_skipped = False
+        last_benched = False  # DALTON-HOOK(automation-subscription-fallback)
         for index, (name, client) in enumerate(candidates):
             # DALTON-HOOK(quota-exhaustion): a candidate this run already
             # judged out of quota is not re-asked — the refusal that benched
@@ -2145,6 +2148,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 if index == 0:
                     primary_skipped = True
                 continue
+            # DALTON-HOOK(automation-subscription-fallback): enforce quota/auth trigger on sync path too
+            if index > 0:
+                from src.dalton.llm.unattended_fallback import is_quota_or_auth_only_client, is_quota_or_auth_switch_trigger
+                if is_quota_or_auth_only_client(cand_client) and not primary_skipped and not is_quota_or_auth_switch_trigger(records[-1].exc if records else None, quota_benched=last_benched):
+                    continue
             if not tried_any:
                 tried_any = True
                 self._notify_bench_switch(request, candidates, index)
@@ -2181,6 +2189,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     if benched:
                         recovery = None
                     if recovery is None:
+                        last_benched = benched  # DALTON-HOOK(automation-subscription-fallback)
                         if benched and frozen_refusal is not None:
                             try:
                                 setattr(exc, "provider_refusal", frozen_refusal)
@@ -2246,6 +2255,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         tried_any = False
         primary_skipped = False
+        last_benched = False  # DALTON-HOOK(automation-subscription-fallback)
         for index, (name, client) in enumerate(candidates):
             # DALTON-HOOK(quota-exhaustion): a candidate this run (or another worker
             # sharing the credential in Redis) already judged out of quota is not
@@ -2258,6 +2268,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 if index == 0:
                     primary_skipped = True
                 continue
+            # DALTON-HOOK(automation-subscription-fallback): enforce quota/auth trigger & live 4-gate admission before activating quota_or_auth_only fallback
+            if index > 0:
+                from src.dalton.llm.unattended_fallback import verify_middleware_fallback_switch
+                if not await verify_middleware_fallback_switch(
+                    candidate_name=name, candidate_client=cand_client,
+                    last_exc=records[-1].exc if records else None,
+                    primary_quota_skipped=primary_skipped, quota_benched=last_benched,
+                    call_id=f"{name}:{_last_message_id(request) or index}",
+                ):
+                    continue
             if not tried_any:
                 tried_any = True
                 self._notify_bench_switch(request, candidates, index)
@@ -2312,6 +2332,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     if benched:
                         recovery = None
                     if recovery is None:
+                        last_benched = benched  # DALTON-HOOK(automation-subscription-fallback)
                         if benched and frozen_refusal is not None:
                             try:
                                 setattr(exc, "provider_refusal", frozen_refusal)
@@ -2345,6 +2366,10 @@ class ModelResilienceMiddleware(AgentMiddleware):
             following = await self._anext_tried(request, candidates, index, refused_at)
             if following is not None:
                 to_model, to_client = candidates[following]
+                # DALTON-HOOK(automation-subscription-fallback): skip fallback notice when next candidate is quota_or_auth_only on non-quota error
+                from src.dalton.llm.unattended_fallback import is_quota_or_auth_only_client, is_quota_or_auth_switch_trigger
+                if is_quota_or_auth_only_client(to_client) and not is_quota_or_auth_switch_trigger(records[-1].exc, quota_benched=last_benched):
+                    continue
                 self._emit_fallback_once(
                     records[-1],
                     to_model,

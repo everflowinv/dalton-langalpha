@@ -419,6 +419,31 @@ async def assist_json(
             persist_raw=persist_raw,
             skip_journal=skip_journal,
         )
+        def _is_quota_or_auth_failure(c: Any) -> bool:
+            if c.ok:
+                return False
+            text = f"{getattr(c, 'error_kind', '') or ''} {getattr(c, 'error', '') or ''}".lower()
+            return any(
+                tok in text
+                for tok in (
+                    "http_429",
+                    "429",
+                    "quota",
+                    "plan_limit",
+                    "rate_limit",
+                    "oauth",
+                    "reauth",
+                    "out_of_credit",
+                )
+            )
+
+        from src.dalton.settings import (
+            allow_cash_fallback_on_unattended,
+            is_unattended_quota_fallback_enabled,
+        )
+
+        unattended_assist_fallback = is_unattended_quota_fallback_enabled()
+
         def _should_fall_back(c: Any, m: str) -> bool:
             if c.ok:
                 return False
@@ -429,7 +454,11 @@ async def assist_json(
             # dalton_complete returns without claiming once past its deadline).
             if own_chain and deadline is not None and time.monotonic() >= deadline:
                 return True
-            return own_chain and _is_subscription(m) and _is_timeout_or_rate_limit(c)
+            if own_chain and _is_subscription(m) and _is_timeout_or_rate_limit(c):
+                return True
+            if unattended_assist_fallback and _is_subscription(m) and _is_quota_or_auth_failure(c):
+                return True
+            return False
 
         def _past_deadline() -> bool:
             return deadline is not None and time.monotonic() >= deadline
@@ -438,6 +467,14 @@ async def assist_json(
             primary_model = resolved_model
             for fb_cand in fb_list:
                 if fb_cand == primary_model:
+                    continue
+                if (
+                    unattended_assist_fallback
+                    and not own_chain
+                    and not _is_safe_to_fallback(comp)
+                    and not _is_subscription(fb_cand)
+                    and not allow_cash_fallback_on_unattended()
+                ):
                     continue
                 if _past_deadline():
                     # A5: a replay probe, not a model failure. Logging these as

@@ -170,16 +170,143 @@ async def internal_llm_complete(
             detail="DALTON_PM_USER_IDS is not configured for internal LLM calls.",
         )
 
+    from src.dalton.llm.unattended_fallback import (
+        _maybe_enqueue_failure_notice_in_tx,
+        format_unattended_quota_notice,
+        inspect_subscription_availability,
+        resolve_unattended_fallback_chain,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+    from src.server.database.pool import get_db_connection
+
+    unattended_on = is_unattended_quota_fallback_enabled()
+    primary_avail = None
+    active_model = requested_model
+    if unattended_on:
+        primary_avail = await inspect_subscription_availability(
+            primary_admin_id, requested_model
+        )
+        if not primary_avail.available:
+            skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+            ordered_pool = [m for m in sorted(allowed_models) if m != requested_model]
+            pre_candidates = resolve_unattended_fallback_chain(
+                task_fallbacks=ordered_pool,
+                primary_model=requested_model,
+                allowed_pool=allowed_models,
+                allow_cash=False,
+                skip_cooldown_keys=skip_keys,
+                user_id=primary_admin_id,
+                ignore_custom_models=True,
+            )
+            for cand_model in pre_candidates:
+                cand_avail = await inspect_subscription_availability(
+                    primary_admin_id, cand_model
+                )
+                if cand_avail.available:
+                    active_model = cand_model
+                    break
+
     result = await dalton_complete(
         user_id=primary_admin_id,
         system_prompt=payload.system_prompt,
         user_prompt=payload.user_prompt,
-        model=requested_model,
+        model=active_model,
         response_schema=schema_model,
         slot="background",
         purpose=payload.purpose,
         timeout_s=payload.timeout_s,
     )
+
+    if not result.ok and unattended_on:
+        err_blob = f"{getattr(result, 'error_kind', '') or ''} {result.error or ''}".lower()
+        is_quota_or_auth = any(
+            tok in err_blob
+            for tok in (
+                "429",
+                "quota",
+                "plan_limit",
+                "rate_limit",
+                "oauth",
+                "reauth",
+                "out_of_credit",
+                "billing",
+            )
+        )
+        if is_quota_or_auth:
+            if primary_avail is None:
+                primary_avail = await inspect_subscription_availability(
+                    primary_admin_id, active_model
+                )
+            skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+            tried = {active_model}
+            ordered_pool = [m for m in sorted(allowed_models) if m not in tried]
+            candidates = resolve_unattended_fallback_chain(
+                task_fallbacks=ordered_pool,
+                primary_model=active_model,
+                allowed_pool=allowed_models,
+                allow_cash=False,
+                skip_cooldown_keys=skip_keys,
+                user_id=primary_admin_id,
+                ignore_custom_models=True,
+            )
+            for cand_model in candidates:
+                cand_avail = await inspect_subscription_availability(
+                    primary_admin_id, cand_model
+                )
+                if not cand_avail.available:
+                    continue
+                cand_res = await dalton_complete(
+                    user_id=primary_admin_id,
+                    system_prompt=payload.system_prompt,
+                    user_prompt=payload.user_prompt,
+                    model=cand_model,
+                    response_schema=schema_model,
+                    slot="background",
+                    purpose=payload.purpose,
+                    timeout_s=payload.timeout_s,
+                )
+                result = cand_res
+                if cand_res.ok:
+                    logger.info(
+                        "[InternalLLM] Primary %s quota/auth failed; succeeded on whitelisted fallback %s",
+                        requested_model,
+                        cand_model,
+                    )
+                    break
+
+            if not result.ok:
+                # Best-effort Item 3 call-site (no-op when Item 3 is absent/disabled)
+                try:
+                    async with get_db_connection() as conn:
+                        async with conn.transaction():
+                            await _maybe_enqueue_failure_notice_in_tx(
+                                conn,
+                                subject_kind="data_task",
+                                subject_id=f"internal_llm:{payload.purpose}:{requested_model}",
+                                source_key=payload.purpose,
+                                recipient_user_id=primary_admin_id,
+                                failure_reason="subscription_quota_exhausted",
+                                summary={
+                                    "model": requested_model,
+                                    "purpose": payload.purpose,
+                                    "message": format_unattended_quota_notice(
+                                        "subscription_quota_exhausted",
+                                        model_name=requested_model,
+                                        reset_at=primary_avail.reset_at if primary_avail else None,
+                                    ),
+                                },
+                                dedup_window_key=(
+                                    f"data_task_quota:{primary_avail.cooldown_key}"
+                                    if primary_avail and primary_avail.cooldown_key
+                                    else None
+                                ),
+                            )
+                except Exception:
+                    logger.debug(
+                        "[InternalLLM] Optional failure-notice hook skipped for purpose=%s",
+                        payload.purpose,
+                        exc_info=True,
+                    )
 
     if result.ok:
         return InternalLLMCompleteResponse(

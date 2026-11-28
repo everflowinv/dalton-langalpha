@@ -914,9 +914,12 @@ async def _plan_limited(resp) -> dict | None:
         detail = (await resp.json()).get("detail")
     except Exception:
         return None
+    # DALTON-HOOK(quota-exhaustion): recognize Dalton unattended subscription cooldown & wakeup exhaustion
+    if isinstance(detail, dict) and detail.get("type") == "dalton_wakeup_quota_exhausted":
+        return detail
     if (
         isinstance(detail, dict)
-        and detail.get("type") == "claude_code_off"
+        and detail.get("type") in ("claude_code_off", "dalton_subscription_cooldown")
         and detail.get("reason") == "plan_limited"
         and isinstance(detail.get("held_until"), str)
     ):
