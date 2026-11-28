@@ -16,7 +16,10 @@ from pydantic import BaseModel, Field, create_model
 
 from src.dalton.app.channels_router import require_channel_service_token
 from src.dalton.capabilities import CapabilityId, require_capability_dep
-from src.dalton.llm.complete import dalton_complete
+from src.dalton.llm.complete import (
+    dalton_complete,
+    inspect_existing_completion_journal,
+)
 from src.dalton.settings import get_dalton_config
 
 logger = logging.getLogger(__name__)
@@ -170,16 +173,126 @@ async def internal_llm_complete(
             detail="DALTON_PM_USER_IDS is not configured for internal LLM calls.",
         )
 
+    from src.dalton.llm.unattended_fallback import (
+        get_admin_subscription_whitelist,
+        inspect_subscription_availability,
+        is_complete_result_quota_or_auth_trigger,
+        is_verified_system_subscription_model,
+        resolve_unattended_fallback_chain,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    unattended_on = is_unattended_quota_fallback_enabled()
+    configured_order = [m for m in get_admin_subscription_whitelist() if m in allowed_models]
+    for m in sorted(allowed_models):
+        if m not in configured_order:
+            configured_order.append(m)
+
+    primary_avail = None
+    active_model = requested_model
+    if unattended_on:
+        primary_avail = await inspect_subscription_availability(
+            primary_admin_id, requested_model, ignore_custom_models=True
+        )
+        if not primary_avail.available:
+            existing_action = "proceed"
+            try:
+                existing_action, _ = await inspect_existing_completion_journal(
+                    purpose=payload.purpose,
+                    model_key=requested_model,
+                    system_prompt=payload.system_prompt,
+                    user_prompt=payload.user_prompt,
+                    response_schema=schema_model,
+                    slot="background",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[InternalLLM] Failed inspecting original journal state for %s (%s); keeping requested model",
+                    requested_model,
+                    type(exc).__name__,
+                )
+                existing_action = "error"
+            if existing_action == "proceed":
+                skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+                pre_candidates = resolve_unattended_fallback_chain(
+                    primary_model=requested_model,
+                    allowed_pool=configured_order,
+                    skip_cooldown_keys=skip_keys,
+                    user_id=primary_admin_id,
+                    ignore_custom_models=True,
+                )
+                for cand_model in pre_candidates:
+                    if not is_verified_system_subscription_model(cand_model):
+                        continue
+                    cand_avail = await inspect_subscription_availability(
+                        primary_admin_id,
+                        cand_model,
+                        ignore_custom_models=True,
+                        include_any_cooldown=True,
+                    )
+                    if cand_avail.available:
+                        active_model = cand_model
+                        break
+
     result = await dalton_complete(
         user_id=primary_admin_id,
         system_prompt=payload.system_prompt,
         user_prompt=payload.user_prompt,
-        model=requested_model,
+        model=active_model,
         response_schema=schema_model,
         slot="background",
         purpose=payload.purpose,
         timeout_s=payload.timeout_s,
+        **({"ignore_custom_models": True} if unattended_on else {}),
     )
+
+    if not result.ok and unattended_on and is_complete_result_quota_or_auth_trigger(result):
+        if primary_avail is None:
+            primary_avail = await inspect_subscription_availability(
+                primary_admin_id, active_model, ignore_custom_models=True
+            )
+        skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+        tried = {active_model}
+        remaining_pool = [m for m in configured_order if m not in tried]
+        candidates = resolve_unattended_fallback_chain(
+            primary_model=active_model,
+            allowed_pool=remaining_pool,
+            skip_cooldown_keys=skip_keys,
+            user_id=primary_admin_id,
+            ignore_custom_models=True,
+        )
+        for cand_model in candidates:
+            if not is_verified_system_subscription_model(cand_model):
+                continue
+            cand_avail = await inspect_subscription_availability(
+                primary_admin_id,
+                cand_model,
+                ignore_custom_models=True,
+                include_any_cooldown=True,
+            )
+            if not cand_avail.available:
+                continue
+            cand_res = await dalton_complete(
+                user_id=primary_admin_id,
+                system_prompt=payload.system_prompt,
+                user_prompt=payload.user_prompt,
+                model=cand_model,
+                response_schema=schema_model,
+                slot="background",
+                purpose=payload.purpose,
+                timeout_s=payload.timeout_s,
+                ignore_custom_models=True,
+            )
+            result = cand_res
+            if cand_res.ok:
+                logger.info(
+                    "[InternalLLM] Primary %s quota/auth failed; succeeded on whitelisted fallback %s",
+                    requested_model,
+                    cand_model,
+                )
+                break
+            if not is_complete_result_quota_or_auth_trigger(cand_res):
+                break
 
     if result.ok:
         return InternalLLMCompleteResponse(

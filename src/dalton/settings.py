@@ -2372,3 +2372,17 @@ def is_failure_notice_enabled() -> bool:
         default=False,
     )
 
+
+def is_unattended_quota_fallback_enabled() -> bool:
+    """Switch for unattended-turn pre-dispatch subscription quota fallback (default ``False``).
+
+    Reads ``DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED`` -> YAML
+    ``autonomy.unattended_quota_fallback_enabled`` -> ``False``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED",
+        "autonomy",
+        "unattended_quota_fallback_enabled",
+        default=False,
+    )
+

@@ -419,9 +419,21 @@ async def assist_json(
             persist_raw=persist_raw,
             skip_journal=skip_journal,
         )
+        from src.dalton.llm.unattended_fallback import (
+            get_admin_subscription_whitelist,
+            inspect_subscription_availability,
+            is_complete_result_quota_or_auth_trigger,
+            is_verified_system_subscription_model,
+        )
+        from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+        unattended_assist_fallback = is_unattended_quota_fallback_enabled()
+
         def _should_fall_back(c: Any, m: str) -> bool:
             if c.ok:
                 return False
+            if unattended_assist_fallback:
+                return _is_subscription(m) and is_complete_result_quota_or_auth_trigger(c)
             if _is_safe_to_fallback(c):
                 return True
             # Past the deadline nothing new can be sent, but a fallback may still have a
@@ -434,11 +446,32 @@ async def assist_json(
         def _past_deadline() -> bool:
             return deadline is not None and time.monotonic() >= deadline
 
+        used_fallback_system_only = False
         if fb_list and _should_fall_back(comp, resolved_model):
             primary_model = resolved_model
+            allowed_sub_pool = (
+                frozenset(get_admin_subscription_whitelist())
+                if unattended_assist_fallback
+                else None
+            )
+            tried_models = {primary_model}
             for fb_cand in fb_list:
-                if fb_cand == primary_model:
+                if fb_cand in tried_models:
                     continue
+                if unattended_assist_fallback:
+                    if allowed_sub_pool is None or fb_cand not in allowed_sub_pool:
+                        continue
+                    if not is_verified_system_subscription_model(fb_cand):
+                        continue
+                    cand_avail = await inspect_subscription_availability(
+                        user_id,
+                        fb_cand,
+                        ignore_custom_models=True,
+                        include_any_cooldown=True,
+                    )
+                    if not cand_avail.available:
+                        continue
+                tried_models.add(fb_cand)
                 if _past_deadline():
                     # A5: a replay probe, not a model failure. Logging these as
                     # "switching to fallback" made one over-budget audit print
@@ -475,9 +508,11 @@ async def assist_json(
                     raise_on_error=False,
                     persist_raw=persist_raw,
                     skip_journal=skip_journal,
+                    **({"ignore_custom_models": True} if unattended_assist_fallback else {}),
                 )
                 comp = comp_fb
                 resolved_model = fb_cand
+                used_fallback_system_only = bool(unattended_assist_fallback)
                 if comp_fb.ok or not _should_fall_back(comp_fb, fb_cand):
                     break
 
@@ -555,6 +590,7 @@ async def assist_json(
                     raise_on_error=False,
                     persist_raw=persist_raw,
                     skip_journal=skip_journal,
+                    **({"ignore_custom_models": True} if used_fallback_system_only else {}),
                 )
             except Exception as repair_call_exc:
                 logger.warning(

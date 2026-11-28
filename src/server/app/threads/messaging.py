@@ -1033,6 +1033,8 @@ async def _handle_send_message(
                 from_service=from_service,
                 is_server_retry=is_server_retry,
                 retry_of_run_id=retry_of_run_id,
+                # DALTON-HOOK(quota-exhaustion): pass payer_user_id for pre-dispatch unattended fallback admission
+                payer_user_id=identity.recorded_as,
                 # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
                 **(
                     {"retry_source_execution_id": retry_source_execution_id}
