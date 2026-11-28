@@ -237,11 +237,11 @@ export default function DeliveryPicker({
                     <span className="truncate">{label}</span>
                   </span>
                 )}
+                {/* DALTON-HOOK(dalton-notify): keep chip removal enabled while adding is disabled so conflicting channels can be cleared */}
                 <button
                   type="button"
                   className="automation-delivery-chip-remove"
                   aria-label={t('automation:deliveryRemove', { name: label })}
-                  disabled={disabled}
                   onClick={() => onChange(methods.filter((m) => m !== entry))}
                 >
                   <X className="size-3" aria-hidden="true" />

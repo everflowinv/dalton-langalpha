@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 from typing import Any
 from unittest.mock import create_autospec
@@ -12,12 +13,18 @@ import pytest
 import src.dalton.database.automation_recycle as recycle_db
 import src.dalton.llm.model_prefs as model_prefs_mod
 import src.dalton.notify.dispatch as notify_dispatch
+import src.dalton.services.automation_recycle as recycle_svc
 import src.dalton.tools.notify_tools as notify_tools_mod
 from src.server.database import automation as auto_db
-from src.server.models.automation import AutomationCreate, DeliveryConfig
+from src.server.database import automation_executions as exec_db
+from src.server.database import user as user_db
+from src.server.database import pool as pool_mod
+from src.server.models.automation import AutomationCreate, AutomationUpdate, DeliveryConfig
 import src.server.services.automation_delivery as automation_delivery
 import src.server.services.automation_settlement as settlement_mod
 import src.server.services.automations.lifecycle as lifecycle_mod
+from src.server.services.webhook_client import WebhookClient
+from src.tools.messaging import tools as messaging
 
 
 def _held_delivery(execution_id: str, entry: str = "feishu") -> automation_delivery.Delivery:
@@ -34,15 +41,123 @@ def _held_delivery(execution_id: str, entry: str = "feishu") -> automation_deliv
     )
 
 
+def _wire_real_settlement_send_spies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    user_routes: dict[str, list[str]],
+    user_overrides: dict[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Attach autospec spies to the actual send interfaces on both upstream and Dalton paths."""
+    soft_deleted_mock = create_autospec(
+        recycle_db.automation_is_soft_deleted,
+        return_value=False,
+    )
+    gateway_request_mock = create_autospec(
+        messaging.gateway_request,
+        return_value=messaging.GatewayAnswer(
+            status=200,
+            data={
+                "targets": [
+                    {
+                        "entry": "feishu",
+                        "address": "feishu:dm:ou_alice",
+                        "name": "Alice DM",
+                        "reached": False,
+                        "via": "fallback",
+                        "error": None,
+                    }
+                ]
+            },
+            text="",
+        ),
+    )
+    record_delivery_mock = create_autospec(exec_db.record_delivery, return_value=None)
+    keep_record_mock = create_autospec(settlement_mod._keep_record, return_value=True)
+    nudge_mock = create_autospec(settlement_mod._nudge_drainer, return_value=None)
+    webhook_fire_mock = create_autospec(WebhookClient.fire_event, return_value=None)
+
+    prefs_payload = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_alice"],
+            "dalton_notify_overrides": dict(user_overrides or {}),
+            "dalton_notify_routes": dict(user_routes),
+        },
+        "other_preference": {},
+    }
+    get_prefs_mock = create_autospec(
+        model_prefs_mod.get_user_preferences,
+        return_value=prefs_payload,
+    )
+    unit_gate_mock = create_autospec(
+        notify_dispatch._resolve_unit_managed_notify_gate,
+        return_value=(True, None, None, True),
+    )
+    claim_gateway_mock = create_autospec(
+        notify_dispatch.claim_target_delivery_with_attempt,
+        return_value=notify_dispatch.ClaimAttempt(True, 1, "deliv-uuid-1"),
+    )
+    dalton_gateway_send_mock = create_autospec(
+        notify_dispatch.post_automation_gateway_notify,
+        return_value={"ok": True},
+    )
+    dalton_bridge_send_mock = create_autospec(
+        notify_dispatch._invoke_post_notify,
+        return_value={"ok": True},
+    )
+    mark_target_mock = create_autospec(
+        notify_dispatch._invoke_mark_delivery,
+        return_value=True,
+    )
+    verdict_mock = create_autospec(
+        notify_dispatch.get_verdict_for_execution,
+        return_value=None,
+    )
+    via_gateway_mock = create_autospec(
+        notify_dispatch.notify_via_gateway_enabled,
+        return_value=True,
+    )
+
+    monkeypatch.setattr(recycle_db, "automation_is_soft_deleted", soft_deleted_mock)
+    monkeypatch.setattr(messaging, "gateway_request", gateway_request_mock)
+    monkeypatch.setattr(exec_db, "record_delivery", record_delivery_mock)
+    monkeypatch.setattr(settlement_mod, "_keep_record", keep_record_mock)
+    monkeypatch.setattr(settlement_mod, "_nudge_drainer", nudge_mock)
+    monkeypatch.setattr(WebhookClient, "fire_event", webhook_fire_mock)
+    monkeypatch.setattr(model_prefs_mod, "get_user_preferences", get_prefs_mock)
+    monkeypatch.setattr(notify_dispatch, "_resolve_unit_managed_notify_gate", unit_gate_mock)
+    monkeypatch.setattr(notify_dispatch, "claim_target_delivery_with_attempt", claim_gateway_mock)
+    monkeypatch.setattr(notify_dispatch, "post_automation_gateway_notify", dalton_gateway_send_mock)
+    monkeypatch.setattr(notify_dispatch, "_invoke_post_notify", dalton_bridge_send_mock)
+    monkeypatch.setattr(notify_dispatch, "_invoke_mark_delivery", mark_target_mock)
+    monkeypatch.setattr(notify_dispatch, "get_verdict_for_execution", verdict_mock)
+    monkeypatch.setattr(notify_dispatch, "notify_via_gateway_enabled", via_gateway_mock)
+    # Keep on_automation_settled's keyword-only default get_verdict_fn from touching DB
+    monkeypatch.setitem(
+        notify_dispatch.on_automation_settled.__kwdefaults__,
+        "get_verdict_fn",
+        verdict_mock,
+    )
+
+    return {
+        "gateway_request": gateway_request_mock,
+        "dalton_gateway_send": dalton_gateway_send_mock,
+        "dalton_bridge_send": dalton_bridge_send_mock,
+        "claim_gateway": claim_gateway_mock,
+        "nudge": nudge_mock,
+        "webhook_fire": webhook_fire_mock,
+    }
+
+
 @pytest.mark.asyncio
-async def test_settlement_builtin_dalton_task_with_delivery_config_delivers_once(
+async def test_settlement_positive_control_and_builtin_held_delivery_count_real_send_interfaces(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Built-in dalton-* task with web delivery_config.methods delivers once (upstream only, Dalton skips)."""
-    execution_id = "exec-builtin-1"
+    """Spy hooks real send interfaces: Dalton sends once without held delivery, and skips when held delivery exists."""
+    auto_id = "11111111-1111-4111-8111-111111111111"
     automation: dict[str, Any] = {
-        "automation_id": "11111111-1111-4111-8111-111111111111",
+        "automation_id": auto_id,
         "user_id": "user-alice",
         "workspace_id": "ws-nvda",
         "name": "dalton-nvda-earn-2026q3-t0",
@@ -55,45 +170,32 @@ async def test_settlement_builtin_dalton_task_with_delivery_config_delivers_once
         "result_excerpt": "NVDA beat consensus.",
     }
 
-    soft_deleted_mock = create_autospec(
-        recycle_db.automation_is_soft_deleted,
-        return_value=False,
-    )
-    finish_here_mock = create_autospec(settlement_mod._finish_here, return_value=None)
-    post_notify_mock = create_autospec(
-        notify_dispatch.post_bridge_notify,
-        return_value={"ok": True},
-    )
-    claim_target_mock = create_autospec(
-        notify_dispatch.claim_target_delivery,
-        return_value=True,
-    )
-    resolve_enabled_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_enabled,
-        return_value=True,
-    )
-    resolve_targets_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_targets,
-        return_value=["feishu:user:ou_alice"],
-    )
-    resolve_overrides_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_overrides,
-        return_value={},
-    )
-    resolve_routes_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_routes,
-        return_value={},
-    )
+    spies = _wire_real_settlement_send_spies(monkeypatch, user_routes={})
 
-    monkeypatch.setattr(recycle_db, "automation_is_soft_deleted", soft_deleted_mock)
-    monkeypatch.setattr(settlement_mod, "_finish_here", finish_here_mock)
-    monkeypatch.setattr(notify_dispatch, "post_bridge_notify", post_notify_mock)
-    monkeypatch.setattr(notify_dispatch, "claim_target_delivery", claim_target_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_enabled", resolve_enabled_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_targets", resolve_targets_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_overrides", resolve_overrides_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_routes", resolve_routes_mock)
+    # 1. Positive control: when execution has NO upstream delivery, Dalton's real send interface is called once
+    await settlement_mod._after_settling(
+        settlement_mod.Outcome.COMPLETED,
+        {**automation, "delivery_config": {}},
+        "exec-positive-control",
+        row,
+        thread_id="thread-ctrl",
+        run_id="run-ctrl",
+        workspace_id="ws-nvda",
+        error=None,
+        delivery=None,
+        final_text="NVDA beat consensus.",
+        finish_left=False,
+    )
+    assert spies["gateway_request"].await_count == 0
+    assert spies["dalton_gateway_send"].await_count == 1
+    assert spies["dalton_bridge_send"].await_count == 0
 
+    spies["gateway_request"].reset_mock()
+    spies["dalton_gateway_send"].reset_mock()
+    spies["claim_gateway"].reset_mock()
+
+    # 2. Built-in task with held delivery: upstream gateway_request sends once, Dalton sends zero times
+    execution_id = "exec-builtin-1"
     with caplog.at_level(logging.INFO, logger=notify_dispatch.__name__):
         await settlement_mod._after_settling(
             settlement_mod.Outcome.COMPLETED,
@@ -109,25 +211,119 @@ async def test_settlement_builtin_dalton_task_with_delivery_config_delivers_once
             finish_left=False,
         )
 
-    assert finish_here_mock.await_count == 1
-    assert post_notify_mock.await_count == 0
-    assert claim_target_mock.await_count == 0
-    assert finish_here_mock.await_count + post_notify_mock.await_count == 1
+    assert spies["gateway_request"].await_count == 1
+    assert spies["dalton_gateway_send"].await_count == 0
+    assert spies["dalton_bridge_send"].await_count == 0
+    assert spies["claim_gateway"].await_count == 0
+    assert (
+        spies["gateway_request"].await_count
+        + spies["dalton_gateway_send"].await_count
+        + spies["dalton_bridge_send"].await_count
+        == 1
+    )
     assert any(
-        "delivery_config.methods" in rec.getMessage() and execution_id in rec.getMessage()
+        "upstream delivery" in rec.getMessage() and execution_id in rec.getMessage()
         for rec in caplog.records
     )
 
 
 @pytest.mark.asyncio
-async def test_settlement_custom_task_with_both_delivery_and_dalton_route_delivers_once(
+async def test_settlement_outbox_queue_and_midrun_switch_deliver_once(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Custom task configured with both delivery_config.methods and dalton_notify_routes delivers once."""
+    """Mid-run switch from web delivery to Dalton route still delivers once through the normal outbox queue."""
     auto_id = "22222222-2222-4222-8222-222222222222"
-    execution_id = "exec-custom-1"
-    automation: dict[str, Any] = {
+    execution_id = "exec-custom-switch-1"
+    # During the run, the user cleared delivery_config.methods and configured a Dalton route,
+    # while the execution itself was already registered as held with the messaging gateway.
+    automation_after_switch: dict[str, Any] = {
+        "automation_id": auto_id,
+        "user_id": "user-alice",
+        "workspace_id": "ws-custom",
+        "name": "Morning Semiconductor Brief",
+        "trigger_type": "cron",
+        "delivery_config": {"methods": []},
+        "metadata": {},
+    }
+    held = _held_delivery(execution_id)
+    row: dict[str, Any] = {
+        "settled_from": "running",
+        "result_excerpt": "Morning brief ready.",
+        "delivery": automation_delivery.stamp(held),
+    }
+
+    spies = _wire_real_settlement_send_spies(
+        monkeypatch,
+        user_routes={f"automation:{auto_id}": ["feishu:user:ou_alice"]},
+        user_overrides={f"automation:{auto_id}": True},
+    )
+    get_auto_mock = create_autospec(
+        auto_db.get_automation,
+        return_value=automation_after_switch,
+    )
+    monkeypatch.setattr(auto_db, "get_automation", get_auto_mock)
+
+    # Normal settlement queue path: finish_left=True nudges drainer; Dalton skips because execution has held delivery
+    with caplog.at_level(logging.INFO, logger=notify_dispatch.__name__):
+        await settlement_mod._after_settling(
+            settlement_mod.Outcome.COMPLETED,
+            automation_after_switch,
+            execution_id,
+            row,
+            thread_id="thread-2",
+            run_id="run-2",
+            workspace_id="ws-custom",
+            error=None,
+            delivery=held,
+            final_text="Morning brief ready.",
+            finish_left=True,
+        )
+
+    assert spies["nudge"].call_count == 1
+    assert spies["dalton_gateway_send"].await_count == 0
+    assert spies["dalton_bridge_send"].await_count == 0
+    assert spies["claim_gateway"].await_count == 0
+
+    # Now the hook outbox worker runs the queued finish job -> upstream sends exactly once
+    outbox_job: dict[str, Any] = {
+        "hook_outbox_id": "job-1",
+        "conversation_thread_id": "thread-2",
+        "run_id": "run-2",
+        "attempts": 1,
+        "payload": {
+            "execution_id": execution_id,
+            "automation_id": auto_id,
+            "user_id": "user-alice",
+            "run_id": "run-2",
+            "status": "completed",
+            "final_text": "Morning brief ready.",
+            "delivery": automation_delivery.stamp(held),
+            "answered": False,
+        },
+    }
+    await settlement_mod._finish_held_run(outbox_job)
+
+    assert spies["gateway_request"].await_count == 1
+    assert (
+        spies["gateway_request"].await_count
+        + spies["dalton_gateway_send"].await_count
+        + spies["dalton_bridge_send"].await_count
+        == 1
+    )
+    assert any(
+        "upstream delivery" in rec.getMessage() and execution_id in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_settlement_midrun_added_delivery_without_registered_execution_still_sends_dalton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When an execution started without upstream delivery, adding delivery_config mid-run does not drop Dalton notify."""
+    auto_id = "22222222-2222-4222-8222-222222222223"
+    automation_now: dict[str, Any] = {
         "automation_id": auto_id,
         "user_id": "user-alice",
         "workspace_id": "ws-custom",
@@ -136,24 +332,36 @@ async def test_settlement_custom_task_with_both_delivery_and_dalton_route_delive
         "delivery_config": {"methods": ["feishu"]},
         "metadata": {},
     }
-    row: dict[str, Any] = {
-        "settled_from": "running",
-        "result_excerpt": "Morning brief ready.",
-    }
+    spies = _wire_real_settlement_send_spies(
+        monkeypatch,
+        user_routes={f"automation:{auto_id}": ["feishu:user:ou_alice"]},
+        user_overrides={f"automation:{auto_id}": True},
+    )
 
-    soft_deleted_mock = create_autospec(
-        recycle_db.automation_is_soft_deleted,
-        return_value=False,
+    await settlement_mod._after_settling(
+        settlement_mod.Outcome.COMPLETED,
+        automation_now,
+        "exec-no-upstream-1",
+        {"settled_from": "running", "result_excerpt": "Morning brief ready."},
+        thread_id="thread-3",
+        run_id="run-3",
+        workspace_id="ws-custom",
+        error=None,
+        delivery=None,
+        final_text="Morning brief ready.",
+        finish_left=False,
     )
-    finish_here_mock = create_autospec(settlement_mod._finish_here, return_value=None)
-    post_notify_mock = create_autospec(
-        notify_dispatch.post_bridge_notify,
-        return_value={"ok": True},
-    )
-    claim_target_mock = create_autospec(
-        notify_dispatch.claim_target_delivery,
-        return_value=True,
-    )
+
+    assert spies["gateway_request"].await_count == 0
+    assert spies["dalton_gateway_send"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_user_notify_eligibility_uses_execution_delivery_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Retry/eligibility checks skip based on this execution's registered delivery, not mutable task delivery_config."""
+    auto_id = "33333333-3333-4333-8333-333333333333"
     resolve_enabled_mock = create_autospec(
         notify_dispatch.resolve_dalton_notify_enabled,
         return_value=True,
@@ -171,87 +379,70 @@ async def test_settlement_custom_task_with_both_delivery_and_dalton_route_delive
         return_value={f"automation:{auto_id}": ["feishu:user:ou_alice"]},
     )
 
-    monkeypatch.setattr(recycle_db, "automation_is_soft_deleted", soft_deleted_mock)
-    monkeypatch.setattr(settlement_mod, "_finish_here", finish_here_mock)
-    monkeypatch.setattr(notify_dispatch, "post_bridge_notify", post_notify_mock)
-    monkeypatch.setattr(notify_dispatch, "claim_target_delivery", claim_target_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_enabled", resolve_enabled_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_targets", resolve_targets_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_overrides", resolve_overrides_mock)
-    monkeypatch.setattr(notify_dispatch, "resolve_dalton_notify_routes", resolve_routes_mock)
-
-    with caplog.at_level(logging.INFO, logger=notify_dispatch.__name__):
-        await settlement_mod._after_settling(
-            settlement_mod.Outcome.COMPLETED,
-            automation,
-            execution_id,
-            row,
-            thread_id="thread-2",
-            run_id="run-2",
-            workspace_id="ws-custom",
-            error=None,
-            delivery=_held_delivery(execution_id),
-            final_text="Morning brief ready.",
-            finish_left=False,
-        )
-
-    assert finish_here_mock.await_count == 1
-    assert post_notify_mock.await_count == 0
-    assert claim_target_mock.await_count == 0
-    assert finish_here_mock.await_count + post_notify_mock.await_count == 1
-    assert any(
-        "delivery_config.methods" in rec.getMessage() and execution_id in rec.getMessage()
-        for rec in caplog.records
-    )
-
-
-@pytest.mark.asyncio
-async def test_evaluate_user_notify_eligibility_skips_when_delivery_config_methods_set(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """evaluate_user_notify_eligibility returns held_delivery_configured and logs when delivery_config.methods is set."""
-    auto_id = "33333333-3333-4333-8333-333333333333"
-    resolve_enabled_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_enabled,
-        return_value=True,
-    )
-    resolve_targets_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_targets,
-        return_value=["feishu:user:ou_alice"],
-    )
-    resolve_overrides_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_overrides,
-        return_value={},
-    )
-    resolve_routes_mock = create_autospec(
-        notify_dispatch.resolve_dalton_notify_routes,
-        return_value={f"automation:{auto_id}": ["feishu:user:ou_alice"]},
-    )
-
+    # 1. Execution has held delivery stamp -> skipped even though automation.delivery_config is now empty
     with caplog.at_level(logging.INFO, logger=notify_dispatch.__name__):
         allowed, reason, targets = await notify_dispatch.evaluate_user_notify_eligibility(
             "user-alice",
             {
                 "automation_id": auto_id,
                 "name": "Custom Task",
-                "delivery_config": {"methods": ["feishu"]},
+                "delivery_config": {},
+            },
+            execution_delivery={
+                "id": "exec-held-1",
+                "targets": [{"entry": "feishu", "address": "feishu:dm:ou_alice", "ok": True}],
             },
             resolve_enabled_fn=resolve_enabled_mock,
             resolve_overrides_fn=resolve_overrides_mock,
             resolve_targets_fn=resolve_targets_mock,
             resolve_routes_fn=resolve_routes_mock,
         )
-
     assert (allowed, reason, targets) == (False, "held_delivery_configured", [])
     resolve_enabled_mock.assert_not_awaited()
-    assert any("delivery_config.methods" in rec.getMessage() for rec in caplog.records)
+    assert any("upstream delivery" in rec.getMessage() for rec in caplog.records)
+
+    # 2. Execution has webhook delivery_result -> skipped
+    allowed_wh, reason_wh, targets_wh = await notify_dispatch.evaluate_user_notify_eligibility(
+        "user-alice",
+        {"automation_id": auto_id, "name": "Custom Task", "delivery_config": {}},
+        execution_delivery_result=[{"method": "slack", "success": True}],
+        resolve_enabled_fn=resolve_enabled_mock,
+        resolve_overrides_fn=resolve_overrides_mock,
+        resolve_targets_fn=resolve_targets_mock,
+        resolve_routes_fn=resolve_routes_mock,
+    )
+    assert (allowed_wh, reason_wh, targets_wh) == (False, "held_delivery_configured", [])
+
+    # 3. Execution had NO upstream delivery (only unsent failure) -> NOT skipped even if delivery_config was edited later
+    allowed_ok, reason_ok, targets_ok = await notify_dispatch.evaluate_user_notify_eligibility(
+        "user-alice",
+        {"automation_id": auto_id, "name": "Custom Task", "delivery_config": {"methods": ["feishu"]}},
+        execution_delivery={"id": "exec-unsent", "targets": [{"entry": "feishu", "ok": False}]},
+        execution_delivery_result=[
+            {
+                "method": "feishu",
+                "address": None,
+                "name": None,
+                "success": False,
+                "via": None,
+                "error": "No chat",
+            }
+        ],
+        resolve_enabled_fn=resolve_enabled_mock,
+        resolve_overrides_fn=resolve_overrides_mock,
+        resolve_targets_fn=resolve_targets_mock,
+        resolve_routes_fn=resolve_routes_mock,
+    )
+    assert allowed_ok is True
+    assert reason_ok is None
+    assert targets_ok == ["feishu:user:ou_alice"]
 
 
 @pytest.mark.asyncio
 async def test_lifecycle_save_validation_rejects_conflicting_delivery_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """create_automation and prepare_automation_update reject delivery_config.methods on built-in or routed tasks."""
+    """create_automation and prepare_owned_automation_update reject delivery_config.methods on built-in or routed tasks."""
     ws_id = "44444444-4444-4444-8444-444444444444"
     auto_id = "55555555-5555-4555-8555-555555555555"
 
@@ -346,6 +537,268 @@ async def test_lifecycle_save_validation_rejects_conflicting_delivery_config(
 
 
 @pytest.mark.asyncio
+async def test_in_lock_recheck_blocks_concurrent_automation_and_preference_race() -> None:
+    """Both save entries re-read the peer table inside the locked transaction regardless of which fields changed."""
+    auto_id = "77777777-7777-4777-8777-777777777777"
+    ws_id = "44444444-4444-4444-8444-444444444444"
+    sql_seen: list[str] = []
+
+    class _TxCursor:
+        def __init__(self, *, pref_row: dict[str, Any] | None, auto_rows: list[dict[str, Any]]):
+            self._pref_row = pref_row
+            self._auto_rows = auto_rows
+
+        async def __aenter__(self) -> "_TxCursor":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            _ = params
+            sql_seen.append(sql)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._pref_row
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._auto_rows)
+
+    class _TxConn:
+        def __init__(self, *, pref_row: dict[str, Any] | None = None, auto_rows: list[dict[str, Any]] | None = None):
+            self._pref_row = pref_row
+            self._auto_rows = auto_rows or []
+
+        def cursor(self, **kwargs: Any) -> _TxCursor:
+            _ = kwargs
+            return _TxCursor(pref_row=self._pref_row, auto_rows=self._auto_rows)
+
+    # 1. Automation update path: locked_row == current (unchanged automation row) and stale pref_for_lock is empty,
+    #    but a concurrent preference write committed dalton_notify_routes before we acquired the lock.
+    #    Even when updating delivery_config (or another field on a task with delivery_config), locked recheck catches it.
+    current_row = {
+        "automation_id": auto_id,
+        "user_id": "user-alice",
+        "workspace_id": ws_id,
+        "name": "Custom Brief",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "status": "active",
+        "instruction": "Summarize news",
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "llm_model": None,
+        "reasoning_effort": None,
+        "delivery_config": {},
+        "metadata": {},
+    }
+    locked_conn_with_new_route = _TxConn(
+        pref_row={
+            "model_preference": {
+                "dalton_notify_routes": {f"automation:{auto_id}": ["feishu:user:ou_alice"]}
+            }
+        }
+    )
+    update_model = AutomationUpdate(delivery_config=DeliveryConfig(methods=["feishu"]))
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as race_auto_exc:
+        await lifecycle_mod.recheck_locked_automation_update(
+            user_id="user-alice",
+            update=update_model,
+            current=current_row,
+            stored_in=ws_id,
+            stored_pin=None,
+            new_cron=None,
+            new_tz=None,
+            pref_for_lock={"dalton_notify_routes": {}},  # stale pre-lock cache!
+            locked_row=dict(current_row),  # automation row itself did not change!
+            effective_kwargs={"delivery_config": {"methods": ["feishu"]}},
+            locked_conn=locked_conn_with_new_route,
+        )
+    assert race_auto_exc.value.field == "delivery_config"
+    assert any("FROM user_preferences" in q for q in sql_seen)
+
+    # Also verify non-delivery field update (e.g., description) rechecks conflict under lock
+    row_with_delivery = {**current_row, "delivery_config": {"methods": ["feishu"]}}
+    desc_update = AutomationUpdate(description="Updated desc")
+    with pytest.raises(lifecycle_mod.AutomationRefusal):
+        await lifecycle_mod.recheck_locked_automation_update(
+            user_id="user-alice",
+            update=desc_update,
+            current=row_with_delivery,
+            stored_in=ws_id,
+            stored_pin=None,
+            new_cron=None,
+            new_tz=None,
+            pref_for_lock={},
+            locked_row=dict(row_with_delivery),
+            effective_kwargs={"description": "Updated desc"},
+            locked_conn=locked_conn_with_new_route,
+        )
+
+    # 2. Preference update path: inside the preference lock tx, validate_dalton_notify_routes_for_user
+    #    locks & reads automations FOR SHARE on the same tx conn and rejects with 409 if delivery_config.methods won.
+    sql_seen.clear()
+    pref_tx_conn = _TxConn(
+        auto_rows=[{"automation_id": auto_id, "delivery_config": {"methods": ["feishu"]}}]
+    )
+    with pytest.raises(HTTPException) as race_pref_exc:
+        await model_prefs_mod.validate_dalton_notify_routes_for_user(
+            "user-alice",
+            {f"automation:{auto_id}": ["feishu:user:ou_alice"]},
+            {},
+            conn=pref_tx_conn,
+        )
+    assert race_pref_exc.value.status_code == 409
+    assert "delivery_config.methods" in str(race_pref_exc.value.detail)
+    assert any("FROM automations" in q and "FOR SHARE" in q for q in sql_seen)
+
+
+@pytest.mark.asyncio
+async def test_restore_automation_rejects_conflict_with_locked_dalton_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring a soft-deleted task with delivery_config.methods fails with 409 if a Dalton route was added."""
+    auto_id = "88888888-8888-4888-8888-888888888888"
+    deleted_row = {
+        "automation_id": auto_id,
+        "user_id": "user-alice",
+        "workspace_id": "44444444-4444-4444-8444-444444444444",
+        "name": "Custom Brief",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "status": "paused",
+        "pre_delete_desired_status": "active",
+        "deleted_at": "2026-11-28T00:00:00+00:00",
+        "config_version": 2,
+        "active_version": 2,
+        "delivery_config": {"methods": ["feishu"]},
+        "metadata": {},
+        "file_name": "custom-brief.json",
+    }
+
+    class _FakeTx:
+        async def __aenter__(self) -> "_FakeTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _FakeDb:
+        def transaction(self) -> _FakeTx:
+            return _FakeTx()
+
+    @asynccontextmanager
+    async def _fake_conn(conn: Any = None):
+        _ = conn
+        yield _FakeDb()
+
+    prepare_prefs_mock = create_autospec(
+        recycle_svc._prepare_prefs,
+        return_value={
+            "model_preference": {
+                "dalton_notify_routes": {f"automation:{auto_id}": ["feishu:user:ou_alice"]}
+            }
+        },
+    )
+    lock_recycle_mock = create_autospec(
+        recycle_db.lock_automation_for_recycle,
+        return_value=deleted_row,
+    )
+    update_recycle_mock = create_autospec(
+        recycle_db.update_automation_recycle,
+        return_value=True,
+    )
+    units_enabled_mock = create_autospec(
+        lambda: False,
+        return_value=False,
+    )
+
+    monkeypatch.setattr(recycle_svc, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(recycle_svc, "_prepare_prefs", prepare_prefs_mock)
+    monkeypatch.setattr(recycle_db, "lock_automation_for_recycle", lock_recycle_mock)
+    monkeypatch.setattr(recycle_db, "update_automation_recycle", update_recycle_mock)
+    import src.dalton.settings as dalton_settings_mod
+
+    monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", units_enabled_mock)
+
+    with pytest.raises(HTTPException) as restore_exc:
+        await recycle_svc.restore_automation(
+            auto_id,
+            actor_user_id="user-alice",
+            expected_config_version=2,
+            owner_user_id="user-alice",
+            company=False,
+        )
+    assert restore_exc.value.status_code == 409
+    assert "Dalton" in str(restore_exc.value.detail)
+    update_recycle_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_core_profile_without_channel_gateway_allows_web_delivery_but_keeps_report_profile_mutex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When CapabilityId.CHANNEL_GATEWAY is off (core profile), generic Dalton mutex is inactive while report_profile stays guarded."""
+    monkeypatch.setenv("DALTON_PROFILE", "core")
+    monkeypatch.delenv("DALTON_CAP_CHANNEL_GATEWAY", raising=False)
+    auto_id = "99999999-9999-4999-8999-999999999999"
+
+    from src.dalton.notify.delivery_mutex import (
+        assert_no_automation_delivery_notify_conflict,
+        check_route_held_delivery_conflict,
+    )
+
+    # 1. Built-in dalton-* task with Slack/Discord webhook delivery is allowed when CHANNEL_GATEWAY is off
+    await assert_no_automation_delivery_notify_conflict(
+        user_id="user-alice",
+        automation={
+            "automation_id": auto_id,
+            "name": "dalton-nvda-earn-2026q3-t0",
+            "metadata": {"dalton_kind": "earnings_t0"},
+        },
+        delivery_config={"methods": ["slack"]},
+        model_pref={"dalton_notify_routes": {f"automation:{auto_id}": ["feishu:user:ou_alice"]}},
+    )
+
+    # 2. Custom task with route + Discord delivery is allowed when CHANNEL_GATEWAY is off
+    await assert_no_automation_delivery_notify_conflict(
+        user_id="user-alice",
+        automation={"automation_id": auto_id, "name": "Custom Brief", "metadata": {}},
+        delivery_config={"methods": ["discord"]},
+        model_pref={"dalton_notify_routes": {f"automation:{auto_id}": ["feishu:user:ou_alice"]}},
+    )
+    assert (
+        check_route_held_delivery_conflict(
+            {"automation_id": auto_id, "delivery_config": {"methods": ["slack"]}},
+            ["feishu:user:ou_alice"],
+        )
+        is None
+    )
+
+    # 3. Existing report_profile + delivery_config.methods mutex is STILL enforced
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as report_exc:
+        await assert_no_automation_delivery_notify_conflict(
+            user_id="user-alice",
+            automation={
+                "automation_id": auto_id,
+                "name": "Report Task",
+                "metadata": {
+                    "report_profile": {
+                        "profile": "market-digest-am",
+                        "report_targets": ["feishu:chat:oc_group_1"],
+                        "failure_targets": [],
+                    }
+                },
+            },
+            delivery_config={"methods": ["slack"]},
+        )
+    assert report_exc.value.field == "delivery_config"
+    assert "report_profile" in str(report_exc.value)
+
+
+@pytest.mark.asyncio
 async def test_notify_route_save_entries_reject_tasks_with_delivery_config_methods(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,3 +862,72 @@ async def test_notify_route_save_entries_reject_tasks_with_delivery_config_metho
         )
     assert pref_exc.value.status_code == 409
     assert "delivery_config.methods" in str(pref_exc.value.detail)
+
+    # 3. apply_dalton_notify_preference_patch enforces conflict inside the locked transaction too
+    class _LockedCur:
+        async def __aenter__(self) -> "_LockedCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            _ = params
+            self._sql = sql
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            if "FROM automations" in getattr(self, "_sql", ""):
+                return [{"automation_id": auto_id, "delivery_config": {"methods": ["feishu"]}}]
+            return [{"platform": "feishu", "platform_user_id": "ou_alice"}]
+
+    class _LockedTx:
+        async def __aenter__(self) -> "_LockedTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _LockedConn:
+        def transaction(self) -> _LockedTx:
+            return _LockedTx()
+
+        def cursor(self, **kwargs: Any) -> _LockedCur:
+            _ = kwargs
+            return _LockedCur()
+
+    @asynccontextmanager
+    async def _fake_pool_conn(conn: Any = None):
+        _ = conn
+        yield _LockedConn()
+
+    stored_prefs = {
+        "model_preference": {
+            "dalton_notify_targets": ["feishu:user:ou_alice"],
+            "dalton_notify_routes": {},
+        },
+        "other_preference": {},
+    }
+    monkeypatch.setattr(pool_mod, "get_db_connection", _fake_pool_conn)
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, return_value=stored_prefs),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "lock_user_preferences",
+        create_autospec(user_db.lock_user_preferences, return_value=stored_prefs),
+    )
+    # Simulate pre-lock read seeing an empty delivery_config while the locked tx sees delivery_config.methods
+    get_auto_mock.return_value = {**task_with_delivery, "delivery_config": {}}
+    upsert_mock = create_autospec(user_db.upsert_user_preferences, return_value=stored_prefs)
+    monkeypatch.setattr(user_db, "upsert_user_preferences", upsert_mock)
+
+    with pytest.raises(HTTPException) as locked_patch_exc:
+        await model_prefs_mod.apply_dalton_notify_preference_patch(
+            "user-alice",
+            {model_prefs_mod.DALTON_NOTIFY_ROUTES_KEY: {f"automation:{auto_id}": ["feishu:user:ou_alice"]}},
+        )
+    assert locked_patch_exc.value.status_code == 409
+    assert "delivery_config.methods" in str(locked_patch_exc.value.detail)
+    upsert_mock.assert_not_awaited()

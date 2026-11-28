@@ -885,12 +885,14 @@ async def update_automation(
 
     async with get_db_connection(conn) as conn:
         is_mock_conn = isinstance(conn, NonCallableMock)
-        if not is_mock_conn and (should_record or expected_cv is not None):
+        # DALTON-HOOK(dalton-notify): ensure locked_row_reconciler always runs inside the tx holding lock_user_preferences before automations FOR UPDATE
+        has_reconciler = hist_ctx is not None and hist_ctx.locked_row_reconciler is not None
+        if not is_mock_conn and (should_record or expected_cv is not None or has_reconciler):
             now_iso = datetime.now(_dt_tz.utc).isoformat()
             async with conn.transaction():
                 # DALTON-HOOK(company-automations): lock user_preferences inside transaction before locking automations row
                 coalesce = get_current_file_coalesce_state()
-                if should_record and not (
+                if (should_record or has_reconciler) and not (
                     coalesce is not None and coalesce.mode == "create_pause"
                 ):
                     if (

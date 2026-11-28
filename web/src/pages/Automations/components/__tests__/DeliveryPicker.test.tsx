@@ -6,7 +6,7 @@ import type { ProviderModelsData } from '@/components/model/types';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import i18n from '@/i18n';
 import { queryKeys } from '@/lib/queryKeys';
-import { renderWithProviders } from '@/test/utils';
+import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import type { Automation, DeliveryOptions } from '@/types/automation';
 import * as api from '../../utils/api';
 import { ALL_WORKSPACES, automationToFormState, type FormPatch, type FormState, INITIAL_FORM } from '../../utils/form';
@@ -1211,6 +1211,43 @@ describe('DeliveryPicker for built-in dalton-* tasks', () => {
     expect(trigger).toBeDisabled();
   });
 
+  it('shows Dalton notify settings notice, disables adding, and still allows removing existing channels for custom tasks with Dalton routes', async () => {
+    serve();
+
+    const routedCustomAuto: Automation = {
+      ...BASE_AUTOMATION,
+      name: 'Daily Market Brief',
+      dalton_notify_category: null,
+      dalton_notify_route_targets: ['feishu:user:ou_alice'],
+      delivery_config: { methods: ['slack:T1/C1'] },
+    };
+
+    const onSubmit = vi.fn();
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={automationToFormState(routedCustomAuto, 'America/New_York', 'home-1')}
+        original={routedCustomAuto}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation:moreOptions')) }));
+    expect(await screen.findByText(label('automation:deliveryManagedByDaltonNotify'))).toBeInTheDocument();
+    const trigger = await screen.findByRole('button', { name: new RegExp(label('automation:deliveryAdd')) });
+    expect(trigger).toBeDisabled();
+
+    // Existing delivery chip remains removable so the user can clear the conflict
+    const removeLabel = label('automation:deliveryRemove', { name: '#research' });
+    const removeBtn = await screen.findByRole('button', { name: removeLabel });
+    expect(removeBtn).not.toBeDisabled();
+    fireEvent.click(removeBtn);
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: removeLabel })).not.toBeInTheDocument();
+    });
+  });
+
   it('keeps DeliveryPicker enabled for ordinary custom tasks', async () => {
     serve();
 
@@ -1218,6 +1255,7 @@ describe('DeliveryPicker for built-in dalton-* tasks', () => {
       ...BASE_AUTOMATION,
       name: 'Daily Market Brief',
       dalton_notify_category: null,
+      dalton_notify_route_targets: [],
     };
 
     renderWithProviders(
@@ -1228,6 +1266,38 @@ describe('DeliveryPicker for built-in dalton-* tasks', () => {
         onCancel={vi.fn()}
         loading={false}
       />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation:moreOptions')) }));
+    const trigger = await screen.findByRole('button', { name: new RegExp(label('automation:deliveryAdd')) });
+    expect(trigger).not.toBeDisabled();
+    expect(screen.queryByText(label('automation:deliveryManagedByDaltonNotify'))).not.toBeInTheDocument();
+  });
+
+  it('keeps DeliveryPicker enabled when channel_gateway capability is disabled', async () => {
+    serve();
+
+    const builtinAuto: Automation = {
+      ...BASE_AUTOMATION,
+      name: 'dalton-nvda-earn-2026q3-t0',
+      dalton_notify_category: 'earnings_t0',
+      dalton_notify_route_targets: ['feishu:user:ou_alice'],
+    };
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['company_wiki'],
+    });
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={automationToFormState(builtinAuto, 'America/New_York', 'home-1')}
+        original={builtinAuto}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+      { queryClient },
     );
 
     fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation:moreOptions')) }));

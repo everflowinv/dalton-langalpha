@@ -1,6 +1,6 @@
 import { useId, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, X } from 'lucide-react'; // DALTON-HOOK(dalton-notify): allow clearing existing delivery chips when Dalton notify manages task
 import {
   Select,
   SelectItem,
@@ -24,8 +24,8 @@ import { useApiKeys } from '@/hooks/useApiKeys';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import ReportProfileFields from '@/components/dalton/ReportProfileFields';
-// DALTON-HOOK(dalton-notify): detect built-in dalton-* automations managed by Dalton notify settings
-import { isBuiltinDaltonNotifyTask } from '@/lib/dalton/automationNotify';
+// DALTON-HOOK(dalton-notify): detect built-in dalton-* automations and routed custom tasks managed by Dalton notify settings
+import { isDaltonNotifyManagedTask } from '@/lib/dalton/automationNotify';
 import { formatAntigravityVariantLabel, inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
 import { effortLabelFor, effortOptions, resolveEffort } from '@/lib/modelTuning';
 import { cn } from '@/lib/utils';
@@ -90,9 +90,9 @@ export default function MoreOptions({
   const { t } = useTranslation();
   // DALTON-HOOK(report-delivery): gate report_profile configuration on channel_gateway capability
   const { hasCapability } = useCapabilities();
-  // DALTON-HOOK(dalton-notify): built-in dalton-* tasks manage delivery via Dalton notify settings
+  // DALTON-HOOK(dalton-notify): built-in dalton-* tasks and routed custom tasks manage delivery via Dalton notify settings
   const daltonNotifyManaged =
-    hasCapability('channel_gateway') && isBuiltinDaltonNotifyTask(form.name, automation);
+    hasCapability('channel_gateway') && isDaltonNotifyManagedTask(form.name, automation);
   const uid = useId();
   const ids = {
     thread: `${uid}-thread`,
@@ -371,7 +371,28 @@ export default function MoreOptions({
               disabledReason={daltonNotifyManaged ? t('automation:deliveryManagedByDaltonNotify') : null}
             />
           ) : daltonNotifyManaged ? (
-            <p className="automation-form-readout mt-0">{t('automation:deliveryManagedByDaltonNotify')}</p>
+            <>
+              <p className="automation-form-readout mt-0">{t('automation:deliveryManagedByDaltonNotify')}</p>
+              {form.delivery_methods.length > 0 && (
+                <ul className="automation-delivery-chips">
+                  {form.delivery_methods.map((entry) => (
+                    <li key={entry} className="automation-delivery-chip">
+                      <span className="automation-delivery-chip-label">
+                        <span className="truncate">{entryName(entry)}</span>
+                      </span>
+                      <button
+                        type="button"
+                        className="automation-delivery-chip-remove"
+                        aria-label={t('automation:deliveryRemove', { name: entryName(entry) })}
+                        onClick={() => patch('delivery_methods', form.delivery_methods.filter((m) => m !== entry))}
+                      >
+                        <X className="size-3" aria-hidden="true" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
           ) : hold ? (
             <>
               <ul className="automation-delivery-chips">

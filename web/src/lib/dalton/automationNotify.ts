@@ -58,3 +58,30 @@ export function isBuiltinDaltonNotifyTask(
   }
   return false;
 }
+
+/**
+ * True when the API returned non-empty Dalton notify route targets for this automation.
+ */
+export function hasDaltonNotifyRouteTargets(
+  automation?: Pick<Automation, 'dalton_notify_route_targets'> | null,
+): boolean {
+  const targets = automation?.dalton_notify_route_targets;
+  return (
+    Array.isArray(targets) &&
+    targets.some((target) => typeof target === 'string' && target.trim().length > 0)
+  );
+}
+
+/**
+ * True when an automation's notifications are managed via Dalton notify settings
+ * (either a built-in `dalton-*` task or a custom task with active Dalton notify routes).
+ */
+export function isDaltonNotifyManagedTask(
+  name: string | null | undefined,
+  automation?: Pick<
+    Automation,
+    'dalton_notify_category' | 'dalton_notify_route_targets' | 'metadata'
+  > | null,
+): boolean {
+  return isBuiltinDaltonNotifyTask(name, automation) || hasDaltonNotifyRouteTargets(automation);
+}

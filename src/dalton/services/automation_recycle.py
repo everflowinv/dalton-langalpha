@@ -808,21 +808,36 @@ async def restore_automation(
             current = int(row.get("config_version") or 1)
             if expected_config_version != current:
                 _version_conflict(expected_config_version, current)
+            restore_pref_bag = (
+                prefs.get("model_preference")
+                if isinstance(prefs, Mapping)
+                and isinstance(prefs.get("model_preference"), Mapping)
+                else {}
+            )
             if row.get("llm_model"):
-                restore_pref_bag = (
-                    prefs.get("model_preference")
-                    if isinstance(prefs, Mapping)
-                    and isinstance(prefs.get("model_preference"), Mapping)
-                    else None
-                )
                 await assert_model_not_retired_under_lock(
                     db,
                     row.get("llm_model"),
                     field="llm_model",
                     user_id=str(row.get("user_id") or pref_owner) if not company else None,
-                    model_pref=restore_pref_bag,
+                    model_pref=restore_pref_bag or None,
                     allow_custom=(not company),
                 )
+            if not company:
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+                from src.server.services.automations.lifecycle import AutomationRefusal
+
+                try:
+                    await assert_no_automation_delivery_notify_conflict(
+                        user_id=str(row.get("user_id") or pref_owner),
+                        automation=row,
+                        delivery_config=row.get("delivery_config"),
+                        model_pref=restore_pref_bag,
+                    )
+                except AutomationRefusal as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
             desired = str(row.get("pre_delete_desired_status") or "paused")
             if desired not in ("active", "paused"):
                 desired = "paused"

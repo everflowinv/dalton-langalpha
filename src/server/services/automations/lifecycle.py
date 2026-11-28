@@ -1014,11 +1014,7 @@ async def prepare_owned_automation_update(
         update_kwargs["delivery_config"] = {**delivery, "methods": methods}
 
     # DALTON-HOOK(dalton-notify): refuse enabling delivery_config.methods alongside Dalton notify
-    if (
-        "delivery_config" in update_kwargs
-        or "name" in update_kwargs
-        or "metadata" in update_kwargs
-    ):
+    if update_kwargs:
         from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
 
         effective_delivery = (
@@ -1226,32 +1222,24 @@ async def recheck_locked_automation_update(
         else:
             effective_kwargs.pop("next_run_at", None)
 
-    # DALTON-HOOK(dalton-notify): recheck delivery/notify conflict if locked row changed
-    if (
-        "delivery_config" in effective_kwargs
-        or "name" in effective_kwargs
-        or "metadata" in effective_kwargs
-    ) and (
-        locked_row.get("delivery_config") != current.get("delivery_config")
-        or locked_row.get("name") != current.get("name")
-        or locked_row.get("metadata") != current.get("metadata")
-    ):
-        from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
+    # DALTON-HOOK(dalton-notify): always recheck delivery/notify conflict inside the locked transaction on any update
+    from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
 
-        await assert_no_automation_delivery_notify_conflict(
-            user_id=user_id,
-            automation={
-                "automation_id": str(locked_row.get("automation_id") or current.get("automation_id") or ""),
-                "name": effective_kwargs.get("name", locked_row.get("name")),
-                "metadata": effective_kwargs.get("metadata", locked_row.get("metadata")),
-            },
-            delivery_config=(
-                effective_kwargs["delivery_config"]
-                if "delivery_config" in effective_kwargs
-                else locked_row.get("delivery_config")
-            ),
-            model_pref=pref_for_lock,
-        )
+    await assert_no_automation_delivery_notify_conflict(
+        user_id=user_id,
+        automation={
+            "automation_id": str(locked_row.get("automation_id") or current.get("automation_id") or ""),
+            "name": effective_kwargs.get("name", locked_row.get("name")),
+            "metadata": effective_kwargs.get("metadata", locked_row.get("metadata")),
+        },
+        delivery_config=(
+            effective_kwargs["delivery_config"]
+            if "delivery_config" in effective_kwargs
+            else locked_row.get("delivery_config")
+        ),
+        model_pref=pref_for_lock,
+        conn=locked_conn,
+    )
 
 
 def pause_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:

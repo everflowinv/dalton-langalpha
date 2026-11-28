@@ -2628,6 +2628,8 @@ async def evaluate_user_notify_eligibility(
     *,
     target: str | None = None,
     include_chat_targets: bool | None = None,
+    execution_delivery: Any = None,
+    execution_delivery_result: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -2654,16 +2656,14 @@ async def evaluate_user_notify_eligibility(
     if is_excluded_automation_for_notify(automation):
         return (False, "toggle_off", [])
 
-    from src.dalton.database.automation_reports import held_delivery_configured
+    from src.dalton.notify.delivery_mutex import execution_has_upstream_delivery
 
-    if isinstance(automation, Mapping) and held_delivery_configured(
-        automation.get("delivery_config")
-    ):
+    if execution_has_upstream_delivery(execution_delivery, execution_delivery_result):
         logger.info(
             "[DALTON_NOTIFY] Skipping Dalton notify for automation_id=%s name=%r: "
-            "delivery_config.methods is already configured",
-            str(automation.get("automation_id") or "").strip(),
-            str(automation.get("name") or "").strip(),
+            "execution already registered upstream delivery",
+            str(automation.get("automation_id") or "").strip() if isinstance(automation, Mapping) else "",
+            str(automation.get("name") or "").strip() if isinstance(automation, Mapping) else "",
         )
         return (False, "held_delivery_configured", [])
 
@@ -4786,12 +4786,20 @@ async def retry_failed_notify_deliveries(
                            a.metadata AS automation_metadata,
                            a.workspace_id::text AS automation_workspace_id,
                            a.user_id AS automation_user_id,
+                           ae.delivery AS execution_delivery,
+                           ae.delivery_result AS execution_delivery_result,
                            -- DALTON-HOOK(data-jobs): join dalton_data_task_defs to check task/notify enabled on retry
                            dt.enabled AS data_task_enabled,
                            dt.notify_enabled AS data_task_notify_enabled
                     FROM dalton_notify_deliveries d
                     LEFT JOIN automations a
                       ON a.automation_id::text = d.automation_id
+                    LEFT JOIN automation_executions ae
+                      ON ae.automation_execution_id = CASE
+                          WHEN d.execution_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                          THEN d.execution_id::uuid
+                          ELSE NULL
+                      END
                     LEFT JOIN dalton_data_task_defs dt
                       ON dt.job_key = CASE
                           WHEN d.automation_id LIKE 'data:%%' THEN SUBSTRING(d.automation_id FROM 6)
@@ -5158,6 +5166,8 @@ async def retry_failed_notify_deliveries(
                     automation_info,
                     target=tgt,
                     include_chat_targets=gate_include_chats,
+                    execution_delivery=row.get("execution_delivery"),
+                    execution_delivery_result=row.get("execution_delivery_result"),
                     resolve_enabled_fn=resolve_enabled_fn,
                     resolve_overrides_fn=resolve_overrides_fn,
                     resolve_targets_fn=resolve_targets_fn,
@@ -6550,6 +6560,8 @@ async def on_automation_settled(
     final_text: str | None = None,
     coverage_unit_id: Any = None,
     coverage_unit_version: Any = None,
+    execution_delivery: Any = None,
+    execution_delivery_result: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -6592,9 +6604,9 @@ async def on_automation_settled(
         from src.dalton.database.automation_reports import (
             automation_has_validated_report_profile,
             ensure_report_failure_alert,
-            held_delivery_configured,
             read_execution_report_confirmed,
         )
+        from src.dalton.notify.delivery_mutex import execution_has_upstream_delivery
 
         if automation_has_validated_report_profile(automation):
             reader = report_status_fn or read_execution_report_confirmed
@@ -6613,10 +6625,10 @@ async def on_automation_settled(
                 )
             return confirmed
 
-        if held_delivery_configured(automation.get("delivery_config")):
+        if execution_has_upstream_delivery(execution_delivery, execution_delivery_result):
             logger.info(
                 "[DALTON_NOTIFY] Skipping Dalton notify on settlement for execution_id=%s "
-                "automation_id=%s name=%r: delivery_config.methods is already configured",
+                "automation_id=%s name=%r: execution already registered upstream delivery",
                 execution_id,
                 str(automation.get("automation_id") or "").strip(),
                 str(automation.get("name") or "").strip(),
@@ -6642,6 +6654,8 @@ async def on_automation_settled(
             user_id,
             automation,
             include_chat_targets=gate_include_chats,
+            execution_delivery=execution_delivery,
+            execution_delivery_result=execution_delivery_result,
             resolve_enabled_fn=resolve_enabled_fn,
             resolve_overrides_fn=resolve_overrides_fn,
             resolve_targets_fn=resolve_targets_fn,
