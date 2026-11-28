@@ -394,6 +394,21 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
      3. 持久数据校验：对 `var/dalton` 下的关键 SQLite 库跑 `sqlite3 <数据库路径> "PRAGMA integrity_check;"`，再去 MinIO 或应用里抽查近期音频转写和工作区聊天附件是否正常打开。
    - **SQLite `-wal` 告警处置**：碰上 SQLite `-wal` 残留且目录不可写导致备份脚本告警时，先确认没有进程在写，再跑一次 `sqlite3 <数据库路径> "PRAGMA wal_checkpoint(TRUNCATE);"`。
 
+### 4.1 冷冻备份集加密上传（`upload_frozen_backup_set.sh`）
+
+使用 `scripts/dalton/ops/prod/backup.sh --tag manual-pre-blob-inline` 生成本机冷冻备份集后，可通过 `scripts/dalton/ops/prod/upload_frozen_backup_set.sh` 将整套文件（数据库 `.dump`、`asr-jobs` 归档包、`backup-set` 与 `minio-manifest` 两份清单，以及对应对象归档）加密同步到 `<DALTON_RCLONE_REMOTE>:<DALTON_RCLONE_DRIVE_DIR>/frozen/<tag>-<备份集ID>/`（例如 `gdrive:DaltonBackup/frozen/manual-pre-blob-inline-<set>/`）：
+
+```bash
+# 1. 预演模式（默认）：校验备份集并列出待上传文件、大小与远端目标路径
+bash scripts/dalton/ops/prod/upload_frozen_backup_set.sh <备份集ID>
+
+# 2. 实际执行：核对明文 SHA-256、流式加密上传、复核暂存与最终路径大小及 MD5，并加密写入 MANIFEST.json.enc，清理临时目录后输出 ok
+bash scripts/dalton/ops/prod/upload_frozen_backup_set.sh <备份集ID> --apply
+```
+
+- **配置、密钥与空间预检**：脚本读取 `~/.config/dalton/offsite-backup.env`，沿用既有 `DALTON_BACKUP_KEY_FILE`（需已存在且可读）、`openssl enc -aes-256-cbc -pbkdf2 -salt`、`DALTON_RCLONE_REMOTE`、`DALTON_RCLONE_DRIVE_DIR` 以及外置盘缓存、临时与日志目录；全部 `rclone` 调用自动绕开本地代理。打包对象归档前会检查外置盘可用空间达到待打包对象体积的 1.1 倍以上，并核对 Google Drive 剩余空间达到待传密文体积的 2 倍以上。
+- **端到端校验与加密续传**：上传前及流式加密过程中逐项核对源文件 SHA-256 与对象归档成员完整性；`moveto` 转正后对最终远端路径复核大小与 MD5，并将含当前密钥指纹的续传清单加密保存为 `MANIFEST.json.enc`。重复执行同一备份集时，脚本先在受限临时目录解密并验证 `MANIFEST.json.enc` 与当前密钥一致，再跳过已通过校验的文件；所有临时文件确认清理完毕后输出 `ok`，日志仅记录文件名、字节大小与执行结果。同一目标同时只能运行一次；缺可信摘要的旧备份集需先补校验（预演模式会列出计划并标明“缺可信摘要”）。
+
 ## 5. 公开入口与网络边界
 
 Dalton 宿主机对外服务**严格只通过 Tailscale Funnel `:8443` -> Caddy `edge`（`127.0.0.1:8088`）** 暴露（细节见 [dev-guide/PUBLIC-DEPLOY.md](./dev-guide/PUBLIC-DEPLOY.md)）：
