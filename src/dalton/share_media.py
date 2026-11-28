@@ -1793,8 +1793,19 @@ def _collect_thread_media_registry(
         facts = container.get("replay_facts") if "replay_facts" in container else container
         if not isinstance(facts, Mapping):
             continue
+        img_urls: list[Any] = []
         imgs = facts.get("images")
-        img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
+        if isinstance(imgs, Mapping):
+            img_urls.extend(imgs.values())
+        elif isinstance(imgs, list):
+            img_urls.extend(imgs)
+        imgs_by_msg = facts.get("images_by_message")
+        if isinstance(imgs_by_msg, Mapping):
+            for per_msg in imgs_by_msg.values():
+                if isinstance(per_msg, Mapping):
+                    img_urls.extend(per_msg.values())
+                elif isinstance(per_msg, list):
+                    img_urls.extend(per_msg)
         for u in img_urls:
             if not isinstance(u, str) or not u.strip():
                 continue

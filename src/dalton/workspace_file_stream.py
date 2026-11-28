@@ -10,10 +10,15 @@ body in memory.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import logging
 import mimetypes
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack
+import re
+import shlex
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 import anyio
@@ -47,10 +52,292 @@ logger = logging.getLogger(__name__)
 # Matches crud.py's wait budget for the shared 16-slot streamed download budget.
 _STREAM_SLOT_WAIT_S: float = 30.0
 _RO_BINARY_DETAIL = "Binary file download is not available in read-only mode"
+_LIVE_DIGEST_TIMEOUT_S: int = 30
+_ONLINE_ATTACH_TIMEOUT_S: float = 10.0
+_ONLINE_ATTACH_CLOSE_TIMEOUT_S: float = 3.0
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # Sentinel distinguishing "version field not provided" from a literal SQL NULL.
 _UNSET: Any = object()
+
+
+def _mirror_expected_sha256(file_meta: Mapping[str, Any]) -> str | None:
+    """Return the validated 64-hex SHA-256 digest on a mirror row, or ``None``."""
+    content_hash = str(file_meta.get("content_hash") or "").strip().lower()
+    blob_sha256 = str(file_meta.get("blob_sha256") or "").strip().lower()
+    if content_hash and blob_sha256 and content_hash != blob_sha256:
+        return None
+    digest = content_hash or blob_sha256
+    if not digest or not _SHA256_HEX_RE.fullmatch(digest):
+        return None
+    return digest
+
+
+def _live_file_digest_command(
+    target: str,
+    *,
+    roots: Sequence[str],
+    denied_roots: Sequence[str] = (),
+) -> str:
+    """Build a read-only shell probe that resolves containment, checks stat
+    stability before/after hashing, and prints canonical path, stat line, and SHA-256.
+    """
+    from ptc_agent.core.sandbox.file_version import version_line
+    from src.server.services.workspace_file_containment import (
+        READ_CONTAINMENT,
+        READ_MISSING,
+        _RESOLVE_SH,
+        _root_lines,
+    )
+
+    setup, patterns = _root_lines(roots)
+    if not patterns:
+        return f"exit {READ_CONTAINMENT}"
+    denied_setup: list[str] = []
+    denied_patterns: list[str] = []
+    for index, root in enumerate(denied_roots):
+        var = f"d{index}"
+        denied_setup.append(
+            f"{var}in={shlex.quote(root)}; "
+            f'{var}=$(realpath -m -- "${var}in" 2>/dev/null) '
+            f'|| {var}=$(readlink -f -- "${var}in" 2>/dev/null) '
+            f'|| {var}=$(__la_rp "${var}in") || true; '
+        )
+        denied_patterns.extend([f'"${var}"', f'"${var}"/*'])
+    denied_check = (
+        f'case "$tt" in {"|".join(denied_patterns)}) '
+        f"exit {READ_CONTAINMENT} ;; *) ;; esac; "
+        if denied_patterns
+        else ""
+    )
+    ver_line = version_line('"$tt"')
+    hash_cmd = (
+        "if command -v sha256sum >/dev/null 2>&1; then "
+        'h=$(sha256sum -- "$tt" 2>/dev/null) || exit 9; h=${h%% *}; '
+        "elif command -v shasum >/dev/null 2>&1; then "
+        'h=$(shasum -a 256 -- "$tt" 2>/dev/null) || exit 9; h=${h%% *}; '
+        "elif command -v openssl >/dev/null 2>&1; then "
+        'h=$(openssl dgst -sha256 -r -- "$tt" 2>/dev/null) || exit 9; h=${h%% *}; '
+        "else "
+        "h=$(python3 -c 'import hashlib,sys; h=hashlib.sha256(); "
+        'f=open(sys.argv[1],"rb"); '
+        '[h.update(b) for b in iter(lambda:f.read(1<<20),b"")]; '
+        "f.close(); print(h.hexdigest())' \"$tt\" 2>/dev/null) || exit 9; "
+        "fi; "
+    )
+    return "".join(
+        [
+            _RESOLVE_SH,
+            *setup,
+            *denied_setup,
+            f"t={shlex.quote(target)}; ",
+            'tt=$(realpath -m -- "$t" 2>/dev/null) ',
+            '|| tt=$(readlink -f -- "$t" 2>/dev/null) || tt=$(__la_rp "$t") ',
+            f"|| exit {READ_CONTAINMENT}; ",
+            f'[ -n "$tt" ] || exit {READ_CONTAINMENT}; ',
+            f'case "$tt" in {"|".join(patterns)}) ;; ',
+            f"*) exit {READ_CONTAINMENT} ;; esac; ",
+            denied_check,
+            f'[ -f "$tt" ] || exit {READ_MISSING}; ',
+            'printf %s "$tt" | base64 | tr -d "\\n"; printf "\\n"; ',
+            ver_line,
+            'v1=$v; ',
+            hash_cmd,
+            ver_line,
+            'v2=$v; ',
+            '[ -n "$h" ] && [ "$v1" = "$v2" ] || exit 8; ',
+            'printf "%s\\n%s\\n" "$v1" "$h"',
+        ]
+    )
+
+
+async def read_live_file_version(
+    sandbox: Any,
+    absolute_path: str,
+    *,
+    work_dir: str,
+) -> tuple[str, int, str] | None:
+    """Return ``(canonical_path, size_bytes, sha256_hex)`` for a live contained file, or ``None``.
+
+    Fails closed on containment escape, missing file, concurrent write while
+    hashing, missing runtime, or any exec/parse error so a stale mirror is never
+    served when the live version cannot be verified.
+    """
+    from ptc_agent.core.sandbox.file_version import line_size
+    from src.server.services.workspace_file_containment import (
+        _addresses_project,
+        is_within,
+        serving_roots,
+    )
+
+    if not _addresses_project(absolute_path, work_dir):
+        return None
+    runtime = getattr(sandbox, "runtime", None)
+    if runtime is None:
+        return None
+    roots = serving_roots(sandbox, work_dir=work_dir)
+    filesystem = getattr(getattr(sandbox, "config", None), "filesystem", None)
+    denied_roots = tuple(getattr(filesystem, "denied_directories", ()) or ())
+    try:
+        result = await runtime.exec(
+            _live_file_digest_command(
+                absolute_path,
+                roots=roots,
+                denied_roots=denied_roots,
+            ),
+            timeout=_LIVE_DIGEST_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Live file digest check failed for %r: %s",
+            absolute_path,
+            exc,
+        )
+        return None
+
+    if getattr(result, "exit_code", None) != 0:
+        return None
+
+    stdout = str(getattr(result, "stdout", "") or "")
+    lines = stdout.splitlines()
+    if len(lines) < 3 or not lines[0]:
+        return None
+    try:
+        canonical = base64.b64decode(lines[0], validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    if not any(is_within(root, canonical) for root in roots):
+        return None
+    validate = getattr(sandbox, "validate_path", None)
+    if callable(validate) and not validate(canonical):
+        return None
+
+    size = line_size(lines[1])
+    digest = lines[2].strip().lower()
+    if size is None or not _SHA256_HEX_RE.fullmatch(digest):
+        return None
+    return canonical, size, digest
+
+
+@asynccontextmanager
+async def attach_online_sandbox_readonly(
+    workspace: Mapping[str, Any],
+    workspace_id: str,
+    *,
+    timeout_s: float = _ONLINE_ATTACH_TIMEOUT_S,
+    close_timeout_s: float = _ONLINE_ATTACH_CLOSE_TIMEOUT_S,
+) -> AsyncIterator[Any | None]:
+    """Attach a temporary running-only, non-waking sandbox handle on a session-less worker.
+
+    Never calls ``get_session_for_workspace`` and never starts/restarts a stopped
+    sandbox. Yields ``None`` when the sandbox cannot be reached or is not running,
+    and always closes the temporary provider/sandbox handle on exit.
+    """
+    from ptc_agent.core.sandbox.attach_only import attach_only
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+    from ptc_agent.core.sandbox.runtime import RuntimeState
+    from src.server.services.computer_manager._types import ComputerBinding
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    durable_sandbox_id = workspace.get("sandbox_id")
+    if not isinstance(durable_sandbox_id, str) or not durable_sandbox_id.strip():
+        yield None
+        return
+    durable_sandbox_id = durable_sandbox_id.strip()
+
+    provider: Any = None
+    sandbox: Any = None
+
+    async def _safe_close(obj: Any) -> None:
+        if obj is None:
+            return
+        close_fn = getattr(obj, "close", None)
+        if not callable(close_fn):
+            return
+        try:
+            async with asyncio.timeout(close_timeout_s):
+                await close_fn()
+        except Exception:
+            logger.debug("Ignoring error closing temporary readonly sandbox handle", exc_info=True)
+
+    try:
+        try:
+            manager = WorkspaceManager.get_instance()
+            computer_id = workspace.get("computer_id")
+            computer_kind = workspace.get("computer_kind")
+            binding = (
+                ComputerBinding(
+                    workspace_id=str(workspace_id),
+                    computer_id=str(computer_id),
+                    kind=str(computer_kind),
+                    dir_name=workspace.get("dir_name"),
+                    root_dir=workspace.get("computer_root_dir"),
+                    provider_ref=durable_sandbox_id,
+                    resource_tier=workspace.get("resource_tier"),
+                    is_always_on=bool(workspace.get("is_always_on", False)),
+                    provider_config=workspace.get("computer_provider_config"),
+                    user_id=workspace.get("user_id"),
+                )
+                if computer_id and computer_kind
+                else None
+            )
+            core_config = manager._core_config_for(binding)
+            provider = manager._provider_for(binding)
+            async with asyncio.timeout(timeout_s):
+                runtime = await provider.get(durable_sandbox_id)
+                state = await runtime.get_state()
+                is_running = (
+                    state == RuntimeState.RUNNING
+                    or getattr(state, "value", None) == "running"
+                )
+                if is_running:
+                    work_dir = (
+                        await runtime.fetch_working_dir()
+                        or (binding.root_dir if binding is not None else None)
+                        or core_config.filesystem.working_directory
+                    )
+                else:
+                    work_dir = None
+
+            if not is_running:
+                p_close, provider = provider, None
+                await _safe_close(p_close)
+            else:
+                sandbox = PTCSandbox(
+                    core_config,
+                    None,
+                    resource_tier=workspace.get("resource_tier"),
+                    host_unavailable_policy=None,
+                    provider=provider,
+                    allow_reconnect=False,
+                )
+                provider = None
+                sandbox.runtime = runtime
+                sandbox.sandbox_id = durable_sandbox_id
+                sandbox._work_dir = work_dir
+        except Exception as exc:
+            logger.warning(
+                "Temporary non-waking attach failed for workspace=%s sandbox=%s: %s",
+                workspace_id,
+                durable_sandbox_id,
+                exc,
+            )
+            s_close, sandbox = sandbox, None
+            p_close, provider = provider, None
+            await _safe_close(s_close)
+            await _safe_close(p_close)
+
+        if sandbox is None:
+            yield None
+        else:
+            with attach_only():
+                yield sandbox
+    finally:
+        s_close, sandbox = sandbox, None
+        p_close, provider = provider, None
+        await _safe_close(s_close)
+        await _safe_close(p_close)
 
 
 class StoredStreamSizeMismatchError(RuntimeError):
@@ -539,6 +826,8 @@ async def shared_large_download(
     *,
     not_found_detail: str = "Shared resource not found",
     expected_size: int | None = None,
+    expected_sha256: str | None = None,
+    require_version_match: bool = False,
 ) -> Response | None:
     """Stream a ``(100 MiB, 256 MiB]`` stored file for a public share download.
 
@@ -549,9 +838,10 @@ async def shared_large_download(
     - ``normalized_path`` has been validated against traversal and passed
       ``target.visible(normalized_path)``.
 
-    When ``expected_size`` is supplied from a warm sandbox's
-    ``FileTooLargeToServe`` check and disagrees with the mirrored ``file_size``,
-    a stale large mirror row is never served (raises HTTP ``404``).
+    When ``expected_size`` / ``expected_sha256`` (or ``require_version_match=True``)
+    is supplied from a live sandbox check and disagrees with the mirrored row
+    (or the digest is missing/unverifiable), a stale mirror row is never served
+    (raises HTTP ``404``).
 
     Every file in the streaming range is unconditionally passed through
     :class:`StreamingSecretRedactor` regardless of MIME type or binary content.
@@ -582,6 +872,25 @@ async def shared_large_download(
             int(expected_size),
         )
         raise HTTPException(status_code=404, detail=not_found_detail)
+
+    if require_version_match or expected_sha256 is not None:
+        wanted_sha256 = str(expected_sha256 or "").strip().lower()
+        mirror_sha256 = _mirror_expected_sha256(file_meta)
+        if (
+            not wanted_sha256
+            or not _SHA256_HEX_RE.fullmatch(wanted_sha256)
+            or not mirror_sha256
+            or mirror_sha256 != wanted_sha256
+        ):
+            logger.warning(
+                "Shared large mirror digest disagrees with live sandbox workspace=%s path=%r "
+                "mirror_sha256=%r live_sha256=%r",
+                workspace_id,
+                normalized_path,
+                mirror_sha256,
+                wanted_sha256 or None,
+            )
+            raise HTTPException(status_code=404, detail=not_found_detail)
 
     filename = (
         file_meta.get("file_name")
@@ -644,34 +953,17 @@ async def shared_large_download(
         )
 
 
-async def shared_large_download_or_warm(
+async def _serve_from_live_sandbox(
+    sandbox: Any,
     target: Any,
     normalized_path: str,
     *,
-    not_found_detail: str = "File not found",
+    not_found_detail: str,
 ) -> tuple[Response | None, Any | None]:
-    """Enforce warm-sandbox-first semantics before streaming a large shared mirror.
+    """Check and serve a shared file against a live (cached or attached) sandbox.
 
-    Returns ``(streamed_response, warm_shared_bytes)``:
-    - When the workspace sandbox is warm:
-      - Reads the live file via ``share_files.warm_sandbox_bytes`` first.
-      - If missing or a symlink resolves outside workspace / invisible scope
-        (``resolved is None``), raises HTTP ``404`` without falling back to the
-        persisted mirror.
-      - If present and readable (including a file replaced/shrunk since the
-        last sync), checks ``folder_unmoved`` and returns the live
-        ``SharedBytes`` so the caller serves live bytes without reading twice.
-      - If ``FileTooLargeToServe`` is raised (present, contained, visible, and
-        larger than exec read cap), checks ``folder_unmoved``, resolves the
-        canonical client path, and streams the ``(100 MiB, 256 MiB]`` mirror
-        only when its ``file_size`` matches the live file's size; a mismatch or
-        missing mirror for a ``> 100 MiB`` live file raises HTTP ``404``.
-      - On transient/other sandbox errors, logs the miss and allows mirror
-        fallback just like ``_shared_file_bytes``.
-    - When the sandbox is not warm (stopped / cold):
-      - Streams ``(100 MiB, 256 MiB]`` mirrors via :func:`shared_large_download`,
-        or returns ``(None, None)`` to let upstream ``_shared_file_bytes`` read
-        ``<= 100 MiB`` DB rows.
+    Never falls back to an unverified persisted mirror on miss, escape,
+    same-size replacement, or sandbox error (always fails closed with 404).
     """
     from src.server.app import share_files
     from src.server.services.workspace_file_containment import FileTooLargeToServe
@@ -679,68 +971,190 @@ async def shared_large_download_or_warm(
 
     workspace_id = target.workspace_id
     owner_user_id = target.workspace["user_id"]
+
+    try:
+        resolved = await share_files.warm_sandbox_bytes(
+            sandbox,
+            normalized_path,
+            work_dir=target.work_dir,
+            visible=target.visible,
+        )
+    except FileTooLargeToServe as too_large:
+        if not await share_files.folder_unmoved(
+            workspace_id, target.workspace.get("dir_name")
+        ):
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+        canonical_client_path = to_client_path(
+            sandbox, too_large.canonical, target.work_dir
+        )
+        if not target.visible(canonical_client_path):
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+
+        live_version = await read_live_file_version(
+            sandbox,
+            too_large.canonical,
+            work_dir=target.work_dir,
+        )
+        if live_version is None:
+            logger.warning(
+                "Shared large file live digest unavailable workspace=%s path=%r; refusing mirror",
+                workspace_id,
+                canonical_client_path,
+            )
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+        live_canonical, live_size, live_sha256 = live_version
+        live_client_path = to_client_path(sandbox, live_canonical, target.work_dir)
+        if (
+            live_size != too_large.size
+            or not target.visible(live_client_path)
+            or not await share_files.folder_unmoved(
+                workspace_id, target.workspace.get("dir_name")
+            )
+        ):
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+
+        if live_size > SERVE_MAX_BYTES:
+            streamed = await shared_large_download(
+                workspace_id,
+                owner_user_id,
+                live_client_path,
+                not_found_detail=not_found_detail,
+                expected_size=live_size,
+                expected_sha256=live_sha256,
+                require_version_match=True,
+            )
+            if streamed is None:
+                raise HTTPException(
+                    status_code=404, detail=not_found_detail
+                ) from None
+            return streamed, None
+
+        # (EXEC_READ_MAX_BYTES, SERVE_MAX_BYTES]: verify mirror digest before serving.
+        try:
+            mirror_meta = await get_large_file_meta(workspace_id, live_client_path)
+        except RuntimeError as exc:
+            if "database pool is not open" in str(exc):
+                mirror_meta = None
+            else:
+                raise
+        if (
+            mirror_meta is None
+            or int(mirror_meta.get("file_size") or 0) != live_size
+            or _mirror_expected_sha256(mirror_meta) != live_sha256
+        ):
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+        record = await share_files.FilePersistenceService.get_file_content(
+            workspace_id, live_client_path
+        )
+        if not record:
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+        content = await share_files.resolve_file_bytes_or_none(
+            record,
+            user_id=owner_user_id,
+            context=f"reading verified large shared file in workspace {workspace_id}",
+        )
+        if (
+            content is None
+            or len(content) != live_size
+            or hashlib.sha256(content).hexdigest() != live_sha256
+        ):
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+        return None, share_files.SharedBytes(
+            live_client_path,
+            content,
+            share_files._mime_for(live_client_path, record.get("mime_type")),
+            "database",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        share_files._log_sandbox_miss("file", workspace_id, exc)
+        raise HTTPException(status_code=404, detail=not_found_detail) from None
+    else:
+        if resolved is None:
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if not await share_files.folder_unmoved(
+            workspace_id, target.workspace.get("dir_name")
+        ):
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        client_path, content = resolved
+        return None, share_files.SharedBytes(
+            client_path,
+            content,
+            share_files._mime_for(client_path, None),
+            "sandbox",
+        )
+
+
+async def shared_large_download_or_warm(
+    target: Any,
+    normalized_path: str,
+    *,
+    not_found_detail: str = "File not found",
+) -> tuple[Response | None, Any | None]:
+    """Enforce live-sandbox-first semantics using shared DB online state.
+
+    Returns ``(streamed_response, warm_shared_bytes)``:
+    - Determines whether the sandbox is online from cross-process DB state
+      (:func:`is_sandbox_online`), not process-local session memory alone.
+    - When this worker holds a warm session, checks the live sandbox directly.
+    - When DB says the sandbox is online but this worker holds no session,
+      performs a non-waking running-only attach (:func:`attach_online_sandbox_readonly`)
+      and checks the live file; if the live sandbox cannot be reached or verified,
+      raises HTTP ``404`` without falling back to the persisted mirror.
+    - For ``FileTooLargeToServe`` on an online sandbox, verifies the live file's
+      SHA-256 digest and size against the mirror row before streaming; any
+      mismatch (including same-size replacements) or missing digest raises ``404``.
+    - Only when DB says the sandbox is offline/stopped (and no warm handle exists)
+      does this stream ``(100 MiB, 256 MiB]`` mirrors via :func:`shared_large_download`
+      or return ``(None, None)`` for ``<= 100 MiB`` DB rows.
+    """
+    from src.server.app import share_files
+    from src.server.services.warm_files import is_sandbox_online
+
+    workspace_id = target.workspace_id
+    owner_user_id = target.workspace["user_id"]
     sandbox = share_files.warm_sandbox(target.workspace, workspace_id)
 
     if sandbox is not None:
-        try:
-            resolved = await share_files.warm_sandbox_bytes(
-                sandbox,
-                normalized_path,
-                work_dir=target.work_dir,
-                visible=target.visible,
-            )
-        except FileTooLargeToServe as too_large:
-            if not await share_files.folder_unmoved(
-                workspace_id, target.workspace.get("dir_name")
-            ):
-                raise HTTPException(
-                    status_code=404, detail=not_found_detail
-                ) from None
-            canonical_client_path = to_client_path(
-                sandbox, too_large.canonical, target.work_dir
-            )
-            if not target.visible(canonical_client_path):
-                raise HTTPException(
-                    status_code=404, detail=not_found_detail
-                ) from None
-            streamed = await shared_large_download(
-                workspace_id,
-                owner_user_id,
-                canonical_client_path,
-                not_found_detail=not_found_detail,
-                expected_size=too_large.size,
-            )
-            if streamed is not None:
-                return streamed, None
-            if too_large.size > SERVE_MAX_BYTES:
-                raise HTTPException(
-                    status_code=404, detail=not_found_detail
-                ) from None
-            return None, None
-        except HTTPException:
-            raise
-        except Exception as exc:
-            share_files._log_sandbox_miss("file", workspace_id, exc)
-            streamed = await shared_large_download(
-                workspace_id,
-                owner_user_id,
+        return await _serve_from_live_sandbox(
+            sandbox,
+            target,
+            normalized_path,
+            not_found_detail=not_found_detail,
+        )
+
+    if is_sandbox_online(target.workspace):
+        async with attach_online_sandbox_readonly(
+            target.workspace, workspace_id
+        ) as attached:
+            if attached is None:
+                logger.warning(
+                    "Shared download refused: workspace=%s status=%r is online in DB "
+                    "but live sandbox is unavailable on this worker; not falling back to mirror",
+                    workspace_id,
+                    target.workspace.get("status"),
+                )
+                raise HTTPException(status_code=404, detail=not_found_detail)
+            return await _serve_from_live_sandbox(
+                attached,
+                target,
                 normalized_path,
                 not_found_detail=not_found_detail,
-            )
-            return streamed, None
-        else:
-            if resolved is None:
-                raise HTTPException(status_code=404, detail=not_found_detail)
-            if not await share_files.folder_unmoved(
-                workspace_id, target.workspace.get("dir_name")
-            ):
-                raise HTTPException(status_code=404, detail=not_found_detail)
-            client_path, content = resolved
-            return None, share_files.SharedBytes(
-                client_path,
-                content,
-                share_files._mime_for(client_path, None),
-                "sandbox",
             )
 
     streamed = await shared_large_download(

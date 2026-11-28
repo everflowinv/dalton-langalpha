@@ -688,20 +688,87 @@ test.describe('Workspace File Storage Batch 1 Step 4 — Live Isolated Deploymen
     }
   });
 
-  test('live public share downgrade (allow_files=false) returns 403 with no-store & Clear-Site-Data, and revoked token returns 404', async ({
+  test('live public share downgrade (allow_files=false) transitions same URL from 200 to 403 with no-store & Clear-Site-Data, and revoked token returns 404', async ({
     request,
   }) => {
-    const downgradedToken = process.env.E2E_LIVE_DOWNGRADED_SHARE_TOKEN || '';
-    const filePath = process.env.E2E_LIVE_TEXT_150M_PATH || 'large_150m.txt';
-    if (downgradedToken) {
-      const downRes = await request.get(
-        `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(downgradedToken)}/files/download?path=${encodeURIComponent(filePath)}`,
+    const shareToken = (
+      process.env.E2E_LIVE_DOWNGRADE_SHARE_TOKEN ||
+      process.env.E2E_LIVE_SHARE_TOKEN ||
+      ''
+    ).trim();
+    const threadId = (process.env.E2E_LIVE_DOWNGRADE_THREAD_ID || '').trim();
+    const filePath = (
+      process.env.E2E_LIVE_DOWNGRADE_FILE_PATH ||
+      process.env.E2E_LIVE_TEXT_150M_PATH ||
+      ''
+    ).trim();
+    const ownerAuthHeader = (process.env.E2E_LIVE_OWNER_AUTH_HEADER || '').trim();
+    const ownerBearer = (process.env.E2E_LIVE_OWNER_BEARER_TOKEN || '').trim();
+    const ownerCookie = (process.env.E2E_LIVE_OWNER_COOKIE || '').trim();
+
+    const missing = [];
+    if (!shareToken) missing.push('E2E_LIVE_DOWNGRADE_SHARE_TOKEN (or E2E_LIVE_SHARE_TOKEN)');
+    if (!threadId) missing.push('E2E_LIVE_DOWNGRADE_THREAD_ID');
+    if (!filePath) missing.push('E2E_LIVE_DOWNGRADE_FILE_PATH (or E2E_LIVE_TEXT_150M_PATH)');
+    if (!ownerAuthHeader && !ownerBearer && !ownerCookie) {
+      missing.push(
+        'E2E_LIVE_OWNER_BEARER_TOKEN, E2E_LIVE_OWNER_COOKIE, or E2E_LIVE_OWNER_AUTH_HEADER',
       );
-      expect(downRes.status()).toBe(403);
-      expect(downRes.headers()['cache-control']).toBe('no-store');
-      expect(downRes.headers()['clear-site-data']).toBe('"cache"');
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `Missing required live downgrade test data when E2E_LIVE_BASE_URL is set: ${missing.join(', ')}`,
+      );
     }
 
+    const downloadUrl = `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(shareToken)}/files/download?path=${encodeURIComponent(filePath)}`;
+
+    // 1. Read the shared file first while allow_files=true & allow_download=true -> must return 200.
+    const beforeRes = await fetch(downloadUrl, { redirect: 'manual', cache: 'no-store' });
+    expect(beforeRes.status, `pre-downgrade download ${downloadUrl}`).toBe(200);
+    expect(beforeRes.headers.get('cache-control')).toBe('no-store');
+    if (beforeRes.body) {
+      const reader = beforeRes.body.getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(first.value?.length || 0).toBeGreaterThan(0);
+      await reader.cancel();
+    }
+
+    // 2. Downgrade share permissions to allow_files=false via owner API on the live deployment.
+    const ownerHeaders = { 'Content-Type': 'application/json' };
+    if (ownerAuthHeader) {
+      ownerHeaders.Authorization = ownerAuthHeader;
+    } else if (ownerBearer) {
+      ownerHeaders.Authorization = `Bearer ${ownerBearer}`;
+    }
+    if (ownerCookie) {
+      ownerHeaders.Cookie = ownerCookie;
+    }
+    const patchRes = await request.post(
+      `${LIVE_BASE_URL}/api/v1/threads/${encodeURIComponent(threadId)}/share`,
+      {
+        headers: ownerHeaders,
+        data: {
+          is_shared: true,
+          permissions: {
+            allow_files: false,
+            allow_download: false,
+          },
+        },
+      },
+    );
+    expect(patchRes.status(), `downgrade share permissions for thread ${threadId}`).toBe(200);
+    const patchJson = await patchRes.json();
+    expect(patchJson?.permissions?.allow_files).toBe(false);
+
+    // 3. Retry the exact same download URL -> must now return 403 with no-store & Clear-Site-Data.
+    const afterRes = await request.get(downloadUrl);
+    expect(afterRes.status(), `post-downgrade download ${downloadUrl}`).toBe(403);
+    expect(afterRes.headers()['cache-control']).toBe('no-store');
+    expect(afterRes.headers()['clear-site-data']).toBe('"cache"');
+
+    // 4. Revoked / nonexistent share token -> must return 404 with Cache-Control: no-store.
     const revokedToken = process.env.E2E_LIVE_REVOKED_SHARE_TOKEN || 'tok-e2e-nonexistent-revoked';
     const revokedRes = await request.get(
       `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(revokedToken)}/files/download?path=${encodeURIComponent(filePath)}`,
