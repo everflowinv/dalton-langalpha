@@ -40,6 +40,7 @@ from src.dalton.capabilities import (
     CapabilityId,
     effective_capabilities,
     get_connector_providers_summary,
+    is_langsmith_tracing_active,
 )
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
@@ -49,8 +50,8 @@ from src.dalton.database.user_integrations import (
 )
 from src.dalton.integrations.constants import (
     FEISHU_CALENDAR_SCOPES,
-    GOOGLE_CALENDAR_MIN_SCOPES,
     GOOGLE_SCOPE_CALENDAR_EVENTS,
+    GOOGLE_SCOPE_CALENDAR_EVENTS_RO,
     GOOGLE_SCOPE_CALENDAR_LIST_RO,
 )
 from src.dalton.integrations.feishu_calendar import (
@@ -303,10 +304,15 @@ def _provider_not_ready_command(
     if not not_ready or len(not_ready) < len(providers):
         return None
     names = "或".join(_provider_display_name(p) for p in not_ready)
+    tracing_blocked = any(
+        bool((summary.get(p) or {}).get("langsmith_tracing_enabled")) for p in not_ready
+    )
     missing_creds = any(
         not bool((summary.get(p) or {}).get("credentials_ready")) for p in not_ready
     )
-    if missing_creds:
+    if tracing_blocked:
+        msg = "当前部署开启了调用追踪，个人日历不可用。"
+    elif missing_creds:
         msg = (
             f"当前部署已开启{names}功能，但管理员尚未在「部署设置 → 集成凭据」完成客户端凭据配置，"
             f"暂无法自助连接，请联系管理员完成配置后再试。"
@@ -317,7 +323,7 @@ def _provider_not_ready_command(
             f"暂无法自助连接，请联系管理员完成配置后再试。"
         )
     return _error_command(
-        "provider_not_ready",
+        "langsmith_tracing_incompatible" if tracing_blocked else "provider_not_ready",
         msg,
         tool_call_id,
         providers=list(not_ready),
@@ -330,8 +336,8 @@ def _required_scopes_for(provider: str, action: str) -> tuple[str, ...]:
         if action == "list_calendars":
             return (GOOGLE_SCOPE_CALENDAR_LIST_RO,)
         if action in _WRITE_ACTIONS:
-            return GOOGLE_CALENDAR_MIN_SCOPES
-        return (GOOGLE_SCOPE_CALENDAR_EVENTS,)
+            return (GOOGLE_SCOPE_CALENDAR_LIST_RO, GOOGLE_SCOPE_CALENDAR_EVENTS)
+        return (GOOGLE_SCOPE_CALENDAR_EVENTS_RO,)
     if provider == "feishu":
         if action == "list_calendars":
             return ("calendar:calendar:readonly",)
@@ -1241,6 +1247,14 @@ def create_calendar_tools(
                 tool_call_id,
             )
 
+        # Mutual exclusion: personal calendar is unavailable when LangSmith tracing is active.
+        if is_langsmith_tracing_active():
+            return _error_command(
+                "langsmith_tracing_incompatible",
+                "当前部署开启了调用追踪，个人日历不可用。",
+                tool_call_id,
+            )
+
         # Batch 1 entry gate: personal calendar is interactive-conversation only.
         if _is_unattended_automation_turn(config):
             return _error_command(
@@ -1337,7 +1351,7 @@ def create_calendar_tools(
                 avail_names = "或".join(_provider_display_name(p) for p in ready_providers)
                 return _error_command(
                     "not_connected",
-                    f"你尚未连接个人日历。前往「设置 → 集成」（{_SETTINGS_INTEGRATIONS_PATH}）连接{avail_names}后，即可在私密对话中查询和管理日程。",
+                    f"你尚未连接个人日历。前往「设置 → 集成」（{_SETTINGS_INTEGRATIONS_PATH}）连接{avail_names}后，即可在私密对话中查看日程和空闲时间。",
                     tool_call_id,
                     settings_path=_SETTINGS_INTEGRATIONS_PATH,
                     available_providers=ready_providers,

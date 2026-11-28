@@ -31,6 +31,7 @@ from src.dalton.auth.sessions import verify_local_session_active
 from src.dalton.capabilities import (
     CapabilityId,
     has_capability,
+    is_langsmith_tracing_active,
     require_personal_integration_capability,
 )
 from src.dalton.database import user_integrations as db
@@ -73,6 +74,7 @@ from src.dalton.integrations.constants import (
     PENDING_CONFIRMATION_TTL_SECONDS,
     build_integration_redirect_uri,
     get_connector_spec,
+    scope_satisfied,
 )
 from src.dalton.integrations.oauth_clients import (
     FEISHU_AUTHORIZE_URL,
@@ -576,10 +578,14 @@ def _missing_min_scopes(provider: str, service: str, granted: Collection[str]) -
     if spec is None:
         return ["unsupported_service"]
     if provider == "google":
-        return [s for s in spec.min_required_scopes if s not in granted_set]
+        return [
+            s
+            for s in spec.min_required_scopes
+            if not scope_satisfied(s, granted_set)
+        ]
     # Feishu v2 token responses may omit offline_access from returned scope string even when refresh_token was issued
     required = [s for s in spec.min_required_scopes if s != "offline_access"]
-    return [s for s in required if s not in granted_set]
+    return [s for s in required if not scope_satisfied(s, granted_set)]
 
 
 def _converge_preferences_for_scopes(
@@ -793,6 +799,11 @@ async def start_oauth_authorization(
             f"Unsupported integration: {norm_provider}/{norm_service}",
             code="unsupported_integration",
             status_code=404,
+        )
+    if norm_service == "calendar" and is_langsmith_tracing_active():
+        raise IntegrationCredentialsNotReadyError(
+            "当前部署开启了调用追踪，个人日历不可用。",
+            details={"provider": norm_provider, "reason": "langsmith_tracing_enabled"},
         )
 
     client_id, _client_secret = _load_provider_oauth_credentials(norm_provider)
@@ -2717,7 +2728,7 @@ def _check_required_scopes(
     if not required_scopes:
         return
     granted_set = set(_parse_scopes(granted_scopes))
-    missing = [s for s in required_scopes if s not in granted_set]
+    missing = [s for s in required_scopes if not scope_satisfied(s, granted_set)]
     if missing:
         raise MissingRequiredScopesError(
             f"Missing required OAuth scopes: {', '.join(missing)}",

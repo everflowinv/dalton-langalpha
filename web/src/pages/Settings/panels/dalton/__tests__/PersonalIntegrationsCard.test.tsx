@@ -729,4 +729,176 @@ describe('PersonalIntegrationsCard', () => {
     );
     expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent('已撤销');
   });
+
+  it('shows read-only calendar copy and marks personal calendar unavailable when LangSmith tracing is enabled', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [
+          makeConnector('google', 'calendar', {
+            credentials_ready: true,
+            ready: false,
+            langsmith_tracing_enabled: true,
+          }),
+          makeConnector('feishu', 'calendar', {
+            credentials_ready: true,
+            ready: false,
+            langsmith_tracing_enabled: true,
+          }),
+        ],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+
+    renderCard();
+
+    const googleRow = await screen.findByTestId('personal-integration-row-google-calendar');
+    const feishuRow = screen.getByTestId('personal-integration-row-feishu-calendar');
+
+    // Read-only copy across card description and both calendar subtitles
+    expect(
+      screen.getByText(
+        '授权连接你的个人 Google 日历或飞书日历，在私密对话中查看日程和空闲时间。',
+      ),
+    ).toBeInTheDocument();
+    expect(googleRow).toHaveTextContent('在私密对话中查看日程和空闲时间。');
+    expect(feishuRow).toHaveTextContent('在私密对话中查看日程和空闲时间。');
+    expect(document.body.textContent).not.toContain('创建、修改或删除日程');
+    expect(document.body.textContent).not.toContain('管理个人日程');
+
+    // LangSmith tracing mutual exclusion badge, message, and disabled connect buttons
+    expect(googleRow).toHaveTextContent('不可用');
+    expect(googleRow).toHaveTextContent('当前部署开启了调用追踪，个人日历不可用');
+    expect(googleRow.querySelector('button')).toBeDisabled();
+    expect(feishuRow).toHaveTextContent('不可用');
+    expect(feishuRow).toHaveTextContent('当前部署开启了调用追踪，个人日历不可用');
+    expect(feishuRow.querySelector('button')).toBeDisabled();
+  });
+
+  it('shows remote revoke completed immediately when single Google disconnect returns succeeded', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar')],
+        connections: [makeConnection('google', 'calendar')],
+        active_purges: [],
+        recent_purges: [],
+        has_personal_integrations: true,
+      },
+    });
+    h.apiDelete.mockResolvedValueOnce({
+      data: {
+        local_disconnected: true,
+        local_tokens_destroyed: true,
+        provider: 'google',
+        service: 'calendar',
+        purge_id: 'p-single-ok',
+        local_purge_status: 'completed',
+        remote_revoke_status: 'succeeded',
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('Google 日历')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '断开连接' }));
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /断开并在 Google 撤销授权/ }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '已断开连接，关联个人数据已清理完成，Google 授权已撤销。',
+      ),
+    );
+  });
+
+  it('merges succeeded and not_applicable for disconnect-all Google services on shared grant', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'google_gmail']);
+    const pCal: PersonalIntegrationPurgeLedger = {
+      purge_id: 'p-shared-cal',
+      provider: 'google',
+      service: 'calendar',
+      provider_account_id: 'acct-google',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'completed',
+      remote_revoke_status: 'pending',
+      retry_count: 0,
+      next_retry_at: null,
+      last_remote_error: null,
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: '2026-11-27T10:00:02Z',
+      remote_completed_at: null,
+    };
+    const pMail: PersonalIntegrationPurgeLedger = {
+      ...pCal,
+      purge_id: 'p-shared-mail',
+      service: 'mail',
+      remote_revoke_status: 'not_applicable',
+    };
+
+    h.apiGet
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [makeConnection('google', 'calendar'), makeConnection('google', 'mail')],
+          active_purges: [],
+          recent_purges: [],
+          has_personal_integrations: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+          connections: [],
+          active_purges: [],
+          recent_purges: [
+            { ...pCal, remote_revoke_status: 'succeeded', remote_completed_at: '2026-11-27T10:00:05Z' },
+            pMail,
+          ],
+          has_personal_integrations: false,
+        },
+      });
+
+    h.apiDelete.mockResolvedValueOnce({
+      data: {
+        provider: 'google',
+        services: ['calendar', 'mail'],
+        purges: [
+          {
+            purge_id: 'p-shared-cal',
+            provider: 'google',
+            service: 'calendar',
+            local_purge_status: 'completed',
+            remote_revoke_status: 'pending',
+          },
+          {
+            purge_id: 'p-shared-mail',
+            provider: 'google',
+            service: 'mail',
+            local_purge_status: 'completed',
+            remote_revoke_status: 'not_applicable',
+          },
+        ],
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('Google 日历')).toBeInTheDocument();
+    const disconnectBtns = screen.getAllByRole('button', { name: '断开连接' });
+    fireEvent.click(disconnectBtns[0]);
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /断开全部 Google 服务并在 Google 撤销授权/ }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('personal-integrations-banner')).toHaveTextContent(
+        '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
+      ),
+    );
+    expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent(
+      '暂未收到 Google 远端撤销的明确确认结果',
+    );
+  });
 });

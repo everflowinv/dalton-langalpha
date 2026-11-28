@@ -15,6 +15,7 @@ from src.dalton.capabilities import (
     CapabilityRequirement,
     effective_capabilities,
     is_capability_requirement_satisfied,
+    is_langsmith_tracing_active,
 )
 from src.dalton.settings import get_dalton_settings
 from src.dalton.tools.coverage_tools import build_coverage_tools
@@ -576,6 +577,8 @@ def build_dalton_tools(
         if active_role not in entry.roles:
             continue
         if entry.id == "coverage_tools_cos" and not allow_personal_watchlist:
+            continue
+        if entry.id == "calendar_tools" and is_langsmith_tracing_active():
             continue
         if not _passes_tier_gate(
             entry.min_tier,

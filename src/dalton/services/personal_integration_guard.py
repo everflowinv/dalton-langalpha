@@ -1110,6 +1110,154 @@ async def is_thread_personal_private(
         raise
 
 
+async def get_thread_creator_user_id(
+    thread_id: str,
+    *,
+    conn: Any = None,
+) -> str | None:
+    """Return ``conversation_threads.user_id`` for ``thread_id`` (fail-closed None)."""
+    tid = normalize_uuid(thread_id) if thread_id else None
+    if tid is None:
+        return None
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT user_id
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s::uuid
+                    LIMIT 1
+                    """,
+                    (tid,),
+                )
+                row = await cur.fetchone()
+                if not isinstance(row, Mapping):
+                    return None
+                uid = str(row.get("user_id") or "").strip()
+                return uid or None
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return None
+        raise
+
+
+def _parse_dm_notify_target(target: str) -> tuple[str, str] | None:
+    """Parse ``feishu:user:<id>``, ``discord:user:<id>``, or ``weixin:user:<id>``."""
+    cleaned = str(target or "").strip()
+    parts = cleaned.split(":", 2)
+    if len(parts) != 3:
+        return None
+    platform, kind, recipient = parts[0].strip().lower(), parts[1].strip().lower(), parts[2].strip()
+    if kind != "user" or not recipient:
+        return None
+    if platform not in ("feishu", "discord", "weixin"):
+        return None
+    return platform, recipient
+
+
+async def verify_personal_dm_target_bound(
+    user_id: str,
+    target: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Verify ``target`` is currently bound to ``user_id`` in channel binding tables (fail-closed)."""
+    uid = str(user_id or "").strip()
+    parsed = _parse_dm_notify_target(target)
+    if not uid or parsed is None:
+        return False
+    platform, recipient_id = parsed
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor() as cur:
+                if platform == "weixin":
+                    await cur.execute(
+                        """
+                        SELECT 1
+                        FROM dalton_channel_weixin_accounts
+                        WHERE user_id = %s
+                          AND status = 'active'
+                          AND ilink_user_id = %s
+                        LIMIT 1
+                        """,
+                        (uid, recipient_id),
+                    )
+                    return (await cur.fetchone()) is not None
+                await cur.execute(
+                    """
+                    SELECT 1
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s
+                      AND platform = %s
+                      AND platform_user_id = %s
+                    LIMIT 1
+                    """,
+                    (uid, platform, recipient_id),
+                )
+                return (await cur.fetchone()) is not None
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return False
+        raise
+
+
+async def list_bound_personal_dm_targets(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> list[str]:
+    """Return canonical DM notify targets currently bound to ``user_id``."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return []
+    targets: list[str] = []
+    seen: set[str] = set()
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT platform, platform_user_id
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s
+                      AND platform IN ('feishu', 'discord')
+                    ORDER BY platform ASC
+                    """,
+                    (uid,),
+                )
+                for row in await cur.fetchall() or []:
+                    plat = str(row.get("platform") or "").strip().lower()
+                    puid = str(row.get("platform_user_id") or "").strip()
+                    if plat in ("feishu", "discord") and puid:
+                        addr = f"{plat}:user:{puid}"
+                        if addr not in seen:
+                            seen.add(addr)
+                            targets.append(addr)
+                await cur.execute(
+                    """
+                    SELECT ilink_user_id
+                    FROM dalton_channel_weixin_accounts
+                    WHERE user_id = %s
+                      AND status = 'active'
+                    ORDER BY created_at DESC
+                    """,
+                    (uid,),
+                )
+                for row in await cur.fetchall() or []:
+                    wx_uid = str(row.get("ilink_user_id") or "").strip()
+                    if wx_uid:
+                        addr = f"weixin:user:{wx_uid}"
+                        if addr not in seen:
+                            seen.add(addr)
+                            targets.append(addr)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return []
+        raise
+    return targets
+
+
 async def enforce_personal_thread_owner_only(
     thread_id: str,
     caller_user_id: str,
@@ -1174,6 +1322,9 @@ __all__ = [
     "claim_first_touch_notice_if_needed",
     "enforce_personal_thread_owner_only",
     "extract_surface_context",
+    "get_thread_creator_user_id",
     "is_thread_personal_private",
+    "list_bound_personal_dm_targets",
+    "verify_personal_dm_target_bound",
     "verify_personal_integration_surface",
 ]

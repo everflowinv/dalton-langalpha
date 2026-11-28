@@ -222,11 +222,11 @@ async def test_r5_calendar_write_actions_rejected_at_entry_without_external_call
 
 
 # ===========================================================================
-# 2. LangSmith first-touch buffering (full start -> end callback lifecycle)
+# 2. LangSmith export: private threads suppressed; non-private turns export immediately
 # ===========================================================================
 
 
-def test_r5_langsmith_defers_export_on_calendar_eligible_turn_and_discards_on_first_touch(
+def test_r5_langsmith_suppresses_already_private_thread_and_exports_non_private_immediately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ls_client = create_autospec(LangSmithClient, instance=True)
@@ -245,7 +245,7 @@ def test_r5_langsmith_defers_export_on_calendar_eligible_turn_and_discards_on_fi
         token_callback=None,
         request=req_stub,
         effective_model="gpt-5",
-        extra_configurable={"personal_calendar_tool_loaded": True},
+        extra_configurable={"has_personal_integration_data": True},
     )
     tracer = next(cb for cb in cfg["callbacks"] if isinstance(cb, NonRetainingTracer))
 
@@ -255,100 +255,26 @@ def test_r5_langsmith_defers_export_on_calendar_eligible_turn_and_discards_on_fi
         name="LangGraph",
         run_type="chain",
         start_time=datetime.now(UTC),
-        inputs={"messages": [{"content": "帮我看看明天和投资人陈总的私密日程 SECRET_FIRST_TURN"}]},
-        outputs={"messages": [{"content": "你明天 10:00 有会议"}]},
+        inputs={"messages": [{"content": "历史私密线程 SECRET_PRIVATE_THREAD"}]},
+        outputs={"messages": [{"content": "私密回复"}]},
         extra={},
         serialized={},
         client=ls_client,
     )
-    # Full callback lifecycle: root start -> child LLM start (with secret prompt) -> LLM end (calls dalton_calendar) -> tool -> root end
     tracer._start_trace(root_run)
     tracer._on_chain_start(root_run)
-    assert ls_client.create_run.call_count == 0
-
-    child_tracer = tracer.copy_with_metadata_defaults(metadata={"langgraph_node": "model"})
-    llm_run = Run(
-        id=uuid4(),
-        parent_run_id=root_id,
-        name="ChatOpenAI",
-        run_type="llm",
-        start_time=datetime.now(UTC),
-        inputs={
-            "messages": [
-                [{"kwargs": {"content": "帮我看看明天和投资人陈总的私密日程 SECRET_FIRST_TURN"}}]
-            ]
-        },
-        outputs={
-            "generations": [
-                [
-                    {
-                        "text": "",
-                        "message": {
-                            "kwargs": {
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": "tc-first-1",
-                                        "name": "dalton_calendar",
-                                        "args": {"action": "list_events"},
-                                    }
-                                ],
-                            }
-                        },
-                    }
-                ]
-            ]
-        },
-        extra={},
-        serialized={},
-        client=ls_client,
-    )
-    child_tracer._start_trace(llm_run)
-    child_tracer._on_chat_model_start(llm_run)
-    # CRITICAL: Even on the very first model call BEFORE tool call is emitted, create_run MUST NOT fire!
-    assert ls_client.create_run.call_count == 0
-    assert ls_client.update_run.call_count == 0
-
-    child_tracer._on_llm_end(llm_run)
-    child_tracer._end_trace(llm_run)
-
-    cal_run = Run(
-        id=uuid4(),
-        parent_run_id=root_id,
-        name="dalton_calendar",
-        run_type="tool",
-        start_time=datetime.now(UTC),
-        inputs={"action": "list_events", "query": "SECRET_FIRST_TURN"},
-        outputs={"output": "明天 10:00 体检 SECRET_RESULT"},
-        extra={},
-        serialized={},
-        client=ls_client,
-    )
-    child_tracer._start_trace(cal_run)
-    child_tracer._on_tool_start(cal_run)
-    child_tracer._on_tool_end(cal_run)
-    child_tracer._end_trace(cal_run)
-
     tracer._on_chain_end(root_run)
     tracer._end_trace(root_run)
-
-    # Entire buffered trace discarded on touch: ZERO create_run and ZERO update_run
     assert ls_client.create_run.call_count == 0
     assert ls_client.update_run.call_count == 0
 
-
-def test_r5_langsmith_defers_then_exports_when_calendar_eligible_turn_does_not_touch_calendar(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ls_client = create_autospec(LangSmithClient, instance=True)
+    ls_client_normal = create_autospec(LangSmithClient, instance=True)
     monkeypatch.setattr(
         tracer_mod,
         "_ambient_equivalent",
-        lambda: NonRetainingTracer(client=ls_client, project_name="test-proj"),
+        lambda: NonRetainingTracer(client=ls_client_normal, project_name="test-proj"),
     )
-
-    req_stub = ChatRequest(messages=[], workspace_id=str(uuid4()))
-    cfg = request_prep_mod.build_graph_config(
+    cfg_normal = request_prep_mod.build_graph_config(
         thread_id=str(uuid4()),
         user_id="user-1",
         workspace_id=str(uuid4()),
@@ -356,78 +282,11 @@ def test_r5_langsmith_defers_then_exports_when_calendar_eligible_turn_does_not_t
         token_callback=None,
         request=req_stub,
         effective_model="gpt-5",
-        extra_configurable={"personal_calendar_tool_loaded": True},
     )
-    tracer = next(cb for cb in cfg["callbacks"] if isinstance(cb, NonRetainingTracer))
-
-    root_id = uuid4()
-    root_run = Run(
-        id=root_id,
-        name="LangGraph",
-        run_type="chain",
-        start_time=datetime.now(UTC),
-        inputs={"messages": [{"content": "分析一下 AAPL Q4 财报"}]},
-        outputs={"messages": [{"content": "AAPL Q4 营收增长 8%"}]},
-        extra={},
-        serialized={},
-        client=ls_client,
+    tracer_normal = next(
+        cb for cb in cfg_normal["callbacks"] if isinstance(cb, NonRetainingTracer)
     )
-    tracer._start_trace(root_run)
-    tracer._on_chain_start(root_run)
-    assert ls_client.create_run.call_count == 0
-
-    child_tracer = tracer.copy_with_metadata_defaults(metadata={"langgraph_node": "model"})
-    llm_run = Run(
-        id=uuid4(),
-        parent_run_id=root_id,
-        name="ChatOpenAI",
-        run_type="llm",
-        start_time=datetime.now(UTC),
-        inputs={"messages": [[{"kwargs": {"content": "分析一下 AAPL Q4 财报"}}]]},
-        outputs={
-            "generations": [
-                [{"text": "AAPL Q4 营收增长 8%", "message": {"kwargs": {"content": "AAPL Q4 营收增长 8%"}}}]
-            ]
-        },
-        extra={},
-        serialized={},
-        client=ls_client,
-    )
-    child_tracer._start_trace(llm_run)
-    child_tracer._on_chat_model_start(llm_run)
-    child_tracer._on_llm_end(llm_run)
-    child_tracer._end_trace(llm_run)
-    # Still buffered until root turn ends cleanly
-    assert ls_client.create_run.call_count == 0
-    assert ls_client.update_run.call_count == 0
-
-    # Root ends without touching calendar -> full trace flushes in order
-    tracer._on_chain_end(root_run)
-    tracer._end_trace(root_run)
-    assert ls_client.create_run.call_count == 2
-    assert ls_client.update_run.call_count == 2
-
-    # When calendar tool is NOT loaded, tracer exports immediately on start (no buffering)
-    ls_client_unloaded = create_autospec(LangSmithClient, instance=True)
-    monkeypatch.setattr(
-        tracer_mod,
-        "_ambient_equivalent",
-        lambda: NonRetainingTracer(client=ls_client_unloaded, project_name="test-proj"),
-    )
-    cfg_unloaded = request_prep_mod.build_graph_config(
-        thread_id=str(uuid4()),
-        user_id="user-1",
-        workspace_id=str(uuid4()),
-        timezone_str="Asia/Shanghai",
-        token_callback=None,
-        request=req_stub,
-        effective_model="gpt-5",
-        extra_configurable={"personal_calendar_tool_loaded": False},
-    )
-    tracer_unloaded = next(
-        cb for cb in cfg_unloaded["callbacks"] if isinstance(cb, NonRetainingTracer)
-    )
-    run_unloaded = Run(
+    run_normal = Run(
         id=uuid4(),
         name="LangGraph",
         run_type="chain",
@@ -436,11 +295,11 @@ def test_r5_langsmith_defers_then_exports_when_calendar_eligible_turn_does_not_t
         outputs={},
         extra={},
         serialized={},
-        client=ls_client_unloaded,
+        client=ls_client_normal,
     )
-    tracer_unloaded._start_trace(run_unloaded)
-    tracer_unloaded._on_chain_start(run_unloaded)
-    assert ls_client_unloaded.create_run.call_count == 1
+    tracer_normal._start_trace(run_normal)
+    tracer_normal._on_chain_start(run_normal)
+    assert ls_client_normal.create_run.call_count == 1
 
 
 # ===========================================================================
@@ -533,6 +392,21 @@ async def test_r5_notify_distinguishes_personal_dm_and_group_targets_and_gates_g
         guard_mod,
         "is_thread_personal_private",
         create_autospec(guard_mod.is_thread_personal_private, return_value=True),
+    )
+    monkeypatch.setattr(
+        guard_mod,
+        "get_thread_creator_user_id",
+        create_autospec(guard_mod.get_thread_creator_user_id, return_value="user-1"),
+    )
+    monkeypatch.setattr(
+        guard_mod,
+        "verify_personal_dm_target_bound",
+        create_autospec(guard_mod.verify_personal_dm_target_bound, return_value=True),
+    )
+    monkeypatch.setattr(
+        guard_mod,
+        "list_bound_personal_dm_targets",
+        create_autospec(guard_mod.list_bound_personal_dm_targets, return_value=[]),
     )
 
     async def _always_true(*_a: Any, **_kw: Any) -> bool:

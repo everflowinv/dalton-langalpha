@@ -426,8 +426,9 @@ export class DeliveryService {
     const trimmedText = rawText.trim();
     const hasNonEmptyText = trimmedText.length > 0;
     const files = options.files ?? [];
+    const initialLinkOnlyFiles = options.linkOnlyFiles ?? [];
 
-    if (!hasNonEmptyText && files.length === 0) {
+    if (!hasNonEmptyText && files.length === 0 && initialLinkOnlyFiles.length === 0) {
       return {
         status: "failed",
         code: null,

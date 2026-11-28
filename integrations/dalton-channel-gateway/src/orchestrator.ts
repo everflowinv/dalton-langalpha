@@ -10896,7 +10896,7 @@ export class ChannelGatewayOrchestrator {
         platform: params.platform,
         target: `${params.platform}:@me`,
         inboundMessageId: params.inboundMessageId,
-        text: "本次结果含个人日历相关附件，已发送到你的私聊",
+        text: "",
         textIsAttachmentPreface: true,
         files: params.files,
         linkOnlyFiles: params.linkOnlyFiles,
@@ -10920,6 +10920,22 @@ export class ChannelGatewayOrchestrator {
       ) {
         return null;
       }
+      await this.deliveryService.executeDelivery({
+        deliveryKey: `${params.deliveryKey}:personal_dm_notice`,
+        kind: "fallback",
+        userId: params.userId,
+        threadId: params.threadId,
+        workspaceId: params.workspaceId,
+        runId: params.runId,
+        platform: params.platform,
+        target: `${params.platform}:@me`,
+        inboundMessageId: params.inboundMessageId,
+        text: "本次结果含个人日历相关附件，已发送到你的私聊",
+        threadScopeKey: params.threadScopeKey,
+        sourceScopeKey: params.sourceScopeKey,
+        sourceGeneration: params.sourceGeneration,
+        activityOrigin: params.activityOrigin,
+      });
       return await this.deliveryService.executeDelivery({
         deliveryKey: `fallback:${params.runId}:personal_redirect_notice`,
         kind: "fallback",

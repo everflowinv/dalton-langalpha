@@ -6698,7 +6698,10 @@ async def on_automation_settled(
 
         from src.dalton.services.personal_integration_guard import (
             PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+            get_thread_creator_user_id,
             is_thread_personal_private,
+            list_bound_personal_dm_targets,
+            verify_personal_dm_target_bound,
         )
 
         is_personal_private_thread = bool(
@@ -6707,13 +6710,25 @@ async def on_automation_settled(
         dm_targets: list[str] = []
         group_redirect_targets: list[str] = []
         if is_personal_private_thread:
+            thread_creator_id = await get_thread_creator_user_id(str(thread_id))
+            if not thread_creator_id:
+                logger.info(
+                    "[DALTON_NOTIFY] Skipping private completion notify for execution_id=%s: unable to verify thread creator",
+                    execution_id,
+                )
+                return False
             seen_dm: set[str] = set()
             seen_group: set[str] = set()
             dm_channels_present: set[str] = set()
             for tgt in targets:
                 ch, cleaned_tgt = _split_target_channel(tgt)
                 if _is_personal_dm_notify_target(cleaned_tgt):
-                    if cleaned_tgt not in seen_dm:
+                    if (
+                        cleaned_tgt not in seen_dm
+                        and await verify_personal_dm_target_bound(
+                            thread_creator_id, cleaned_tgt
+                        )
+                    ):
                         dm_targets.append(cleaned_tgt)
                         seen_dm.add(cleaned_tgt)
                         dm_channels_present.add(ch)
@@ -6730,16 +6745,37 @@ async def on_automation_settled(
                 }
                 if missing_group_channels or not dm_targets:
                     try:
-                        personal_candidates = await resolve_targets_fn(user_id)
+                        personal_candidates = await resolve_targets_fn(thread_creator_id)
                     except Exception:
                         personal_candidates = []
+                    try:
+                        bound_candidates = await list_bound_personal_dm_targets(
+                            thread_creator_id
+                        )
+                    except Exception:
+                        bound_candidates = []
                     enabled_personal_dms: list[tuple[str, str]] = []
+                    seen_cand: set[str] = set()
                     for cand in personal_candidates or []:
                         cand_ch, cleaned_cand = _split_target_channel(cand)
                         if (
-                            _is_personal_dm_notify_target(cleaned_cand)
+                            cleaned_cand not in seen_cand
+                            and _is_personal_dm_notify_target(cleaned_cand)
+                            and is_channel_target_enabled(cleaned_cand)
+                            and await verify_personal_dm_target_bound(
+                                thread_creator_id, cleaned_cand
+                            )
+                        ):
+                            seen_cand.add(cleaned_cand)
+                            enabled_personal_dms.append((cand_ch, cleaned_cand))
+                    for cand in bound_candidates or []:
+                        cand_ch, cleaned_cand = _split_target_channel(cand)
+                        if (
+                            cleaned_cand not in seen_cand
+                            and _is_personal_dm_notify_target(cleaned_cand)
                             and is_channel_target_enabled(cleaned_cand)
                         ):
+                            seen_cand.add(cleaned_cand)
                             enabled_personal_dms.append((cand_ch, cleaned_cand))
                     # First match the same platform as the group target(s).
                     for cand_ch, cleaned_cand in enabled_personal_dms:
@@ -6747,7 +6783,7 @@ async def on_automation_settled(
                             dm_targets.append(cleaned_cand)
                             seen_dm.add(cleaned_cand)
                             dm_channels_present.add(cand_ch)
-                    # If still no DM target at all, fall back to any enabled personal DM target of the user.
+                    # If still no DM target at all, fall back to any enabled verified DM target of the thread creator.
                     if not dm_targets:
                         for cand_ch, cleaned_cand in enabled_personal_dms:
                             if cleaned_cand not in seen_dm:
@@ -6886,11 +6922,17 @@ async def on_automation_settled(
                             **base_payload_record,
                             "text": PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
                             "card": feishu_redirect_card if ch == "feishu" else None,
+                            "personal_private_group_notice": True,
                             "transport": "gateway" if target_via_gateway else "bridge",
                         }
                     else:
                         target_payload = {
                             **base_payload_record,
+                            **(
+                                {"personal_private_dm_redirect": True}
+                                if is_personal_private_thread
+                                else {}
+                            ),
                             "transport": "gateway" if target_via_gateway else "bridge",
                         }
                     if target_via_gateway:

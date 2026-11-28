@@ -407,6 +407,21 @@ async def test_p0_backend_channel_gateway_personal_private_automation_fallback_a
         create_autospec(guard_mod.is_thread_personal_private, return_value=True),
     )
     monkeypatch.setattr(
+        guard_mod,
+        "get_thread_creator_user_id",
+        create_autospec(guard_mod.get_thread_creator_user_id, return_value="user-1"),
+    )
+    monkeypatch.setattr(
+        guard_mod,
+        "verify_personal_dm_target_bound",
+        create_autospec(guard_mod.verify_personal_dm_target_bound, return_value=True),
+    )
+    monkeypatch.setattr(
+        guard_mod,
+        "list_bound_personal_dm_targets",
+        create_autospec(guard_mod.list_bound_personal_dm_targets, return_value=[]),
+    )
+    monkeypatch.setattr(
         notify_dispatch_mod,
         "_resolve_unit_managed_notify_gate",
         create_autospec(

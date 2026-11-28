@@ -35,6 +35,7 @@ from src.dalton.database.user_integrations import (
 from src.dalton.integrations.constants import (
     GOOGLE_GMAIL_DRAFT_SCOPES,
     get_connector_spec,
+    scope_satisfied,
 )
 from src.dalton.integrations.lock_guard import track_advisory_lock
 from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
@@ -277,7 +278,11 @@ async def sync_google_sibling_rows_tx(
 
             spec = get_connector_spec("google", sib.service)
             sib_missing = (
-                [s for s in spec.min_required_scopes if s not in actual_granted_set]
+                [
+                    s
+                    for s in spec.min_required_scopes
+                    if not scope_satisfied(s, actual_granted_set)
+                ]
                 if spec is not None
                 else ["unsupported_service"]
             )

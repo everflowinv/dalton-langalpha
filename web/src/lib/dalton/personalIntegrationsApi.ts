@@ -20,6 +20,7 @@ export interface PersonalIntegrationConnectorInfo {
   enabled: boolean;
   ready: boolean;
   credentials_ready: boolean;
+  langsmith_tracing_enabled?: boolean;
   callback_url: string;
   events_url: string | null;
 }

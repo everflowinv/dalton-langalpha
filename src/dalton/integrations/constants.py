@@ -7,6 +7,7 @@ metadata always match mounted routes (§4.3, §6).
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal
 
@@ -30,7 +31,14 @@ GOOGLE_SCOPE_EMAIL = "email"
 GOOGLE_SCOPE_CALENDAR_LIST_RO = (
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
 )
+GOOGLE_SCOPE_CALENDAR_EVENTS_RO = (
+    "https://www.googleapis.com/auth/calendar.events.readonly"
+)
 GOOGLE_SCOPE_CALENDAR_EVENTS = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_SCOPE_CALENDAR_READONLY = (
+    "https://www.googleapis.com/auth/calendar.readonly"
+)
+GOOGLE_SCOPE_CALENDAR_FULL = "https://www.googleapis.com/auth/calendar"
 GOOGLE_SCOPE_GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE = "https://www.googleapis.com/auth/gmail.drafts.create"
 GOOGLE_SCOPE_GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
@@ -41,7 +49,7 @@ GOOGLE_IDENTITY_SCOPES: tuple[str, ...] = (
 )
 GOOGLE_CALENDAR_MIN_SCOPES: tuple[str, ...] = (
     GOOGLE_SCOPE_CALENDAR_LIST_RO,
-    GOOGLE_SCOPE_CALENDAR_EVENTS,
+    GOOGLE_SCOPE_CALENDAR_EVENTS_RO,
 )
 GOOGLE_GMAIL_MIN_SCOPES: tuple[str, ...] = (GOOGLE_SCOPE_GMAIL_READONLY,)
 GOOGLE_GMAIL_DRAFT_SCOPES: tuple[str, ...] = (
@@ -54,10 +62,48 @@ FEISHU_CALENDAR_SCOPES: tuple[str, ...] = (
     FEISHU_SCOPE_OFFLINE_ACCESS,
     "calendar:calendar:readonly",
     "calendar:calendar.event:read",
-    "calendar:calendar.event:create",
-    "calendar:calendar.event:update",
-    "calendar:calendar.event:delete",
 )
+
+# Broader scopes that satisfy a narrower read-only requirement (so existing write-granted
+# connections continue working seamlessly under Batch 1 read-only calendar).
+SCOPE_EQUIVALENTS: dict[str, frozenset[str]] = {
+    GOOGLE_SCOPE_CALENDAR_EVENTS_RO: frozenset(
+        {
+            GOOGLE_SCOPE_CALENDAR_EVENTS_RO,
+            GOOGLE_SCOPE_CALENDAR_EVENTS,
+            GOOGLE_SCOPE_CALENDAR_READONLY,
+            GOOGLE_SCOPE_CALENDAR_FULL,
+        }
+    ),
+    GOOGLE_SCOPE_CALENDAR_LIST_RO: frozenset(
+        {
+            GOOGLE_SCOPE_CALENDAR_LIST_RO,
+            GOOGLE_SCOPE_CALENDAR_READONLY,
+            GOOGLE_SCOPE_CALENDAR_FULL,
+        }
+    ),
+    "calendar:calendar:readonly": frozenset(
+        {
+            "calendar:calendar:readonly",
+            "calendar:calendar",
+        }
+    ),
+    "calendar:calendar.event:read": frozenset(
+        {
+            "calendar:calendar.event:read",
+            "calendar:calendar",
+        }
+    ),
+}
+
+
+def scope_satisfied(required_scope: str, granted_scopes: Collection[str]) -> bool:
+    """Return True if ``required_scope`` (or an equivalent superset scope) is in ``granted_scopes``."""
+    granted_set = set(granted_scopes)
+    accepted = SCOPE_EQUIVALENTS.get(required_scope)
+    if accepted is not None:
+        return any(s in granted_set for s in accepted)
+    return required_scope in granted_set
 FEISHU_MAIL_READONLY_SCOPES: tuple[str, ...] = (
     FEISHU_SCOPE_OFFLINE_ACCESS,
     "mail:user_mailbox.folder:read",
@@ -232,7 +278,10 @@ __all__ = [
     "GOOGLE_IDENTITY_SCOPES",
     "GOOGLE_OAUTH_CALLBACK_PATH",
     "GOOGLE_SCOPE_CALENDAR_EVENTS",
+    "GOOGLE_SCOPE_CALENDAR_EVENTS_RO",
+    "GOOGLE_SCOPE_CALENDAR_FULL",
     "GOOGLE_SCOPE_CALENDAR_LIST_RO",
+    "GOOGLE_SCOPE_CALENDAR_READONLY",
     "GOOGLE_SCOPE_EMAIL",
     "GOOGLE_SCOPE_GMAIL_COMPOSE",
     "GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE",
@@ -243,7 +292,9 @@ __all__ = [
     "PENDING_CONFIRMATION_TTL_SECONDS",
     "PERSONAL_INTEGRATION_CONNECTOR_SPECS",
     "PersonalIntegrationConnectorSpec",
+    "SCOPE_EQUIVALENTS",
     "build_feishu_integration_events_url",
     "build_integration_redirect_uri",
     "get_connector_spec",
+    "scope_satisfied",
 ]

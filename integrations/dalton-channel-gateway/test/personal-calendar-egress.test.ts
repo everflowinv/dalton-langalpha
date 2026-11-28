@@ -609,5 +609,103 @@ describe("Personal integration channel egress guard (automation, fallback & retr
         (c) => c.delivery_key === `fallback:${runId}:personal_redirect_notice`,
       ),
     ).toBe(false);
+
+    // DM MUST NOT receive premature "已发送到你的私聊" notice when all attachments & fallback links failed
+    const dmTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === "feishu:@me",
+    );
+    expect(dmTexts).toHaveLength(0);
+    expect(dmTexts.some((m) => m.text.includes("已发送到你的私聊"))).toBe(false);
+    expect(
+      h.backend.deliveryClaims.some(
+        (c) => c.delivery_key === `deliverables:${runId}:personal_dm_notice`,
+      ),
+    ).toBe(false);
+  });
+
+  it("private thread attachment DM redirect sends confirmation to DM only after attachment or fallback link succeeds", async () => {
+    const runId = "55555555-6666-7777-8888-999999999993";
+    const groupTarget = "feishu:oc_group_attach_link";
+
+    vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      if (
+        req.target === groupTarget &&
+        !req.delivery_key.endsWith(":personal_redirect_notice")
+      ) {
+        return {
+          claim_status: "denied",
+          status: "failed",
+          code: "personal_integration_private_only",
+          has_personal_integration_data: true,
+          redirect_dm_address: "feishu:@me",
+          message: "personal calendar thread cannot send attachments to group",
+        };
+      }
+      if (req.delivery_key.endsWith(":personal_redirect_notice")) {
+        return {
+          claim_status: "claimed",
+          platform: "feishu",
+          target_address: groupTarget,
+          is_current: true,
+          personal_private_redirect_notice: true,
+          forced_text: REDIRECT_NOTICE,
+        };
+      }
+      return {
+        claim_status: "claimed",
+        platform: "feishu",
+        target_address: "feishu:@me",
+        recipient_platform_user_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
+        is_current: true,
+      };
+    });
+
+    const redirectFn = (
+      h.app.orchestrator as unknown as {
+        executeDeliverableFallbackWithPersonalRedirect: (
+          p: Record<string, unknown>,
+        ) => Promise<{ status: string } | null>;
+      }
+    ).executeDeliverableFallbackWithPersonalRedirect.bind(h.app.orchestrator);
+
+    const res = await redirectFn({
+      deliveryKey: `deliverables:${runId}`,
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      workspaceId: "ws-1",
+      runId,
+      platform: "feishu",
+      targetAddress: groupTarget,
+      inboundMessageId: null,
+      files: [],
+      linkOnlyFiles: [
+        {
+          path: "calendar_large_export.pdf",
+          workspace_id: "ws-1",
+          filename: "calendar_large_export.pdf",
+          reason: "oversized",
+        },
+      ],
+      threadScopeKey: null,
+      sourceScopeKey: null,
+      sourceGeneration: null,
+      activityOrigin: "automation",
+    });
+
+    expect(res?.status).toBe("sent");
+    const dmTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === "feishu:@me",
+    );
+    // Link is delivered first, followed by the post-delivery confirmation text
+    expect(dmTexts.length).toBeGreaterThanOrEqual(2);
+    expect(dmTexts[dmTexts.length - 1]?.text).toBe(
+      "本次结果含个人日历相关附件，已发送到你的私聊",
+    );
+    const groupTexts = h.feishuAdapter.sentTexts.filter(
+      (m) => m.targetAddress === groupTarget,
+    );
+    expect(groupTexts).toHaveLength(1);
+    expect(groupTexts[0]?.text).toBe(REDIRECT_NOTICE);
   });
 });

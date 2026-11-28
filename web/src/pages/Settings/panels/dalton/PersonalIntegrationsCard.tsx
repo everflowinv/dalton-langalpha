@@ -68,12 +68,12 @@ const SERVICE_META: Record<
 > = {
   'google:calendar': {
     title: 'Google 日历',
-    subtitle: '在私密对话中查询日程、查看空闲时段，并在确认后创建、修改或删除日程。',
+    subtitle: '在私密对话中查看日程和空闲时间。',
     capability: 'google_calendar',
   },
   'feishu:calendar': {
     title: '飞书日历',
-    subtitle: '连接本人飞书日历，在私密对话中查询和管理个人日程与提醒。',
+    subtitle: '在私密对话中查看日程和空闲时间。',
     capability: 'feishu_calendar',
   },
   'feishu:mail': {
@@ -95,6 +95,138 @@ function serviceKey(
   return `${provider}:${service}`;
 }
 
+interface PurgeStatusSummaryItem {
+  local_purge_status?: string;
+  remote_revoke_status?: string;
+}
+
+function resolveGoogleDisconnectBanner(
+  kind: 'service' | 'provider_all',
+  purges: PurgeStatusSummaryItem[],
+  opts: {
+    allTrackedFound: boolean;
+    hasPurgingConn?: boolean;
+    remoteMode?: 'remote_if_sole' | 'local_only';
+    allowOmittedRemoteAsLocalDone?: boolean;
+  },
+): { tone: 'info' | 'success' | 'warning' | 'error'; text: string } {
+  const hasRunningLocal =
+    Boolean(opts.hasPurgingConn) || purges.some((p) => p.local_purge_status === 'running');
+  const hasRetryableRemote = purges.some((p) => p.remote_revoke_status === 'failed_retryable');
+  const hasPendingRemote = purges.some((p) => p.remote_revoke_status === 'pending');
+  const anyRemoteSuperseded = purges.some((p) => p.remote_revoke_status === 'superseded');
+  const hasPurges = opts.allTrackedFound && purges.length > 0;
+  const allLocalCompleted =
+    hasPurges &&
+    purges.every(
+      (p) => p.local_purge_status === 'completed' || p.local_purge_status === 'not_required',
+    );
+  const allRemoteTerminalOk =
+    hasPurges &&
+    purges.every(
+      (p) =>
+        p.remote_revoke_status === 'succeeded' || p.remote_revoke_status === 'not_applicable',
+    );
+  const anyRemoteSucceeded =
+    hasPurges && purges.some((p) => p.remote_revoke_status === 'succeeded');
+  const allRemoteNotApplicable =
+    hasPurges && purges.every((p) => p.remote_revoke_status === 'not_applicable');
+  const allRemoteOmitted =
+    opts.allowOmittedRemoteAsLocalDone &&
+    hasPurges &&
+    purges.every((p) => !p.remote_revoke_status);
+
+  if (kind === 'provider_all') {
+    if (hasRunningLocal) {
+      return {
+        tone: 'info',
+        text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
+      };
+    }
+    if (hasRetryableRemote) {
+      return {
+        tone: 'warning',
+        text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
+      };
+    }
+    if (hasPendingRemote) {
+      return {
+        tone: 'info',
+        text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
+      };
+    }
+    if (anyRemoteSuperseded) {
+      return {
+        tone: 'info',
+        text: '已断开原 Google 服务，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
+      };
+    }
+    if (allLocalCompleted && allRemoteTerminalOk && anyRemoteSucceeded) {
+      return {
+        tone: 'success',
+        text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
+      };
+    }
+    if ((allLocalCompleted && (allRemoteNotApplicable || allRemoteOmitted)) || (opts.allowOmittedRemoteAsLocalDone && purges.length === 0)) {
+      return {
+        tone: 'success',
+        text: '已断开全部 Google 服务，关联本地个人数据已清理完成。',
+      };
+    }
+    return {
+      tone: 'info',
+      text: '已断开全部 Google 服务，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。',
+    };
+  }
+
+  if (hasRunningLocal) {
+    return {
+      tone: 'info',
+      text: '已断开连接，正在后台清理关联对话个人数据。',
+    };
+  }
+  if (hasRetryableRemote) {
+    return {
+      tone: 'warning',
+      text: '已断开连接，关联个人数据已清理完成，Google 远端撤销待重试。',
+    };
+  }
+  if (hasPendingRemote) {
+    return {
+      tone: 'info',
+      text: '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。',
+    };
+  }
+  if (anyRemoteSuperseded) {
+    return {
+      tone: 'info',
+      text: '已断开原连接，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
+    };
+  }
+  if (allLocalCompleted && allRemoteTerminalOk && anyRemoteSucceeded) {
+    return {
+      tone: 'success',
+      text: '已断开连接，关联个人数据已清理完成，Google 授权已撤销。',
+    };
+  }
+  if (
+    allLocalCompleted &&
+    (opts.remoteMode !== 'remote_if_sole' || allRemoteNotApplicable || allRemoteOmitted)
+  ) {
+    return {
+      tone: 'success',
+      text: '已断开连接，关联个人数据已清理完成。',
+    };
+  }
+  return {
+    tone: 'info',
+    text:
+      opts.remoteMode === 'remote_if_sole'
+        ? '已断开连接，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。'
+        : '已断开连接，请稍后刷新确认关联个人数据清理状态。',
+  };
+}
+
 function statusBadgeMeta(
   conn: PersonalIntegrationConnection | undefined,
   connector: PersonalIntegrationConnectorInfo | undefined,
@@ -111,6 +243,9 @@ function statusBadgeMeta(
       case 'revoked_purging':
         return { label: '正在清理数据', tone: 'accent' };
     }
+  }
+  if (connector && connector.langsmith_tracing_enabled) {
+    return { label: '不可用', tone: 'warning' };
   }
   if (connector && !connector.credentials_ready) {
     return { label: '待配置凭据', tone: 'neutral' };
@@ -413,29 +548,27 @@ export function PersonalIntegrationsCard() {
               : undefined,
         });
       } else {
-        const googleText =
-          localPurgeStatus === 'running'
-            ? '已断开连接，正在后台清理关联对话个人数据。'
-            : remoteRevokeStatus === 'failed_retryable'
-              ? '已断开连接，关联个人数据已清理完成，Google 远端撤销待重试。'
-              : remoteRevokeStatus === 'pending'
-                ? '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。'
-                : localPurgeStatus === 'completed' || localPurgeStatus === 'not_required'
-                  ? '已断开连接，关联个人数据已清理完成。'
-                  : '已断开连接并启动关联个人数据清理。';
+        const resolved = resolveGoogleDisconnectBanner(
+          'service',
+          [
+            {
+              local_purge_status: localPurgeStatus,
+              remote_revoke_status: remoteRevokeStatus,
+            },
+          ],
+          {
+            allTrackedFound: Boolean(localPurgeStatus || remoteRevokeStatus),
+            remoteMode: mode,
+            allowOmittedRemoteAsLocalDone: true,
+          },
+        );
         const needsTracking =
           localPurgeStatus === 'running' ||
           remoteRevokeStatus === 'pending' ||
           remoteRevokeStatus === 'failed_retryable' ||
           !localPurgeStatus;
         setBanner({
-          tone:
-            remoteRevokeStatus === 'failed_retryable'
-              ? 'warning'
-              : localPurgeStatus === 'running' || remoteRevokeStatus === 'pending'
-                ? 'info'
-                : 'success',
-          text: googleText,
+          ...resolved,
           tracking: needsTracking
             ? {
                 kind: 'service',
@@ -483,30 +616,15 @@ export function PersonalIntegrationsCard() {
               remoteMode: 'remote_if_sole',
             }
           : undefined;
-      if (hasRunningLocal) {
-        setBanner({
-          tone: 'info',
-          text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
-          tracking,
-        });
-      } else if (hasRetryableRemote) {
-        setBanner({
-          tone: 'warning',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
-          tracking,
-        });
-      } else if (hasPendingRemote) {
-        setBanner({
-          tone: 'info',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
-          tracking,
-        });
-      } else {
-        setBanner({
-          tone: 'success',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成。',
-        });
-      }
+      const resolved = resolveGoogleDisconnectBanner('provider_all', purges, {
+        allTrackedFound: true,
+        remoteMode: 'remote_if_sole',
+        allowOmittedRemoteAsLocalDone: true,
+      });
+      setBanner({
+        ...resolved,
+        tracking,
+      });
       invalidate();
     },
     onError: (err) => {
@@ -638,62 +756,18 @@ export function PersonalIntegrationsCard() {
     );
     const hasRunningLocal =
       hasPurgingConn || trackedPurges.some((p) => p.local_purge_status === 'running');
-    const hasRetryableRemote = trackedPurges.some(
-      (p) => p.remote_revoke_status === 'failed_retryable',
-    );
-    const hasPendingRemote = trackedPurges.some((p) => p.remote_revoke_status === 'pending');
-    const anyRemoteSuperseded = trackedPurges.some((p) => p.remote_revoke_status === 'superseded');
     const allLocalCompleted =
       allTrackedFound &&
       trackedPurges.every(
         (p) => p.local_purge_status === 'completed' || p.local_purge_status === 'not_required',
       );
-    const allRemoteSucceeded =
-      allTrackedFound && trackedPurges.every((p) => p.remote_revoke_status === 'succeeded');
-    const allRemoteNotApplicable =
-      allTrackedFound && trackedPurges.every((p) => p.remote_revoke_status === 'not_applicable');
 
     if (tracking.kind === 'provider_all') {
-      if (hasRunningLocal) {
-        return {
-          tone: 'info',
-          text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
-        };
-      }
-      if (hasRetryableRemote) {
-        return {
-          tone: 'warning',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
-        };
-      }
-      if (hasPendingRemote) {
-        return {
-          tone: 'info',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
-        };
-      }
-      if (anyRemoteSuperseded) {
-        return {
-          tone: 'info',
-          text: '已断开原 Google 服务，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
-        };
-      }
-      if (allLocalCompleted && allRemoteSucceeded) {
-        return {
-          tone: 'success',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 授权已撤销。',
-        };
-      }
-      if (allLocalCompleted && allRemoteNotApplicable) {
-        return {
-          tone: 'success',
-          text: '已断开全部 Google 服务，关联本地个人数据已清理完成。',
-        };
-      }
-      return {
-        tone: 'info',
-        text: '已断开全部 Google 服务，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。',
-      };
+      return resolveGoogleDisconnectBanner('provider_all', trackedPurges, {
+        allTrackedFound,
+        hasPurgingConn,
+        remoteMode: tracking.remoteMode,
+      });
     }
 
     if (tracking.kind === 'switch') {
@@ -735,52 +809,11 @@ export function PersonalIntegrationsCard() {
       };
     }
 
-    if (hasRunningLocal) {
-      return {
-        tone: 'info',
-        text: '已断开连接，正在后台清理关联对话个人数据。',
-      };
-    }
-    if (hasRetryableRemote) {
-      return {
-        tone: 'warning',
-        text: '已断开连接，关联个人数据已清理完成，Google 远端撤销待重试。',
-      };
-    }
-    if (hasPendingRemote) {
-      return {
-        tone: 'info',
-        text: '已断开连接，关联个人数据已清理完成，正在后台撤销 Google 授权。',
-      };
-    }
-    if (anyRemoteSuperseded) {
-      return {
-        tone: 'info',
-        text: '已断开原连接，因检测到新的授权，旧的 Google 远端撤销任务已终止。',
-      };
-    }
-    if (allLocalCompleted && allRemoteSucceeded) {
-      return {
-        tone: 'success',
-        text: '已断开连接，关联个人数据已清理完成，Google 授权已撤销。',
-      };
-    }
-    if (
-      allLocalCompleted &&
-      (tracking.remoteMode !== 'remote_if_sole' || allRemoteNotApplicable)
-    ) {
-      return {
-        tone: 'success',
-        text: '已断开连接，关联个人数据已清理完成。',
-      };
-    }
-    return {
-      tone: 'info',
-      text:
-        tracking.remoteMode === 'remote_if_sole'
-          ? '已断开连接，暂未收到 Google 远端撤销的明确确认结果，请稍后刷新查看。'
-          : '已断开连接，请稍后刷新确认关联个人数据清理状态。',
-    };
+    return resolveGoogleDisconnectBanner('service', trackedPurges, {
+      allTrackedFound,
+      hasPurgingConn,
+      remoteMode: tracking.remoteMode,
+    });
   }, [banner, data]);
 
   const privacyUrl = resolvePrivacyPolicyUrl(profile);
@@ -798,7 +831,7 @@ export function PersonalIntegrationsCard() {
     <DaltonSettingsCard
       id="dalton-personal-integrations"
       title="个人日历与邮箱连接"
-      description="授权连接你的个人 Google 日历或飞书日历，在私密对话中查询日程、查看空闲时段，并在确认后管理个人日程。"
+      description="授权连接你的个人 Google 日历或飞书日历，在私密对话中查看日程和空闲时间。"
       action={
         <DaltonRefreshButton
           onClick={() => void refetch()}
@@ -894,13 +927,22 @@ export function PersonalIntegrationsCard() {
                       </div>
                     )}
 
-                    {!conn && !isReady && row.capOn && (
-                      <p className="text-xs text-(--color-text-tertiary)">
-                        {!credsReady
-                          ? '管理员在「部署设置 → 集成凭据」完成配置后即可连接。'
-                          : '管理员完成公开回调地址与服务端加密配置后即可连接。'}
+                    {row.connector?.langsmith_tracing_enabled && row.service === 'calendar' && (
+                      <p className="text-xs text-(--color-warning)">
+                        当前部署开启了调用追踪，个人日历不可用
                       </p>
                     )}
+
+                    {!conn &&
+                      !isReady &&
+                      row.capOn &&
+                      !row.connector?.langsmith_tracing_enabled && (
+                        <p className="text-xs text-(--color-text-tertiary)">
+                          {!credsReady
+                            ? '管理员在「部署设置 → 集成凭据」完成配置后即可连接。'
+                            : '管理员完成公开回调地址与服务端加密配置后即可连接。'}
+                        </p>
+                      )}
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2 shrink-0">

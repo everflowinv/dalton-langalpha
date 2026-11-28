@@ -1344,19 +1344,13 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
-        # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag and calendar tool load state for LangSmith buffering
+        # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag for LangSmith suppression on historical private threads
         from src.dalton.services.personal_integration_guard import (
             is_thread_personal_private,
-        )
-        from src.dalton.services.personal_integration_trace import (
-            graph_has_personal_integration_tool,
         )
 
         thread_is_personal_private = await is_thread_personal_private(
             thread_id, meta=prior_thread
-        )
-        personal_calendar_tool_loaded = (
-            not on_claude_code and graph_has_personal_integration_tool(ptc_graph)
         )
 
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
@@ -1371,8 +1365,6 @@ async def astream_ptc_workflow(
                 if thread_is_personal_private
                 else {}
             ),
-            # DALTON-HOOK(personal-integrations): mark whether personal calendar tool is mounted on this turn's graph
-            "personal_calendar_tool_loaded": personal_calendar_tool_loaded,
             # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag

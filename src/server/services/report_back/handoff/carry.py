@@ -192,6 +192,11 @@ def carried_unwatched(request, prior: PriorAttempt) -> Optional[bool]:
     that resume. A person's own turn cut short stays theirs, and one nobody
     watched stays unwatched.
     """
+    # DALTON-HOOK(personal-integrations): normal /retry inherits unwatched=True from the retried attempt
+    if getattr(request, "retry_of_run_id", None):
+        if prior.retried is not None and run_unwatched(prior.retried) is True:
+            return True
+        return None
     if getattr(request, "query_type", None) != "system":
         return None
     prev = prior.latest

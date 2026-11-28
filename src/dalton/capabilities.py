@@ -563,6 +563,41 @@ def personal_integration_capability(provider: str, service: str) -> CapabilityId
     )
 
 
+def is_langsmith_tracing_active(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when LangSmith tracing is enabled via env vars, runtime context, or config."""
+    env = os.environ if environ is None else environ
+    for key in (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_TRACING_V2",
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_TRACING",
+    ):
+        raw = env.get(key)
+        if raw is not None and raw.strip().lower() in _TRUTHY_VALUES:
+            return True
+    if environ is None:
+        try:
+            from langchain_core.tracers.context import (
+                _tracing_v2_is_enabled,
+                tracing_v2_callback_var,
+            )
+
+            if _tracing_v2_is_enabled() or tracing_v2_callback_var.get() is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            from src.config.settings import is_langsmith_tracing_enabled
+
+            if is_langsmith_tracing_enabled():
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
     """Return a redacted readiness summary for personal integration providers (§6).
 
@@ -578,6 +613,7 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
 
     public_url = get_dalton_public_app_url().strip()
     enc_ok = bool(encryption_configured())
+    langsmith_tracing_on = is_langsmith_tracing_active()
     g_group = get_credential_group("google_oauth")
     g_uri_ok, g_uri_reason = google_redirect_uri_eligible(public_url)
     f_group = get_credential_group("feishu_app")
@@ -595,7 +631,10 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
             "redirect_uri_eligible": bool(g_uri_ok),
             "redirect_uri_reason": g_uri_reason,
             "encryption_configured": enc_ok,
-            "ready": bool(g_group.ready and g_uri_ok and enc_ok),
+            "langsmith_tracing_enabled": langsmith_tracing_on,
+            "ready": bool(
+                g_group.ready and g_uri_ok and enc_ok and not langsmith_tracing_on
+            ),
         },
         "feishu": {
             "credentials_ready": bool(f_group.ready),
@@ -603,7 +642,10 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
             "event_credentials_ready": f_event_dual_ready,
             "public_url_configured": bool(public_url),
             "encryption_configured": enc_ok,
-            "ready": bool(f_group.ready and bool(public_url) and enc_ok),
+            "langsmith_tracing_enabled": langsmith_tracing_on,
+            "ready": bool(
+                f_group.ready and bool(public_url) and enc_ok and not langsmith_tracing_on
+            ),
         },
     }
 
@@ -717,6 +759,18 @@ def require_personal_integration_capability(
     norm_provider = str(provider).strip().lower()
     summary = get_connector_providers_summary().get(norm_provider)
     if not summary or not summary.get("ready"):
+        if summary and summary.get("langsmith_tracing_enabled"):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "personal_integrations_not_ready",
+                    "reason": "langsmith_tracing_enabled",
+                    "message": "当前部署开启了调用追踪，个人日历不可用。",
+                    "provider": norm_provider,
+                    "service": str(service).strip().lower(),
+                    "missing": ["langsmith_tracing_disabled"],
+                },
+            )
         missing: list[str] = []
         if not summary or not summary.get("credentials_ready"):
             missing.append("oauth_credentials")

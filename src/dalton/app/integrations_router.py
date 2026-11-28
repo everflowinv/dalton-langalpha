@@ -480,6 +480,9 @@ async def list_personal_integrations_endpoint(
                 "enabled": cap_enabled,
                 "ready": bool(p_info.get("ready")),
                 "credentials_ready": bool(p_info.get("credentials_ready")),
+                "langsmith_tracing_enabled": bool(
+                    p_info.get("langsmith_tracing_enabled")
+                ),
                 "callback_url": build_integration_redirect_uri(spec.provider),
                 "events_url": (
                     build_feishu_integration_events_url()
