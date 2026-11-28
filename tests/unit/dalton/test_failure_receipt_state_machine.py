@@ -330,8 +330,8 @@ class _InMemoryFailureNoticeDB:
                     cur.rowcount = len(claimed)
                     return
 
-                if "UPDATE dalton_failure_notice_targets SET status = CASE WHEN %s IS NOT NULL" in s:
-                    restored_st, _restored_st2, prior_nra, prior_ec, prior_em, tr_id, tok = p
+                if "UPDATE dalton_failure_notice_targets SET status = COALESCE( %s::text," in s:
+                    restored_st, prior_nra, prior_ec, prior_em, tr_id, tok = p
                     t = db.targets.get(str(tr_id))
                     if t and t["status"] == "sending" and t["claim_token"] == str(tok):
                         t["status"] = restored_st if restored_st is not None else ("pending" if t["attempt_count"] <= 1 else "retryable_failed")

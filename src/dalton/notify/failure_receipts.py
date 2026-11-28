@@ -1318,11 +1318,13 @@ async def release_unstarted_failure_notice_claim(
                 await cur.execute(
                     """
                     UPDATE dalton_failure_notice_targets
-                    SET status = CASE
-                            WHEN %s IS NOT NULL THEN %s
-                            WHEN attempt_count <= 1 THEN 'pending'
-                            ELSE 'retryable_failed'
-                        END,
+                    SET status = COALESCE(
+                            %s::text,
+                            CASE
+                                WHEN attempt_count <= 1 THEN 'pending'
+                                ELSE 'retryable_failed'
+                            END
+                        ),
                         attempt_count = GREATEST(attempt_count - 1, 0),
                         claim_token = NULL,
                         claim_expires_at = NULL,
@@ -1335,7 +1337,6 @@ async def release_unstarted_failure_notice_claim(
                       AND claim_token = %s::uuid
                     """,
                     (
-                        restored_status,
                         restored_status,
                         prior_next_retry_at,
                         prior_error_code,
