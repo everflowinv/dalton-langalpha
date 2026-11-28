@@ -87,6 +87,10 @@ DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
         "Commercial Guidepoint connector on dalton-research-host: calls vendor native Guidepoint MCP "
         "(https://clapi.guidepoint.io/mcp-server/v1/mcp) with OAuth Bearer token rather than Dalton's HTTP bridge."
     ),
+    "src/dalton/integrations/google_calendar.py": (
+        "Personal Google Calendar integration client: calls Google's official Calendar MCP endpoint "
+        "(https://calendarmcp.googleapis.com/mcp/v1) with user OAuth Bearer token rather than Dalton's HTTP bridge."
+    ),
 }
 
 

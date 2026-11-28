@@ -7005,7 +7005,7 @@ _GCAL_OP_KEYS = {
     "list_events": {"query", "time_min", "time_max", "limit"},
     "insert_event": {"summary", "description", "start", "end"},
     "delete_event": {"event_id"},
-    "health_check": set(),
+    "health_check": {"ack_reconcile"},
 }
 
 GCAL_CATALOG_ENTRY: dict[str, Any] = {
@@ -12347,18 +12347,42 @@ class ResearchDataBridge:
     ) -> dict[str, Any]:
         operation = str(arguments.get("operation") or "list_events").strip() or "list_events"
         calendar_id = os.environ.get("DALTON_GCAL_CALENDAR_ID", "").strip()
+        raw_backend = os.environ.get("DALTON_GCAL_BACKEND", "").strip().lower()
+        backend_mode = raw_backend or "legacy_gws"
         try:
-            if raw_caller_token is not None or self.cfg.backend_internal_url_explicit:
-                payload, returned_cal_id = await self._gcal_forward_to_backend(
-                    operation,
-                    arguments,
-                    eff_timeout,
-                    raw_caller_token or "",
-                )
-                if returned_cal_id:
-                    calendar_id = returned_cal_id
-            else:
+            if backend_mode == "legacy_gws":
+                # Decision #1: default legacy_gws runs _gcal_run directly without
+                # touching the backend tracker-calendar gate or sending any HTTP.
                 payload = await self._gcal_run(arguments, operation, float(eff_timeout))
+            elif backend_mode == "official_mcp":
+                token = (raw_caller_token or "").strip()
+                if not token:
+                    payload = _gcal_failure(
+                        "invalid_caller_token",
+                        "invalid_caller_token",
+                        "官方日历通道需要有效的调用者身份令牌。",
+                        "权限或额度",
+                    )
+                    if operation == "health_check":
+                        payload["data"] = {"calendar_ok": False}
+                else:
+                    payload, returned_cal_id = await self._gcal_forward_to_backend(
+                        operation,
+                        arguments,
+                        eff_timeout,
+                        token,
+                    )
+                    if returned_cal_id:
+                        calendar_id = returned_cal_id
+            else:
+                payload = _gcal_failure(
+                    "invalid_gcal_backend",
+                    "invalid_gcal_backend",
+                    "DALTON_GCAL_BACKEND 配置无效。",
+                    "上游不可用",
+                )
+                if operation == "health_check":
+                    payload["data"] = {"calendar_ok": False}
         except asyncio.TimeoutError:
             payload = _gcal_failure("timeout", "timeout", _GCAL_HINT_TIMEOUT, "上游不可用")
             if operation == "health_check":
@@ -14106,7 +14130,10 @@ class ResearchDataBridge:
             return await self._handle_tmeet_call(req_id, arguments, eff_timeout)
         if tool_name == "research" and route == "gcal":
             return await self._handle_gcal_call(
-                req_id, arguments, eff_timeout, raw_caller_token=raw_caller_token
+                req_id,
+                arguments,
+                eff_timeout,
+                raw_caller_token=(raw_caller_token or None),
             )
         if tool_name == "research" and route == "discord-history":
             return await self._handle_discord_history_call(req_id, arguments, eff_timeout)
@@ -26252,7 +26279,7 @@ async def _handle_client(
                     rpc_params,
                     caller_identity=caller_identity,
                     conn_id=conn_id,
-                    raw_caller_token=supplied_caller_token,
+                    raw_caller_token=supplied_caller_token or None,
                 )
                 await _send_http(writer, 200, "OK", reply)
                 return

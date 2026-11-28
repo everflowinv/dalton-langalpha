@@ -32,12 +32,14 @@ from src.dalton.integrations.tracker_calendar import (
     authorize_tracker_calendar_execution,
     execute_tracker_calendar_legacy_gws,
     execute_tracker_calendar_official_mcp,
+    is_valid_tracker_automation_id,
     register_default_tracker_purge_handler,
 )
 from src.dalton.sandbox_caller_identity import verify_caller_token
 from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_gcal_backend,
+    get_tracker_calendar_automation_id,
     get_tracker_calendar_owner_id,
     is_dalton_enabled,
 )
@@ -146,6 +148,17 @@ async def tracker_calendar_mcp_endpoint(
             },
         )
 
+    try:
+        backend_mode = get_dalton_gcal_backend()
+    except ValueError:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "invalid_gcal_backend",
+                "message": "DALTON_GCAL_BACKEND has an unsupported value.",
+            },
+        ) from None
+
     owner_id = get_tracker_calendar_owner_id()
     if not owner_id:
         raise HTTPException(
@@ -164,7 +177,20 @@ async def tracker_calendar_mcp_endpoint(
             },
         )
 
-    if operation != "health_check":
+    configured_auto_id = get_tracker_calendar_automation_id()
+    if backend_mode == "official_mcp" and not is_valid_tracker_automation_id(configured_auto_id):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "tracker_automation_not_configured",
+                "message": "DALTON_TRACKER_CALENDAR_AUTOMATION_ID must be a valid UUID under official_mcp.",
+            },
+        )
+
+    require_execution_authz = operation != "health_check" or bool(
+        body.arguments.get("ack_reconcile")
+    )
+    if require_execution_authz:
         if claims["run_origin"] != "automation":
             raise HTTPException(
                 status_code=403,
@@ -182,24 +208,19 @@ async def tracker_calendar_mcp_endpoint(
             execution_id=claims["automation_execution_id"],
         )
         if authz.get("ok") is not True:
+            err_code = str(authz.get("code") or "execution_not_authorized")
+            status_code = 503 if err_code == "tracker_automation_not_configured" else 403
             raise HTTPException(
-                status_code=403,
+                status_code=status_code,
                 detail={
-                    "code": str(authz.get("code") or "execution_not_authorized"),
-                    "message": "Caller execution identity is not an active tracker automation run.",
+                    "code": err_code,
+                    "message": (
+                        "DALTON_TRACKER_CALENDAR_AUTOMATION_ID must be a valid UUID."
+                        if err_code == "tracker_automation_not_configured"
+                        else "Caller execution identity is not an active tracker automation run."
+                    ),
                 },
             )
-
-    try:
-        backend_mode = get_dalton_gcal_backend()
-    except ValueError:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "invalid_gcal_backend",
-                "message": "DALTON_GCAL_BACKEND has an unsupported value.",
-            },
-        ) from None
 
     if backend_mode == "official_mcp":
         payload, calendar_id = await execute_tracker_calendar_official_mcp(

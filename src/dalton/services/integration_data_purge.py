@@ -11,6 +11,8 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
+import inspect
 import logging
 import os
 import time
@@ -67,7 +69,35 @@ PURGED_PLACEHOLDER = "[已因断开个人连接清除相关个人数据]"
 PURGED_TOOL_ARGS: dict[str, Any] = {"_purged": True}
 PURGED_TOOL_ARGS_JSON = '{"_purged": true}'
 
-TrackerPurgeHandler = Callable[[PurgeLedgerRow], Awaitable[bool]]
+@dataclass(frozen=True)
+class TrackerPurgeSnapshot:
+    """Pre-delete snapshot of the old tracker calendar connection for Layer 6b purge.
+
+    Captured inside ``finish_disconnect_locked`` before ``delete_connection_upto_epoch``
+    removes the connection row so local-only disconnects and accounts with remaining
+    sibling services still have the old epoch, calendar ID, write scope, and tokens.
+    """
+
+    auth_epoch: int
+    provider_account_id: str
+    calendar_id: str | None
+    granted_scopes: str
+    can_write: bool
+    access_token: str | None
+    refresh_token: str | None
+    expires_at: datetime | None
+
+    def __repr__(self) -> str:
+        return (
+            f"TrackerPurgeSnapshot(auth_epoch={self.auth_epoch!r}, "
+            f"provider_account_id={self.provider_account_id!r}, "
+            f"can_write={self.can_write!r}, "
+            f"has_access_token={bool(self.access_token)!r}, "
+            f"has_refresh_token={bool(self.refresh_token)!r})"
+        )
+
+
+TrackerPurgeHandler = Callable[..., Awaitable[bool]]
 
 # Extension point registered by Step 4 (earnings tracker calendar cleanup).
 _tracker_purge_handler: TrackerPurgeHandler | None = None
@@ -1791,6 +1821,7 @@ async def run_local_purge(
     _lock_held: bool = False,
     _claimed_attempt_gen: int | None = None,
     lease_seconds: int = 300,
+    tracker_snapshot: TrackerPurgeSnapshot | None = None,
 ) -> LocalPurgeReport:
     """Execute the 6-layer Scheme 2A local online purge for ``purge_id`` (idempotent & re-entrant).
 
@@ -1825,6 +1856,7 @@ async def run_local_purge(
         cancel_drain_timeout_s=cancel_drain_timeout_s,
         claimed_attempt_gen=claimed_gen,
         lease_seconds=lease_seconds,
+        tracker_snapshot=tracker_snapshot,
     )
 
 
@@ -2230,6 +2262,7 @@ async def _run_local_purge_body(
     cancel_drain_timeout_s: float = 120.0,
     claimed_attempt_gen: int | None = None,
     lease_seconds: int = 300,
+    tracker_snapshot: TrackerPurgeSnapshot | None = None,
 ) -> LocalPurgeReport:
     report = LocalPurgeReport(purge_id=str(purge_id))
     completed_or_superseded = False
@@ -2429,7 +2462,19 @@ async def _run_local_purge_body(
         handler = get_tracker_purge_handler()
         if handler is not None:
             try:
-                handled = await handler(ledger)
+                if tracker_snapshot is not None:
+                    sig = inspect.signature(handler)
+                    accepts_snapshot = "snapshot" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig.parameters.values()
+                    )
+                    handled = (
+                        await handler(ledger, snapshot=tracker_snapshot)
+                        if accepts_snapshot
+                        else await handler(ledger)
+                    )
+                else:
+                    handled = await handler(ledger)
                 tracker_reconcile_needed = not bool(handled)
             except Exception:
                 logger.warning(

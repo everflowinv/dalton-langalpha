@@ -573,6 +573,168 @@ def _retry_pending_deletes(watchlist: dict[str, Any], errors: list[Any]) -> None
     watchlist["pending_delete_event_ids"] = kept
 
 
+def _pending_reconcile_slots(watchlist: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = watchlist.get("pending_reconcile_slots")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        ticker = item.get("ticker")
+        old_date = item.get("date")
+        old_timing = item.get("timing") or "unknown"
+        if (
+            isinstance(ticker, str)
+            and ticker.strip()
+            and isinstance(old_date, str)
+            and parse_iso_date(old_date) is not None
+        ):
+            entry: dict[str, Any] = {
+                "ticker": ticker.strip(),
+                "date": old_date,
+                "timing": str(old_timing) if str(old_timing) in TIMINGS else "unknown",
+            }
+            keep_id = item.get("keep_event_id")
+            if isinstance(keep_id, str) and keep_id.strip():
+                entry["keep_event_id"] = keep_id.strip()
+            out.append(entry)
+    return out
+
+
+def _remember_pending_reconcile_slot(
+    watchlist: dict[str, Any],
+    *,
+    ticker: str,
+    old_date: str,
+    old_timing: str,
+    keep_event_id: str | None = None,
+) -> None:
+    norm_timing = old_timing if old_timing in TIMINGS else "unknown"
+    slots = _pending_reconcile_slots(watchlist)
+    for item in slots:
+        if (
+            item["ticker"] == ticker
+            and item["date"] == old_date
+            and item["timing"] == norm_timing
+        ):
+            if keep_event_id:
+                item["keep_event_id"] = keep_event_id
+            watchlist["pending_reconcile_slots"] = slots
+            return
+    rec: dict[str, Any] = {
+        "ticker": ticker,
+        "date": old_date,
+        "timing": norm_timing,
+    }
+    if keep_event_id:
+        rec["keep_event_id"] = keep_event_id
+    slots.append(rec)
+    watchlist["pending_reconcile_slots"] = slots
+
+
+def _drop_pending_reconcile_slot(
+    watchlist: dict[str, Any],
+    *,
+    ticker: str,
+    old_date: str,
+    old_timing: str,
+) -> None:
+    norm_timing = old_timing if old_timing in TIMINGS else "unknown"
+    slots = [
+        item
+        for item in _pending_reconcile_slots(watchlist)
+        if not (
+            item["ticker"] == ticker
+            and item["date"] == old_date
+            and item["timing"] == norm_timing
+        )
+    ]
+    if slots:
+        watchlist["pending_reconcile_slots"] = slots
+    else:
+        watchlist.pop("pending_reconcile_slots", None)
+
+
+def _reclaim_one_pending_slot(
+    watchlist: dict[str, Any],
+    slot: dict[str, Any],
+    errors: list[Any],
+) -> bool:
+    ticker = slot["ticker"]
+    old_day = parse_iso_date(slot.get("date"))
+    if old_day is None:
+        return True
+    old_timing = str(slot.get("timing") or "unknown")
+    keep_id = str(slot.get("keep_event_id") or "").strip()
+    old_start, old_end = _day_bounds(old_day)
+    old_listed = call_research(
+        route="gcal",
+        operation="list_events",
+        query=ticker,
+        time_min=old_start,
+        time_max=old_end,
+        limit=50,
+    )
+    old_events = _events_from(old_listed)
+    if old_events is None:
+        errors.append(_research_error(old_listed))
+        return False
+    slot_ok = True
+    for ev in old_events:
+        ev_summary = ev.get("summary") if isinstance(ev.get("summary"), str) else ""
+        stale_id = ev.get("id").strip() if isinstance(ev.get("id"), str) else ""
+        if not stale_id or stale_id == keep_id or f"({ticker})" not in ev_summary:
+            continue
+        if not _slot_matches(ev, old_day.isoformat(), old_timing):
+            continue
+        deleted = call_research(route="gcal", operation="delete_event", event_id=stale_id)
+        if _delete_is_refused(deleted):
+            errors.append(_research_error(deleted))
+            slot_ok = False
+        elif _delete_is_fatal(deleted):
+            errors.append(_research_error(deleted))
+            _remember_pending_delete(watchlist, stale_id)
+            slot_ok = False
+    return slot_ok
+
+
+def _retry_pending_reconcile_slots(watchlist: dict[str, Any], errors: list[Any]) -> None:
+    slots = _pending_reconcile_slots(watchlist)
+    if not slots:
+        return
+    kept: list[dict[str, Any]] = []
+    for slot in slots:
+        if not _reclaim_one_pending_slot(watchlist, slot, errors):
+            kept.append(slot)
+    if kept:
+        watchlist["pending_reconcile_slots"] = kept
+    else:
+        watchlist.pop("pending_reconcile_slots", None)
+
+
+def _activate_backend_reconcile(workspace: Path, watchlist: dict[str, Any]) -> bool:
+    """Persist backend ``tracker_reconcile_needed`` marker locally and clear stale event IDs."""
+    changed = False
+    if watchlist.get("tracker_reconcile_needed") is not True:
+        watchlist["tracker_reconcile_needed"] = True
+        changed = True
+    if watchlist.get("tracker_reconcile_source") != "backend":
+        watchlist["tracker_reconcile_source"] = "backend"
+        changed = True
+    for section in ("confirmed", "pending", "reported"):
+        rows = watchlist.get(section)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("calendar_event_id") is not None:
+                row["calendar_event_id"] = None
+                changed = True
+    if changed:
+        _save_watchlist(workspace, watchlist)
+    return changed
+
+
 def _scan_failure(row: dict[str, Any]) -> dict[str, str]:
     detail = row.get("notes") or row.get("evidence") or row.get("source_url") or "scan_failed"
     if not isinstance(detail, str) or not detail.strip():
@@ -586,6 +748,7 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     workspace = require_workspace(args.workspace_dir)
     day = today_et()
     calendar_ok = False
+    backend_reconcile_needed = False
     try:
         result = call_research(
             route="gcal",
@@ -598,8 +761,18 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
             and isinstance(data, dict)
             and data.get("calendar_ok") is True
         )
+        if calendar_ok and isinstance(data, dict) and data.get("tracker_reconcile_needed") is True:
+            backend_reconcile_needed = True
     except Exception:  # noqa: BLE001 - self-test records calendar failure without the exception text
         calendar_ok = False
+    watchlist_exists = _watchlist_exists(workspace)
+    if backend_reconcile_needed and watchlist_exists:
+        try:
+            wl = _load_watchlist(workspace)
+            if isinstance(wl, dict):
+                _activate_backend_reconcile(workspace, wl)
+        except (OSError, ValueError):
+            pass
     try:
         rows = load_universe()
         universe_ok = _universe_ok(rows)
@@ -607,15 +780,18 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     except (OSError, ValueError):
         universe_ok = False
         universe_count = 0
-    return {
+    out: dict[str, Any] = {
         "ok": calendar_ok and universe_ok,
         "calendar_ok": calendar_ok,
         "universe_ok": universe_ok,
         "universe_count": universe_count,
-        "watchlist_exists": _watchlist_exists(workspace),
+        "watchlist_exists": watchlist_exists,
         "report_run_id": report_run_id(day),
         "date": day.isoformat(),
     }
+    if backend_reconcile_needed:
+        out["tracker_reconcile_needed"] = True
+    return out
 
 
 def cmd_list(args: argparse.Namespace) -> dict[str, Any]:
@@ -815,6 +991,10 @@ def _apply_one(
     if events is None:
         errors.append(_research_error(listed))
         return None
+    listed_data = listed.get("data") if isinstance(listed, dict) else None
+    if isinstance(listed_data, dict) and listed_data.get("tracker_reconcile_needed") is True:
+        watchlist["tracker_reconcile_needed"] = True
+        watchlist["tracker_reconcile_source"] = "backend"
     raw_old = plan.get("old_event_id")
     old_id = raw_old.strip() if isinstance(raw_old, str) else ""
     blocked = _current_pending_deletes(watchlist)
@@ -848,42 +1028,34 @@ def _apply_one(
             _remember_pending_delete(watchlist, old_id)
             delete_failed = True
     elif plan["action"] == "replace" and not old_id:
-        # Post-reconnect first-run stale event reclamation: local calendar_event_id was
-        # cleared during disconnect purge, so look up the old slot remotely and delete it.
+        # Post-reconnect stale event reclamation: persist old date & timing before
+        # updating watchlist, and drop the pending slot only after lookup & delete succeed.
         old_day = parse_iso_date(plan.get("old_date"))
         if old_day is not None:
-            old_start, old_end = _day_bounds(old_day)
-            old_listed = call_research(
-                route="gcal",
-                operation="list_events",
-                query=ticker,
-                time_min=old_start,
-                time_max=old_end,
-                limit=50,
+            old_timing = str(plan.get("old_timing") or "unknown")
+            old_iso = old_day.isoformat()
+            _remember_pending_reconcile_slot(
+                watchlist,
+                ticker=ticker,
+                old_date=old_iso,
+                old_timing=old_timing,
+                keep_event_id=event_id,
             )
-            old_events = _events_from(old_listed)
-            if old_events is None:
-                errors.append(_research_error(old_listed))
-                delete_failed = True
+            slot = {
+                "ticker": ticker,
+                "date": old_iso,
+                "timing": old_timing if old_timing in TIMINGS else "unknown",
+                "keep_event_id": event_id,
+            }
+            if _reclaim_one_pending_slot(watchlist, slot, errors):
+                _drop_pending_reconcile_slot(
+                    watchlist,
+                    ticker=ticker,
+                    old_date=old_iso,
+                    old_timing=old_timing,
+                )
             else:
-                old_timing = str(plan.get("old_timing") or "unknown")
-                for ev in old_events:
-                    ev_summary = ev.get("summary") if isinstance(ev.get("summary"), str) else ""
-                    stale_id = ev.get("id").strip() if isinstance(ev.get("id"), str) else ""
-                    if not stale_id or stale_id == event_id or f"({ticker})" not in ev_summary:
-                        continue
-                    if not _slot_matches(ev, old_day.isoformat(), old_timing):
-                        continue
-                    deleted = call_research(
-                        route="gcal", operation="delete_event", event_id=stale_id
-                    )
-                    if _delete_is_refused(deleted):
-                        errors.append(_research_error(deleted))
-                        delete_failed = True
-                    elif _delete_is_fatal(deleted):
-                        errors.append(_research_error(deleted))
-                        _remember_pending_delete(watchlist, stale_id)
-                        delete_failed = True
+                delete_failed = True
     entry = {
         "ticker": ticker,
         "name": plan["name"],
@@ -939,6 +1111,7 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
         return result
     errors = _apply_scan_errors(bad, recs)
     _retry_pending_deletes(watchlist, errors)
+    _retry_pending_reconcile_slots(watchlist, errors)
     if not recs:
         _save_watchlist(workspace, watchlist)
         result = _fail(
@@ -1070,8 +1243,49 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if done is not None:
             applied.append(done)
-    if watchlist.get("tracker_reconcile_needed") and not errors:
-        watchlist.pop("tracker_reconcile_needed", None)
+    finished_recs = {
+        ticker for ticker, row in recs.items() if row.get("status") != "scan_failed"
+    }
+    all_universe_scanned = bool(universe) and universe.issubset(finished_recs)
+    all_confirmed_have_ids = all(
+        isinstance(item, dict)
+        and isinstance(item.get("calendar_event_id"), str)
+        and bool(item["calendar_event_id"].strip())
+        for item in watchlist["confirmed"]
+    )
+    no_pending_cleanups = (
+        not _pending_reconcile_slots(watchlist)
+        and not _current_pending_deletes(watchlist)
+    )
+    if (
+        watchlist.get("tracker_reconcile_needed")
+        and not errors
+        and no_pending_cleanups
+        and all_universe_scanned
+        and all_confirmed_have_ids
+    ):
+        if watchlist.get("tracker_reconcile_source") == "backend":
+            try:
+                ack = call_research(
+                    route="gcal",
+                    operation="health_check",
+                    ack_reconcile=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(_public_error(exc))
+            else:
+                if isinstance(ack, dict) and ack.get("ok") is True:
+                    watchlist.pop("tracker_reconcile_needed", None)
+                    watchlist.pop("tracker_reconcile_source", None)
+                else:
+                    errors.append(
+                        _research_error(
+                            ack if isinstance(ack, dict) else {"error": "reconcile_ack_failed"}
+                        )
+                    )
+        else:
+            watchlist.pop("tracker_reconcile_needed", None)
+            watchlist.pop("tracker_reconcile_source", None)
     watchlist["updated"] = scan_date
     _save_watchlist(workspace, watchlist)
     confirmed_ids = set(_ticker_map(watchlist["confirmed"]))
