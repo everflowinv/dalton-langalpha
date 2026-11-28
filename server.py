@@ -86,11 +86,16 @@ if __name__ == "__main__":
     os.environ.setdefault("EDGAR_RATE_LIMIT_PER_SEC", str(max(1, 9 // args.workers)))
     if args.workers > 9 and os.environ["EDGAR_RATE_LIMIT_PER_SEC"] == "1":
         logger.warning(f"{args.workers} workers at 1 SEC request/s each exceed SEC's 10/s per client")
-    # uvloop resolves host names on libuv's thread pool, 4 threads unless this
-    # says otherwise, so a few lookups stuck on an unanswering resolver would
-    # hold every connect in the worker. Sized like asyncio's own executor, which
-    # did the lookups before.
-    os.environ.setdefault("UV_THREADPOOL_SIZE", str(min(32, (os.process_cpu_count() or 1) + 4)))
+    # DALTON-HOOK(uvloop-off): keep uvicorn on standard asyncio unless uvloop is explicitly enabled.
+    from src.dalton.settings import is_uvloop_enabled
+
+    _use_uvloop = is_uvloop_enabled()
+    if _use_uvloop:
+        # uvloop resolves host names on libuv's thread pool, 4 threads unless this
+        # says otherwise, so a few lookups stuck on an unanswering resolver would
+        # hold every connect in the worker. Sized like asyncio's own executor, which
+        # did the lookups before.
+        os.environ.setdefault("UV_THREADPOOL_SIZE", str(min(32, (os.process_cpu_count() or 1) + 4)))
 
     try:
         logger.info(f"Starting server on {args.host}:{args.port}")
@@ -104,6 +109,7 @@ if __name__ == "__main__":
             workers=args.workers,
             log_level=args.log_level,
             log_config=build_uvicorn_log_config(),
+            loop="uvloop" if _use_uvloop else "asyncio",  # DALTON-HOOK(uvloop-off)
             timeout_keep_alive=300,  # 5 minutes - for long-running workflows
             # TCP_NODELAY on every connection; see the module.
             http="src.server.http_protocol:NoDelayHTTPProtocol",
