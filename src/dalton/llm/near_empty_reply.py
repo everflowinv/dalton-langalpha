@@ -1153,6 +1153,11 @@ async def aattach_retry_send_dedup(
     """Async version used by ``tools.py``: checks in-process cache, then durable Postgres
     ``conversation_responses.metadata``, then checkpoint ``AIMessage.additional_kwargs``,
     and attaches delivery-time ``source_message_id`` + ``captured_images`` for ``:imgfix``."""
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+
+    if not is_near_empty_retry_enabled() and not is_strict_deliverable_text_enabled():
+        return body
+
     from src.dalton.channels.deliverable_text import (
         alookup_agent_send_image_context,
         contains_unresolved_sandbox_image_path,

@@ -447,6 +447,7 @@ async def extract_text_from_thread(
         # row's run stream directly. Resolving through local BTM state can
         # pick a retained terminal LocalRunExecution from a prior run on this worker
         # while the live run executes elsewhere (v4 2.4c review F6).
+        # DALTON-HOOK(deliverable-text): expose live turn's own qualified deliverable answer
         raw_text = await _extract_from_redis(
             thread_id, str(active_run["conversation_response_id"])
         )
@@ -566,6 +567,7 @@ async def _extract_from_redis(thread_id: str, run_id: str) -> str:
             if content:
                 chunks.append(content)
 
+    # DALTON-HOOK(deliverable-text): return accumulated strict deliverable text when enabled
     return strict_acc.result().text if strict_acc is not None else "".join(chunks)
 
 

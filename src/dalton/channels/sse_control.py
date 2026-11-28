@@ -640,10 +640,13 @@ class DaltonStreamControl:
         """Extract ``(leading_frames, text_content, content_type, text_phase)`` for a
         live chunk, handling mixed-phase Responses frames and reasoning lifecycle in
         Dalton so ``sse_producer.py`` stays a thin delegation hook."""
+        from src.dalton.settings import is_strict_deliverable_text_enabled
+
         if (
             not is_compaction
             and not is_inner_llm_chunk
             and isinstance(message_chunk, (AIMessage, AIMessageChunk))
+            and is_strict_deliverable_text_enabled()
         ):
             split = _split_mixed_phase_content(
                 message_chunk.content,

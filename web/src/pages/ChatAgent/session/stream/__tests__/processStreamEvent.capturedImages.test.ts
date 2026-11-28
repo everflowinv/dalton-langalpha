@@ -87,6 +87,7 @@ describe('live: where a run\'s images were captured', () => {
     expect(captured('live')).toBeUndefined();
   });
 
+  // DALTON-HOOK(deliverable-text): verify per-message images_by_message scoping across bubbles and fallback
   it('pins images_by_message per segment and scopes each bubble to its own segment map with global fallback for unmatched segments', () => {
     const v1 = 'https://cdn.example/response-images/t/v1/price.png';
     const v2 = 'https://cdn.example/response-images/t/v2/price.png';
@@ -174,6 +175,7 @@ describe('live: where a run\'s images were captured', () => {
     expect(byId('unmatched').contentSegments[0].capturedImages).toEqual({ 'charts/price.png': v2, 'charts/extra.png': fallbackUrl });
   });
 
+  // DALTON-HOOK(deliverable-text): verify per-segment capturedImages stay distinct inside one bubble on same-path rewrites
   it('keeps per-segment capturedImages distinct inside a single multi-segment bubble for same-path rewrites', () => {
     const v1 = 'https://cdn.example/response-images/t/v1/price.png';
     const v2 = 'https://cdn.example/response-images/t/v2/price.png';

@@ -16593,17 +16593,17 @@ async def _update_inbound_progress_once(
                     agent_send_row = await cur.fetchone()
                     if agent_send_row:
                         has_delivered_current_agent_send = bool(
-                            agent_send_row["has_delivered_current_agent_send"]
+                            agent_send_row.get("has_delivered_current_agent_send")
                         )
                         has_delivered_current_files_only = bool(
-                            agent_send_row["has_delivered_current_files_only"]
+                            agent_send_row.get("has_delivered_current_files_only")
                         )
                         has_failed_current_agent_send = (
-                            bool(agent_send_row["has_failed_current_agent_send"])
+                            bool(agent_send_row.get("has_failed_current_agent_send"))
                             and not has_delivered_current_agent_send
                         )
                         has_unresolved_current_agent_send_images = bool(
-                            agent_send_row["has_unresolved_current_agent_send_images"]
+                            agent_send_row.get("has_unresolved_current_agent_send_images")
                         )
                         raw_unresolved = agent_send_row.get("unresolved_current_agent_sends")
                         if isinstance(raw_unresolved, list):

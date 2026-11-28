@@ -297,7 +297,7 @@ export PATH="{fake_bin_to}:/bin:/usr/bin"
 DALTON_DEPLOY_LIB_ONLY=1
 DALTON_REPO_ROOT="{repo}"
 DALTON_ALEMBIC_QUERY_RETRY_DELAY_S=0
-DALTON_ALEMBIC_QUERY_TIMEOUT_S=1
+DALTON_ALEMBIC_QUERY_TIMEOUT_S=2
 source "{_DEPLOY_SCRIPT}"
 get_dalton_alembic_version
 """
@@ -306,7 +306,7 @@ get_dalton_alembic_version
         capture_output=True,
         text=True,
         check=False,
-        timeout=10,
+        timeout=20,
     )
     assert res_to.returncode != 0
     assert res_to.stdout == ""

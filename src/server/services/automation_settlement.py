@@ -829,6 +829,7 @@ async def settle_by_run(
         )
     elif outcome is Outcome.COMPLETED:
         answer = RunAnswer()
+        answer_read_failed = False  # DALTON-HOOK(deliverable-text): do not fabricate empty-turn summary when checkpoint read failed
         if thread_id:
             # The run's own turn, however many the thread has taken since.
             try:
@@ -841,10 +842,11 @@ async def settle_by_run(
                     f"execution_id={execution_id} run_id={run_id} error={e}"
                 )
                 answer = RunAnswer()
+                answer_read_failed = True
         excerpt = (plain_excerpt(answer.text) or None) if answer.text else None
         # DALTON-HOOK(deliverable-text): resolve empty-text automation excerpt from dalton_channel_deliveries truth and order extracted_text -> sent
         from src.dalton.channels.deliverable_text import resolve_automation_final_text, resolve_completed_automation_excerpt_from_db
-        if excerpt is None:
+        if excerpt is None and not answer_read_failed:
             excerpt = await resolve_completed_automation_excerpt_from_db(execution_id, answer=answer, excerpt=excerpt, thread_id=thread_id, run_id=run_id)
         final_text = resolve_automation_final_text(answer)
     # DALTON-HOOK(automation-subscription-fallback): surface subscription fallback notice in execution excerpt and delivery text
