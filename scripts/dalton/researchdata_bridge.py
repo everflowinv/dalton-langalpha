@@ -8527,7 +8527,19 @@ class ResearchDataBridge:
         cached = getattr(self, "_cached_effective_caps", None)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
             return cached[1]
-        active = caps_mod.effective_capabilities(environ=env)
+        try:
+            active = caps_mod.effective_capabilities(environ=env)
+        except Exception as exc:
+            # The bridge runs on the host Python, which cannot import the full backend
+            # settings stack (src.config -> ptc_agent). Keep routes served, as when the
+            # capabilities module itself is unavailable.
+            if not getattr(self, "_effective_caps_warned", False):
+                logger.warning(
+                    "Capability evaluation unavailable on the bridge host (%s); routes stay enabled",
+                    type(exc).__name__,
+                )
+                self._effective_caps_warned = True
+            return None
         self._cached_effective_caps = (cache_key, active)
         return active
 
@@ -8539,6 +8551,8 @@ class ResearchDataBridge:
         if cleaned not in caps_mod.BRIDGE_ROUTE_CAPABILITY_MAP:
             return False
         active_caps = self._effective_capabilities_cached()
+        if active_caps is None:
+            return False
         return not bool(
             caps_mod.is_research_source_enabled(cleaned, capabilities=active_caps)
         )
