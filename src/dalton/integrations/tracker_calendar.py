@@ -1,19 +1,15 @@
-"""Dedicated earnings tracker calendar service: official MCP mapping, legacy bridge relay, and disconnect purge (§4.5(2), §5.3).
+"""Dedicated earnings tracker calendar service: official MCP mapping and legacy bridge relay (§5.3).
 
 Never logs OAuth tokens, bridge tokens, calendar IDs, or event contents.
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping
 from datetime import UTC, date, datetime, timedelta
-import json
 import logging
 import os
-from pathlib import Path
-import posixpath
 import re
-import tempfile
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,15 +24,6 @@ from src.dalton.database.automation_reports import (
     _identity_code,
     lock_report_execution,
 )
-from src.dalton.database.user_integrations import (
-    PurgeLedgerRow,
-    TriggerReason,
-)
-from src.dalton.deployment_credentials.catalog import (
-    GOOGLE_OAUTH_CLIENT_ID_KEY,
-    GOOGLE_OAUTH_CLIENT_SECRET_KEY,
-)
-from src.dalton.deployment_credentials.snapshot import get_credential_group
 from src.dalton.integrations.constants import (
     GOOGLE_CALENDAR_MIN_SCOPES,
     GOOGLE_CALENDAR_WRITE_SCOPES,
@@ -54,11 +41,6 @@ from src.dalton.integrations.google_calendar import (
 from src.dalton.integrations.lock_guard import assert_no_advisory_lock_held
 from src.dalton.integrations.oauth_clients import (
     GoogleOAuthClientProtocol,
-    get_google_oauth_client,
-)
-from src.dalton.services.integration_data_purge import (
-    TrackerPurgeSnapshot,
-    register_tracker_purge_handler,
 )
 from src.dalton.services.user_integrations_oauth import (
     PersonalIntegrationError,
@@ -68,7 +50,6 @@ from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_bridge_base_url,
     get_tracker_calendar_automation_id,
-    get_tracker_calendar_owner_id,
 )
 from src.server.database.pool import get_db_connection
 
@@ -107,7 +88,7 @@ _OP_KEYS: dict[str, frozenset[str]] = {
     "list_events": frozenset({"query", "time_min", "time_max", "limit"}),
     "insert_event": frozenset({"summary", "description", "start", "end"}),
     "delete_event": frozenset({"event_id"}),
-    "health_check": frozenset({"ack_reconcile"}),
+    "health_check": frozenset(),
 }
 
 _HINT_WINDOW = "time_min 到 time_max 的窗口不能超过 400 天。"
@@ -257,23 +238,18 @@ def has_tracker_write_scope(scopes: str | Collection[str] | None) -> bool:
 
 
 def resolve_tracker_calendar_target_id(
-    conn_or_snapshot: Any | None = None,
+    conn_row: Any | None = None,
     *,
     env_calendar_id: str | None = None,
 ) -> str:
-    """Resolve the authoritative Google Calendar ID for tracker ops and disconnect cleanup.
+    """Resolve the authoritative Google Calendar ID for tracker calendar operations.
 
-    Priority (shared by ``execute_tracker_calendar_official_mcp``,
-    ``_resolve_purge_remote_credentials``, and ``gws_migration_probe.py``):
-      1. ``snapshot.calendar_id`` when a ``TrackerPurgeSnapshot`` is supplied
-      2. ``conn.preferences['tracker_calendar_id']`` when an integration row is supplied
-      3. ``env_calendar_id`` (explicit env override for tests) or ``DALTON_GCAL_CALENDAR_ID``
+    Priority:
+      1. ``conn_row.preferences['tracker_calendar_id']`` when an integration row is supplied
+      2. ``env_calendar_id`` (explicit env override for tests) or ``DALTON_GCAL_CALENDAR_ID``
     """
-    if conn_or_snapshot is not None:
-        snap_cal = getattr(conn_or_snapshot, "calendar_id", None)
-        if isinstance(snap_cal, str) and snap_cal.strip():
-            return snap_cal.strip()
-        prefs = getattr(conn_or_snapshot, "preferences", None)
+    if conn_row is not None:
+        prefs = getattr(conn_row, "preferences", None)
         if isinstance(prefs, Mapping):
             pref_cal = str(prefs.get("tracker_calendar_id") or "").strip()
             if pref_cal:
@@ -621,13 +597,10 @@ async def execute_tracker_calendar_official_mcp(
                 tool_name="list_events",
                 arguments=mcp_args,
             )
-            hc_data: dict[str, Any] = {"calendar_ok": True, "backend": "official_mcp"}
-            if validated.get("ack_reconcile"):
-                await integrations_db.clear_pending_tracker_reconcile(owner_id)
-                hc_data["tracker_reconcile_cleared"] = True
-            elif await integrations_db.has_pending_tracker_reconcile(owner_id):
-                hc_data["tracker_reconcile_needed"] = True
-            return {"ok": True, "status": "ok", "data": hc_data}, calendar_id
+            return (
+                {"ok": True, "status": "ok", "data": {"calendar_ok": True, "backend": "official_mcp"}},
+                calendar_id,
+            )
 
         if operation == "list_events":
             limit = int(validated["limit"])
@@ -676,8 +649,6 @@ async def execute_tracker_calendar_official_mcp(
             }
             if truncated:
                 data["truncated"] = True
-            if await integrations_db.has_pending_tracker_reconcile(owner_id):
-                data["tracker_reconcile_needed"] = True
             return {"ok": True, "status": "ok", "data": data}, calendar_id
 
         if operation == "insert_event":
@@ -822,13 +793,7 @@ def _validate_operation_arguments(
     operation: str, arguments: Mapping[str, Any]
 ) -> dict[str, Any]:
     if operation == "health_check":
-        ack = arguments.get("ack_reconcile")
-        if ack is not None and not isinstance(ack, bool):
-            return {
-                "ok": False,
-                "error_payload": _gcal_param_error("ack_reconcile 必须是布尔值。"),
-            }
-        return {"ok": True, "ack_reconcile": bool(ack)}
+        return {"ok": True}
 
     if operation == "list_events":
         if arguments.get("time_min") is None or arguments.get("time_max") is None:
@@ -1038,730 +1003,6 @@ async def execute_tracker_calendar_legacy_gws(
     return dict(payload), calendar_id
 
 
-# ---------------------------------------------------------------------------
-# Layer 6b Disconnect Purge Handler (Item 6, §4.5(2) item 6)
-# ---------------------------------------------------------------------------
-
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    if path.is_symlink():
-        return
-    raw = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    fd, tmp_name = tempfile.mkstemp(prefix=".tracker-purge-", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-def _dump_json_text(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-
-
-def _scrub_watchlist_doc(
-    wl: dict[str, Any],
-    *,
-    mark_reconcile_needed: bool,
-) -> bool:
-    changed = False
-    for section in ("confirmed", "pending", "reported"):
-        rows = wl.get(section)
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if isinstance(row, dict) and row.get("calendar_event_id") is not None:
-                row["calendar_event_id"] = None
-                changed = True
-    if wl.get("pending_delete_event_ids"):
-        wl["pending_delete_event_ids"] = []
-        changed = True
-    if mark_reconcile_needed:
-        if wl.get("tracker_reconcile_needed") is not True:
-            wl["tracker_reconcile_needed"] = True
-            changed = True
-        if wl.get("tracker_reconcile_source") != "backend":
-            wl["tracker_reconcile_source"] = "backend"
-            changed = True
-    else:
-        if "tracker_reconcile_needed" in wl:
-            wl.pop("tracker_reconcile_needed", None)
-            changed = True
-        if "tracker_reconcile_source" in wl:
-            wl.pop("tracker_reconcile_source", None)
-            changed = True
-    return changed
-
-
-def _scrub_apply_doc(doc: dict[str, Any]) -> bool:
-    changed = False
-    for key in ("planned", "applied"):
-        rows = doc.get(key)
-        if not isinstance(rows, list):
-            continue
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            for field_name in ("event_id", "old_event_id", "calendar_event_id"):
-                if item.get(field_name) is not None:
-                    item[field_name] = None
-                    changed = True
-    return changed
-
-
-def _scrub_roll_doc(doc: dict[str, Any]) -> bool:
-    changed = False
-    moved = doc.get("moved")
-    if isinstance(moved, list):
-        for item in moved:
-            if not isinstance(item, dict):
-                continue
-            for field_name in ("calendar_event_id", "event_id"):
-                if item.get(field_name) is not None:
-                    item[field_name] = None
-                    changed = True
-    return changed
-
-
-def _discover_tracker_workspace_dirs(
-    explicit_dirs: Sequence[Path] | None = None,
-) -> list[Path]:
-    if explicit_dirs is not None:
-        return [Path(p) for p in explicit_dirs]
-    found: list[Path] = []
-    env_dir = os.getenv("DALTON_TRACKER_WORKSPACE_DIR", "").strip()
-    if env_dir:
-        candidate = Path(env_dir).expanduser()
-        if candidate.is_dir() and not candidate.is_symlink():
-            found.append(candidate)
-    return found
-
-
-def clean_local_tracker_event_ids(
-    workspace_dirs: Sequence[Path],
-    *,
-    mark_reconcile_needed: bool = False,
-) -> int:
-    """Clear local calendar event IDs from ``watchlist.json``, ``apply.json``, and ``roll.json``.
-
-    Never follows symlinks and returns the count of modified JSON files.
-    """
-    modified = 0
-    for ws in workspace_dirs:
-        if not ws.is_dir() or ws.is_symlink():
-            continue
-        state_dir = ws / "state" / "richard-earnings"
-        if not state_dir.is_dir() or state_dir.is_symlink():
-            continue
-
-        watchlist_path = state_dir / "watchlist.json"
-        if watchlist_path.is_file() and not watchlist_path.is_symlink():
-            try:
-                wl = json.loads(watchlist_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                wl = None
-            if isinstance(wl, dict) and _scrub_watchlist_doc(
-                wl, mark_reconcile_needed=mark_reconcile_needed
-            ):
-                _atomic_write_json(watchlist_path, wl)
-                modified += 1
-
-        scans_dir = state_dir / "scans"
-        if scans_dir.is_dir() and not scans_dir.is_symlink():
-            for day_dir in sorted(scans_dir.iterdir()):
-                if not day_dir.is_dir() or day_dir.is_symlink():
-                    continue
-                apply_path = day_dir / "apply.json"
-                if apply_path.is_file() and not apply_path.is_symlink():
-                    try:
-                        doc = json.loads(apply_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        doc = None
-                    if isinstance(doc, dict) and _scrub_apply_doc(doc):
-                        _atomic_write_json(apply_path, doc)
-                        modified += 1
-
-                roll_path = day_dir / "roll.json"
-                if roll_path.is_file() and not roll_path.is_symlink():
-                    try:
-                        doc = json.loads(roll_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        doc = None
-                    if isinstance(doc, dict) and _scrub_roll_doc(doc):
-                        _atomic_write_json(roll_path, doc)
-                        modified += 1
-
-    return modified
-
-
-async def _lookup_tracker_automation_workspace(
-    automation_id: str | None = None,
-    *,
-    conn: Any = None,
-) -> tuple[str | None, str | None]:
-    """Return ``(workspace_id, user_id)`` for the tracker automation row, or ``(None, None)``."""
-    target_id = str(automation_id or get_tracker_calendar_automation_id() or "").strip()
-    if not is_valid_tracker_automation_id(target_id):
-        return None, None
-    async with get_db_connection(conn) as db_conn:
-        async with db_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT workspace_id::text AS workspace_id, user_id
-                FROM automations
-                WHERE automation_id = %s::uuid
-                """,
-                (target_id,),
-            )
-            row = await cur.fetchone()
-    if not row or not row.get("workspace_id"):
-        return None, None
-    ws_id = str(row["workspace_id"]).strip()
-    owner = str(row.get("user_id") or "").strip() or None
-    return (ws_id or None), owner
-
-
-async def _resolve_tracker_workspace_backend(
-    workspace_id: str,
-    *,
-    user_id: str | None = None,
-) -> Any:
-    """Resolve a pinned ``SandboxBackend`` for the tracker automation's workspace."""
-    from ptc_agent.agent.backends.sandbox import SandboxBackend
-    from ptc_agent.core.paths import SandboxLayout
-    from src.server.database.workspace import get_workspace
-    from src.server.services.workspace_manager import WorkspaceManager
-
-    assert_no_advisory_lock_held("tracker_calendar.resolve_workspace_backend")
-    workspace_manager = WorkspaceManager.get_instance()
-    session = await workspace_manager.get_session_for_workspace(
-        str(workspace_id), user_id=user_id
-    )
-    if not hasattr(session, "sandbox") or session.sandbox is None:
-        raise RuntimeError(f"Sandbox session unavailable for workspace {workspace_id}")
-    row = await get_workspace(str(workspace_id)) or {}
-    dir_name = row.get("dir_name")
-    layout = SandboxLayout(session.sandbox.working_dir).for_workspace(dir_name)
-    return SandboxBackend(session.sandbox, layout.workspace)
-
-
-async def _backend_read_json(backend: Any, rel_path: str) -> dict[str, Any] | None:
-    text: str | None = None
-    if hasattr(backend, "adownload_file_bytes"):
-        raw = await backend.adownload_file_bytes(rel_path)
-        if raw is None:
-            return None
-        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-    elif hasattr(backend, "aread_text"):
-        text = await backend.aread_text(rel_path)
-    if text is None:
-        return None
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-async def _backend_write_json(backend: Any, rel_path: str, data: dict[str, Any]) -> bool:
-    serialized = _dump_json_text(data)
-    if hasattr(backend, "awrite_text"):
-        res = await backend.awrite_text(rel_path, serialized)
-        return res is not False
-    if hasattr(backend, "awrite"):
-        res = await backend.awrite(rel_path, serialized, overwrite=True)
-        return not getattr(res, "error", None)
-    return False
-
-
-def _resolve_sandbox_workspace_root(backend: Any) -> str:
-    """Return the normalized absolute workspace root from ``SandboxBackend.workspace_dir`` if available."""
-    raw = getattr(backend, "workspace_dir", None)
-    if isinstance(raw, str) and raw.strip():
-        norm = posixpath.normpath(raw.strip())
-        if norm.startswith("/"):
-            return norm.rstrip("/")
-    return ""
-
-
-def _validate_sandbox_scan_file_path(candidate: str, ws_root: str) -> str | None:
-    """Ensure a candidate scan file path lies strictly within the target workspace's scans directory."""
-    cleaned = str(candidate or "").strip()
-    if not cleaned:
-        return None
-    if ws_root:
-        full = (
-            posixpath.normpath(cleaned)
-            if cleaned.startswith("/")
-            else posixpath.normpath(posixpath.join(ws_root, cleaned))
-        )
-        scans_prefix = f"{ws_root}/state/richard-earnings/scans/"
-        if not full.startswith(scans_prefix):
-            return None
-        return full
-    if cleaned.startswith("/"):
-        return None
-    norm = posixpath.normpath(cleaned)
-    if not norm.startswith("state/richard-earnings/scans/"):
-        return None
-    return norm
-
-
-async def _enumerate_sandbox_scan_files(
-    backend: Any,
-    scans_dir: str,
-    ws_root: str,
-) -> tuple[bool, list[str], list[str]]:
-    """Enumerate ``apply.json`` and ``roll.json`` under ``scans_dir`` inside the workspace.
-
-    Returns ``(ok, apply_paths, roll_paths)``. Fails closed (``ok=False``) when the
-    backend reports a glob/ls error so unreadable sandboxes are never treated as clean.
-    """
-    raw_apply: list[str] = []
-    raw_roll: list[str] = []
-    enumerated = False
-
-    # 1. Preferred: SandboxBackend.aglob normalizes against the pinned workspace root
-    #    and surfaces sandbox errors on GlobResult.error.
-    if hasattr(backend, "aglob"):
-        apply_res = await backend.aglob("apply.json", scans_dir)
-        apply_err = getattr(apply_res, "error", None)
-        if isinstance(apply_err, str) and apply_err.strip():
-            return False, [], []
-        apply_matches = getattr(apply_res, "matches", None)
-        if isinstance(apply_matches, list):
-            enumerated = True
-            for m in apply_matches:
-                if isinstance(m, Mapping) and isinstance(m.get("path"), str):
-                    raw_apply.append(m["path"])
-
-            roll_res = await backend.aglob("roll.json", scans_dir)
-            roll_err = getattr(roll_res, "error", None)
-            if isinstance(roll_err, str) and roll_err.strip():
-                return False, [], []
-            roll_matches = getattr(roll_res, "matches", None)
-            if isinstance(roll_matches, list):
-                for m in roll_matches:
-                    if isinstance(m, Mapping) and isinstance(m.get("path"), str):
-                        raw_roll.append(m["path"])
-
-    # 2. Fallback for backends / mocks exposing aglob_paths (always passing workspace-rooted scans_dir).
-    if not enumerated and hasattr(backend, "aglob_paths"):
-        ap = await backend.aglob_paths("apply.json", scans_dir)
-        rp = await backend.aglob_paths("roll.json", scans_dir)
-        if isinstance(ap, list):
-            enumerated = True
-            raw_apply.extend(str(p) for p in ap if isinstance(p, str))
-        if isinstance(rp, list):
-            enumerated = True
-            raw_roll.extend(str(p) for p in rp if isinstance(p, str))
-
-    # 3. Fallback: directory listing via SandboxBackend.als on the workspace-rooted scans_dir.
-    if not enumerated and hasattr(backend, "als"):
-        ls_res = await backend.als(scans_dir)
-        ls_err = getattr(ls_res, "error", None)
-        if isinstance(ls_err, str) and ls_err.strip():
-            return False, [], []
-        entries = getattr(ls_res, "entries", None)
-        if isinstance(entries, list):
-            enumerated = True
-            for entry in entries:
-                if isinstance(entry, Mapping) and entry.get("is_dir"):
-                    sub = str(entry.get("path") or "").rstrip("/")
-                    if sub:
-                        raw_apply.append(f"{sub}/apply.json")
-                        raw_roll.append(f"{sub}/roll.json")
-
-    valid_apply: list[str] = []
-    for p in dict.fromkeys(sorted(raw_apply)):
-        validated = _validate_sandbox_scan_file_path(p, ws_root)
-        if validated is None:
-            logger.warning(
-                "[tracker-purge] ignoring out-of-workspace apply.json candidate outside scans root"
-            )
-            continue
-        valid_apply.append(validated)
-
-    valid_roll: list[str] = []
-    for p in dict.fromkeys(sorted(raw_roll)):
-        validated = _validate_sandbox_scan_file_path(p, ws_root)
-        if validated is None:
-            logger.warning(
-                "[tracker-purge] ignoring out-of-workspace roll.json candidate outside scans root"
-            )
-            continue
-        valid_roll.append(validated)
-
-    return True, valid_apply, valid_roll
-
-
-async def clean_sandbox_tracker_event_ids(
-    backend: Any,
-    *,
-    mark_reconcile_needed: bool = False,
-) -> tuple[bool, int]:
-    """Clear calendar event IDs inside a sandbox workspace backend.
-
-    Always locates files using ``SandboxBackend.workspace_dir`` when available and
-    verifies every enumerated scan file path stays within that workspace.
-
-    Returns ``(workspace_found_and_cleaned, modified_file_count)``.
-    """
-    ws_root = _resolve_sandbox_workspace_root(backend)
-    watchlist_path = (
-        f"{ws_root}/state/richard-earnings/watchlist.json"
-        if ws_root
-        else "state/richard-earnings/watchlist.json"
-    )
-    scans_dir = (
-        f"{ws_root}/state/richard-earnings/scans"
-        if ws_root
-        else "state/richard-earnings/scans"
-    )
-
-    wl = await _backend_read_json(backend, watchlist_path)
-    if wl is None:
-        return False, 0
-
-    modified = 0
-    if _scrub_watchlist_doc(wl, mark_reconcile_needed=mark_reconcile_needed):
-        if not await _backend_write_json(backend, watchlist_path, wl):
-            return False, modified
-        modified += 1
-
-    enum_ok, apply_paths, roll_paths = await _enumerate_sandbox_scan_files(
-        backend, scans_dir, ws_root
-    )
-    if not enum_ok:
-        return False, modified
-
-    for file_path in apply_paths:
-        doc = await _backend_read_json(backend, file_path)
-        if isinstance(doc, dict) and _scrub_apply_doc(doc):
-            if not await _backend_write_json(backend, file_path, doc):
-                return False, modified
-            modified += 1
-
-    for file_path in roll_paths:
-        doc = await _backend_read_json(backend, file_path)
-        if isinstance(doc, dict) and _scrub_roll_doc(doc):
-            if not await _backend_write_json(backend, file_path, doc):
-                return False, modified
-            modified += 1
-
-    return True, modified
-
-
-async def _clean_tracker_workspaces(
-    *,
-    workspace_dirs: Sequence[Path] | None,
-    workspace_backend: Any | None,
-    user_id: str,
-    mark_reconcile_needed: bool,
-) -> tuple[bool, int]:
-    """Locate the tracker workspace (local directory or automation sandbox) and clear event IDs."""
-    dirs = _discover_tracker_workspace_dirs(workspace_dirs)
-    local_watchlists = [
-        d for d in dirs if (d / "state" / "richard-earnings" / "watchlist.json").is_file()
-    ]
-    if local_watchlists:
-        return True, clean_local_tracker_event_ids(
-            local_watchlists, mark_reconcile_needed=mark_reconcile_needed
-        )
-
-    backend = workspace_backend
-    if backend is None and workspace_dirs is None:
-        try:
-            ws_id, auto_owner = await _lookup_tracker_automation_workspace()
-            if ws_id:
-                backend = await _resolve_tracker_workspace_backend(
-                    ws_id, user_id=auto_owner or user_id
-                )
-        except Exception as exc:
-            logger.warning(
-                "[tracker-purge] unable to locate tracker automation workspace (%s); keeping tracker_reconcile_needed",
-                type(exc).__name__,
-            )
-            return False, 0
-
-    if backend is not None:
-        try:
-            return await clean_sandbox_tracker_event_ids(
-                backend, mark_reconcile_needed=mark_reconcile_needed
-            )
-        except Exception as exc:
-            logger.warning(
-                "[tracker-purge] sandbox workspace cleanup failed (%s); keeping tracker_reconcile_needed",
-                type(exc).__name__,
-            )
-            return False, 0
-
-    return False, 0
-
-
-async def _resolve_purge_remote_credentials(
-    ledger: PurgeLedgerRow,
-    *,
-    snapshot: TrackerPurgeSnapshot | None = None,
-    oauth_client: GoogleOAuthClientProtocol | None = None,
-) -> tuple[str | None, str | None, str | None]:
-    """Return ``(access_token, granted_scopes, calendar_id)`` if available for remote cleanup."""
-    # 1. Preferred: pre-delete snapshot captured by finish_disconnect_locked before row removal.
-    if (
-        snapshot is not None
-        and snapshot.auth_epoch <= ledger.auth_epoch_upto
-        and snapshot.provider_account_id == ledger.provider_account_id
-    ):
-        cal_id = resolve_tracker_calendar_target_id(snapshot) or None
-        scopes = snapshot.granted_scopes
-        if not snapshot.can_write or not has_tracker_write_scope(scopes):
-            return None, scopes, cal_id
-        now = datetime.now(UTC)
-        if snapshot.access_token and (
-            snapshot.expires_at is None
-            or (
-                snapshot.expires_at.astimezone(UTC)
-                if snapshot.expires_at.tzinfo
-                else snapshot.expires_at.replace(tzinfo=UTC)
-            )
-            > now + timedelta(seconds=30)
-        ):
-            return snapshot.access_token, scopes, cal_id
-        if snapshot.refresh_token:
-            token, refreshed_scopes = await _refresh_for_purge(
-                snapshot.refresh_token, oauth_client=oauth_client
-            )
-            return token, (refreshed_scopes or scopes), cal_id
-        return None, scopes, cal_id
-
-    # 2. If connection row for this epoch still exists (e.g. direct call / pre-delete), inspect it.
-    conn_row = await integrations_db.get_connection(
-        ledger.user_id, "google", "calendar", decrypt_tokens=True
-    )
-    if (
-        conn_row is not None
-        and conn_row.auth_epoch <= ledger.auth_epoch_upto
-        and conn_row.provider_account_id == ledger.provider_account_id
-    ):
-        cal_id = resolve_tracker_calendar_target_id(conn_row) or None
-        scopes = conn_row.granted_scopes
-        if not has_tracker_write_scope(scopes):
-            return None, scopes, cal_id
-        now = datetime.now(UTC)
-        if conn_row.access_token and (
-            conn_row.expires_at is None
-            or (
-                conn_row.expires_at.astimezone(UTC)
-                if conn_row.expires_at.tzinfo
-                else conn_row.expires_at.replace(tzinfo=UTC)
-            )
-            > now + timedelta(seconds=30)
-        ):
-            return conn_row.access_token, scopes, cal_id
-        if conn_row.refresh_token:
-            token, refreshed_scopes = await _refresh_for_purge(
-                conn_row.refresh_token, oauth_client=oauth_client
-            )
-            return token, (refreshed_scopes or scopes), cal_id
-        return None, scopes, cal_id
-
-    # 3. Crash-resume fallback after row removal: use ledger's revoke token if present.
-    env_calendar_id = resolve_tracker_calendar_target_id(None) or None
-    decrypted_ledger = (
-        ledger
-        if ledger.revoke_token
-        else await integrations_db.get_purge_ledger(
-            ledger.purge_id, decrypt_revoke_token=True
-        )
-    )
-    revoke_tok = decrypted_ledger.revoke_token if decrypted_ledger is not None else None
-    if not revoke_tok:
-        return None, None, env_calendar_id
-    token, refreshed_scopes = await _refresh_for_purge(
-        revoke_tok, oauth_client=oauth_client
-    )
-    return token, refreshed_scopes, env_calendar_id
-
-
-async def _refresh_for_purge(
-    refresh_token: str,
-    *,
-    oauth_client: GoogleOAuthClientProtocol | None = None,
-) -> tuple[str | None, str | None]:
-    group = get_credential_group("google_oauth")
-    if not group.ready:
-        return None, None
-    client_id = group.values.get(GOOGLE_OAUTH_CLIENT_ID_KEY, "")
-    client_secret = group.values.get(GOOGLE_OAUTH_CLIENT_SECRET_KEY, "")
-    if not client_id or not client_secret:
-        return None, None
-    client = oauth_client or get_google_oauth_client()
-    try:
-        refreshed = await client.refresh_access_token(
-            client_id=client_id,
-            client_secret=client_secret,
-            refresh_token=refresh_token,
-        )
-    except Exception:
-        return None, None
-    return refreshed.access_token, refreshed.scope
-
-
-async def handle_tracker_calendar_purge(
-    ledger: PurgeLedgerRow,
-    *,
-    snapshot: TrackerPurgeSnapshot | None = None,
-    workspace_dirs: Sequence[Path] | None = None,
-    workspace_backend: Any | None = None,
-    google_client: GoogleCalendarClientProtocol | None = None,
-    oauth_client: GoogleOAuthClientProtocol | None = None,
-    now_et: datetime | None = None,
-) -> bool:
-    """Purge handler registered at ``register_tracker_purge_handler`` (§4.5(2) item 6).
-
-    Returns:
-        ``True`` when no further reconciliation is needed (either this ledger is not
-        for the tracker owner's Google calendar, or both local/sandbox event IDs and
-        remote ``_gcal_is_tracker`` events were deleted cleanly).
-        ``False`` when either workspace cleanup could not be located/completed or
-        remote deletion could not complete (e.g. read-only OAuth scope, external
-        revocation, missing token, or remote transient failure), causing the purger
-        to record ``tracker_reconcile_needed = TRUE`` without failing the disconnect flow.
-    """
-    owner_id = get_tracker_calendar_owner_id()
-    if (
-        not owner_id
-        or ledger.user_id.strip().lower() != owner_id.lower()
-        or ledger.provider != "google"
-        or ledger.service not in ("calendar", None)
-    ):
-        return True
-
-    # Step 1 (Local first): locate actual workspace (local or automation sandbox) and clear
-    # event IDs while writing tracker_reconcile_needed + tracker_reconcile_source='backend'.
-    # If workspace/sandbox is unreachable, do NOT delete remote events yet: keep
-    # tracker_reconcile_needed=TRUE in PostgreSQL so the next weekly scan reconciles both
-    # local ledger/history and remote events together.
-    local_cleaned, _ = await _clean_tracker_workspaces(
-        workspace_dirs=workspace_dirs,
-        workspace_backend=workspace_backend,
-        user_id=ledger.user_id,
-        mark_reconcile_needed=True,
-    )
-    if not local_cleaned:
-        logger.warning(
-            "[tracker-purge] workspace unreachable or uncleaned for purge_id=%s; skipping remote delete and keeping tracker_reconcile_needed",
-            ledger.purge_id,
-        )
-        return False
-
-    # External revocations have already invalidated remote tokens -> reconcile on next reconnect.
-    if ledger.trigger_reason in (
-        TriggerReason.WEBHOOK_REVOKED,
-        TriggerReason.ERROR_CODE_REVOKED,
-    ):
-        return False
-
-    access_token, granted_scopes, calendar_id = await _resolve_purge_remote_credentials(
-        ledger, snapshot=snapshot, oauth_client=oauth_client
-    )
-    if not access_token or not calendar_id:
-        return False
-    if granted_scopes is not None and not has_tracker_write_scope(granted_scopes):
-        return False
-
-    tz = ZoneInfo(TRACKER_DEFAULT_TIMEZONE)
-    ref_now = now_et or datetime.now(tz)
-    if ref_now.tzinfo is None:
-        ref_now = ref_now.replace(tzinfo=tz)
-    else:
-        ref_now = ref_now.astimezone(tz)
-
-    time_min = (ref_now - timedelta(days=30)).isoformat()
-    time_max = (ref_now + timedelta(days=365)).isoformat()
-    client = google_client or get_google_calendar_client()
-
-    try:
-        page_token: str | None = None
-        tracker_ids: list[str] = []
-        seen_ids: set[str] = set()
-        for _ in range(20):
-            list_args = build_google_list_events_args(
-                calendar_id=calendar_id,
-                time_min=time_min,
-                time_max=time_max,
-                tz_name=TRACKER_DEFAULT_TIMEZONE,
-                limit=TRACKER_GCAL_MAX_LIMIT,
-                page_token=page_token,
-            )
-            raw_list = await client.call_mcp_tool(
-                access_token=access_token,
-                tool_name="list_events",
-                arguments=list_args,
-            )
-            raw_events, next_token = _extract_mcp_events(raw_list)
-            for ev in raw_events:
-                norm = normalize_tracker_event(ev)
-                if norm is None or not is_tracker_event(norm):
-                    continue
-                ev_id = norm["id"]
-                if ev_id not in seen_ids:
-                    seen_ids.add(ev_id)
-                    tracker_ids.append(ev_id)
-            if not next_token:
-                break
-            page_token = next_token
-
-        for ev_id in tracker_ids:
-            try:
-                await client.call_mcp_tool(
-                    access_token=access_token,
-                    tool_name="delete_event",
-                    arguments={
-                        "calendarId": calendar_id,
-                        "eventId": ev_id,
-                        "notificationLevel": "NONE",
-                    },
-                )
-            except GoogleCalendarAPIError as exc:
-                if exc.status_code in (404, 410):
-                    continue
-                raise
-    except (GoogleCalendarAPIError, GoogleMCPElicitationRequired) as exc:
-        logger.warning(
-            "[tracker-purge] remote managed event cleanup incomplete for purge_id=%s (%s); marking tracker_reconcile_needed",
-            ledger.purge_id,
-            type(exc).__name__,
-        )
-        return False
-    except Exception as exc:
-        logger.warning(
-            "[tracker-purge] unexpected remote cleanup error for purge_id=%s (%s); marking tracker_reconcile_needed",
-            ledger.purge_id,
-            type(exc).__name__,
-        )
-        return False
-
-    # Both workspace and remote cleanup completed cleanly: clear the local reconcile marker.
-    cleared_ok, _ = await _clean_tracker_workspaces(
-        workspace_dirs=workspace_dirs,
-        workspace_backend=workspace_backend,
-        user_id=ledger.user_id,
-        mark_reconcile_needed=False,
-    )
-    return bool(cleared_ok)
-
-
-def register_default_tracker_purge_handler() -> None:
-    """Register the production tracker calendar purge handler at Step 1's extension point."""
-    register_tracker_purge_handler(handle_tracker_calendar_purge)
-
-
 __all__ = [
     "LEGACY_GWS_BRIDGE_PATH",
     "LEGACY_GWS_MAX_TIMEOUT_S",
@@ -1774,18 +1015,14 @@ __all__ = [
     "TRACKER_WRITE_SCOPE_MISSING_CODE",
     "TRACKER_WRITE_SCOPE_MISSING_MESSAGE",
     "authorize_tracker_calendar_execution",
-    "clean_local_tracker_event_ids",
-    "clean_sandbox_tracker_event_ids",
     "execute_tracker_calendar_legacy_gws",
     "execute_tracker_calendar_official_mcp",
-    "handle_tracker_calendar_purge",
     "has_tracker_read_scope",
     "has_tracker_write_scope",
     "is_tracker_event",
     "is_valid_tracker_automation_id",
     "normalize_tracker_event",
     "parse_scope_tokens",
-    "register_default_tracker_purge_handler",
     "resolve_tracker_calendar_target_id",
     "with_tracker_marker",
 ]

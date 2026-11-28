@@ -2,23 +2,16 @@
 """Everflow production operations probe for Google Workspace official MCP migration (§7.1(1), §7.4).
 
 Subcommands:
-  - ``calendar-purge-drill``: isolated non-production test-stack purge drill.
-    Enforces 3 mandatory non-production guards on ACTUAL resources before touching
-    DB or calendar:
-      1) Actual pool database name (``current_database()`` & pool conninfo) ends with
-         ``_test`` AND matches ``--database-url``
-      2) ``DALTON_TRACKER_CALENDAR_OWNER_ID`` (and ledger user) != hardcoded production owner UUID
-      3) Effective target calendar ID that cleanup will delete (resolved from connection
-         ``preferences.tracker_calendar_id`` or ``DALTON_GCAL_CALENDAR_ID``) is in the
-         registered test sub-calendar list (``DALTON_TEST_GCAL_CALENDAR_IDS``)
   - ``prod-readonly-check`` (alias ``calendar``): verifies host ``gws`` account matches
     the owner's bound Google account and ``tracker_calendar_id == DALTON_GCAL_CALENDAR_ID``
-    BEFORE any MCP call, then runs read-only ``health_check`` + 400-day EST/EDT ``list_events``
-    and skips write round-trip with ``跳过：需要写权限`` under read-only grants.
+    against the running research bridge BEFORE any MCP call, then runs read-only
+    ``health_check`` + 400-day EST/EDT ``list_events`` and skips write round-trip with
+    ``跳过：需要写权限`` under read-only grants.
   - ``drain``: polls PostgreSQL ``automation_executions`` (and host prepare locks
-    ``locks/prepare_<period>.lock`` + ``locks/execution_<id>.lock`` resolved from
-    the actual prepare config for ``--target mail``) until idle, exiting 2 on timeout
-    and 1 if lock files cannot be read.
+    ``locks/prepare_<period>.lock`` + ``locks/execution_<id>.lock`` +
+    ``state/research-images/worker.lock`` resolved from the host service config for
+    ``--target mail``) until idle, exiting 2 on timeout and 1 if lock files or host
+    config cannot be read.
 
 Never prints or logs OAuth tokens, refresh tokens, or full calendar event contents.
 """
@@ -27,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import AsyncIterator, Collection, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import fcntl
@@ -47,13 +40,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from psycopg.conninfo import conninfo_to_dict  # noqa: E402
 
-from src.dalton.integrations.tracker_calendar import (  # noqa: E402
-    resolve_tracker_calendar_target_id,
-)
-
-# Hardcoded production tracker calendar owner UUID — NEVER overridable via CLI flags.
-PROD_TRACKER_CALENDAR_OWNER_ID = "991a99ad-8ff2-4bd8-bf08-e5963a248798"
-REGISTERED_TEST_CALENDARS_ENV = "DALTON_TEST_GCAL_CALENDAR_IDS"
 BRIDGE_RUNTIME_INFO_PATH = "/internal/tracker-calendar/runtime-info"
 DRAIN_TIMEOUT_EXIT_CODE = 2
 READONLY_SKIP_REASON = "跳过：需要写权限"
@@ -80,40 +66,6 @@ def extract_database_name(database_url: str) -> str:
     return str(parsed.get("dbname") or "").strip()
 
 
-def parse_registered_test_calendar_ids(
-    explicit: Collection[str] | str | None = None,
-) -> tuple[str, ...]:
-    """Parse registered test sub-calendar IDs from explicit list or ``DALTON_TEST_GCAL_CALENDAR_IDS``."""
-    raw_items: list[str]
-    if explicit is None:
-        env_val = os.getenv(REGISTERED_TEST_CALENDARS_ENV, "")
-        raw_items = env_val.replace("\n", ",").replace(" ", ",").split(",")
-    elif isinstance(explicit, str):
-        raw_items = explicit.replace("\n", ",").replace(" ", ",").split(",")
-    else:
-        raw_items = [str(item) for item in explicit]
-
-    seen: set[str] = set()
-    cleaned: list[str] = []
-    for item in raw_items:
-        val = item.strip()
-        if not val or val.lower() == "primary":
-            continue
-        if val not in seen:
-            seen.add(val)
-            cleaned.append(val)
-    return tuple(cleaned)
-
-
-def resolve_effective_tracker_calendar_id(
-    conn_row: Any | None,
-    *,
-    env_calendar_id: str | None = None,
-) -> str:
-    """Resolve the exact calendar ID that tracker cleanup will target (shared with ``tracker_calendar.py``)."""
-    return resolve_tracker_calendar_target_id(conn_row, env_calendar_id=env_calendar_id)
-
-
 @asynccontextmanager
 async def open_probe_db_pool() -> AsyncIterator[Any]:
     """Ensure the shared psycopg AsyncConnectionPool is open for probe DB queries, closing if opened here."""
@@ -131,98 +83,10 @@ async def open_probe_db_pool() -> AsyncIterator[Any]:
             await pool.close()
 
 
-async def _query_actual_database_name(conn: Any = None) -> str:
-    """Query ``SELECT current_database()`` on the active connection pool."""
-    from src.server.database.pool import get_db_connection
-
-    async with get_db_connection(conn) as db_conn:
-        async with db_conn.cursor() as cur:
-            await cur.execute("SELECT current_database()")
-            row = await cur.fetchone()
-    if not row:
-        return ""
-    if isinstance(row, dict):
-        return str(row.get("current_database") or "").strip()
-    return str(row[0] or "").strip()
-
-
 def _configured_pool_database_name() -> str:
     from src.server.database.pool import get_db_connection_string
 
     return extract_database_name(get_db_connection_string())
-
-
-def validate_non_prod_drill_guard(
-    *,
-    database_url: str,
-    actual_db_name: str,
-    owner_id: str,
-    effective_calendar_id: str,
-    registered_test_calendar_ids: Collection[str] | str | None = None,
-    prod_calendar_id: str | None = None,
-    expected_calendar_id: str | None = None,
-) -> tuple[bool, list[str]]:
-    """Enforce the 3 mandatory non-production guards for ``calendar-purge-drill``.
-
-    Checks the ACTUAL connected database name, hardcoded production owner constant,
-    and the EFFECTIVE calendar ID that cleanup will delete against the registered
-    test sub-calendar allowlist.
-    """
-    reasons: list[str] = []
-
-    # Guard 1: Both actual pool database name and --database-url must end with `_test` and match.
-    url_db_name = extract_database_name(database_url)
-    cleaned_actual_db = str(actual_db_name or "").strip()
-    if not cleaned_actual_db or not cleaned_actual_db.endswith("_test"):
-        reasons.append(
-            f"actual pool database name must end with '_test' (got {cleaned_actual_db or '<empty>'!r})"
-        )
-    if not url_db_name or not url_db_name.endswith("_test"):
-        reasons.append(
-            f"--database-url database name must end with '_test' (got {url_db_name or '<empty>'!r})"
-        )
-    elif cleaned_actual_db and url_db_name != cleaned_actual_db:
-        reasons.append(
-            f"--database-url database ({url_db_name!r}) does not match actual pool database ({cleaned_actual_db!r})"
-        )
-
-    # Guard 2: Owner must be set and NEVER equal the hardcoded production owner constant.
-    cleaned_owner = str(owner_id or "").strip()
-    if not cleaned_owner:
-        reasons.append("DALTON_TRACKER_CALENDAR_OWNER_ID must be configured for test drill")
-    elif cleaned_owner.lower() == PROD_TRACKER_CALENDAR_OWNER_ID.lower():
-        reasons.append(
-            "DALTON_TRACKER_CALENDAR_OWNER_ID must not equal the production tracker owner"
-        )
-
-    # Guard 3: Effective target calendar ID must be in the registered test sub-calendar allowlist.
-    cleaned_cal = str(effective_calendar_id or "").strip()
-    cleaned_prod_cal = str(prod_calendar_id or "").strip()
-    cleaned_expected_cal = str(expected_calendar_id or "").strip()
-    allowed_test_cals = parse_registered_test_calendar_ids(registered_test_calendar_ids)
-    allowed_lower = {c.lower() for c in allowed_test_cals}
-
-    if not cleaned_cal:
-        reasons.append("effective target calendar ID must be configured (registered test sub-calendar required)")
-    elif cleaned_cal.lower() == "primary":
-        reasons.append("target calendar must be a registered test sub-calendar, never 'primary'")
-    elif cleaned_prod_cal and cleaned_cal.lower() == cleaned_prod_cal.lower():
-        reasons.append("target calendar must not equal the production tracker calendar")
-    elif not allowed_test_cals:
-        reasons.append(
-            f"registered test sub-calendar list is empty (configure {REGISTERED_TEST_CALENDARS_ENV})"
-        )
-    elif cleaned_cal.lower() not in allowed_lower:
-        reasons.append(
-            "effective target calendar ID is not in the registered test sub-calendar list"
-        )
-
-    if cleaned_expected_cal and cleaned_cal and cleaned_expected_cal != cleaned_cal:
-        reasons.append(
-            "resolved connection/env calendar ID does not match --calendar-id argument"
-        )
-
-    return (len(reasons) == 0), reasons
 
 
 def _probe_flock_state(path: Path) -> bool:
@@ -262,72 +126,6 @@ def _probe_flock_state(path: Path) -> bool:
         os.close(fd)
 
 
-def resolve_mail_prepare_state_root(
-    *,
-    prepare_config_path: Path | None = None,
-    state_root: Path | None = None,
-) -> Path:
-    """Resolve the authoritative market-digest prepare state directory from prepare config."""
-    raw_cfg = (
-        str(prepare_config_path).strip()
-        if prepare_config_path is not None
-        else os.getenv("DALTON_MARKET_DIGEST_PREPARE_CONFIG", "").strip()
-    )
-    raw_state = (
-        str(state_root).strip()
-        if state_root is not None
-        else os.getenv("DALTON_MARKET_DIGEST_STATE_ROOT", "").strip()
-    )
-
-    resolved_from_cfg: Path | None = None
-    if raw_cfg:
-        cfg_path = Path(raw_cfg).expanduser()
-        if cfg_path.is_symlink() or not cfg_path.is_file():
-            raise MailLockCheckError(f"prepare config not found or invalid: {cfg_path}")
-        try:
-            from scripts.dalton.market_digest_inputs import load_prepare_config
-
-            loaded = load_prepare_config(config_path=cfg_path)
-            resolved_from_cfg = Path(loaded.state_root)
-        except Exception:
-            # Fallback to direct JSON parsing of state_root if sibling tool paths are absent
-            # on a control host, still validating absolute path and rejecting symlinks/bad JSON.
-            try:
-                parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise MailLockCheckError(f"cannot read prepare config: {exc}") from exc
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("state_root"), str):
-                raise MailLockCheckError("prepare config is missing string 'state_root'")
-            raw_sr = parsed["state_root"].strip()
-            if not raw_sr or not Path(raw_sr).is_absolute():
-                raise MailLockCheckError("prepare config 'state_root' must be an absolute path")
-            resolved_from_cfg = Path(raw_sr)
-
-    resolved_from_arg: Path | None = None
-    if raw_state:
-        sr_path = Path(raw_state).expanduser()
-        if not sr_path.is_absolute():
-            raise MailLockCheckError("state_root must be an absolute path")
-        resolved_from_arg = sr_path
-
-    if resolved_from_cfg is not None and resolved_from_arg is not None:
-        if resolved_from_cfg.resolve() != resolved_from_arg.resolve():
-            raise MailLockCheckError(
-                "prepare config state_root does not match DALTON_MARKET_DIGEST_STATE_ROOT"
-            )
-        return resolved_from_cfg
-
-    chosen = resolved_from_cfg or resolved_from_arg
-    if chosen is None:
-        raise MailLockCheckError(
-            "market-digest prepare state_root is not configured "
-            "(set DALTON_MARKET_DIGEST_PREPARE_CONFIG or DALTON_MARKET_DIGEST_STATE_ROOT)"
-        )
-    if chosen.is_symlink():
-        raise MailLockCheckError("market-digest state_root must not be a symlink")
-    return chosen
-
-
 def _read_bridge_env_file(path: Path) -> dict[str, str]:
     """Read simple ``KEY=VALUE`` lines from a host bridge env file without following symlinks."""
     try:
@@ -359,6 +157,141 @@ def _read_bridge_env_file(path: Path) -> dict[str, str]:
     return out
 
 
+def _load_host_bridge_env(*, bridge_env_file: Path | None = None) -> dict[str, str]:
+    """Load host service env settings from ``--bridge-env-file``, ``DALTON_BRIDGE_ENV_FILE``,
+    or ``~/.config/dalton/researchdata-bridge.env`` when present.
+    """
+    raw_env_file = (
+        str(bridge_env_file).strip()
+        if bridge_env_file is not None
+        else os.getenv("DALTON_BRIDGE_ENV_FILE", "").strip()
+    )
+    env_file_explicit = bool(raw_env_file)
+    env_path = (
+        Path(raw_env_file).expanduser()
+        if env_file_explicit
+        else Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
+    )
+    try:
+        os.lstat(env_path)
+    except FileNotFoundError:
+        if env_file_explicit:
+            raise MailLockCheckError(f"bridge env file not found: {env_path}") from None
+        return {}
+    except OSError as exc:
+        if env_file_explicit:
+            raise MailLockCheckError(f"cannot access bridge env file {env_path}: {exc}") from exc
+        return {}
+    return _read_bridge_env_file(env_path)
+
+
+def _resolve_host_path_setting(
+    *,
+    explicit_path: Path | None,
+    env_key: str,
+    bridge_env: Mapping[str, str],
+    require_absolute: bool = True,
+) -> Path | None:
+    """Resolve one path setting from explicit CLI arg, host bridge env file, and process env."""
+    if explicit_path is not None:
+        explicit = Path(explicit_path).expanduser()
+        if require_absolute and not explicit.is_absolute():
+            raise MailLockCheckError(f"{env_key} must be an absolute path")
+        return explicit
+
+    raw_from_file = str(bridge_env.get(env_key) or "").strip()
+    from_env_file: Path | None = None
+    if raw_from_file:
+        cand = Path(raw_from_file).expanduser()
+        if require_absolute and not cand.is_absolute():
+            raise MailLockCheckError(f"bridge env {env_key} must be an absolute path")
+        from_env_file = cand
+
+    raw_from_proc = os.getenv(env_key, "").strip()
+    from_proc: Path | None = None
+    if raw_from_proc:
+        cand = Path(raw_from_proc).expanduser()
+        if require_absolute and not cand.is_absolute():
+            raise MailLockCheckError(f"{env_key} must be an absolute path")
+        from_proc = cand
+
+    if from_env_file is not None and from_proc is not None:
+        if from_env_file.resolve() != from_proc.resolve():
+            raise MailLockCheckError(
+                f"bridge env {env_key} does not match process {env_key}"
+            )
+        return from_env_file
+    return from_env_file or from_proc
+
+
+def resolve_mail_prepare_state_root(
+    *,
+    prepare_config_path: Path | None = None,
+    state_root: Path | None = None,
+    bridge_env_file: Path | None = None,
+) -> Path:
+    """Resolve the authoritative market-digest prepare state directory from CLI, host bridge env, or process env."""
+    bridge_env = (
+        {}
+        if (prepare_config_path is not None and state_root is not None)
+        else _load_host_bridge_env(bridge_env_file=bridge_env_file)
+    )
+    cfg_path = _resolve_host_path_setting(
+        explicit_path=prepare_config_path,
+        env_key="DALTON_MARKET_DIGEST_PREPARE_CONFIG",
+        bridge_env=bridge_env,
+        require_absolute=False,
+    )
+    resolved_from_arg = _resolve_host_path_setting(
+        explicit_path=state_root,
+        env_key="DALTON_MARKET_DIGEST_STATE_ROOT",
+        bridge_env=bridge_env,
+        require_absolute=True,
+    )
+
+    resolved_from_cfg: Path | None = None
+    if cfg_path is not None:
+        if cfg_path.is_symlink() or not cfg_path.is_file():
+            raise MailLockCheckError(f"prepare config not found or invalid: {cfg_path}")
+        try:
+            from scripts.dalton.market_digest_inputs import load_prepare_config
+
+            loaded = load_prepare_config(config_path=cfg_path)
+            resolved_from_cfg = Path(loaded.state_root)
+        except Exception:
+            # Fallback to direct JSON parsing of state_root if sibling tool paths are absent
+            # on a control host, still validating absolute path and rejecting symlinks/bad JSON.
+            try:
+                parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise MailLockCheckError(f"cannot read prepare config: {exc}") from exc
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("state_root"), str):
+                raise MailLockCheckError("prepare config is missing string 'state_root'")
+            raw_sr = parsed["state_root"].strip()
+            if not raw_sr or not Path(raw_sr).is_absolute():
+                raise MailLockCheckError("prepare config 'state_root' must be an absolute path")
+            resolved_from_cfg = Path(raw_sr)
+
+    if resolved_from_cfg is not None and resolved_from_arg is not None:
+        if resolved_from_cfg.resolve() != resolved_from_arg.resolve():
+            raise MailLockCheckError(
+                "prepare config state_root does not match DALTON_MARKET_DIGEST_STATE_ROOT"
+            )
+        chosen = resolved_from_cfg
+    else:
+        chosen = resolved_from_cfg or resolved_from_arg
+
+    if chosen is None:
+        raise MailLockCheckError(
+            "market-digest prepare state_root is not configured "
+            "(set DALTON_MARKET_DIGEST_PREPARE_CONFIG or DALTON_MARKET_DIGEST_STATE_ROOT "
+            "in researchdata-bridge.env or environment)"
+        )
+    if chosen.is_symlink():
+        raise MailLockCheckError("market-digest state_root must not be a symlink")
+    return chosen
+
+
 def resolve_mail_research_home(
     *,
     research_home: Path | None = None,
@@ -381,62 +314,16 @@ def resolve_mail_research_home(
             raise MailLockCheckError("research_home must be an absolute path")
         return explicit
 
-    raw_env_file = (
-        str(bridge_env_file).strip()
-        if bridge_env_file is not None
-        else os.getenv("DALTON_BRIDGE_ENV_FILE", "").strip()
+    bridge_env = _load_host_bridge_env(bridge_env_file=bridge_env_file)
+    resolved = _resolve_host_path_setting(
+        explicit_path=None,
+        env_key="DALTON_RESEARCH_HOME",
+        bridge_env=bridge_env,
+        require_absolute=True,
     )
-    env_file_explicit = bool(raw_env_file)
-    env_path = (
-        Path(raw_env_file).expanduser()
-        if env_file_explicit
-        else Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
+    chosen = resolved or (
+        Path.home() / "Library" / "Application Support" / "Everflow" / "research"
     )
-
-    from_env_file: Path | None = None
-    env_file_exists = False
-    try:
-        os.lstat(env_path)
-        env_file_exists = True
-    except FileNotFoundError:
-        if env_file_explicit:
-            raise MailLockCheckError(f"bridge env file not found: {env_path}") from None
-    except OSError as exc:
-        if env_file_explicit:
-            raise MailLockCheckError(f"cannot access bridge env file {env_path}: {exc}") from exc
-
-    if env_file_exists:
-        parsed_env = _read_bridge_env_file(env_path)
-        raw_from_file = str(parsed_env.get("DALTON_RESEARCH_HOME") or "").strip()
-        if raw_from_file:
-            cand = Path(raw_from_file).expanduser()
-            if not cand.is_absolute():
-                raise MailLockCheckError(
-                    "bridge env DALTON_RESEARCH_HOME must be an absolute path"
-                )
-            from_env_file = cand
-
-    raw_from_proc = os.getenv("DALTON_RESEARCH_HOME", "").strip()
-    from_proc: Path | None = None
-    if raw_from_proc:
-        cand = Path(raw_from_proc).expanduser()
-        if not cand.is_absolute():
-            raise MailLockCheckError("DALTON_RESEARCH_HOME must be an absolute path")
-        from_proc = cand
-
-    if from_env_file is not None and from_proc is not None:
-        if from_env_file.resolve() != from_proc.resolve():
-            raise MailLockCheckError(
-                "bridge env DALTON_RESEARCH_HOME does not match process DALTON_RESEARCH_HOME"
-            )
-        chosen = from_env_file
-    else:
-        chosen = (
-            from_env_file
-            or from_proc
-            or (Path.home() / "Library" / "Application Support" / "Everflow" / "research")
-        )
-
     if chosen.is_symlink():
         raise MailLockCheckError("research_home must not be a symlink")
     return chosen
@@ -503,7 +390,9 @@ def check_mail_host_locks(
         except OSError as exc:
             raise MailLockCheckError(f"cannot inspect {parent_dir.name}: {exc}") from exc
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            raise MailLockCheckError(f"research images lock parent is not a directory: {parent_dir.name}")
+            raise MailLockCheckError(
+                f"research images lock parent is not a directory: {parent_dir.name}"
+            )
 
     worker_lock = images_sub / "worker.lock"
     if _probe_flock_state(worker_lock):
@@ -600,172 +489,6 @@ def _account_matches_connection(host_account: str | None, conn_row: Any) -> bool
     return False
 
 
-async def run_calendar_purge_drill(
-    *,
-    database_url: str,
-    owner_id: str,
-    calendar_id: str,
-    registered_test_calendar_ids: Collection[str] | str | None = None,
-    prod_calendar_id: str | None = None,
-    workspace_dir: Path | None = None,
-    purge_id: str | None = None,
-    dry_run: bool = False,
-) -> tuple[int, dict[str, Any]]:
-    """Execute Stage A isolated non-production purge drill (§7.1(1)).
-
-    Both ``dry_run=True`` and ``dry_run=False`` query the ACTUAL connected database name
-    and connection row, resolve the EFFECTIVE target calendar ID using the same function
-    as ``tracker_calendar.py`` (never falling back to CLI ``--calendar-id``), and abort
-    before any disconnect or purge call if any guard fails.
-    """
-    pool_cfg_db_name = _configured_pool_database_name()
-    pre_ok, pre_reasons = validate_non_prod_drill_guard(
-        database_url=database_url,
-        actual_db_name=pool_cfg_db_name,
-        owner_id=owner_id,
-        effective_calendar_id=calendar_id,
-        registered_test_calendar_ids=registered_test_calendar_ids,
-        prod_calendar_id=prod_calendar_id,
-    )
-    if not pre_ok:
-        return 1, {
-            "ok": False,
-            "command": "calendar-purge-drill",
-            "guard_failed": True,
-            "reasons": pre_reasons,
-        }
-
-    from src.dalton.database import user_integrations as integrations_db
-    from src.dalton.integrations.tracker_calendar import (
-        register_default_tracker_purge_handler,
-    )
-    from src.dalton.services.integration_data_purge import run_local_purge
-    from src.dalton.services.user_integrations_lifecycle import (
-        begin_disconnect,
-        finish_disconnect,
-    )
-
-    async with open_probe_db_pool():
-        # Verify the ACTUAL database the pool connected to (not just env/CLI strings).
-        actual_db_name = await _query_actual_database_name()
-
-        target_owner_id = str(owner_id or "").strip()
-        if purge_id:
-            existing_ledger = await integrations_db.get_purge_ledger(
-                purge_id, decrypt_revoke_token=False
-            )
-            if existing_ledger is None:
-                return 1, {
-                    "ok": False,
-                    "command": "calendar-purge-drill",
-                    "guard_failed": True,
-                    "reasons": [f"purge ledger {purge_id} not found"],
-                }
-            if existing_ledger.user_id.strip().lower() == PROD_TRACKER_CALENDAR_OWNER_ID.lower():
-                return 1, {
-                    "ok": False,
-                    "command": "calendar-purge-drill",
-                    "guard_failed": True,
-                    "reasons": [
-                        "purge ledger belongs to the production tracker owner"
-                    ],
-                }
-            if existing_ledger.user_id.strip().lower() != target_owner_id.lower():
-                return 1, {
-                    "ok": False,
-                    "command": "calendar-purge-drill",
-                    "guard_failed": True,
-                    "reasons": [
-                        "purge ledger user_id does not match --owner-id"
-                    ],
-                }
-
-        conn_row = await integrations_db.get_connection(
-            target_owner_id, "google", "calendar", decrypt_tokens=False
-        )
-        if conn_row is None and not purge_id:
-            return 1, {
-                "ok": False,
-                "command": "calendar-purge-drill",
-                "guard_passed": False,
-                "error": "test owner google/calendar connection not found in test database",
-            }
-
-        # Guard the EXACT calendar ID that the purge handler will target for deletion
-        # (preferences.tracker_calendar_id, else DALTON_GCAL_CALENDAR_ID — NEVER CLI --calendar-id).
-        effective_calendar_id = resolve_effective_tracker_calendar_id(conn_row)
-        actual_ok, actual_reasons = validate_non_prod_drill_guard(
-            database_url=database_url,
-            actual_db_name=actual_db_name,
-            owner_id=target_owner_id,
-            effective_calendar_id=effective_calendar_id,
-            registered_test_calendar_ids=registered_test_calendar_ids,
-            prod_calendar_id=prod_calendar_id,
-            expected_calendar_id=calendar_id,
-        )
-        if not actual_ok:
-            return 1, {
-                "ok": False,
-                "command": "calendar-purge-drill",
-                "guard_failed": True,
-                "reasons": actual_reasons,
-            }
-
-        if dry_run:
-            return 0, {
-                "ok": True,
-                "command": "calendar-purge-drill",
-                "dry_run": True,
-                "guard_passed": True,
-                "database_name": actual_db_name,
-                "calendar_guard_passed": True,
-            }
-
-        register_default_tracker_purge_handler()
-        if workspace_dir is not None:
-            os.environ["DALTON_TRACKER_WORKSPACE_DIR"] = str(workspace_dir)
-
-        if purge_id:
-            report = await run_local_purge(purge_id)
-            return 0, {
-                "ok": True,
-                "command": "calendar-purge-drill",
-                "guard_passed": True,
-                "database_name": actual_db_name,
-                "purge_id": report.purge_id,
-                "threads_purged": len(report.threads_purged),
-                "tracker_reconcile_needed": report.tracker_reconcile_needed,
-            }
-
-        created_purge_id = await begin_disconnect(
-            target_owner_id,
-            "google",
-            "calendar",
-            remote_mode="local_only",
-        )
-        finished = await finish_disconnect(
-            created_purge_id,
-            revoker=None,
-            run_remote_revoke=False,
-        )
-        ledger = await integrations_db.get_purge_ledger(
-            created_purge_id, decrypt_revoke_token=False
-        )
-        return 0, {
-            "ok": finished is not None and finished.local_purge_status.value == "completed",
-            "command": "calendar-purge-drill",
-            "guard_passed": True,
-            "database_name": actual_db_name,
-            "purge_id": created_purge_id,
-            "local_purge_status": (
-                finished.local_purge_status.value if finished is not None else "unknown"
-            ),
-            "tracker_reconcile_needed": bool(
-                ledger.tracker_reconcile_needed if ledger is not None else True
-            ),
-        }
-
-
 async def run_prod_readonly_check(
     *,
     owner_id: str,
@@ -798,6 +521,7 @@ async def run_prod_readonly_check(
             "error": "DALTON_TRACKER_CALENDAR_OWNER_ID is not configured",
         }
 
+    db_name = _configured_pool_database_name()
     async with open_probe_db_pool():
         conn_row = await integrations_db.get_connection(
             cleaned_owner, "google", "calendar", decrypt_tokens=False
@@ -806,6 +530,7 @@ async def run_prod_readonly_check(
             return 1, {
                 "ok": False,
                 "command": "prod-readonly-check",
+                "database_name": db_name,
                 "error": "owner google/calendar connection not found",
             }
 
@@ -877,6 +602,7 @@ async def run_prod_readonly_check(
             return 1, {
                 "ok": False,
                 "command": "prod-readonly-check",
+                "database_name": db_name,
                 "owner_id": cleaned_owner,
                 "provider_account_bound": bool(conn_row.provider_account_id),
                 "bridge_reachable": bridge_reachable,
@@ -997,6 +723,7 @@ async def run_prod_readonly_check(
         return (0 if overall_ok else 1), {
             "ok": overall_ok,
             "command": "prod-readonly-check",
+            "database_name": db_name,
             "owner_id": cleaned_owner,
             "provider_account_bound": bool(conn_row.provider_account_id),
             "bridge_reachable": bridge_reachable,
@@ -1049,6 +776,7 @@ async def run_drain(
             "error": "no target automation IDs configured",
         }
 
+    db_name = _configured_pool_database_name()
     resolved_state_root: Path | None = None
     resolved_research_home: Path | None = None
     if target == "mail" and check_locks_fn is None:
@@ -1056,6 +784,7 @@ async def run_drain(
             resolved_state_root = resolve_mail_prepare_state_root(
                 prepare_config_path=prepare_config_path,
                 state_root=state_root,
+                bridge_env_file=bridge_env_file,
             )
             resolved_research_home = resolve_mail_research_home(
                 research_home=research_home,
@@ -1066,6 +795,7 @@ async def run_drain(
                 "ok": False,
                 "command": "drain",
                 "target": target,
+                "database_name": db_name,
                 "drained": False,
                 "error": str(exc),
             }
@@ -1091,6 +821,7 @@ async def run_drain(
                             check_mail_host_locks(
                                 resolved_state_root,
                                 research_home=resolved_research_home,
+                                bridge_env_file=bridge_env_file,
                             )
                         )
                 except MailLockCheckError as exc:
@@ -1098,6 +829,7 @@ async def run_drain(
                         "ok": False,
                         "command": "drain",
                         "target": target,
+                        "database_name": db_name,
                         "drained": False,
                         "error": str(exc),
                     }
@@ -1109,6 +841,7 @@ async def run_drain(
                     "ok": True,
                     "command": "drain",
                     "target": target,
+                    "database_name": db_name,
                     "drained": True,
                     "running_count": 0,
                     "active_locks": [],
@@ -1119,6 +852,7 @@ async def run_drain(
                     "ok": False,
                     "command": "drain",
                     "target": target,
+                    "database_name": db_name,
                     "drained": False,
                     "running_count": running_count,
                     "active_locks": active_locks,
@@ -1154,24 +888,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_drill = sub.add_parser(
-        "calendar-purge-drill",
-        help="Run isolated non-production tracker calendar disconnect & 2A purge drill.",
-    )
-    p_drill.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
-    p_drill.add_argument(
-        "--owner-id", default=os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID", "")
-    )
-    p_drill.add_argument(
-        "--calendar-id", default=os.getenv("DALTON_GCAL_CALENDAR_ID", "")
-    )
-    p_drill.add_argument(
-        "--prod-calendar-id", default=os.getenv("DALTON_PROD_GCAL_CALENDAR_ID", "")
-    )
-    p_drill.add_argument("--workspace-dir", default=os.getenv("DALTON_TRACKER_WORKSPACE_DIR", ""))
-    p_drill.add_argument("--purge-id", default="")
-    p_drill.add_argument("--dry-run", action="store_true")
-
     for name in ("prod-readonly-check", "calendar"):
         p_prod = sub.add_parser(
             name,
@@ -1191,12 +907,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_drain.add_argument("--wait-seconds", type=int, default=600)
     p_drain.add_argument("--poll-interval", type=float, default=5.0)
     p_drain.add_argument("--automation-id", action="append", default=[])
-    p_drain.add_argument(
-        "--prepare-config", default=os.getenv("DALTON_MARKET_DIGEST_PREPARE_CONFIG", "")
-    )
-    p_drain.add_argument(
-        "--state-root", default=os.getenv("DALTON_MARKET_DIGEST_STATE_ROOT", "")
-    )
+    p_drain.add_argument("--prepare-config", default="")
+    p_drain.add_argument("--state-root", default="")
     p_drain.add_argument("--research-home", default="")
     p_drain.add_argument(
         "--bridge-env-file", default=os.getenv("DALTON_BRIDGE_ENV_FILE", "")
@@ -1209,20 +921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "calendar-purge-drill":
-        ws = Path(args.workspace_dir).expanduser() if args.workspace_dir else None
-        code, payload = asyncio.run(
-            run_calendar_purge_drill(
-                database_url=args.database_url,
-                owner_id=args.owner_id,
-                calendar_id=args.calendar_id,
-                prod_calendar_id=args.prod_calendar_id or None,
-                workspace_dir=ws,
-                purge_id=args.purge_id or None,
-                dry_run=bool(args.dry_run),
-            )
-        )
-    elif args.command in ("prod-readonly-check", "calendar"):
+    if args.command in ("prod-readonly-check", "calendar"):
         code, payload = asyncio.run(
             run_prod_readonly_check(
                 owner_id=args.owner_id,

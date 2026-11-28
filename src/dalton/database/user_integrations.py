@@ -1385,49 +1385,6 @@ async def mark_tracker_reconcile_needed(
             )
 
 
-async def has_pending_tracker_reconcile(
-    user_id: str, *, conn: Any = None
-) -> bool:
-    """Return True if any Google Calendar purge ledger for ``user_id`` still needs reconciliation."""
-    async with get_db_connection(conn) as db_conn:
-        async with db_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM dalton_integration_purge_ledger
-                    WHERE user_id = %s
-                      AND provider = 'google'
-                      AND (service = 'calendar' OR service IS NULL)
-                      AND tracker_reconcile_needed IS TRUE
-                ) AS pending
-                """,
-                (user_id,),
-            )
-            row = await cur.fetchone()
-    return bool(row and row.get("pending"))
-
-
-async def clear_pending_tracker_reconcile(
-    user_id: str, *, conn: Any = None
-) -> int:
-    """Clear ``tracker_reconcile_needed`` on all pending Google Calendar purge ledgers for ``user_id``."""
-    async with get_db_connection(conn) as db_conn:
-        async with db_conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE dalton_integration_purge_ledger
-                SET tracker_reconcile_needed = FALSE
-                WHERE user_id = %s
-                  AND provider = 'google'
-                  AND (service = 'calendar' OR service IS NULL)
-                  AND tracker_reconcile_needed IS TRUE
-                """,
-                (user_id,),
-            )
-            return int(cur.rowcount or 0)
-
-
 async def update_purge_ledger_remote_status(
     purge_id: str | UUID,
     *,

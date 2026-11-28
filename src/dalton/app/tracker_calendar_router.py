@@ -19,7 +19,6 @@ from src.dalton.capabilities import (
     require_capability,
     require_capability_dep,
 )
-from src.dalton.database import user_integrations as integrations_db
 from src.dalton.integrations.google_calendar import (
     GoogleCalendarClientProtocol,
     get_google_calendar_client,
@@ -34,7 +33,6 @@ from src.dalton.integrations.tracker_calendar import (
     execute_tracker_calendar_legacy_gws,
     execute_tracker_calendar_official_mcp,
     is_valid_tracker_automation_id,
-    register_default_tracker_purge_handler,
 )
 from src.dalton.sandbox_caller_identity import verify_caller_token
 from src.dalton.settings import (
@@ -46,9 +44,6 @@ from src.dalton.settings import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Register the Step 4 tracker calendar purge handler on router module load.
-register_default_tracker_purge_handler()
 
 _NO_STORE_HEADERS: dict[str, str] = {
     "Cache-Control": "no-store",
@@ -188,10 +183,7 @@ async def tracker_calendar_mcp_endpoint(
             },
         )
 
-    require_execution_authz = operation != "health_check" or bool(
-        body.arguments.get("ack_reconcile")
-    )
-    if require_execution_authz:
+    if operation != "health_check":
         if claims["run_origin"] != "automation":
             raise HTTPException(
                 status_code=403,
@@ -238,164 +230,10 @@ async def tracker_calendar_mcp_endpoint(
             eff_timeout=body.timeout_s,
             http_client=get_router_legacy_gws_http_client(),
         )
-        if (
-            operation == "health_check"
-            and bool(body.arguments.get("ack_reconcile"))
-            and isinstance(payload, dict)
-            and payload.get("ok") is True
-        ):
-            await integrations_db.clear_pending_tracker_reconcile(owner_id)
-            hc_data = payload.get("data")
-            if isinstance(hc_data, dict):
-                hc_data["tracker_reconcile_cleared"] = True
 
     return JSONResponse(
         status_code=200,
         content={"payload": payload, "calendar_id": calendar_id},
-        headers=_NO_STORE_HEADERS,
-    )
-
-
-@router.get("/tracker-calendar/reconcile-status")
-async def tracker_calendar_reconcile_status_endpoint(
-    request: Request,
-) -> JSONResponse:
-    """Read-only endpoint exposing PostgreSQL ``tracker_reconcile_needed`` to the weekly scan.
-
-    Works independently of ``DALTON_GCAL_BACKEND`` (including default ``legacy_gws``)
-    without altering normal ``legacy_gws`` read/write paths.
-    """
-    if not is_dalton_enabled():
-        raise HTTPException(status_code=404, detail="Dalton mode disabled")
-    require_capability(CapabilityId.FUND_AUTOMATIONS)
-
-    _verify_bridge_token(request)
-    claims = _verify_raw_caller_token(request)
-
-    try:
-        backend_mode = get_dalton_gcal_backend()
-    except ValueError:
-        backend_mode = "invalid"
-
-    owner_id = get_tracker_calendar_owner_id()
-    if not owner_id:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "ok": True,
-                "owner_configured": False,
-                "tracker_reconcile_needed": False,
-                "backend": backend_mode,
-            },
-            headers=_NO_STORE_HEADERS,
-        )
-
-    if claims["user"].strip().lower() != owner_id.lower():
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "tracker_owner_mismatch",
-                "message": "Caller is not the configured tracker calendar owner.",
-            },
-        )
-
-    pending = await integrations_db.has_pending_tracker_reconcile(owner_id)
-    return JSONResponse(
-        status_code=200,
-        content={
-            "ok": True,
-            "owner_configured": True,
-            "tracker_reconcile_needed": bool(pending),
-            "backend": backend_mode,
-        },
-        headers=_NO_STORE_HEADERS,
-    )
-
-
-@router.post("/tracker-calendar/reconcile-ack")
-async def tracker_calendar_reconcile_ack_endpoint(
-    request: Request,
-) -> JSONResponse:
-    """Clear PostgreSQL ``tracker_reconcile_needed`` once the weekly scan completes reconciliation.
-
-    Authorized via the same active automation execution check as ``/tracker-calendar`` and
-    works under both ``legacy_gws`` and ``official_mcp``.
-    """
-    if not is_dalton_enabled():
-        raise HTTPException(status_code=404, detail="Dalton mode disabled")
-    require_capability(CapabilityId.FUND_AUTOMATIONS)
-
-    _verify_bridge_token(request)
-    claims = _verify_raw_caller_token(request)
-
-    try:
-        backend_mode = get_dalton_gcal_backend()
-    except ValueError:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "invalid_gcal_backend",
-                "message": "DALTON_GCAL_BACKEND has an unsupported value.",
-            },
-        ) from None
-
-    owner_id = get_tracker_calendar_owner_id()
-    if not owner_id:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "tracker_owner_not_configured",
-                "message": "DALTON_TRACKER_CALENDAR_OWNER_ID is not configured.",
-            },
-        )
-    if claims["user"].strip().lower() != owner_id.lower():
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "tracker_owner_mismatch",
-                "message": "Caller is not the configured tracker calendar owner.",
-            },
-        )
-    if claims["run_origin"] != "automation":
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "not_automation_run",
-                "message": "Tracker reconcile acknowledgement requires an active automation run.",
-            },
-        )
-    authz = await authorize_tracker_calendar_execution(
-        user_id=claims["user"],
-        workspace_id=claims["workspace"],
-        thread_id=claims["thread"],
-        run_id=claims["run_id"],
-        automation_id=claims["turn_origin_automation_id"],
-        execution_id=claims["automation_execution_id"],
-    )
-    if authz.get("ok") is not True:
-        err_code = str(authz.get("code") or "execution_not_authorized")
-        status_code = 503 if err_code == "tracker_automation_not_configured" else 403
-        raise HTTPException(
-            status_code=status_code,
-            detail={
-                "code": err_code,
-                "message": (
-                    "DALTON_TRACKER_CALENDAR_AUTOMATION_ID must be a valid UUID."
-                    if err_code == "tracker_automation_not_configured"
-                    else "Caller execution identity is not an active tracker automation run."
-                ),
-            },
-        )
-
-    cleared = await integrations_db.clear_pending_tracker_reconcile(owner_id)
-    return JSONResponse(
-        status_code=200,
-        content={
-            "ok": True,
-            "tracker_reconcile_cleared": True,
-            "cleared_count": int(cleared),
-            "backend": backend_mode,
-        },
         headers=_NO_STORE_HEADERS,
     )
 
@@ -407,6 +245,4 @@ __all__ = [
     "get_router_tracker_oauth_client",
     "router",
     "tracker_calendar_mcp_endpoint",
-    "tracker_calendar_reconcile_ack_endpoint",
-    "tracker_calendar_reconcile_status_endpoint",
 ]

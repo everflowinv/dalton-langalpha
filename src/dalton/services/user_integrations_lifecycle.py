@@ -1590,19 +1590,15 @@ async def finish_disconnect_locked(
     Once acquired, re-reads the ledger inside the lock and skips local purge if
     ``local_purge_status != 'running'``.
     """
-    from src.dalton.integrations.tracker_calendar import has_tracker_write_scope
     from src.dalton.services.integration_data_purge import (
-        TrackerPurgeSnapshot,
         run_local_purge,
         try_purge_ledger_lock,
     )
-    from src.dalton.settings import get_tracker_calendar_owner_id
 
     deleted_connections = 0
     local_status = LocalPurgeStatus.RUNNING
     final_remote_status = RemoteRevokeStatus.NOT_APPLICABLE
     claimed_attempt_gen: int | None = None
-    tracker_snapshot: TrackerPurgeSnapshot | None = None
 
     # Hold try_purge_ledger_lock ONLY for the short PG claim & connection-delete phase;
     # release the dedicated PG session and advisory lock BEFORE running 2A purge (which
@@ -1636,41 +1632,6 @@ async def finish_disconnect_locked(
                     provider_account_id=ledger.provider_account_id,
                 )
 
-                # Capture tracker calendar owner's old epoch, calendar ID, write scope,
-                # and tokens BEFORE deleting the connection row so local-only disconnects
-                # and accounts with remaining sibling services can still purge remote events.
-                tracker_owner = get_tracker_calendar_owner_id()
-                if (
-                    tracker_owner
-                    and ledger.user_id.strip().lower() == tracker_owner.lower()
-                    and ledger.provider == "google"
-                    and ledger.service in ("calendar", None)
-                ):
-                    pre_delete_row = await db.get_connection(
-                        ledger.user_id,
-                        "google",
-                        "calendar",
-                        decrypt_tokens=True,
-                    )
-                    if (
-                        pre_delete_row is not None
-                        and pre_delete_row.auth_epoch <= ledger.auth_epoch_upto
-                        and pre_delete_row.provider_account_id == ledger.provider_account_id
-                    ):
-                        prefs = dict(pre_delete_row.preferences or {})
-                        cal_id = str(prefs.get("tracker_calendar_id") or "").strip() or None
-                        can_write = has_tracker_write_scope(pre_delete_row.granted_scopes)
-                        tracker_snapshot = TrackerPurgeSnapshot(
-                            auth_epoch=pre_delete_row.auth_epoch,
-                            provider_account_id=pre_delete_row.provider_account_id,
-                            calendar_id=cal_id,
-                            granted_scopes=pre_delete_row.granted_scopes,
-                            can_write=can_write,
-                            access_token=pre_delete_row.access_token if can_write else None,
-                            refresh_token=pre_delete_row.refresh_token if can_write else None,
-                            expires_at=pre_delete_row.expires_at,
-                        )
-
                 if ledger.trigger_reason != TriggerReason.ACCOUNT_SWITCH:
                     deleted_connections = await db.delete_connection_upto_epoch(
                         ledger.user_id,
@@ -1697,7 +1658,6 @@ async def finish_disconnect_locked(
             cancel_drain_timeout_s=cancel_drain_timeout_s,
             _lock_held=True,
             _claimed_attempt_gen=claimed_attempt_gen,
-            tracker_snapshot=tracker_snapshot,
         )
         refreshed = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
         assert refreshed is not None

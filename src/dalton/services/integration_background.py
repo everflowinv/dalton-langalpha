@@ -8,9 +8,6 @@ and remote-revoke retry loops.
 from __future__ import annotations
 
 from src.dalton.integrations.oauth_clients import get_google_remote_revoker
-from src.dalton.integrations.tracker_calendar import (
-    register_default_tracker_purge_handler,
-)
 from src.dalton.services.integration_data_purge import (
     run_personal_purge_resume_loop as _run_personal_purge_resume_loop,
 )
@@ -20,8 +17,6 @@ from src.dalton.services.integration_health_sweep import (
 from src.dalton.services.integration_revoke import (
     run_integration_revoke_retry_loop as _run_integration_revoke_retry_loop,
 )
-
-register_default_tracker_purge_handler()
 
 
 async def run_personal_purge_resume_loop(*, poll_interval_s: float = 60.0) -> None:
