@@ -507,7 +507,7 @@ async def test_first_turn_settings_sql_reads_earliest_response_metadata(monkeypa
     conn = create_autospec(AsyncConnection, instance=True)
 
     @asynccontextmanager
-    async def _get_conn():
+    async def _get_conn(_conn=None):
         yield conn
 
     @asynccontextmanager
@@ -1213,7 +1213,7 @@ async def test_colleague_workspace_wakeup_restart_retries_as_recorded_sender_and
     fake_conn = create_autospec(AsyncConnection, instance=True)
 
     @asynccontextmanager
-    async def _get_conn():
+    async def _get_conn(_conn=None):
         yield fake_conn
 
     @asynccontextmanager

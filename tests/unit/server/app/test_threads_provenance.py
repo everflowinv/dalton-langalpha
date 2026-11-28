@@ -8,7 +8,7 @@ pattern used by the other threads route tests. Neutral placeholder data only.
 import hashlib
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, create_autospec
 
 import pytest
 import pytest_asyncio
@@ -72,8 +72,21 @@ def _body_meta(body_inline, *, byte_len=None, object_key=None):
 
 
 @asynccontextmanager
-async def _fake_db_conn():
-    yield AsyncMock()
+async def _fake_db_conn(conn=None):
+    # DALTON-HOOK(personal-integrations): the personal-thread guard reads the thread row
+    # through this connection; an empty row means "not personal-private".
+    from psycopg import AsyncConnection, AsyncCursor
+
+    fake = create_autospec(AsyncConnection, instance=True)
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.fetchone.return_value = None
+
+    @asynccontextmanager
+    async def _cursor(*_a, **_kw):
+        yield cur
+
+    fake.cursor = _cursor
+    yield fake
 
 
 @contextmanager
