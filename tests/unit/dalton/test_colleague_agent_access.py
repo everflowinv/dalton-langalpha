@@ -1746,7 +1746,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             updated_at=datetime.now(UTC),
         )
         now_ts = datetime.now(UTC)
-        art = Artifact(
+        art = Artifact(kind="file", 
             artifact_id="art-1",
             code="abc123",
             workspace_id="ws-1",
@@ -1949,7 +1949,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
 
         # 3) Same-transaction check in artifacts_db.turn_version skips cut when pending_outbound_confirm is set
         now_ts = datetime.now(UTC)
-        art = Artifact(
+        art = Artifact(kind="file", 
             artifact_id=art_uuid,
             code="c1",
             workspace_id=ws_uuid,
@@ -2138,7 +2138,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
         )
 
         now_ts = datetime.now(UTC)
-        art1 = Artifact(
+        art1 = Artifact(kind="file", 
             artifact_id="art-1",
             code="c1",
             workspace_id="ws-1",
@@ -2153,7 +2153,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             created_at=now_ts,
             shared_seq=1,
         )
-        art2 = Artifact(
+        art2 = Artifact(kind="file", 
             artifact_id="art-2",
             code="c2",
             workspace_id="ws-1",
@@ -3353,7 +3353,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
         snap_pub_spy = create_autospec(
             snapshot_mod.publish,
             return_value=SimpleNamespace(
-                artifact=SimpleNamespace(artifact_id="art-1", workspace_id=ws_b, audience="public"),
+                artifact=SimpleNamespace(artifact_id="art-1", kind="file", workspace_id=ws_b, audience="public"),
                 seq=1,
                 cut=True,
                 shared_now=True,
@@ -3377,7 +3377,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             create_autospec(
                 artifact_records_mod.reached,
                 return_value=(
-                    SimpleNamespace(artifact_id="art-1", workspace_id=ws_b, audience="public"),
+                    SimpleNamespace(artifact_id="art-1", kind="file", workspace_id=ws_b, audience="public"),
                     SimpleNamespace(owner_id=user_b, is_shared=False),
                 ),
             ),
@@ -3416,6 +3416,7 @@ class TestAnalystOutboundGuardAndKeepUpdated:
                 artifact_records_mod._response,
                 return_value={
                     "artifact_id": "art-1",
+                    "kind": "file",
                     "code": "c1",
                     "url": "/a/c1",
                     "workspace_id": ws_b,
@@ -3968,7 +3969,7 @@ class TestR6SharingAuthGating:
             content_type="text/html",
             content=b"test",
         )
-        art_turn = Artifact(
+        art_turn = Artifact(kind="file", 
             artifact_id=art_uuid,
             code="c1",
             workspace_id=ws_uuid,
@@ -3983,7 +3984,7 @@ class TestR6SharingAuthGating:
             created_at=now_ts,
             shared_seq=1,
         )
-        art_legacy = Artifact(
+        art_legacy = Artifact(kind="file", 
             artifact_id=art_uuid,
             code="c1",
             workspace_id=ws_uuid,
@@ -4144,7 +4145,7 @@ class TestR6SharingAuthGating:
 
         # 2) snapshot.publish skips clear_pending_outbound_confirm DB call when switch OFF
         now_ts = datetime.now(UTC)
-        art1 = Artifact(
+        art1 = Artifact(kind="file", 
             artifact_id="art-off-1",
             code="c1",
             workspace_id="ws-1",

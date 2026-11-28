@@ -48,10 +48,14 @@ import { ChartComposerContext, createChartComposer, useChartAskHandler, useChart
 import { useStockData } from './hooks/useStockData';
 import { useStockQuoteModel } from './hooks/useStockQuoteModel';
 import { useChartLegendSlots } from './hooks/useChartLegendSlots';
-import { chartKeyParts, normalizeTimeframe } from './utils/chartInstanceKey';
+import { chartIdFor, chartKeyParts, chartParts, normalizeTimeframe } from '@/lib/bars/chartId';
 import { getShowLayersRequest, subscribeLayerView, type ShowLayersRequest } from './stores/layerViewStore';
-import { chartSelectionStore, isConfirmedFor, useChartSelections } from './stores/chartSelectionStore';
-import { buildMarketSendContexts } from './utils/selectionSend';
+import { buildMarketSendContexts } from './utils/marketSend';
+import { useCommentUi } from '../ChatAgent/components/viewers/html/comments/useCommentUi';
+import ConfirmDialog from '../Dashboard/components/ConfirmDialog';
+import { ArtifactCommentSendContext } from '../ChatAgent/components/artifactComments/sendContext';
+import type { ChatCommentSends } from '../ChatAgent/components/artifactComments/useChatCommentSends';
+import type { ArtifactCommentRef } from '../ChatAgent/components/artifactComments/artifactCommentReply';
 import { layerAskContext } from './utils/layerAsk';
 
 // Stable identity for the pre-data render, so the reconcile effect's
@@ -147,12 +151,21 @@ function MarketViewInner() {
   });
   const chartRef = useRef<MarketChartHandle>(null);
   const { collectViews } = useChartComposer();
+  // The chart's comments. On a desktop they go to the chat panel beside it,
+  // through its sends; a phone has no chat beside, and each send starts its
+  // own turn in the workspace.
+  const isMobile = useIsMobile();
+  const [chatSends, setChatSends] = useState<Pick<ChatCommentSends, 'sender' | 'sends'> | null>(null);
+  const commentUi = useCommentUi(null, chatSends?.sends);
+  const chartComments = useMemo(
+    () => ({ ui: commentUi, tabId: CHART_COMMENTS_TAB, active: true }),
+    [commentUi],
+  );
   const [chartImage, setChartImage] = useState<string | null>(null);       // base64 data URL
   const [chartImageDesc, setChartImageDesc] = useState<string | null>(null); // text description for LLM
   const [showOverview, setShowOverview] = useState<boolean>(false);
   const [mobileTab, setMobileTab] = useState<'watchlist' | null>(null);
   const [chatExpanded, setChatExpanded] = useState(false);
-  const isMobile = useIsMobile();
 
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   // The composer's scope, stored under its old pref name and values so a
@@ -258,6 +271,38 @@ function MarketViewInner() {
   // The workspace the chat runs in: Home under the Chief of Staff, the selected
   // one otherwise. The chart shows the agent's layers drawn in it.
   const activeWorkspaceId = scope === 'all' ? homeWorkspace?.workspace_id ?? null : selectedWorkspaceId;
+  // DALTON-HOOK(team-sharing): pass the loaded Home or selected workspace record to MarketChart.
+  const activeWorkspace = useMemo(
+    () =>
+      scope === 'all'
+        ? (homeWorkspace ?? null)
+        : (workspaces.find((ws) => ws.workspace_id === selectedWorkspaceId) ?? null),
+    [scope, homeWorkspace, workspaces, selectedWorkspaceId],
+  );
+
+  // A comment being written on the chart belongs to this workspace's chart,
+  // and goes when the chart moves to another, so a move that takes the chart
+  // elsewhere then waits on the writer's answer: from the picker or a link
+  // followed while the page is open. The toolbar's pick of a workspace sets
+  // the workspace and then the side in one press, so both land in the one
+  // move held here.
+  const [heldMove, setHeldMove] = useState<ScopeMove | null>(null);
+  const applyMove = useCallback((move: Partial<ScopeMove>) => {
+    if (move.workspaceId !== undefined) selectWorkspace(move.workspaceId);
+    if (move.scope) setScope(move.scope);
+  }, [selectWorkspace]);
+  const writingOnChart = commentUi.writing(CHART_COMMENTS_TAB);
+  const homeWorkspaceId = homeWorkspace?.workspace_id ?? null;
+  const moveScope = useCallback((move: Partial<ScopeMove>) => {
+    const next = { scope, workspaceId: selectedWorkspaceId, ...move };
+    const chartTo = next.scope === 'all' ? homeWorkspaceId : next.workspaceId;
+    if (!writingOnChart || chartTo === activeWorkspaceId) applyMove(move);
+    else setHeldMove((prev) => ({ ...(prev ?? { scope, workspaceId: selectedWorkspaceId }), ...move }));
+  }, [writingOnChart, applyMove, scope, selectedWorkspaceId, homeWorkspaceId, activeWorkspaceId]);
+  const pickScope = useCallback((next: ComposerScope) => moveScope({ scope: next }), [moveScope]);
+  // Picking a workspace is picking its side too, as the toolbar does next.
+  const pickWorkspace = useCallback((id: string) => moveScope({ workspaceId: id, scope: 'workspace' }), [moveScope]);
+  const moveFromRoute = useEffectEvent(moveScope);
 
   // Switch the chart to a given instance: for a request to show layers below,
   // and a layer chip that jumps to a different ticker.
@@ -304,6 +349,18 @@ function MarketViewInner() {
     setChatExpanded(true);
   } : null);
 
+  // A line in the chat beside naming a comment on a chart in this workspace
+  // brings that chart up and the comment forward on it.
+  const { requestFocus } = commentUi;
+  const focusSerial = useRef(0);
+  const openChartComment = useCallback((comment: ArtifactCommentRef) => {
+    const chart = chartParts(comment.path);
+    if (comment.kind !== 'chart' || !chart || comment.workspaceId !== activeWorkspaceId) return;
+    handleJumpToChart(chart.symbol, chart.timeframe);
+    focusSerial.current += 1;
+    requestFocus({ kind: 'chart', path: comment.path, commentId: comment.commentId, key: focusSerial.current });
+  }, [activeWorkspaceId, handleJumpToChart, requestFocus]);
+
   // Chat return path — captured from URL (or history entry state in Dalton) when navigating from chat DetailPanel
   const [chatReturnPath, setChatReturnPath] = useState<string | null>(() => openingRoute.returnTo);
 
@@ -330,16 +387,23 @@ function MarketViewInner() {
     if (route.timeframe && INTERVALS.some((i) => i.key === route.timeframe)) {
       setSelectedInterval(route.timeframe);
     }
-    // Apply workspace before scope so MarketChatPanel resolves the right
-    // workspace when it mounts the forwarded thread.
-    if (route.workspaceId) {
-      selectWorkspace(route.workspaceId);
-    }
-    if (route.scope) {
-      setScope(route.scope);
+    // Workspace and scope as one move, which waits on a comment being
+    // written on the chart as the picker's does.
+    if (route.workspaceId || route.scope) {
+      moveFromRoute({
+        ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
+        ...(route.scope ? { scope: route.scope } : {}),
+      });
     }
     if (route.returnTo) {
       setChatReturnPath(route.returnTo);
+    }
+    // A comment a phone opened from the chat comes forward on the chart the
+    // route lands on, as one the Market chat names does.
+    const commentChart = route.commentId ? chartIdFor(route.symbol, route.timeframe) : null;
+    if (route.commentId && commentChart) {
+      focusSerial.current += 1;
+      requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId, key: focusSerial.current });
     }
     // `thread` stays for MarketChatPanel, which consumes it itself.
     // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL & persist consumed `ws`/`returnTo` in history state
@@ -354,7 +418,7 @@ function MarketViewInner() {
         return next;
       }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, setSearchParams, selectWorkspace, location.state]);
+  }, [searchParams, selectedStock, setSearchParams, selectWorkspace, location.state, requestFocus]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);
@@ -403,20 +467,6 @@ function MarketViewInner() {
   const toggleOverview = useCallback(() => setShowOverview((v) => !v), []);
 
 
-  // A confirmed chart selection for the live chart rides on send (even with an
-  // empty box), so let the mobile input treat it as sendable content.
-  const { selections: chartSelections } = useChartSelections();
-  const hasChartSelectionForChart = useMemo(() => {
-    const sym = (selectedStock || '').toUpperCase();
-    const tf = normalizeTimeframe(selectedInterval);
-    return chartSelections.some((s) => isConfirmedFor(s, sym, tf));
-  }, [chartSelections, selectedStock, selectedInterval]);
-  // DALTON-HOOK(chat-attachment-count): confirmed chart region crops count toward MAX_FILES
-  const confirmedChartImageCount = useMemo(() => {
-    const sym = (selectedStock || '').toUpperCase();
-    const tf = normalizeTimeframe(selectedInterval);
-    return chartSelections.filter((s) => isConfirmedFor(s, sym, tf) && Boolean(s.croppedImage)).length;
-  }, [chartSelections, selectedStock, selectedInterval]);
   const mobileChatInputRef = useRef<ChatInputHandle>(null);
 
   const handleCaptureChart = useCallback(async () => {
@@ -440,7 +490,7 @@ function MarketViewInner() {
 
   const handleCaptureChartForContext = useCallback(async () => {
     // DALTON-HOOK(chat-attachment-count): reject capturing a new screenshot when already at MAX_FILES
-    if (!chartImage && (mobileChatInputRef.current?.getAttachmentCount() ?? confirmedChartImageCount) >= MAX_FILES) {
+    if (!chartImage && (mobileChatInputRef.current?.getAttachmentCount() ?? 0) >= MAX_FILES) {
       toast({
         variant: 'destructive',
         title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
@@ -494,18 +544,16 @@ function MarketViewInner() {
     }
 
     setChartImageDesc(parts.join('\n'));
-  }, [chartImage, confirmedChartImageCount, selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency, quote.places, t, toast]);
+  }, [chartImage, selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency, quote.places, t, toast]);
 
   const handleSendMessage = useCallback(async (message: string, attachments: ReadyAttachment[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string | null; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
-    const send = buildMarketSendContexts(selectedStock || '', selectedInterval, message, collectViews());
+    const send = buildMarketSendContexts(selectedStock || '', selectedInterval, collectViews());
     const contexts: unknown[] = [send.skill];
     if (chartImage) {
       contexts.push({ type: 'image', data: chartImage, description: chartImageDesc || undefined });
     }
     const attached = attachmentSendParts(attachments);
     contexts.push(...attached.contexts);
-    // The confirmed selections on the chart on screen.
-    contexts.push(...send.contexts);
     // DALTON-HOOK(chat-attachment-count): refuse before navigating if files + screenshots exceed MAX_FILES
     if (countContextAttachments(contexts as Record<string, unknown>[]) > MAX_FILES) {
       toast({
@@ -521,7 +569,7 @@ function MarketViewInner() {
     if (chartImage) {
       metaItems.push({ name: chartImageDesc || 'Chart', type: 'image', size: 0, dataUrl: chartImage });
     }
-    metaItems.push(...attached.meta, ...send.attachments);
+    metaItems.push(...attached.meta);
     const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
     // The selected workspace, or, under the Chief of Staff, Home, which the server
@@ -541,13 +589,12 @@ function MarketViewInner() {
       navigate(`/chat/t/__default__`, {
         state: {
           workspaceId,
-          initialMessage: send.outgoingMessage,
+          initialMessage: message,
           ...(subagents.toSend !== undefined ? { subagentsAllowed: subagents.toSend } : {}),
           additionalContext: imageContext,
           // Carry the chart-annotation skill over so the agent starts with
           // the drawing guide (the tools themselves are always bound).
           skills: ['chart-annotation'],
-          ...(send.snapshots.length > 0 ? { chartSelections: send.snapshots } : {}),
           ...(send.chartViews.length > 0 ? { chartViews: send.chartViews } : {}),
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
@@ -556,7 +603,6 @@ function MarketViewInner() {
           ...tuning.toSend,
         },
       });
-      chartSelectionStore.clearAll();
     } catch (error) {
       console.error('Error opening the chat:', error);
       toast({
@@ -694,6 +740,7 @@ function MarketViewInner() {
               symbol={selectedStock}
               interval={selectedInterval}
               workspaceId={activeWorkspaceId}
+              workspace={activeWorkspace}
               onIntervalChange={handleIntervalChange}
               onCapture={handleCaptureChart}
               onStockMeta={handleStockMeta as any}
@@ -707,7 +754,7 @@ function MarketViewInner() {
               liveTick={wsPrices.get(selectedStock)?.barData || null}
               wsStatus={wsStatus}
               marketStatus={marketStatus}
-              selectionTools
+              comments={chartComments}
             />
           </div>
 
@@ -746,7 +793,7 @@ function MarketViewInner() {
                 return sent;
               }}
               scope={scope}
-              onScopeChange={setScope}
+              onScopeChange={pickScope}
               model={threadModel.model}
               sendModel={threadModel.sendModel}
               onPickModel={threadModel.pickModel}
@@ -757,15 +804,12 @@ function MarketViewInner() {
               onPickFastMode={tuning.setFastMode}
               workspaces={selectableWorkspaces}
               selectedWorkspaceId={selectedWorkspaceId}
-              onWorkspaceChange={selectWorkspace}
+              onWorkspaceChange={pickWorkspace}
               onCaptureChart={handleCaptureChartForContext}
               chartImage={chartImage}
               onRemoveChartImage={() => { setChartImage(null); setChartImageDesc(null); }}
               prefillMessage={prefillMessage}
               onClearPrefill={() => setPrefillMessage('')}
-              hasExternalContext={hasChartSelectionForChart}
-              // DALTON-HOOK(chat-attachment-count): reserve slots for confirmed chart crops
-              externalAttachmentCount={confirmedChartImageCount}
               placeholder={t('marketView:chatPanel.askStockPlaceholder')}
               // The desktop panel waits out the same check: until it confirms
               // the restored workspace there is none to send to, and
@@ -843,11 +887,13 @@ function MarketViewInner() {
                     loading={overviewLoading}
                   />
                 )}
+                <ArtifactCommentSendContext value={chatSends?.sender ?? null}>
                 <MarketChart
                   ref={chartRef}
                   symbol={selectedStock}
                   interval={selectedInterval}
                   workspaceId={activeWorkspaceId}
+                  workspace={activeWorkspace}
                   onIntervalChange={handleIntervalChange}
                   onCapture={handleCaptureChart}
                   onStockMeta={handleStockMeta as any}
@@ -861,7 +907,7 @@ function MarketViewInner() {
                   liveTick={wsPrices.get(selectedStock)?.barData || null}
                   wsStatus={wsStatus}
                   marketStatus={marketStatus}
-                  selectionTools
+                  comments={chartComments}
                   toolbarLead={
                     backToWatchlistButton ? (
                       <div className="inline-flex items-center">
@@ -875,6 +921,7 @@ function MarketViewInner() {
                   toolbarTrail={toolbarTrail}
                   toolbarSubrow={legend.toolbarSubrow}
                 />
+                </ArtifactCommentSendContext>
               </div>
             </div>
             <div className="market-resize-handle" onMouseDown={handleDragStart} />
@@ -884,12 +931,12 @@ function MarketViewInner() {
                   symbol={selectedStock}
                   interval={selectedInterval}
                   scope={scope}
-                  onScopeChange={setScope}
+                  onScopeChange={pickScope}
                   activeWorkspaceId={activeWorkspaceId}
                   workspaces={selectableWorkspaces}
                   selectedWorkspaceId={selectedWorkspaceId}
                   workspacePending={workspacePending}
-                  onWorkspaceChange={selectWorkspace}
+                  onWorkspaceChange={pickWorkspace}
                   chartImage={chartImage}
                   chartImageDesc={chartImageDesc}
                   onCaptureChart={handleCaptureChartForContext}
@@ -902,14 +949,34 @@ function MarketViewInner() {
                   onNavigateSubagent={(tid, taskId) => navigate(`/chat/t/${tid}/${taskId}`)}
                   onReturnToChat={chatReturnPath ? () => navigate(chatReturnPath) : undefined}
                   onJumpToChart={handleJumpToChart}
+                  onCommentSends={setChatSends}
+                  onOpenChartComment={openChartComment}
                 />
               </div>
             </div>
           </div>
         </>
       )}
+      <ConfirmDialog
+        open={heldMove !== null}
+        title={t('pageViewer:comments.discardConfirm')}
+        message={t('pageViewer:comments.discardOnSwitch')}
+        confirmLabel={t('pageViewer:comments.discard')}
+        cancelLabel={t('pageViewer:comments.keepWriting')}
+        onConfirm={() => { if (heldMove) applyMove(heldMove); }}
+        onOpenChange={(open) => { if (!open) setHeldMove(null); }}
+      />
     </div>
   );
+}
+
+/** The chart's own id among the page's comment targets: it has one chart. */
+const CHART_COMMENTS_TAB = 'market-chart';
+
+/** Where the chat runs: the side, and the workspace the workspace side remembers. */
+interface ScopeMove {
+  scope: ComposerScope;
+  workspaceId: string | null;
 }
 
 function MarketView() {

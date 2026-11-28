@@ -140,7 +140,7 @@ def _make_artifact(
     loaded_files: tuple[str, ...] = (),
     left_out_files: tuple[str, ...] = (),
 ) -> Artifact:
-    return Artifact(
+    return Artifact(kind="file", 
         artifact_id=artifact_id,
         code="abc123",
         workspace_id=workspace_id,
@@ -1849,7 +1849,7 @@ async def test_consecutive_folder_publishes_preserve_left_out_and_exclude_file_c
     version_hashes_by_seq: dict[int, dict[str, str]] = {}
 
     def _current_artifact() -> Artifact:
-        return Artifact(
+        return Artifact(kind="file", 
             artifact_id=artifact_state["artifact_id"],
             code="abc123",
             workspace_id=artifact_state["workspace_id"],

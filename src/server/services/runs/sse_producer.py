@@ -41,7 +41,7 @@ from src.server.utils.content_normalizer import (
 # DALTON-HOOK(thinking-leak): live assistant text is filtered before it is framed.
 from src.server.utils.thinking_leak import ThinkingLeakGate
 from src.server.utils.pg_sanitize import finite_json_dumps
-from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, queue_record
+from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, computer_lost, queue_record
 from src.server.contracts.status import classify_interrupts
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
 from src.server.database.runs.lifecycle import ProducerRecord
@@ -1038,12 +1038,17 @@ class RunSSEProducer:
             # Don't yield error event - this is expected behavior
             raise
         except Exception as e:
+            # A turn that lost its Claude Code computer is stopped to be
+            # resumed, not failed: its run_end says so, with no error frame.
+            lost = computer_lost(e) is not None
             if isinstance(e, TurnTimeLimitError):
                 # A planned stop the [TIMEOUT_ERROR] line has already named;
                 # its traceback is only this generator's own raise.
                 logger.warning(
                     f"Turn stopped at its time limit for thread_id={self.thread_id}: {e}"
                 )
+            elif lost:
+                logger.warning(f"Turn lost its Claude Code computer for thread_id={self.thread_id}: {e}")
             else:
                 logger.exception(f"Error in stream generator for thread_id={self.thread_id}: {e}")
             _stream_span.record_exception(e)
@@ -1053,9 +1058,9 @@ class RunSSEProducer:
             # marked not executed when retries fail before opening a new message.
             for frame in self.flush_pending_tool_calls():
                 yield frame
-            if not isinstance(e, TurnTimeLimitError):
+            if not (isinstance(e, TurnTimeLimitError) or lost):
                 yield await self._build_error_event(str(e), exc=e)
-            raise  # Re-raise so the run executor finalizes as failed
+            raise  # Re-raise so the run executor finalizes it
         finally:
             # Safety net: if the stream ends (timeout / error / CancelledError /
             # aclose()) while a compaction window is still open, release the

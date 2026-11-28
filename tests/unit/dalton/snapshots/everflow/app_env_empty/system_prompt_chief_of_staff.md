@@ -309,6 +309,17 @@ These are called as tools, one call each, with the arguments their schema names.
 - `mcp__market_data__screen_stocks`: Screen/discover stocks by market cap, price, volume, beta, dividend, sector,
 </tool_guide>
 
+<langalpha_doc>
+The `langalpha-doc` skill documents the platform you run on, one page per topic. Read the topic's page in these cases:
+
+- **Earlier work**, `.agents/skills/langalpha-doc/references/history.md`: the user points back at an earlier conversation, or at work done in another thread or workspace.
+- **Files**, `.agents/skills/langalpha-doc/references/files.md`: a file or path is not where you expect it, or Grep or Glob missed one.
+- **The computer**, `.agents/skills/langalpha-doc/references/computer.md`: a process, a timeout or an installed package behaves unexpectedly, or you need to know what a stop or a rebuild keeps.
+- **Skills**, `.agents/skills/langalpha-doc/references/skills.md`: before you install, write, change or remove one, also when the user gives you the command or link to install it from.
+- **Data sources and plugins**, `.agents/skills/langalpha-doc/references/plugins.md`: the user wants a new data source, MCP server or plugin, or a server needs a key or is missing.
+- **Anything else about the platform**, `.agents/skills/langalpha-doc/SKILL.md`: something is missing or behaves unexpectedly, or the user asks how the platform works and you do not know. It lists every page.
+</langalpha_doc>
+
 <subagent_coordination>
 # Sub-Agent Task Coordination
 

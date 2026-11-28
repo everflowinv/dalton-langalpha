@@ -59,7 +59,7 @@ import { useCardState } from '../hooks/useCardState';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { classifyAgentPath, isSubagentFilePath } from '../utils/agentPaths';
 import { fileArtifactPath } from '../utils/fileArtifact';
-import type { FileOperationArtifactPayload, ThreadForkCut } from '@/types/api';
+import type { FileOperationArtifactPayload } from '@/types/api';
 import { taskIdFromAgentId } from '../utils/agentId';
 import {
   routeStopAction,
@@ -106,7 +106,7 @@ import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
 import { OlderHistorySkeleton } from './chatView/OlderHistorySkeleton';
 import { useThreadCommands } from '../hooks/useCommands';
 import { ThreadCommandsContext } from './commands/threadCommandsContext';
-import { ChatCommentSendsProvider, useChatCommentSends } from './artifactComments/useChatCommentSends';
+import { ChatCommentSendsProvider, useChatCommentSends, whenTaken } from './artifactComments/useChatCommentSends';
 import { DockableComposer } from './chatView/composerDock';
 import { ComposerDockContext } from './chatView/useComposerDock';
 import { useChatCover, useChatCoverReads } from './chatView/useChatCover';
@@ -114,6 +114,7 @@ import { useComposerGiveBack } from './chatView/useComposerGiveBack';
 import { usePublishFile } from './chatView/usePublishFile';
 import { DockTurnStatus } from './chatView/DockTurnStatus';
 import { QueuedCommentDeck } from './artifactComments/QueuedCommentDeck';
+import { useDeckComposer } from './artifactComments/useDeckComposer';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
 // DALTON-HOOK(mobile-web): PanInfo no longer needed after disabling content-area drag-to-close on mobile FilePanel
@@ -167,7 +168,6 @@ import { handOffToggleFocus } from './filePanel/panelToggleFocus';
 import { PanelLoadingStrip } from './filePanel/PanelLoadingStrip';
 import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelChart } from './chatView/usePanelChart';
-import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
 // DALTON-HOOK(channel-deep-links): resolve ?chart=&layer= and ?widget= deep links in ChatView
 import { useChannelDeepLinks } from './chatView/useChannelDeepLinks';
 import { useMessageActionBundles } from './chatView/useMessageActionBundles';
@@ -184,6 +184,7 @@ import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
 import { useForkThread } from './chatView/useForkThread';
 import { ForkedFromLink } from './chatView/ForkedFromLink';
+import type { SubagentInfo } from './messageList/types';
 import { ThreadPrivacyRow } from './chatView/threadPrivacy';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
 import { withCopy } from '@/i18n';
@@ -211,6 +212,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const marketWatchEnabled = useFeatureEnabled('market_watch');
   const queryClient = useQueryClient();
   const initialMessageSentRef = useRef(false);
+  // A message another page brought, from when its route state is cleared until
+  // its send settles: the new chat is that message's, not the workspace's
+  // unsent draft's.
+  const [kickoffSending, setKickoffSending] = useState(false);
   const state = location.state as LocationState | null;
   // The workspace row drives the header title and names Home. It
   // has to come from the shared detail query rather than a mount-time snapshot:
@@ -456,6 +461,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     forThread,
     threadId: currentThreadId,
     threadModels,
+    forkDivider,
     marketWatch,
     isShared: threadIsShared,
     handleThumbUp,
@@ -884,8 +890,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // The file comments queued for this thread's next send, shown above the
   // text box and carried by its send, and the sender the file panel uses.
   const commentSends = useChatCommentSends({
-    threadId: panelThreadId, running: isLoading, watch: watchCommentSends, chatCovered: coverReads.covered,
-    sendToChat: (artifactComments) => stableSendMessage('', null, null, composerSendOptions({ ...readComposerOptions(), artifactComments })),
+    threadId: panelThreadId, workspaceId, running: isLoading, watch: watchCommentSends, chatCovered: coverReads.covered,
+    sendToChat: (artifactComments) => whenTaken((onTaken) =>
+      stableSendMessage('', null, null, composerSendOptions({ ...readComposerOptions(), artifactComments, onTaken }))),
   });
   const { deck: commentDeck, take: takeQueuedComments } = commentSends;
   // A rerun carries what the composer shows, as a send does, so a pick whose
@@ -949,23 +956,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [isCompacting, isLoading, handleStop, stableStopCompaction]);
 
-  const panelChart = usePanelChart(isActive, chatInputRef);
-  // DALTON-HOOK(chat-attachment-count): panel chart region screenshots count toward MAX_FILES
-  const panelChartImageCount = useMemo(
-    () => panelChart.chips.filter((s) => Boolean(s.croppedImage)).length,
-    [panelChart.chips],
-  );
-  const prevPanelChartImageCountRef = useRef(panelChartImageCount);
-  useEffect(() => {
-    const prev = prevPanelChartImageCountRef.current;
-    prevPanelChartImageCountRef.current = panelChartImageCount;
-    if (panelChartImageCount > prev && (chatInputRef.current?.getAttachmentCount() ?? panelChartImageCount) > MAX_FILES) {
-      toast({
-        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
-        variant: 'destructive',
-      });
-    }
-  }, [panelChartImageCount, t]);
+  const panelChart = usePanelChart(chatInputRef);
 
   // Wrapper: converts ChatInput's send into handleSendMessage(message,
   // additionalContext, attachmentMeta), the send itself the draft it gives back.
@@ -1006,9 +997,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       contexts.push(...widgetSnapshotsToContexts(modelOptions.widgetSnapshots));
     }
 
-    // DALTON-HOOK(chat-attachment-count): guard total attachments (files + widget/chart screenshots)
-    // before panelChart.takeForSend clears chart selections or dispatches a doomed request.
-    if (countContextAttachments(contexts) + panelChartImageCount > MAX_FILES) {
+    // DALTON-HOOK(chat-attachment-count): guard total attachments (files + widget screenshots)
+    // before a doomed request is dispatched.
+    if (countContextAttachments(contexts) > MAX_FILES) {
       toast({
         title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
         variant: 'destructive',
@@ -1016,26 +1007,20 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       return false;
     }
 
-    // Regions and price levels picked on a panel chart tab, and what each chart shows.
-    const { picked, chartViews } = panelChart.takeForSend(message);
-    if (picked) {
-      contexts.push(...picked.contexts);
-      meta.push(...picked.attachments);
-    }
+    // What each chart in the panel shows.
+    const chartViews = panelChart.viewsForSend();
 
     const additionalContext = contexts.length > 0 ? contexts : null;
     const attachmentMeta = meta.length > 0 ? meta : null;
-    const outgoing = picked?.outgoingMessage ?? message;
-    // The queued file comments go with every send, the text as their note.
-    const artifactComments = takeQueuedComments(outgoing);
+    // The queued comments, on files and charts, go with every send, the text as their note.
+    const artifactComments = takeQueuedComments(message);
     // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
     return stableSendMessage(
-      outgoing,
+      message,
       additionalContext,
       attachmentMeta,
       composerSendOptions({
         ...modelOptions,
-        ...(picked ? { chartSelections: picked.snapshots } : {}),
         ...(artifactComments ? { artifactComments } : {}),
         ...(chartViews.length > 0 ? { chartViews } : {}),
         // DALTON-HOOK(composer-drafts): the box as the person wrote it — a
@@ -1045,7 +1030,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         draft: send,
       }),
     );
-  }, [marketWatchEnabled, stableSendMessage, panelChart, panelChartImageCount, takeQueuedComments, composerSendOptions, t]);
+  }, [marketWatchEnabled, stableSendMessage, panelChart, takeQueuedComments, composerSendOptions, t]);
 
   const planReader = useLatestRef(usePlanReader());
 
@@ -1275,23 +1260,21 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isMobile, filePanel: rightPanelType === 'file', panelExpanded, panelWidth: rightPanelWidth, threadId: panelThreadId,
     mainAgent: activeAgentId === 'main', queuedComments: commentDeck.comments, reads: coverReads,
   });
-  // Files that hold the send keep the comments waiting with them; the
-  // composer takes focus, where the hint beside Send says why.
-  const addCommentsToTurn = useStableHandler(() => {
-    const input = chatInputRef.current;
-    if (input && !input.send() && input.holdsSend()) input.focus();
-  });
-  const focusComposer = useStableHandler(() => { chatInputRef.current?.focus(); });
+  const deckComposer = useDeckComposer(chatInputRef);
+  const openArtifactComment = useMemo(
+    () => ({ file: handleOpenArtifactComment, chart: handleOpenArtifactComment }),
+    [handleOpenArtifactComment],
+  );
   // The queued comments ride above the text box and count as something to
   // send. Folded as the sheet starts over the chat, so it docks folded.
   const composerDeck = {
-    hasExternalContext: panelChart.chips.length > 0 || commentDeck.ready.length > 0,
+    hasExternalContext: commentDeck.ready.length > 0,
     placeholder: commentDeck.placeholder ?? chatPlaceholder,
     // DALTON-HOOK(team-sharing): a colleague's workspace or a read-only
     // thread shows no docked comment box — comments are sent into the thread
     // from the owner's own chat.
-    deck: teamReadOnly.isColleague || isThreadReadOnly ? null : <QueuedCommentDeck deck={commentDeck} running={isLoading} compact={isMobile && dockOpen} onOpen={handleOpenArtifactComment}
-      onAddToTurn={addCommentsToTurn} focusComposer={focusComposer} />,
+    deck: teamReadOnly.isColleague || isThreadReadOnly ? null : <QueuedCommentDeck deck={commentDeck} running={isLoading} compact={isMobile && dockOpen} onOpen={openArtifactComment}
+      {...deckComposer} />,
   };
 
   // On desktop the header's files toggle gives way to the panel's own the
@@ -1422,14 +1405,25 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const fromThreadId = state?.fromThreadId;
   const fromWorkspaceId = state?.fromWorkspaceId;
   // Every exit to another thread marks itself intentional as it goes, and
-  // asks the file panel about unsaved drafts first (`leaveToThread`).
-  const goToThread = useCallback((targetThreadId: string, navState: LocationState) => {
+  // asks the file panel about unsaved drafts first (`leaveToThread`). A task
+  // id opens one of the thread's tasks there.
+  const goToThread = useCallback((targetThreadId: string, navState: LocationState, taskId?: string) => {
     intentionalExitRef.current = true;
-    navigate(`/chat/t/${targetThreadId}`, { state: navState });
+    navigate(taskId ? `/chat/t/${targetThreadId}/${taskId}` : `/chat/t/${targetThreadId}`, { state: navState });
   }, [navigate]);
-  const leaveToThread = useCallback((targetThreadId: string, navState: LocationState) => {
-    leaveFiles(() => goToThread(targetThreadId, navState));
+  const leaveToThread = useCallback((targetThreadId: string, navState: LocationState, taskId?: string) => {
+    leaveFiles(() => goToThread(targetThreadId, navState, taskId));
   }, [leaveFiles, goToThread]);
+  // A task card in a turn a fork borrowed opens in the thread that holds the
+  // task's runs; the route looks up its workspace.
+  const openSubagentTaskFromChat = useCallback((info: SubagentInfo, ownerThreadId?: string) => {
+    if (!ownerThreadId || ownerThreadId === currentThreadId) {
+      handleOpenSubagentTask(info);
+      return;
+    }
+    const agentId = resolveSubagentIdToAgentId ? resolveSubagentIdToAgentId(info.subagentId) : info.subagentId;
+    leaveToThread(ownerThreadId, {}, taskIdFromAgentId(agentId) ?? undefined);
+  }, [currentThreadId, handleOpenSubagentTask, leaveToThread, resolveSubagentIdToAgentId]);
   const openDispatcher = useCallback((dispatcherThreadId: string) => {
     leaveToThread(
       dispatcherThreadId,
@@ -1437,37 +1431,30 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     );
   }, [leaveToThread, fromThreadId, fromWorkspaceId]);
 
-  // "Fork from here" and "Edit in new chat": a copy of this thread up to a
-  // turn, opened as a new chat while this view is still the one in front. A
-  // view kept mounted after the user moved on leaves the fork in the list.
-  // The file panel is asked before the copy is made, so declining leaves no
+  // "Fork from here": a new chat carrying on from this thread through a
+  // reply, opened while this view is still the one in front. A view kept
+  // mounted after the user moved on leaves the fork in the list.
+  // The file panel is asked before the fork is made, so declining leaves no
   // fork behind, and asked again on the way out unless the user already
-  // agreed to discard: a draft typed while the copy ran is asked about too.
-  // A copy that waits on its dialog runs without the button's pending state,
-  // which ends when the dialog opens.
+  // agreed to discard: a draft typed meanwhile is asked about too. The button
+  // spins from when the request goes, so not while the dialog asks.
   const forkDiscardAgreedRef = useRef(false);
   const openFork = useCallback((forkThreadId: string, navState: LocationState) => {
     if (!isActiveRef.current) return;
     if (forkDiscardAgreedRef.current) goToThread(forkThreadId, navState);
     else leaveToThread(forkThreadId, navState);
   }, [goToThread, leaveToThread]);
-  const forkFromTurn = useForkThread({ threadId: currentThreadId, open: openFork });
-  const handleForkFromTurn = useCallback(
-    (turnIndex: number, cut: ThreadForkCut) => new Promise<void>((resolve) => {
-      // The guard runs this at once when nothing was unsaved, and later only
-      // once the user agreed in its dialog.
-      let inline = true;
-      let went = false;
-      leaveFiles(() => {
-        went = true;
-        forkDiscardAgreedRef.current = !inline;
-        void forkFromTurn(turnIndex, cut).finally(resolve);
-      });
-      inline = false;
-      if (!went) resolve();
-    }),
-    [leaveFiles, forkFromTurn],
-  );
+  const forkFromTurn = useForkThread({ threadId: currentThreadId, workspaceId, open: openFork });
+  const handleForkFromTurn = useCallback((turnIndex: number) => {
+    // The guard runs this at once when nothing was unsaved, and later only
+    // once the user agreed in its dialog.
+    let inline = true;
+    leaveFiles(() => {
+      forkDiscardAgreedRef.current = !inline;
+      forkFromTurn(turnIndex);
+    });
+    inline = false;
+  }, [leaveFiles, forkFromTurn]);
 
   // The file cards' Publish, one dialog for the chat.
   const { onPublishFile, dialog: publishDialog } = usePublishFile(workspaceId || null);
@@ -1477,6 +1464,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const { messageActions, subagentMessageActions } = useMessageActionBundles({
     reportThreadId: currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined,
     feedbackLoading,
+    onOpenThread: leaveToThread,
     onOpenFile: handleOpenFileFromChat,
     onDownloadFile: handleDownloadFileFromChat,
     onPublishFile,
@@ -1495,7 +1483,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onToolCallDetailClick: handleToolCallDetailClick,
     onOpenChart: handleOpenChart,
     onOpenArtifactComment: handleOpenArtifactComment,
-    onOpenSubagentTask: handleOpenSubagentTask,
+    onOpenSubagentTask: openSubagentTaskFromChat,
     onOpenDispatcher: openDispatcher,
     onAnswerQuestion: handleAnswerQuestion,
     onSkipQuestion: handleSkipQuestion,
@@ -1652,7 +1640,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         reasoningEffort,
         fastMode,
         widgetSnapshots,
-        chartSelections,
         chartViews,
         skills,
         hiddenOpener,
@@ -1662,21 +1649,21 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       } = location.state;
       const mergedContext = mergeSkills(additionalContext, skills);
       // Clear navigation state to prevent re-sending on re-renders
+      setKickoffSending(true);
       navigate(location.pathname, { replace: true, state: {} });
       const send = () => {
-        handleSendMessage(initialMessage ?? '', mergedContext, attachmentMeta || null, {
+        void Promise.resolve(handleSendMessage(initialMessage ?? '', mergedContext, attachmentMeta || null, {
           model,
           reasoningEffort,
           fastMode,
           widgetSnapshots,
-          chartSelections,
           chartViews,
           subagentsAllowed: subagentsToSend,
           ...tuningToSend,
           sharedWithWorkspace: landingShared,
           hiddenOpener,
           threadTitle,
-        });
+        })).finally(() => setKickoffSending(false));
       };
       // The welcome flow's hand-off is sent at once: the view is mounted by
       // the time its effects run, and the hand-off into it holds the page
@@ -2117,6 +2104,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                               allowFiles={isThreadReadOnly}
                               holding={heldBeforeWork}
                               holdLine={compactionAbove && <CompactingLine {...compactionAbove} />}
+                              forkDivider={forkDivider}
                             />
                           </DispatchStatusProvider>
                         </MessageActionsProvider>
@@ -2265,8 +2253,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               // DALTON-HOOK(mobile-web): respect iPhone Home Indicator safe-area inset on mobile floating composer
               className={`absolute inset-x-0 bottom-0 z-10 pointer-events-none ${isMobile ? 'px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]' : 'p-4'} flex justify-center`}
             >
-              {/* sibling-space-y, not space-y: SelectionChips' own margin would
-                  otherwise win. */}
               {/* Re-declares --composer-h for the same reason the transcript
                   content does (TRANSCRIPT_BOTTOM_PAD): nothing in the stack
                   reads it. */}
@@ -2301,7 +2287,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     {/* Each a row of the stack; one that renders nothing leaves
                         no element, so it takes no gap. */}
                     {composerDock.docked && threadNotices.map(({ key, node }) => <React.Fragment key={key}>{node}</React.Fragment>)}
-                    <SelectionChips chips={panelChart.chips} />
                     {/* At a file's foot the transcript is out of view, so the
                         turn's progress comes along with the composer. */}
                     {composerDock.docked && <DockTurnStatus running={isLoading} messages={messages} />}
@@ -2347,8 +2332,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
                         inHome={isHome}
-                        // DALTON-HOOK(chat-attachment-count): include panel chart captures in composer attachment cap
-                        externalAttachmentCount={panelChartImageCount}
                         header={tray.strip}
                         toolbarStatus={(privacyChip || tray.dock) && <>{privacyChip}{tray.dock}</>}
                         notices={composerNotices}

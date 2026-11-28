@@ -1,4 +1,5 @@
-"""The owner's routes on a file's comments, and a thread's queue of them.
+"""The owner's routes on a file's or a chart's comments, and a thread's queue
+of them.
 
 A shared workspace's comments are its holder's, like its records: every
 member writes, queues, resolves and reads them as the workspace's owner does,
@@ -110,6 +111,7 @@ async def _comments_changed(
             artifact_id=artifact.artifact_id,
             workspace_id=artifact.workspace_id,
             path=artifact.path,
+            kind=artifact.kind,
             thread_id=thread_id,
             comment_ids=comment_ids,
         )
@@ -140,7 +142,7 @@ async def list_thread_queued_comments(
 async def list_comments(
     artifact_id: str, x_user_id: CurrentUserId
 ) -> CommentListResponse:
-    """Every comment on the file, by pin number, with its messages."""
+    """Every comment on the file or chart, by pin number, with its messages."""
     artifact, access = await reached(artifact_id, x_user_id)
     comments = await artifacts_db.list_comments(artifact.artifact_id)
     return CommentListResponse(
@@ -156,6 +158,8 @@ async def create_comment(
     await _require_non_external_for_comments(x_user_id)  # DALTON-HOOK(external-share-guard)
     artifact, access = await reached(artifact_id, x_user_id)
     owner_id = access.owner_id
+    body.check_against(artifact.kind)
+    file_sha256, title = body.file_fields(artifact.kind)
     with db_errors():
         await _require_reached(access, x_user_id, body.thread_id)
         comment = await artifacts_db.create_comment(
@@ -165,8 +169,8 @@ async def create_comment(
             body=body.body,
             delivery=body.delivery,
             thread_id=body.thread_id,
-            file_sha256=body.file_sha256,
-            title=body.title,
+            file_sha256=file_sha256,
+            title=title,
             caller=x_user_id,
         )
     await _comments_changed(

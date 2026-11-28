@@ -264,8 +264,13 @@
     "threadTurns": "Turns",
     "threadNeedsInput": "Waiting for your input",
     "threadUnseen": "Finished, not yet viewed",
+    "draft": "Draft",
+    "draftPrefix": "Draft:",
+    "draftWaiting": "Has an unsent draft",
     "workspaceUnread": "Has threads you haven't viewed",
     "untitledThread": "Untitled",
+    "forkPreparing": "Copying…",
+    "forkPreparingHint": "Copying the chat into a new one. A long chat takes a little while.",
     "onComputer": "On {{name}} · {{kind}}",
     "noConversations": "No conversations yet",
     "workspaceFallback": "Workspace",
@@ -1003,6 +1008,8 @@
     "failedLoadThreads": "Failed to load threads. Please refresh the page.",
     "invalidThread": "Invalid thread. Please try again.",
     "failedDeleteThread": "Failed to delete thread. Please try again.",
+    "forkCountNote_one": "This chat has {{count}} fork. It'll keep working, but will no longer show the conversation before it was forked.",
+    "forkCountNote_other": "This chat has {{count}} forks. They'll keep working, but will no longer show the conversation before they were forked.",
     "failedRenameThread": "Failed to rename thread. Please try again.",
     "viewAll": "View all",
     "shared": "Shared",
@@ -1130,7 +1137,9 @@
         "labelQuote": "{{label}} · “{{quote}}”",
         "quote": "“{{quote}}”",
         "open": "Show it in the file",
-        "openLabel": "Show comment {{number}} in the file"
+        "openLabel": "Show comment {{number}} in the file",
+        "open_chart": "Show it on the chart",
+        "openLabel_chart": "Show comment {{number}} on the chart"
       },
       "reply": {
         "replied_one": "Replied to comment <nums/> on {{title}}",
@@ -1141,7 +1150,8 @@
         "unread": "Unread",
         "showMore": "Show more",
         "showLess": "Show less",
-        "readRest": "Read the whole reply in the file"
+        "readRest": "Read the whole reply in the file",
+        "readRest_chart": "Read the whole reply on the chart"
       },
       "deck": {
         "queuedCount_one": "{{count}} queued comment",
@@ -1153,6 +1163,7 @@
         "addToTurn": "Add to this turn",
         "addToTurnTitle": "Send them into the turn that is running, with what you wrote as their note",
         "showInFile": "Show it in the file",
+        "showInFile_chart": "Show it on the chart",
         "keepOne": "Keep as a note: it stays on the file, unsent",
         "keepOneLabel": "Keep comment {{number}} as a note",
         "more": "{{rest}} more",
@@ -1170,6 +1181,21 @@
     "forkedFromDeleted": "Forked from a deleted chat",
     "forkFailed": "Couldn't open a new chat from here. Try again.",
     "forkTitle": "{{title}} (fork)",
+    "forkDivider": {
+      "shown": "Forked from {{title}}",
+      "shownUntitled": "Forked from another chat",
+      "changed": "Forked from {{title}} (since changed)",
+      "changedUntitled": "Forked from another chat (since changed)",
+      "deleted": "Forked from a deleted chat",
+      "unavailable": "Forked from a chat you can't open",
+      "open": "Open",
+      "hint": {
+        "shown": "Messages above are from the original chat. They can't be edited, regenerated, rated or forked here.",
+        "changed": "The original changed after this fork, so only the messages before that change are shown. They can't be edited, regenerated, rated or forked here.",
+        "deleted": "The original chat was deleted, so its messages are no longer shown.",
+        "unavailable": "You can't open the original chat, so its messages aren't shown."
+      }
+    },
     "reconnecting": "Reconnecting…",
     "offlineHistoryLoad": "You are offline, so this conversation could not be refreshed. It will catch up when your connection returns.",
     "jumpToLatest": {
@@ -1246,6 +1272,7 @@
     "worker": "Worker",
     "agentNotFound": "Agent not found",
     "stoppedChip": "Stopped",
+    "computerLostChip": "Stopped: the computer went offline",
     "workingFor": "Working for {{duration}}",
     "workedFor": "Worked for {{duration}}",
     "worked": "Worked",
@@ -1350,7 +1377,7 @@
       "regenerate": "Regenerate response",
       "retry": "Retry",
       "forkFromHere": "Fork from here",
-      "editInNewChat": "Edit in new chat"
+      "forking": "Making the fork…"
     },
     "turnFiles": {
       "open": "Open",

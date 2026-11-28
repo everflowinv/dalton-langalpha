@@ -15,6 +15,7 @@ from src.server.app.threads import fork as fork_app
 from src.server.database import thread_fork
 from src.server.database.conversation import threads_read
 from src.server.services import writer_guard
+from src.server.services.forks import materialize as fork_materialize
 from src.server.services.forks import service as fork_service
 from src.server.services.forks.model import ForkRequest, ThroughTurn
 from src.server.services.forks.snapshot import Snapshot
@@ -319,14 +320,14 @@ async def test_fork_with_write_permission_records_caller_as_user_id(
         ),
         patch.object(
             fork_service,
-            "_copy_chains",
-            create_autospec(fork_service._copy_chains, return_value=None),
+            "_write_checkpoints",
+            create_autospec(fork_service._write_checkpoints, return_value=None),
         ),
         patch.object(fork_service, "create_thread", create_thr),
         patch.object(
             thread_fork,
-            "write_ledger",
-            create_autospec(thread_fork.write_ledger, return_value=1),
+            "write_tasks",
+            create_autospec(thread_fork.write_tasks, return_value=None),
         ),
         patch.object(
             thread_fork,
@@ -339,9 +340,9 @@ async def test_fork_with_write_permission_records_caller_as_user_id(
             create_autospec(thread_fork.hold_thread_row, return_value=None),
         ),
         patch.object(
-            fork_service,
-            "_after_commit",
-            create_autospec(fork_service._after_commit, return_value=None),
+            fork_materialize,
+            "read_cut",
+            create_autospec(fork_materialize.read_cut, return_value=None),
         ),
     ):
         result = await fork_service.fork_thread(
@@ -353,7 +354,7 @@ async def test_fork_with_write_permission_records_caller_as_user_id(
             )
         )
 
-    assert result.turns_copied == 1
+    assert result.thread_id
     assert req_ws_access.await_count == 2
     create_thr.assert_awaited_once()
     kwargs = create_thr.await_args.kwargs
@@ -395,7 +396,6 @@ async def test_fork_aborts_if_colleague_sharing_revoked_mid_copy(
     )
 
     fake_conn = _FakeConn()
-    after_commit = create_autospec(fork_service._after_commit)
 
     with (
         patch.object(
@@ -441,8 +441,8 @@ async def test_fork_aborts_if_colleague_sharing_revoked_mid_copy(
         ),
         patch.object(
             fork_service,
-            "_copy_chains",
-            create_autospec(fork_service._copy_chains, return_value=None),
+            "_write_checkpoints",
+            create_autospec(fork_service._write_checkpoints, return_value=None),
         ),
         patch.object(
             fork_service,
@@ -451,8 +451,8 @@ async def test_fork_aborts_if_colleague_sharing_revoked_mid_copy(
         ),
         patch.object(
             thread_fork,
-            "write_ledger",
-            create_autospec(thread_fork.write_ledger, return_value=1),
+            "write_tasks",
+            create_autospec(thread_fork.write_tasks, return_value=None),
         ),
         patch.object(
             thread_fork,
@@ -464,7 +464,11 @@ async def test_fork_aborts_if_colleague_sharing_revoked_mid_copy(
             "hold_thread_row",
             create_autospec(thread_fork.hold_thread_row, return_value=None),
         ),
-        patch.object(fork_service, "_after_commit", after_commit),
+        patch.object(
+            fork_materialize,
+            "read_cut",
+            create_autospec(fork_materialize.read_cut, return_value=None),
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await fork_service.fork_thread(
@@ -477,7 +481,6 @@ async def test_fork_aborts_if_colleague_sharing_revoked_mid_copy(
 
     assert exc_info.value.status_code == 404
     assert req_ws_access.await_count == 2
-    after_commit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -686,14 +689,14 @@ async def test_colleague_fork_succeeds_with_single_connection_pool(
         ),
         patch.object(
             fork_service,
-            "_copy_chains",
-            create_autospec(fork_service._copy_chains, return_value=None),
+            "_write_checkpoints",
+            create_autospec(fork_service._write_checkpoints, return_value=None),
         ),
         patch.object(fork_service, "create_thread", create_thr),
         patch.object(
             thread_fork,
-            "write_ledger",
-            create_autospec(thread_fork.write_ledger, return_value=1),
+            "write_tasks",
+            create_autospec(thread_fork.write_tasks, return_value=None),
         ),
         patch.object(
             thread_fork,
@@ -706,9 +709,9 @@ async def test_colleague_fork_succeeds_with_single_connection_pool(
             create_autospec(thread_fork.hold_thread_row, return_value=None),
         ),
         patch.object(
-            fork_service,
-            "_after_commit",
-            create_autospec(fork_service._after_commit, return_value=None),
+            fork_materialize,
+            "read_cut",
+            create_autospec(fork_materialize.read_cut, return_value=None),
         ),
     ):
         result = await fork_service.fork_thread(
@@ -720,7 +723,7 @@ async def test_colleague_fork_succeeds_with_single_connection_pool(
             )
         )
 
-    assert result.turns_copied == 1
+    assert result.thread_id
     assert single_pool.max_concurrent == 1
     assert single_pool.in_use == 0
     create_thr.assert_awaited_once()

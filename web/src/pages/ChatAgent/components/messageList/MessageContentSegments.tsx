@@ -40,7 +40,7 @@ import { useMotionSafe } from '@/lib/reducedMotion';
 import { useProseReport } from './proseTyping';
 import { projectContent, blockIsProcess, blockVisible, replyStartKey, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
-import type { ContentSegmentRecord, FoldState, ToolCallProcessRecord } from './types';
+import type { ContentSegmentRecord, FoldState, SubagentInfo, ToolCallProcessRecord } from './types';
 import type {
   CreateWorkspaceRenderBlock,
   CreditPauseRenderBlock,
@@ -93,6 +93,9 @@ interface MessageContentSegmentsProps {
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
   /** The message these are, under which its prose reports its typing. */
   messageId?: string;
+  /** The thread that holds this turn's task runs when it is another thread's:
+   *  a turn a fork borrowed, whose task cards open there. */
+  taskThreadId?: string | null;
 }
 
 interface TextBlockProps {
@@ -175,11 +178,11 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return block.segment.capturedImages ? <CapturedImagesContext.Provider value={block.segment.capturedImages}>{body}</CapturedImagesContext.Provider> : body;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId, taskThreadId = null }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const motionSafe = useMotionSafe();
   const {
-    onOpenSubagentTask, onOpenFile, onToolCallDetailClick, onOpenChart,
+    onOpenSubagentTask: openSubagentTask, onOpenFile, onToolCallDetailClick, onOpenChart,
     onAnswerQuestion, onSkipQuestion,
     onApproveCreateWorkspace, onRejectCreateWorkspace,
     onApproveStartQuestion, onRejectStartQuestion,
@@ -191,6 +194,12 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     onWidgetSendPrompt,
     widgetExports, // DALTON-HOOK(shared-widgets): export actions this surface offers
   } = useMessageActions();
+  const onOpenSubagentTask = useMemo(
+    () => (openSubagentTask && taskThreadId
+      ? (info: SubagentInfo) => openSubagentTask(info, taskThreadId)
+      : openSubagentTask),
+    [openSubagentTask, taskThreadId],
+  );
 
   // Stable, because `ActivityBlock` is memoized and its other props survive a
   // render that only advanced the typewriter. A fresh closure here would hand

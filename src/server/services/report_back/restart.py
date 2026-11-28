@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 from src.server.contracts.status import (
+    COMPUTER_LOST_REASON,
+    RESTART_REASON_META,
     asked_for,
     is_restart_interrupted,
     restart_resume_expired,
@@ -73,6 +75,9 @@ class OwedResume:
     source_run_id: Optional[str] = None
     # DALTON-HOOK(cos-settings-tools): interrupted run id so restart resume distinguishes automation continuations from normal user turns
     interrupted_run_id: Optional[str] = None
+    #: Whether the turn stopped because its Claude Code computer stopped
+    #: answering, rather than for a restart.
+    computer_lost: bool = False
 
     @property
     def report_source(self) -> None:
@@ -81,10 +86,15 @@ class OwedResume:
     def message(self, *, steered: bool) -> str:
         lines = ["<system>"]
         if self.interrupted:
+            cause = (
+                "because the connection to the computer running it was lost"
+                if self.computer_lost
+                else "by a routine deployment before it finished"
+            )
             lines.append(
-                "Your previous turn was paused by a routine deployment before it "
-                "finished. Continue where you left off. Before repeating a tool "
-                "call from that turn, check whether it already took effect."
+                f"Your previous turn was paused {cause}. Continue where you left "
+                "off. Before repeating a tool call from that turn, check whether "
+                "it already took effect."
             )
         if self.tasks:
             lines.append(self.stopped_tasks_notice(also=self.interrupted))
@@ -92,10 +102,11 @@ class OwedResume:
         return "\n".join(lines)
 
     def stopped_tasks_notice(self, *, also: bool) -> str:
-        lines = [
-            ("The deployment also paused" if also else "A routine deployment paused")
-            + " these background subagents before they finished:"
-        ]
+        if self.computer_lost:
+            cause = "The lost connection also paused" if also else "A lost connection to the computer paused"
+        else:
+            cause = "The deployment also paused" if also else "A routine deployment paused"
+        lines = [f"{cause} these background subagents before they finished:"]
         for task in self.tasks:
             description = " ".join((task.description or "").split())
             lines.append(
@@ -194,6 +205,14 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         retry_run_id = str(run_id)
     if not interrupted and not tasks:
         return NotOwed("nothing the restart stopped is left", wake=False)
+    computer_lost = interrupted and (state["metadata"] or {}).get(RESTART_REASON_META) == COMPUTER_LOST_REASON
+    if computer_lost and state.get("resumes_lost_computer"):
+        # The resume of a turn that lost its computer lost it again: a
+        # machine that keeps dropping would otherwise resume without end.
+        # The subagents its stop took down are still offered back.
+        if not tasks:
+            return NotOwed("the turn resuming a lost computer lost it again", wake=False)
+        interrupted, retry_run_id = False, None
     # DALTON-HOOK(automation-subscription-fallback): carry interrupted run's execution link on restart resume
     # DALTON-HOOK(automation-effort): also read automation_source_execution_id for post-graph wakeup/continuation resumes
     # (pre-graph pending input above checks only firing-owned automation_execution_id so wakeups recover via /retry)
@@ -220,6 +239,7 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         automation_execution_id=execution_id or None,
         source_run_id=(str(run_id) if interrupted else None),  # DALTON-HOOK(team-model-catalog)
         interrupted_run_id=str(run_id),  # DALTON-HOOK(cos-settings-tools)
+        computer_lost=computer_lost,
     )
 
 

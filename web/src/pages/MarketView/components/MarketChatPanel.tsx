@@ -60,14 +60,16 @@ import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
 import { readMarketViewRoute } from '../utils/marketRoute';
-import { normalizeTimeframe } from '../utils/chartInstanceKey';
-import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stores/chartSelectionStore';
-import { buildMarketSendContexts } from '../utils/selectionSend';
+import { buildMarketSendContexts } from '../utils/marketSend';
 import { layerAskContext } from '../utils/layerAsk';
-import { SelectionChips } from './SelectionChips';
 // DALTON-HOOK(composer-drafts): clear new-chat draft on explicit New Chat action
 import { clear as clearChatDraft } from '@/lib/dalton/chatDrafts';
 import { useChartAskHandler, useChartComposer } from '@/components/chart/chartComposer';
+import { whenTaken, type ChatCommentSends } from '../../ChatAgent/components/artifactComments/useChatCommentSends';
+import { QueuedCommentDeck } from '../../ChatAgent/components/artifactComments/QueuedCommentDeck';
+import { useDeckComposer } from '../../ChatAgent/components/artifactComments/useDeckComposer';
+import type { ArtifactCommentRef } from '../../ChatAgent/components/artifactComments/artifactCommentReply';
+import { useMarketCommentSends } from '../hooks/useMarketCommentSends';
 import './MarketPanel.css';
 
 /** Compact status banner shown above the input (interrupt, compaction, etc.). */
@@ -127,6 +129,14 @@ interface MarketChatPanelProps {
   onJumpToChart?: (symbol: string, timeframe: string) => void;
   /** DALTON-HOOK(watchlist): optional personal watchlist snapshot attached only in private sessions. */
   watchlistContext?: string | null;
+  /**
+   * The chat's comment sends, for the chart beside it, which sends its
+   * comments here as a file panel does to the chat beside it; null once
+   * this chat is gone.
+   */
+  onCommentSends?: (sends: Pick<ChatCommentSends, 'sender' | 'sends'> | null) => void;
+  /** Brings a comment on the chart beside forward: a line in this chat named it. */
+  onOpenChartComment?: (comment: ArtifactCommentRef) => void;
 }
 
 function PanelLoading(): React.ReactElement {
@@ -296,6 +306,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onReturnToChat,
     onJumpToChart,
     watchlistContext,
+    onCommentSends,
+    onOpenChartComment,
     activeWorkspaceId,
     initialThreadId,
     onSelectThread,
@@ -324,22 +336,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // the content mounts only once there is a transcript to show.
   const [messagesContainer, setMessagesContainer] = useState<HTMLDivElement | null>(null);
   const [transcript, setTranscript] = useState<HTMLDivElement | null>(null);
-
-  // The user's confirmed chart selections (region / price level). Render a chip
-  // per selection that still matches the live chart instance — selections drawn
-  // on another ticker/timeframe are stale and dropped on send anyway.
-  const { selections } = useChartSelections();
-  const liveSym = symbol ? symbol.toUpperCase() : '';
-  const liveTf = normalizeTimeframe(interval);
-  const chips = useMemo(
-    () => selections.filter((s) => isConfirmedFor(s, liveSym, liveTf)),
-    [selections, liveSym, liveTf],
-  );
-  // DALTON-HOOK(chat-attachment-count): confirmed chart region crops count toward MAX_FILES
-  const confirmedChartImageCount = useMemo(
-    () => chips.filter((s) => Boolean(s.croppedImage)).length,
-    [chips],
-  );
 
   // With no workspace to pick, the scope picker still offers the Chief of Staff
   // and says why the workspace list is empty.
@@ -477,6 +473,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const teamReadOnly = useTeamReadOnly(activeWorkspaceId, activeWorkspace);
   const canMarkSeen = !isDaltonAuth || Boolean(activeWorkspaceId && activeWorkspace && !teamReadOnly.isReadOnly);
   useActiveThreadPublisher(threadId, { canMarkSeen });
+  // The thread once the server has named it; undefined for a new chat.
+  const realThreadId = threadId && threadId !== '__default__' ? threadId : undefined;
 
   // The Chief of Staff's turn may start on another Default than the account's.
   // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home), activeTurnModel, and createdThreadId like ChatView
@@ -562,11 +560,35 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     chartImageRef.current = chartImage;
   }, [chartImage]);
 
+  // The comments queued for this thread's next send, shown above the text
+  // box, and the sender the chart's comment layer sends through. A comment
+  // sent alone carries the chart's skill too, as every send here does.
+  const { deck: commentDeck, take: takeQueuedComments, openers: commentOpeners } = useMarketCommentSends({
+    threadId: realThreadId,
+    workspaceId: activeWorkspaceId,
+    running: isLoading,
+    watch: chat.watchCommentSends,
+    sendToChat: (artifactComments) => whenTaken((onTaken) => {
+      const market = buildMarketSendContexts(symbol, interval, collectViews());
+      return handleSendMessage('', [market.skill], null, {
+        ...readComposerOptions(),
+        artifactComments,
+        onTaken,
+        ...(market.chartViews.length > 0 ? { chartViews: market.chartViews } : {}),
+        subagentsAllowed: subagentsToSend,
+        ...tuningToSend,
+      });
+    }),
+    onCommentSends,
+    onOpenChartComment,
+  });
+  const deckComposer = useDeckComposer(chatInputRef);
+
   // Send: shape attachments + chart screenshot like ChatAgent does.
   const handleSend = useCallback(
     ({ message, files, commands, modelOptions }: ComposerSend) => {
       const slashCommands = commands as SlashCommandLike[];
-      const send = buildMarketSendContexts(symbol, interval, message, collectViews());
+      const send = buildMarketSendContexts(symbol, interval, collectViews());
       const contexts: Record<string, unknown>[] = symbol ? [send.skill] : [];
       // DALTON-HOOK(watchlist): auto-attach personal watchlist_context ONLY in private unshared sessions
       const cachedThreads = queryClient.getQueryData<{ threads?: Array<{ thread_id: string; is_shared?: boolean }> }>(queryKeys.threads.byWorkspace(activeWorkspaceId));
@@ -595,11 +617,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       contexts.push(...attached.contexts);
       metaItems.push(...attached.meta);
 
-      // The confirmed selections on the chart on screen; a lone note becomes
-      // the message text when the user typed nothing (so the bubble isn't empty).
-      contexts.push(...send.contexts);
-      metaItems.push(...send.attachments);
-
       // DALTON-HOOK(chat-attachment-count): prevent sending files + chart screenshots past MAX_FILES
       if (countContextAttachments(contexts) > MAX_FILES) {
         toast({
@@ -611,27 +628,26 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
+      // The queued comments go with every send, the text as their note.
+      const artifactComments = takeQueuedComments(message);
 
       // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when
-      // sending fails. The screenshot and confirmed selections ride this one send, so they are
-      // spent only once the server accepts it: a refused send (the budget gate, the network)
-      // leaves them on the chart to send again.
-      // Spend only what this send carried: a selection confirmed or a screenshot retaken while
-      // it waited for acceptance belongs to the next send.
-      const sentSelectionIds = chartSelectionStore.getConfirmedFor(liveSym, liveTf).map((sel) => sel.id);
+      // sending fails. The screenshot rides this one send, so it is spent only once the server
+      // accepts it: a refused send (the budget gate, the network) leaves it to send again.
+      // Spend only what this send carried: a screenshot retaken while it waited for acceptance
+      // belongs to the next send.
       const sentImage = chartImage;
       const spendChartContext = () => {
         if (sentImage && chartImageRef.current === sentImage) onClearChartImage();
-        for (const id of sentSelectionIds) chartSelectionStore.remove(id);
       };
       // DALTON-HOOK(antigravity-series): tag outgoing Dalton sends with the active manual model pick sequence so queued sends never clear a newer unsent pick
       const modelPickSeq = isDaltonBuild && modelOptions?.model && modelOptions.model === threadModel.sendModel
         ? threadModel.sendModelSeq
         : undefined;
-      const sent = handleSendMessage(send.outgoingMessage, additionalContext, attachmentMeta, {
+      const sent = handleSendMessage(message, additionalContext, attachmentMeta, {
         ...modelOptions,
         ...(modelPickSeq != null ? { modelPickSeq } : {}),
-        ...(send.snapshots.length > 0 ? { chartSelections: send.snapshots } : {}),
+        ...(artifactComments ? { artifactComments } : {}),
         ...(send.chartViews.length > 0 ? { chartViews: send.chartViews } : {}),
         subagentsAllowed: subagentsToSend,
         ...tuningToSend,
@@ -642,12 +658,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq, watchlistContext, teamReadOnly.isColleague, scope, activeWorkspace],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq, watchlistContext, teamReadOnly.isColleague, scope, activeWorkspace, takeQueuedComments],
   );
 
   // DALTON-HOOK(chat-attachment-count): reject capturing a new chart screenshot when already at MAX_FILES
   const handleCaptureChart = useCallback(() => {
-    if (!chartImage && (chatInputRef.current?.getAttachmentCount() ?? confirmedChartImageCount) >= MAX_FILES) {
+    if (!chartImage && (chatInputRef.current?.getAttachmentCount() ?? 0) >= MAX_FILES) {
       toast({
         title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
         variant: 'destructive',
@@ -655,7 +671,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       return;
     }
     onCaptureChart();
-  }, [chartImage, confirmedChartImageCount, onCaptureChart, t]);
+  }, [chartImage, onCaptureChart, t]);
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
   // stopWorkflow aborts the stream reader, finalizes the open message with a
@@ -673,8 +689,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Action slash commands (/compact, /offload). Mirrors ChatView's handler so
   // the input's action verbs do the same thing here.
   const handleAction = useCallback((cmd: ActionCommandLike) => {
-    if (!threadId || threadId === '__default__') return;
-    const thread = forThread(threadId);
+    if (!realThreadId) return;
+    const thread = forThread(realThreadId);
 
     const surfaceActionError = (err: unknown, fallbackKey: string, busyKey = 'chat.compactBusy') => {
       const resp = (err as { response?: { status?: number; data?: unknown } } | undefined)?.response;
@@ -695,7 +711,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
     if (cmd.name === 'compact') {
       setIsCompacting?.('summarize');
-      summarizeThread(threadId)
+      summarizeThread(realThreadId)
         .then((data: Record<string, unknown>) => {
           setIsCompacting?.(false);
           thread.landCompaction({
@@ -706,7 +722,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError'); setIsCompacting?.(false); });
     } else if (cmd.name === 'offload') {
       setIsCompacting?.('offload');
-      offloadThread(threadId)
+      offloadThread(realThreadId)
         .then((data: Record<string, unknown>) => {
           setIsCompacting?.(false);
           thread.landCompaction({
@@ -719,13 +735,13 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         })
         .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError', 'chat.offloadBusy'); setIsCompacting?.(false); });
     }
-  }, [threadId, setIsCompacting, forThread, t]);
+  }, [realThreadId, setIsCompacting, forThread, t]);
 
   // Subagent navigation — chips deep-link to ChatAgent for full subagent view.
   const handleOpenSubagentTask = useCallback((info: SubagentInfo) => {
-    if (!info.subagentId || !threadId || threadId === '__default__') return;
-    onNavigateSubagent?.(threadId, info.subagentId);
-  }, [threadId, onNavigateSubagent]);
+    if (!info.subagentId || !realThreadId) return;
+    onNavigateSubagent?.(realThreadId, info.subagentId);
+  }, [realThreadId, onNavigateSubagent]);
 
   // Main transcript only: the panel keeps no subagent cards (it hands the
   // chat engine no card updater), so a subagent's own rows never render here
@@ -786,8 +802,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // gone, and the files of a send a stop held back come back to the composer,
   // beside whatever was typed there since.
   useComposerGiveBack(chatInputRef, chat);
-  // A thread the server has named, so a failed turn's banner can offer "Report this".
-  const reportThreadId = threadId && threadId !== '__default__' ? threadId : undefined;
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
   const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
@@ -805,6 +819,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const publishAllowed =
     !teamReadOnly.isColleague && identity.canActAsOwner && !identity.isConfirming;
   const messageActions = useMemo<MessageActions>(() => ({
+    onOpenArtifactComment: commentOpeners,
     onOpenSubagentTask: stableOpenSubagentTask,
     onToolCallDetailClick: stableToolCallDetail,
     onAnswerQuestion: stableAnswerQuestion,
@@ -833,7 +848,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onWidgetSendPrompt: stableWidgetSendPrompt,
     onRevealMessage: follow.reveal,
     ...(publishAllowed ? { onPublishFile } : {}), // DALTON-HOOK(external-share-guard)
-    reportThreadId,
+    // A thread the server has named, so a failed turn's banner can offer "Report this".
+    reportThreadId: realThreadId,
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
@@ -842,7 +858,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction, // DALTON-HOOK(watchlist)
     stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, reportThreadId, // DALTON-HOOK(external-share-guard)
+    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, realThreadId, // DALTON-HOOK(external-share-guard)
+    commentOpeners,
   ]);
 
   // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
@@ -850,11 +867,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // workspace, since only the Chief of Staff hands work off to the workspaces.
   // Memoized: a fresh object per render would defeat the memoized bubbles downstream.
   const dispatcherContext = useMemo(
-    () =>
-      scope === 'all' && threadId && threadId !== '__default__'
-        ? { threadId, workspaceId: activeWorkspaceId }
-        : null,
-    [scope, threadId, activeWorkspaceId],
+    () => (scope === 'all' && realThreadId ? { threadId: realThreadId, workspaceId: activeWorkspaceId } : null),
+    [scope, realThreadId, activeWorkspaceId],
   );
 
   const showQuickQueries = messages.length === 0 && !isLoading && !isLoadingHistory;
@@ -862,13 +876,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Continue the current conversation in the full ChatView page. `/chat/t/:id`
   // resolves the thread's workspace on its own; we also pass it via state to
   // skip the lookup. Available once a real thread exists.
-  const canOpenInChat = !!threadId && threadId !== '__default__';
   const handleOpenInChat = useCallback(() => {
-    if (!threadId || threadId === '__default__') return;
-    navigate(`/chat/t/${threadId}`, {
+    if (!realThreadId) return;
+    navigate(`/chat/t/${realThreadId}`, {
       state: { workspaceId: activeWorkspaceId },
     });
-  }, [navigate, threadId, activeWorkspaceId]);
+  }, [navigate, realThreadId, activeWorkspaceId]);
 
   // Shared styling for the header's right-hand action chip.
   const headerBtnStyle: React.CSSProperties = {
@@ -900,7 +913,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Session title: first user message text (truncated) or fallback to "New chat".
   const newChatLabel = t('marketView:chatHistory.newChat');
   const activeTitle = useMemo(() => {
-    if (!threadId || threadId === '__default__') return newChatLabel;
+    if (!realThreadId) return newChatLabel;
     const firstUser = (messages as unknown as Array<Record<string, unknown>>).find(
       (m) => (m.role as string) === 'user',
     );
@@ -908,7 +921,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     const trimmed = raw.trim();
     if (!trimmed) return newChatLabel;
     return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
-  }, [messages, threadId, newChatLabel]);
+  }, [messages, realThreadId, newChatLabel]);
 
   return (
     <div className="market-panel">
@@ -933,7 +946,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
           onSelectThread={onSelectThread}
           onStartNewChat={onStartNewChat}
         />
-        {canOpenInChat ? (
+        {realThreadId ? (
           <button
             type="button"
             onClick={handleOpenInChat}
@@ -972,7 +985,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             </p>
             {messageError && (
               <div style={{ margin: '16px 24px 0', maxWidth: '100%', width: '100%' }}>
-                <ErrorBanner error={messageError} reportThreadId={reportThreadId} />
+                <ErrorBanner error={messageError} reportThreadId={realThreadId} />
               </div>
             )}
           </div>
@@ -996,7 +1009,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             </ChartSurfaceContext>
             {messageError && (
               <div style={{ margin: '8px 0' }}>
-                <ErrorBanner error={messageError} reportThreadId={reportThreadId} />
+                <ErrorBanner error={messageError} reportThreadId={realThreadId} />
               </div>
             )}
           </div>
@@ -1066,9 +1079,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         </div>
       )}
 
-      {/* Chart selection chips, directly above the input like the status banners. */}
-      <SelectionChips chips={chips} />
-
       {/* Input */}
       <ChatInput
         ref={chatInputRef}
@@ -1103,13 +1113,19 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onRemoveChartImage={onClearChartImage}
         prefillMessage={prefillMessage}
         onClearPrefill={onClearPrefill}
-        hasExternalContext={chips.length > 0}
-        // DALTON-HOOK(chat-attachment-count): reserve slots for confirmed chart crops
-        externalAttachmentCount={confirmedChartImageCount}
+        hasExternalContext={commentDeck.ready.length > 0}
+        deck={(
+          <QueuedCommentDeck
+            deck={commentDeck}
+            running={isLoading}
+            onOpen={commentOpeners}
+            {...deckComposer}
+          />
+        )}
         placeholder={
           wasStopped && !isLoading && !pendingInterrupt
             ? t('chat.placeholderStopped')
-            : (placeholder ?? t('marketView:chatPanel.defaultPlaceholder'))
+            : (commentDeck.placeholder ?? placeholder ?? t('marketView:chatPanel.defaultPlaceholder'))
         }
         threadModels={threadModels}
         tokenUsage={tokenUsage}

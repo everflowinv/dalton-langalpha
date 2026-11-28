@@ -65,7 +65,7 @@ import { namesStagedFiles, stagedFilesOf, type AttachmentMeta } from '../utils/f
 import { discardAttachment, freshenStaged } from '../utils/attachmentUpload';
 import type { HitlResponseBody } from '@/types/api';
 import type { AssistantMessage, UserMessage, ChatMessage } from '@/types/chat';
-import type { ArtifactCommentsShown } from '@/types/api';
+import type { ArtifactCommentsShown, ForkDividerEvent } from '@/types/api';
 import type { PreviewData } from './utils/types';
 import type { ComposerDraft } from '@/components/ui/chat-input.types';
 import { createRecentlySentTracker } from './utils/recentlySentTracker';
@@ -414,6 +414,10 @@ export function useChatMessages(
 
   // Token usage tracking (for context window progress ring)
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
+  // Where a fork's borrowed turns end, from the replay of the page that
+  // holds the line; null until that page is loaded, and in a thread that is
+  // no such fork.
+  const [forkDivider, setForkDivider] = useState<ForkDividerEvent | null>(null);
   // What the next send summarizes first, as the server last read it.
   const [nextSummary, setNextSummary] = useState<NextSummary | null>(null);
   // Whether the stream still owes the next reading (`StreamRuntime`).
@@ -876,6 +880,7 @@ export function useChatMessages(
     setFallbackSuggestion,
     setThreadModels,
     setTokenUsage,
+    setForkDivider,
     setNextSummary,
     setReloadTrigger,
     setHasActiveSubagents,
@@ -1053,6 +1058,7 @@ export function useChatMessages(
         setMessages([]);
         setThreadModels([]);
         setTokenUsage(null);
+        setForkDivider(null);
         setNextSummary(null);
         nextSummaryOwedRef.current = false;
         setFallbackSuggestion(null);
@@ -2454,7 +2460,7 @@ export function useChatMessages(
       acceptedFired = true;
       onAccepted?.();
     };
-    const { widgetSnapshots, chartSelections, artifactComments, chartViews } = modelOptions;
+    const { widgetSnapshots, artifactComments, chartViews } = modelOptions;
     const commentSend = commentSendOf(artifactComments);
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -2469,7 +2475,7 @@ export function useChatMessages(
     // key for its own re-send.
     const requestKey = requestKeys.take(sendFingerprint(threadId, message, commentSend), { alongside: true, key: resend.requestKey, comments: artifactComments });
     const userMessage: ChatMessage = {
-      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta, widgetSnapshots, chartSelections, artifactComments, id: resend.shown?.userId }),
+      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta, widgetSnapshots, artifactComments, id: resend.shown?.userId }),
       steering: true,
       requestKey,
       ...(currentRunIdRef.current ? { steeredRunId: currentRunIdRef.current } : {}),
@@ -2776,7 +2782,6 @@ export function useChatMessages(
       ...createUserMessage(message, newestTurn(liveMessages.get()) ?? undefined, {
         attachments: attachmentMeta,
         widgetSnapshots: modelOptions.widgetSnapshots,
-        chartSelections: modelOptions.chartSelections,
         artifactComments: modelOptions.artifactComments,
         id: shown?.userId,
       }),
@@ -2909,7 +2914,11 @@ export function useChatMessages(
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
   // DALTON-HOOK(antigravity-series): preserve modelPickSeq across queued/steered/resent sends so turn-end only clears the pick actually sent
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, modelPickSeq, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, sharedWithWorkspace, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, modelPickSeq, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, sharedWithWorkspace, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews, onTaken }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+    // A new chat's placeholder is no thread a send can be found in.
+    const tookIn = (tid: string | null | undefined) => {
+      if (tid && tid !== '__default__') onTaken?.(tid);
+    };
     // What the request carries, and a resend of it again.
     const commentSend = commentSendOf(artifactComments);
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0) || !!commentSend;
@@ -2960,7 +2969,6 @@ export function useChatMessages(
       const queuedMsg = createUserMessage(message, undefined, {
         attachments: attachmentMeta,
         widgetSnapshots,
-        chartSelections,
         artifactComments,
       });
       const queuedMessage: ChatMessage = { ...queuedMsg, queued: true };
@@ -2994,7 +3002,7 @@ export function useChatMessages(
         additionalContext,
         attachmentMeta,
         // The draft rides along, for a stop to give back as the composer held it.
-        modelOptions: { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext, chartViews, draft },
+        modelOptions: { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, artifactComments, keepFullContext, chartViews, draft },
         messageId: queuedMessage.id as string,
         requestKey,
         onAccepted,
@@ -3008,6 +3016,7 @@ export function useChatMessages(
       });
       setQueuedSend(message.trim() || '…');
       // DALTON-HOOK(composer-drafts): no acceptance here — see the promise above
+      tookIn(threadId);
       return outcome ?? true;
     }
 
@@ -3026,7 +3035,8 @@ export function useChatMessages(
       // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
       // only when a composer is behind it.
       // DALTON-HOOK(antigravity-series): preserve modelPickSeq across queued not_running sends
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
+      tookIn(threadId);
       return outcome ?? true;
     }
 
@@ -3035,7 +3045,10 @@ export function useChatMessages(
 
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      // The steer takes its request before its first wait.
+      const steered = handleSendSteering(message, additionalContext, attachmentMeta, { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      tookIn(threadId);
+      return steered;
     }
 
     // Store model options so HITL resume can forward them
@@ -3048,7 +3061,6 @@ export function useChatMessages(
     const userMessage = hiddenOpener ? null : createUserMessage(message, turnIndex, {
       attachments: attachmentMeta,
       widgetSnapshots,
-      chartSelections,
       artifactComments,
       id: resend.shown?.userId,
     });
@@ -3062,6 +3074,7 @@ export function useChatMessages(
     // now, and the comments are on their way from the click.
     const takeKey = (tid: string) => requestKeys.take(sendFingerprint(tid, message, commentSend), { key: resend.requestKey, comments: artifactComments });
     const keyNow = !threadId || threadId === '__default__' ? null : takeKey(threadId);
+    if (keyNow) tookIn(threadId);
 
     // Track model used in this send
     if (model) {
@@ -3173,6 +3186,8 @@ export function useChatMessages(
     const requestKey = keyNow ?? takeKey(effectiveThreadId);
     // DALTON-HOOK(antigravity-series): retain first submitted model & pickSeq per requestKey for 409 duplicate adoption
     turnModelTrackerRef.current.recordSubmission(requestKey, { model: model || null, pickSeq: modelPickSeq ?? null });
+    // A send with no words learns its new thread's id from the server's first frame.
+    if (!keyNow) tookIn(effectiveThreadId);
     // How the request ended for its comments, unless the server answered first.
     let ended: SendOutcome = 'dropped';
     let wasDisconnected = false;
@@ -3243,6 +3258,7 @@ export function useChatMessages(
           currentRunIdRef.current = runId;
           if (resolvedThreadId && resolvedThreadId !== '__default__') {
             threadIdRef.current = resolvedThreadId;
+            if (!keyNow && effectiveThreadId === '__default__') tookIn(resolvedThreadId);
           }
         },
         signal: abortController.signal,
@@ -4689,6 +4705,7 @@ export function useChatMessages(
     liveMessages: liveView,
     threadId,
     threadModels,
+    forkDivider,
     isLoading,
     // DALTON-HOOK(antigravity-series): expose activeTurnModel & createdThreadId for Dalton turn-pick & tuning handle binding
     activeTurnModel,

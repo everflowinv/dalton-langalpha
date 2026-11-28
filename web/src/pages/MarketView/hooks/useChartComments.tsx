@@ -1,0 +1,103 @@
+/**
+ * The owner's comments on MarketChart in one place: whether comment mode is
+ * on, the Comment tool for the toolbar, and the layer over the chart. Only
+ * the Light chart draws them, so the Advanced chart turns the mode off.
+ */
+import { useEffect, useMemo, type ReactNode, type RefObject } from 'react';
+import type { IChartApi, ISeriesApi } from 'lightweight-charts';
+import { useTranslation } from 'react-i18next';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(artifact-publishing-off)
+import { useTeamReadOnly } from '@/pages/ChatAgent/components/dalton/TeamSharing'; // DALTON-HOOK(team-sharing)
+import { ChartComments, type ChartCommentsHost } from '@/pages/ChatAgent/components/viewers/comments/chart/ChartComments';
+import { CommentTools } from '@/pages/ChatAgent/components/viewers/html/comments/CommentTools';
+import type { ChartLayerDrawing } from './useChartLayerIntegration';
+
+/** What the layer reads off the chart as it is drawn. */
+interface ChartOn {
+  chart: IChartApi | null;
+  seriesRef: RefObject<ISeriesApi<'Candlestick'> | null>;
+  content: HTMLElement | null;
+  drawing: ChartLayerDrawing;
+  interval: string;
+}
+
+export interface ChartCommentsWiring {
+  /** Comment mode is on: the chart's own explain card stands down. */
+  mode: boolean;
+  /** The Comment tool, or nothing where comments cannot be kept. */
+  tools: ReactNode;
+  /** The comment layer over the chart, or nothing off the Light chart. */
+  layer: (on: ChartOn) => ReactNode;
+}
+
+export function useChartComments(
+  host: ChartCommentsHost | null,
+  isCustom: boolean,
+  {
+    workspaceId,
+    chartId,
+    workspace,
+  }: {
+    workspaceId: string | null | undefined;
+    chartId: string | null;
+    workspace?: {
+      user_id?: string | null;
+      name?: string | null;
+      effective_web_access?: string | null;
+      colleague_dispatch_enabled?: boolean | null;
+    } | null;
+  },
+): ChartCommentsWiring {
+  const { t } = useTranslation();
+  // DALTON-HOOK(artifact-publishing-off): chart comments ride the deployment's
+  // file-comments switch and reuse file-comment caller identity and workspace
+  // ownership checks (external/unconfirmed callers and colleague workspaces get no entry).
+  const { artifactCommentsEnabled } = useCapabilities();
+  const identity = useCallerIdentity(); // DALTON-HOOK(external-share-guard)
+  const teamReadOnly = useTeamReadOnly(workspaceId, workspace); // DALTON-HOOK(team-sharing)
+  const canComment =
+    artifactCommentsEnabled
+    && identity.canActAsOwner
+    && !identity.isConfirming
+    && !teamReadOnly.isColleague;
+  const comments = canComment ? host : null;
+  const mode = isCustom && !!comments && comments.ui.modeTab === comments.tabId;
+  const { setMode } = host?.ui ?? {};
+  const tab = host?.tabId;
+  useEffect(() => {
+    if ((!isCustom || !canComment) && tab) setMode?.(tab, false);
+  }, [isCustom, canComment, tab, setMode]);
+
+  const kept = comments && workspaceId && chartId ? { comments, workspaceId, chartId } : null;
+  // The same element while nothing it shows changes, so a live bar repainting the chart passes it by.
+  const tools = useMemo(() => comments && workspaceId && chartId && (
+    <div className="chart-tool-buttons">
+      <CommentTools
+        tabId={comments.tabId}
+        workspaceId={workspaceId}
+        target={{ kind: 'chart', path: chartId }}
+        ui={comments.ui}
+        variant="chart"
+        modeTitle={t('pageViewer:comments.modeTitleChart')}
+      />
+    </div>
+  ), [comments, workspaceId, chartId, t]);
+  // Only the parts of the drawing the layer reads, each stable across live bars, reach the memoized layer.
+  const layer = ({ chart, seriesRef, content, drawing: { render }, interval }: ChartOn) => kept && isCustom && (
+    <ChartComments
+      host={kept.comments}
+      workspaceId={kept.workspaceId}
+      chartId={kept.chartId}
+      chart={chart}
+      seriesRef={seriesRef}
+      content={content}
+      grid={render.grid}
+      identities={render.identities}
+      primitiveRef={render.primitiveRef}
+      seriesKeysRef={render.seriesKeysRef}
+      interval={interval}
+    />
+  );
+  return { mode, tools, layer };
+}

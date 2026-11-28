@@ -46,9 +46,9 @@ vi.mock('../artifactComments/sendContext', async (importOriginal) => {
   return {
     ...actual,
     useArtifactCommentSender: () => ({
-      besideThreadId: commentSenderState.besideThreadId,
-      sendToThread: vi.fn(),
-      startThread: vi.fn(),
+      beside: commentSenderState.besideThreadId ? { threadId: commentSenderState.besideThreadId } : null,
+      running: false,
+      send: vi.fn(),
     }),
   };
 });
@@ -57,7 +57,7 @@ vi.mock('../artifactComments/useCommentDestinations', async (importOriginal) => 
   const actual = await importOriginal<typeof import('../artifactComments/useCommentDestinations')>();
   return {
     ...actual,
-    useCommentDestinations: (workspaceId: string | null | undefined, docPath: string | null | undefined) => {
+    useCommentDestinations: (workspaceId: string | null | undefined, docPath: { kind: 'file' | 'chart'; path: string } | null) => {
       if (commentDestState.canBind && workspaceId && docPath) {
         return {
           choices: [
@@ -87,6 +87,7 @@ vi.mock('../artifactComments/commentSends', async (importOriginal) => {
 
 function makeArtifact(overrides: Partial<Artifact>): Artifact {
   return {
+    kind: 'file' as const,
     artifact_id: 'art-a',
     code: 'code-a',
     url: '/a/code-a',
@@ -980,7 +981,7 @@ describe('Mobile HTML More menu R5: linked-doc separation, inline versions & PDF
         <>
           {scenario.ownerTools && (
             <>
-              <CommentTools tabId="tab-1" workspaceId="ws-1" path="reports/a.html" ui={ownerUi} variant="crumb" />
+              <CommentTools tabId="tab-1" workspaceId="ws-1" target={{ kind: 'file', path: 'reports/a.html' }} ui={ownerUi} variant="crumb" />
               <PinPageButton workspaceId="ws-1" path="reports/a.html" threadId="th-beside" />
               <ArtifactCrumbs view={ownerVersionView} onReview={vi.fn()} readAt={100} />
             </>

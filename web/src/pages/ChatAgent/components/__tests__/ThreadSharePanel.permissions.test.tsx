@@ -162,6 +162,7 @@ describe('ThreadSharePanel, ShareButton, and FileHeaderActions permissions', () 
     h.sharedLinks = [];
     h.saveThreadSharing.mockResolvedValue(undefined);
     h.unshareArtifact.mockResolvedValue({
+      kind: 'file' as const,
       artifact_id: 'art-1',
       code: 'c1',
       url: '/a/c1',
@@ -310,6 +311,7 @@ describe('ThreadSharePanel, ShareButton, and FileHeaderActions permissions', () 
   it('shows stop-share entry in FileHeaderActions when a historical public monitor exists despite artifact.shared=false', async () => {
     const openUnshareOnly = vi.fn();
     h.findArtifact.mockResolvedValue({
+      kind: 'file' as const,
       artifact_id: 'art-legacy',
       code: 'legacy-code',
       url: '/a/legacy-code',
@@ -432,6 +434,7 @@ describe('ThreadSharePanel, ShareButton, and FileHeaderActions permissions', () 
     const openPublish = vi.fn();
     const openUnshareOnly = vi.fn();
     h.findArtifact.mockResolvedValue({
+      kind: 'file' as const,
       artifact_id: 'art-owner-legacy',
       code: 'owner-code',
       url: '/a/owner-code',

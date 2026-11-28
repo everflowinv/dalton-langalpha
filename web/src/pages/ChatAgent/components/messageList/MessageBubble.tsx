@@ -1,7 +1,7 @@
 import { useSharedBubble } from './SharedThreadContext';
 import React, { useContext, useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Building2, Check, Copy, FileSearch, GitBranch, Info, Pencil, RefreshCw, RotateCcw, SquarePen, StopCircle, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react';
+import { Building2, Check, Copy, FileSearch, GitBranch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp, WifiOff } from 'lucide-react';
 import { useAccount } from '@/hooks/useAccount';
 import { ThumbDownDialog } from '../ThumbDownSentDialog';
 import FigureEightLoading, { FADE_MS } from '@/components/ui/figure-eight-loading';
@@ -15,9 +15,8 @@ import { ReportFailure } from '@/components/ui/error-banner';
 import { isReportable } from '@/lib/upstreamFailure';
 import { SentMessageBody } from './SentMessageBody';
 import type { StructuredError } from '@/utils/rateLimitError';
-import { countDedupedSources, type CreditPauseState, type MessageProvenance, type UserMessage, type PendingToolCallChunk, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
+import { countDedupedSources, type CreditPauseState, type MessageProvenance, type UserMessage, type PendingToolCallChunk, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState, type TurnStop } from '@/types/chat';
 import { TextShimmer } from '@/components/ui/text-shimmer';
-import type { SelectionPreviewShape } from '../SelectionContextPreview';
 import { AttachmentCard, InlineSelectionCards, InlineWidgetDeck } from './attachments';
 import type { AttachmentData, WidgetChipShape } from './attachments';
 import { MessageContentSegments } from './MessageContentSegments';
@@ -38,7 +37,9 @@ import { sentMessageForCopy, sentMessageWords } from './sentMessage';
 import { TurnFileCards } from './TurnFileCards';
 import { QuietEndLine } from './QuietEndLine';
 import type { QuietEnd } from '../../session/wakeupEvents';
-import type { ArtifactCommentsShown, ThreadForkCut } from '@/types/api';
+import type { ArtifactCommentsShown } from '@/types/api';
+import { Loader } from '@/components/ui/loader';
+import { useForkButtonState } from '../../hooks/forkMutation';
 import { CommentSendBody } from '../artifactComments/CommentSendBody';
 import { InPlaceSwap } from '@/components/ui/crossfade';
 import { CollapseClockContext, isFreshSend, playEntrance, turnEndDelays } from './transcriptMotion';
@@ -70,17 +71,24 @@ function useStillFor(busy: boolean, ms: number): boolean {
   return still;
 }
 
-/** The stopped chip of a turn its account's suspension ended, in the same
- *  quiet ink as the user's own stop: neither theirs nor a fault. */
-function SuspensionStopChip(): React.ReactElement {
+/** The stopped chip closing a stopped turn, in quiet ink, not red: the
+ *  user's own stop, their account's suspension, or a computer that stopped
+ *  answering, none of them a fault of the turn. */
+function StopChip({ stop }: { stop: TurnStop }): React.ReactElement {
+  const { t } = useTranslation();
   const { orgT } = useAccount();
+  const [Icon, label] = stop === 'suspension'
+    ? [Building2, orgT('organization.suspended.turnStopped')]
+    : stop === 'computer_lost'
+      ? [WifiOff, t('chat.computerLostChip')]
+      : [StopCircle, t('chat.stoppedChip')];
   return (
     <div
       className="inline-flex items-center gap-1.5 self-start mt-1 text-xs"
       style={{ color: 'var(--color-text-tertiary)' }}
     >
-      <Building2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      <span>{orgT('organization.suspended.turnStopped')}</span>
+      <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span>{label}</span>
     </div>
   );
 }
@@ -109,25 +117,18 @@ const ACTION_BUTTON = 'tap-target press p-1 min-h-7 min-w-7 inline-flex items-ce
 const ICON = 'h-3.5 w-3.5';
 const QUIET_INK = { color: 'var(--color-text-tertiary)' };
 
-/** A copy of the chat into a new one. The button holds itself while its
- *  request runs, as feedback; the host keeps it to one copy at a time across
- *  the transcript, shows a refusal and opens the new chat. */
-function ForkActionButton({ cut, turnIndex, icon: Icon, label }: {
-  cut: ThreadForkCut;
-  turnIndex: number;
-  icon: LucideIcon;
-  label: string;
-}): React.ReactElement {
-  const { onForkFromTurn } = useMessageActions();
-  const [pending, setPending] = useState(false);
-  const fork = () => {
-    if (!onForkFromTurn || pending) return;
-    setPending(true);
-    void onForkFromTurn(turnIndex, cut).finally(() => setPending(false));
-  };
+/** A new chat carrying on from this one through this reply. The button
+ *  spins while its fork is made, beside the sidebar's row for it, and every
+ *  fork button holds while any fork is, since one runs at a time. The host
+ *  shows a refusal and opens the new chat. */
+function ForkActionButton({ turnIndex }: { turnIndex: number }): React.ReactElement {
+  const { t } = useTranslation();
+  const { onForkFromTurn, reportThreadId } = useMessageActions();
+  const { forking, held } = useForkButtonState(reportThreadId, turnIndex);
+  const label = forking ? t('chat.actions.forking') : t('chat.actions.forkFromHere');
   return (
-    <button onClick={fork} disabled={pending} className={ACTION_BUTTON} title={label} aria-label={label}>
-      <Icon className={ICON} style={QUIET_INK} />
+    <button onClick={() => onForkFromTurn?.(turnIndex)} disabled={held} aria-busy={forking} className={ACTION_BUTTON} title={label} aria-label={label}>
+      {forking ? <Loader size={12} style={QUIET_INK} /> : <GitBranch className={ICON} style={QUIET_INK} />}
     </button>
   );
 }
@@ -189,6 +190,9 @@ interface MessageBubbleProps {
    *  of its first call): the message that opened it has not reached the model
    *  and draws as pending, and the reply draws no indicator under it. */
   held?: boolean;
+  /** Set on a turn a fork borrowed: the thread that holds it, where it is
+   *  changed and rated, and where its task cards open. */
+  borrowedFrom?: string | null;
 }
 
 /**
@@ -197,7 +201,7 @@ interface MessageBubbleProps {
  * MessageActionsContext (one identity-stable object per host), so a streamed
  * chunk never re-renders settled bubbles through a handler identity.
  */
-export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, endsReply = isTurnTail, canRegenerate = true, isLatestReply = true, isTurnLive, turnFiles, completedAt, quietEnd, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext, continuesSender, held = false }: MessageBubbleProps): React.ReactElement | null {
+export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, endsReply = isTurnTail, canRegenerate = true, isLatestReply = true, isTurnLive, turnFiles, completedAt, quietEnd, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext, continuesSender, held = false, borrowedFrom = null }: MessageBubbleProps): React.ReactElement | null {
   const { onOpenFile, onDownloadFile, onRevealFiles, onOpenSources, onEditMessage, editDrafts, onRegenerate, onRetry, onForkFromTurn, onThumbUp, onThumbDown, onThumbDownFollowUp, reportThreadId, feedbackLoading } = useMessageActions();
   const { t } = useTranslation();
   const root = useWorkspaceFolders()?.rootDir;
@@ -209,7 +213,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   const hasAttachments = isUser && attachments && attachments.length > 0;
   const widgetSnapshots = message.widgetSnapshots as WidgetChipShape[] | undefined;
   const hasWidgetSnapshots = isUser && widgetSnapshots && widgetSnapshots.length > 0;
-  const chartSelections = message.chartSelections as SelectionPreviewShape[] | undefined;
+  const chartSelections = message.chartSelections as UserMessage['chartSelections'];
   const hasChartSelections = isUser && chartSelections && chartSelections.length > 0;
   const provenance = isUser ? (message.provenance as MessageProvenance | undefined) : undefined;
   const shared = useSharedBubble(message as UserMessage, turnIndex);
@@ -355,11 +359,14 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   // regenerating a reply the task can still change asks about an answer that
   // does not exist yet. `isLoading` stays in the condition on its own account:
   // it hides every other turn's controls while the session loads.
-  const showActions = canShowActions && !turnLive && !isLoading;
-  // Copying the chat into a new one changes nothing here, so a turn running
-  // in this thread holds back only the reply it is still writing: a finished
-  // reply forks through itself, and any sent message forks before itself.
-  const showFork = canShowActions && (isUser || !turnLive);
+  const turnSettled = canShowActions && !turnLive;
+  const showActions = turnSettled && !isLoading;
+  // The actions on a turn of the thread's own. A turn a fork borrowed is the
+  // original's, shown from there: it keeps the Copy button, and is changed,
+  // rated and forked from only in the original. Fork needs only `ownTurn`;
+  // the rest also wait out the session's running turn (`ownActions`).
+  const ownTurn = turnSettled && !borrowedFrom;
+  const ownActions = ownTurn && !isLoading;
   // The footer buttons this bubble draws. The row shows, takes the focus and
   // shows its time only when one is drawn.
   const visible = {
@@ -371,26 +378,24 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     // message, which the server keeps theirs to rewrite (`canRewrite` already
     // says so for their turn).
     // DALTON-HOOK(chat-large-upload): hide edit pencil on failed steers and unadmitted attachment sends
-    edit: showActions && isUser && !!onEditMessage && !isSteering && !artifactComments && !message.queueError && !(message.unadmitted && hasAttachments) && shared.canRewrite && !theirs,
-    // The same turn's message in a new chat, to change and send there. It
-    // changes nothing here, so it needs no say over this thread's turns; a
-    // steer or a send of comments has no turn of its own to stop before.
-    editInNewChat: showFork && isUser && !!onForkFromTurn && turnIndex !== null && !isPendingDelivery && !isSteering && !artifactComments,
+    edit: ownActions && isUser && !!onEditMessage && !isSteering && !artifactComments && !message.queueError && !(message.unadmitted && hasAttachments) && shared.canRewrite && !theirs,
     // Both roles (a user bubble falls back to message.content).
     copy: showActions,
-    thumbUp: showActions && isAssistant && !hasError && !!onThumbUp,
-    thumbDown: showActions && isAssistant && !hasError && !!onThumbDown,
+    thumbUp: ownActions && isAssistant && !hasError && !!onThumbUp,
+    thumbDown: ownActions && isAssistant && !hasError && !!onThumbDown,
     // One regenerate per backend turn, on the turn's last bubble:
     // regenerating re-runs the whole turn from its input checkpoint (mid-run
     // steering can't be replayed), so the affordance sits at the end of the
     // full response. A turn that opened hidden has none: that checkpoint
     // lacks the words its context carried.
-    regenerate: showActions && isAssistant && (!hasError || unloaded) && !!onRegenerate && !!isTurnTail && canRegenerate && shared.canRewrite,
+    regenerate: ownActions && isAssistant && (!hasError || unloaded) && !!onRegenerate && !!isTurnTail && canRegenerate && shared.canRewrite,
     // A rule's refusal gets the same answer however often it is sent.
-    retry: showActions && isAssistant && hasError && !unloaded && !!onRetry && isLatestReply && !failure?.ruleStop && shared.canRewrite,
+    retry: ownActions && isAssistant && hasError && !unloaded && !!onRetry && isLatestReply && !failure?.ruleStop && shared.canRewrite,
     // The conversation through this reply, copied into a new chat. On the
     // turn's last bubble, as regenerate is, since it copies the whole turn.
-    fork: showFork && isAssistant && !!isTurnTail && !!onForkFromTurn && turnIndex !== null && (!hasError || hasBody) && !unloaded,
+    // It changes nothing here, so a running turn holds back only its own
+    // reply, and the thread's turns need not be the viewer's to rewrite.
+    fork: ownTurn && isAssistant && !!isTurnTail && !!onForkFromTurn && turnIndex !== null && (!hasError || hasBody) && !unloaded,
   };
   const rowShown = Object.values(visible).some(Boolean);
   // A message shows when it was sent and a reply when its turn ended. A
@@ -525,9 +530,6 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         <Pencil className={ICON} style={QUIET_INK} />
       </button>
     )}
-    {visible.editInNewChat && (
-      <ForkActionButton cut="before_turn" turnIndex={turnIndex!} icon={SquarePen} label={t('chat.actions.editInNewChat')} />
-    )}
 
     {/* Copy, then assistant-only: ThumbUp -> ThumbDown -> Regenerate/Retry */}
     {visible.copy && (
@@ -592,7 +594,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
       </button>
     )}
     {visible.fork && (
-      <ForkActionButton cut="through_turn" turnIndex={turnIndex!} icon={GitBranch} label={t('chat.actions.forkFromHere')} />
+      <ForkActionButton turnIndex={turnIndex!} />
     )}
     {!atEnd && shownTime}
   </div>
@@ -643,6 +645,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         othersPause={!shared.answersPause}
         dispatcherContext={dispatcherContext}
         messageId={replyId}
+        taskThreadId={borrowedFrom}
       />
       </CitationMetadataProvider>
     ) : (
@@ -840,23 +843,9 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
           />
         )}
 
-        {/* Per-message "⏹ Stopped" marker — the turn was hard-stopped by the
-            user (live finalize or replay of a stopped turn). Quiet ink, not
-            red: a stop is the user's own action, not a loss/error state. */}
-        {isAssistant && message.stopped && (
-          message.stopped === 'suspension' ? (
-            // Not the user's stop: their account's access ended mid-turn.
-            <SuspensionStopChip />
-          ) : (
-          <div
-            className="inline-flex items-center gap-1.5 self-start mt-1 text-xs"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          >
-            <StopCircle className="h-3.5 w-3.5 shrink-0" />
-            <span>{t('chat.stoppedChip')}</span>
-          </div>
-          )
-        )}
+        {/* The turn was stopped: by its user (live or replayed), by its
+            account's suspension, or by its computer going offline. */}
+        {isAssistant && message.stopped && <StopChip stop={message.stopped as TurnStop} />}
 
         {/* The assistant's meta row: what the turn drew on, and what you can do
             with it, on one line closing the turn.

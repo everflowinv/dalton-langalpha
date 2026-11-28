@@ -38,6 +38,9 @@ import { useTitleFade } from '@/hooks/useTitleFade';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
+import { draftKeys, useWaitingDraft } from '@/lib/composerDrafts';
+import { DraftMark, DraftPencil } from '@/components/ui/draft-mark';
+import { NewThreadDraftRow, ThreadDraftLine } from './navDraftRows';
 import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useThreadFlags } from '@/lib/threadLifecycle/store';
@@ -45,6 +48,8 @@ import type { User } from '@/types/api';
 import type { TeamWorkspacesResponse } from './dalton/TeamSharing';
 // DALTON-HOOK(coverage-tree): the workspace row's sector/member chip text
 //(resolved per row in NavigationPanel; no coverage import needed here)
+import { usePendingForks } from '../hooks/forkMutation';
+import { PendingForkRow } from './PendingForkRow';
 import { sidebarAgentRowLabel, type SidebarAgentRow } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
 import type { NavWorkspace } from '../hooks/useNavigationData';
@@ -139,6 +144,7 @@ function ThreadRowTitle({ tid, title, active, onActivate }: {
   tid: string; title: string; active: boolean; onActivate: () => void;
 }) {
   const fading = useTitleFade(title);
+  const draft = useWaitingDraft(draftKeys.thread(tid));
   return (
     <span
       data-nav-key={`thread:${tid}:title`}
@@ -152,6 +158,7 @@ function ThreadRowTitle({ tid, title, active, onActivate }: {
       className={cn('text-sm truncate', fading && 'animate-fade-in', active && 'rail-prompt')}
       style={{ color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}
     >
+      {draft !== null && <><DraftMark prefix />{' '}</>}
       {title}
     </span>
   );
@@ -222,6 +229,7 @@ function ThreadMetaCard({ thread, title, t }: {
         {title}
       </div>
       <ThreadMetaRows thread={thread} t={t} />
+      <ThreadDraftLine tid={thread.thread_id} />
     </HoverCardContent>
   );
 }
@@ -1009,9 +1017,10 @@ function WorkspaceTreeRowImpl({
   const isPinned = Boolean(ws.is_pinned);
   const machine = useRowMachine(ws);
   const threads = threadsData?.threads || [];
+  const pendingForks = usePendingForks(wsId);
   // Row-order signature for the thread rows' glide: rows re-measure only when
   // membership or order actually changes, not on every panel render.
-  const threadOrderSignature = threads.map((th) => th.thread_id).join('|');
+  const threadOrderSignature = [...pendingForks.map((f) => f.key), ...threads.map((th) => th.thread_id)].join('|');
   const threadsLoading = threadsData?.loading || false;
   const isRenaming = rename.active;
   // DALTON-HOOK(colleague-dispatch): gate workspace row actions by ownership and caller tier
@@ -1040,6 +1049,12 @@ function WorkspaceTreeRowImpl({
   // A closed shared workspace says it holds something unread; open, its
   // threads say which.
   const unreadMark = !!shared?.hasUnread && !isExpanded;
+  // A new thread written here and not sent: a row of its own atop the open
+  // workspace, the pencil on the closed one.
+  const newDraftKey = draftKeys.newThread(wsId);
+  const newDraft = useWaitingDraft(onNewThread ? newDraftKey : null);
+  const draftMark = newDraft !== null && !isExpanded;
+  const trailingMark = unreadMark || draftMark;
   const onRenameRow = (menu: 'dropdown' | 'context') => (
     menu === 'context' ? requestRename : canRename ? () => rename.onStart(wsId, ws.name || '') : undefined
   );
@@ -1123,15 +1138,16 @@ function WorkspaceTreeRowImpl({
                       {coverageChip}
                     </span>
                   )}
-                  {unreadMark && (
-                    <span className="ml-auto flex shrink-0 items-center">
-                      <UnseenMark label={t('nav.workspaceUnread')} />
+                  {trailingMark && (
+                    <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {draftMark && <DraftPencil draftKey={newDraftKey} />}
+                      {unreadMark && <UnseenMark label={t('nav.workspaceUnread')} />}
                     </span>
                   )}
                   {/* Chevron + row actions float over the name's tail on hover
                       (as thread rows do), so the name keeps the full row width
                       instead of truncating around controls that are not showing. */}
-                  <div className={isMobile ? `nav-panel-row-actions-mobile flex items-center gap-0.5 ${unreadMark ? '' : 'ml-auto '}shrink-0` : 'nav-panel-row-actions'}>
+                  <div className={isMobile ? `nav-panel-row-actions-mobile flex items-center gap-0.5 ${trailingMark ? '' : 'ml-auto '}shrink-0` : 'nav-panel-row-actions'}>
                     <span className="shrink-0 flex items-center">
                       <ChevronRight
                         className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
@@ -1210,7 +1226,8 @@ function WorkspaceTreeRowImpl({
             shrinks to header height (clean gap), and the DragOverlay chip
             carries the visual instead. */}
         <kit.Collapse show={isExpanded && !isDragging}>
-          {!threadsLoading && threads.length === 0 && (
+          {newDraft !== null && <NewThreadDraftRow preview={newDraft} onOpen={() => onNewThread?.(wsId)} />}
+          {!threadsLoading && threads.length === 0 && pendingForks.length === 0 && newDraft === null && (
             <div
               className="text-xs px-2 py-1"
               style={{ paddingLeft: 34, color: 'var(--color-icon-muted)' }}
@@ -1219,6 +1236,11 @@ function WorkspaceTreeRowImpl({
             </div>
           )}
           <kit.ThreadList>
+            {pendingForks.map((fork) => (
+              <kit.ThreadItem key={fork.key} order={threadOrderSignature}>
+                <PendingForkRow fork={fork} />
+              </kit.ThreadItem>
+            ))}
             {threads.map((thread) => (
               <kit.ThreadItem key={thread.thread_id} order={threadOrderSignature}>
                 {/* DALTON-HOOK(colleague-dispatch): forward workspace and caller identity to ThreadTreeRow */}

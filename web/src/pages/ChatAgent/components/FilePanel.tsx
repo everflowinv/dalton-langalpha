@@ -1036,7 +1036,7 @@ function FilePanel({
                   <CommentTools
                     tabId={activeTab.id}
                     workspaceId={workspaceId}
-                    path={htmlDocState.path}
+                    target={{ kind: 'file', path: htmlDocState.path }}
                     ui={comments}
                     variant="crumb"
                     modeDisabled={fileComments.view?.versionView.version !== null || htmlView.source}
@@ -1195,6 +1195,8 @@ function FilePanel({
               <ActiveTabBody
                 activeTab={activeTab}
                 browser={browserView}
+                commentUi={comments ?? null}
+                active={isActive !== false}
                 tabs={tabs}
                 workspaceId={workspaceId}
                 apiAdapter={apiAdapter}

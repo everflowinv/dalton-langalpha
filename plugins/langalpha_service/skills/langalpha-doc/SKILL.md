@@ -9,15 +9,15 @@ You run on a **computer**: one sandbox machine that belongs to the user. Each of
 
 ## Reference files
 
-- The user points back at an earlier conversation or at work done in another thread or workspace; a compaction summary; a background task's steps; a tool result saved to a file: `.agents/skills/langalpha-doc/references/history.md`.
-- Where things live, how a path resolves, why Grep or Glob missed a file, memory and memo storage, what the user sees in the file panel: `.agents/skills/langalpha-doc/references/files.md`.
-- The Drive, the user's files kept across every workspace and computer: whether it is turned on, putting a file in it, files that are not text, a save that did not land, history and trash: `.agents/skills/langalpha-doc/references/drive.md`.
-- Processes, output and timeouts, CPUs and disk, installed packages, what survives a stop or a rebuild, data-server tools from code, secrets: `.agents/skills/langalpha-doc/references/computer.md`.
-- Installing, writing or changing a skill, here or for every workspace: `.agents/skills/langalpha-doc/references/skills.md`.
-- The user wants a new data source, MCP server, brokerage connection or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
+- **Earlier work**: The user points back at an earlier conversation or at work done in another thread or workspace; a compaction summary; a background task's steps; a tool result saved to a file: `.agents/skills/langalpha-doc/references/history.md`.
+- **Files**: Where things live, how a path resolves, why Grep or Glob missed a file, memory and memo storage, what the user sees in the file panel: `.agents/skills/langalpha-doc/references/files.md`.
+- **The Drive**, the user's files kept across every workspace and computer: whether it is turned on, putting a file in it, files that are not text, a save that did not land, history and trash: `.agents/skills/langalpha-doc/references/drive.md`.
+- **The computer**: Processes, output and timeouts, CPUs and disk, installed packages, what survives a stop or a rebuild, data-server tools from code, secrets: `.agents/skills/langalpha-doc/references/computer.md`.
+- **Skills**: Installing a skill, an `npx skills add` command included, or writing, changing or saving one, here or for every workspace: `.agents/skills/langalpha-doc/references/skills.md`.
+- **Data sources and plugins**: The user wants a new data source, MCP server, brokerage connection or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
 <!-- DALTON-HOOK(prompt-audit-text): link settings-map.md and update Dalton chat app list -->
-<!-- DALTON_CAP:channel_gateway -->- Talking with the user in a chat app, or sending a message or file to <!-- DALTON_CAP:channel_feishu -->Feishu<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_discord -->, <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_discord -->Discord<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_weixin --><!-- DALTON_CAP:channel_feishu|channel_discord --> or <!-- /DALTON_CAP -->personal WeChat<!-- /DALTON_CAP -->: `.agents/skills/langalpha-doc/references/chat.md`.
-<!-- /DALTON_CAP -->- Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus <!-- DALTON_CAP:conversation_archive -->Team Memory locations, <!-- /DALTON_CAP -->background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
+<!-- DALTON_CAP:channel_gateway -->- **Chat apps**: Talking with the user in a chat app, or sending a message or file to <!-- DALTON_CAP:channel_feishu -->Feishu<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_discord -->, <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_discord -->Discord<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_weixin --><!-- DALTON_CAP:channel_feishu|channel_discord --> or <!-- /DALTON_CAP -->personal WeChat<!-- /DALTON_CAP -->: `.agents/skills/langalpha-doc/references/chat.md`.
+<!-- /DALTON_CAP -->- **Settings**: Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus <!-- DALTON_CAP:conversation_archive -->Team Memory locations, <!-- /DALTON_CAP -->background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
 
 ## Traps
 

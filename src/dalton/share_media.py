@@ -1194,6 +1194,34 @@ def mint_oss_media_session_cookie(
     return sid_hash, origin_hash
 
 
+_BORROWED_REF_THREAD_PLACEHOLDER = "{seg}"
+
+
+def _redact_borrowed_ref_id(
+    ref_id: str,
+    *,
+    backend: str,
+    source_thread_id: str | None,
+) -> str:
+    """Replace plaintext ``source_thread_id`` segment inside upstream object keys with an opaque placeholder."""
+    if backend != "upstream" or not source_thread_id:
+        return str(ref_id)
+    needle = f"/{source_thread_id}/"
+    if needle in str(ref_id):
+        return str(ref_id).replace(needle, f"/{_BORROWED_REF_THREAD_PLACEHOLDER}/", 1)
+    return str(ref_id)
+
+
+def _expand_borrowed_ref_id(ref_id: str, *, backend: str, source_thread_id: str) -> str:
+    """Restore ``source_thread_id`` into a borrowed upstream object key after lineage resolution."""
+    if backend != "upstream":
+        return str(ref_id)
+    placeholder = f"/{_BORROWED_REF_THREAD_PLACEHOLDER}/"
+    if placeholder in str(ref_id):
+        return str(ref_id).replace(placeholder, f"/{source_thread_id}/", 1)
+    return str(ref_id)
+
+
 def mint_owner_media_token(
     *,
     thread_id: str,
@@ -1204,10 +1232,18 @@ def mint_owner_media_token(
     origin_hash: str = "",
     ttl_seconds: int = MEDIA_TOKEN_TTL_SECONDS,
     now_ts: int | None = None,
+    source_segment_index: int | None = None,
+    source_turn_index: int | None = None,
+    source_thread_id: str | None = None,
 ) -> str:
     """Mint HMAC-signed owner media token bound to viewer, session cookie, origin, and object."""
     now = int(now_ts if now_ts is not None else time.time())
-    payload = {
+    stored_ref = (
+        _redact_borrowed_ref_id(ref_id, backend=str(backend), source_thread_id=source_thread_id)
+        if source_segment_index is not None
+        else str(ref_id)
+    )
+    payload: dict[str, Any] = {
         "v": 1,
         "typ": "dalton_owner_media",
         "tid": str(thread_id),
@@ -1215,9 +1251,14 @@ def mint_owner_media_token(
         "sid": str(sid_hash or ""),
         "org": str(origin_hash or ""),
         "b": str(backend),
-        "ref": str(ref_id),
+        "ref": stored_ref,
         "exp": now + max(60, int(ttl_seconds)),
     }
+    if source_segment_index is not None:
+        if source_turn_index is None:
+            raise ValueError("source_turn_index is required when source_segment_index is set")
+        payload["seg"] = int(source_segment_index)
+        payload["trn"] = int(source_turn_index)
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     p_b64 = _b64u_encode(raw)
     sig = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
@@ -1264,15 +1305,28 @@ def mint_public_media_ref(
     thread_id: str,
     backend: str,
     ref_id: str,
+    source_segment_index: int | None = None,
+    source_turn_index: int | None = None,
+    source_thread_id: str | None = None,
 ) -> str:
     """Mint a thread-bound opaque ``media_ref`` for ``allow_files=True`` shared media routes."""
-    payload = {
+    stored_ref = (
+        _redact_borrowed_ref_id(ref_id, backend=str(backend), source_thread_id=source_thread_id)
+        if source_segment_index is not None
+        else str(ref_id)
+    )
+    payload: dict[str, Any] = {
         "v": 1,
         "typ": "dalton_pub_media",
         "tid": str(thread_id),
         "b": str(backend),
-        "ref": str(ref_id),
+        "ref": stored_ref,
     }
+    if source_segment_index is not None:
+        if source_turn_index is None:
+            raise ValueError("source_turn_index is required when source_segment_index is set")
+        payload["seg"] = int(source_segment_index)
+        payload["trn"] = int(source_turn_index)
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     p_b64 = _b64u_encode(raw)
     sig = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
@@ -2020,6 +2074,7 @@ async def _is_attachment_bound_to_thread(
     allowed_owner_ids: Iterable[str] | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
     registry: ThreadMediaRegistry | None = None,
+    turn_indices: Iterable[int] | None = None,
 ) -> bool:
     """Verify an ``attachments/*`` object key is bound to ``thread_id`` (fail closed)."""
     if not thread_id or not _is_safe_object_key(key):
@@ -2027,7 +2082,7 @@ async def _is_attachment_bound_to_thread(
     cleaned = strip_private_media_prefix(key)
     if not cleaned.startswith("attachments/"):
         return False
-    if cleaned.startswith(f"attachments/{thread_id}/"):
+    if turn_indices is None and cleaned.startswith(f"attachments/{thread_id}/"):
         return True
 
     parts = cleaned.split("/")
@@ -2047,7 +2102,7 @@ async def _is_attachment_bound_to_thread(
         reg_att_ids = resolved_registry.attachment_ids
     else:
         resolved_registry = await _load_thread_media_registry_from_db(
-            thread_id, owner_id=owner_id
+            thread_id, owner_id=owner_id, turn_indices=turn_indices
         )
         if resolved_registry is None:
             return False
@@ -2081,6 +2136,7 @@ async def _is_chat_upload_bound_to_thread(
     owner_id: str | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
     registry: ThreadMediaRegistry | None = None,
+    turn_indices: Iterable[int] | None = None,
 ) -> set[str]:
     """Return allowed uploader ``user_id``s if ``upload_id`` is registered on ``thread_id``; empty set otherwise."""
     uid = str(upload_id or "").strip()
@@ -2091,7 +2147,9 @@ async def _is_chat_upload_bound_to_thread(
     if queries is not None:
         reg = _collect_thread_media_registry(thread_id, owner_id=owner_id, queries=queries)
         return set(reg.upload_id_owners.get(uid) or ())
-    loaded = await _load_thread_media_registry_from_db(thread_id, owner_id=owner_id)
+    loaded = await _load_thread_media_registry_from_db(
+        thread_id, owner_id=owner_id, turn_indices=turn_indices
+    )
     if loaded is None:
         return set()
     return set(loaded.upload_id_owners.get(uid) or ())
@@ -2272,17 +2330,6 @@ async def resolve_thread_media_bindings(
     )
     if registry is None:
         return None
-
-    # Merge steering_delivered items from the current page (e.g., cold-projected before turn_slices persist).
-    for item in item_list:
-        if isinstance(item, Mapping) and item.get("event") == "steering_delivered":
-            data = item.get("data")
-            if isinstance(data, Mapping):
-                _register_steering_messages_into_registry(
-                    data.get("messages"),
-                    registry,
-                    default_owner_id=owner_id,
-                )
 
     bindings: dict[str, tuple[str, str]] = {}
 
@@ -2484,32 +2531,106 @@ def _rewrite_item_urls(
     return item
 
 
+def match_borrowed_segment_index(lineage: Any, part: Any) -> int | None:
+    """Resolve the opaque 0-based ancestor segment index in ``lineage.borrow.ancestors`` for ``part``."""
+    ancestors = getattr(getattr(lineage, "borrow", None), "ancestors", None) or ()
+    if not ancestors:
+        return None
+    part_tid = str(getattr(part, "thread_id", "") or "")
+    if not part_tid:
+        return None
+    part_turns: list[int] = []
+    for ln in getattr(part, "lines", None) or ():
+        item = ln.item() if hasattr(ln, "item") else (ln if isinstance(ln, Mapping) else None)
+        data = item.get("data") if isinstance(item, Mapping) else None
+        t = data.get("turn_index") if isinstance(data, Mapping) else None
+        if isinstance(t, int) and not isinstance(t, bool):
+            part_turns.append(t)
+
+    first_match: int | None = None
+    for idx, seg in enumerate(ancestors):
+        if str(seg.thread_id) != part_tid:
+            continue
+        if first_match is None:
+            first_match = idx
+        if part_turns and all(seg.first_turn <= t <= seg.through_turn for t in part_turns):
+            return idx
+    return first_match
+
+
+def _extract_item_turn_index(item: Mapping[str, Any]) -> int | None:
+    data = item.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    turn = data.get("turn_index")
+    if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 0:
+        return turn
+    return None
+
+
 def rewrite_items_for_public_media(
     items: list[dict[str, Any]],
     *,
     thread_id: str,
     share_token: str,
     bindings: Mapping[str, tuple[str, str]] | None,
+    source_segment_index: int | None = None,
+    source_thread_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
 
     Fail-closed: when ``bindings is None`` or any configured-storage URL could
     not be signed into a controlled media ref, that raw object URL is erased
-    rather than left verbatim in the replay payload.
+    rather than left verbatim in the replay payload. When ``source_segment_index``
+    is provided (borrowed ancestor part), each item's media refs are bound to
+    both that opaque segment index and the item's ``turn_index``.
     """
     if bindings is None:
         return [_strip_raw_storage_urls_from_item(it) for it in items]
-    url_map: dict[str, str] = {}
-    upload_id_map: dict[str, str] = {}
-    for key, (backend, ref_id) in bindings.items():
-        ref = mint_public_media_ref(thread_id=thread_id, backend=backend, ref_id=ref_id)
-        controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
-        if key.startswith("upload_id:"):
-            upload_id_map[key[len("upload_id:") :]] = controlled
-        else:
-            url_map[key] = controlled
-    out: list[dict[str, Any]] = []
+
+    def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
+        u_map: dict[str, str] = {}
+        up_map: dict[str, str] = {}
+        for key, (backend, ref_id) in bindings.items():
+            ref = mint_public_media_ref(
+                thread_id=thread_id,
+                backend=backend,
+                ref_id=ref_id,
+                source_segment_index=source_segment_index,
+                source_turn_index=turn_idx,
+                source_thread_id=source_thread_id,
+            )
+            controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
+            if key.startswith("upload_id:"):
+                up_map[key[len("upload_id:") :]] = controlled
+            else:
+                u_map[key] = controlled
+        return u_map, up_map
+
+    if source_segment_index is None:
+        url_map, upload_id_map = _build_maps(None)
+        out: list[dict[str, Any]] = []
+        for it in items:
+            rewritten = (
+                _rewrite_item_urls(it, url_map, upload_id_map)
+                if (url_map or upload_id_map)
+                else it
+            )
+            out.append(_strip_raw_storage_urls_from_item(rewritten))
+        return out
+
+    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
+    out = []
     for it in items:
+        turn_idx = _extract_item_turn_index(it)
+        if turn_idx is None:
+            out.append(_strip_raw_storage_urls_from_item(it))
+            continue
+        pair = maps_by_turn.get(turn_idx)
+        if pair is None:
+            pair = _build_maps(turn_idx)
+            maps_by_turn[turn_idx] = pair
+        url_map, upload_id_map = pair
         rewritten = (
             _rewrite_item_urls(it, url_map, upload_id_map)
             if (url_map or upload_id_map)
@@ -2527,35 +2648,75 @@ def rewrite_lines_for_owner_media(
     bindings: Mapping[str, tuple[str, str]] | None,
     sid_hash: str = "",
     origin_hash: str = "",
+    source_segment_index: int | None = None,
+    source_thread_id: str | None = None,
 ) -> list[Any]:
     """Rewrite stored media URLs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``.
 
     Fail-closed: when ``bindings is None`` or any configured-storage URL could
     not be signed into a controlled media token, that raw object URL is erased
-    rather than left verbatim in the replay payload.
+    rather than left verbatim in the replay payload. When ``source_segment_index``
+    is provided (borrowed ancestor part), each line's tokens are bound to that
+    opaque segment index and the line's ``turn_index``.
     """
     from src.server.services.history.replay.lines import Line, line_of
 
     if bindings is None:
         return _strip_raw_storage_urls_from_lines(lines)
-    url_map: dict[str, str] = {}
-    upload_id_map: dict[str, str] = {}
-    for key, (backend, ref_id) in bindings.items():
-        tok = mint_owner_media_token(
-            thread_id=thread_id,
-            viewer_id=viewer_id,
-            backend=backend,
-            ref_id=ref_id,
-            sid_hash=sid_hash,
-            origin_hash=origin_hash,
-        )
-        controlled = f"/api/v1/threads/{thread_id}/media/{tok}"
-        if key.startswith("upload_id:"):
-            upload_id_map[key[len("upload_id:") :]] = controlled
-        else:
-            url_map[key] = controlled
 
-    out: list[Any] = []
+    def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
+        u_map: dict[str, str] = {}
+        up_map: dict[str, str] = {}
+        for key, (backend, ref_id) in bindings.items():
+            tok = mint_owner_media_token(
+                thread_id=thread_id,
+                viewer_id=viewer_id,
+                backend=backend,
+                ref_id=ref_id,
+                sid_hash=sid_hash,
+                origin_hash=origin_hash,
+                source_segment_index=source_segment_index,
+                source_turn_index=turn_idx,
+                source_thread_id=source_thread_id,
+            )
+            controlled = f"/api/v1/threads/{thread_id}/media/{tok}"
+            if key.startswith("upload_id:"):
+                up_map[key[len("upload_id:") :]] = controlled
+            else:
+                u_map[key] = controlled
+        return u_map, up_map
+
+    if source_segment_index is None:
+        url_map, upload_id_map = _build_maps(None)
+        out: list[Any] = []
+        for ln in lines:
+            if not isinstance(ln, Line):
+                out.append(ln)
+                continue
+            if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
+                out.append(ln)
+                continue
+            needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
+                bool(upload_id_map) and '"upload_id"' in ln.data_json
+            )
+            has_http = "http" in ln.data_json.lower()
+            if not needs_rewrite and not has_http:
+                out.append(ln)
+                continue
+            raw_item = ln.item()
+            rewritten = (
+                _rewrite_item_urls(raw_item, url_map, upload_id_map)
+                if needs_rewrite
+                else raw_item
+            )
+            cleaned = _strip_raw_storage_urls_from_item(rewritten)
+            out.append(line_of(cleaned) if cleaned is not raw_item else ln)
+        return out
+
+    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
+    has_binding_urls = any(not k.startswith("upload_id:") for k in bindings)
+    has_binding_uploads = any(k.startswith("upload_id:") for k in bindings)
+    out = []
     for ln in lines:
         if not isinstance(ln, Line):
             out.append(ln)
@@ -2563,14 +2724,28 @@ def rewrite_lines_for_owner_media(
         if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
             out.append(ln)
             continue
-        needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
-            bool(upload_id_map) and '"upload_id"' in ln.data_json
-        )
         has_http = "http" in ln.data_json.lower()
-        if not needs_rewrite and not has_http:
+        maybe_upload = has_binding_uploads and '"upload_id"' in ln.data_json
+        if not has_http and not maybe_upload and not has_binding_urls:
             out.append(ln)
             continue
         raw_item = ln.item()
+        turn_idx = _extract_item_turn_index(raw_item)
+        if turn_idx is None:
+            cleaned = _strip_raw_storage_urls_from_item(raw_item)
+            out.append(line_of(cleaned) if cleaned is not raw_item else ln)
+            continue
+        pair = maps_by_turn.get(turn_idx)
+        if pair is None:
+            pair = _build_maps(turn_idx)
+            maps_by_turn[turn_idx] = pair
+        url_map, upload_id_map = pair
+        needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
+            bool(upload_id_map) and '"upload_id"' in ln.data_json
+        )
+        if not needs_rewrite and not has_http:
+            out.append(ln)
+            continue
         rewritten = (
             _rewrite_item_urls(raw_item, url_map, upload_id_map)
             if needs_rewrite
@@ -2588,11 +2763,14 @@ async def prepare_owner_replay_media(
     *,
     thread_id: str,
     viewer_id: str,
+    page: Any | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Mint ``dalton_oss_media_session`` cookie (when applicable) and rewrite owner media URLs.
 
-    Thin-hook entry point for ``src/server/app/threads/messaging.py``. Returns
-    ``(rewritten_lines, set_cookie_headers)``.
+    Thin-hook entry point for ``src/server/app/threads/messaging.py``. When
+    ``page`` carries borrowed ancestor ``PagePart``s, resolves and rewrites each
+    part against its own thread's media registry so inherited screenshots and
+    attachments keep working links. Returns ``(rewritten_lines, set_cookie_headers)``.
     """
     set_cookies: list[str] = []
     sid_hash, origin_hash = "", ""
@@ -2602,6 +2780,70 @@ async def prepare_owner_replay_media(
         if oss_session:
             sid_hash, origin_hash = oss_session
         set_cookies = cookie_holder.headers.getlist("set-cookie")
+
+    parts = getattr(page, "parts", None) if page is not None else None
+    has_borrowed_parts = bool(
+        parts and any(str(getattr(p, "thread_id", "")) != str(thread_id) for p in parts)
+    )
+
+    if has_borrowed_parts:
+        from src.server.services.forks.model import ForkLineage
+
+        rows_thread = getattr(rows, "thread", None)
+        lineage = ForkLineage.parse(
+            rows_thread.get("fork") if isinstance(rows_thread, Mapping) else None
+        )
+        divider = getattr(page, "divider", None)
+        out_lines: list[Any] = [divider] if divider is not None else []
+        for part in parts:
+            part_lines = list(getattr(part, "lines", None) or ())
+            if not part_lines:
+                continue
+            part_tid = str(getattr(part, "thread_id", "") or "")
+            is_borrowed = part_tid != str(thread_id)
+            part_rows = getattr(part, "rows", None)
+            if part_rows is None and not is_borrowed:
+                part_rows = rows
+
+            part_thread_raw = getattr(part_rows, "thread", None) if part_rows is not None else None
+            part_thread_dict = (
+                dict(part_thread_raw) if isinstance(part_thread_raw, Mapping) else {}
+            )
+            part_thread_dict.setdefault("conversation_thread_id", part_tid)
+            part_owner = (
+                getattr(part_rows, "owner_id", None)
+                or getattr(part, "owner_id", None)
+                or part_thread_dict.get("user_id")
+            )
+            if part_owner and not part_thread_dict.get("user_id"):
+                part_thread_dict["user_id"] = str(part_owner)
+            part_queries = getattr(part_rows, "queries", None) or ()
+
+            seg_idx = match_borrowed_segment_index(lineage, part) if is_borrowed else None
+            if is_borrowed and seg_idx is None:
+                part_bindings = None
+            else:
+                part_bindings = await resolve_thread_media_bindings(
+                    part_thread_dict,
+                    part_queries,
+                    [
+                        ln.item()
+                        for ln in part_lines
+                        if ln.event in ("user_message", "message_chunk", "steering_delivered")
+                    ],
+                )
+            rewritten_part = rewrite_lines_for_owner_media(
+                part_lines,
+                thread_id=thread_id,
+                viewer_id=viewer_id,
+                bindings=part_bindings,
+                sid_hash=sid_hash,
+                origin_hash=origin_hash,
+                source_segment_index=seg_idx,
+                source_thread_id=part_tid if is_borrowed else None,
+            )
+            out_lines.extend(rewritten_part)
+        return out_lines, set_cookies
 
     thread_dict = dict(rows.thread) if isinstance(getattr(rows, "thread", None), Mapping) else {}
     thread_dict.setdefault("conversation_thread_id", thread_id)
@@ -2642,6 +2884,7 @@ async def _serve_media_payload(
     backend: str,
     ref_id: str,
     cache_control: str,
+    turn_indices: Iterable[int] | None = None,
 ) -> Response:
     base_headers = {
         "Cache-Control": cache_control,
@@ -2658,7 +2901,7 @@ async def _serve_media_payload(
             if not cleaned.startswith(f"response-images/{thread_id}/"):
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
             registry = await _load_thread_media_registry_from_db(
-                thread_id, owner_id=thread_owner_id or None
+                thread_id, owner_id=thread_owner_id or None, turn_indices=turn_indices
             )
             if registry is None or cleaned not in registry.captured_image_keys:
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
@@ -2667,7 +2910,10 @@ async def _serve_media_payload(
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         elif cleaned.startswith("attachments/"):
             bound = await _is_attachment_bound_to_thread(
-                thread_id, cleaned, owner_id=thread_owner_id or None
+                thread_id,
+                cleaned,
+                owner_id=thread_owner_id or None,
+                turn_indices=turn_indices,
             )
             if not bound:
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
@@ -2684,7 +2930,10 @@ async def _serve_media_payload(
         from src.dalton import chat_upload_storage as chat_store
 
         allowed_users = await _is_chat_upload_bound_to_thread(
-            thread_id, ref_id, owner_id=thread_owner_id or None
+            thread_id,
+            ref_id,
+            owner_id=thread_owner_id or None,
+            turn_indices=turn_indices,
         )
         if not allowed_users:
             raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
@@ -2711,6 +2960,117 @@ async def _serve_media_payload(
     raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
 
 
+def _parse_borrowed_media_claims(
+    claims: Mapping[str, Any], *, err_headers: dict[str, str]
+) -> tuple[int, int] | None:
+    """Extract ``(segment_index, turn_index)`` from borrowed media claims, failing closed on malformed/legacy shapes."""
+    if "stid" in claims:
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+    has_seg = "seg" in claims
+    has_trn = "trn" in claims
+    if not has_seg and not has_trn:
+        return None
+    if not (has_seg and has_trn):
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+    seg = claims.get("seg")
+    trn = claims.get("trn")
+    if (
+        not isinstance(seg, int)
+        or isinstance(seg, bool)
+        or seg < 0
+        or not isinstance(trn, int)
+        or isinstance(trn, bool)
+        or trn < 0
+    ):
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+    return seg, trn
+
+
+def _displayed_turns_in_segment_rows(
+    seg_rows: Any, *, first_turn: int, shown_through: int
+) -> set[int]:
+    """Return turn indices present in ``seg_rows`` within ``[first_turn, shown_through]``."""
+    turns: set[int] = set()
+    for q in getattr(seg_rows, "queries", None) or ():
+        if isinstance(q, Mapping):
+            t = q.get("turn_index")
+            if isinstance(t, int) and not isinstance(t, bool) and first_turn <= t <= shown_through:
+                turns.add(t)
+    responses = getattr(seg_rows, "responses_by_turn", None)
+    if isinstance(responses, Mapping):
+        for t in responses:
+            if isinstance(t, int) and not isinstance(t, bool) and first_turn <= t <= shown_through:
+                turns.add(t)
+    return turns
+
+
+async def _resolve_borrowed_owner_media_target(
+    thread: Mapping[str, Any],
+    *,
+    viewer_id: str,
+    segment_index: int,
+    turn_index: int,
+) -> tuple[str, str, str, tuple[int, ...]]:
+    """Verify a borrowed ancestor owner media token against live lineage, viewer read access, and displayed turn range."""
+    from src.dalton.sharing import check_borrowed_thread_readable
+    from src.server.database.conversation import get_thread_by_id
+    from src.server.services.forks.model import ForkLineage
+    from src.server.services.forks.segments import read_segment
+    from src.server.services.shared_workspaces.access import thread_access
+
+    err_headers = {"Cache-Control": "private, no-store"}
+
+    raw_fork = thread.get("fork") or (thread.get("metadata") or {}).get("fork")
+    lineage = ForkLineage.parse(raw_fork)
+    if (
+        lineage is None
+        or lineage.borrow is None
+        or segment_index >= len(lineage.borrow.ancestors)
+    ):
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+
+    matching_seg = lineage.borrow.ancestors[segment_index]
+    if not (matching_seg.first_turn <= turn_index <= matching_seg.through_turn):
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+
+    source_thread_id = str(matching_seg.thread_id)
+    if is_dalton_multiuser_auth_enabled():
+        await _verify_viewer_thread_read(source_thread_id, viewer_id)
+    else:
+        readable = await check_borrowed_thread_readable(
+            source_thread_id, viewer_id, upstream_access=thread_access
+        )
+        if not readable:
+            raise HTTPException(status_code=403, detail="Forbidden", headers=err_headers)
+
+    seg_state, seg_rows = await read_segment(matching_seg, readable=True, with_rows=True)
+    if (
+        seg_state.shown_through is None
+        or not (matching_seg.first_turn <= turn_index <= seg_state.shown_through)
+        or seg_rows is None
+    ):
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+
+    displayed_turns = _displayed_turns_in_segment_rows(
+        seg_rows, first_turn=matching_seg.first_turn, shown_through=seg_state.shown_through
+    )
+    if turn_index not in displayed_turns:
+        raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+
+    src_ws = str((getattr(seg_rows, "thread", None) or {}).get("workspace_id") or "")
+    src_owner = str(getattr(seg_rows, "owner_id", None) or "")
+    if not src_ws or not src_owner:
+        src_thread = await get_thread_by_id(source_thread_id)
+        if not src_thread:
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+        src_ws = src_ws or str(src_thread.get("workspace_id") or "")
+        src_owner = src_owner or str(
+            src_thread.get("user_id") or src_thread.get("owner_id") or ""
+        )
+
+    return source_thread_id, src_ws, src_owner, (turn_index,)
+
+
 @owner_media_router.get("/{thread_id}/media/{media_token}")
 async def serve_owner_thread_media(
     thread_id: str,
@@ -2720,22 +3080,151 @@ async def serve_owner_thread_media(
     """Serve controlled session media to an authenticated thread viewer."""
     from src.server.database.conversation import get_thread_by_id
 
-    claims, _viewer_id = gate
+    claims, viewer_id = gate
+    err_headers = {"Cache-Control": "private, no-store"}
 
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(
             status_code=404,
             detail="Thread not found",
-            headers={"Cache-Control": "private, no-store"},
+            headers=err_headers,
         )
+
+    target_tid = thread_id
+    target_ws = str(thread.get("workspace_id") or "")
+    target_owner = str(thread.get("user_id") or thread.get("owner_id") or "")
+    turn_indices: tuple[int, ...] | None = None
+
+    borrowed_claim = _parse_borrowed_media_claims(claims, err_headers=err_headers)
+    backend = str(claims.get("b") or "")
+    ref_id = str(claims.get("ref") or "")
+    if borrowed_claim is not None:
+        seg_idx, turn_idx = borrowed_claim
+        target_tid, target_ws, target_owner, turn_indices = (
+            await _resolve_borrowed_owner_media_target(
+                thread,
+                viewer_id=viewer_id,
+                segment_index=seg_idx,
+                turn_index=turn_idx,
+            )
+        )
+        ref_id = _expand_borrowed_ref_id(ref_id, backend=backend, source_thread_id=target_tid)
+
     return await _serve_media_payload(
-        thread_id=thread_id,
-        workspace_id=str(thread.get("workspace_id") or ""),
-        thread_owner_id=str(thread.get("user_id") or thread.get("owner_id") or ""),
-        backend=str(claims.get("b") or ""),
-        ref_id=str(claims.get("ref") or ""),
+        thread_id=target_tid,
+        workspace_id=target_ws,
+        thread_owner_id=target_owner,
+        backend=backend,
+        ref_id=ref_id,
         cache_control="private, no-store",
+        turn_indices=turn_indices,
+    )
+
+
+async def _resolve_borrowed_public_media_target(
+    thread: Mapping[str, Any],
+    *,
+    thread_id: str,
+    segment_index: int,
+    turn_index: int,
+) -> tuple[str, str, str, tuple[int, ...]]:
+    """Verify a borrowed ancestor media ref against live lineage, displayed turn range, and source share settings."""
+    from src.dalton.share_redaction import (
+        _load_threads_for_redaction,
+        _resolve_borrowed_source_permissions,
+    )
+    from src.dalton.sharing import check_borrowed_thread_readable
+    from src.server.services.forks.model import ForkLineage
+    from src.server.services.forks.segments import read_segment
+    from src.server.services.shared_workspaces.access import thread_access
+
+    no_store = {"Cache-Control": "no-store"}
+    deny_headers = {"Cache-Control": "no-store", "Clear-Site-Data": '"cache"'}
+
+    raw_fork = thread.get("fork") or (thread.get("metadata") or {}).get("fork")
+    loaded_fork: dict[str, Any] = {}
+    if raw_fork is None:
+        try:
+            loaded_fork = await _load_threads_for_redaction([thread_id])
+        except Exception:
+            raise HTTPException(
+                status_code=404, detail="Media not found", headers=no_store
+            ) from None
+        raw_fork = (loaded_fork.get(thread_id) or {}).get("fork")
+
+    lineage = ForkLineage.parse(raw_fork)
+    if (
+        lineage is None
+        or lineage.borrow is None
+        or segment_index >= len(lineage.borrow.ancestors)
+    ):
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    matching_seg = lineage.borrow.ancestors[segment_index]
+    if not (matching_seg.first_turn <= turn_index <= matching_seg.through_turn):
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    source_thread_id = str(matching_seg.thread_id)
+    try:
+        loaded = await _load_threads_for_redaction([thread_id, source_thread_id])
+    except Exception:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store) from None
+
+    # Re-parse lineage from fresh DB row when available so stale share snapshots cannot linger.
+    fresh_fork = (loaded.get(thread_id) or {}).get("fork")
+    if fresh_fork is not None:
+        fresh_lineage = ForkLineage.parse(fresh_fork)
+        if (
+            fresh_lineage is None
+            or fresh_lineage.borrow is None
+            or segment_index >= len(fresh_lineage.borrow.ancestors)
+            or str(fresh_lineage.borrow.ancestors[segment_index].thread_id) != source_thread_id
+        ):
+            raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+        lineage = fresh_lineage
+        matching_seg = fresh_lineage.borrow.ancestors[segment_index]
+        if not (matching_seg.first_turn <= turn_index <= matching_seg.through_turn):
+            raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    src_trow = loaded.get(source_thread_id)
+    if src_trow is None or src_trow.get("workspace_status") == "deleted":
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    viewer = lineage.by or str(thread.get("user_id") or thread.get("owner_id") or "")
+    readable = await check_borrowed_thread_readable(
+        source_thread_id, viewer, upstream_access=thread_access
+    )
+    if not readable:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    seg_state, seg_rows = await read_segment(matching_seg, readable=True, with_rows=True)
+    if (
+        seg_state.shown_through is None
+        or not (matching_seg.first_turn <= turn_index <= seg_state.shown_through)
+        or seg_rows is None
+    ):
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    displayed_turns = _displayed_turns_in_segment_rows(
+        seg_rows, first_turn=matching_seg.first_turn, shown_through=seg_state.shown_through
+    )
+    if turn_index not in displayed_turns:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    src_eff = await _resolve_borrowed_source_permissions(src_trow)
+    if not src_eff.allow_files:
+        raise HTTPException(
+            status_code=403,
+            detail="Permission 'allow_files' not granted for this shared thread",
+            headers=deny_headers,
+        )
+
+    return (
+        source_thread_id,
+        str(src_trow.get("workspace_id") or ""),
+        str(src_trow.get("user_id") or src_trow.get("owner_user_id") or ""),
+        (turn_index,),
     )
 
 
@@ -2767,11 +3256,33 @@ async def serve_shared_thread_media(
         )
     thread_id = str(thread["conversation_thread_id"])
     claims = verify_public_media_ref(media_ref, expected_thread_id=thread_id)
+    target_tid = thread_id
+    target_ws = str(thread.get("workspace_id") or "")
+    target_owner = str(thread.get("user_id") or thread.get("owner_id") or "")
+    turn_indices: tuple[int, ...] | None = None
+
+    borrowed_claim = _parse_borrowed_media_claims(
+        claims, err_headers={"Cache-Control": "no-store"}
+    )
+    backend = str(claims.get("b") or "")
+    ref_id = str(claims.get("ref") or "")
+    if borrowed_claim is not None:
+        seg_idx, turn_idx = borrowed_claim
+        target_tid, target_ws, target_owner, turn_indices = (
+            await _resolve_borrowed_public_media_target(
+                thread,
+                thread_id=thread_id,
+                segment_index=seg_idx,
+                turn_index=turn_idx,
+            )
+        )
+        ref_id = _expand_borrowed_ref_id(ref_id, backend=backend, source_thread_id=target_tid)
     return await _serve_media_payload(
-        thread_id=thread_id,
-        workspace_id=str(thread.get("workspace_id") or ""),
-        thread_owner_id=str(thread.get("user_id") or thread.get("owner_id") or ""),
-        backend=str(claims.get("b") or ""),
-        ref_id=str(claims.get("ref") or ""),
+        thread_id=target_tid,
+        workspace_id=target_ws,
+        thread_owner_id=target_owner,
+        backend=backend,
+        ref_id=ref_id,
         cache_control="no-store",
+        turn_indices=turn_indices,
     )

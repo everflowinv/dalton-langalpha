@@ -64,7 +64,8 @@ vi.mock('@/hooks/useArtifact', async (importOriginal) => {
       record: workspaceId ? { artifact_id: 'art-1', code: 'code123', url: '/a/code123' } : undefined,
       error: null,
     }),
-    useArtifactByPath: (_workspaceId: string | null | undefined, path: string | null | undefined) => {
+    useArtifactRecord: (_workspaceId: string | null | undefined, target: { kind: string; path: string } | null) => {
+      const path = target?.path;
       if (!path) return { data: undefined };
       const mapped = hoisted.artifactsByPath[path];
       return {
@@ -229,6 +230,7 @@ function makeArtifactView(version: number | null = null): HtmlArtifactView {
     active: true,
     versionView: {
       record: {
+        kind: 'file' as const,
         artifact_id: 'art-1',
         code: 'code123',
         url: '/a/code123',
@@ -1239,7 +1241,7 @@ describe('Desktop pending ArtifactCrumbs and linked-doc CommentTools parity', ()
 
     const desktopSend = vi.fn().mockResolvedValue({ threadId: 'th-1' });
     const desktopSender: ArtifactCommentSender = {
-      besideThreadId: 'th-1',
+      beside: { threadId: 'th-1' },
       running: false,
       send: desktopSend,
     };
@@ -1250,7 +1252,7 @@ describe('Desktop pending ArtifactCrumbs and linked-doc CommentTools parity', ()
         <CommentTools
           tabId="tab-1"
           workspaceId="ws-1"
-          path="reports/b.html"
+          target={{ kind: 'file', path: 'reports/b.html' }}
           ui={ui}
           variant="crumb"
           modeDisabled
@@ -1269,7 +1271,7 @@ describe('Desktop pending ArtifactCrumbs and linked-doc CommentTools parity', ()
     hoisted.isMobile = true;
     const mobileSend = vi.fn().mockResolvedValue({ threadId: 'th-1' });
     const mobileSender: ArtifactCommentSender = {
-      besideThreadId: 'th-1',
+      beside: { threadId: 'th-1' },
       running: false,
       send: mobileSend,
     };

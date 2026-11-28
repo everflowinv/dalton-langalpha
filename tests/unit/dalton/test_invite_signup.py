@@ -2106,6 +2106,7 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     )
 
     artifact_ext = artifacts_db.Artifact(
+        kind="file",
         artifact_id="40000000-0000-4000-8000-000000000001",
         code="artext12345",
         workspace_id=ws_ext_id,
@@ -2120,6 +2121,7 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         created_at=now,
     )
     artifact_int = artifacts_db.Artifact(
+        kind="file",
         artifact_id="40000000-0000-4000-8000-000000000002",
         code="artint12345",
         workspace_id=ws_int_id,

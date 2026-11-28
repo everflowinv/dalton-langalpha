@@ -1402,6 +1402,61 @@ async def require_workspace_access(
 verify_workspace_access = require_workspace_access
 
 
+async def check_borrowed_thread_readable(
+    thread_id: str,
+    viewer: str,
+    *,
+    upstream_access: Any = None,
+) -> bool:
+    """Check whether ``viewer`` may read borrowed ancestor ``thread_id`` during replay.
+
+    Reuses the same read-access rules as ordinary thread replay:
+    - Outside Dalton multiuser auth: delegates directly to ``upstream_access`` (``thread_access``).
+    - Under Dalton multiuser auth (``supabase`` / ``local``): upstream shared-workspace
+      holders use ``upstream_access``; Dalton workspaces reuse
+      ``require_thread_access(..., channel="web", need="read")`` (covering thread owner,
+      workspace owner, and colleague read access).
+    """
+    from src.server.database.shared_workspaces import is_holder
+    from src.server.services.shared_workspaces.access import (
+        thread_access as default_thread_access,
+    )
+
+    access_fn = upstream_access if upstream_access is not None else default_thread_access
+    if not _multiuser_auth_enabled():
+        try:
+            await access_fn(thread_id, viewer)
+        except HTTPException:
+            return False
+        return True
+
+    meta = await conv_db.get_thread_auth_meta(thread_id)
+    if not meta:
+        return False
+    owner_id = str(meta.get("thread_user_id") or meta.get("user_id") or "").strip()
+    ws_owner_id = str(meta.get("workspace_owner_id") or "").strip() or None
+    if is_holder(owner_id) or (ws_owner_id and is_holder(ws_owner_id)):
+        try:
+            await access_fn(thread_id, viewer)
+        except HTTPException:
+            return False
+        return True
+
+    try:
+        await require_thread_access(
+            thread_id,
+            viewer,
+            channel="web",
+            need="read",
+            owner_id=owner_id or None,
+            workspace_owner_id=ws_owner_id,
+            workspace_id=meta.get("workspace_id"),
+        )
+    except HTTPException:
+        return False
+    return True
+
+
 async def require_thread_access(
     thread_id: str,
     user_id: str | None,

@@ -15,6 +15,7 @@ import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(ex
 import { useEnsureArtifact } from '@/hooks/useArtifact';
 import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { queryKeys } from '@/lib/queryKeys'; // DALTON-HOOK(monitors)
+import { targetFor } from '@/lib/artifactTarget';
 import { ThreadLifecycleFeed } from '@/lib/threadLifecycle/ThreadLifecycleFeed';
 import { getMonitorByArtifact, type MonitorSummary } from '@/pages/Monitors/api'; // DALTON-HOOK(monitors)
 import PublishDialog from '../ChatAgent/components/PublishDialog';
@@ -110,7 +111,7 @@ export default function OwnerArtifactView({ code, metadata }: {
   // in this tab, at the section it named, and Back returns here. The section
   // comes as the link's own fragment, already escaped.
   const openLink = (linked: string, fragment: string) => {
-    ensureArtifact(workspaceId, linked).then(
+    ensureArtifact(workspaceId, targetFor('file', linked)).then(
       (artifact) => window.location.assign(fragment ? `${artifact.url}#${fragment}` : artifact.url),
       () => toast({ description: t('publish:linkFailed'), variant: 'destructive' }),
     );
@@ -154,7 +155,7 @@ export default function OwnerArtifactView({ code, metadata }: {
             {/* DALTON-HOOK(external-share-guard): hide CommentTools and version picker for external or unknown callers */}
             {canUseOwnerComments && (
               <>
-                <CommentTools tabId={VIEW_ID} workspaceId={workspaceId} path={path} ui={ui} variant="bar" modeDisabled={versionView.version !== null} />
+                <CommentTools tabId={VIEW_ID} workspaceId={workspaceId} target={{ kind: 'file', path }} ui={ui} variant="bar" modeDisabled={versionView.version !== null} />
                 <ArtifactVersionPicker view={versionView} variant="bar" />
               </>
             )}

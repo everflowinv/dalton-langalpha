@@ -40,6 +40,7 @@ def _artifact():
     from src.server.database import artifacts as artifacts_db
 
     return artifacts_db.Artifact(
+        kind="file",
         artifact_id=ARTIFACT_ID,
         code="artsw1test",
         workspace_id="ws-switch-1",
@@ -673,16 +674,33 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
     )
     # DALTON-HOOK(artifact-publishing-off): upstream #741/#746/#749 gates Claude Code on claude_code_admitted and passes (sandbox, admitted).
     from ptc_agent.agent.claude_code.launcher import LocalLauncher
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from ptc_agent.core.sandbox.asset_gate import AssetGate
+    from ptc_agent.core.sandbox.drive_mount import NO_DRIVE
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
     config.claude_code_admitted = Admitted()
     target = create_llm("claude-haiku-5-5-code")
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.config = config
+    sandbox.assets = AssetGate()
+    sandbox.livefs = None
+    sandbox.drive = NO_DRIVE
+    sandbox.history = None
+    sandbox.sandbox_id = "sb-switch-1"
+    sandbox.runtime = None
+    sandbox.call_filer = None
+    sandbox.paid_calls = None
+    sandbox.livefs_lost = False
+    mcp_registry = create_autospec(MCPRegistry, instance=True)
+    mcp_registry.get_all_tools.return_value = {}
     with patch.object(AgentConfig, "get_llm_client", return_value=target):
         graph = PTCAgent(config).create_agent(
             llm=target,
             thread_id="t-switch-1",
             user_id="u-1",
-            mcp_registry=MagicMock(),
-            sandbox=MagicMock(),
+            mcp_registry=mcp_registry,
+            sandbox=sandbox,
             claude_code_launcher=lambda sandbox, admitted, *queue, **kw: LocalLauncher(),
         )
     # Upstream #729: a Claude Code graph's turn is the run named by config.

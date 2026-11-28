@@ -15,7 +15,6 @@ import type {
 import type { Attachment } from '@/types/sse';
 import type { ArtifactCommentsShown } from '@/types/api';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
-import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
 import type { AttachmentMeta } from '../../utils/fileUpload';
 
 // Re-export types for consumers
@@ -192,11 +191,10 @@ export function mergeAcceptedAttachments(
 export function createUserMessage(
   message: string,
   turnIndex: number | undefined,
-  { attachments, widgetSnapshots, chartSelections, artifactComments, id }: {
+  { attachments, widgetSnapshots, artifactComments, id }: {
     // DALTON-HOOK(chat-large-upload): normalize caller-owned and server attachment shapes into Attachment[]
     attachments?: ReadonlyArray<AttachmentMeta | Attachment | Record<string, unknown>> | null;
     widgetSnapshots?: WidgetContextSnapshot[] | null;
-    chartSelections?: ChartSelectionSnapshot[] | null;
     artifactComments?: ArtifactCommentsShown | null;
     id?: string;
   } = {},
@@ -219,9 +217,6 @@ export function createUserMessage(
   }
   if (widgetSnapshots && widgetSnapshots.length > 0) {
     msg.widgetSnapshots = widgetSnapshots;
-  }
-  if (chartSelections && chartSelections.length > 0) {
-    msg.chartSelections = chartSelections;
   }
   if (artifactComments && artifactComments.comments.length > 0) {
     msg.artifactComments = artifactComments;
