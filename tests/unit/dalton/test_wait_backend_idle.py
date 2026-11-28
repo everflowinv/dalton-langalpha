@@ -372,3 +372,31 @@ echo "EXITED_LOOPS=$loops"
     )
     assert res2.returncode == 0, f"stderr={res2.stderr} stdout={res2.stdout}"
     assert "EXITED_LOOPS=1" in res2.stdout
+
+
+def test_wait_backend_idle_copied_alone_reads_shared_sql_from_repo(tmp_path: Path) -> None:
+    """The production entry copies only this script and deploy_main.sh to a temp dir."""
+    import shutil
+
+    db_path = tmp_path / "pg.sqlite"
+    _init_fake_db(db_path).close()
+    copied = tmp_path / "entry" / "wait_backend_idle.sh"
+    copied.parent.mkdir()
+    shutil.copy(_WAIT_IDLE_SCRIPT, copied)
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(_FAKE_DOCKER_PY.format(python=sys.executable), encoding="utf-8")
+    fake_docker.chmod(0o755)
+    env = os.environ.copy()
+    env.pop("WAIT_BACKEND_IDLE_SQL_FILE", None)
+    env.update(
+        PATH=f"{fake_bin}:{env.get('PATH', '')}",
+        FAKE_PG_SQLITE_DB=str(db_path),
+        WAIT_BACKEND_IDLE_SLEEP_SECONDS="0",
+        WAIT_BACKEND_IDLE_MAX_CHECKS="2",
+        DALTON_REPO_ROOT=str(_REPO_ROOT),
+    )
+    res = subprocess.run(["bash", str(copied)], env=env, capture_output=True, text=True, timeout=15)
+    assert res.returncode == 0, res.stderr
+    assert "idle after" in res.stdout

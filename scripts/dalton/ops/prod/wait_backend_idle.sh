@@ -8,6 +8,11 @@ MAX_CHECKS="${WAIT_BACKEND_IDLE_MAX_CHECKS:-720}"
 POSTGRES_CONTAINER="${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THREAD_BUSY_SQL_FILE="${WAIT_BACKEND_IDLE_SQL_FILE:-${SCRIPT_DIR}/backend_busy_threads.sql}"
+# The production entry copies only this script and deploy_main.sh to a temp dir; read the shared
+# query from the repo then.
+if [ ! -f "$THREAD_BUSY_SQL_FILE" ] && [ -z "${WAIT_BACKEND_IDLE_SQL_FILE:-}" ] && [ -n "${DALTON_REPO_ROOT:-}" ]; then
+  THREAD_BUSY_SQL_FILE="${DALTON_REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql"
+fi
 if [ ! -f "$THREAD_BUSY_SQL_FILE" ]; then
   echo "ERROR: missing ${THREAD_BUSY_SQL_FILE}" >&2
   exit 1
