@@ -2280,6 +2280,7 @@ def is_near_empty_retry_enabled() -> bool:
     )
 
 
+<<<<<<< HEAD
 BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH = (
     "plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx"
 )
@@ -2304,6 +2305,23 @@ def resolve_default_model_template_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return REPO_ROOT / BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH
+=======
+def is_automation_capacity_retry_enabled() -> bool:
+    """Switch for DB-backed automation capacity backoff retry (``DALTON_AUTOMATION_CAPACITY_RETRY``).
+
+    Defaults to ``True`` (production fix for writer-pool / quota burst exhaustion);
+    disable via ``DALTON_AUTOMATION_CAPACITY_RETRY=0`` or YAML
+    ``autonomy.capacity_retry_enabled: false``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_AUTOMATION_CAPACITY_RETRY",
+        "autonomy",
+        "capacity_retry_enabled",
+        default=True,
+    )
+
+
+>>>>>>> refs/lane/106
 
 
 def get_redis_diag_ops_dir() -> Path:

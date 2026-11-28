@@ -782,10 +782,10 @@ ExecutionStatus = Literal[
 # on (a machine of the user's own) could not be reached: not back before the
 # automation's next firing, or not answering when its turn started.
 SkipReason = Literal["user", "thread_busy", "interrupted", "precheck", "computer_unreachable"]  # DALTON-HOOK(precheck-skip-reason)
-# What a ``waiting`` firing waits for: the turn running in its thread, or the
-# computer its turn runs on to be reachable again. Kept once the wait ends,
-# each a wait that can end in the skip of the same name.
-WaitReason = Literal["thread_busy", "computer_unreachable"]
+# What a ``waiting`` firing waits for: the turn running in its thread, the
+# computer its turn runs on to be reachable again, or server capacity to open.
+# Kept once the wait ends, each a wait that can end in the skip/failure of the same name.
+WaitReason = Literal["thread_busy", "computer_unreachable", "capacity_limit"]  # DALTON-HOOK(automation-capacity-retry)
 # Why a ``failed`` firing failed, when it was not the automation's own doing:
 # a usage limit refused it or paused its run, the Claude plan of its Claude
 # Code model refused or stopped it (``claude_plan``), another subscription's

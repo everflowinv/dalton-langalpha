@@ -145,6 +145,12 @@ class AutomationScheduler:
     async def _sweep(self) -> None:
         await self._sweep_abandoned_firings()
         await self._sweep_parked_firings()
+        # DALTON-HOOK(automation-capacity-retry): sweep DB-parked capacity backoff retries across workers
+        from src.dalton.automations.capacity_retry import sweep_capacity_parked
+
+        await sweep_capacity_parked(
+            self.dispatch, stopping=self._shutdown_event.is_set
+        )
 
     async def _sweep_abandoned_firings(self) -> None:
         """Settle firings whose process stopped holding them.
@@ -210,7 +216,12 @@ class AutomationScheduler:
         )
 
     def dispatch(
-        self, automation: Dict[str, Any], execution_id: str, *, name: str
+        self,
+        automation: Dict[str, Any],
+        execution_id: str,
+        *,
+        name: str,
+        claim_token: Optional[str] = None,  # DALTON-HOOK(automation-capacity-retry)
     ) -> None:
         """Run a firing in the background, whatever triggered it.
 
@@ -222,8 +233,13 @@ class AutomationScheduler:
         LangChain config, and the run's events would stream into the chat
         that triggered it.
         """
+        coro = (
+            self._run_execution(automation, execution_id, claim_token=claim_token)
+            if claim_token is not None
+            else self._run_execution(automation, execution_id)
+        )
         task = asyncio.create_task(
-            self._run_execution(automation, execution_id),
+            coro,
             name=name,
             context=self._context.copy(),
         )
@@ -300,11 +316,20 @@ class AutomationScheduler:
             logger.exception("[SCHEDULER] recycle purge failed")
 
     async def _run_execution(
-        self, automation: Dict[str, Any], execution_id: str
+        self,
+        automation: Dict[str, Any],
+        execution_id: str,
+        *,
+        claim_token: Optional[str] = None,  # DALTON-HOOK(automation-capacity-retry)
     ) -> None:
         """Wrapper that catches exceptions from executor."""
         try:
-            await self._executor.execute(automation, execution_id)
+            if claim_token is not None:
+                await self._executor.execute(
+                    automation, execution_id, claim_token=claim_token
+                )
+            else:
+                await self._executor.execute(automation, execution_id)
         except Exception as e:
             logger.error(
                 f"[SCHEDULER] Execution task failed: "

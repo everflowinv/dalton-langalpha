@@ -589,6 +589,7 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
+<<<<<<< HEAD
   # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
   # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
   "xlsx-preserve-calcpr"
@@ -608,6 +609,12 @@ ALLOWED_HOOKS=(
   # and deployment secret redaction.
   "deployment-credentials"
 >>>>>>> refs/lane/82
+=======
+  # Production fix: defer and retry automation capacity failures (WriterGuardUnavailable,
+  # quota burst 429, credit-gate 503) in Postgres via wait_reason='capacity_limit' up to 15m,
+  # and reset conversation_threads.current_status on pre-START automation failure/exit.
+  "automation-capacity-retry"
+>>>>>>> refs/lane/106
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -1995,9 +1995,21 @@ class InMemoryChannelStore:
             return out
 
         # Automation runs (I-8)
+        if "SELECT user_id, workspace_id, thread_id, automation_name, entries, status, targets FROM dalton_channel_automation_runs WHERE execution_id = %s" in norm:
+            r = self.automation_runs.get(str(params[0]))
+            return [dict(r)] if r else []
+
         if "SELECT targets FROM dalton_channel_automation_runs WHERE execution_id = %s" in norm:
             r = self.automation_runs.get(str(params[0]))
             return [{"targets": r["targets"]}] if r else []
+
+        if "DELETE FROM dalton_channel_automation_runs WHERE execution_id = %s" in norm:
+            exec_id = str(params[0])
+            r = self.automation_runs.get(exec_id)
+            if r and r.get("status") == "registered":
+                del self.automation_runs[exec_id]
+                return [{"deleted": True}]
+            return []
 
         if "SELECT * FROM dalton_channel_automation_runs WHERE execution_id = %s" in norm:
             r = self.automation_runs.get(str(params[0]))
@@ -2062,6 +2074,33 @@ class InMemoryChannelStore:
                 and r.get("kind") == "agent_send"
                 and r.get("status") in ("sent", "partial")
             ]
+
+        if "UPDATE dalton_channel_automation_runs SET thread_id = %s" in norm:
+            tid, exec_id = params
+            r = self.automation_runs.get(str(exec_id))
+            if r and r.get("status") == "registered":
+                r["thread_id"] = UUID(str(tid)) if tid else None
+                r["updated_at"] = now
+                return [dict(r)]
+            return []
+
+        if "UPDATE dalton_channel_automation_runs SET workspace_id = %s" in norm:
+            ws_id, tid, aname, entries_json, targets_json, exec_id = params
+            r = self.automation_runs.get(str(exec_id))
+            if r and r.get("status") == "registered":
+                r["workspace_id"] = UUID(str(ws_id)) if ws_id else None
+                if tid is not None:
+                    r["thread_id"] = UUID(str(tid))
+                r["automation_name"] = str(aname)
+                r["entries"] = (
+                    entries_json.obj if hasattr(entries_json, "obj") else entries_json
+                )
+                r["targets"] = (
+                    targets_json.obj if hasattr(targets_json, "obj") else targets_json
+                )
+                r["updated_at"] = now
+                return [{"targets": r["targets"]}]
+            return []
 
         if "UPDATE dalton_channel_automation_runs" in norm:
             f_status, f_text, tid, run_id, targets_json, exec_id = params

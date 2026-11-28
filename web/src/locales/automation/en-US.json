@@ -167,6 +167,7 @@
   "runUnknown": "Unknown",
   "waitingNote": "It runs when the turn now running in its thread ends.",
   "waitingForComputerNote": "Its computer can't be reached right now. It runs once the computer is back.",
+  "waitingForCapacityNote": "Queued waiting for server capacity. It will retry automatically.",
   "skippedThreadBusy": "Skipped because its thread stayed busy.",
   "skippedInterrupted": "Skipped because the server restarted while it waited.",
   "skippedComputerUnreachable": "Skipped because its computer couldn't be reached in time.",

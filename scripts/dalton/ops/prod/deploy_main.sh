@@ -4859,6 +4859,37 @@ _deploy_scripts_changed_in_target() {
   return 1
 }
 
+_load_backend_busy_threads_sql() {
+  local sql_file="" candidate=""
+  for candidate in \
+    "${DALTON_BACKEND_BUSY_THREADS_SQL:-}" \
+    "${SCRIPT_DIR}/backend_busy_threads.sql" \
+    "${REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql" \
+    "$(dirname "$WAIT_IDLE_SCRIPT")/backend_busy_threads.sql"; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      sql_file="$candidate"
+      break
+    fi
+  done
+  if [ -z "$sql_file" ]; then
+    echo "ERROR: backend_busy_threads.sql not found" >&2
+    return 1
+  fi
+  tr '\n' ' ' < "$sql_file" | sed 's/  */ /g; s/^ //; s/ $//'
+}
+
+_pre_restart_busy_sql() {
+  local busy_threads_sql=""
+  busy_threads_sql="$(_load_backend_busy_threads_sql)" || return 1
+  printf "SELECT (%s) + (SELECT count(*) FROM subagent_runs WHERE status='in_progress')" "$busy_threads_sql"
+}
+
+_pre_restart_busy() {
+  local total_sql=""
+  total_sql="$(_pre_restart_busy_sql)" || return 0
+  [ "$(docker exec "${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}" psql -U postgres -d postgres -Atc "$total_sql")" != "0" ]
+}
+
 _stop_on_reexec_handshake_failure() {
   local msg="${1:-re-exec handshake failed}" cur_head="" cur_dalton_rev="" cur_upstream_rev=""
   echo "ERROR: ${msg}; stopping without executing target deploy_main.sh (services and frontend untouched)" >&2
@@ -5263,6 +5294,13 @@ run_deploy_main() {
           exit 1
         fi
       fi
+      if [ -f "${REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql" ]; then
+        if ! cp "${REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql" "${reexec_tmp}/backend_busy_threads.sql"; then
+          rm -rf "$reexec_tmp"
+          _stop_on_reexec_handshake_failure "failed to copy updated backend_busy_threads.sql to ${reexec_tmp}"
+          exit 1
+        fi
+      fi
       if ! bash -n "${reexec_tmp}/deploy_main.sh" || { [ -f "${reexec_tmp}/wait_backend_idle.sh" ] && ! bash -n "${reexec_tmp}/wait_backend_idle.sh"; }; then
         rm -rf "$reexec_tmp"
         _stop_on_reexec_handshake_failure "updated deploy scripts in ${TARGET} failed bash -n syntax check"
@@ -5458,7 +5496,15 @@ run_deploy_main() {
   fi
   # Re-check right before the restart: the backup and build take minutes, and a turn
   # started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
-  busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
+  # Uses the exact same thread-busy SQL file (backend_busy_threads.sql) as wait_backend_idle.sh.
+  local pre_restart_busy_sql=""
+  if ! pre_restart_busy_sql="$(_pre_restart_busy_sql)"; then
+    echo "ERROR: failed to load backend_busy_threads.sql: reverting (backend not restarted)" >&2
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  busy() { [ "$(docker exec "${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}" psql -U postgres -d postgres -Atc "$pre_restart_busy_sql")" != "0" ]; }
   while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; release_deploy_lock || true; exit 1; }; done
 
   if ! check_clean_migration_dirs; then

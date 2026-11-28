@@ -328,7 +328,7 @@ async def list_automation_runs(
             "agent thread."
         ),
     ),
-    wait_reason: Literal["thread_busy", "computer_unreachable"] | None = Query(None),
+    wait_reason: Literal["thread_busy", "computer_unreachable", "capacity_limit"] | None = Query(None),  # DALTON-HOOK(automation-capacity-retry)
 ):
     """List executions. Omitted scope stays the caller's own agent runs.
 
