@@ -371,15 +371,19 @@ async def download_shared_file(
     if normalized_path is None or not target.visible(normalized_path):
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
-    # DALTON-HOOK(workspace-file-streaming): stream (100 MiB, 256 MiB] shared files through StreamingSecretRedactor
-    from src.dalton.workspace_file_stream import shared_large_download
-    if (streamed := await shared_large_download(target.workspace_id, target.workspace["user_id"], normalized_path, not_found_detail=_NOT_FOUND)) is not None:
+    # DALTON-HOOK(workspace-file-streaming): enforce warm-sandbox-first check before streaming (100 MiB, 256 MiB] mirror
+    from src.dalton.workspace_file_stream import shared_large_download_or_warm
+    streamed, warm_resolved = await shared_large_download_or_warm(target, normalized_path, not_found_detail=_NOT_FOUND)
+    if streamed is not None:
         return streamed
 
-    vault_secrets, resolved = await asyncio.gather(
-        get_vault_secrets_for_redaction(target.workspace["user_id"]),
-        _shared_file_bytes(target, normalized_path),
-    )
+    if warm_resolved is not None:
+        vault_secrets, resolved = await get_vault_secrets_for_redaction(target.workspace["user_id"]), warm_resolved
+    else:
+        vault_secrets, resolved = await asyncio.gather(
+            get_vault_secrets_for_redaction(target.workspace["user_id"]),
+            _shared_file_bytes(target, normalized_path),
+        )
     if resolved is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 

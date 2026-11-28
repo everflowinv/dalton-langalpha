@@ -25,15 +25,22 @@
 	header_up -X-User-Id
 }
 
-# Redact ?token=<jwt>, delete sensitive authentication / internal headers, and
-# strip response Location headers from access logs so HTTP->HTTPS redirects or
-# query tokens never leak into logs (Caddy logs the original request before
-# header mutation).
+# Redact ?token=<jwt> / ?dl_token= / ?ticket= and path share tokens
+# (/api/v1/public/shared/<token>, /s/<token>, /a/<token>, /og-meta?path=/s/<token>),
+# delete sensitive authentication / internal headers, and strip response Location
+# headers from access logs so HTTP->HTTPS redirects or tokens never leak into logs
+# (Caddy logs the original request before header mutation).
 (dalton_access_log) {
 	log {
 		output stdout
 		format filter {
-			wrap json
+			wrap filter {
+				wrap json
+				fields {
+					request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+` `${1}REDACTED`
+					request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+))[^/?#]+` `${1}REDACTED`
+				}
+			}
 			fields {
 				request>uri query {
 					replace token REDACTED
@@ -161,20 +168,17 @@
 		}
 	}
 
-	# 1b. Read-only avatar proxy (GET/HEAD /storage/avatars/* -> MinIO current version only,
-	#     stripping versionId); every other /storage/* path or method returns 404.
+	# 1b. Read-only avatar proxy (GET/HEAD /storage/<prefix>avatars/* -> MinIO current version only,
+	#     stripping all query parameters including versionId and response-* overrides);
+	#     every other /storage/* path or method returns 404.
 	@storage_avatars {
 		method GET HEAD
-		path /storage/avatars/*
-		not path /storage/avatars/
+		expression `("{$STORAGE_KEY_PREFIX:}" == "" && {path}.startsWith("/storage/avatars/") && {path} != "/storage/avatars/") || ("{$STORAGE_KEY_PREFIX:}" != "" && {path}.startsWith("/storage/" + ("{$STORAGE_KEY_PREFIX:}".endsWith("/") ? "{$STORAGE_KEY_PREFIX:}" : "{$STORAGE_KEY_PREFIX:}" + "/") + "avatars/") && {path} != "/storage/" + ("{$STORAGE_KEY_PREFIX:}".endsWith("/") ? "{$STORAGE_KEY_PREFIX:}" : "{$STORAGE_KEY_PREFIX:}" + "/") + "avatars/")`
 	}
 	handle @storage_avatars {
 		route {
-			uri query -versionId
-			uri query -versionid
-			uri query -VersionId
 			uri strip_prefix /storage
-			rewrite * /dalton-storage{path}
+			rewrite * /{$STORAGE_BUCKET_NAME:dalton-storage}{path}?
 			import strip_internal_request_headers
 			request_header -Authorization
 			request_header -Cookie

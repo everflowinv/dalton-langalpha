@@ -5720,7 +5720,13 @@ class TestSandboxNetworkAndInitScript:
             text = caddy_path.read_text(encoding="utf-8")
             for m in re.finditer(r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}", text):
                 caddy_vars.add(m.group(1))
-        assert caddy_vars == {"DOMAIN", "DALTON_TLS_MODE", "DALTON_EDGE_HTTPS_PORT"}
+        assert caddy_vars == {
+            "DOMAIN",
+            "DALTON_TLS_MODE",
+            "DALTON_EDGE_HTTPS_PORT",
+            "STORAGE_BUCKET_NAME",
+            "STORAGE_KEY_PREFIX",
+        }
 
         # --- Case 1: Merged compose edge env never contains backend secrets across all overlays ---
         for combo in (

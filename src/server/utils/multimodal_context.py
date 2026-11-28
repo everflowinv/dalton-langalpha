@@ -175,18 +175,22 @@ async def build_attachment_metadata(
         else f"private-media/attachments/{batch_id}"
     )
 
-    # DALTON-HOOK(storage-private-bucket-urls): omit direct bucket attachment URLs when public_bucket_urls=false
-    from src.dalton.private_bucket_urls import allow_public_bucket_attachment_urls
-    emit_public_urls = allow_public_bucket_attachment_urls()
+    # DALTON-HOOK(storage-private-bucket-urls): store AU1-verifiable object_key instead of direct bucket URL when public_bucket_urls=false
+    from src.dalton.private_bucket_urls import attach_private_attachment_ref
 
     async def entry(att: TurnAttachment) -> Dict[str, Any]:
         meta: Dict[str, Any] = {"name": att.name, "type": att.kind, "size": att.size}
         source = att.source
         if not isinstance(source, InlineSource):
-            if source.object_key and emit_public_urls:
-                meta["url"] = _object_url(source.object_key)
+            if source.object_key:
+                attach_private_attachment_ref(
+                    meta,
+                    object_key=source.object_key,
+                    attachment_id=source.attachment_id,
+                    public_url_fn=_object_url,
+                )
             return meta
-        if is_storage_enabled() and emit_public_urls:
+        if is_storage_enabled():
             # The key's extension comes off the type as a data URL states it.
             safe_key = sanitize_storage_key(att.name, f"data:{att.mime_type};")
             # Its own folder: two files of one name in a turn are two objects.
@@ -201,7 +205,11 @@ async def build_attachment_metadata(
                     content_type=served_type(normalize_mime(att.mime_type)),
                 )
                 if stored:
-                    meta["url"] = _object_url(storage_key)
+                    attach_private_attachment_ref(
+                        meta,
+                        object_key=storage_key,
+                        public_url_fn=_object_url,
+                    )
             except Exception:
                 logger.warning("Failed to upload attachment %r", safe_key, exc_info=True)
         return meta

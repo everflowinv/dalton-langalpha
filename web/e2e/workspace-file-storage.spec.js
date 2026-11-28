@@ -19,12 +19,32 @@
  *        `Clear-Site-Data: "cache"`, and hides the Workspace Files toggle on reload.
  *      - Closed/invalid share token returns HTTP 404 with `Cache-Control: no-store`
  *        and renders the unavailable page.
+ *   5. Live Isolated Deployment verification (real Caddy + Backend + MinIO,
+ *      ZERO page.route stubs; skipped by default and enabled when
+ *      ``E2E_LIVE_BASE_URL`` is set):
+ *      - Real avatar GET/HEAD under ``/storage/<prefix>avatars/*``, query-param
+ *        stripping (``?versionId=...&response-content-type=text/html``), and
+ *        404 on non-avatar paths / write methods.
+ *      - Real 150 MiB text and binary public-share streaming downloads through
+ *        real Caddy + Backend with ``Cache-Control: no-store`` and redaction.
+ *      - Real downgraded share (``allow_files=false``) returning 403 with
+ *        ``Cache-Control: no-store`` and ``Clear-Site-Data: "cache"``, and
+ *        revoked/invalid share token returning 404 with ``Cache-Control: no-store``.
+ *      - Optional access-log verification when ``E2E_LIVE_CADDY_LOG_PATH`` or
+ *        ``E2E_LIVE_BACKEND_LOG_PATH`` is provided.
  */
 import { Buffer } from 'node:buffer';
+import fs from 'node:fs';
 import { configureSSE, resetMockServer, mockAPI, test, expect } from './fixtures.js';
 import { chatViewOverrides, WS, TH } from './helpers/chatScenario.js';
 
 const APP_API_ORIGIN = `http://127.0.0.1:${process.env.E2E_MOCK_PORT}`;
+const LIVE_BASE_URL = (process.env.E2E_LIVE_BASE_URL || '').replace(/\/+$/, '');
+const LIVE_KEY_PREFIX = (() => {
+  const raw = (process.env.E2E_LIVE_STORAGE_KEY_PREFIX || '').trim().replace(/^\/+|\/+$/g, '');
+  return raw ? `${raw}/` : '';
+})();
+const LIVE_MIN_150M_BYTES = Number(process.env.E2E_LIVE_MIN_LARGE_BYTES || 150 * 1024 * 1024);
 
 // Valid 1x1 transparent PNG so <img> elements decode cleanly with naturalWidth === 1.
 const TINY_PNG = Buffer.from(
@@ -541,5 +561,152 @@ test.describe('Workspace File Storage Batch 1 Step 4', () => {
 
     expect(resp.status()).toBe(404);
     expect(resp.headers()['cache-control']).toBe('no-store');
+  });
+});
+
+/**
+ * Stream a large HTTP response chunk-by-chunk (without buffering 150+ MiB in JS
+ * memory) and verify size + secret redaction across chunk boundaries.
+ */
+async function streamAndVerifyLargeDownload(url, { rawSecret, redactedMarker }) {
+  const res = await fetch(url, { redirect: 'manual', cache: 'no-store' });
+  const headers = Object.fromEntries(res.headers.entries());
+  if (!res.ok || !res.body) {
+    return {
+      status: res.status,
+      headers,
+      totalBytes: 0,
+      sawRawSecret: false,
+      sawRedactedMarker: false,
+    };
+  }
+  const secretBuf = rawSecret ? Buffer.from(rawSecret, 'utf8') : null;
+  const markerBuf = redactedMarker ? Buffer.from(redactedMarker, 'utf8') : null;
+  const keepTail = Math.max(secretBuf?.length || 0, markerBuf?.length || 0, 64);
+
+  let totalBytes = 0;
+  let sawRawSecret = false;
+  let sawRedactedMarker = false;
+  let tail = Buffer.alloc(0);
+
+  const reader = res.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    totalBytes += chunk.length;
+    const windowBuf = tail.length ? Buffer.concat([tail, chunk]) : chunk;
+    if (secretBuf && windowBuf.includes(secretBuf)) {
+      sawRawSecret = true;
+    }
+    if (markerBuf && windowBuf.includes(markerBuf)) {
+      sawRedactedMarker = true;
+    }
+    tail = windowBuf.length > keepTail ? windowBuf.subarray(windowBuf.length - keepTail) : windowBuf;
+  }
+  return { status: res.status, headers, totalBytes, sawRawSecret, sawRedactedMarker };
+}
+
+test.describe('Workspace File Storage Batch 1 Step 4 — Live Isolated Deployment (Caddy + Backend + MinIO)', () => {
+  test.skip(
+    !LIVE_BASE_URL,
+    'Set E2E_LIVE_BASE_URL (e.g. http://127.0.0.1:8088) to run real Caddy + Backend + MinIO verification',
+  );
+
+  test('live Caddy avatar proxy: current version readable, all query params stripped, non-avatar & writes return 404', async ({
+    request,
+  }) => {
+    const avatarPath =
+      process.env.E2E_LIVE_AVATAR_PATH || `/storage/${LIVE_KEY_PREFIX}avatars/e2e-avatar.png`;
+
+    const getRes = await request.get(`${LIVE_BASE_URL}${avatarPath}`);
+    expect(getRes.status()).toBe(200);
+    expect((getRes.headers()['content-type'] || '').toLowerCase()).toMatch(/^image\//);
+    expect((getRes.headers()['x-content-type-options'] || '').toLowerCase()).toBe('nosniff');
+    expect((await getRes.body()).length).toBeGreaterThan(0);
+
+    const headRes = await request.head(`${LIVE_BASE_URL}${avatarPath}`);
+    expect(headRes.status()).toBe(200);
+
+    // Query-string stripping: versionId & response-content-type=text/html must NOT reach MinIO.
+    const attackRes = await request.get(
+      `${LIVE_BASE_URL}${avatarPath}?versionId=old-nonexistent-version&response-content-type=text/html&response-content-disposition=inline`,
+    );
+    expect(attackRes.status()).toBe(200);
+    const attackCt = (attackRes.headers()['content-type'] || '').toLowerCase();
+    expect(attackCt).toMatch(/^image\//);
+    expect(attackCt).not.toContain('text/html');
+
+    // Non-GET/HEAD and non-avatar paths must return 404 from Caddy.
+    const putRes = await request.put(`${LIVE_BASE_URL}${avatarPath}`, { data: 'forbidden' });
+    expect(putRes.status()).toBe(404);
+
+    for (const blocked of [
+      `/storage/${LIVE_KEY_PREFIX}avatars/`,
+      `/storage/${LIVE_KEY_PREFIX}blobs/u1/deadbeef`,
+      `/storage/${LIVE_KEY_PREFIX}private-media/response-images/t1/abc/chart.png`,
+      '/storage',
+    ]) {
+      const blockedRes = await request.get(`${LIVE_BASE_URL}${blocked}`);
+      expect(blockedRes.status(), `expected 404 for ${blocked}`).toBe(404);
+    }
+  });
+
+  test('live public share: 150 MiB text and binary downloads stream redacted bytes with Cache-Control: no-store', async () => {
+    test.setTimeout(180_000);
+    const shareToken = process.env.E2E_LIVE_SHARE_TOKEN || '';
+    const textPath = process.env.E2E_LIVE_TEXT_150M_PATH || '';
+    const binPath = process.env.E2E_LIVE_BIN_150M_PATH || '';
+    test.skip(
+      !shareToken || !textPath || !binPath,
+      'Set E2E_LIVE_SHARE_TOKEN, E2E_LIVE_TEXT_150M_PATH, and E2E_LIVE_BIN_150M_PATH for live 150 MiB stream check',
+    );
+
+    const rawSecret = process.env.E2E_LIVE_SECRET_SENTINEL || '';
+    const redactedMarker = process.env.E2E_LIVE_REDACTED_MARKER || '[REDACTED:';
+
+    for (const filePath of [textPath, binPath]) {
+      const url = `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(shareToken)}/files/download?path=${encodeURIComponent(filePath)}`;
+      const res = await streamAndVerifyLargeDownload(url, { rawSecret, redactedMarker });
+      expect(res.status, `download ${filePath}`).toBe(200);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['content-length']).toBeUndefined();
+      expect(res.totalBytes).toBeGreaterThanOrEqual(LIVE_MIN_150M_BYTES);
+      if (rawSecret) {
+        expect(res.sawRawSecret, `raw secret leaked in ${filePath}`).toBe(false);
+        expect(res.sawRedactedMarker, `redacted marker missing in ${filePath}`).toBe(true);
+      }
+    }
+
+    // Optional access-log verification: share token must be redacted in Caddy & backend logs.
+    for (const logPath of [process.env.E2E_LIVE_CADDY_LOG_PATH, process.env.E2E_LIVE_BACKEND_LOG_PATH]) {
+      if (logPath && fs.existsSync(logPath)) {
+        const logText = fs.readFileSync(logPath, 'utf8');
+        expect(logText, `raw share token leaked in ${logPath}`).not.toContain(shareToken);
+        expect(logText, `expected REDACTED in ${logPath}`).toContain('/api/v1/public/shared/REDACTED');
+      }
+    }
+  });
+
+  test('live public share downgrade (allow_files=false) returns 403 with no-store & Clear-Site-Data, and revoked token returns 404', async ({
+    request,
+  }) => {
+    const downgradedToken = process.env.E2E_LIVE_DOWNGRADED_SHARE_TOKEN || '';
+    const filePath = process.env.E2E_LIVE_TEXT_150M_PATH || 'large_150m.txt';
+    if (downgradedToken) {
+      const downRes = await request.get(
+        `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(downgradedToken)}/files/download?path=${encodeURIComponent(filePath)}`,
+      );
+      expect(downRes.status()).toBe(403);
+      expect(downRes.headers()['cache-control']).toBe('no-store');
+      expect(downRes.headers()['clear-site-data']).toBe('"cache"');
+    }
+
+    const revokedToken = process.env.E2E_LIVE_REVOKED_SHARE_TOKEN || 'tok-e2e-nonexistent-revoked';
+    const revokedRes = await request.get(
+      `${LIVE_BASE_URL}/api/v1/public/shared/${encodeURIComponent(revokedToken)}/files/download?path=${encodeURIComponent(filePath)}`,
+    );
+    expect(revokedRes.status()).toBe(404);
+    expect(revokedRes.headers()['cache-control']).toBe('no-store');
   });
 });

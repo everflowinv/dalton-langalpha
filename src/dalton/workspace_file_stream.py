@@ -538,6 +538,7 @@ async def shared_large_download(
     normalized_path: str,
     *,
     not_found_detail: str = "Shared resource not found",
+    expected_size: int | None = None,
 ) -> Response | None:
     """Stream a ``(100 MiB, 256 MiB]`` stored file for a public share download.
 
@@ -547,6 +548,10 @@ async def shared_large_download(
       ``Cache-Control: no-store`` and ``Clear-Site-Data: "cache"``).
     - ``normalized_path`` has been validated against traversal and passed
       ``target.visible(normalized_path)``.
+
+    When ``expected_size`` is supplied from a warm sandbox's
+    ``FileTooLargeToServe`` check and disagrees with the mirrored ``file_size``,
+    a stale large mirror row is never served (raises HTTP ``404``).
 
     Every file in the streaming range is unconditionally passed through
     :class:`StreamingSecretRedactor` regardless of MIME type or binary content.
@@ -567,6 +572,16 @@ async def shared_large_download(
     file_size = int(file_meta.get("file_size") or 0)
     if not _in_stream_range(file_size):
         return None
+    if expected_size is not None and file_size != int(expected_size):
+        logger.warning(
+            "Shared large mirror size disagrees with warm sandbox workspace=%s path=%r "
+            "mirror_size=%d live_size=%d",
+            workspace_id,
+            normalized_path,
+            file_size,
+            int(expected_size),
+        )
+        raise HTTPException(status_code=404, detail=not_found_detail)
 
     filename = (
         file_meta.get("file_name")
@@ -627,3 +642,111 @@ async def shared_large_download(
             media_type=mime,
             headers=headers,
         )
+
+
+async def shared_large_download_or_warm(
+    target: Any,
+    normalized_path: str,
+    *,
+    not_found_detail: str = "File not found",
+) -> tuple[Response | None, Any | None]:
+    """Enforce warm-sandbox-first semantics before streaming a large shared mirror.
+
+    Returns ``(streamed_response, warm_shared_bytes)``:
+    - When the workspace sandbox is warm:
+      - Reads the live file via ``share_files.warm_sandbox_bytes`` first.
+      - If missing or a symlink resolves outside workspace / invisible scope
+        (``resolved is None``), raises HTTP ``404`` without falling back to the
+        persisted mirror.
+      - If present and readable (including a file replaced/shrunk since the
+        last sync), checks ``folder_unmoved`` and returns the live
+        ``SharedBytes`` so the caller serves live bytes without reading twice.
+      - If ``FileTooLargeToServe`` is raised (present, contained, visible, and
+        larger than exec read cap), checks ``folder_unmoved``, resolves the
+        canonical client path, and streams the ``(100 MiB, 256 MiB]`` mirror
+        only when its ``file_size`` matches the live file's size; a mismatch or
+        missing mirror for a ``> 100 MiB`` live file raises HTTP ``404``.
+      - On transient/other sandbox errors, logs the miss and allows mirror
+        fallback just like ``_shared_file_bytes``.
+    - When the sandbox is not warm (stopped / cold):
+      - Streams ``(100 MiB, 256 MiB]`` mirrors via :func:`shared_large_download`,
+        or returns ``(None, None)`` to let upstream ``_shared_file_bytes`` read
+        ``<= 100 MiB`` DB rows.
+    """
+    from src.server.app import share_files
+    from src.server.services.workspace_file_containment import FileTooLargeToServe
+    from src.server.services.workspace_files import to_client_path
+
+    workspace_id = target.workspace_id
+    owner_user_id = target.workspace["user_id"]
+    sandbox = share_files.warm_sandbox(target.workspace, workspace_id)
+
+    if sandbox is not None:
+        try:
+            resolved = await share_files.warm_sandbox_bytes(
+                sandbox,
+                normalized_path,
+                work_dir=target.work_dir,
+                visible=target.visible,
+            )
+        except FileTooLargeToServe as too_large:
+            if not await share_files.folder_unmoved(
+                workspace_id, target.workspace.get("dir_name")
+            ):
+                raise HTTPException(
+                    status_code=404, detail=not_found_detail
+                ) from None
+            canonical_client_path = to_client_path(
+                sandbox, too_large.canonical, target.work_dir
+            )
+            if not target.visible(canonical_client_path):
+                raise HTTPException(
+                    status_code=404, detail=not_found_detail
+                ) from None
+            streamed = await shared_large_download(
+                workspace_id,
+                owner_user_id,
+                canonical_client_path,
+                not_found_detail=not_found_detail,
+                expected_size=too_large.size,
+            )
+            if streamed is not None:
+                return streamed, None
+            if too_large.size > SERVE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=404, detail=not_found_detail
+                ) from None
+            return None, None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            share_files._log_sandbox_miss("file", workspace_id, exc)
+            streamed = await shared_large_download(
+                workspace_id,
+                owner_user_id,
+                normalized_path,
+                not_found_detail=not_found_detail,
+            )
+            return streamed, None
+        else:
+            if resolved is None:
+                raise HTTPException(status_code=404, detail=not_found_detail)
+            if not await share_files.folder_unmoved(
+                workspace_id, target.workspace.get("dir_name")
+            ):
+                raise HTTPException(status_code=404, detail=not_found_detail)
+            client_path, content = resolved
+            return None, share_files.SharedBytes(
+                client_path,
+                content,
+                share_files._mime_for(client_path, None),
+                "sandbox",
+            )
+
+    streamed = await shared_large_download(
+        workspace_id,
+        owner_user_id,
+        normalized_path,
+        not_found_detail=not_found_detail,
+    )
+    return streamed, None

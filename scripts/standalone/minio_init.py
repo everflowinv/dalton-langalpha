@@ -8,12 +8,35 @@ short-lived HMAC sandbox download relay.
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import sys
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+try:
+    from src.dalton.storage_bucket_rules import (
+        BucketRuleVerificationError,
+        ROLE_MAIN,
+        build_bucket_policy,
+        normalize_key_prefix,
+        verify_bucket_policy,
+    )
+except ImportError:
+    from dalton.storage_bucket_rules import (  # type: ignore[no-redef]
+        BucketRuleVerificationError,
+        ROLE_MAIN,
+        build_bucket_policy,
+        normalize_key_prefix,
+        verify_bucket_policy,
+    )
 
 
 def _env(primary: str, *fallbacks: str, default: str = "") -> str:
@@ -68,6 +91,64 @@ def _ensure_private_bucket(
     client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
     print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
     return 0
+
+
+def _ensure_main_avatars_policy(
+    client: object,
+    *,
+    bucket: str,
+    key_prefix: str,
+    endpoint: str,
+) -> int:
+    """Grant anonymous s3:GetObject ONLY on current versions of ``<prefix>avatars/*``."""
+    prefix = normalize_key_prefix(key_prefix)
+    policy_doc = build_bucket_policy(bucket=bucket, role=ROLE_MAIN, key_prefix=prefix)
+    assert policy_doc is not None
+    try:
+        client.put_bucket_policy(  # type: ignore[attr-defined]
+            Bucket=bucket,
+            Policy=json.dumps(policy_doc, separators=(",", ":")),
+        )
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR setting avatars read-only policy on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        resp = client.get_bucket_policy(Bucket=bucket)  # type: ignore[attr-defined]
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR verifying avatars read-only policy on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if isinstance(resp, dict):
+        raw = resp.get("Policy")
+        actual = json.loads(raw) if isinstance(raw, str) and raw else (raw if isinstance(raw, dict) else None)
+        try:
+            verify_bucket_policy(actual, bucket=bucket, role=ROLE_MAIN, key_prefix=prefix)
+        except BucketRuleVerificationError as exc:
+            print(
+                f"[minio-init] ERROR avatars policy verification failed on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"[minio-init] Verified avatars read-only policy on main bucket '{bucket}' "
+        f"(prefix='{prefix}') at {endpoint}.",
+        flush=True,
+    )
+    return 0
+
+
+def _resolve_main_storage_bucket() -> str:
+    if "STORAGE_BUCKET_NAME" in os.environ:
+        return (os.environ.get("STORAGE_BUCKET_NAME") or "").strip()
+    return (os.environ.get("S3_BUCKET_NAME") or "").strip()
 
 
 def main() -> int:
@@ -135,22 +216,35 @@ def main() -> int:
         return rc
     initialized.add((endpoint, bucket))
 
-    # Optional general storage bucket initialization when STORAGE_BUCKET_NAME is set
-    # to a distinct bucket on the same MinIO endpoint.
-    storage_bucket = _env("STORAGE_BUCKET_NAME")
+    # Optional general main-storage bucket initialization when STORAGE_BUCKET_NAME
+    # (or S3_BUCKET_NAME) is set on the same MinIO endpoint. Keep all prefixes private
+    # except current-version anonymous s3:GetObject on <STORAGE_KEY_PREFIX>avatars/*.
+    storage_provider = (os.getenv("STORAGE_PROVIDER") or "").strip().lower()
+    storage_bucket = _resolve_main_storage_bucket() if storage_provider != "none" else ""
     if storage_bucket:
-        storage_endpoint = _env("STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if storage_endpoint == endpoint and (storage_endpoint, storage_bucket) not in initialized:
-            storage_region = _env("STORAGE_REGION", default=region)
-            rc = _ensure_private_bucket(
+        storage_endpoint = _env(
+            "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default=endpoint
+        ).rstrip("/")
+        if storage_endpoint == endpoint:
+            if (storage_endpoint, storage_bucket) not in initialized:
+                storage_region = _env("STORAGE_REGION", "S3_REGION", default=region)
+                rc = _ensure_private_bucket(
+                    client,
+                    bucket=storage_bucket,
+                    region=storage_region,
+                    endpoint=storage_endpoint,
+                )
+                if rc != 0:
+                    return rc
+                initialized.add((storage_endpoint, storage_bucket))
+            rc = _ensure_main_avatars_policy(
                 client,
                 bucket=storage_bucket,
-                region=storage_region,
+                key_prefix=os.getenv("STORAGE_KEY_PREFIX", ""),
                 endpoint=storage_endpoint,
             )
             if rc != 0:
                 return rc
-            initialized.add((storage_endpoint, storage_bucket))
 
     # Optional transcription bucket initialization when DALTON_ASR_STORAGE_BUCKET_NAME is set
     # against the same MinIO endpoint (keeps default Core behavior unchanged when unset).

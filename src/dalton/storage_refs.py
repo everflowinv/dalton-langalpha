@@ -460,6 +460,10 @@ def is_main_bucket_response_image_url(
     raw = (url or "").strip()
     if not raw or "response-images/" not in raw:
         return False
+    for logical_prefix in _RESPONSE_IMAGE_LOGICAL_PREFIXES:
+        if raw.startswith(logical_prefix):
+            tail = unquote(raw[len(logical_prefix) :])
+            return _is_valid_response_image_tail(tail, require_hash=True)
     try:
         parsed = urlsplit(raw)
     except ValueError:
@@ -1379,7 +1383,8 @@ STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
             "metadata IS NOT NULL AND metadata ? 'attachments' "
             "AND jsonb_typeof(metadata -> 'attachments') = 'array' "
             "AND EXISTS (SELECT 1 FROM jsonb_array_elements(metadata -> 'attachments') AS att "
-            "WHERE COALESCE(att ->> 'url', '') LIKE '%%/attachments/%%')"
+            "WHERE COALESCE(att ->> 'url', '') LIKE '%%/attachments/%%' "
+            "OR COALESCE(att ->> 'object_key', '') LIKE '%%attachments/%%')"
         ),
         where_summary="full-table batched scan: metadata->'attachments' url containing '/attachments/'",
         source_ref="migrations/versions/001_initial_schema.py:309-329; src/server/utils/multimodal_context.py:171-196; src/server/handlers/chat/ptc_run.py:641-658",
@@ -2169,6 +2174,12 @@ def extract_response_image_object_key(
     raw = (url or "").strip()
     if not raw or not is_main_bucket_response_image_url(raw, env=env):
         return None
+    for logical_prefix in _RESPONSE_IMAGE_LOGICAL_PREFIXES:
+        if raw.startswith(logical_prefix):
+            tail = unquote(raw[len(logical_prefix) :])
+            if _is_valid_response_image_tail(tail, require_hash=True):
+                return f"{logical_prefix}{tail}"
+            return None
     try:
         parsed = urlsplit(raw)
     except ValueError:

@@ -63,10 +63,6 @@ async def capture_images(
     """
     if not is_storage_enabled() or not image_paths:
         return {}
-    # DALTON-HOOK(storage-private-bucket-urls): skip late direct-URL image capture when public_bucket_urls=false
-    from src.dalton.private_bucket_urls import allow_public_bucket_image_capture
-    if not allow_public_bucket_image_capture():
-        return {}
     if project is None and workspace_id:
         return await _capture_from_held_folder(
             sandbox, image_paths, thread_id, workspace_id
