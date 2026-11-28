@@ -740,6 +740,7 @@ class WorkflowJournal:
             {
                 "workflow": self.workflow,
                 "run_id": self.run_id,
+                "run_dir": self.base_rel,
                 "phases": self.phases,
                 "dispatched": self.dispatched,
                 "status": status,

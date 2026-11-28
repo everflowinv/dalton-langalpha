@@ -925,10 +925,14 @@ async function _mProbeCandidateOnDisk(
   phaseTitle,
   label,
   expectedRunId = null,
-  requireReceipt = true
+  requireReceipt = true,
+  progressPath = null,
+  dispatchLabel = null
 ) {
   const norm = _mNormPath(candidatePath, W)
   const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
+  const progNorm = _mNormPath(progressPath, W) || ''
+  const dispLbl = typeof dispatchLabel === 'string' ? dispatchLabel.trim() : ''
   if (!norm) {
     return {
       verified: true,
@@ -953,17 +957,85 @@ async function _mProbeCandidateOnDisk(
     }
   }
   const pyCode = [
-    `import json, pathlib, sys`,
+    `import json, pathlib, re, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
     `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
     `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
+    `prog_arg = sys.argv[3].strip() if len(sys.argv) > 3 else ''`,
+    `disp_lbl = sys.argv[4].strip() if len(sys.argv) > 4 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
     `run_matched = None`,
     `receipt_rid = None`,
     `if want_rid:`,
+    `    allowed_rids = {want_rid}`,
+    `    if prog_arg and disp_lbl:`,
+    `        try:`,
+    `            pp = pathlib.Path(prog_arg)`,
+    `            prog = json.loads(pp.read_text(encoding='utf-8')) if pp.is_file() else None`,
+    `            rfrom = str(prog.get('resumed_from') or '').strip() if isinstance(prog, dict) else ''`,
+    `            prog_rid = str(prog.get('run_id') or '').strip() if isinstance(prog, dict) else ''`,
+    `            if rfrom and (not prog_rid or prog_rid == want_rid):`,
+    `                ws_root = pathlib.Path('.').resolve()`,
+    `                run_dir_raw = str(prog.get('run_dir') or '').strip()`,
+    `                this_dir = pathlib.Path(run_dir_raw) if run_dir_raw else (pathlib.Path(rfrom).parent / want_rid)`,
+    `                safe_lbl = re.sub(r'[^0-9A-Za-z_\\u4e00-\\u9fff.-]+', '_', disp_lbl)[:80] or 'dispatch'`,
+    `                jf = this_dir / 'journal' / f'{safe_lbl}.json'`,
+    `                was_replayed = False`,
+    `                if jf.is_file() and jf.resolve().is_relative_to(ws_root):`,
+    `                    jd = json.loads(jf.read_text(encoding='utf-8'))`,
+    `                    ds = jd.get('dispatches') if isinstance(jd, dict) else None`,
+    `                    if isinstance(ds, list) and ds and isinstance(ds[-1], dict):`,
+    `                        last = ds[-1]`,
+    `                        was_replayed = bool(last.get('status') == 'ok' and isinstance(last.get('resumed_from'), str) and last['resumed_from'].strip())`,
+    `                if was_replayed:`,
+    `                    cur_dir = rfrom`,
+    `                    visited = set()`,
+    `                    hops = 0`,
+    `                    while cur_dir and hops < 32:`,
+    `                        nd = cur_dir.strip().rstrip('/')`,
+    `                        if not nd or nd in visited:`,
+    `                            break`,
+    `                        visited.add(nd)`,
+    `                        hops += 1`,
+    `                        dp = pathlib.Path(nd)`,
+    `                        if not dp.is_dir() or not dp.resolve().is_relative_to(ws_root):`,
+    `                            break`,
+    `                        anc_rid = None`,
+    `                        nxt = None`,
+    `                        for meta_name, rid_k in (('resume.json', 'task_id'), ('status.json', 'run_id')):`,
+    `                            mf = dp / meta_name`,
+    `                            if mf.is_file():`,
+    `                                try:`,
+    `                                    md = json.loads(mf.read_text(encoding='utf-8'))`,
+    `                                    if isinstance(md, dict):`,
+    `                                        if not anc_rid and isinstance(md.get(rid_k), str) and md[rid_k].strip():`,
+    `                                            anc_rid = md[rid_k].strip()`,
+    `                                        if not nxt and isinstance(md.get('resumed_from'), str) and md['resumed_from'].strip():`,
+    `                                            nxt = md['resumed_from'].strip()`,
+    `                                except Exception:`,
+    `                                    pass`,
+    `                        if not anc_rid and dp.name:`,
+    `                            anc_rid = dp.name`,
+    `                        if anc_rid:`,
+    `                            allowed_rids.add(anc_rid)`,
+    `                        if not nxt and (dp / 'journal').is_dir():`,
+    `                            for ajf in sorted((dp / 'journal').glob('*.json')):`,
+    `                                try:`,
+    `                                    ajd = json.loads(ajf.read_text(encoding='utf-8'))`,
+    `                                    for ent in (ajd.get('dispatches') or []) if isinstance(ajd, dict) else []:`,
+    `                                        if isinstance(ent, dict) and isinstance(ent.get('resumed_from'), str) and ent['resumed_from'].strip():`,
+    `                                            nxt = ent['resumed_from'].strip()`,
+    `                                            break`,
+    `                                except Exception:`,
+    `                                    continue`,
+    `                                if nxt:`,
+    `                                    break`,
+    `                        cur_dir = nxt`,
+    `        except Exception:`,
+    `            pass`,
     `    run_matched = False`,
     `    if ok and sha:`,
     `        rp = model_edit.publish_receipt_path(p)`,
@@ -975,14 +1047,14 @@ async function _mProbeCandidateOnDisk(
     `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
     `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
     `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
-    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `                run_matched = bool(receipt_rid in allowed_rids and r_sha == sha.lower() and path_ok)`,
     `            except Exception:`,
     `                run_matched = False`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
   const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
-    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}，或经日志复用的续跑链）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" "${progNorm}" "${dispLbl}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
   ].join('\n')
   const probeOpts = {
     agentType: 'dalton-evidence',
@@ -1547,8 +1619,17 @@ async function runModelingPipeline(ctx) {
   })
   let candidatePath = null
   let modelSha = null
-  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id 独立核验盘上可读性、哈希与发布回执
-  const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id（或经日志复用的续跑链）独立核验盘上可读性、哈希与发布回执
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedCandPath,
+    W,
+    p2,
+    '核验候选落盘',
+    runId,
+    true,
+    progressPath,
+    stage2a ? '模型构建与落盘' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     candidatePath = plannedCandPath
     modelSha = diskProbe.model_sha256
@@ -1767,7 +1848,16 @@ async function runModelingPipeline(ctx) {
       const fixCand = rawFixCand ? _mValidModelOutPath(rawFixCand, baselinePath, W) : null
       const fixProbe =
         fixRes && fixCand && _mHasPath(fixRes.files, fixCand, W)
-          ? await _mProbeCandidateOnDisk(fixCand, W, fixPhase, '核验候选落盘', runId)
+          ? await _mProbeCandidateOnDisk(
+              fixCand,
+              W,
+              fixPhase,
+              '核验候选落盘',
+              runId,
+              true,
+              progressPath,
+              `模型修改 ${fixRounds}`
+            )
           : null
       const fixVerified = Boolean(
         fixProbe && fixProbe.verified && fixProbe.readable && fixProbe.model_sha256 && fixProbe.run_matched
@@ -2070,7 +2160,16 @@ async function reviseModelForReport(ctx) {
   // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedNextPath,
+    W,
+    phaseLabel,
+    '核验联动候选落盘',
+    runId,
+    true,
+    progressPath,
+    editRes ? '模型联动修订' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256
@@ -2859,10 +2958,14 @@ async function _mProbeCandidateOnDisk(
   phaseTitle,
   label,
   expectedRunId = null,
-  requireReceipt = true
+  requireReceipt = true,
+  progressPath = null,
+  dispatchLabel = null
 ) {
   const norm = _mNormPath(candidatePath, W)
   const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
+  const progNorm = _mNormPath(progressPath, W) || ''
+  const dispLbl = typeof dispatchLabel === 'string' ? dispatchLabel.trim() : ''
   if (!norm) {
     return {
       verified: true,
@@ -2887,17 +2990,85 @@ async function _mProbeCandidateOnDisk(
     }
   }
   const pyCode = [
-    `import json, pathlib, sys`,
+    `import json, pathlib, re, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
     `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
     `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
+    `prog_arg = sys.argv[3].strip() if len(sys.argv) > 3 else ''`,
+    `disp_lbl = sys.argv[4].strip() if len(sys.argv) > 4 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
     `run_matched = None`,
     `receipt_rid = None`,
     `if want_rid:`,
+    `    allowed_rids = {want_rid}`,
+    `    if prog_arg and disp_lbl:`,
+    `        try:`,
+    `            pp = pathlib.Path(prog_arg)`,
+    `            prog = json.loads(pp.read_text(encoding='utf-8')) if pp.is_file() else None`,
+    `            rfrom = str(prog.get('resumed_from') or '').strip() if isinstance(prog, dict) else ''`,
+    `            prog_rid = str(prog.get('run_id') or '').strip() if isinstance(prog, dict) else ''`,
+    `            if rfrom and (not prog_rid or prog_rid == want_rid):`,
+    `                ws_root = pathlib.Path('.').resolve()`,
+    `                run_dir_raw = str(prog.get('run_dir') or '').strip()`,
+    `                this_dir = pathlib.Path(run_dir_raw) if run_dir_raw else (pathlib.Path(rfrom).parent / want_rid)`,
+    `                safe_lbl = re.sub(r'[^0-9A-Za-z_\\u4e00-\\u9fff.-]+', '_', disp_lbl)[:80] or 'dispatch'`,
+    `                jf = this_dir / 'journal' / f'{safe_lbl}.json'`,
+    `                was_replayed = False`,
+    `                if jf.is_file() and jf.resolve().is_relative_to(ws_root):`,
+    `                    jd = json.loads(jf.read_text(encoding='utf-8'))`,
+    `                    ds = jd.get('dispatches') if isinstance(jd, dict) else None`,
+    `                    if isinstance(ds, list) and ds and isinstance(ds[-1], dict):`,
+    `                        last = ds[-1]`,
+    `                        was_replayed = bool(last.get('status') == 'ok' and isinstance(last.get('resumed_from'), str) and last['resumed_from'].strip())`,
+    `                if was_replayed:`,
+    `                    cur_dir = rfrom`,
+    `                    visited = set()`,
+    `                    hops = 0`,
+    `                    while cur_dir and hops < 32:`,
+    `                        nd = cur_dir.strip().rstrip('/')`,
+    `                        if not nd or nd in visited:`,
+    `                            break`,
+    `                        visited.add(nd)`,
+    `                        hops += 1`,
+    `                        dp = pathlib.Path(nd)`,
+    `                        if not dp.is_dir() or not dp.resolve().is_relative_to(ws_root):`,
+    `                            break`,
+    `                        anc_rid = None`,
+    `                        nxt = None`,
+    `                        for meta_name, rid_k in (('resume.json', 'task_id'), ('status.json', 'run_id')):`,
+    `                            mf = dp / meta_name`,
+    `                            if mf.is_file():`,
+    `                                try:`,
+    `                                    md = json.loads(mf.read_text(encoding='utf-8'))`,
+    `                                    if isinstance(md, dict):`,
+    `                                        if not anc_rid and isinstance(md.get(rid_k), str) and md[rid_k].strip():`,
+    `                                            anc_rid = md[rid_k].strip()`,
+    `                                        if not nxt and isinstance(md.get('resumed_from'), str) and md['resumed_from'].strip():`,
+    `                                            nxt = md['resumed_from'].strip()`,
+    `                                except Exception:`,
+    `                                    pass`,
+    `                        if not anc_rid and dp.name:`,
+    `                            anc_rid = dp.name`,
+    `                        if anc_rid:`,
+    `                            allowed_rids.add(anc_rid)`,
+    `                        if not nxt and (dp / 'journal').is_dir():`,
+    `                            for ajf in sorted((dp / 'journal').glob('*.json')):`,
+    `                                try:`,
+    `                                    ajd = json.loads(ajf.read_text(encoding='utf-8'))`,
+    `                                    for ent in (ajd.get('dispatches') or []) if isinstance(ajd, dict) else []:`,
+    `                                        if isinstance(ent, dict) and isinstance(ent.get('resumed_from'), str) and ent['resumed_from'].strip():`,
+    `                                            nxt = ent['resumed_from'].strip()`,
+    `                                            break`,
+    `                                except Exception:`,
+    `                                    continue`,
+    `                                if nxt:`,
+    `                                    break`,
+    `                        cur_dir = nxt`,
+    `        except Exception:`,
+    `            pass`,
     `    run_matched = False`,
     `    if ok and sha:`,
     `        rp = model_edit.publish_receipt_path(p)`,
@@ -2909,14 +3080,14 @@ async function _mProbeCandidateOnDisk(
     `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
     `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
     `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
-    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `                run_matched = bool(receipt_rid in allowed_rids and r_sha == sha.lower() and path_ok)`,
     `            except Exception:`,
     `                run_matched = False`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
   const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
-    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}，或经日志复用的续跑链）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" "${progNorm}" "${dispLbl}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
   ].join('\n')
   const probeOpts = {
     agentType: 'dalton-evidence',
@@ -3481,8 +3652,17 @@ async function runModelingPipeline(ctx) {
   })
   let candidatePath = null
   let modelSha = null
-  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id 独立核验盘上可读性、哈希与发布回执
-  const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id（或经日志复用的续跑链）独立核验盘上可读性、哈希与发布回执
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedCandPath,
+    W,
+    p2,
+    '核验候选落盘',
+    runId,
+    true,
+    progressPath,
+    stage2a ? '模型构建与落盘' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     candidatePath = plannedCandPath
     modelSha = diskProbe.model_sha256
@@ -3701,7 +3881,16 @@ async function runModelingPipeline(ctx) {
       const fixCand = rawFixCand ? _mValidModelOutPath(rawFixCand, baselinePath, W) : null
       const fixProbe =
         fixRes && fixCand && _mHasPath(fixRes.files, fixCand, W)
-          ? await _mProbeCandidateOnDisk(fixCand, W, fixPhase, '核验候选落盘', runId)
+          ? await _mProbeCandidateOnDisk(
+              fixCand,
+              W,
+              fixPhase,
+              '核验候选落盘',
+              runId,
+              true,
+              progressPath,
+              `模型修改 ${fixRounds}`
+            )
           : null
       const fixVerified = Boolean(
         fixProbe && fixProbe.verified && fixProbe.readable && fixProbe.model_sha256 && fixProbe.run_matched
@@ -4004,7 +4193,16 @@ async function reviseModelForReport(ctx) {
   // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedNextPath,
+    W,
+    phaseLabel,
+    '核验联动候选落盘',
+    runId,
+    true,
+    progressPath,
+    editRes ? '模型联动修订' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256
@@ -5226,10 +5424,14 @@ async function _mProbeCandidateOnDisk(
   phaseTitle,
   label,
   expectedRunId = null,
-  requireReceipt = true
+  requireReceipt = true,
+  progressPath = null,
+  dispatchLabel = null
 ) {
   const norm = _mNormPath(candidatePath, W)
   const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
+  const progNorm = _mNormPath(progressPath, W) || ''
+  const dispLbl = typeof dispatchLabel === 'string' ? dispatchLabel.trim() : ''
   if (!norm) {
     return {
       verified: true,
@@ -5254,17 +5456,85 @@ async function _mProbeCandidateOnDisk(
     }
   }
   const pyCode = [
-    `import json, pathlib, sys`,
+    `import json, pathlib, re, sys`,
     `sys.path.insert(0, '.agents/skills/dalton-model/scripts')`,
     `import model_readable, model_fingerprint, model_edit`,
     `p = pathlib.Path(sys.argv[1])`,
     `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
+    `prog_arg = sys.argv[3].strip() if len(sys.argv) > 3 else ''`,
+    `disp_lbl = sys.argv[4].strip() if len(sys.argv) > 4 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
     `run_matched = None`,
     `receipt_rid = None`,
     `if want_rid:`,
+    `    allowed_rids = {want_rid}`,
+    `    if prog_arg and disp_lbl:`,
+    `        try:`,
+    `            pp = pathlib.Path(prog_arg)`,
+    `            prog = json.loads(pp.read_text(encoding='utf-8')) if pp.is_file() else None`,
+    `            rfrom = str(prog.get('resumed_from') or '').strip() if isinstance(prog, dict) else ''`,
+    `            prog_rid = str(prog.get('run_id') or '').strip() if isinstance(prog, dict) else ''`,
+    `            if rfrom and (not prog_rid or prog_rid == want_rid):`,
+    `                ws_root = pathlib.Path('.').resolve()`,
+    `                run_dir_raw = str(prog.get('run_dir') or '').strip()`,
+    `                this_dir = pathlib.Path(run_dir_raw) if run_dir_raw else (pathlib.Path(rfrom).parent / want_rid)`,
+    `                safe_lbl = re.sub(r'[^0-9A-Za-z_\\u4e00-\\u9fff.-]+', '_', disp_lbl)[:80] or 'dispatch'`,
+    `                jf = this_dir / 'journal' / f'{safe_lbl}.json'`,
+    `                was_replayed = False`,
+    `                if jf.is_file() and jf.resolve().is_relative_to(ws_root):`,
+    `                    jd = json.loads(jf.read_text(encoding='utf-8'))`,
+    `                    ds = jd.get('dispatches') if isinstance(jd, dict) else None`,
+    `                    if isinstance(ds, list) and ds and isinstance(ds[-1], dict):`,
+    `                        last = ds[-1]`,
+    `                        was_replayed = bool(last.get('status') == 'ok' and isinstance(last.get('resumed_from'), str) and last['resumed_from'].strip())`,
+    `                if was_replayed:`,
+    `                    cur_dir = rfrom`,
+    `                    visited = set()`,
+    `                    hops = 0`,
+    `                    while cur_dir and hops < 32:`,
+    `                        nd = cur_dir.strip().rstrip('/')`,
+    `                        if not nd or nd in visited:`,
+    `                            break`,
+    `                        visited.add(nd)`,
+    `                        hops += 1`,
+    `                        dp = pathlib.Path(nd)`,
+    `                        if not dp.is_dir() or not dp.resolve().is_relative_to(ws_root):`,
+    `                            break`,
+    `                        anc_rid = None`,
+    `                        nxt = None`,
+    `                        for meta_name, rid_k in (('resume.json', 'task_id'), ('status.json', 'run_id')):`,
+    `                            mf = dp / meta_name`,
+    `                            if mf.is_file():`,
+    `                                try:`,
+    `                                    md = json.loads(mf.read_text(encoding='utf-8'))`,
+    `                                    if isinstance(md, dict):`,
+    `                                        if not anc_rid and isinstance(md.get(rid_k), str) and md[rid_k].strip():`,
+    `                                            anc_rid = md[rid_k].strip()`,
+    `                                        if not nxt and isinstance(md.get('resumed_from'), str) and md['resumed_from'].strip():`,
+    `                                            nxt = md['resumed_from'].strip()`,
+    `                                except Exception:`,
+    `                                    pass`,
+    `                        if not anc_rid and dp.name:`,
+    `                            anc_rid = dp.name`,
+    `                        if anc_rid:`,
+    `                            allowed_rids.add(anc_rid)`,
+    `                        if not nxt and (dp / 'journal').is_dir():`,
+    `                            for ajf in sorted((dp / 'journal').glob('*.json')):`,
+    `                                try:`,
+    `                                    ajd = json.loads(ajf.read_text(encoding='utf-8'))`,
+    `                                    for ent in (ajd.get('dispatches') or []) if isinstance(ajd, dict) else []:`,
+    `                                        if isinstance(ent, dict) and isinstance(ent.get('resumed_from'), str) and ent['resumed_from'].strip():`,
+    `                                            nxt = ent['resumed_from'].strip()`,
+    `                                            break`,
+    `                                except Exception:`,
+    `                                    continue`,
+    `                                if nxt:`,
+    `                                    break`,
+    `                        cur_dir = nxt`,
+    `        except Exception:`,
+    `            pass`,
     `    run_matched = False`,
     `    if ok and sha:`,
     `        rp = model_edit.publish_receipt_path(p)`,
@@ -5276,14 +5546,14 @@ async function _mProbeCandidateOnDisk(
     `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
     `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
     `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
-    `                run_matched = bool(receipt_rid == want_rid and r_sha == sha.lower() and path_ok)`,
+    `                run_matched = bool(receipt_rid in allowed_rids and r_sha == sha.lower() and path_ok)`,
     `            except Exception:`,
     `                run_matched = False`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
   const prompt = [
-    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}）发布` : ''}（不修改任何文件）。`,
-    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+    `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}，或经日志复用的续跑链）发布` : ''}（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" "${progNorm}" "${dispLbl}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
   ].join('\n')
   const probeOpts = {
     agentType: 'dalton-evidence',
@@ -5848,8 +6118,17 @@ async function runModelingPipeline(ctx) {
   })
   let candidatePath = null
   let modelSha = null
-  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id 独立核验盘上可读性、哈希与发布回执
-  const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id（或经日志复用的续跑链）独立核验盘上可读性、哈希与发布回执
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedCandPath,
+    W,
+    p2,
+    '核验候选落盘',
+    runId,
+    true,
+    progressPath,
+    stage2a ? '模型构建与落盘' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     candidatePath = plannedCandPath
     modelSha = diskProbe.model_sha256
@@ -6068,7 +6347,16 @@ async function runModelingPipeline(ctx) {
       const fixCand = rawFixCand ? _mValidModelOutPath(rawFixCand, baselinePath, W) : null
       const fixProbe =
         fixRes && fixCand && _mHasPath(fixRes.files, fixCand, W)
-          ? await _mProbeCandidateOnDisk(fixCand, W, fixPhase, '核验候选落盘', runId)
+          ? await _mProbeCandidateOnDisk(
+              fixCand,
+              W,
+              fixPhase,
+              '核验候选落盘',
+              runId,
+              true,
+              progressPath,
+              `模型修改 ${fixRounds}`
+            )
           : null
       const fixVerified = Boolean(
         fixProbe && fixProbe.verified && fixProbe.readable && fixProbe.model_sha256 && fixProbe.run_matched
@@ -6371,7 +6659,16 @@ async function reviseModelForReport(ctx) {
   // 绝不信任子任务回传的旧路径或自报哈希，也绝不把其他运行发布的文件认作本轮新候选。
   let nextPath = null
   let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘', runId)
+  const diskProbe = await _mProbeCandidateOnDisk(
+    plannedNextPath,
+    W,
+    phaseLabel,
+    '核验联动候选落盘',
+    runId,
+    true,
+    progressPath,
+    editRes ? '模型联动修订' : null
+  )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath
     nextSha = diskProbe.model_sha256

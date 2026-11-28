@@ -657,7 +657,35 @@ def create_run_workflow_tool(
         # that settled some other way, so a stop mid-admission keeps its entry.
         base_rel = run_dir(short_thread_id, run_task.task_id)
         admitted = False
+        # DALTON-HOOK(modeling-lock): acquire the per-workspace modeling lock
+        # at entry for modeling workflows so two concurrent runs never race on
+        # model versions or shared progress files.
+        modeling_lock_acquired = False
+        from src.dalton.workflows.modeling_lock import (
+            ModelingLockBusy,
+            acquire_modeling_lock,
+            modeling_lock_ttl,
+            needs_modeling_lock,
+            release_modeling_lock,
+        )
+
         try:
+            if needs_modeling_lock(meta.name, params):
+                try:
+                    await acquire_modeling_lock(
+                        backend,
+                        registry=registry,
+                        run_id=run_task.task_id,
+                        workflow=meta.name,
+                        thread_id=thread_id,
+                        tool_call_id=launch_tool_call_id,
+                        workspace_id=configurable.get("workspace_id"),
+                        ttl_seconds=modeling_lock_ttl(caps),
+                    )
+                except ModelingLockBusy as error:
+                    run_task.mark_never_started("workspace modeling lock busy")
+                    raise _Refused(str(error)) from error
+                modeling_lock_acquired = True
             await _admit_run(
                 run_task,
                 caps,
@@ -686,6 +714,16 @@ def create_run_workflow_tool(
                 except ResumeRefused as error:
                     raise _Refused(str(error)) from error
         except BaseException as launch_error:
+            # DALTON-HOOK(modeling-lock): release lock if admission or resume
+            # claim fails after the lock was acquired.
+            if modeling_lock_acquired:
+                await release_modeling_lock(
+                    backend,
+                    registry=registry,
+                    run_id=run_task.task_id,
+                    workflow=meta.name,
+                    workspace_id=configurable.get("workspace_id"),
+                )
             if admitted:
                 # The row is in the ledger and the namespace fence is held —
                 # the post-INSERT arm settles it as a terminal error and
@@ -728,6 +766,9 @@ def create_run_workflow_tool(
             # progress marker path the driver's journal keeps current.
             journal_source=journal_source,
             progress_path=progress_path,
+            # DALTON-HOOK(modeling-lock): hand ownership of the acquired lock
+            # to the driver so it releases when the run finishes.
+            modeling_lock_held=modeling_lock_acquired,
         )
         driver = WorkflowDriver(spec)
         try:
@@ -741,12 +782,32 @@ def create_run_workflow_tool(
                 action="init",
             )
         except SpawnStoppedError:
+            # DALTON-HOOK(modeling-lock): release lock when spawn is stopped.
+            if modeling_lock_acquired:
+                await release_modeling_lock(
+                    backend,
+                    registry=registry,
+                    run_id=run_task.task_id,
+                    workflow=meta.name,
+                    workspace_id=configurable.get("workspace_id"),
+                )
             return _stopped_reply(run_task, tool_call_id)
-        except SpawnError as error:
-            raise _Refused(
-                f"could not start {run_task.display_id} — {error}.",
-                failure=type(error).__name__,
-            ) from error
+        except BaseException as error:
+            # DALTON-HOOK(modeling-lock): release lock when spawn fails.
+            if modeling_lock_acquired:
+                await release_modeling_lock(
+                    backend,
+                    registry=registry,
+                    run_id=run_task.task_id,
+                    workflow=meta.name,
+                    workspace_id=configurable.get("workspace_id"),
+                )
+            if isinstance(error, SpawnError):
+                raise _Refused(
+                    f"could not start {run_task.display_id} — {error}.",
+                    failure=type(error).__name__,
+                ) from error
+            raise
 
         logger.info(
             "Workflow run started",

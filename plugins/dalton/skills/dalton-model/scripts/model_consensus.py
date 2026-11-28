@@ -777,6 +777,26 @@ def write_consensus_snapshot(
                 post_coord_map_sha256=post_cm_sha,
             )
         os.replace(editing_copy, mpath)
+        # Keep existing publish receipt SHA aligned across legitimate write-snapshot
+        # transitions while preserving the original publishing run_id.
+        pub_rcpt = model_edit.publish_receipt_path(mpath)
+        if pub_rcpt.is_file():
+            try:
+                rcpt_doc = json.loads(pub_rcpt.read_text(encoding="utf-8"))
+                if (
+                    isinstance(rcpt_doc, dict)
+                    and str(rcpt_doc.get("candidate_sha256") or "").strip().lower()
+                    == pre_model_sha.lower()
+                ):
+                    rcpt_doc["candidate_sha256"] = new_sha.lower()
+                    tmp_rcpt = pub_rcpt.with_name(f".{pub_rcpt.name}.{os.getpid()}.tmp")
+                    tmp_rcpt.write_text(
+                        json.dumps(rcpt_doc, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(tmp_rcpt, pub_rcpt)
+            except Exception:
+                pass
         if cp_obj is not None and new_cm_text is not None:
             tmp_cm = cp_obj.with_name(f".{cp_obj.name}.{os.getpid()}.tmp")
             tmp_cm.write_text(new_cm_text, encoding="utf-8")

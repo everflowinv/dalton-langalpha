@@ -8686,6 +8686,11 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
     from src.config.models import WorkflowOrchestrationConfig
 
     ws = tmp_path / "ws_real_resume_rework"
+    scripts_src = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
     r_rel = "research/2026-11-27-model-PDD"
     dump_rel = f"{r_rel}/model_dump"
     base_rel = "model/PDD-model-v01.xlsx"
@@ -8846,6 +8851,16 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
         return WorkflowDriver(spec), dispatched
 
     state_box: dict[str, str] = {}
+    probe_results_run1: list[dict[str, Any]] = []
+    probe_results_run2: list[dict[str, Any]] = []
+
+    def _run_real_probe(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, f"Missing bash command block in prompt:\n{prompt}"
+        cmd = m.group(1).replace("python3 ", f"{sys.executable} ")
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, f"Real probe failed: {proc.stdout}\n{proc.stderr}"
+        return json.loads(proc.stdout.strip())
 
     # --- RUN 1: Runs Prep -> Stage 2a (real model_edit v01->v02 H1) -> Stage 2b (real write-snapshot H1->H2
     #     + real in-place consensus rework H2->H3), then CRASHES before Stage 2b finishes! ---
@@ -8866,7 +8881,8 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
                 "baseline_health_warning": None,
             }
         if label == "读取运行ID":
-            return {"run_id": "run-r4-1"}
+            prog_doc = json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))
+            return {"run_id": prog_doc["run_id"]}
         if label == "模型构建与落盘":
             edit1 = medit.apply_edit_plan(
                 baseline_path=base_p,
@@ -8881,6 +8897,7 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
                 coord_map_out=cm_p,
                 skip_recalc=True,
                 mode="update",
+                progress_path=ws / r_rel / ".progress.json",
             )
             state_box["h1"] = edit1["candidate_sha256"]
             return {
@@ -8891,13 +8908,9 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
                 "recalc_status": "ok",
             }
         if label == "核验候选落盘":
-            return {
-                "path": cand_rel,
-                "exists": cand_p.is_file(),
-                "readable": cand_p.is_file(),
-                "model_sha256": mfp.file_sha256(cand_p),
-                "run_matched": True,
-            }
+            out = _run_real_probe(prompt)
+            probe_results_run1.append(out)
+            return out
         if label == "一致预期对照":
             # 1) Real write-snapshot (H1 -> H2)
             rc_s = mcons.main(
@@ -8921,6 +8934,7 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
                 skip_recalc=True,
                 mode="update",
                 in_place=True,
+                progress_path=ws / r_rel / ".progress.json",
             )
             state_box["h3"] = edit_rework["candidate_sha256"]
             assert state_box["h1"] != state_box["h2"] != state_box["h3"]
@@ -8933,6 +8947,9 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
 
     driver1, dispatched1 = _make_run_driver("run-r4-1", _run1_handler)
     await driver1.run()
+    assert len(probe_results_run1) == 1
+    assert probe_results_run1[0]["run_matched"] is True
+    assert probe_results_run1[0]["receipt_run_id"] == "run-r4-1"
     assert (ws / dump_rel / "consensus-snapshot-receipt.json").is_file()
     rcpt = json.loads((ws / dump_rel / "consensus-snapshot-receipt.json").read_text(encoding="utf-8"))
     assert rcpt["pre_snapshot_model_sha256"] == state_box["h1"]
@@ -8944,15 +8961,12 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
 
     def _run2_handler(label: str, prompt: str) -> Any:
         if label == "读取运行ID":
-            return {"run_id": "run-r4-2"}
+            prog_doc = json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))
+            return {"run_id": prog_doc["run_id"]}
         if label == "核验候选落盘":
-            return {
-                "path": cand_rel,
-                "exists": cand_p.is_file(),
-                "readable": cand_p.is_file(),
-                "model_sha256": mfp.file_sha256(cand_p),
-                "run_matched": True,
-            }
+            out = _run_real_probe(prompt)
+            probe_results_run2.append(out)
+            return out
         if label == "模型构建与落盘":
             raise AssertionError("Stage 2a MUST be replayed from journal + receipt, NEVER re-dispatched!")
         if label == "一致预期对照":
@@ -9015,6 +9029,10 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
     await driver2.run()
 
     dispatched2_labels = [lbl for lbl, _ in dispatched2]
+    assert len(probe_results_run2) == 1
+    assert probe_results_run2[0]["run_matched"] is True, probe_results_run2[0]
+    assert probe_results_run2[0]["receipt_run_id"] == "run-r4-1"
+    assert probe_results_run2[0]["model_sha256"] == state_box["h3"]
     assert "建模准备" not in dispatched2_labels, "Prep should replay"
     assert "模型构建与落盘" not in dispatched2_labels, "Stage 2a MUST replay via receipt chain!"
     assert "一致预期对照" in dispatched2_labels
@@ -11156,3 +11174,824 @@ async def test_p0b_r7_2_report_sync_probe_ignores_unclosed_html_comment_to_eof(
     )
     assert probe_before["synced"] is True, probe_before
     assert "report_sync" not in res_before["failedStages"]
+
+
+# ===========================================================================
+# P0-b Round 8 fixes (Items 1-2)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_p0b_r8_1_resume_chain_receipt_adoption_and_fresh_dispatch_strictness(
+    tmp_path: Path,
+) -> None:
+    """R8 #1:
+    1) Prior run published candidate -> resumed under a new run_id (single-hop AND multi-hop
+       Run 1 -> Run 2 -> Run 3): real disk probe traces `resumed_from` recursively, accepts
+       the ancestor's receipt when path+hash match and the stage was replayed, and delivers;
+    2) Freshly dispatched Stage 2a on a resumed run returning success JSON pointing to an
+       ancestor run's receipt MUST still be rejected (`run_matched=False`);
+    3) Receipt belonging to an unrelated run outside the resume chain is rejected even on replay."""
+    import asyncio
+    import fnmatch
+    import shlex as _shlex
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+    from src.config.models import WorkflowOrchestrationConfig
+
+    wf_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+    wf_meta = compile_check(wf_script)
+
+    def _setup_ws(name: str) -> tuple[Path, str, str, Path, str, Path, str, Path, str, Path, str, Path, Any]:
+        ws = tmp_path / name
+        scripts_src = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+        dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+        dst_scripts.mkdir(parents=True, exist_ok=True)
+        for py_f in scripts_src.glob("*.py"):
+            shutil.copy2(py_f, dst_scripts / py_f.name)
+        r_rel = "research/2026-11-27-model-PDD"
+        dump_rel = f"{r_rel}/model_dump"
+        base_rel = "model/PDD-model-v01.xlsx"
+        base_p = ws / base_rel
+        base_sha = _write_simple_valid_model(base_p)
+        cand_rel = "model/PDD-model-v02.xlsx"
+        cand_p = ws / cand_rel
+        cm_rel = f"{dump_rel}/coord_map.json"
+        cm_p = ws / cm_rel
+        fp_rel = f"{dump_rel}/PDD-fingerprint.json"
+        cons_rel = "data/consensus/2026-11-27_1000.json"
+        cons_p = ws / cons_rel
+        cons_p.parent.mkdir(parents=True, exist_ok=True)
+        cons_p.write_text(
+            json.dumps(
+                {
+                    "ticker": "PDD",
+                    "as_of_date": "2026-11-27",
+                    "source_type": "Market Consensus",
+                    "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 1100.0}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        backend = create_autospec(SandboxBackend, instance=True)
+        backend.workspace_dir = str(ws)
+
+        async def _aread(path: str) -> str | None:
+            p = ws / path
+            return p.read_text(encoding="utf-8") if p.is_file() else None
+
+        async def _awrite(path: str, text: str) -> bool:
+            p = ws / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            return True
+
+        async def _aglob(pattern: str, root: str = ".") -> list[str]:
+            found: list[str] = []
+            base_root = ws if root in (".", "") else (ws / root)
+            if not base_root.exists():
+                return []
+            for p in base_root.rglob("*"):
+                if p.is_file():
+                    rel = p.relative_to(ws).as_posix()
+                    if fnmatch.fnmatch(rel, pattern):
+                        found.append(rel)
+            return sorted(found)
+
+        async def _aexec(cmd: str) -> Any:
+            if "sha256sum -- " in cmd:
+                tail = cmd.split("sha256sum -- ", 1)[1]
+                lines = []
+                for rel in _shlex.split(tail):
+                    p = ws / rel
+                    if not p.is_file():
+                        return _NS(exit_code=1, output="")
+                    lines.append(f"{mfp.file_sha256(p)}  {rel}")
+                return _NS(exit_code=0, output="\n".join(lines) + "\n")
+            return _NS(exit_code=1, output="")
+
+        backend.aread_text.side_effect = _aread
+        backend.awrite_text.side_effect = _awrite
+        backend.aglob_paths.side_effect = _aglob
+        backend.aexecute.side_effect = _aexec
+        return ws, r_rel, dump_rel, base_p, base_sha, cand_p, cand_rel, cm_p, cm_rel, fp_rel, cons_rel, cons_p, backend
+
+    def _run_real_probe(ws: Path, prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, prompt
+        cmd = m.group(1).replace("python3 ", f"{sys.executable} ")
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return json.loads(proc.stdout.strip())
+
+    def _make_driver(
+        backend: Any,
+        r_rel: str,
+        base_rel: str,
+        run_id_str: str,
+        handler: Any,
+        *,
+        journal_source: str | None = None,
+    ) -> tuple[WorkflowDriver, list[str]]:
+        dispatched: list[str] = []
+        registry = BackgroundTaskRegistry()
+
+        class _FakeDispatcher:
+            subagent_types = frozenset({"general-purpose", "dalton-evidence"})
+
+            async def dispatch(
+                self,
+                *,
+                subagent_type: str,
+                description: str,
+                prompt: str,
+                run_id: str | None = None,
+                owner_task_id: str | None = None,
+                base_configurable: dict[str, Any] | None = None,
+                time_limit: float | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                dispatched.append(description)
+                task = await registry.register(
+                    tool_call_id=f"{run_id_str}-child-{len(dispatched)}",
+                    description=description,
+                    prompt=prompt[:200],
+                    subagent_type=subagent_type,
+                    run_id=run_id,
+                )
+                task.per_call_records = []
+
+                async def _run_child() -> str:
+                    res = handler(description, prompt)
+                    if isinstance(res, Exception):
+                        task.terminal_status = "error"
+                        raise res
+                    task.terminal_status = "completed"
+                    return json.dumps(res, ensure_ascii=False)
+
+                task.asyncio_task = asyncio.create_task(_run_child())
+                return task
+
+        run_task = _NS(
+            task_id=run_id_str,
+            display_id=run_id_str,
+            task_run_id=None,
+            spawned_run_id=run_id_str,
+            terminal_status=None,
+            stop_at=None,
+            keep_straggler=lambda _w: None,
+        )
+        params = {
+            "ticker": "PDD",
+            "company": "PDD Holdings",
+            "workspace_dir": ".",
+            "as_of": "2026-11-27",
+            "mode": "update",
+            "model_path": base_rel,
+            "progress_path": f"{r_rel}/.progress.json",
+        }
+        spec = WorkflowRunSpec(
+            run_task=run_task,
+            registry=registry,
+            dispatcher=_FakeDispatcher(),
+            backend=backend,
+            thread_id="thread-r8-resume",
+            short_thread_id="88888888",
+            script=wf_script,
+            script_args=params,
+            meta=wf_meta,
+            source="prebuilt",
+            caps=WorkflowOrchestrationConfig(
+                enabled=True,
+                max_dispatches_per_run=30,
+                max_concurrent_children=4,
+                child_timeout=30.0,
+                run_timeout=60.0,
+                memory_limit_mb=64,
+                cpu_budget_s=15.0,
+            ),
+            journal_source=journal_source,
+            progress_path=f"{r_rel}/.progress.json",
+        )
+        return WorkflowDriver(spec), dispatched
+
+    # --- Case 1 & 2: Multi-hop resume (Run 1 publishes v02 & writes snapshot, crashes;
+    #     Run 2 replays Stage 2a & crashes in Stage 2b; Run 3 resumes from Run 2 ->
+    #     traces Run 3 -> Run 2 -> Run 1, adopts Run 1's receipt, delivers normally!) ---
+    ws, r_rel, dump_rel, base_p, base_sha, cand_p, cand_rel, cm_p, cm_rel, fp_rel, cons_rel, cons_p, backend = _setup_ws(
+        "ws_r8_multihop"
+    )
+    base_rel = "model/PDD-model-v01.xlsx"
+    probes_m: list[dict[str, Any]] = []
+
+    def _h_r1(lbl: str, prompt: str) -> Any:
+        if lbl == "建模准备":
+            fp_obj = mfp.build_fingerprint(base_p, ticker="PDD")
+            (ws / fp_rel).parent.mkdir(parents=True, exist_ok=True)
+            (ws / fp_rel).write_text(json.dumps(fp_obj, indent=2), encoding="utf-8")
+            return {
+                "files": [fp_rel],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": base_rel,
+                "baseline_sha256": base_sha,
+                "fingerprint_path": fp_rel,
+                "consensus_path": cons_rel,
+                "planned_output_path": cand_rel,
+                "baseline_health_warning": None,
+            }
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "模型构建与落盘":
+            ed = medit.apply_edit_plan(
+                baseline_path=base_p,
+                ticker="PDD",
+                plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1150}]},
+                output_path=cand_p,
+                workspace_dir=ws,
+                fingerprint=json.loads((ws / fp_rel).read_text(encoding="utf-8")),
+                coord_map_out=cm_p,
+                skip_recalc=True,
+                mode="update",
+                progress_path=ws / r_rel / ".progress.json",
+            )
+            return {
+                "files": [cand_rel, cm_rel],
+                "summary": "v02 built",
+                "candidate_path": cand_rel,
+                "model_sha256": ed["candidate_sha256"],
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(ws, prompt)
+            probes_m.append(out)
+            return out
+        if lbl == "一致预期对照":
+            # Also exercise write-snapshot updating publish receipt SHA (no rework!) then crashing
+            assert mcons.main(["write-snapshot", "--model", str(cand_p), "--consensus", str(cons_p), "--coord-map", str(cm_p)]) == 0
+            return RuntimeError("crash right after write-snapshot")
+        if lbl in ("模型本轮范围检查", "写入降级账本"):
+            return RuntimeError("interrupted")
+        raise AssertionError(lbl)
+
+    d1, _ = _make_driver(backend, r_rel, base_rel, "run-r8-m1", _h_r1)
+    await d1.run()
+    assert probes_m[-1]["run_matched"] is True and probes_m[-1]["receipt_run_id"] == "run-r8-m1"
+
+    # Run 2 resumes from Run 1: replays Prep & Stage 2a, passes real probe (single-hop), then crashes in Stage 2b
+    def _h_r2(lbl: str, prompt: str) -> Any:
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "模型构建与落盘":
+            raise AssertionError("Run 2 must replay Stage 2a")
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(ws, prompt)
+            probes_m.append(out)
+            return out
+        if lbl in ("一致预期对照", "模型本轮范围检查", "写入降级账本"):
+            return RuntimeError("Run 2 interrupted before finish")
+        raise AssertionError(lbl)
+
+    d2, disp2 = _make_driver(
+        backend, r_rel, base_rel, "run-r8-m2", _h_r2, journal_source=".agents/threads/88888888/workflows/run-r8-m1"
+    )
+    await d2.run()
+    assert "模型构建与落盘" not in disp2
+    assert probes_m[-1]["run_matched"] is True and probes_m[-1]["receipt_run_id"] == "run-r8-m1"
+
+    # Run 3 resumes from Run 2 (2 hops away from Run 1!): traces Run 3 -> Run 2 -> Run 1 and delivers!
+    def _h_r3(lbl: str, prompt: str) -> Any:
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "模型构建与落盘":
+            raise AssertionError("Run 3 must replay Stage 2a")
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(ws, prompt)
+            probes_m.append(out)
+            return out
+        if lbl == "一致预期对照":
+            assert mcons.main(["diff", "--model", str(cand_p), "--ticker", "PDD", "--research-dir", str(ws / r_rel), "--consensus", str(cons_p)]) == 0
+            return {
+                "files": [cand_rel, cm_rel, f"{dump_rel}/consensus-diff.md", f"{dump_rel}/consensus-diff.json"],
+                "summary": "diff ok",
+                "candidate_path": cand_rel,
+                "model_sha256": mfp.file_sha256(cand_p),
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if lbl == "模型本轮范围检查":
+            chk_res = mchk.write_check_and_ledger(
+                workspace_dir=ws,
+                ticker="PDD",
+                research_dir=ws / r_rel,
+                candidate_path=cand_p,
+                baseline_path=base_p,
+                fingerprint_path=ws / fp_rel,
+                coord_map_path=cm_p,
+                run_id="run-r8-m3",
+                workflow="company-model",
+                mode="update",
+            )
+            files = [f"{dump_rel}/model-check.md", f"{dump_rel}/model-verification.json"]
+            if chk_res.get("remaining_issues_path"):
+                files.append(f"{dump_rel}/remaining-issues.md")
+            return {
+                "files": files,
+                "summary": "checked",
+                "readable": chk_res["readable"],
+                "final_status": chk_res["final_status"],
+                "model_sha256": chk_res["candidate_sha256"],
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{dump_rel}/remaining-issues.md" if chk_res.get("remaining_issues_path") else None,
+            }
+        raise AssertionError(lbl)
+
+    d3, disp3 = _make_driver(
+        backend, r_rel, base_rel, "run-r8-m3", _h_r3, journal_source=".agents/threads/88888888/workflows/run-r8-m2"
+    )
+    await d3.run()
+    assert "模型构建与落盘" not in disp3
+    assert probes_m[-1]["run_matched"] is True and probes_m[-1]["receipt_run_id"] == "run-r8-m1"
+    res3 = json.loads((ws / ".agents/threads/88888888/workflows/run-r8-m3/result.json").read_text(encoding="utf-8"))
+    assert res3["ok"] is True and res3["candidate_path"] == cand_rel
+    vd3 = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        expected_run_id="run-r8-m3",
+        expected_workflow="company-model",
+    )
+    assert vd3["ok"] is True, vd3["errors"]
+
+    # --- Case 3: Fresh dispatch on a resumed run returning success JSON pointing to ancestor's receipt -> REJECTED! ---
+    ws_f, r_f, dump_f, base_pf, base_shaf, cand_pf, cand_relf, cm_pf, cm_relf, fp_relf, cons_relf, _, backend_f = _setup_ws(
+        "ws_r8_fresh_strict"
+    )
+    probes_f: list[dict[str, Any]] = []
+
+    def _h_f1(lbl: str, prompt: str) -> Any:
+        if lbl == "建模准备":
+            fp_obj = mfp.build_fingerprint(base_pf, ticker="PDD")
+            (ws_f / fp_relf).parent.mkdir(parents=True, exist_ok=True)
+            (ws_f / fp_relf).write_text(json.dumps(fp_obj, indent=2), encoding="utf-8")
+            return {
+                "files": [fp_relf],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": base_rel,
+                "baseline_sha256": base_shaf,
+                "fingerprint_path": fp_relf,
+                "consensus_path": cons_relf,
+                "planned_output_path": cand_relf,
+                "baseline_health_warning": None,
+            }
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws_f / r_f / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "模型构建与落盘":
+            # Publishes v02 with run-r8-f1 receipt, then crashes BEFORE returning ok (not replayable!)
+            medit.apply_edit_plan(
+                baseline_path=base_pf,
+                ticker="PDD",
+                plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1200}]},
+                output_path=cand_pf,
+                workspace_dir=ws_f,
+                fingerprint=json.loads((ws_f / fp_relf).read_text(encoding="utf-8")),
+                coord_map_out=cm_pf,
+                skip_recalc=True,
+                mode="update",
+                progress_path=ws_f / r_f / ".progress.json",
+            )
+            return RuntimeError("stage2a crashed after publishing")
+        if lbl == "核验候选落盘":
+            # Interrupt Run 1 right away before Stage 2b
+            return RuntimeError("run1 interrupted")
+        raise AssertionError(lbl)
+
+    df1, _ = _make_driver(backend_f, r_f, base_rel, "run-r8-f1", _h_f1)
+    await df1.run()
+
+    def _h_f2(lbl: str, prompt: str) -> Any:
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws_f / r_f / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "模型构建与落盘":
+            # Fresh dispatch in Run 2 returns success JSON pointing to Run 1's v02 WITHOUT republishing!
+            return {
+                "files": [cand_relf, cm_relf],
+                "summary": "claimed ok without running model_edit",
+                "candidate_path": cand_relf,
+                "model_sha256": mfp.file_sha256(cand_pf),
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(ws_f, prompt)
+            probes_f.append(out)
+            return out
+        raise AssertionError(f"Fresh dispatch with stale ancestor receipt must stop before {lbl!r}")
+
+    df2, disp_f2 = _make_driver(
+        backend_f, r_f, base_rel, "run-r8-f2", _h_f2, journal_source=".agents/threads/88888888/workflows/run-r8-f1"
+    )
+    await df2.run()
+    assert "建模准备" not in disp_f2, "Prep replayed (progress has resumed_from)"
+    assert "模型构建与落盘" in disp_f2, "Stage 2a was freshly dispatched"
+    assert len(probes_f) == 1
+    assert probes_f[0]["run_matched"] is False and probes_f[0]["receipt_run_id"] == "run-r8-f1"
+    res_f2 = json.loads((ws_f / ".agents/threads/88888888/workflows/run-r8-f2/result.json").read_text(encoding="utf-8"))
+    assert res_f2["ok"] is False and res_f2["status"] == "failed_unusable"
+    assert res_f2["candidate_path"] is None
+
+    # --- Case 4: Unrelated foreign run_id outside resume chain is STILL rejected even on replay ---
+    rcpt_p = medit.publish_receipt_path(cand_p)
+    rcpt_doc = json.loads(rcpt_p.read_text(encoding="utf-8"))
+    rcpt_doc["run_id"] = "run-unrelated-outsider"
+    rcpt_p.write_text(json.dumps(rcpt_doc, indent=2), encoding="utf-8")
+    probes_foreign: list[dict[str, Any]] = []
+
+    def _h_r4(lbl: str, prompt: str) -> Any:
+        if lbl == "读取运行ID":
+            return {"run_id": json.loads((ws / r_rel / ".progress.json").read_text(encoding="utf-8"))["run_id"]}
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(ws, prompt)
+            probes_foreign.append(out)
+            return out
+        raise AssertionError(f"Foreign receipt must stop before {lbl!r}")
+
+    d4, _ = _make_driver(
+        backend, r_rel, base_rel, "run-r8-m4", _h_r4, journal_source=".agents/threads/88888888/workflows/run-r8-m2"
+    )
+    await d4.run()
+    assert len(probes_foreign) == 1
+    assert probes_foreign[0]["run_matched"] is False
+    assert probes_foreign[0]["receipt_run_id"] == "run-unrelated-outsider"
+    res4 = json.loads((ws / ".agents/threads/88888888/workflows/run-r8-m4/result.json").read_text(encoding="utf-8"))
+    assert res4["ok"] is False and res4["status"] == "failed_unusable"
+
+
+@pytest.mark.asyncio
+async def test_p0b_r8_2_workspace_modeling_lock_excludes_concurrent_launches_and_releases_on_finish_or_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8 #2:
+    1) `company-model`, `earnings-deep-update` (with `model_path`), and `full-coverage` acquire
+       the per-workspace modeling lock at entry before entering modeling;
+    2) While one modeling run holds the lock, concurrent launches (across threads or workflows in
+       the same workspace, including true `asyncio.gather` races) are refused at entry with the
+       readable message「这个工作区正在更新模型，请等它完成后再试」, without entering modeling
+       or clobbering the active holder's progress;
+    3) Non-modeling workflows (`bullbear-doc`, `earnings-deep-update` without `model_path`) and
+       other workspaces are NOT blocked;
+    4) Lock releases cleanly on completion / failure / cancellation, and recovers automatically
+       after `expires_at` (with late release from an expired holder never clobbering a new holder)."""
+    import asyncio
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import BackgroundSubagentMiddleware
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunError,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import PrebuiltWorkflowRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.workflows.modeling_lock import (
+        MODELING_LOCK_BUSY_MESSAGE,
+        MODELING_LOCK_PATH,
+        release_modeling_lock,
+    )
+
+    ws = tmp_path / "ws_r8_lock"
+    ws.mkdir(parents=True, exist_ok=True)
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+
+    def _wf_js(name: str) -> str:
+        return f"export const meta = {{ name: {json.dumps(name)}, description: {json.dumps(name)} }}\nreturn {{ ok: true }}\n"
+
+    scripts = {
+        "company-model": _wf_js("company-model"),
+        "earnings-deep-update": _wf_js("earnings-deep-update"),
+        "full-coverage": _wf_js("full-coverage"),
+        "bullbear-doc": _wf_js("bullbear-doc"),
+    }
+    prebuilt = create_autospec(PrebuiltWorkflowRegistry, instance=True)
+    prebuilt.get.side_effect = scripts.get
+    prebuilt.names.side_effect = lambda: sorted(scripts)
+
+    captured_specs: list[WorkflowRunSpec] = []
+    monkeypatch.setattr(
+        wf_tool_mod,
+        "WorkflowDriver",
+        lambda spec: (captured_specs.append(spec), create_autospec(WorkflowDriver, instance=True))[1],
+    )
+
+    async def _noop_spawn(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", _noop_spawn)
+    monkeypatch.setattr(
+        "src.config.settings.get_workflow_orchestration_config",
+        lambda: WorkflowOrchestrationConfig(),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.as_of.resolve_launch_as_of",
+        lambda _b, _n, p, _j: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.subject_kind.resolve_launch_subject_kind",
+        lambda _n, p, _c: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.company_routing.resolve_launch_company_routing",
+        lambda *_a, **_kw: asyncio.sleep(0, result=None),
+    )
+
+    active_ws_id = {"id": "ws-lock-1"}
+    monkeypatch.setattr(
+        wf_tool_mod,
+        "get_config",
+        lambda: {"metadata": {"run_id": "turn-1"}, "configurable": {"user_id": "u-1", "workspace_id": active_ws_id["id"]}},
+    )
+
+    def _make_tool(thread_id: str, short_id: str, target_backend: Any = backend) -> Any:
+        mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+        mw.registry = BackgroundTaskRegistry()
+        mw.checkpointer = object()
+
+        async def _admit(task: Any, **_kw: Any) -> str:
+            return ""
+
+        mw.admit_task_run.side_effect = _admit
+        dispatcher = create_autospec(SubagentDispatcher, instance=True)
+        dispatcher.middleware = mw
+        dispatcher.registry = mw.registry
+        dispatcher.subagent_types = ["general-purpose"]
+        return wf_tool_mod.create_run_workflow_tool(
+            dispatcher=dispatcher,
+            backend=target_backend,
+            thread_id=thread_id,
+            short_thread_id=short_id,
+            store=None,
+            user_id="u-1",
+            prebuilt_workflows=prebuilt,
+        )
+
+    # 1. Concurrent `asyncio.gather` race on two threads in the SAME workspace:
+    #    exactly ONE acquires the lock and starts, the other gets the readable refusal!
+    tool_t1 = _make_tool("thread-a", "aaaa1111")
+    tool_t2 = _make_tool("thread-b", "bbbb2222")
+    r1, r2 = await asyncio.gather(
+        tool_t1.coroutine(
+            workflow="company-model",
+            params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+            tool_call_id="call-race-1",
+        ),
+        tool_t2.coroutine(
+            workflow="full-coverage",
+            params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+            tool_call_id="call-race-2",
+        ),
+    )
+    replies = [str(r1), str(r2)]
+    busy_replies = [m for m in replies if MODELING_LOCK_BUSY_MESSAGE in m]
+    assert len(busy_replies) == 1, replies
+    assert len(captured_specs) == 1
+    holder_spec = captured_specs[0]
+    assert holder_spec.modeling_lock_held is True
+    lock_doc = json.loads((ws / MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert lock_doc["status"] == "locked"
+    assert lock_doc["run_id"] == holder_spec.run_task.task_id
+    assert lock_doc["expires_at"] > lock_doc["acquired_at"]
+
+    # 2. While held, earnings-deep-update WITH model_path is refused,
+    #    while earnings-deep-update WITHOUT model_path and bullbear-doc are NOT blocked!
+    tool_t3 = _make_tool("thread-c", "cccc3333")
+    refused_deep = await tool_t3.coroutine(
+        workflow="earnings-deep-update",
+        params={"ticker": "PDD", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-11-27", "model_path": "model/PDD-model-v01.xlsx"},
+        tool_call_id="call-deep-with-model",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE in str(refused_deep)
+    assert len(captured_specs) == 1
+
+    ok_deep_no_model = await tool_t3.coroutine(
+        workflow="earnings-deep-update",
+        params={"ticker": "PDD", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-11-27"},
+        tool_call_id="call-deep-no-model",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE not in str(ok_deep_no_model)
+    assert len(captured_specs) == 2 and captured_specs[-1].modeling_lock_held is False
+
+    ok_bullbear = await tool_t3.coroutine(
+        workflow="bullbear-doc",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-bb",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE not in str(ok_bullbear)
+    assert len(captured_specs) == 3
+
+    # 3. Another workspace is NOT blocked!
+    ws_other = tmp_path / "ws_r8_lock_other"
+    ws_other.mkdir(parents=True, exist_ok=True)
+    backend_other = create_autospec(SandboxBackend, instance=True)
+    backend_other.workspace_dir = str(ws_other)
+
+    async def _aread_other(path: str) -> str | None:
+        p = ws_other / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite_other(path: str, text: str) -> bool:
+        p = ws_other / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    backend_other.aread_text.side_effect = _aread_other
+    backend_other.awrite_text.side_effect = _awrite_other
+    active_ws_id["id"] = "ws-lock-2"
+    tool_other = _make_tool("thread-other", "oooo9999", target_backend=backend_other)
+    ok_other = await tool_other.coroutine(
+        workflow="company-model",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-other-ws",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE not in str(ok_other)
+    assert len(captured_specs) == 4
+    active_ws_id["id"] = "ws-lock-1"
+
+    # 4. Real WorkflowDriver lifecycle: holds lock while running, blocks a second concurrent
+    #    modeling WorkflowDriver without touching Run 1's .progress.json, and releases on finish!
+    released_ok = await release_modeling_lock(
+        backend,
+        run_id=holder_spec.run_task.task_id,
+        workflow=holder_spec.meta.name,
+        workspace_id="ws-lock-1",
+    )
+    assert released_ok is True
+
+    entered_run1 = asyncio.Event()
+    unblock_run1 = asyncio.Event()
+    run2_dispatched: list[str] = []
+    prog_rel = "research/2026-11-27-model-PDD/.progress.json"
+    cm_wait_script = (
+        "export const meta = { name: 'company-model', description: 'cm' }\n"
+        "await agent('step1', { label: '建模准备' })\n"
+        "return { ok: true }\n"
+    )
+    cm_wait_meta = compile_check(cm_wait_script)
+
+    def _make_live_driver(run_id_str: str, is_first: bool) -> WorkflowDriver:
+        reg = BackgroundTaskRegistry()
+
+        class _Disp:
+            subagent_types = frozenset({"general-purpose"})
+
+            async def dispatch(
+                self,
+                *,
+                subagent_type: str,
+                description: str,
+                prompt: str,
+                run_id: str | None = None,
+                owner_task_id: str | None = None,
+                base_configurable: dict[str, Any] | None = None,
+                time_limit: float | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                if not is_first:
+                    run2_dispatched.append(description)
+                t = await reg.register(
+                    tool_call_id=f"{run_id_str}-c",
+                    description=description,
+                    prompt=prompt,
+                    subagent_type=subagent_type,
+                    run_id=run_id,
+                )
+                t.per_call_records = []
+
+                async def _work() -> str:
+                    if is_first:
+                        entered_run1.set()
+                        await unblock_run1.wait()
+                    t.terminal_status = "completed"
+                    return "ok"
+
+                t.asyncio_task = asyncio.create_task(_work())
+                return t
+
+        rt = _NS(
+            task_id=run_id_str,
+            display_id=run_id_str,
+            task_run_id=None,
+            spawned_run_id=run_id_str,
+            terminal_status=None,
+            stop_at=None,
+            keep_straggler=lambda _w: None,
+        )
+        return WorkflowDriver(
+            WorkflowRunSpec(
+                run_task=rt,
+                registry=reg,
+                dispatcher=_Disp(),
+                backend=backend,
+                thread_id=f"thr-{run_id_str}",
+                short_thread_id=run_id_str[:8],
+                script=cm_wait_script,
+                script_args={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+                meta=cm_wait_meta,
+                source="prebuilt",
+                base_configurable={"workspace_id": "ws-lock-1"},
+                caps=WorkflowOrchestrationConfig(enabled=True, child_timeout=10.0, run_timeout=30.0),
+                progress_path=prog_rel,
+            )
+        )
+
+    live_d1 = _make_live_driver("run-live-1", is_first=True)
+    live_d2 = _make_live_driver("run-live-2", is_first=False)
+    t_d1 = asyncio.create_task(live_d1.run())
+    await entered_run1.wait()
+
+    # While live_d1 is running, live_d2 is rejected at entry, never dispatches, never overwrites .progress.json!
+    with pytest.raises(WorkflowRunError, match=MODELING_LOCK_BUSY_MESSAGE):
+        await live_d2.run()
+    assert run2_dispatched == []
+    prog_during = json.loads((ws / prog_rel).read_text(encoding="utf-8"))
+    assert prog_during["run_id"] == "run-live-1" and prog_during["status"] == "running"
+
+    # Let live_d1 finish -> lock is released automatically!
+    unblock_run1.set()
+    await t_d1
+    lock_after = json.loads((ws / MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert lock_after["status"] == "released" and lock_after["run_id"] == "run-live-1"
+
+    # Now a subsequent launch succeeds!
+    ok_after_release = await tool_t1.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-after-release",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE not in str(ok_after_release)
+    new_holder_id = captured_specs[-1].run_task.task_id
+
+    # 5. Expired lock recovery + late release from expired holder must NOT clobber new holder!
+    (ws / MODELING_LOCK_PATH).write_text(
+        json.dumps(
+            {
+                "status": "locked",
+                "run_id": "run-crashed-old",
+                "workflow": "company-model",
+                "acquired_at": 1.0,
+                "expires_at": 2.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_after_expiry = await tool_t2.coroutine(
+        workflow="full-coverage",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-after-expiry",
+    )
+    assert MODELING_LOCK_BUSY_MESSAGE not in str(ok_after_expiry)
+    recovered_holder_id = captured_specs[-1].run_task.task_id
+    assert recovered_holder_id != new_holder_id
+
+    # Late release from the crashed old run must be a no-op!
+    assert (
+        await release_modeling_lock(
+            backend, run_id="run-crashed-old", workflow="company-model", workspace_id="ws-lock-1"
+        )
+        is False
+    )
+    lock_still_held = json.loads((ws / MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert lock_still_held["status"] == "locked" and lock_still_held["run_id"] == recovered_holder_id

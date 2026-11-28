@@ -62,6 +62,15 @@ from src.dalton.workflows.journal import (
     missing_declared_artifacts,
     prompt_digest,
 )
+# DALTON-HOOK(modeling-lock): per-workspace modeling lock helpers owned by
+# Dalton; driver enforces acquisition for direct callers and releases on exit.
+from src.dalton.workflows.modeling_lock import (
+    ModelingLockBusy,
+    acquire_modeling_lock,
+    modeling_lock_ttl,
+    needs_modeling_lock,
+    release_modeling_lock,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -118,6 +127,9 @@ class WorkflowRunSpec:
     # launching skill can find an interrupted run and resume it. Resolved
     # from ``params.progress_path`` at launch.
     progress_path: str | None = None
+    # DALTON-HOOK(modeling-lock): whether RunWorkflow already acquired the
+    # workspace modeling lock on behalf of this run.
+    modeling_lock_held: bool = False
 
 
 class WorkflowRunError(RuntimeError):
@@ -268,6 +280,23 @@ class WorkflowDriver:
             journal_source=spec.journal_source,
             progress_path=spec.progress_path,
         )
+        # DALTON-HOOK(modeling-lock): track lock ownership and avoid
+        # overwriting the active holder's progress marker on lock refusal.
+        self._modeling_lock_held = bool(spec.modeling_lock_held)
+        self._skip_progress_on_finalize = False
+
+    async def _release_modeling_lock(self) -> None:
+        # DALTON-HOOK(modeling-lock): idempotent release of this run's lock.
+        if not self._modeling_lock_held:
+            return
+        self._modeling_lock_held = False
+        await release_modeling_lock(
+            self.spec.backend,
+            registry=self.spec.registry,
+            run_id=self.wf_task_id,
+            workflow=self.spec.meta.name,
+            workspace_id=(self.spec.base_configurable or {}).get("workspace_id"),
+        )
 
     async def run(self, _request: Any = None) -> str:
         """Drive the run to a terminal state.
@@ -284,53 +313,86 @@ class WorkflowDriver:
         self._started_at = time.time()
         self.spec.run_task.stop_at = self._started_at + caps.run_timeout
         try:
-            await self._emitter.emit(
-                "run_started",
-                name=self.spec.meta.name,
-                description=self.spec.meta.description,
-                source=self.spec.source,
-            )
-            async with asyncio.timeout(caps.run_timeout):
-                outcome = await run_workflow_script(
-                    self.spec.script,
-                    self.spec.script_args,
-                    host=self,
-                    limits=WorkflowLimits(
-                        memory_limit_mb=caps.memory_limit_mb,
-                        cpu_budget_s=caps.cpu_budget_s,
-                    ),
+            try:
+                await self._emitter.emit(
+                    "run_started",
+                    name=self.spec.meta.name,
+                    description=self.spec.meta.description,
+                    source=self.spec.source,
                 )
-            # Terminal bookkeeping runs outside the deadline — a run that
-            # beat the timeout must not have its finalize killed by it.
-            terminal = await self._finish_outcome(outcome)
-        except asyncio.CancelledError as cancel:
-            # A stop for running past its time limit ends the run as its own
-            # clock would, unless a user's stop reached the run too: it
-            # stamps the run cancelled, and wins.
-            user_stop = self.spec.run_task.terminal_status == "cancelled"
-            if user_stop or not is_time_limit_cancel(cancel):
-                await self._shielded(self._on_cancelled())
-                raise
-            asyncio.current_task().uncancel()
-            error = await self._shielded(
-                self._fail(f"Run timed out after {caps.run_timeout}s")
-            )
-            raise WorkflowRunError(error) from None
-        except TimeoutError:
-            terminal = _Terminal(error=f"Run timed out after {caps.run_timeout}s")
-        except Exception as error:
-            logger.error(
-                "Workflow driver crashed",
-                wf_task_id=self.wf_task_id,
-                error=str(error),
-                exc_info=True,
-            )
-            terminal = _Terminal(error=str(error))
+                # DALTON-HOOK(modeling-lock): enforce per-workspace modeling
+                # exclusivity even when WorkflowDriver is invoked directly
+                # outside RunWorkflow; on contention do not enter modeling.
+                lock_busy_error: str | None = None
+                if not self._modeling_lock_held and needs_modeling_lock(
+                    self.spec.meta.name, self.spec.script_args
+                ):
+                    try:
+                        await acquire_modeling_lock(
+                            self.spec.backend,
+                            registry=self.spec.registry,
+                            run_id=self.wf_task_id,
+                            workflow=self.spec.meta.name,
+                            thread_id=self.spec.thread_id,
+                            workspace_id=(self.spec.base_configurable or {}).get(
+                                "workspace_id"
+                            ),
+                            ttl_seconds=modeling_lock_ttl(caps),
+                        )
+                        self._modeling_lock_held = True
+                    except ModelingLockBusy as lock_err:
+                        self._skip_progress_on_finalize = True
+                        lock_busy_error = str(lock_err)
 
-        if terminal.error is None:
-            await self._finalize("completed", result_preview=terminal.result_preview)
-            return terminal.summary
-        raise WorkflowRunError(await self._fail(terminal.error))
+                if lock_busy_error is not None:
+                    terminal = _Terminal(error=lock_busy_error)
+                else:
+                    async with asyncio.timeout(caps.run_timeout):
+                        outcome = await run_workflow_script(
+                            self.spec.script,
+                            self.spec.script_args,
+                            host=self,
+                            limits=WorkflowLimits(
+                                memory_limit_mb=caps.memory_limit_mb,
+                                cpu_budget_s=caps.cpu_budget_s,
+                            ),
+                        )
+                    # Terminal bookkeeping runs outside the deadline — a run that
+                    # beat the timeout must not have its finalize killed by it.
+                    terminal = await self._finish_outcome(outcome)
+            except asyncio.CancelledError as cancel:
+                # A stop for running past its time limit ends the run as its own
+                # clock would, unless a user's stop reached the run too: it
+                # stamps the run cancelled, and wins.
+                user_stop = self.spec.run_task.terminal_status == "cancelled"
+                if user_stop or not is_time_limit_cancel(cancel):
+                    await self._shielded(self._on_cancelled())
+                    raise
+                asyncio.current_task().uncancel()
+                error = await self._shielded(
+                    self._fail(f"Run timed out after {caps.run_timeout}s")
+                )
+                raise WorkflowRunError(error) from None
+            except TimeoutError:
+                terminal = _Terminal(error=f"Run timed out after {caps.run_timeout}s")
+            except Exception as error:
+                logger.error(
+                    "Workflow driver crashed",
+                    wf_task_id=self.wf_task_id,
+                    error=str(error),
+                    exc_info=True,
+                )
+                terminal = _Terminal(error=str(error))
+
+            if terminal.error is None:
+                await self._finalize("completed", result_preview=terminal.result_preview)
+                return terminal.summary
+            raise WorkflowRunError(await self._fail(terminal.error))
+        finally:
+            # DALTON-HOOK(modeling-lock): safety net release if an exception
+            # escaped before _finalize ran.
+            if self._modeling_lock_held:
+                await self._shielded(self._release_modeling_lock())
 
     async def _shielded(self, cleanup: Coroutine[Any, Any, Any]) -> Any:
         """Run a stop's terminal bookkeeping past a cancel of the run, so the
@@ -1016,7 +1078,11 @@ class WorkflowDriver:
         await self._write_json("status.json", payload)
         # DALTON-HOOK(workflow-journal): the terminal progress write is what
         # retires the marker the launching skill resumes from.
-        await self._journal.write_progress(status)
+        # DALTON-HOOK(modeling-lock): skip touching shared progress when this
+        # run was turned away by another active holder, and release our lock.
+        if not self._skip_progress_on_finalize:
+            await self._journal.write_progress(status)
+        await self._release_modeling_lock()
         await self._emitter.persist_snapshot()
 
     async def _write_json(self, path: str, value: Any) -> bool:
