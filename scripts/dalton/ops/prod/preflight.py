@@ -3821,6 +3821,63 @@ def _validate_web_releases_current_for_snapshot(
     return resolved, link_target, rel_id, ver_payload
 
 
+def _verify_snapshot_frontend_target(
+    snap_path: Path,
+    web_info: Mapping[str, Any],
+    *,
+    snap_ver_obj: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Verify the snapshot's frontend release target directory exists and its `version.json` matches."""
+    errors: list[str] = []
+    w_path = str(web_info.get("path") or "").strip()
+    w_target = str(web_info.get("link_target") or "").strip()
+    if not w_path or not w_target:
+        return ["web_releases_current missing path or link_target"]
+    cur_path = _abs_no_deref(w_path)
+    resolved_check = (
+        Path(w_target)
+        if os.path.isabs(w_target)
+        else (cur_path.parent / w_target)
+    )
+    if not resolved_check.is_dir():
+        return [f"web_releases_current target release directory missing: {resolved_check}"]
+    releases_root = cur_path.parent.resolve()
+    resolved_abs = resolved_check.resolve()
+    try:
+        rel_sub = resolved_abs.relative_to(releases_root)
+    except ValueError:
+        return [
+            f"web_releases_current target release directory escapes {releases_root}: {resolved_abs}"
+        ]
+    if str(rel_sub) in ("", "."):
+        return [
+            f"web_releases_current target points to {releases_root} itself instead of a release directory"
+        ]
+    if cur_path.exists() and not cur_path.is_symlink():
+        errors.append(
+            f"web_releases_current path {cur_path} exists as a non-symlink; inspect or move it manually before rollback"
+        )
+    target_ver_obj, target_ver_err = _parse_frontend_version_json(resolved_abs / "version.json")
+    if target_ver_err or target_ver_obj is None:
+        errors.append(f"web_releases_current target release version.json invalid ({target_ver_err})")
+        return errors
+    if snap_ver_obj is None:
+        v_rel = str(web_info.get("version_json_rel_path") or "").strip()
+        snap_ver_obj, snap_ver_err = _parse_frontend_version_json(snap_path / v_rel)
+        if snap_ver_err or snap_ver_obj is None:
+            errors.append(f"web_releases_current snapshot version.json invalid ({snap_ver_err})")
+            return errors
+    expected_ident = _frontend_version_identity(snap_ver_obj)
+    target_ident = _frontend_version_identity(target_ver_obj)
+    for field, exp_val in expected_ident.items():
+        if target_ident.get(field) != exp_val:
+            errors.append(
+                f"web_releases_current target {resolved_abs}/version.json "
+                f"{field}={target_ident.get(field)!r} does not match snapshot {exp_val!r}"
+            )
+    return errors
+
+
 def verify_cutover_snapshot(snapshot_dir: Path | str) -> list[str]:
     """Verify a cutover snapshot directory against its `snapshot-manifest.json` SHA-256 list."""
     snap_path = Path(snapshot_dir).expanduser().resolve()
@@ -3894,16 +3951,22 @@ def verify_cutover_snapshot(snapshot_dir: Path | str) -> list[str]:
         w_exists = web_info.get("exists")
         w_is_symlink = web_info.get("is_symlink")
         w_target = str(web_info.get("link_target") or "").strip()
+        web_meta_ok = True
         if not w_path:
             errors.append("web_releases_current missing path")
+            web_meta_ok = False
         if w_exists is not True:
             errors.append("web_releases_current must record exists=true")
+            web_meta_ok = False
         if w_is_symlink is not True:
             errors.append("web_releases_current must record is_symlink=true")
+            web_meta_ok = False
         if not w_target or w_target in (".", "..") or ".." in Path(w_target).parts:
             errors.append(f"web_releases_current has missing or unsafe link_target: {w_target!r}")
+            web_meta_ok = False
         v_rel = str(web_info.get("version_json_rel_path") or "").strip()
         v_sha = str(web_info.get("version_json_sha256") or "").strip()
+        snap_ver_obj: dict[str, Any] | None = None
         if not v_rel or v_rel.startswith("/") or ".." in Path(v_rel).parts:
             errors.append(f"web_releases_current missing or unsafe version_json_rel_path: {v_rel!r}")
         else:
@@ -3913,9 +3976,19 @@ def verify_cutover_snapshot(snapshot_dir: Path | str) -> list[str]:
             elif not _SHA256_HEX_RE.fullmatch(v_sha) or _sha256_file(v_fp) != v_sha:
                 errors.append(f"sha256 mismatch for {v_rel}")
             else:
-                _v_obj, v_err = _parse_frontend_version_json(v_fp)
-                if v_err:
+                v_obj, v_err = _parse_frontend_version_json(v_fp)
+                if v_err or v_obj is None:
                     errors.append(f"invalid web release version snapshot ({v_rel}): {v_err}")
+                else:
+                    snap_ver_obj = v_obj
+        if web_meta_ok and snap_ver_obj is not None:
+            errors.extend(
+                _verify_snapshot_frontend_target(
+                    snap_path,
+                    web_info,
+                    snap_ver_obj=snap_ver_obj,
+                )
+            )
 
     return errors
 
@@ -4344,40 +4417,11 @@ def restore_cutover_snapshot(
         raise RuntimeError(
             "cannot restore web_releases_current: snapshot manifest lacks valid symlink metadata"
         )
+    target_errs = _verify_snapshot_frontend_target(snap_path, web_info)
+    if target_errs:
+        raise RuntimeError("cannot restore web_releases_current: " + "; ".join(target_errs))
     cur_path = _abs_no_deref(str(web_info["path"]))
     link_target = str(web_info["link_target"]).strip()
-    resolved_check = (
-        Path(link_target)
-        if os.path.isabs(link_target)
-        else (cur_path.parent / link_target)
-    )
-    if not resolved_check.is_dir():
-        raise RuntimeError(
-            f"cannot restore web_releases_current: target release directory missing: {resolved_check}"
-        )
-    target_ver_obj, target_ver_err = _parse_frontend_version_json(resolved_check / "version.json")
-    if target_ver_err or target_ver_obj is None:
-        raise RuntimeError(
-            f"cannot restore web_releases_current: target release version.json invalid ({target_ver_err})"
-        )
-    snap_ver_rel = str(web_info.get("version_json_rel_path") or "").strip()
-    snap_ver_obj, snap_ver_err = _parse_frontend_version_json(snap_path / snap_ver_rel)
-    if snap_ver_err or snap_ver_obj is None:
-        raise RuntimeError(
-            f"cannot restore web_releases_current: snapshot version.json invalid ({snap_ver_err})"
-        )
-    expected_ident = _frontend_version_identity(snap_ver_obj)
-    target_ident = _frontend_version_identity(target_ver_obj)
-    for field, exp_val in expected_ident.items():
-        if target_ident.get(field) != exp_val:
-            raise RuntimeError(
-                f"cannot restore web_releases_current: target {resolved_check}/version.json "
-                f"{field}={target_ident.get(field)!r} does not match snapshot {exp_val!r}"
-            )
-    if cur_path.exists() and not cur_path.is_symlink():
-        raise RuntimeError(
-            f"cannot restore web_releases_current: {cur_path} exists as a non-symlink; inspect or move it manually before re-running rollback"
-        )
     actions.append(f"restore web_releases_current: {cur_path} -> {link_target}")
     if not dry_run:
         cur_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4560,6 +4604,11 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
             str(os.environ.get("INTERNAL_SERVICE_TOKEN") or "").strip()
             or str(repo_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
         )
+    fallback_svc_tok = ""
+    if getattr(args, "fallback_repo_env", None):
+        fb_env_path = Path(args.fallback_repo_env).expanduser().resolve()
+        fb_vals = _parse_simple_env_file(fb_env_path)
+        fallback_svc_tok = str(fb_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
     docker_bin = os.environ.get("DOCKER_BIN", "docker")
 
     def _docker_runner(d_args: list[str], timeout_s: float) -> tuple[int, str, str]:
@@ -4580,6 +4629,20 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
             body=body,
             timeout_s=timeout_s,
         )
+        if (
+            code == 401
+            and fallback_svc_tok
+            and fallback_svc_tok != str(headers.get("X-Service-Token") or "").strip()
+        ):
+            fb_headers = dict(headers)
+            fb_headers["X-Service-Token"] = fallback_svc_tok
+            code, parsed, err = _http_request(
+                method,
+                url,
+                headers=fb_headers,
+                body=body,
+                timeout_s=timeout_s,
+            )
         return code, (parsed if isinstance(parsed, dict) else None), (err or "")
 
     res = mg.verify_container_maintenance_gate(
@@ -5754,12 +5817,63 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
         time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
 
 
+def _resolve_bridge_admin_token_from_verified_snapshot(
+    snapshot_dir: Path | str,
+) -> tuple[str, str | None]:
+    """Verify a cutover snapshot and extract its saved `DALTON_BRIDGE_ADMIN_TOKEN`."""
+    snap_path = Path(snapshot_dir).expanduser().resolve()
+    snap_errs = verify_cutover_snapshot(snap_path)
+    if snap_errs:
+        return "", f"snapshot verification failed ({'; '.join(snap_errs)})"
+    try:
+        manifest = json.loads((snap_path / SNAPSHOT_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return "", f"unreadable snapshot manifest ({exc})"
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(entries, dict):
+        return "", "snapshot manifest missing files map"
+
+    def _entry_path(key: str) -> Path | None:
+        info = entries.get(key)
+        if not isinstance(info, dict) or info.get("existed") is not True:
+            return None
+        rel = str(info.get("rel_path") or "").strip()
+        if not rel:
+            return None
+        fp = snap_path / rel
+        return fp if fp.is_file() else None
+
+    snap_bridge_env = _entry_path("bridge_env")
+    if snap_bridge_env is not None:
+        tok = str(_parse_simple_env_file(snap_bridge_env).get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
+        if tok:
+            return tok, None
+
+    snap_bridge_plist = _entry_path("plist_bridge")
+    if snap_bridge_plist is not None:
+        p_ev, _p_err = _load_plist_env_vars_strict(snap_bridge_plist)
+        if p_ev:
+            tok = str(p_ev.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
+            if tok:
+                return tok, None
+
+    snap_repo_env = _entry_path("repo_env")
+    if snap_repo_env is not None:
+        tok = str(_parse_simple_env_file(snap_repo_env).get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
+        if tok:
+            return tok, None
+
+    return "", None
+
+
 def cmd_drain_bridge(args: argparse.Namespace) -> int:
     """Drain legacy researchdata bridge (`:8960`) via `/admin/drain` before `launchctl bootout`.
 
-    1. Sends `POST /admin/drain` (`{"drain": true}`) using `DALTON_BRIDGE_ADMIN_TOKEN`.
+    1. Sends `POST /admin/drain` (`{"drain": true}`) using `DALTON_BRIDGE_ADMIN_TOKEN` from
+       current config; on HTTP `401` (or missing current token) when `--snapshot-dir` is given,
+       verifies the snapshot and retries with the snapshot's saved `DALTON_BRIDGE_ADMIN_TOKEN`.
     2. Polls `GET /admin/drain` until `draining=true`, `inflight == 0`, `queued == 0`, and
-       `ingest_inflight == 0`.
+       `ingest_inflight == 0` (default timeout 240s to cover the 180s ingest limit).
     3. With `--allow-down`, skips drain ONLY when `com.dalton.researchdata-bridge` is confirmed
        unloaded from launchd AND absent from the process table (`ps`).
     """
@@ -5808,7 +5922,21 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
         repo_vals = _parse_simple_env_file(repo_env_path)
         admin_tok = str(repo_vals.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
 
-    if not admin_tok:
+    snapshot_admin_tok = ""
+    snapshot_tok_err: str | None = None
+    snapshot_dir_arg = getattr(args, "snapshot_dir", None)
+    if snapshot_dir_arg:
+        snapshot_admin_tok, snapshot_tok_err = _resolve_bridge_admin_token_from_verified_snapshot(
+            snapshot_dir_arg
+        )
+
+    candidate_tokens: list[tuple[str, str]] = []
+    if admin_tok:
+        candidate_tokens.append(("current", admin_tok))
+    if snapshot_admin_tok and snapshot_admin_tok != admin_tok:
+        candidate_tokens.append(("snapshot", snapshot_admin_tok))
+
+    if not candidate_tokens:
         if allow_down:
             stopped, proc_detail = _is_bridge_process_stopped()
             if stopped:
@@ -5828,17 +5956,15 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
                     )
                 )
                 return 0
+        extra_snap = f"; snapshot fallback error: {snapshot_tok_err}" if snapshot_tok_err else ""
         print(
             f"ERROR: cannot drain {base_url}: missing DALTON_BRIDGE_ADMIN_TOKEN "
-            f"(checked {bridge_env_path}, {bridge_plist}, and {repo_env_path})",
+            f"(checked {bridge_env_path}, {bridge_plist}, and {repo_env_path}{extra_snap})",
             file=sys.stderr,
         )
         return 1
 
-    auth_headers = {
-        "Authorization": f"Bearer {admin_tok}",
-        "Content-Type": "application/json",
-    }
+    active_idx = 0
     deadline = time.monotonic() + timeout_s
 
     def _parse_bridge_counters(payload: Any) -> tuple[bool, dict[str, int] | None, str]:
@@ -5855,9 +5981,15 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
             return False, vals, f"draining={payload.get('draining')!r}, {vals}"
         return True, vals, f"draining=True, {vals}"
 
-    # Phase 1: Enter drain mode via POST /admin/drain (bounded retry on transient connectivity)
+    # Phase 1: Enter drain mode via POST /admin/drain (bounded retry on transient connectivity;
+    # fallback to verified snapshot admin token on HTTP 401)
     last_post_err = "no response received"
     while True:
+        tok_source, active_tok = candidate_tokens[active_idx]
+        auth_headers = {
+            "Authorization": f"Bearer {active_tok}",
+            "Content-Type": "application/json",
+        }
         req_t = min(5.0, max(0.2, deadline - time.monotonic()))
         d_code, d_body, d_err = _http_request(
             "POST",
@@ -5868,9 +6000,14 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
         )
         if not d_err and d_code == 200 and isinstance(d_body, dict):
             break
+        if d_code == 401 and active_idx + 1 < len(candidate_tokens):
+            active_idx += 1
+            continue
         if d_code in (401, 403):
+            tried = ",".join(src for src, _ in candidate_tokens[: active_idx + 1])
+            snap_note = f"; snapshot fallback unavailable: {snapshot_tok_err}" if snapshot_tok_err else ""
             print(
-                f"ERROR: POST {base_url}/admin/drain rejected credentials (HTTP {d_code})",
+                f"ERROR: POST {base_url}/admin/drain rejected credentials (HTTP {d_code}, tried={tried}{snap_note})",
                 file=sys.stderr,
             )
             return 1
@@ -5905,7 +6042,8 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
 
         if time.monotonic() >= deadline:
             print(
-                f"ERROR: drain-bridge timed out after {timeout_s:.1f}s ({last_post_err})",
+                f"ERROR: drain-bridge timed out after {timeout_s:.1f}s ({last_post_err}); "
+                "if ingest is still running, wait for ingest to finish before re-running (入库未结束时先等待再重跑)",
                 file=sys.stderr,
             )
             return 1
@@ -5914,16 +6052,22 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
     # Phase 2: Poll GET /admin/drain until draining=true AND inflight==0 AND queued==0 AND ingest_inflight==0
     last_detail = ""
     while True:
+        tok_source, active_tok = candidate_tokens[active_idx]
         req_t = min(5.0, max(0.2, deadline - time.monotonic()))
         g_code, g_body, g_err = _http_request(
             "GET",
             f"{base_url}/admin/drain",
-            headers={"Authorization": f"Bearer {admin_tok}"},
+            headers={"Authorization": f"Bearer {active_tok}"},
             timeout_s=req_t,
         )
+        if g_code == 401 and active_idx + 1 < len(candidate_tokens):
+            active_idx += 1
+            continue
         if g_code in (401, 403):
+            tried = ",".join(src for src, _ in candidate_tokens[: active_idx + 1])
+            snap_note = f"; snapshot fallback unavailable: {snapshot_tok_err}" if snapshot_tok_err else ""
             print(
-                f"ERROR: GET {base_url}/admin/drain rejected credentials (HTTP {g_code})",
+                f"ERROR: GET {base_url}/admin/drain rejected credentials (HTTP {g_code}, tried={tried}{snap_note})",
                 file=sys.stderr,
             )
             return 1
@@ -5941,6 +6085,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
                                 "inflight": 0,
                                 "queued": 0,
                                 "ingest_inflight": 0,
+                                "token_source": tok_source,
                                 "process_check": proc_detail,
                             },
                             ensure_ascii=False,
@@ -5974,6 +6119,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
                             "inflight": 0,
                             "queued": 0,
                             "ingest_inflight": 0,
+                            "token_source": tok_source,
                         },
                         ensure_ascii=False,
                     )
@@ -5983,7 +6129,8 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
 
         if time.monotonic() >= deadline:
             print(
-                f"ERROR: drain-bridge timed out after {timeout_s:.1f}s ({last_detail})",
+                f"ERROR: drain-bridge timed out after {timeout_s:.1f}s ({last_detail}); "
+                "if ingest_inflight > 0, wait for ingest to finish before re-running (入库未结束时先等待再重跑)",
                 file=sys.stderr,
             )
             return 1
@@ -6258,6 +6405,7 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_gver.add_argument("--repo", required=True)
     p_gver.add_argument("--state-file", default=None)
     p_gver.add_argument("--repo-env", default=None)
+    p_gver.add_argument("--fallback-repo-env", default=None)
     p_gver.add_argument("--expected-revision", type=int, default=None)
     p_gver.add_argument("--expected-paused", default="true", choices=("true", "false"))
     p_gver.add_argument("--backend-url", default="http://127.0.0.1:8000")
@@ -6318,7 +6466,8 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_db.add_argument("--plist-dir", default=None)
     p_db.add_argument("--repo-env", default=None)
     p_db.add_argument("--bridge-env", default=None)
-    p_db.add_argument("--timeout", type=float, default=30.0)
+    p_db.add_argument("--snapshot-dir", default=None)
+    p_db.add_argument("--timeout", type=float, default=240.0)
     p_db.add_argument("--poll-interval", type=float, default=0.5)
     p_db.add_argument("--allow-down", action="store_true")
 

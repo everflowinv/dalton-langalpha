@@ -146,6 +146,8 @@ set -euo pipefail
 bash scripts/dalton/ops/prod/wait_backend_idle.sh --max-wait-seconds 600
 ```
 
+> **说明**：`wait_backend_idle.sh` 仅检查数据库中的对话回合、子智能体任务与数据任务槽位，**不覆盖旧桥 `:8960` 内的知识库/卖方纪要入库（`ingest_inflight`）与桥内排队请求**；桥内入库与排队请求的排空由第 5 步先调用 `:8960/admin/drain`（超时 240 秒，覆盖 180 秒入库上限并等待 `inflight`、`queued`、`ingest_inflight` 全部归零）保证。
+
 **成功判据**：退出码 `0`，输出 `idle (maintenance mode, checks=...) threads=0 subagents=0 data_slots=0 data_runs=0`。
 
 **失败回滚命令**：若在窗口内持续忙碌决定改期，执行第 2 步的开闸命令即可恢复对外服务。
@@ -167,23 +169,24 @@ SNAP_DIR="$(bash scripts/dalton/ops/prod/snapshot_research_host.sh --label cutov
 
 **失败回滚命令**：若快照写入或校验失败，保持原服务运行，按第 2 步开闸命令恢复访问并排查缺失文件、磁盘空间或目录权限。
 
-### 第 5 步：排空并停止 `:8943` 与旧桥 `:8960`
+### 第 5 步：先排空并停止旧桥 `:8960`，再排空并停止上游 `:8943`
 
-先对当前刷新方 `:8943` 执行停前排空：`drain-refresher` 复用预检有效环境解析（含 `GUIDEPOINT_ENV_FILE`）读取管理员凭据；当访问令牌剩余 TTL ≤ 60 秒时，在它仍是唯一持锁方时先通过完整 MCP 会话握手完成一次受控刷新并确认落盘，再向 `/admin/drain` 发送排空指令，并持续确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且令牌目录清零 `.guidepoint_mcp_tokens.*.tmp`。接着卸载 `:8943`；在卸载旧桥 `:8960` 前，先调用 `drain-bridge` 向 `:8960/admin/drain` 下发排空指令并确认 `draining=true` 且 `inflight == 0`、`queued == 0`、`ingest_inflight == 0`，再卸载 `:8960` 并确认刷新锁 `.guidepoint.owner.lock` 已释放：
+必须**先排空并停止旧桥 `:8960`**，再排空并停止上游 Guidepoint 代理 `:8943`（避免桥内排队请求在拿到执行名额后访问已停止的上游）。先调用 `drain-bridge`（超时设为 240 秒，覆盖 180 秒入库上限并留出余量）向 `:8960/admin/drain` 下发排空指令，等 `draining=true` 且 `inflight == 0`、`queued == 0`、`ingest_inflight == 0` 后卸载 `:8960`；再对当前刷新方 `:8943` 执行停前排空：`drain-refresher` 复用预检有效环境解析（含 `GUIDEPOINT_ENV_FILE`）读取管理员凭据，当访问令牌剩余 TTL ≤ 60 秒时在它仍是唯一持锁方时先通过完整 MCP 会话握手完成一次受控刷新并确认落盘，再向 `/admin/drain` 发送排空指令并持续确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且令牌目录清零 `.guidepoint_mcp_tokens.*.tmp`，随后卸载 `:8943` 并确认刷新锁 `.guidepoint.owner.lock` 已释放：
 
 ```bash
 set -euo pipefail
-.venv/bin/python scripts/dalton/ops/prod/preflight.py drain-refresher \
+.venv/bin/python scripts/dalton/ops/prod/preflight.py drain-bridge \
   --repo "$(pwd)" \
   --home "${HOME}" \
-  --target legacy \
-  --url http://127.0.0.1:8943 && \
-  launchctl bootout "${DOMAIN}/com.dalton.guidepoint-mcp-proxy" && \
-  .venv/bin/python scripts/dalton/ops/prod/preflight.py drain-bridge \
+  --url http://127.0.0.1:8960 \
+  --timeout 240 && \
+  launchctl bootout "${DOMAIN}/com.dalton.researchdata-bridge" && \
+  .venv/bin/python scripts/dalton/ops/prod/preflight.py drain-refresher \
     --repo "$(pwd)" \
     --home "${HOME}" \
-    --url http://127.0.0.1:8960 && \
-  launchctl bootout "${DOMAIN}/com.dalton.researchdata-bridge" && \
+    --target legacy \
+    --url http://127.0.0.1:8943 && \
+  launchctl bootout "${DOMAIN}/com.dalton.guidepoint-mcp-proxy" && \
   .venv/bin/python scripts/dalton/ops/prod/preflight.py wait-lock-free \
     --repo "$(pwd)" \
     --home "${HOME}"
@@ -192,13 +195,13 @@ set -euo pipefail
 确认两个端口均已释放监听：
 
 ```bash
-lsof -nP -iTCP:8943 -sTCP:LISTEN || true
 lsof -nP -iTCP:8960 -sTCP:LISTEN || true
+lsof -nP -iTCP:8943 -sTCP:LISTEN || true
 ```
 
-**成功判据**：`drain-refresher`（输出 `"draining": true`、`"in_flight": 0`、`"tmp_files": 0`）、`drain-bridge`（输出 `"draining": true`、`"inflight": 0`、`"queued": 0`、`"ingest_inflight": 0`）与 `wait-lock-free`（输出 `"free": true`）均返回 `0`；两次 `lsof` 均为空输出，表明 `:8943` 与 `:8960` 已完全停止。
+**成功判据**：`drain-bridge`（输出 `"draining": true`、`"inflight": 0`、`"queued": 0`、`"ingest_inflight": 0`）、`drain-refresher`（输出 `"draining": true`、`"in_flight": 0`、`"tmp_files": 0`）与 `wait-lock-free`（输出 `"free": true`）均返回 `0`；两次 `lsof` 均为空输出，表明 `:8960` 与 `:8943` 已完全停止。
 
-**失败回滚命令**：
+**失败说明与回滚命令**：若 `drain-bridge` 超时且 `ingest_inflight > 0`，属于**入库未结束时先等待再重跑**的情形（此时上游 `:8943` 尚未停止），请等待桥内入库结束（上限 180 秒）后再重跑本步或执行一键回滚：
 
 ```bash
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
@@ -415,9 +418,9 @@ bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh --dry-r
 
 一键回滚脚本按以下顺序幂等执行，支持在修复环境问题后重复运行：
 
-1. 先在宿主机侧落闸并读回确认维护准入闸门已关闭（在快照校验与 Compose 参数解析之前完成），随后校验快照目录 SHA-256 清单与有效前端版本指针完整性，再使用快照中的 `.env` 校验仍在运行的旧后端闭闸状态，并默认独立执行数据库空闲检查（仅在显式传入 `--skip-idle-wait` 时跳过）。
-2. 对 `com.dalton.research-host`（`:8951`）执行停前排空（仅在服务已从 `launchd` 卸载且进程表无匹配进程时跳过排空；仍登记于 `launchd` 或进程存活时继续限时等待，存活时在 TTL ≤ 60 秒条件下先受控刷新并确认落盘，再发送 `/admin/drain` 并确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且无 `.guidepoint_mcp_tokens.*.tmp`），随后卸载并确认端口停止响应。
-3. 排空并停止 `:8943`；调用旧桥 `:8960/admin/drain` 确认 `draining=true` 且 `inflight == 0`、`queued == 0`、`ingest_inflight == 0` 后再卸载 `:8960` 并确认端口释放；确认 `.guidepoint.owner.lock` 已释放；从快照原子还原 `.env`、三份 `plist`、宿主机环境文件、交接日志与 `web/releases/current` 符号链接（要求目标发布目录及 `version.json` 与快照一致；Guidepoint 令牌文件比较 `obtained_at` 或 `mtime`，保留更新的现网令牌，仅在缺失或损坏时用快照兜底）。
+1. 先在宿主机侧落闸并读回确认维护准入闸门已关闭（在快照校验与 Compose 参数解析之前完成；数据库连接失败时自动复用 `--no-db-lock` 应急写入并读回验证），随后校验快照目录 SHA-256 清单并在停服前解析快照指向确认旧前端目标发布目录存在且 `version.json` 匹配（自动选择快照时采用相同检查），再优先使用快照中的 `.env` 令牌校验当前运行的后端闭闸状态（遇 HTTP `401` 时回退使用当前配置 `.env` 核验，两者均失败时停在闭闸），并默认独立执行数据库空闲检查（注：`wait_backend_idle.sh` 不覆盖旧桥入库，仅在显式传入 `--skip-idle-wait` 时跳过）。
+2. 先调用旧桥 `:8960/admin/drain`（默认超时 240 秒，覆盖 180 秒入库上限；当前配置管理令牌返回 `401` 时使用已校验快照中的管理令牌重试；仍失败或超时则在停止任何刷新服务之前退出，入库未结束时先等待再重跑），等 `draining=true` 且 `inflight == 0`、`queued == 0`、`ingest_inflight == 0` 后再卸载 `:8960` 并确认端口释放；随后对 `com.dalton.research-host`（`:8951`）执行停前排空（仅在服务已从 `launchd` 卸载且进程表无匹配进程时跳过排空；仍登记于 `launchd` 或进程存活时继续限时等待，存活时在 TTL ≤ 60 秒条件下先受控刷新并确认落盘，再发送 `/admin/drain` 并确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且无 `.guidepoint_mcp_tokens.*.tmp`）并卸载确认端口停止响应。
+3. 排空并停止 `:8943`；确认 `.guidepoint.owner.lock` 已释放；从快照原子还原 `.env`、三份 `plist`、宿主机环境文件、交接日志与 `web/releases/current` 符号链接（目标发布目录及 `version.json` 已在停服前核对，还原前再次复核；Guidepoint 令牌文件比较 `obtained_at` 或 `mtime`，保留更新的现网令牌，仅在缺失或损坏时用快照兜底）。
 4. 重新加载并启动旧 Guidepoint 代理（`:8943`）与旧研究数据桥（`:8960`），分别限时轮询确认 `:8943` 已持锁、`:8960/healthz` 健康就绪。
 5. 通过 `preflight.py compose-args` 按还原后的 `.env`（认 `COMPOSE_FILE`）解析编排参数，强制重建 `backend` 容器，限时轮询 `:8000/health` 健康就绪后再核验闭闸状态。
 6. 实调旧桥 Wiki `search`、旧桥 Guidepoint `search_library` 与 `:8943/mcp` 直调（采用完整 MCP 会话握手与 JSON/SSE 响应解码）验证业务可用，并在开闸前核对实际提供的前端 `/version.json` 与还原后的快照版本一致。
