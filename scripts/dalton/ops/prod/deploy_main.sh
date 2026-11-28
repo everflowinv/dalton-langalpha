@@ -5025,8 +5025,19 @@ run_deploy_main() {
     fi
 
     reused=""
+    local reuse_verify_failed=0
     if [ -z "$resumed_completed_backup" ] && [ "$resuming_active_wait" -eq 0 ] && [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
       reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
+      if [ -n "$reused" ]; then
+        local reuse_verify_err=""
+        if ! reuse_verify_err=$(_verify_completed_backup_artifact "$reused" 2>&1); then
+          reuse_verify_failed=1
+          local reuse_reason=""
+          reuse_reason=$(printf '%s\n' "$reuse_verify_err" | tr '\n' ' ' | sed -e 's/[[:space:]]*$//')
+          echo "backup: cannot reuse candidate backup (artifact verification failed: ${reuse_reason:-unknown}); taking a fresh one"
+          reused=""
+        fi
+      fi
     fi
     if [ -n "$resumed_completed_backup" ]; then
       DEPLOY_BACKUP_STATUS="fresh"
@@ -5036,7 +5047,9 @@ run_deploy_main() {
       DEPLOY_BACKUP_STATUS="reused"
       echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
     else
-      [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
+      if [ -n "$REUSE_BACKUP_MIN" ] && [ "$reuse_verify_failed" -eq 0 ]; then
+        echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
+      fi
       local backup_tag_file="${DALTON_PG_BACKUP_TAG_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-tag}"
       # Default wait covers lock phase (2h) + mirror phase (4h) + reconcile/publish margin (1h) = 7h (25200s).
       local _lock_wait_t="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"

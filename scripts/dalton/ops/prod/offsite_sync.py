@@ -30,6 +30,8 @@ from src.dalton.consistent_backup import (
     ArchivedObjectRecord,
     BucketArchiveSpec,
     TarGzObjectSink,
+    VersionSelectionResult,
+    deduplicate_selections,
     detect_bucket_versioning,
     list_all_current_objects,
     list_all_object_versions,
@@ -48,6 +50,7 @@ def build_weekly_minio_baseline(
     """Archive current normal object versions across active buckets into a weekly baseline tar.gz."""
     sink = TarGzObjectSink(out_tar_path, tmp_dir=tmp_dir)
     try:
+        selections: list[tuple[BucketArchiveSpec, VersionSelectionResult]] = []
         for spec in bucket_specs:
             ver_enabled = (
                 spec.versioning_enabled
@@ -70,6 +73,8 @@ def build_weekly_minio_baseline(
                 snapshot_referenced_keys=(),
                 versioning_enabled=ver_enabled,
             )
+            selections.append((spec, sel))
+        for spec, sel in deduplicate_selections(selections):
             for item in sel.selected:
                 sink.archive_object(spec.s3_client, item)
         records = sink.finalize()

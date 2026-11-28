@@ -215,7 +215,7 @@ def _spec_endpoint_identity(spec: BucketArchiveSpec) -> str:
     return ""
 
 
-def _deduplicate_selections(
+def deduplicate_selections(
     selections: Sequence[tuple[BucketArchiveSpec, VersionSelectionResult]],
 ) -> list[tuple[BucketArchiveSpec, VersionSelectionResult]]:
     """Deduplicate selected objects by ``(endpoint, bucket, full_key)`` before archiving."""
@@ -233,6 +233,9 @@ def _deduplicate_selections(
             unique_items.append(obj)
         deduped.append((spec, dataclasses.replace(sel, selected=tuple(unique_items))))
     return deduped
+
+
+_deduplicate_selections = deduplicate_selections
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2182,7 +2185,7 @@ async def run_consistent_backup(
 
         # Deduplicate across overlapping specs (e.g. shared bucket with empty main prefix
         # and non-empty chat_upload prefix) by (endpoint, bucket, full_key) before archiving.
-        selections = _deduplicate_selections(selections)
+        selections = deduplicate_selections(selections)
 
         # Step 3b: pack terminal ASR jobs only + asr_usage.jsonl in its own process group
         asr_summary: AsrArchiveSummary | None = None

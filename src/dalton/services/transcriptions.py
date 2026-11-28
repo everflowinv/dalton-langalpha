@@ -2489,10 +2489,20 @@ async def resubmit_transcription_job(
         )
 
         new_status = str(new_job.get("status") or "")
-        if new_status == TranscriptionJobStatus.CANCELLED.value:
-            # If the stable attempt row was cancelled (e.g. post-restore convergence marked
-            # a pre-submit awaiting_upload row cancelled), rotate to a fresh deterministic
-            # attempt ID and resubmit instead of returning ok=True for a cancelled row.
+        if (
+            new_status
+            in (
+                TranscriptionJobStatus.FAILED.value,
+                TranscriptionJobStatus.CANCELLED.value,
+            )
+            and _is_restored_no_resume_job(new_job)
+        ):
+            # Only when post-restore convergence marked the existing replacement attempt
+            # failed (submit_attempted / in-flight) or cancelled (pre-submit awaiting_upload)
+            # with restored_no_resume / error_category=restored_inflight do we rotate to a
+            # fresh deterministic attempt ID and resubmit. Normal ASR failures still use
+            # /retry, and user-initiated cancellations must not spawn a new billed attempt
+            # on request replay.
             latest_old = await db.get_transcription_job(old_job_id)
             if isinstance(latest_old, dict):
                 cur_old_job = dict(latest_old)
@@ -2582,7 +2592,14 @@ async def resubmit_transcription_job(
             elif stamped_job is not None:
                 new_job = stamped_job
                 stamped_status = str(new_job.get("status") or "")
-                if stamped_status == TranscriptionJobStatus.CANCELLED.value:
+                if (
+                    stamped_status
+                    in (
+                        TranscriptionJobStatus.FAILED.value,
+                        TranscriptionJobStatus.CANCELLED.value,
+                    )
+                    and _is_restored_no_resume_job(new_job)
+                ):
                     continue
                 if stamped_status != TranscriptionJobStatus.AWAITING_UPLOAD.value:
                     return {

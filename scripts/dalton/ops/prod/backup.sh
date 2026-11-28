@@ -113,20 +113,9 @@ if [[ "${DALTON_BACKUP_SET_MODE:-consistent}" == "legacy" ]]; then
     exit 0
 fi
 
-# Verify external drive mount & standard layout before writing anything.
-if [[ "${SKIP_MOUNT_CHECK}" != "1" ]]; then
-    if ! MOUNT_ERR="$("${PY_BIN}" "${BACKUP_LIB}" verify-mount \
-        --mount-root "${EXT_MOUNT_ROOT}" \
-        --backups-root "${BACKUP_ROOT}" 2>&1)"; then
-        echo "$(date '+%F %T') fail mount_check: ${MOUNT_ERR}"
-        exit 1
-    fi
-fi
-
-mkdir -p "$(dirname "${DETAIL_LOG}")" 2>/dev/null || true
-
-# Consume optional one-shot backup set ID hint written by deploy_main.sh and publish
-# active set ID while running so deploy_main.sh can track and resume after completion.
+# Resolve backup set ID BEFORE mount check so any early failure (including
+# unmounted external drive) still emits `set=<ID>` and deploy_main.sh aborts
+# immediately instead of waiting for the full backup timeout.
 NEXT_ID_FILE="${DALTON_PG_BACKUP_NEXT_ID_FILE:-${HOME}/Library/Logs/.dalton-pg-backup.next-set-id}"
 ACTIVE_ID_FILE="${DALTON_PG_BACKUP_ACTIVE_ID_FILE:-${HOME}/Library/Logs/.dalton-pg-backup.active-set-id}"
 SET_ID_HINT=""
@@ -139,6 +128,21 @@ if [[ -n "${SET_ID_HINT}" ]] && [[ "${SET_ID_HINT}" =~ ^[A-Za-z0-9._-]{1,128}$ ]
 else
     RUN_SET_ID="$(date +%Y%m%d-%H%M%S)"
 fi
+
+# Verify external drive mount & standard layout before writing anything.
+if [[ "${SKIP_MOUNT_CHECK}" != "1" ]]; then
+    if ! MOUNT_ERR="$("${PY_BIN}" "${BACKUP_LIB}" verify-mount \
+        --mount-root "${EXT_MOUNT_ROOT}" \
+        --backups-root "${BACKUP_ROOT}" 2>&1)"; then
+        MOUNT_ERR_LINE="$(printf '%s\n' "${MOUNT_ERR}" | tr '\n' ' ' | sed -e 's/[[:space:]]*$//')"
+        echo "$(date '+%F %T') fail set=${RUN_SET_ID} mount_check: ${MOUNT_ERR_LINE}"
+        exit 1
+    fi
+fi
+
+mkdir -p "$(dirname "${DETAIL_LOG}")" 2>/dev/null || true
+
+# Publish active set ID while running so deploy_main.sh can track and resume after completion.
 mkdir -p "$(dirname "${ACTIVE_ID_FILE}")" 2>/dev/null || true
 printf '%s\n' "${RUN_SET_ID}" > "${ACTIVE_ID_FILE}" 2>/dev/null || true
 

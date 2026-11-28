@@ -5120,12 +5120,12 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
             return (True, True)
         if s.startswith("SELECT to_regclass"):
             tbl = params[0] if params else ""
-            if tbl in ("public.workspace_file_blobs", "public.dalton_chat_uploads"):
+            if tbl in ("public.workspace_file_blobs", "public.dalton_chat_file_uploads"):
                 return (tbl,)
             return (None,)
         if "FROM workspace_file_blobs" in s:
             return [("u1", main_sha, len(main_blob), False)]
-        if "FROM dalton_chat_uploads" in s:
+        if "FROM dalton_chat_file_uploads" in s:
             return [("up1", "ready", chat_logical_key, len(chat_file), chat_sha)]
         return []
 
@@ -5146,6 +5146,12 @@ def test_r5_shared_bucket_overlapping_prefixes_dedup_backup_and_restore_and_reje
         )
     )
     assert res.reconcile_report.ok is True
+    assert any(
+        ref.consumer == "dalton_chat_file_uploads"
+        and ref.bucket_role == "chat_upload"
+        and ref.object_key == chat_logical_key
+        for ref in res.inventory.references
+    )
     assert len(res.manifest_objects) == 2
     assert sorted((r.bucket, r.key) for r in res.manifest_objects) == sorted(
         [(shared_bucket, main_key), (shared_bucket, chat_full_key)]
@@ -5616,3 +5622,400 @@ exit 0
     )
     assert res_dep.returncode == 1, res_dep.stdout + res_dep.stderr
     assert "backup artifact unavailable" in res_dep.stdout
+
+
+def test_r7_transcription_resubmit_rotates_only_on_restored_no_resume_failed_or_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R7 #1: /resubmit allocates a fresh attempt ONLY when the existing replacement attempt is
+    `failed` or `cancelled` AND carries `restored_no_resume` (or `error_category=restored_inflight`).
+    - Post-restore `failed` attempt -> rotates & submits new attempt; replaying twice submits once.
+    - Post-restore `cancelled` attempt -> rotates & submits new attempt; replaying twice submits once.
+    - Normal ASR `failed` attempt -> keeps existing row without allocating/submitting (use /retry).
+    - User-cancelled `cancelled` attempt -> keeps existing row without allocating/submitting."""
+    import uuid
+
+    audio_bytes = b"audio-r7-resubmit-gate-cases"
+    audio_sha = _sha(audio_bytes)
+
+    def _run_case(
+        *,
+        old_job_id: str,
+        attempt_status: str,
+        attempt_error_category: str | None = None,
+        attempt_usage: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], str]:
+        attempt_0 = str(
+            uuid.uuid5(
+                tr_svc._TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
+                f"dalton-asr-resubmit-attempt:{old_job_id}",
+            )
+        )
+        idemp_0 = str(
+            uuid.uuid5(
+                tr_svc._TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
+                f"dalton-asr-resubmit:{old_job_id}:{attempt_0}",
+            )
+        )
+        row_store: dict[str, dict[str, Any]] = {
+            old_job_id: {
+                "job_id": old_job_id,
+                "created_by_user_id": "user-1",
+                "workspace_id": "ws-1",
+                "thread_id": "th-1",
+                "source_object_key": f"transcriptions/ws-1/{old_job_id}/source/call.m4a",
+                "source_size_bytes": len(audio_bytes),
+                "source_sha256": audio_sha,
+                "language": "zh",
+                "hotwords": [],
+                "status": "failed",
+                "stage": "failed",
+                "version": 2,
+                "idempotency_key": f"orig-{old_job_id}",
+                "usage": {
+                    "upload": {"completed": True},
+                    "restored_no_resume": True,
+                    "resubmit_attempt_id": attempt_0,
+                    "resubmit_attempt_seq": 0,
+                },
+            },
+            attempt_0: {
+                "job_id": attempt_0,
+                "created_by_user_id": "user-1",
+                "workspace_id": "ws-1",
+                "thread_id": "th-1",
+                "source_object_key": f"transcriptions/ws-1/{old_job_id}/source/call.m4a",
+                "source_size_bytes": len(audio_bytes),
+                "source_sha256": audio_sha,
+                "language": "zh",
+                "hotwords": [],
+                "status": attempt_status,
+                "stage": attempt_status,
+                "error_category": attempt_error_category,
+                "version": 2,
+                "idempotency_key": idemp_0,
+                "usage": dict(attempt_usage or {}),
+            },
+        }
+        bridge_calls: list[dict[str, Any]] = []
+
+        async def _fake_get_job(jid: str, *, conn: Any = None) -> dict[str, Any] | None:
+            r = row_store.get(jid)
+            return dict(r) if r is not None else None
+
+        async def _fake_create_job(**kwargs: Any) -> dict[str, Any]:
+            for existing in row_store.values():
+                if existing["idempotency_key"] == kwargs["idempotency_key"]:
+                    return dict(existing)
+            row = {
+                "job_id": str(kwargs["job_id"]),
+                "created_by_user_id": kwargs["created_by_user_id"],
+                "workspace_id": kwargs["workspace_id"],
+                "thread_id": kwargs.get("thread_id") or "",
+                "source_object_key": kwargs["source_object_key"],
+                "source_size_bytes": int(kwargs["source_size_bytes"]),
+                "source_sha256": kwargs["source_sha256"],
+                "language": kwargs.get("language"),
+                "hotwords": list(kwargs.get("hotwords") or []),
+                "status": kwargs["status"].value if hasattr(kwargs["status"], "value") else str(kwargs["status"]),
+                "stage": str(kwargs.get("stage") or "awaiting_upload"),
+                "error_category": None,
+                "idempotency_key": kwargs["idempotency_key"],
+                "version": 1,
+                "usage": dict(kwargs.get("usage") or {}),
+            }
+            row_store[row["job_id"]] = row
+            return dict(row)
+
+        async def _fake_update_versioned(job_id: str, *, expected_version: int, **kwargs: Any):
+            row = row_store.get(job_id)
+            if row is None or int(row["version"]) != int(expected_version):
+                return False, dict(row) if row else None
+            for k in ("status", "stage", "usage", "segment_count", "completed_segments"):
+                if kwargs.get(k) is not None:
+                    val = kwargs[k]
+                    row[k] = val.value if hasattr(val, "value") else (dict(val) if isinstance(val, dict) else val)
+            row["version"] = int(row["version"]) + 1
+            return True, dict(row)
+
+        async def _fake_bridge_submit(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            bridge_calls.append(dict(payload))
+            return 200, {"ok": True, "job": {"status": "queued", "stage": "queued"}}
+
+        with monkeypatch.context() as mp:
+            mp.setattr(tr_svc, "require_internal_transcription_caller", create_autospec(tr_svc.require_internal_transcription_caller, side_effect=lambda u: u))
+            mp.setattr(tr_svc, "authorize_job_access", create_autospec(tr_svc.authorize_job_access, return_value=None))
+            mp.setattr(tr_db, "get_transcription_job", create_autospec(tr_db.get_transcription_job, side_effect=_fake_get_job))
+            mp.setattr(tr_db, "create_transcription_job", create_autospec(tr_db.create_transcription_job, side_effect=_fake_create_job))
+            mp.setattr(tr_db, "update_transcription_job_versioned", create_autospec(tr_db.update_transcription_job_versioned, side_effect=_fake_update_versioned))
+            mp.setattr(tr_svc, "is_transcription_storage_configured", create_autospec(tr_svc.is_transcription_storage_configured, return_value=True))
+            mp.setattr(tr_svc, "object_size", create_autospec(tr_svc.object_size, return_value=len(audio_bytes)))
+            mp.setattr(tr_svc, "call_bridge_submit_transcription", create_autospec(tr_svc.call_bridge_submit_transcription, side_effect=_fake_bridge_submit))
+
+            first = asyncio.run(tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-1"))
+            second = asyncio.run(tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-1"))
+        return first, second, bridge_calls, attempt_0
+
+    # 1. Post-restore `failed` (submit_attempted + restored_no_resume) -> allocates new attempt & submits once on replay
+    r1_fail, r2_fail, calls_fail, att0_fail = _run_case(
+        old_job_id="77777771-1111-1111-1111-111111111111",
+        attempt_status="failed",
+        attempt_error_category="restored_inflight",
+        attempt_usage={"submit_attempted": True, "restored_no_resume": True},
+    )
+    assert r1_fail["ok"] is True
+    assert r1_fail["job"]["job_id"] != att0_fail
+    assert r1_fail["job"]["status"] == "queued"
+    assert r2_fail["job"]["job_id"] == r1_fail["job"]["job_id"]
+    assert len(calls_fail) == 1
+    assert calls_fail[0]["job_id"] == r1_fail["job"]["job_id"]
+
+    # 2. Post-restore `cancelled` (restored_no_resume) -> allocates new attempt & submits once on replay
+    r1_canc, r2_canc, calls_canc, att0_canc = _run_case(
+        old_job_id="77777772-2222-2222-2222-222222222222",
+        attempt_status="cancelled",
+        attempt_error_category=None,
+        attempt_usage={"restored_no_resume": True},
+    )
+    assert r1_canc["ok"] is True
+    assert r1_canc["job"]["job_id"] != att0_canc
+    assert r1_canc["job"]["status"] == "queued"
+    assert r2_canc["job"]["job_id"] == r1_canc["job"]["job_id"]
+    assert len(calls_canc) == 1
+
+    # 3. Normal ASR `failed` (no restored_no_resume / not restored_inflight) -> does NOT allocate new attempt
+    r1_norm, r2_norm, calls_norm, att0_norm = _run_case(
+        old_job_id="77777773-3333-3333-3333-333333333333",
+        attempt_status="failed",
+        attempt_error_category="provider_timeout",
+        attempt_usage={"submit_attempted": True},
+    )
+    assert r1_norm["ok"] is True
+    assert r1_norm["job"]["job_id"] == att0_norm
+    assert r1_norm["job"]["status"] == "failed"
+    assert r2_norm["job"]["job_id"] == att0_norm
+    assert calls_norm == []
+
+    # 4. User-initiated `cancelled` (no restored_no_resume) -> replay does NOT spawn new billed attempt
+    r1_ucanc, r2_ucanc, calls_ucanc, att0_ucanc = _run_case(
+        old_job_id="77777774-4444-4444-4444-444444444444",
+        attempt_status="cancelled",
+        attempt_error_category=None,
+        attempt_usage={"submit_attempted": True, "cancellation": {"provider_cancel_verified": False}},
+    )
+    assert r1_ucanc["ok"] is True
+    assert r1_ucanc["job"]["job_id"] == att0_ucanc
+    assert r1_ucanc["job"]["status"] == "cancelled"
+    assert r2_ucanc["job"]["job_id"] == att0_ucanc
+    assert calls_ucanc == []
+
+
+def test_r7_backup_sh_unmounted_emits_set_id_and_deploy_main_aborts_immediately(
+    tmp_path: Path,
+) -> None:
+    """R7 #2: When external drive is unmounted, backup.sh resolves RUN_SET_ID before verify-mount
+    and emits `fail set=<ID> mount_check: ...`, so deploy_main.sh matches set=<ID> and aborts
+    immediately instead of waiting up to 7 hours."""
+    import time
+
+    from tests.unit.dalton.test_deploy_main_reuse_backup import _run_deploy, _setup_deploy_env
+
+    ctx = _setup_deploy_env(tmp_path / "dep-unmounted")
+    seed = Path(ctx["seed"])
+    (seed / "src/dalton/migrations/versions/d041_next.py").write_text(
+        "revision = 'd041'\ndown_revision = 'd040'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "add d041"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+
+    next_id_file = tmp_path / "unmounted.next-id"
+    active_id_file = tmp_path / "unmounted.active-id"
+    missing_mount = tmp_path / "unmounted-external-drive"
+    backup_sh = REPO_ROOT / "scripts/dalton/ops/prod/backup.sh"
+
+    # Fake launchctl executes the REAL backup.sh against a non-existent external mount root.
+    (Path(ctx["fake_bin"]) / "launchctl").write_text(
+        f"""#!/bin/bash
+if [ "$1" = "kickstart" ]; then
+  DALTON_REPO_ROOT="{REPO_ROOT}" \\
+  DALTON_REPO_PYTHON="{sys.executable}" \\
+  DALTON_BACKUP_LOAD_ENV=0 \\
+  DALTON_EXTERNAL_MOUNT_ROOT="{missing_mount}" \\
+  DALTON_BACKUP_ROOT="{missing_mount}/Dalton/backups" \\
+  DALTON_PG_BACKUP_NEXT_ID_FILE="{next_id_file}" \\
+  DALTON_PG_BACKUP_ACTIVE_ID_FILE="{active_id_file}" \\
+  bash "{backup_sh}" >> "{ctx['backup_log']}" 2>&1 || true
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (Path(ctx["fake_bin"]) / "launchctl").chmod(0o755)
+
+    t0 = time.monotonic()
+    res = _run_deploy(
+        ctx,
+        tmp_path / "dep-unmounted",
+        extra_setup=(
+            f'DALTON_DEPLOY_BACKUP_WAIT_S=25200; DALTON_DEPLOY_BACKUP_POLL_S=1; '
+            f'DALTON_DEPLOY_BACKUP_WAIT_STATE_FILE="{tmp_path}/w_unmounted.state"; '
+            f'DALTON_PG_BACKUP_NEXT_ID_FILE="{next_id_file}"'
+        ),
+    )
+    elapsed = time.monotonic() - t0
+
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert elapsed < 30.0, f"deploy_main waited too long on unmounted backup: {elapsed:.2f}s"
+    assert "mount_check:" in res.stdout
+    assert "set=" in res.stdout
+    assert "backup failed, abort" in res.stdout
+    log_text = Path(ctx["backup_log"]).read_text(encoding="utf-8")
+    assert " fail set=" in log_text and "mount_check:" in log_text
+    assert not active_id_file.exists()
+
+
+def test_r7_deploy_main_reuse_backup_verifies_artifact_and_re_backs_up_on_corruption(
+    tmp_path: Path,
+) -> None:
+    """R7 #3: `--reuse-backup-minutes` verifies the candidate backup set with
+    `_verify_completed_backup_artifact`; intact sets are reused without kickstart, while
+    missing/corrupted dump/manifest/archive logs the reason and triggers a fresh backup."""
+    from tests.unit.dalton.test_deploy_main_reuse_backup import _run_deploy, _setup_deploy_env
+
+    # Build a complete verified backup set on disk.
+    backups_root = tmp_path / "reuse-backups"
+    obj_bytes = b"reuse-mirrored-object"
+    obj_sha = _sha(obj_bytes)
+    pool_obj = backups_root / "minio-mirror" / "objects" / obj_sha[:2] / obj_sha
+    pool_obj.parent.mkdir(parents=True, exist_ok=True)
+    pool_obj.write_bytes(obj_bytes)
+
+    staged_dump = tmp_path / "reuse-staged.dump"
+    staged_dump.write_bytes(b"PGDMP-reuse-intact")
+    staged_asr = tmp_path / "reuse-staged-asr.tar.gz"
+    asr_bytes = b"reuse-asr-archive-bytes"
+    staged_asr.write_bytes(asr_bytes)
+
+    pub = local_backup_set.publish_local_backup_set(
+        backups_root=backups_root,
+        backup_set_id="20261127-reuse-1",
+        tag="daily",
+        snapshot_id="00000101-00000001-1",
+        staged_dump_path=staged_dump,
+        manifest_objects=[
+            consistent_backup.ArchivedObjectRecord(
+                bucket="dalton-main",
+                key=f"blobs/u1/{obj_sha}",
+                version_id="v1",
+                size=len(obj_bytes),
+                archived_sha256=obj_sha,
+            )
+        ],
+        asr_summary=consistent_backup.AsrArchiveSummary(
+            archive_path=staged_asr,
+            size_bytes=len(asr_bytes),
+            sha256=_sha(asr_bytes),
+            included_job_ids=("job-r7",),
+            included_usage_ledger=True,
+        ),
+        reconcile_ok=True,
+    )
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ok_line = f"{now_str} ok  16G {pub.dump_path} set={pub.backup_set_id}\n"
+
+    # Case 1: Intact backup set -> reused directly without kickstart.
+    ctx_ok = _setup_deploy_env(tmp_path / "case-intact")
+    seed_ok = Path(ctx_ok["seed"])
+    (seed_ok / "app.py").write_text("v2-code-only\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed_ok), "commit", "-qam", "code only"], check=True)
+    subprocess.run(["git", "-C", str(seed_ok), "push", "-q", "origin", "dalton/main"], check=True)
+    Path(ctx_ok["backup_log"]).write_text(ok_line, encoding="utf-8")
+
+    res_ok = _run_deploy(ctx_ok, tmp_path / "case-intact", args="--reuse-backup-minutes 60")
+    assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+    assert "backup: reusing (" in res_ok.stdout
+    trace_ok = Path(ctx_ok["launchctl_trace"]).read_text(encoding="utf-8") if Path(ctx_ok["launchctl_trace"]).exists() else ""
+    assert "kickstart" not in trace_ok
+
+    # Case 2: Corrupted/missing object manifest -> logs reason and takes a fresh backup.
+    assert pub.manifest_path.is_file()
+    pub.manifest_path.unlink()
+
+    ctx_bad = _setup_deploy_env(tmp_path / "case-corrupt")
+    seed_bad = Path(ctx_bad["seed"])
+    (seed_bad / "app.py").write_text("v2-code-only\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed_bad), "commit", "-qam", "code only"], check=True)
+    subprocess.run(["git", "-C", str(seed_bad), "push", "-q", "origin", "dalton/main"], check=True)
+    Path(ctx_bad["backup_log"]).write_text(ok_line, encoding="utf-8")
+
+    res_bad = _run_deploy(ctx_bad, tmp_path / "case-corrupt", args="--reuse-backup-minutes 60")
+    assert res_bad.returncode == 0, res_bad.stdout + res_bad.stderr
+    assert "artifact verification failed:" in res_bad.stdout
+    assert "object manifest missing" in res_bad.stdout
+    assert "taking a fresh one" in res_bad.stdout
+    assert "backup: reusing (" not in res_bad.stdout
+    trace_bad = Path(ctx_bad["launchctl_trace"]).read_text(encoding="utf-8")
+    assert "kickstart" in trace_bad
+
+
+def test_r7_weekly_minio_baseline_dedups_overlapping_bucket_specs(tmp_path: Path) -> None:
+    """R7 #4: Weekly offsite baseline (`build_weekly_minio_baseline`) deduplicates overlapping
+    bucket specs by `(endpoint, bucket, full_key)` before archiving so shared buckets with
+    empty main prefix and non-empty chat_upload prefix never archive the same object twice."""
+    shared_bucket = "shared-weekly-bucket"
+    chat_prefix = "chat-ns"
+    main_blob = b"weekly-main-blob"
+    chat_blob = b"weekly-chat-under-prefix"
+    main_key = f"blobs/u1/{_sha(main_blob)}"
+    chat_full_key = f"{chat_prefix}/chat-uploads/ws1/up1/doc.pdf"
+
+    s3 = _FakeS3Client(versioning_by_bucket={shared_bucket: True})
+    s3.seed_object(shared_bucket, main_key, main_blob, content_type="application/octet-stream")
+    s3.seed_object(shared_bucket, chat_full_key, chat_blob, content_type="application/pdf")
+
+    env = {
+        "STORAGE_PROVIDER": "s3",
+        "STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+        "STORAGE_BUCKET_NAME": shared_bucket,
+        "STORAGE_KEY_PREFIX": "",
+        "STORAGE_ACCESS_KEY_ID": "ak",
+        "STORAGE_SECRET_ACCESS_KEY": "sk",
+        "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": shared_bucket,
+        "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX": chat_prefix,
+        "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "ak",
+        "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "sk",
+    }
+    specs = consistent_backup.resolve_runtime_bucket_specs(
+        env=env,
+        apply_core_defaults=False,
+        rewrite_container_minio=False,
+        client_factory=lambda **_kw: s3,
+    )
+    assert len(specs) == 2
+    assert {s.key_prefix for s in specs} == {"", chat_prefix}
+
+    out_tar = tmp_path / "weekly-minio-baseline.tar.gz"
+    out_manifest = tmp_path / "weekly-baseline-2026-11-29.json"
+    records, payload = offsite_sync.build_weekly_minio_baseline(
+        bucket_specs=specs,
+        baseline_id="2026-11-29",
+        out_tar_path=out_tar,
+        manifest_out_path=out_manifest,
+    )
+
+    assert len(records) == 2
+    assert sorted((r.bucket, r.key) for r in records) == sorted(
+        [(shared_bucket, main_key), (shared_bucket, chat_full_key)]
+    )
+    assert payload["object_count"] == 2
+    assert len(payload["objects"]) == 2
+    with tarfile.open(out_tar, "r:gz") as tf:
+        members = [m.name for m in tf.getmembers() if m.isfile() and m.name.startswith("objects/")]
+        assert len(members) == 2
+        assert len(set(members)) == 2
