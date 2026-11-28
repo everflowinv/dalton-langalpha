@@ -198,7 +198,8 @@ async def test_consensus_us_hk_verified_adr_unverified_adr_and_all_7_states() ->
             provider="yfinance",
             as_of="2026-11-26T12:00:00Z",
         ),
-        # 3. Verified ADR from curated table: TSM (5 ordinary TWD shares per ADR, TWD->USD = 0.031) -> ok
+        # 3. Verified ADR from curated table: TSM (5 ordinary TWD shares per ADR, TWD->USD = 0.031,
+        #    cross-checked via Yahoo forwardEps = $9.30/ADS matching FY2 60 * 5 * 0.031) -> ok
         "TSM": consensus_mod.RawConsensusRecord(
             symbol="TSM",
             fy1_eps=50.0,
@@ -212,6 +213,7 @@ async def test_consensus_us_hk_verified_adr_unverified_adr_and_all_7_states() ->
             as_of="2026-11-26T12:00:00Z",
             quote_type="EQUITY",
             security_name="Taiwan Semiconductor Manufacturing Company Limited ADR",
+            provider_forward_eps_per_quote_unit=9.30,
         ),
         # 4. Unverified ADR (not in curated table, foreign EPS, no row adr_ratio) -> unit_unverified!
         "XYZADR": consensus_mod.RawConsensusRecord(
@@ -404,6 +406,7 @@ async def test_adr_ratios_tm_10_metadata_and_currency_match_not_per_adr_proof() 
         assert len(entry.effective_date) == 10 and date.fromisoformat(entry.effective_date)
 
     # 2. TM @ $180, ordinary-share EPS = 250 JPY, FX JPY->USD = 0.006 -> per-ADR EPS = 250 * 10 * 0.006 = $15 -> P/E = 12.0
+    #    Cross-checked via Yahoo forwardEps = $18.0/ADS (matching FY2 300 * 10 * 0.006 = $18.0).
     records = {
         "TM": consensus_mod.RawConsensusRecord(
             symbol="TM",
@@ -416,6 +419,21 @@ async def test_adr_ratios_tm_10_metadata_and_currency_match_not_per_adr_proof() 
             analyst_count=18,
             provider="yfinance",
             security_name="Toyota Motor Corporation ADR",
+            provider_forward_eps_per_quote_unit=18.0,
+        ),
+        # TM with JPY estimates but WITHOUT forwardEps -> currency match alone no longer proves ordinary-share unit!
+        "HMC": consensus_mod.RawConsensusRecord(
+            symbol="HMC",
+            fy1_eps=250.0,
+            fy2_eps=300.0,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="JPY",
+            quote_currency="USD",
+            analyst_count=14,
+            provider="yfinance",
+            security_name="Honda Motor Co., Ltd. ADR",
+            provider_forward_eps_per_quote_unit=None,
         ),
         # Unverified ADR where estimate_currency == quote_currency == USD, but provider did NOT confirm per-ADR!
         "USDADR": consensus_mod.RawConsensusRecord(
@@ -456,8 +474,14 @@ async def test_adr_ratios_tm_10_metadata_and_currency_match_not_per_adr_proof() 
     tm_val = await adapter.get_valuation("TM", latest_price=180.0, quote_currency="USD")
     assert tm_val["status"] == "ok"
     assert tm_val["shares_per_quote_unit"] == 10.0
+    assert tm_val["unit_verification_method"] == "cross_check_per_ordinary"
     assert tm_val["pe_fy1"] == 12.0
     assert tm_val["pe_fy2"] == 10.0
+
+    # Foreign currency matching underlying_currency WITHOUT forwardEps -> unit_unverified!
+    hmc_no_fwd = await adapter.get_valuation("HMC", latest_price=30.0, quote_currency="USD")
+    assert hmc_no_fwd["status"] == "unit_unverified"
+    assert hmc_no_fwd["pe_fy1"] is None
 
     # Currency match (USD == USD) does NOT prove per-ADR unit -> unit_unverified!
     usd_adr = await adapter.get_valuation("USDADR", latest_price=100.0, quote_currency="USD")
@@ -915,7 +939,7 @@ async def test_standalone_core_metrics_service_end_to_end_us_hk_adr_missing_unli
         if symbol == "0700.HK":
             return consensus_mod.RawConsensusRecord(symbol="0700.HK", fy1_eps=25.0, fy2_eps=27.5, fy1_end="2026-12-31", fy2_end="2027-12-31", estimate_currency="CNY", quote_currency="HKD", analyst_count=30, provider="yfinance")
         if symbol == "TSM":
-            return consensus_mod.RawConsensusRecord(symbol="TSM", fy1_eps=50.0, fy2_eps=60.0, fy1_end="2026-12-31", fy2_end="2027-12-31", estimate_currency="TWD", quote_currency="USD", analyst_count=20, provider="yfinance", security_name="TSM ADR")
+            return consensus_mod.RawConsensusRecord(symbol="TSM", fy1_eps=50.0, fy2_eps=60.0, fy1_end="2026-12-31", fy2_end="2027-12-31", estimate_currency="TWD", quote_currency="USD", analyst_count=20, provider="yfinance", security_name="TSM ADR", provider_forward_eps_per_quote_unit=9.30)
         return consensus_mod.RawConsensusRecord(symbol=symbol, quote_currency="HKD", provider="yfinance")
 
     async def _core_fx(src: str, dst: str) -> float | None:
@@ -1133,9 +1157,20 @@ async def test_adr_azn_direct_ordinary_share_smfg_1_2_and_unverified_omitted() -
     assert azn["pe_fy1"] == 15.0  # NOT 30.0 (old 0.5 ratio)!
 
     smfg = await adapter.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
-    assert smfg["status"] == "ok"
-    assert smfg["shares_per_quote_unit"] == 1.2
-    assert smfg["pe_fy1"] == 10.0  # 18 / (250 * 1.2 * 0.006) = 10.0, NOT 20.0 (old 0.6 ratio)!
+    # Without forwardEps, SMFG fails closed to unit_unverified unless an explicit coverage-row adr_ratio is provided.
+    assert smfg["status"] == "unit_unverified"
+    assert smfg["pe_fy1"] is None
+
+    smfg_explicit = await adapter.get_valuation(
+        "SMFG",
+        latest_price=18.0,
+        quote_currency="USD",
+        coverage_row={"aliases": {"adr_ratio": 1.2}},
+    )
+    assert smfg_explicit["status"] == "ok"
+    assert smfg_explicit["shares_per_quote_unit"] == 1.2
+    assert smfg_explicit["unit_verification_method"] == "explicit_ratio"
+    assert smfg_explicit["pe_fy1"] == 10.0  # 18 / (250 * 1.2 * 0.006) = 10.0, NOT 20.0 (old 0.6 ratio)!
 
     shel = await adapter.get_valuation("SHEL", latest_price=70.0, quote_currency="USD")
     assert shel["status"] == "unit_unverified"
@@ -2660,3 +2695,1315 @@ async def test_slow_redis_write_releases_upstream_slot_holds_singleflight_and_ke
     # Confirm Redis kv did not receive the timed-out writes (proving memory snapshot served the reads)
     assert cache_key not in kv
     assert cd_key not in kv
+
+
+@pytest.mark.asyncio
+async def test_chinese_adr_forward_eps_cross_check_per_ads_and_tcom_unverified_ratio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Yahoo info['forwardEps'] cross-validates Chinese ADRs (BABA/JD/PDD/BIDU/TCOM) as per-ADS rather than multiplying CNY EPS by N."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    # Production yfinance observations (2026-11-27): prices & forwardEps in USD/ADS, 0y/+1y EPS in CNY per ADS.
+    prod_cases: dict[str, dict[str, Any]] = {
+        "BABA": {"price": 89.86, "forwardEps": 9.12, "fy1": 43.69, "fy2": 61.08, "name": "Alibaba Group Holding Limited"},
+        "JD": {"price": 27.43, "forwardEps": 4.21, "fy1": 20.59, "fy2": 28.28, "name": "JD.com, Inc."},
+        "PDD": {"price": 89.02, "forwardEps": 12.61, "fy1": 72.01, "fy2": 84.07, "name": "PDD Holdings Inc."},
+        "BIDU": {"price": 63.61, "forwardEps": 5.93, "fy1": 32.93, "fy2": 39.58, "name": "Baidu, Inc."},
+        "TCOM": {"price": 40.62, "forwardEps": 4.13, "fy1": 25.20, "fy2": 27.56, "name": "Trip.com Group Limited"},
+    }
+    assert "TCOM" in consensus_mod.KNOWN_ADR_SYMBOLS
+    assert "TCOM" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+
+    def _make_adr_ticker(sym: str) -> Any:
+        row = prod_cases[sym]
+        ticker = create_autospec(yf.Ticker, instance=True)
+        ticker.earnings_estimate = pd.DataFrame(
+            {"avg": [row["fy1"], row["fy2"]], "numberOfAnalysts": [30, 28]},
+            index=["0y", "+1y"],
+        )
+        analysis = create_autospec(YfAnalysis, instance=True)
+        analysis._earnings_trend = [
+            {"period": "0y", "endDate": "2027-03-31"},
+            {"period": "+1y", "endDate": "2028-03-31"},
+        ]
+        ticker._analysis = analysis
+        ticker.info = {
+            "currency": "USD",
+            "financialCurrency": "CNY",
+            "forwardEps": row["forwardEps"],
+            "quoteType": "EQUITY",
+            "longName": row["name"],
+        }
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_adr_ticker),
+    )
+
+    cny_to_usd = 1.0 / 7.1
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=lambda src, dst: cny_to_usd if (src, dst) == ("CNY", "USD") else None,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    for sym, row in prod_cases.items():
+        val = await adapter.get_valuation(sym, latest_price=row["price"], quote_currency="USD")
+        assert val["status"] == "ok", f"{sym} failed: {val}"
+        assert val["unit_verified"] is True, sym
+        assert val["shares_per_quote_unit"] == 1.0, sym
+        assert val["unit_verification_method"] == "cross_check_per_ads", sym
+        assert val["pe_fy1"] is not None and 5.0 <= val["pe_fy1"] <= 20.0, (sym, val["pe_fy1"])
+        assert val["pe_fy2"] is not None and 5.0 <= val["pe_fy2"] <= 20.0, (sym, val["pe_fy2"])
+        expected_pe_fy1 = round(row["price"] / (row["fy1"] * cny_to_usd), 2)
+        expected_pe_fy2 = round(row["price"] / (row["fy2"] * cny_to_usd), 2)
+        assert val["pe_fy1"] == expected_pe_fy1, sym
+        assert val["pe_fy2"] == expected_pe_fy2, sym
+
+    # Verify cached record actually stored Yahoo forwardEps
+    cached_baba, is_fresh = await consensus_mod._read_consensus_cache(
+        "BABA", today=date(2026, 11, 27)
+    )
+    assert cached_baba is not None and is_fresh is True
+    assert cached_baba["provider_forward_eps_per_quote_unit"] == 9.12
+
+
+@pytest.mark.asyncio
+async def test_adr_forward_eps_cross_check_per_ordinary_missing_outlier_fmp_and_legacy_cache() -> None:
+    """Verify per-ordinary-share detection, missing forwardEps -> unit_unverified, outlier -> unit_unverified, N<1.8 ambiguity, 1:1 table, FMP fallback, and legacy cache compatibility."""
+    cny_to_usd = 1.0 / 7.1
+    fx_calls: list[tuple[str, str]] = []
+
+    async def _fx(src: str, dst: str) -> float | None:
+        fx_calls.append((src, dst))
+        return {("CNY", "USD"): cny_to_usd, ("JPY", "USD"): 0.006, ("EUR", "USD"): 1.08}.get(
+            (src, dst)
+        )
+
+    # 1. Constructed per-ordinary-share BABA (EPS = per-ADS EPS / 8) and JD (EPS = per-ADS EPS / 2)
+    ord_records: dict[str, consensus_mod.RawConsensusRecord] = {
+        "BABA": consensus_mod.RawConsensusRecord(
+            symbol="BABA",
+            fy1_eps=43.69 / 8.0,
+            fy2_eps=61.08 / 8.0,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="CNY",
+            quote_currency="USD",
+            analyst_count=35,
+            provider="yfinance",
+            security_name="Alibaba Group Holding Limited",
+            provider_forward_eps_per_quote_unit=9.12,
+        ),
+        "JD": consensus_mod.RawConsensusRecord(
+            symbol="JD",
+            fy1_eps=20.59 / 2.0,
+            fy2_eps=28.28 / 2.0,
+            fy1_end="2026-12-31",
+            fy2_end="2027-12-31",
+            estimate_currency="CNY",
+            quote_currency="USD",
+            analyst_count=28,
+            provider="yfinance",
+            security_name="JD.com, Inc.",
+            provider_forward_eps_per_quote_unit=4.21,
+        ),
+        # 1:1 verified ADR in table without forwardEps -> verified_table 1.0
+        "ASML": consensus_mod.RawConsensusRecord(
+            symbol="ASML",
+            fy1_eps=20.0,
+            fy2_eps=25.0,
+            fy1_end="2026-12-31",
+            fy2_end="2027-12-31",
+            estimate_currency="EUR",
+            quote_currency="USD",
+            analyst_count=30,
+            provider="yfinance",
+            security_name="ASML Holding N.V.",
+            provider_forward_eps_per_quote_unit=None,
+        ),
+        # N=1.2 with r1=1.44, r2=1.20: both hypotheses fit within ln(1.5),
+        # S_ord = ln(1.2)^2 vs S_ads = ln(1.44)^2 + ln(1.2)^2 = 5 * S_ord >= 2 * S_ord -> per-ordinary, FY1 PE = 10.0
+        "SMFG": consensus_mod.RawConsensusRecord(
+            symbol="SMFG",
+            fy1_eps=250.0,
+            fy2_eps=300.0,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="JPY",
+            quote_currency="USD",
+            analyst_count=14,
+            provider="yfinance",
+            security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+            provider_forward_eps_per_quote_unit=2.16,
+        ),
+    }
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda s: ord_records.get(s),
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    baba_ord = await adapter.get_valuation("BABA", latest_price=89.86, quote_currency="USD")
+    assert baba_ord["status"] == "ok"
+    assert baba_ord["shares_per_quote_unit"] == 8.0
+    assert baba_ord["unit_verification_method"] == "cross_check_per_ordinary"
+    assert baba_ord["pe_fy1"] == round(89.86 / (43.69 * cny_to_usd), 2)
+    assert 5.0 <= baba_ord["pe_fy1"] <= 20.0
+
+    jd_ord = await adapter.get_valuation("JD", latest_price=27.43, quote_currency="USD")
+    assert jd_ord["status"] == "ok"
+    assert jd_ord["shares_per_quote_unit"] == 2.0
+    assert jd_ord["unit_verification_method"] == "cross_check_per_ordinary"
+    assert jd_ord["pe_fy1"] == round(27.43 / (20.59 * cny_to_usd), 2)
+    assert 5.0 <= jd_ord["pe_fy1"] <= 20.0
+
+    asml_1to1 = await adapter.get_valuation("ASML", latest_price=864.0, quote_currency="USD")
+    assert asml_1to1["status"] == "ok"
+    assert asml_1to1["shares_per_quote_unit"] == 1.0
+    assert asml_1to1["unit_verification_method"] == "verified_table"
+    assert asml_1to1["pe_fy1"] == 40.0
+
+    smfg_scored = await adapter.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert smfg_scored["status"] == "ok"
+    assert smfg_scored["unit_verified"] is True
+    assert smfg_scored["shares_per_quote_unit"] == 1.2
+    assert smfg_scored["unit_verification_method"] == "cross_check_per_ordinary"
+    assert smfg_scored["pe_fy1"] == 10.0
+
+    # 2. Missing forwardEps on BABA -> unit_unverified (NOT wrong ~1.3x P/E) and ZERO FX calls
+    consensus_mod._clear_consensus_cache_for_tests()
+    fx_calls.clear()
+    adapter_no_fwd = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: consensus_mod.RawConsensusRecord(
+            symbol="BABA",
+            fy1_eps=43.69,
+            fy2_eps=61.08,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="CNY",
+            quote_currency="USD",
+            analyst_count=35,
+            provider="yfinance",
+            security_name="Alibaba Group Holding Limited",
+            provider_forward_eps_per_quote_unit=None,
+        ),
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    baba_no_fwd = await adapter_no_fwd.get_valuation("BABA", latest_price=89.86, quote_currency="USD")
+    assert baba_no_fwd["status"] == "unit_unverified"
+    assert baba_no_fwd["unit_verified"] is False
+    assert baba_no_fwd["pe_fy1"] is None
+    assert baba_no_fwd["pe_fy2"] is None
+    assert fx_calls == []
+
+    # 3. Ratio far from both 1 and N (forwardEps=25 -> r1=4.06, r2=2.91, both > ln(1.5) from 1 and 8) -> unit_unverified
+    consensus_mod._clear_consensus_cache_for_tests()
+    adapter_outlier = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: consensus_mod.RawConsensusRecord(
+            symbol="BABA",
+            fy1_eps=43.69,
+            fy2_eps=61.08,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="CNY",
+            quote_currency="USD",
+            analyst_count=35,
+            provider="yfinance",
+            security_name="Alibaba Group Holding Limited",
+            provider_forward_eps_per_quote_unit=25.0,
+        ),
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    baba_outlier = await adapter_outlier.get_valuation("BABA", latest_price=89.86, quote_currency="USD")
+    assert baba_outlier["status"] == "unit_unverified"
+    assert baba_outlier["pe_fy1"] is None
+
+    # 4. FMP fallback for BABA (CNY, no forwardEps) -> unit_unverified (deleted Rule 3 inference does not apply)
+    consensus_mod._clear_consensus_cache_for_tests()
+    fmp_baba = create_autospec(FMPClient, instance=True)
+    fmp_baba.get_analyst_estimates.return_value = [
+        {"date": "2027-03-31", "epsAvg": 43.69, "numAnalystsEps": 30},
+        {"date": "2028-03-31", "epsAvg": 61.08, "numAnalystsEps": 28},
+    ]
+    fmp_baba.get_income_statement.return_value = [
+        {"date": "2026-03-31", "reportedCurrency": "CNY"}
+    ]
+    fmp_baba.get_profile.return_value = [
+        {"symbol": "BABA", "currency": "USD", "companyName": "Alibaba Group Holding Limited", "isAdr": True}
+    ]
+    adapter_fmp = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: None,
+        fmp_client=fmp_baba,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    baba_fmp = await adapter_fmp.get_valuation("BABA", latest_price=89.86, quote_currency="USD")
+    assert baba_fmp["status"] == "unit_unverified"
+    assert baba_fmp["pe_fy1"] is None
+
+    # 5. Legacy cached record (missing `provider_forward_eps_per_quote_unit` key) deserializes & serves cleanly
+    consensus_mod._clear_consensus_cache_for_tests()
+    legacy_baba_dict: dict[str, Any] = {
+        "symbol": "BABA",
+        "fy1_eps": 43.69,
+        "fy2_eps": 61.08,
+        "fy1_end": "2027-03-31",
+        "fy2_end": "2028-03-31",
+        "estimate_currency": "CNY",
+        "quote_currency": "USD",
+        "analyst_count": 35,
+        "provider": "yfinance",
+        "as_of": "2026-11-26T12:00:00Z",
+        "quote_type": "EQUITY",
+        "security_name": "Alibaba Group Holding Limited",
+        "eps_per_quote_unit_confirmed": False,
+        "is_adr": None,
+        "last_reported_fy_end": "2026-03-31",
+        "fy1_unit_unverified": False,
+        "fy2_unit_unverified": False,
+    }
+    assert "provider_forward_eps_per_quote_unit" not in legacy_baba_dict
+    parsed_legacy = consensus_mod.RawConsensusRecord.from_dict(legacy_baba_dict)
+    assert parsed_legacy.provider_forward_eps_per_quote_unit is None
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("BABA")] = (
+        time.time(),
+        legacy_baba_dict,
+    )
+    cached_val, needs_warm = await adapter_fmp.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD"
+    )
+    assert cached_val is not None
+    assert cached_val["status"] == "unit_unverified"
+    assert cached_val["pe_fy1"] is None
+    assert needs_warm is True
+
+    legacy_nvda_dict = {
+        "symbol": "NVDA",
+        "fy1_eps": 4.5,
+        "fy2_eps": 5.4,
+        "fy1_end": "2027-01-31",
+        "fy2_end": "2028-01-31",
+        "estimate_currency": "USD",
+        "quote_currency": "USD",
+        "analyst_count": 40,
+        "provider": "yfinance",
+    }
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("NVDA")] = (
+        time.time(),
+        legacy_nvda_dict,
+    )
+    cached_nvda, needs_warm_nvda = await adapter_fmp.get_cached_valuation(
+        "NVDA", latest_price=135.0, quote_currency="USD"
+    )
+    assert cached_nvda is not None
+    assert cached_nvda["status"] == "ok"
+    assert cached_nvda["pe_fy1"] == 30.0
+    assert needs_warm_nvda is False
+
+
+@pytest.mark.asyncio
+async def test_adr_cross_check_tightened_single_year_overlap_and_two_year_disagreement() -> None:
+    """Tightened cross-check: single-year overlap (JD FY1 r~=1.45) and two-year disagreement (N=2 ordinary with +100% FY2 growth) both fail closed to unit_unverified."""
+    cny_to_usd = 1.0 / 7.1
+
+    async def _fx(src: str, dst: str) -> float | None:
+        return cny_to_usd if (src, dst) == ("CNY", "USD") else None
+
+    # 1. JD with ONLY FY1 (r = 4.21 / (20.59 / 7.1) ~= 1.4517):
+    #    within ln(1.5) of BOTH target=1.0 (d=0.373) and target=2.0 (d=0.320) -> unit_unverified.
+    jd_fy1_only = consensus_mod.RawConsensusRecord(
+        symbol="JD",
+        fy1_eps=20.59,
+        fy2_eps=None,
+        fy1_end="2026-12-31",
+        fy2_end=None,
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=28,
+        provider="yfinance",
+        security_name="JD.com, Inc.",
+        provider_forward_eps_per_quote_unit=4.21,
+    )
+    adapter_jd_single = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: jd_fy1_only,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_jd_single = await adapter_jd_single.get_valuation(
+        "JD", latest_price=27.43, quote_currency="USD"
+    )
+    assert val_jd_single["status"] == "unit_unverified"
+    assert val_jd_single["unit_verified"] is False
+    assert val_jd_single["pe_fy1"] is None
+    assert val_jd_single["pe_fy1_status"] == "unit_unverified"
+    assert val_jd_single["pe_fy2_status"] == "no_coverage"
+
+    # 2. True per-ordinary-share data (N=2 JD) where FY2 grows +100% (10.0 -> 20.0 CNY/share)
+    #    and forwardEps matches FY1 per-ADS (20.0 / 7.1 USD):
+    #    r1 = 2.0 (per_ordinary) vs r2 = 1.0 (per_ads) -> years disagree -> unit_unverified.
+    consensus_mod._clear_consensus_cache_for_tests()
+    jd_ord_100pct_growth = consensus_mod.RawConsensusRecord(
+        symbol="JD",
+        fy1_eps=10.0,
+        fy2_eps=20.0,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=25,
+        provider="yfinance",
+        security_name="JD.com, Inc.",
+        provider_forward_eps_per_quote_unit=20.0 * cny_to_usd,
+    )
+    adapter_jd_disagree = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: jd_ord_100pct_growth,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_jd_disagree = await adapter_jd_disagree.get_valuation(
+        "JD", latest_price=27.43, quote_currency="USD"
+    )
+    assert val_jd_disagree["status"] == "unit_unverified"
+    assert val_jd_disagree["unit_verified"] is False
+    assert val_jd_disagree["pe_fy1"] is None
+    assert val_jd_disagree["pe_fy2"] is None
+    assert val_jd_disagree["pe_fy1_status"] == "unit_unverified"
+    assert val_jd_disagree["pe_fy2_status"] == "unit_unverified"
+
+
+@pytest.mark.asyncio
+async def test_adr_legacy_cache_missing_key_triggers_warmup_vs_explicit_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy ADR cache missing `provider_forward_eps_per_quote_unit` displays unit_unverified AND triggers warmup; new records with explicit null stay fresh without re-warming."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    cny_to_usd = 1.0 / 7.1
+
+    def _make_baba_ticker(sym: str) -> Any:
+        assert sym == "BABA"
+        ticker = create_autospec(yf.Ticker, instance=True)
+        ticker.earnings_estimate = pd.DataFrame(
+            {"avg": [43.69, 61.08], "numberOfAnalysts": [35, 32]},
+            index=["0y", "+1y"],
+        )
+        analysis = create_autospec(YfAnalysis, instance=True)
+        analysis._earnings_trend = [
+            {"period": "0y", "endDate": "2027-03-31"},
+            {"period": "+1y", "endDate": "2028-03-31"},
+        ]
+        ticker._analysis = analysis
+        ticker.info = {
+            "currency": "USD",
+            "financialCurrency": "CNY",
+            "forwardEps": 9.12,
+            "quoteType": "EQUITY",
+            "longName": "Alibaba Group Holding Limited",
+        }
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_baba_ticker),
+    )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=lambda src, dst: cny_to_usd if (src, dst) == ("CNY", "USD") else None,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    # 1. Fresh legacy ADR cache (key absent): shows unit_unverified AND requests background warmup.
+    legacy_baba_dict: dict[str, Any] = {
+        "symbol": "BABA",
+        "fy1_eps": 43.69,
+        "fy2_eps": 61.08,
+        "fy1_end": "2027-03-31",
+        "fy2_end": "2028-03-31",
+        "estimate_currency": "CNY",
+        "quote_currency": "USD",
+        "analyst_count": 35,
+        "provider": "yfinance",
+        "as_of": "2026-11-27T08:00:00Z",
+        "quote_type": "EQUITY",
+        "security_name": "Alibaba Group Holding Limited",
+        "eps_per_quote_unit_confirmed": False,
+        "is_adr": None,
+        "last_reported_fy_end": "2026-03-31",
+        "fy1_unit_unverified": False,
+        "fy2_unit_unverified": False,
+    }
+    assert "provider_forward_eps_per_quote_unit" not in legacy_baba_dict
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("BABA")] = (
+        time.time(),
+        legacy_baba_dict,
+    )
+
+    before_val, before_needs_warm = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD"
+    )
+    assert before_val is not None
+    assert before_val["status"] == "unit_unverified"
+    assert before_val["pe_fy1"] is None
+    assert before_val["pe_fy2"] is None
+    assert before_needs_warm is True
+
+    # 2. Background warmup refreshes legacy cache and warms FX; next cached request returns verified P/E.
+    adapter.schedule_warmup("BABA", quote_currency="USD")
+    warm_task = consensus_mod._INFLIGHT_WARMUP.get("BABA")
+    assert warm_task is not None
+    await warm_task
+
+    after_val, after_needs_warm = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD"
+    )
+    assert after_val is not None
+    assert after_val["status"] == "ok"
+    assert after_val["unit_verified"] is True
+    assert after_val["shares_per_quote_unit"] == 1.0
+    assert after_val["unit_verification_method"] == "cross_check_per_ads"
+    assert after_val["pe_fy1"] == round(89.86 / (43.69 * cny_to_usd), 2)
+    assert after_val["pe_fy2"] == round(89.86 / (61.08 * cny_to_usd), 2)
+    assert after_needs_warm is False
+
+    # 3. New ADR cache record where provider_forward_eps_per_quote_unit is EXPLICITLY null ->
+    #    still unit_unverified, but considered fresh (needs_warmup=False, no endless refresh).
+    consensus_mod._clear_consensus_cache_for_tests()
+    explicit_null_baba = consensus_mod.RawConsensusRecord(
+        symbol="BABA",
+        fy1_eps=43.69,
+        fy2_eps=61.08,
+        fy1_end="2027-03-31",
+        fy2_end="2028-03-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=35,
+        provider="yfinance",
+        quote_type="EQUITY",
+        security_name="Alibaba Group Holding Limited",
+        provider_forward_eps_per_quote_unit=None,
+    ).to_dict()
+    assert "provider_forward_eps_per_quote_unit" in explicit_null_baba
+    assert explicit_null_baba["provider_forward_eps_per_quote_unit"] is None
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("BABA")] = (
+        time.time(),
+        explicit_null_baba,
+    )
+
+    null_val, null_needs_warm = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD"
+    )
+    assert null_val is not None
+    assert null_val["status"] == "unit_unverified"
+    assert null_val["pe_fy1"] is None
+    assert null_val["pe_fy2"] is None
+    assert null_needs_warm is False
+
+
+@pytest.mark.asyncio
+async def test_adr_fmp_single_year_backfill_preserves_yahoo_verified_year(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Yahoo provides only FY2 (with forwardEps) and FMP backfills FY1 (no anchor), FY2 still computes P/E while FY1 stays unit_unverified."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    cny_to_usd = 1.0 / 7.1
+
+    def _make_baba_fy2_only_ticker(sym: str) -> Any:
+        assert sym == "BABA"
+        ticker = create_autospec(yf.Ticker, instance=True)
+        ticker.earnings_estimate = pd.DataFrame(
+            {"avg": [61.08], "numberOfAnalysts": [32]},
+            index=["+1y"],
+        )
+        analysis = create_autospec(YfAnalysis, instance=True)
+        analysis._earnings_trend = [
+            {"period": "+1y", "endDate": "2028-03-31"},
+        ]
+        ticker._analysis = analysis
+        ticker.info = {
+            "currency": "USD",
+            "financialCurrency": "CNY",
+            "forwardEps": 9.12,
+            "quoteType": "EQUITY",
+            "longName": "Alibaba Group Holding Limited",
+        }
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_baba_fy2_only_ticker),
+    )
+
+    fmp_baba = create_autospec(FMPClient, instance=True)
+    fmp_baba.get_analyst_estimates.return_value = [
+        {"date": "2027-03-31", "epsAvg": 43.69, "numAnalystsEps": 30},
+        {"date": "2028-03-31", "epsAvg": 61.50, "numAnalystsEps": 28},
+    ]
+    fmp_baba.get_income_statement.return_value = [
+        {"date": "2026-03-31", "reportedCurrency": "CNY"}
+    ]
+    fmp_baba.get_profile.return_value = [
+        {"symbol": "BABA", "currency": "USD", "companyName": "Alibaba Group Holding Limited", "isAdr": True}
+    ]
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_baba,
+        fx_fetcher=lambda src, dst: cny_to_usd if (src, dst) == ("CNY", "USD") else None,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    val = await adapter.get_valuation("BABA", latest_price=89.86, quote_currency="USD")
+    assert val["provider"] == "yfinance+fmp"
+    assert val["status"] == "ok"
+    assert val["unit_verified"] is True
+    assert val["shares_per_quote_unit"] == 1.0
+    assert val["unit_verification_method"] == "cross_check_per_ads"
+    # FMP-filled FY1 has no cross-check anchor -> unit_unverified
+    assert val["fy1_end"] == "2027-03-31"
+    assert val["fy1_eps"] == 43.69
+    assert val["pe_fy1"] is None
+    assert val["pe_fy1_status"] == "unit_unverified"
+    # Yahoo FY2 stays cross-validated against Yahoo forwardEps -> 10.45x P/E
+    assert val["fy2_end"] == "2028-03-31"
+    assert val["fy2_eps"] == 61.08
+    assert val["pe_fy2"] == round(89.86 / (61.08 * cny_to_usd), 2)
+    assert val["pe_fy2_status"] == "ok"
+    assert val["eps_growth_fy2"] is None
+    assert val["eps_growth_fy2_status"] == "unit_unverified"
+
+    # Cached record retains per-year source provenance and serves identical valuation
+    cached_rec, is_fresh = await consensus_mod._read_consensus_cache(
+        "BABA", today=date(2026, 11, 27)
+    )
+    assert cached_rec is not None and is_fresh is True
+    assert cached_rec["fy1_provider"] == "fmp"
+    assert cached_rec["fy2_provider"] == "yfinance"
+    assert cached_rec["provider_forward_eps_per_quote_unit"] == 9.12
+    assert cached_rec["provider_forward_eps_source"] == "yfinance"
+
+    cached_val, needs_warm = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD"
+    )
+    assert cached_val is not None and needs_warm is False
+    assert cached_val["pe_fy1"] is None
+    assert cached_val["pe_fy1_status"] == "unit_unverified"
+    assert cached_val["pe_fy2"] == val["pe_fy2"]
+    assert cached_val["pe_fy2_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_adr_loss_year_marked_loss_independently_of_unit_verification() -> None:
+    """EPS <= 0 on an ADR is marked `loss` even when unit verification fails (e.g. forwardEps <= 0), while profitable years still require verified unit."""
+    cny_to_usd = 1.0 / 7.1
+    fx_calls: list[tuple[str, str]] = []
+
+    async def _fx(src: str, dst: str) -> float | None:
+        fx_calls.append((src, dst))
+        return cny_to_usd if (src, dst) == ("CNY", "USD") else None
+
+    assert "NIO" in consensus_mod.KNOWN_ADR_SYMBOLS
+    assert "NIO" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+
+    # 1. NIO: FY1 loss (-5.20 CNY), FY2 profitable (+1.80 CNY), forwardEps <= 0 (no anchor) ->
+    #    FY1 = loss, FY2 = unit_unverified, no FX call.
+    nio_neg_fwd = consensus_mod.RawConsensusRecord(
+        symbol="NIO",
+        fy1_eps=-5.20,
+        fy2_eps=1.80,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=20,
+        provider="yfinance",
+        security_name="NIO Inc.",
+        provider_forward_eps_per_quote_unit=-0.35,
+    )
+    adapter_neg_fwd = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: nio_neg_fwd,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_neg = await adapter_neg_fwd.get_valuation("NIO", latest_price=4.50, quote_currency="USD")
+    assert val_neg["status"] == "loss"
+    assert val_neg["unit_verified"] is False
+    assert val_neg["pe_fy1"] is None
+    assert val_neg["pe_fy1_status"] == "loss"
+    assert val_neg["pe_fy2"] is None
+    assert val_neg["pe_fy2_status"] == "unit_unverified"
+    assert val_neg["eps_growth_fy2"] is None
+    assert val_neg["eps_growth_fy2_status"] == "loss"
+    assert fx_calls == []
+
+    # 2. NIO: FY1 loss (-5.20 CNY), FY2 profitable (+1.80 CNY), positive forwardEps = 0.25 USD
+    #    matching FY2 (1.80 / 7.1 ~= 0.2535) -> FY1 = loss, FY2 = ok with verified P/E.
+    consensus_mod._clear_consensus_cache_for_tests()
+    fx_calls.clear()
+    nio_pos_fwd = consensus_mod.RawConsensusRecord(
+        symbol="NIO",
+        fy1_eps=-5.20,
+        fy2_eps=1.80,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=20,
+        provider="yfinance",
+        security_name="NIO Inc.",
+        provider_forward_eps_per_quote_unit=0.25,
+    )
+    adapter_pos_fwd = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: nio_pos_fwd,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_pos = await adapter_pos_fwd.get_valuation("NIO", latest_price=4.50, quote_currency="USD")
+    assert val_pos["status"] == "ok"
+    assert val_pos["unit_verified"] is True
+    assert val_pos["shares_per_quote_unit"] == 1.0
+    assert val_pos["unit_verification_method"] == "cross_check_per_ads"
+    assert val_pos["pe_fy1"] is None
+    assert val_pos["pe_fy1_status"] == "loss"
+    assert val_pos["pe_fy2"] == round(4.50 / (1.80 * cny_to_usd), 2)
+    assert val_pos["pe_fy2_status"] == "ok"
+    assert val_pos["eps_growth_fy2"] is None
+    assert val_pos["eps_growth_fy2_status"] == "loss"
+    assert fx_calls == [("CNY", "USD")]
+
+    # 3. NIO: both FY1 and FY2 <= 0 with no anchor -> both loss, zero FX calls.
+    consensus_mod._clear_consensus_cache_for_tests()
+    fx_calls.clear()
+    nio_both_loss = consensus_mod.RawConsensusRecord(
+        symbol="NIO",
+        fy1_eps=-5.20,
+        fy2_eps=-1.10,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=20,
+        provider="yfinance",
+        security_name="NIO Inc.",
+        provider_forward_eps_per_quote_unit=None,
+    )
+    adapter_both_loss = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: nio_both_loss,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_both = await adapter_both_loss.get_valuation("NIO", latest_price=4.50, quote_currency="USD")
+    assert val_both["status"] == "loss"
+    assert val_both["pe_fy1_status"] == "loss"
+    assert val_both["pe_fy2_status"] == "loss"
+    assert val_both["eps_growth_fy2_status"] == "loss"
+    assert fx_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adr_scoring_zero_best_score_and_insufficient_margin_boundary() -> None:
+    """Scoring boundary: S_best == 0 satisfies the 2x ratio rule; two eligible hypotheses with S_other < 2 * S_best fail closed."""
+    jpy_to_usd = 0.006
+
+    async def _fx(src: str, dst: str) -> float | None:
+        return jpy_to_usd if (src, dst) == ("JPY", "USD") else None
+
+    # 1. SMFG (N=1.2) single year with exact r = 1.20 (forwardEps = 1.80, eps*fx = 1.50):
+    #    S_ord = 0.0, S_ads = ln(1.2)^2 > 0 -> S_best == 0 satisfies -> cross_check_per_ordinary, PE = 10.0
+    smfg_exact = consensus_mod.RawConsensusRecord(
+        symbol="SMFG",
+        fy1_eps=250.0,
+        fy2_eps=None,
+        fy1_end="2027-03-31",
+        fy2_end=None,
+        estimate_currency="JPY",
+        quote_currency="USD",
+        analyst_count=14,
+        provider="yfinance",
+        security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+        provider_forward_eps_per_quote_unit=1.80,
+    )
+    adapter_exact = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: smfg_exact,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_exact = await adapter_exact.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert val_exact["status"] == "ok"
+    assert val_exact["shares_per_quote_unit"] == 1.2
+    assert val_exact["unit_verification_method"] == "cross_check_per_ordinary"
+    assert val_exact["pe_fy1"] == 10.0
+
+    # 2. SMFG (N=1.2) with midpoint ratios r1 = r2 = 1.095 (~sqrt(1.2)):
+    #    both hypotheses eligible and S_other < 2 * S_best -> unit_unverified
+    consensus_mod._clear_consensus_cache_for_tests()
+    smfg_tie = consensus_mod.RawConsensusRecord(
+        symbol="SMFG",
+        fy1_eps=250.0,
+        fy2_eps=250.0,
+        fy1_end="2027-03-31",
+        fy2_end="2028-03-31",
+        estimate_currency="JPY",
+        quote_currency="USD",
+        analyst_count=14,
+        provider="yfinance",
+        security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+        provider_forward_eps_per_quote_unit=1.50 * 1.095,
+    )
+    adapter_tie = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: smfg_tie,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_tie = await adapter_tie.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert val_tie["status"] == "unit_unverified"
+    assert val_tie["pe_fy1"] is None
+    assert val_tie["pe_fy2"] is None
+
+
+@pytest.mark.asyncio
+async def test_adr_legacy_cache_missing_key_ignores_explicit_adr_ratio_until_refreshed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy BABA cache missing `provider_forward_eps_per_quote_unit` with explicit `adr_ratio=8` stays unit_unverified before refresh (including during 429 cooldown), retries after cooldown, and returns 14.6 / 10.45 after refresh."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    cny_to_usd = 1.0 / 7.1
+    coverage_row: dict[str, Any] = {"aliases": {"adr_ratio": 8}}
+    mode = {"behavior": "rate_limit"}
+
+    def _make_baba_ticker(sym: str) -> Any:
+        assert sym == "BABA"
+        if mode["behavior"] == "rate_limit":
+            raise consensus_mod.ConsensusRateLimitError("429 Too Many Requests")
+        ticker = create_autospec(yf.Ticker, instance=True)
+        ticker.earnings_estimate = pd.DataFrame(
+            {"avg": [43.69, 61.08], "numberOfAnalysts": [35, 32]},
+            index=["0y", "+1y"],
+        )
+        analysis = create_autospec(YfAnalysis, instance=True)
+        analysis._earnings_trend = [
+            {"period": "0y", "endDate": "2027-03-31"},
+            {"period": "+1y", "endDate": "2028-03-31"},
+        ]
+        ticker._analysis = analysis
+        ticker.info = {
+            "currency": "USD",
+            "financialCurrency": "CNY",
+            "forwardEps": 9.12,
+            "quoteType": "EQUITY",
+            "longName": "Alibaba Group Holding Limited",
+        }
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_baba_ticker),
+    )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=lambda src, dst: cny_to_usd if (src, dst) == ("CNY", "USD") else None,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    # Seed legacy BABA record (no `provider_forward_eps_per_quote_unit` key) AND warm CNY->USD FX cache.
+    legacy_baba_dict: dict[str, Any] = {
+        "symbol": "BABA",
+        "fy1_eps": 43.69,
+        "fy2_eps": 61.08,
+        "fy1_end": "2027-03-31",
+        "fy2_end": "2028-03-31",
+        "estimate_currency": "CNY",
+        "quote_currency": "USD",
+        "analyst_count": 35,
+        "provider": "yfinance",
+        "as_of": "2026-11-27T08:00:00Z",
+        "quote_type": "EQUITY",
+        "security_name": "Alibaba Group Holding Limited",
+        "eps_per_quote_unit_confirmed": False,
+        "is_adr": None,
+        "last_reported_fy_end": "2026-03-31",
+        "fy1_unit_unverified": False,
+        "fy2_unit_unverified": False,
+    }
+    assert "provider_forward_eps_per_quote_unit" not in legacy_baba_dict
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("BABA")] = (
+        time.time(),
+        legacy_baba_dict,
+    )
+    consensus_mod._FX_CACHE[consensus_mod._fx_cache_key("CNY", "USD")] = (
+        time.time(),
+        cny_to_usd,
+    )
+
+    # 1. Before refresh: must NOT compute stale 1.83x / 1.31x via explicit adr_ratio=8 -> unit_unverified + needs_warmup
+    val_before, warm_before = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD", coverage_row=coverage_row
+    )
+    assert val_before is not None
+    assert val_before["status"] == "unit_unverified"
+    assert val_before["unit_verified"] is False
+    assert val_before["pe_fy1"] is None
+    assert val_before["pe_fy2"] is None
+    assert val_before["pe_fy1_status"] == "unit_unverified"
+    assert val_before["pe_fy2_status"] == "unit_unverified"
+    assert warm_before is True
+
+    # 2. Warmup hits 429 -> enters cooldown; during cooldown still unit_unverified (not 1.83/1.31) and does not re-trigger warmup
+    adapter.schedule_warmup("BABA", quote_currency="USD", coverage_row=coverage_row)
+    warm_task = consensus_mod._INFLIGHT_WARMUP.get("BABA")
+    assert warm_task is not None
+    await warm_task
+
+    val_cd, warm_cd = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD", coverage_row=coverage_row
+    )
+    assert val_cd is not None
+    assert val_cd["status"] == "unit_unverified"
+    assert val_cd["pe_fy1"] is None
+    assert val_cd["pe_fy2"] is None
+    assert warm_cd is False
+
+    # 3. After cooldown expires, next request retries warmup; once refreshed, BABA shows 14.6 / 10.45x
+    consensus_mod._CONSENSUS_ERROR_COOLDOWN.clear()
+    mode["behavior"] = "ok"
+
+    val_retry, warm_retry = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD", coverage_row=coverage_row
+    )
+    assert val_retry is not None
+    assert val_retry["status"] == "unit_unverified"
+    assert warm_retry is True
+
+    adapter.schedule_warmup("BABA", quote_currency="USD", coverage_row=coverage_row)
+    warm_task2 = consensus_mod._INFLIGHT_WARMUP.get("BABA")
+    assert warm_task2 is not None
+    await warm_task2
+
+    val_after, warm_after = await adapter.get_cached_valuation(
+        "BABA", latest_price=89.86, quote_currency="USD", coverage_row=coverage_row
+    )
+    assert val_after is not None
+    assert val_after["status"] == "ok"
+    assert val_after["unit_verified"] is True
+    assert val_after["shares_per_quote_unit"] == 1.0
+    assert val_after["unit_verification_method"] == "cross_check_per_ads"
+    assert val_after["pe_fy1"] == 14.6
+    assert val_after["pe_fy2"] == 10.45
+    assert warm_after is False
+
+
+@pytest.mark.asyncio
+async def test_adr_fx_unready_does_not_mask_loss_year() -> None:
+    """When NIO has FY1 loss (-5.20 CNY) and FY2 profit (+1.80 CNY) with positive anchor, FX cache miss returns FY1=loss & FY2=loading (and FX 429 returns FY1=loss & FY2=rate_limited)."""
+    nio_rec = consensus_mod.RawConsensusRecord(
+        symbol="NIO",
+        fy1_eps=-5.20,
+        fy2_eps=1.80,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="USD",
+        analyst_count=20,
+        provider="yfinance",
+        security_name="NIO Inc.",
+        provider_forward_eps_per_quote_unit=0.25,
+    )
+
+    async def _rate_limited_fx(src: str, dst: str) -> float | None:
+        raise consensus_mod.ConsensusRateLimitError(f"429 FX {src}->{dst}")
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: nio_rec,
+        fx_fetcher=_rate_limited_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    # 1. Cached consensus + FX cache miss (no FX cooldown) -> FY1 = loss, FY2 = loading, needs_warmup = True
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("NIO")] = (
+        time.time(),
+        nio_rec.to_dict(),
+    )
+    val_miss, needs_warm = await adapter.get_cached_valuation(
+        "NIO", latest_price=4.50, quote_currency="USD"
+    )
+    assert val_miss is not None
+    assert needs_warm is True
+    assert val_miss["status"] == "loading"
+    assert val_miss.get("pending") is True
+    assert val_miss["pe_fy1"] is None
+    assert val_miss["pe_fy1_status"] == "loss"
+    assert val_miss["pe_fy2"] is None
+    assert val_miss["pe_fy2_status"] == "loading"
+    assert val_miss["eps_growth_fy2"] is None
+    assert val_miss["eps_growth_fy2_status"] == "loss"
+
+    # 2. Blocking valuation hitting FX 429 -> FY1 = loss, FY2 = rate_limited
+    val_429 = await adapter.get_valuation("NIO", latest_price=4.50, quote_currency="USD")
+    assert val_429["status"] == "rate_limited"
+    assert val_429["pe_fy1"] is None
+    assert val_429["pe_fy1_status"] == "loss"
+    assert val_429["pe_fy2"] is None
+    assert val_429["pe_fy2_status"] == "rate_limited"
+    assert val_429["eps_growth_fy2"] is None
+    assert val_429["eps_growth_fy2_status"] == "loss"
+
+    # 3. Cached valuation during FX 429 cooldown -> FY1 = loss, FY2 = rate_limited, needs_warmup = False
+    val_cd, needs_warm_cd = await adapter.get_cached_valuation(
+        "NIO", latest_price=4.50, quote_currency="USD"
+    )
+    assert val_cd is not None
+    assert needs_warm_cd is False
+    assert val_cd["status"] == "rate_limited"
+    assert val_cd["pe_fy1_status"] == "loss"
+    assert val_cd["pe_fy2_status"] == "rate_limited"
+    assert val_cd["eps_growth_fy2_status"] == "loss"
+
+
+@pytest.mark.asyncio
+async def test_hk_cross_currency_eps_growth_uses_original_currency_when_factors_match() -> None:
+    """0700.HK with 20.16 / 22.05 CNY EPS and 1.09 CNY->HKD FX computes FY2 EPS growth from original currency (9.38%, not 9.37%)."""
+    tencent_rec = consensus_mod.RawConsensusRecord(
+        symbol="0700.HK",
+        fy1_eps=20.16,
+        fy2_eps=22.05,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="HKD",
+        analyst_count=40,
+        provider="yfinance",
+        security_name="Tencent Holdings Limited",
+    )
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: tencent_rec,
+        fx_fetcher=lambda src, dst: 1.09 if (src, dst) == ("CNY", "HKD") else None,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val = await adapter.get_valuation("0700.HK", latest_price=400.0, quote_currency="HKD")
+    assert val["status"] == "ok"
+    assert val["eps_growth_fy2"] == 9.38
+    assert val["eps_growth_fy2_status"] == "ok"
+    assert val["pe_fy1"] == round(400.0 / (20.16 * 1.09), 2)
+    assert val["pe_fy2"] == round(400.0 / (22.05 * 1.09), 2)
+
+
+@pytest.mark.asyncio
+async def test_adr_scoring_two_year_preference_disagreement_fails_closed() -> None:
+    """When both per-ADS and per-ordinary hypotheses are eligible, two fiscal years preferring different nearest hypotheses fail closed to unit_unverified even if total score satisfies the 2x ratio."""
+    jpy_to_usd = 0.006
+
+    async def _fx(src: str, dst: str) -> float | None:
+        return jpy_to_usd if (src, dst) == ("JPY", "USD") else None
+
+    # 1. Forward counterexample (SMFG, N=1.2): per-ADS EPS 250 / 350 JPY, FX=0.006, forwardEps=2.16 USD.
+    #    r1=1.44 (closer to ord=1.2) vs r2=1.029 (closer to ads=1.0); ads_score ~= 2.35 * ord_score,
+    #    yet the two fiscal years disagree on nearest hypothesis -> unit_unverified (not PE=10x).
+    smfg_fwd_counter = consensus_mod.RawConsensusRecord(
+        symbol="SMFG",
+        fy1_eps=250.0,
+        fy2_eps=350.0,
+        fy1_end="2027-03-31",
+        fy2_end="2028-03-31",
+        estimate_currency="JPY",
+        quote_currency="USD",
+        analyst_count=14,
+        provider="yfinance",
+        security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+        provider_forward_eps_per_quote_unit=2.16,
+    )
+    adapter_fwd = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: smfg_fwd_counter,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_fwd = await adapter_fwd.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert val_fwd["status"] == "unit_unverified"
+    assert val_fwd["unit_verified"] is False
+    assert val_fwd["pe_fy1"] is None
+    assert val_fwd["pe_fy2"] is None
+    assert val_fwd["pe_fy1_status"] == "unit_unverified"
+    assert val_fwd["pe_fy2_status"] == "unit_unverified"
+
+    # 2. Reverse counterexample (SMFG, N=1.2): EPS 250 / 350 JPY, FX=0.006, forwardEps=1.75 USD.
+    #    r1=1.167 (closer to ord=1.2) vs r2=0.833 (closer to ads=1.0); ord_score ~= 2.35 * ads_score,
+    #    yet the two fiscal years disagree on nearest hypothesis -> unit_unverified (not PE=12x).
+    consensus_mod._clear_consensus_cache_for_tests()
+    smfg_rev_counter = consensus_mod.RawConsensusRecord(
+        symbol="SMFG",
+        fy1_eps=250.0,
+        fy2_eps=350.0,
+        fy1_end="2027-03-31",
+        fy2_end="2028-03-31",
+        estimate_currency="JPY",
+        quote_currency="USD",
+        analyst_count=14,
+        provider="yfinance",
+        security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+        provider_forward_eps_per_quote_unit=1.75,
+    )
+    adapter_rev = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: smfg_rev_counter,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+    val_rev = await adapter_rev.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert val_rev["status"] == "unit_unverified"
+    assert val_rev["unit_verified"] is False
+    assert val_rev["pe_fy1"] is None
+    assert val_rev["pe_fy2"] is None
+    assert val_rev["pe_fy1_status"] == "unit_unverified"
+    assert val_rev["pe_fy2_status"] == "unit_unverified"
+
+
+@pytest.mark.asyncio
+async def test_adr_legacy_cache_missing_key_blocks_one_to_one_table_and_explicit_ratio_until_refreshed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy ADR cache missing `provider_forward_eps_per_quote_unit` waits for refresh (unit_unverified + warmup) even for 1:1 table entries (ASML) and explicit `adr_ratio=1` (SONY)."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    fx_map = {("EUR", "USD"): 1.08, ("JPY", "USD"): 0.006}
+
+    def _make_ticker(sym: str) -> Any:
+        ticker = create_autospec(yf.Ticker, instance=True)
+        analysis = create_autospec(YfAnalysis, instance=True)
+        if sym == "ASML":
+            ticker.earnings_estimate = pd.DataFrame(
+                {"avg": [20.0, 25.0], "numberOfAnalysts": [30, 28]},
+                index=["0y", "+1y"],
+            )
+            analysis._earnings_trend = [
+                {"period": "0y", "endDate": "2026-12-31"},
+                {"period": "+1y", "endDate": "2027-12-31"},
+            ]
+            ticker.info = {
+                "currency": "USD",
+                "financialCurrency": "EUR",
+                "forwardEps": None,
+                "quoteType": "EQUITY",
+                "longName": "ASML Holding N.V.",
+            }
+        elif sym == "SONY":
+            ticker.earnings_estimate = pd.DataFrame(
+                {"avg": [200.0, 240.0], "numberOfAnalysts": [18, 16]},
+                index=["0y", "+1y"],
+            )
+            analysis._earnings_trend = [
+                {"period": "0y", "endDate": "2027-03-31"},
+                {"period": "+1y", "endDate": "2028-03-31"},
+            ]
+            ticker.info = {
+                "currency": "USD",
+                "financialCurrency": "JPY",
+                "forwardEps": None,
+                "quoteType": "EQUITY",
+                "longName": "Sony Group Corporation ADR",
+            }
+        else:
+            raise AssertionError(f"Unexpected ticker {sym}")
+        ticker._analysis = analysis
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_ticker),
+    )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=lambda src, dst: fx_map.get((src, dst)),
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    # 1. ASML (1:1 in VERIFIED_ADR_SHARES_PER_UNIT) with legacy cache missing key + warm FX cache:
+    #    must return unit_unverified + needs_warmup=True (not stale 40.0x) until refreshed.
+    legacy_asml: dict[str, Any] = {
+        "symbol": "ASML",
+        "fy1_eps": 20.0,
+        "fy2_eps": 25.0,
+        "fy1_end": "2026-12-31",
+        "fy2_end": "2027-12-31",
+        "estimate_currency": "EUR",
+        "quote_currency": "USD",
+        "analyst_count": 30,
+        "provider": "yfinance",
+        "as_of": "2026-11-27T08:00:00Z",
+        "quote_type": "EQUITY",
+        "security_name": "ASML Holding N.V.",
+        "eps_per_quote_unit_confirmed": False,
+        "is_adr": True,
+        "last_reported_fy_end": "2025-12-31",
+        "fy1_unit_unverified": False,
+        "fy2_unit_unverified": False,
+    }
+    assert "provider_forward_eps_per_quote_unit" not in legacy_asml
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("ASML")] = (
+        time.time(),
+        legacy_asml,
+    )
+    consensus_mod._FX_CACHE[consensus_mod._fx_cache_key("EUR", "USD")] = (time.time(), 1.08)
+
+    asml_before, asml_warm = await adapter.get_cached_valuation(
+        "ASML", latest_price=864.0, quote_currency="USD"
+    )
+    assert asml_before is not None
+    assert asml_before["status"] == "unit_unverified"
+    assert asml_before["unit_verified"] is False
+    assert asml_before["pe_fy1"] is None
+    assert asml_before["pe_fy2"] is None
+    assert asml_before["pe_fy1_status"] == "unit_unverified"
+    assert asml_before["pe_fy2_status"] == "unit_unverified"
+    assert asml_warm is True
+
+    adapter.schedule_warmup("ASML", quote_currency="USD")
+    asml_task = consensus_mod._INFLIGHT_WARMUP.get("ASML")
+    assert asml_task is not None
+    await asml_task
+
+    asml_after, asml_warm_after = await adapter.get_cached_valuation(
+        "ASML", latest_price=864.0, quote_currency="USD"
+    )
+    assert asml_after is not None
+    assert asml_after["status"] == "ok"
+    assert asml_after["unit_verified"] is True
+    assert asml_after["shares_per_quote_unit"] == 1.0
+    assert asml_after["unit_verification_method"] == "verified_table"
+    assert asml_after["pe_fy1"] == 40.0
+    assert asml_warm_after is False
+
+    # 2. SONY with explicit `adr_ratio=1` + legacy cache missing key + warm FX cache:
+    #    must return unit_unverified + needs_warmup=True until refreshed.
+    sony_row: dict[str, Any] = {"aliases": {"adr_ratio": 1}}
+    legacy_sony: dict[str, Any] = {
+        "symbol": "SONY",
+        "fy1_eps": 200.0,
+        "fy2_eps": 240.0,
+        "fy1_end": "2027-03-31",
+        "fy2_end": "2028-03-31",
+        "estimate_currency": "JPY",
+        "quote_currency": "USD",
+        "analyst_count": 18,
+        "provider": "yfinance",
+        "as_of": "2026-11-27T08:00:00Z",
+        "quote_type": "EQUITY",
+        "security_name": "Sony Group Corporation ADR",
+        "eps_per_quote_unit_confirmed": False,
+        "is_adr": True,
+        "last_reported_fy_end": "2026-03-31",
+        "fy1_unit_unverified": False,
+        "fy2_unit_unverified": False,
+    }
+    assert "provider_forward_eps_per_quote_unit" not in legacy_sony
+    consensus_mod._CONSENSUS_CACHE[consensus_mod._consensus_cache_key("SONY")] = (
+        time.time(),
+        legacy_sony,
+    )
+    consensus_mod._FX_CACHE[consensus_mod._fx_cache_key("JPY", "USD")] = (time.time(), 0.006)
+
+    sony_before, sony_warm = await adapter.get_cached_valuation(
+        "SONY", latest_price=24.0, quote_currency="USD", coverage_row=sony_row
+    )
+    assert sony_before is not None
+    assert sony_before["status"] == "unit_unverified"
+    assert sony_before["unit_verified"] is False
+    assert sony_before["pe_fy1"] is None
+    assert sony_before["pe_fy2"] is None
+    assert sony_before["pe_fy1_status"] == "unit_unverified"
+    assert sony_before["pe_fy2_status"] == "unit_unverified"
+    assert sony_warm is True
+
+    adapter.schedule_warmup("SONY", quote_currency="USD", coverage_row=sony_row)
+    sony_task = consensus_mod._INFLIGHT_WARMUP.get("SONY")
+    assert sony_task is not None
+    await sony_task
+
+    sony_after, sony_warm_after = await adapter.get_cached_valuation(
+        "SONY", latest_price=24.0, quote_currency="USD", coverage_row=sony_row
+    )
+    assert sony_after is not None
+    assert sony_after["status"] == "ok"
+    assert sony_after["unit_verified"] is True
+    assert sony_after["shares_per_quote_unit"] == 1.0
+    assert sony_after["unit_verification_method"] == "explicit_ratio"
+    assert sony_after["pe_fy1"] == 20.0
+    assert sony_warm_after is False
+
+
+@pytest.mark.asyncio
+async def test_cross_currency_non_adr_both_years_loss_skips_fx_with_none_rate_and_unverified() -> None:
+    """Cross-currency non-ADR (HKD quote, CNY EPS) with both years <= 0 skips FX lookup, reports fx_rate=None and unit_verified=False, and preserves per-year loss status."""
+    fx_calls: list[tuple[str, str]] = []
+
+    async def _fx(src: str, dst: str) -> float | None:
+        fx_calls.append((src, dst))
+        return 1.09 if (src, dst) == ("CNY", "HKD") else None
+
+    hk_loss_rec = consensus_mod.RawConsensusRecord(
+        symbol="9866.HK",
+        fy1_eps=-5.20,
+        fy2_eps=0.0,
+        fy1_end="2026-12-31",
+        fy2_end="2027-12-31",
+        estimate_currency="CNY",
+        quote_currency="HKD",
+        analyst_count=15,
+        provider="yfinance",
+        security_name="NIO Inc.",
+    )
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: hk_loss_rec,
+        fx_fetcher=_fx,
+        today_fn=lambda: date(2026, 11, 27),
+    )
+
+    val_live = await adapter.get_valuation("9866.HK", latest_price=35.0, quote_currency="HKD")
+    assert val_live["status"] == "loss"
+    assert val_live["fx_rate"] is None
+    assert val_live["unit_verified"] is False
+    assert val_live["pe_fy1"] is None
+    assert val_live["pe_fy2"] is None
+    assert val_live["pe_fy1_status"] == "loss"
+    assert val_live["pe_fy2_status"] == "loss"
+    assert val_live["eps_growth_fy2"] is None
+    assert val_live["eps_growth_fy2_status"] == "loss"
+    assert fx_calls == []
+
+    val_cached, needs_warm = await adapter.get_cached_valuation(
+        "9866.HK", latest_price=35.0, quote_currency="HKD"
+    )
+    assert val_cached is not None
+    assert needs_warm is False
+    assert val_cached["status"] == "loss"
+    assert val_cached["fx_rate"] is None
+    assert val_cached["unit_verified"] is False
+    assert val_cached["pe_fy1"] is None
+    assert val_cached["pe_fy2"] is None
+    assert val_cached["pe_fy1_status"] == "loss"
+    assert val_cached["pe_fy2_status"] == "loss"
+    assert val_cached["eps_growth_fy2"] is None
+    assert val_cached["eps_growth_fy2_status"] == "loss"
+    assert fx_calls == []

@@ -5,7 +5,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { ChannelAdapter } from "../src/channels/adapter.js";
 import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { loadConfig } from "../src/config.js";
-import { handleOpsAlert, sanitizeBackupAlertDetail } from "../src/ops-alerts.js";
+import {
+  dispatchRedisDiagSummaryAlerts,
+  evaluateRedisDiagAlerts,
+  handleOpsAlert,
+  REDIS_DIAG_P2_COOLDOWN_MS,
+  sanitizeBackupAlertDetail,
+} from "../src/ops-alerts.js";
 import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
 import { createMockBackend, TEST_SERVICE_TOKEN } from "./helpers.js";
@@ -575,6 +581,166 @@ describe("ops-alerts alphaengine_token_expiring", () => {
     expect(allFailRes.status).toBe(502);
     expect(allFailRes.data.ok).toBe(false);
     expect(allFailRes.data.any_succeeded).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("ops-alerts redis diagnostics aggregation & dedup", () => {
+  it("evaluates P1/P2/P3 alerts with event-window P1 dedup and 30m P2/P3 cooldown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-redis-diag-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const summary = {
+      cluster: {
+        active_worker_count: 2,
+        total_transport_lost_5m: 1,
+        total_transport_lost_ever: 1,
+        last_transport_lost_at: "2026-11-27T12:00:00+00:00",
+        total_recovered_writes_5m: 6,
+        max_pool_utilization: 0.85,
+        max_loop_lag_5s_ms: 1650,
+        max_payload_bytes_5m: 600_000,
+        max_wire_ms: 520,
+        max_acquire_ms: 10,
+      },
+      server: {
+        stats: { latest_fork_usec: 250_000 },
+        slowlog: [{ id: 1, start_time: 1_700_000_000, duration_us: 130_000, command: "XADD" }],
+      },
+      workers: [
+        { worker_id: "node:1001", counts: { transport_lost_total: 1 } },
+        { worker_id: "node:1002", counts: { transport_lost_total: 0 } },
+      ],
+    };
+
+    const t0 = 1_700_000_000_000;
+    const sent: Array<{ target: string; text: string }> = [];
+    const sender = vi.fn(async (target: string, text: string) => {
+      sent.push({ target, text });
+      return { messageId: `om_${sent.length}` };
+    });
+
+    const first = await dispatchRedisDiagSummaryAlerts({
+      summary,
+      state: {},
+      nowMs: t0,
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(first.results.map((r) => r.alert.code)).toEqual([
+      "redis_diag_p1",
+      "redis_diag_p2",
+      "redis_diag_p3",
+    ]);
+    expect(sent).toHaveLength(3);
+    expect(sent[0]?.text).toContain("Dalton Redis P1 告警：");
+    expect(sent[1]?.text).toContain("Dalton Redis P2 退化告警：");
+    expect(sent[2]?.text).toContain("Dalton Redis P3 预警：");
+
+    // 60 seconds later: all 3 suppressed
+    const second = evaluateRedisDiagAlerts(summary, first.nextState, t0 + 60_000);
+    expect(second.alerts).toHaveLength(0);
+
+    // 31 minutes later: P2 and P3 re-fire (other P2 signals still active); P1 stays suppressed without a new transport_lost
+    const third = evaluateRedisDiagAlerts(
+      summary,
+      first.nextState,
+      t0 + REDIS_DIAG_P2_COOLDOWN_MS + 60_000,
+    );
+    expect(third.alerts.map((a) => a.code)).toEqual(["redis_diag_p2", "redis_diag_p3"]);
+
+    // Old PID expiry lowers cluster total_transport_lost_ever (from 1 -> 1 on a NEW worker) within 5m: P1 STILL fires!
+    const fourth = evaluateRedisDiagAlerts(
+      {
+        ...summary,
+        cluster: {
+          ...summary.cluster,
+          total_transport_lost_5m: 1,
+          total_transport_lost_ever: 1,
+          last_transport_lost_at: "2026-11-27T12:02:00+00:00",
+        },
+        workers: [{ worker_id: "node:2002", counts: { transport_lost_total: 1 } }],
+      },
+      first.nextState,
+      t0 + 120_000,
+    );
+    expect(fourth.alerts.map((a) => a.code)).toEqual(["redis_diag_p1"]);
+
+    // Slowlog-only P2: lingering same slowlog ID does NOT re-fire after 30m, but a new ID DOES fire.
+    const slowOnly = {
+      cluster: { active_worker_count: 1 },
+      server: {
+        stats: { latest_fork_usec: 1000 },
+        slowlog: [{ id: 1, start_time: 1_700_000_000, duration_us: 130_000, command: "XADD" }],
+      },
+    };
+    const sameSlowAfter31m = evaluateRedisDiagAlerts(
+      slowOnly,
+      first.nextState,
+      t0 + REDIS_DIAG_P2_COOLDOWN_MS + 60_000,
+    );
+    expect(sameSlowAfter31m.alerts).toHaveLength(0);
+
+    const newSlowAfter31m = evaluateRedisDiagAlerts(
+      {
+        ...slowOnly,
+        server: {
+          stats: { latest_fork_usec: 1000 },
+          slowlog: [{ id: 2, start_time: 1_700_001_900, duration_us: 140_000, command: "SET" }],
+        },
+      },
+      first.nextState,
+      t0 + REDIS_DIAG_P2_COOLDOWN_MS + 60_000,
+    );
+    expect(newSlowAfter31m.alerts.map((a) => a.code)).toEqual(["redis_diag_p2"]);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("ops-alerts monitor_publish_failed", () => {
+  it("renders default and configured templates with up to 600 chars detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-mon-pub-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_mon_1" }));
+    const longDetail = "x".repeat(700);
+    const resDefault = await handleOpsAlert({
+      body: {
+        code: "monitor_publish_failed",
+        detail: longDetail,
+      },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resDefault.status).toBe(200);
+    const sentText = sender.mock.calls[0][1];
+    expect(sentText).toContain("Dalton 看板发布告警");
+    expect(sentText).toContain("x".repeat(600));
+    expect(sentText).not.toContain("x".repeat(601));
 
     rmSync(dir, { recursive: true, force: true });
   });

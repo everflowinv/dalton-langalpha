@@ -14,9 +14,11 @@ Rejects any release archive containing:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 FORBIDDEN_PAX_PREFIXES: tuple[str, ...] = (
     "LIBARCHIVE.xattr.",
@@ -40,7 +42,52 @@ FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
     ("scripts", "dalton", "researchdata_bridge.py"),
     ("scripts", "dalton", "research_runtime"),
     ("scripts", "dalton", "ops"),
+    ("scripts", "dalton", "data_assets", "skills"),
+    ("scripts", "dalton", "data_assets", "everflow_only.txt"),
+    ("src", "dalton", "data_jobs", "everflow_defaults.yaml"),
     ("web", ".env.dalton"),
+)
+
+# Post-package content gate matching package_release.sh (zero proprietary leaks).
+FORBIDDEN_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("everflow_company_domain", re.compile(r"everflowinv", re.IGNORECASE)),
+    ("personal_home_path", re.compile(r"/Users/richardlu", re.IGNORECASE)),
+    ("everflow_home_path", re.compile(r"/Users/everflow", re.IGNORECASE)),
+    (
+        "windows_eve_path",
+        re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[/\\]Eve(?![A-Za-z0-9_])", re.IGNORECASE),
+    ),
+    ("feishu_chat_id", re.compile(r"oc_[0-9a-f]{20,}", re.IGNORECASE)),
+    ("feishu_user_id", re.compile(r"ou_[0-9a-f]{20,}", re.IGNORECASE)),
+    ("discord_target_id", re.compile(r"(?:user|channel):[0-9]{15,}", re.IGNORECASE)),
+)
+
+_BINARY_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".bmp",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".tgz",
+        ".tar",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".eot",
+        ".parquet",
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".dylib",
+        ".wasm",
+    }
 )
 
 
@@ -64,18 +111,21 @@ def _normalized_parts(member_name: str) -> tuple[str, ...]:
 
 
 def inspect_tarball(
-    tar_path: Path | str,
+    tar_path: Path | str | None = None,
     *,
+    fileobj: BinaryIO | None = None,
     expected_top_dir: str | None = None,
 ) -> list[str]:
-    """Inspect a tar archive and return a list of policy violations (empty if clean)."""
-    path = Path(tar_path)
+    """Inspect a tar archive (path or in-memory fileobj) and return policy violations."""
+    if tar_path is None and fileobj is None:
+        raise ValueError("inspect_tarball requires tar_path or fileobj")
     violations: list[str] = []
     member_count = 0
     recognized_top_dirs: set[str] = set()
     nested_file_count = 0
 
-    with tarfile.open(path, mode="r:*") as tf:
+    open_kwargs = {"fileobj": fileobj, "mode": "r:*"} if fileobj is not None else {"name": Path(tar_path), "mode": "r:*"}
+    with tarfile.open(**open_kwargs) as tf:
         global_pax = getattr(tf, "pax_headers", None) or {}
         for key in sorted(global_pax):
             if _is_forbidden_pax_key(key):
@@ -105,6 +155,10 @@ def inspect_tarball(
                     f"forbidden Everflow/proprietary member in core archive: {member.name} "
                     f"(matched {'/'.join(matched_forbidden)})"
                 )
+            elif parts and parts[-1].endswith(".dalton.yaml"):
+                violations.append(
+                    f"forbidden Everflow overlay member in core archive: {member.name}"
+                )
 
             pax_headers = member.pax_headers or {}
             for key in sorted(pax_headers):
@@ -112,6 +166,43 @@ def inspect_tarball(
                     violations.append(
                         f"forbidden metadata pax header on {member.name}: {key}"
                     )
+
+            for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                if pattern.search(member.name):
+                    violations.append(
+                        f"forbidden proprietary member path ({rule_name}): {member.name}"
+                    )
+
+            if (member.issym() or member.islnk()) and member.linkname:
+                link_target = member.linkname
+                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                    if pattern.search(link_target):
+                        violations.append(
+                            f"forbidden proprietary link target ({rule_name}): "
+                            f"{member.name} -> {link_target}"
+                        )
+                if link_target.endswith(".dalton.yaml") or link_target.endswith(
+                    "everflow_defaults.yaml"
+                ):
+                    violations.append(
+                        f"forbidden Everflow overlay link target: {member.name} -> {link_target}"
+                    )
+
+            if member.isfile():
+                suffix = PurePosixPath(member.name).suffix.lower()
+                if suffix not in _BINARY_SUFFIXES:
+                    extracted = tf.extractfile(member)
+                    if extracted is not None:
+                        raw_bytes = extracted.read()
+                        if b"\x00" not in raw_bytes[:8192]:
+                            text = raw_bytes.decode("utf-8", errors="replace")
+                            for line_no, line in enumerate(text.splitlines(), 1):
+                                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                                    if pattern.search(line):
+                                        violations.append(
+                                            f"forbidden proprietary content ({rule_name}): "
+                                            f"{member.name}:{line_no}"
+                                        )
 
             if expected_top_dir is not None:
                 if raw_name.startswith("/") or ".." in parts:

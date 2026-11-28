@@ -268,6 +268,11 @@ async def assemble_finalize_artifacts(
             exc_info=True,
         )
 
+    # DALTON-HOOK(deliverable-text): forward per-message captured images onto run_end and replay_facts for live/replay parity
+    by_msg = getattr(handler, "captured_images_by_message", None) if handler is not None else None
+    if by_msg:
+        metadata["persisted_images_by_message"] = by_msg
+
     return RunOutcome(
         status=status,
         interrupt_reason=interrupt_reason,
@@ -279,6 +284,7 @@ async def assemble_finalize_artifacts(
         no_model_calls=no_model_calls,  # DALTON-HOOK(budget)
         record=await _producer_record(key, handler, stop_events, status),
         images=await _turn_images(key, metadata, handler),
+        images_by_message=dict(by_msg) if by_msg else {},  # DALTON-HOOK(deliverable-text)
     )
 
 

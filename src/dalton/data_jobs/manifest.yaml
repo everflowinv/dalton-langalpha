@@ -13,12 +13,12 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 420
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash scripts/bbg_remote_refresh.sh"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+      - "bash scripts/bbg_remote_refresh.sh"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"
@@ -35,12 +35,12 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh update && bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh dashboard"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash skills/cn-leverage-monitor/run.sh update && bash skills/cn-leverage-monitor/run.sh dashboard"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh update && bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh dashboard"
+      - "bash skills/cn-leverage-monitor/run.sh update && bash skills/cn-leverage-monitor/run.sh dashboard"
     secret_names: []
     freeze_paths:
       - "state/cn-leverage/pipeline_status.json"
@@ -61,12 +61,12 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 300
     output_max_bytes: 30000
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/skills/jp-leverage-monitor/run.sh run"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash skills/jp-leverage-monitor/run.sh run"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/skills/jp-leverage-monitor/run.sh run"
+      - "bash skills/jp-leverage-monitor/run.sh run"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"
@@ -83,12 +83,12 @@ tasks:
     timeout_seconds: null
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/skills/kr-leverage-monitor/run.sh run"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash skills/kr-leverage-monitor/run.sh run"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/skills/kr-leverage-monitor/run.sh run"
+      - "bash skills/kr-leverage-monitor/run.sh run"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"
@@ -105,10 +105,10 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 900
     output_max_bytes: 20000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: |-
       set -euo pipefail
-      cd /Users/everflow/.openclaw/workspace
+      cd "${WORKDIR:-$PWD}"
       mkdir -p temp
       bash skills/index-crowding-research/scripts/run.sh --json self-test > temp/index-crowding-cron-selftest.json
       python3 -m json.tool temp/index-crowding-cron-selftest.json >/dev/null
@@ -128,7 +128,7 @@ tasks:
       - "-c"
       - |-
         set -euo pipefail
-        cd /Users/everflow/.openclaw/workspace
+        cd "${WORKDIR:-$PWD}"
         mkdir -p temp
         bash skills/index-crowding-research/scripts/run.sh --json self-test > temp/index-crowding-cron-selftest.json
         python3 -m json.tool temp/index-crowding-cron-selftest.json >/dev/null
@@ -159,7 +159,7 @@ tasks:
     timeout_seconds: 1200
     no_output_timeout_seconds: 420
     output_max_bytes: 20000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/sentiment_dashboard_digest.sh"
     command_argv:
       - "sh"
@@ -183,7 +183,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh python3 scripts/megacap_relative_signal_monitor.py --json"
     command_argv:
       - "sh"
@@ -206,7 +206,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh bash skills/us-bottom-monitor/run.sh --json run"
     command_argv:
       - "sh"
@@ -228,7 +228,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh bash skills/us-top-monitor/run.sh --json run"
     command_argv:
       - "sh"
@@ -250,7 +250,7 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 300
     output_max_bytes: 20000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash skills/sentiment-dashboard/scripts/run.sh self-test --json && bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json"
     command_argv:
       - "sh"
@@ -272,7 +272,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py us-topbottom-dm-v23"
     command_argv:
       - "python3"
@@ -294,7 +294,7 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh python3 scripts/asia_leverage_crossview.py --charts"
     command_argv:
       - "sh"
@@ -320,12 +320,12 @@ tasks:
     timeout_seconds: 3600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/skills/tw-leverage-monitor/run.sh update --quiet --json"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash skills/tw-leverage-monitor/run.sh update --quiet --json"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/skills/tw-leverage-monitor/run.sh update --quiet --json"
+      - "bash skills/tw-leverage-monitor/run.sh update --quiet --json"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"
@@ -343,12 +343,12 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 420
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
-    command: "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
+    command: "bash scripts/bbg_remote_refresh.sh"
     command_argv:
       - "sh"
       - "-c"
-      - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+      - "bash scripts/bbg_remote_refresh.sh"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"
@@ -365,7 +365,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh bash scripts/quantum_ew_monitor.sh"
     command_argv:
       - "sh"
@@ -387,7 +387,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     command_argv:
       - "sh"
@@ -411,7 +411,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     command_argv:
       - "sh"
@@ -433,7 +433,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py softbank-nav-monitor"
     command_argv:
       - "python3"
@@ -457,7 +457,7 @@ tasks:
     timeout_seconds: 120
     no_output_timeout_seconds: 120
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py tsmc-adr-premium"
     command_argv:
       - "python3"
@@ -483,7 +483,7 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: 900
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py ai-chain-daily"
     command_argv:
       - "python3"
@@ -509,7 +509,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py us-etf-monthly-flows"
     command_argv:
       - "python3"
@@ -531,7 +531,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py vol-surface-daily-snapshot"
     command_argv:
       - "python3"
@@ -558,9 +558,9 @@ tasks:
     no_output_timeout_seconds: 300
     output_max_bytes: 50000
     cwd: "var/dalton/openclaw-data"
-    command: "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python -I scripts/gs_pb_weekly.py run --json"
+    command: "${DALTON_DATA_TASK_GS_PB_PYTHON} -I scripts/gs_pb_weekly.py run --json"
     command_argv:
-      - "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python"
+      - "${DALTON_DATA_TASK_GS_PB_PYTHON}"
       - "-I"
       - "scripts/gs_pb_weekly.py"
       - "run"
@@ -586,7 +586,7 @@ tasks:
     timeout_seconds: 2400
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "sh -lc bash skills/fde-hiring-tracker/scripts/run.sh --quiet --json snapshot --concurrency 8"
     command_argv:
       - "bash"
@@ -613,7 +613,7 @@ tasks:
     timeout_seconds: 900
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "sh -lc bash scripts/fde_hiring_weekly_report.sh"
     command_argv:
       - "bash"
@@ -635,7 +635,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 560
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/opt/homebrew/bin/python3 -I scripts/semi_rescue_alert.py run --slot am --send --json"
     command_argv:
       - "python3"
@@ -661,7 +661,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 560
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/opt/homebrew/bin/python3 -I scripts/semi_rescue_alert.py run --slot pm --send --json"
     command_argv:
       - "python3"
@@ -687,7 +687,7 @@ tasks:
     timeout_seconds: 300
     no_output_timeout_seconds: 240
     output_max_bytes: 20000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/opt/homebrew/bin/python3 -I scripts/semi_bottom_checklist.py run"
     command_argv:
       - "python3"
@@ -711,7 +711,7 @@ tasks:
     timeout_seconds: 1800
     no_output_timeout_seconds: 1800
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py e-watch-daily"
     command_argv:
       - "python3"
@@ -736,7 +736,7 @@ tasks:
     timeout_seconds: 300
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "sh -lc python3 scripts/e_watch_monitor.py --mode intraday"
     command_argv:
       - "python3"
@@ -759,7 +759,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py pt-watchlist-asia"
     command_argv:
       - "python3"
@@ -783,7 +783,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py pt-watchlist-us"
     command_argv:
       - "python3"
@@ -807,7 +807,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py china-2c-hk-monitor"
     command_argv:
       - "python3"
@@ -831,7 +831,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "python3 scripts/cron_command_tasks.py china-2c-us-monitor"
     command_argv:
       - "python3"
@@ -855,7 +855,7 @@ tasks:
     timeout_seconds: 120
     no_output_timeout_seconds: null
     output_max_bytes: null
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "sh -lc 'mkdir -p state/a-share-volume-watch && python3 scripts/a_share_volume_watch.py 2>>state/a-share-volume-watch/stderr.log'"
     command_argv:
       - "sh"
@@ -974,7 +974,7 @@ tasks:
     timeout_seconds: 2400
     no_output_timeout_seconds: 1800
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/pm_cockpit/run.py --state-dir state/monitor-feeds/pm_cockpit --output-dir research-outputs/pm-market-state --json"
     command_argv:
       - "/app/.venv/bin/python"
@@ -1000,7 +1000,7 @@ tasks:
     timeout_seconds: 600
     no_output_timeout_seconds: 300
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/ashare_monitor/run.py --state-dir state/monitor-feeds/ashare_monitor --output-dir research-outputs/cn-intraday --json"
     command_argv:
       - "/app/.venv/bin/python"
@@ -1026,7 +1026,7 @@ tasks:
     timeout_seconds: 1800
     no_output_timeout_seconds: 600
     output_max_bytes: 50000
-    cwd: "/Users/everflow/.openclaw/workspace"
+    cwd: "${DALTON_DATA_TASK_WORKSPACE}"
     command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/hk_momentum/run.py --state-dir state/monitor-feeds/hk_momentum --output-dir research-outputs/hk-momentum --json"
     command_argv:
       - "/app/.venv/bin/python"

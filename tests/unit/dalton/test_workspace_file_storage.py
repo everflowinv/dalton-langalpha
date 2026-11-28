@@ -1906,7 +1906,15 @@ def test_dalton_integration_conftest_disables_dotenv_before_alembic(tmp_path):
     import dotenv
     import dotenv.main
 
-    from tests.integration.dalton.conftest import disable_dotenv_loading
+    had_dotenv_disabled = "PYTHON_DOTENV_DISABLED" in os.environ
+    prev_dotenv_disabled = os.environ.get("PYTHON_DOTENV_DISABLED")
+    try:
+        from tests.integration.dalton.conftest import disable_dotenv_loading
+    finally:
+        if had_dotenv_disabled and prev_dotenv_disabled is not None:
+            os.environ["PYTHON_DOTENV_DISABLED"] = prev_dotenv_disabled
+        else:
+            os.environ.pop("PYTHON_DOTENV_DISABLED", None)
 
     env_file = tmp_path / ".env"
     env_file.write_text("DALTON_DOTENV_LEAK_TEST_KEY=should_not_load\n", encoding="utf-8")

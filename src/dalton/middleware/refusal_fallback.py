@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -88,6 +89,7 @@ def build_refusal_notice_response(response: Any, config: Mapping[str, Any] | Non
     last_meta = dict(getattr(last, "response_metadata", None) or {})
     notice = AIMessage(
         content=refusal_notice_text(config),
+        id=f"dalton-refusal-{uuid.uuid4().hex[:12]}",
         usage_metadata=getattr(last, "usage_metadata", None),
         response_metadata=last_meta,
     )

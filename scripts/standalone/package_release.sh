@@ -30,6 +30,7 @@ OUTPUT_SET=0
 TAR_PATH=""
 REPORT_PATH=""
 INCLUDE_CI=0
+STRICT_SCAN=1
 
 usage() {
   cat <<'EOF'
@@ -43,6 +44,7 @@ Options:
   --report <file>     Also write the proprietary-term scan report to this path
   --include-ci        Also export CI compose overlay & standalone test harness
                       (docker-compose.ci.yml, tests/fakes, tests/standalone)
+  --strict-scan       Enforce zero-leak scan on exported artifact (enabled by default)
   -h, --help          Show this help
 EOF
 }
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --include-ci)
       INCLUDE_CI=1
+      shift
+      ;;
+    --strict-scan)
+      STRICT_SCAN=1
       shift
       ;;
     -h|--help)
@@ -174,7 +180,8 @@ RELEASE_TOP_DIR="dalton-core-${SHORT_SHA}"
 #   - scripts/dalton/research_runtime/
 #   - scripts/dalton/ops/
 #   - scripts/dalton/launchd/
-#   - scripts/dalton/data_assets/
+#   - scripts/dalton/data_assets/skills/ (and Everflow-only scripts listed in
+#       scripts/dalton/data_assets/everflow_only.txt, stripped post-extract)
 #   - scripts/dalton/monitor_feeds/
 #   - scripts/dalton/realrun/
 #   - integrations/dalton-channel-gateway/
@@ -239,6 +246,9 @@ ALLOWLIST_OPTIONAL=(
   "docs/dalton/dev-guide/STANDALONE-DEPLOY.md"
   "deploy/standalone"
   "scripts/standalone"
+  "scripts/dalton/seed_openclaw_data.sh"
+  "scripts/dalton/data_assets/scripts"
+  "scripts/dalton/data_assets/everflow_only.txt"
   "plugins/dalton_sec"
   "plugins/dalton_macro"
   "plugins/dalton_company_wiki"
@@ -304,6 +314,9 @@ DENY_PATHS=(
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"
+  "scripts/standalone/package_release.sh"
+  "scripts/standalone/verify_release_tarball.py"
+  "src/dalton/data_jobs/everflow_defaults.yaml"
   "web/.env.dalton"
   "docs-site/src/content/docs/everflow"
   "docs-site/src/content/docs/explore/deliver-to-feishu.mdx"
@@ -315,6 +328,79 @@ for deny in "${DENY_PATHS[@]}"; do
     rm -rf "${EXPORT_ROOT:?}/${deny}"
   fi
 done
+
+# Customer release artifacts exclude frontend test fixtures unless --include-ci is set.
+if [[ "$INCLUDE_CI" -eq 0 ]]; then
+  rm -rf "${EXPORT_ROOT}/web/e2e"
+  if [[ -d "${EXPORT_ROOT}/web" ]]; then
+    find "${EXPORT_ROOT}/web" -type d -name '__tests__' -exec rm -rf {} +
+  fi
+fi
+
+# Strip Everflow-only `DALTON_CAP:researchdata_bridge` branches from exported skill
+# docs so proprietary emails/host paths never ship inside Standalone Core artifacts.
+if [[ -d "${EXPORT_ROOT}/plugins" ]]; then
+  python3 - "${EXPORT_ROOT}/plugins" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+plugins_root = Path(sys.argv[1])
+block_re = re.compile(
+    r"<!--\s*DALTON_CAP:researchdata_bridge\s*-->"
+    r"(?:(?!-->|<!--\s*/DALTON_CAP\s*-->).|\n)*?"
+    r"(?:<!--\s*DALTON_CAP_ELSE\s*-->(?P<else_body>(?:(?!<!--\s*/DALTON_CAP\s*-->).|\n)*?))?"
+    r"<!--\s*/DALTON_CAP\s*-->",
+    re.DOTALL,
+)
+
+for md_path in sorted(plugins_root.rglob("*.md")):
+    if not md_path.is_file():
+        continue
+    original = md_path.read_text(encoding="utf-8", errors="replace")
+    if "DALTON_CAP:researchdata_bridge" not in original:
+        continue
+    updated = block_re.sub(lambda m: m.group("else_body") or "", original)
+    if updated != original:
+        md_path.write_text(updated, encoding="utf-8")
+PY
+fi
+
+# Strip Everflow-only data_assets entries listed in everflow_only.txt so
+# Standalone Core ships only generic data-task scripts.
+strip_everflow_only_data_assets() {
+  local export_root="$1"
+  local list_file="$2"
+  local assets_root="${export_root}/scripts/dalton/data_assets"
+  [[ -d "$assets_root" && -f "$list_file" ]] || return 0
+  local raw_line entry target
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    raw_line="${raw_line%$'\r'}"
+    entry="${raw_line%%#*}"
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" == /* || "$entry" == *".."* ]]; then
+      echo "ERROR: Unsafe everflow_only.txt entry: ${entry}" >&2
+      return 1
+    fi
+    target="${assets_root}/${entry}"
+    if [[ -e "$target" || -L "$target" ]]; then
+      rm -rf "$target"
+    fi
+  done < "$list_file"
+  rm -f "${assets_root}/everflow_only.txt"
+}
+
+EVERFLOW_ONLY_LIST=""
+if [[ -f "${EXPORT_ROOT}/scripts/dalton/data_assets/everflow_only.txt" ]]; then
+  EVERFLOW_ONLY_LIST="${EXPORT_ROOT}/scripts/dalton/data_assets/everflow_only.txt"
+elif [[ -f "${REPO_ROOT}/scripts/dalton/data_assets/everflow_only.txt" ]]; then
+  EVERFLOW_ONLY_LIST="${REPO_ROOT}/scripts/dalton/data_assets/everflow_only.txt"
+fi
+if [[ -n "$EVERFLOW_ONLY_LIST" ]]; then
+  strip_everflow_only_data_assets "$EXPORT_ROOT" "$EVERFLOW_ONLY_LIST"
+fi
 
 # Strip any *.dalton.yaml file anywhere in the exported tree
 find "$EXPORT_ROOT" -type f -name '*.dalton.yaml' -delete
@@ -332,14 +418,49 @@ SCAN_TERMS=(
   "guidepoint"
 )
 
+# Regex rules for Everflow proprietary values (company domain, personal/Everflow home paths,
+# Windows paths, Feishu/Discord long IDs) that must NEVER ship in Standalone Core.
+FORBIDDEN_REGEX_NAMES=(
+  "everflow_company_domain"
+  "personal_home_path"
+  "everflow_home_path"
+  "windows_eve_path"
+  "feishu_chat_id"
+  "feishu_user_id"
+  "discord_target_id"
+)
+FORBIDDEN_REGEX_PATTERNS=(
+  'everflowinv'
+  '/Users/richardlu'
+  '/Users/everflow'
+  '(^|[^A-Za-z0-9_])[A-Za-z]:[/\\]Eve([^A-Za-z0-9_]|$)'
+  'oc_[0-9a-f]{20,}'
+  'ou_[0-9a-f]{20,}'
+  '(user|channel):[0-9]{15,}'
+)
+
+SYMLINK_MANIFEST="$STAGE_DIR/symlink_targets.txt"
+: > "$SYMLINK_MANIFEST"
+while IFS= read -r -d '' link_path; do
+  rel_link="${link_path#"${EXPORT_ROOT}/"}"
+  link_target="$(readlink "$link_path" 2>/dev/null || true)"
+  printf '%s -> %s\n' "$rel_link" "$link_target" >> "$SYMLINK_MANIFEST"
+done < <(find "$EXPORT_ROOT" -type l -print0 2>/dev/null)
+
+STRICT_VIOLATIONS=0
 SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
 {
   echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
-  echo "Mode: report-only (Batch 1; promoted to hard gate in Batch 2/3)"
+  echo "Mode: zero-leak gate (any forbidden Everflow/proprietary match fails packaging)"
   for term in "${SCAN_TERMS[@]}"; do
     echo ""
     echo "--- Term: ${term} ---"
-    hits="$(grep -rnI --binary-files=without-match -F "$term" "$EXPORT_ROOT" 2>/dev/null || true)"
+    file_hits="$(grep -rnI --binary-files=without-match -F "$term" "$EXPORT_ROOT" 2>/dev/null || true)"
+    link_hits="$(grep -n -F "$term" "$SYMLINK_MANIFEST" 2>/dev/null | sed 's/^/[symlink] /' || true)"
+    hits="${file_hits}"
+    if [[ -n "$link_hits" ]]; then
+      hits="${hits:+${hits}$'\n'}${link_hits}"
+    fi
     if [[ -z "$hits" ]]; then
       echo "(0 matches)"
     else
@@ -353,6 +474,29 @@ SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
       fi
     fi
   done
+  for i in "${!FORBIDDEN_REGEX_NAMES[@]}"; do
+    rname="${FORBIDDEN_REGEX_NAMES[$i]}"
+    rpat="${FORBIDDEN_REGEX_PATTERNS[$i]}"
+    echo ""
+    echo "--- Forbidden Pattern: ${rname} ---"
+    file_hits="$(grep -rnIEi --binary-files=without-match "$rpat" "$EXPORT_ROOT" 2>/dev/null || true)"
+    link_hits="$(grep -nEi "$rpat" "$SYMLINK_MANIFEST" 2>/dev/null | sed 's/^/[symlink] /' || true)"
+    hits="${file_hits}"
+    if [[ -n "$link_hits" ]]; then
+      hits="${hits:+${hits}$'\n'}${link_hits}"
+    fi
+    if [[ -z "$hits" ]]; then
+      echo "(0 matches)"
+    else
+      count="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
+      echo "Total matches: ${count}"
+      printf '%s\n' "$hits" | sed -n "1,40{s|${EXPORT_ROOT}/||g;p;}"
+      if [[ "$count" -gt 40 ]]; then
+        echo "... ($((count - 40)) more lines truncated)"
+      fi
+      STRICT_VIOLATIONS=$((STRICT_VIOLATIONS + count))
+    fi
+  done
 } > "$SCAN_OUTPUT"
 
 cat "$SCAN_OUTPUT"
@@ -360,6 +504,11 @@ cat "$SCAN_OUTPUT"
 if [[ -n "$REPORT_PATH" ]]; then
   mkdir -p "$(dirname "$REPORT_PATH")"
   cp "$SCAN_OUTPUT" "$REPORT_PATH"
+fi
+
+if [[ "$STRICT_SCAN" -eq 1 && "$STRICT_VIOLATIONS" -gt 0 ]]; then
+  echo "ERROR: Standalone Core release failed zero-leak scan with ${STRICT_VIOLATIONS} forbidden match(es)" >&2
+  exit 1
 fi
 
 if [[ -n "$OUTPUT_DIR_ABS" ]]; then

@@ -126,6 +126,7 @@ export interface WatchlistTierPolicyCommitResponse {
 export type ValuationStatus =
   | 'ok'
   | 'loss'
+  | 'loading'
   | 'no_coverage'
   | 'unit_unverified'
   | 'stale'

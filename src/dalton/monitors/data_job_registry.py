@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat as stat_mod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from html import escape as html_escape
@@ -61,8 +61,13 @@ class MonitorDataJobBinding:
     # admin tier is re-verified on every public data-job republish.
     approved_by_admin_user_id: str | None = None
     # When True, snapshot only the entry file and static references found by
-    # walk_manifest (skip unreferenced sibling files in rel_dir, e.g. portfolio/*.md).
+    # walk_manifest (plus same-directory / data/*.json files, skipping unrelated siblings).
     dependencies_only: bool = False
+    # Optional per-panel source health validation against a status.json under data_root
+    # (or custom callable returning ``(ok, error_reason)``).
+    status_rel_path: str | None = None
+    required_status_sources: tuple[str, ...] = ()
+    source_health_check: Callable[[Path], tuple[bool, str | None]] | None = None
 
 
 SENTIMENT_DASHBOARD_JOB_KEY = "sentiment-dashboard-refresh"
@@ -177,6 +182,8 @@ MONITOR_DATA_JOB_REGISTRY: dict[
             rel_dir="research-outputs/pm-market-state/pm-market-state",
             entry_file="index.html",
             sort_order=25,
+            status_rel_path="state/monitor-feeds/pm_cockpit/status.json",
+            required_status_sources=("us",),
         ),
         MonitorDataJobBinding(
             job_key="pm-market-state",
@@ -187,6 +194,8 @@ MONITOR_DATA_JOB_REGISTRY: dict[
             rel_dir="research-outputs/pm-market-state/cn-sector-rotation",
             entry_file="index.html",
             sort_order=35,
+            status_rel_path="state/monitor-feeds/pm_cockpit/status.json",
+            required_status_sources=("cn", "cn_valuation"),
         ),
     ),
     "cn-intraday": MonitorDataJobBinding(
@@ -236,6 +245,48 @@ def get_registered_monitor_binding_by_slug(
         if binding.slug == clean_slug:
             return binding
     return None
+
+
+def check_binding_source_health(
+    data_root: Path,
+    binding: MonitorDataJobBinding,
+) -> tuple[bool, str | None]:
+    """Evaluate per-panel source health declared on ``binding`` under ``data_root``."""
+    if binding.source_health_check is not None:
+        return binding.source_health_check(data_root)
+    if not binding.status_rel_path or not binding.required_status_sources:
+        return True, None
+    parts = _split_clean_rel_parts(binding.status_rel_path, allow_leading_slash=False)
+    if not parts:
+        return False, f"非法状态文件路径: {binding.status_rel_path}"
+    status_path = data_root.joinpath(*parts)
+    if status_path.is_symlink():
+        return False, f"状态文件不允许符号链接: {binding.status_rel_path}"
+    if not status_path.is_file():
+        return False, f"缺少面板数据源状态文件: {binding.status_rel_path}"
+    try:
+        doc = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"读取面板数据源状态失败: {exc}"
+    if not isinstance(doc, dict):
+        return False, "面板数据源状态格式无效"
+    sources = doc.get("sources")
+    if not isinstance(sources, dict):
+        return False, "面板数据源状态缺少 sources 字段"
+    failures: list[str] = []
+    for key in binding.required_status_sources:
+        ent = sources.get(key)
+        if not isinstance(ent, dict):
+            failures.append(f"{key}：缺少源状态")
+            continue
+        if not ent.get("ok") or ent.get("stale"):
+            label = str(ent.get("label") or key)
+            reason = str(ent.get("reason") or "来源采集失败").strip()
+            last_ok = str(ent.get("last_success_at") or "无").strip()
+            failures.append(f"{label}未更新（上次成功：{last_ok}，原因：{reason}）")
+    if failures:
+        return False, "；".join(failures)
+    return True, None
 
 
 def validate_monitor_data_job_registry() -> None:

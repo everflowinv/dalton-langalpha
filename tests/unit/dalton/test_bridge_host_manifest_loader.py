@@ -14,9 +14,11 @@ import sys
 REPO = Path(__file__).resolve().parents[3]
 
 _PROBE = r"""
+import os
 import sys
 from pathlib import Path
 repo = Path(sys.argv[1])
+os.environ["DALTON_DATA_TASK_GS_PB_PYTHON"] = "/opt/test/gs-pb/bin/python"
 sys.modules["src"] = None  # any ``import src...`` now raises ImportError
 sys.path.insert(0, str(repo / "scripts" / "dalton"))
 import researchdata_bridge as rb
@@ -28,7 +30,8 @@ spec = rb.resolve_host_run_command_spec(
     data_root=repo / "var" / "dalton" / "openclaw-data",
     ocw_root=Path("/nonexistent"),
 )
-assert spec["command_argv"] == list(entry.command_argv), spec
+expected_argv = ["/opt/test/gs-pb/bin/python", *list(entry.command_argv)[1:]]
+assert spec["command_argv"] == expected_argv, spec
 print("OK", entry.runner)
 """
 

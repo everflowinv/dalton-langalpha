@@ -27,13 +27,37 @@ export function appendTextChunk(
   content: string,
   order: number,
   phase?: TextSegment['phase'],
+  // DALTON-HOOK(empty-turn-guard): isolate text segments by server messageId and preserve continuation link
+  messageId?: string,
+  continuedFromMessageId?: string,
 ): ContentSegment[] {
   const last = segments[segments.length - 1];
-  if (last?.type === 'text' && last.chunks && last.phase === phase && order > last.chunks.order) {
+  if (
+    last?.type === 'text' &&
+    last.chunks &&
+    last.phase === phase &&
+    last.messageId === messageId &&
+    order > last.chunks.order
+  ) {
     const text = last.content + content;
-    return [...segments.slice(0, -1), { ...last, content: text, chunks: { order, end: text.length, prev: last.chunks } }];
+    return [
+      ...segments.slice(0, -1),
+      {
+        ...last,
+        content: text,
+        ...(continuedFromMessageId && !last.continuedFromMessageId ? { continuedFromMessageId } : {}),
+        chunks: { order, end: text.length, prev: last.chunks },
+      },
+    ];
   }
-  const segment: TextSegment = { type: 'text', content, order, ...(phase ? { phase } : {}) };
+  const segment: TextSegment = {
+    type: 'text',
+    content,
+    order,
+    ...(phase ? { phase } : {}),
+    ...(messageId ? { messageId } : {}),
+    ...(continuedFromMessageId ? { continuedFromMessageId } : {}),
+  };
   if (order > newestChunkOrder(segments)) segment.chunks = { order, end: content.length, prev: null };
   return [...segments, segment];
 }

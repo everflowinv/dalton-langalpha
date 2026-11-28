@@ -479,6 +479,110 @@ def _load_ops_jobs_from_status_file(
     return raw_jobs, None
 
 
+MONITOR_PUBLISH_ISSUE_STATUSES: tuple[str, ...] = (
+    "failed",
+    "partial_failed",
+    "disabled",
+)
+
+
+async def _fetch_monitor_publish_ops_job(
+    *,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    """Summarize recent terminal monitor publish issues directly from backend PostgreSQL.
+
+    Uses the backend's existing ``get_db_connection()`` pool with no extra DSN configuration.
+    Excludes normal cross-run ``superseded`` rows; includes ``failed``, ``partial_failed``,
+    and ``disabled``. Returns ``None`` when ``DATA_JOBS`` capability is disabled or the
+    DB pool is unavailable (e.g. isolated unit tests).
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.DATA_JOBS):
+        return None
+    hours = max(1, int(lookback_hours))
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT run_id::text AS run_id,
+                           job_key,
+                           monitor_publish_status,
+                           completed_at,
+                           monitor_publish_detail->>'last_error' AS last_error
+                      FROM dalton_data_task_runs
+                     WHERE monitor_publish_status IN ('failed', 'partial_failed', 'disabled')
+                       AND COALESCE(completed_at, updated_at) >= NOW() - make_interval(hours => %s)
+                     ORDER BY COALESCE(completed_at, updated_at) DESC
+                     LIMIT 20
+                    """,
+                    (hours,),
+                )
+                rows = await cur.fetchall()
+    except Exception as exc:
+        logger.debug(
+            "[DALTON_SYSTEM_JOBS] Skipping backend DB monitor publish ops status: %s",
+            exc,
+        )
+        return None
+
+    filtered = [
+        r
+        for r in (rows or [])
+        if isinstance(r, Mapping)
+        and str(r.get("monitor_publish_status") or "").strip() in MONITOR_PUBLISH_ISSUE_STATUSES
+    ]
+    issues = [
+        {
+            "run_id": str(r.get("run_id") or ""),
+            "job_key": str(r.get("job_key") or ""),
+            "monitor_publish_status": str(r.get("monitor_publish_status") or ""),
+            "completed_at": _iso_or_none(r.get("completed_at")),
+            "last_error": str(r.get("last_error") or "").strip() or None,
+        }
+        for r in filtered[:10]
+    ]
+    if not filtered:
+        status = "on"
+        last_run_at = None
+        last_result = "健康（无终态发布失败）"
+    else:
+        status = "partial"
+        last_run_at = _iso_or_none(filtered[0].get("completed_at"))
+        summary_items = [
+            f"{r.get('job_key')}({r.get('monitor_publish_status')})"
+            for r in filtered[:5]
+        ]
+        last_result = f"近 {hours}h 异常 {len(filtered)} 条：" + "，".join(summary_items)
+    return {
+        "key": "ops-monitor-publish",
+        "kind": "ops_monitor_publish",
+        "scope": "ops",
+        "title": "看板发布核验",
+        "description": "汇总数据任务看板发布终态失败或禁用记录（排除正常取代 superseded）",
+        "status": status,
+        "last_run_at": last_run_at,
+        "last_result": last_result,
+        "next_run_at": None,
+        "can_toggle": False,
+        "can_run_now": False,
+        "issue_count": len(filtered),
+        "issues": issues,
+    }
+
+
+def _append_or_replace_ops_job(
+    jobs: list[dict[str, Any]], extra: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if extra is None:
+        return jobs
+    out = [item for item in jobs if item.get("key") != extra.get("key")]
+    out.append(extra)
+    return out
+
+
 async def _fetch_ops_jobs() -> list[dict[str, Any]]:
     """Build the ``ops`` scope read-only job entries.
 
@@ -489,6 +593,8 @@ async def _fetch_ops_jobs() -> list[dict[str, Any]]:
       * Otherwise (default), reads ``var/dalton/ops_jobs_status.json`` exported by
         ``com.dalton.ops-status-exporter``, rejecting stale or malformed files
         as ``status="unknown"`` without calling the bridge.
+      * Appends ``ops-monitor-publish`` directly from the backend's existing
+        PostgreSQL connection (no extra DSN config required).
     """
     from src.dalton.capabilities import CapabilityId, has_capability
     from src.dalton.profile import DeploymentProfile, resolve_profile
@@ -500,21 +606,27 @@ async def _fetch_ops_jobs() -> list[dict[str, Any]]:
     if is_ops_jobs_via_bridge_enabled():
         if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
             return []
+        jobs: list[dict[str, Any]]
         try:
             status_code, data = await _call_host_bridge("GET", "/jobs/ops", timeout_s=5.0)
             if status_code == 200 and isinstance(data, dict):
-                return _merge_ops_jobs_payload(by_key, data.get("jobs"))
+                jobs = _merge_ops_jobs_payload(by_key, data.get("jobs"))
+            else:
+                jobs = list(by_key.values())
         except Exception as exc:
             logger.debug("[DALTON_SYSTEM_JOBS] Host bridge ops jobs unreachable: %s", exc)
-        return list(by_key.values())
+            jobs = list(by_key.values())
+        return _append_or_replace_ops_job(jobs, await _fetch_monitor_publish_ops_job())
 
     raw_jobs, err_reason = _load_ops_jobs_from_status_file()
     if raw_jobs is not None:
-        return _merge_ops_jobs_payload(by_key, raw_jobs)
-    if err_reason == "stale":
-        for entry in by_key.values():
-            entry["last_result"] = "状态文件已过期"
-    return list(by_key.values())
+        jobs = _merge_ops_jobs_payload(by_key, raw_jobs)
+    else:
+        if err_reason == "stale":
+            for entry in by_key.values():
+                entry["last_result"] = "状态文件已过期"
+        jobs = list(by_key.values())
+    return _append_or_replace_ops_job(jobs, await _fetch_monitor_publish_ops_job())
 
 
 def _build_home_job_entry(

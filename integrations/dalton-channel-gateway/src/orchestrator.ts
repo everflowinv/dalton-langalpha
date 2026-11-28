@@ -1,6 +1,14 @@
 import { basename } from "node:path";
 import type { AgentRoutesHandler } from "./agent-routes.js";
 import {
+  buildImageCorrectionText,
+  containsUnresolvedSandboxImagePath,
+  DeliverableTextAccumulator,
+  mergeImagesByMessage,
+  resolveChannelFallbackText,
+  resolveDeliveryImageUrls,
+} from "./shared/deliverable-text.js";
+import {
   type BackendClient,
   BackendHttpError,
   type ChartSnapshotItem,
@@ -20,6 +28,7 @@ import {
   type ThreadMessageDispatchPayload,
   type ThreadStatusInfo,
   type ThreadWakeupItem,
+  type UnresolvedCurrentAgentSend,
   type WorkspaceUploadWeixinContext,
 } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
@@ -4657,8 +4666,7 @@ export class ChannelGatewayOrchestrator {
     let currentThreadId = params.threadId;
     let currentRunId = resolved.run_id;
     let currentTurnIndex = resolved.turn_index;
-    let currentSegmentText = "";
-    let lastCompletedSegmentText = "";
+    const deliverableAcc = new DeliverableTextAccumulator();
     let steeringAccepted = false;
     let steeredIntoRunId: string | null =
       resolved.steered_into_run_id ?? resolved.run_id;
@@ -4801,11 +4809,23 @@ export class ChannelGatewayOrchestrator {
       if (sse.event === "tool_calls") {
         sawTurnAccepted = true;
         if (this.isMainAgentLane(payload.agent)) {
-          // Reset pre-tool preamble so only post-tool final response text is sent as fallback
-          if (currentSegmentText.trim().length > 0) {
-            lastCompletedSegmentText = currentSegmentText;
-            currentSegmentText = "";
-          }
+          deliverableAcc.pushEvent("tool_calls", payload);
+        }
+        continue;
+      }
+
+      if (sse.event === "tool_call_start" || sse.event === "tool_call_result") {
+        sawTurnAccepted = true;
+        if (this.isMainAgentLane(payload.agent)) {
+          deliverableAcc.pushEvent(sse.event, payload);
+        }
+        continue;
+      }
+
+      if (sse.event === "message_discarded") {
+        sawTurnAccepted = true;
+        if (this.isMainAgentLane(payload.agent)) {
+          deliverableAcc.pushEvent("message_discarded", payload);
         }
         continue;
       }
@@ -4816,45 +4836,16 @@ export class ChannelGatewayOrchestrator {
         sse.event === "content_block_delta"
       ) {
         sawTurnAccepted = true;
-        // Ignore subagent chunks (`agent: "task:<id>"` or `"subagent:<id>"`, `src/server/services/history/replay/lanes.py:11`)
-        if (!this.isMainAgentLane(payload.agent)) {
-          continue;
-        }
-        // Skip reasoning chunks (`content_type !== "text"` when `content_type` is present)
-        if (
-          typeof payload.content_type === "string" &&
-          payload.content_type !== "text"
-        ) {
-          continue;
-        }
-        const delta =
-          typeof payload.content === "string"
-            ? payload.content
-            : typeof payload.text === "string"
-              ? payload.text
-              : typeof payload.delta === "string"
-                ? payload.delta
-                : "";
-        if (delta && payload.role !== "user") {
-          currentSegmentText += delta;
-        }
-        if (payload.finish_reason === "tool_calls") {
-          if (currentSegmentText.trim().length > 0) {
-            lastCompletedSegmentText = currentSegmentText;
-            currentSegmentText = "";
-          }
+        if (this.isMainAgentLane(payload.agent)) {
+          deliverableAcc.pushEvent(sse.event, payload);
         }
         continue;
       }
 
       if (sse.event === "message") {
         sawTurnAccepted = true;
-        if (
-          this.isMainAgentLane(payload.agent) &&
-          payload.role === "assistant" &&
-          typeof payload.content === "string"
-        ) {
-          currentSegmentText = payload.content;
+        if (this.isMainAgentLane(payload.agent)) {
+          deliverableAcc.pushEvent("message", payload);
         }
         continue;
       }
@@ -4934,6 +4925,7 @@ export class ChannelGatewayOrchestrator {
         );
         runEndChartSnapshots = parseChartSnapshotsList(payload.chart_snapshots);
         collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+        deliverableAcc.pushEvent("run_end", payload);
         if (typeof payload.outbound_blocked === "boolean") {
           runEndOutboundBlocked = payload.outbound_blocked;
         }
@@ -4946,10 +4938,8 @@ export class ChannelGatewayOrchestrator {
       }
     }
 
-    const assistantText =
-      currentSegmentText.trim().length > 0
-        ? currentSegmentText
-        : lastCompletedSegmentText;
+    const extractedDeliverable = deliverableAcc.result();
+    const assistantText = extractedDeliverable.text;
 
     // If `steering_accepted` was received, attach to the running turn and reconcile when it finishes (§1.3.2)
     if (steeringAccepted) {
@@ -5363,10 +5353,33 @@ export class ChannelGatewayOrchestrator {
     });
 
     let fallbackDeliveryFailed = false;
-    const trimmedAssistant = assistantText.trim();
+    const strictDeliverable =
+      prog.strict_deliverable_text_enabled ??
+      resolved.strict_deliverable_text_enabled ??
+      true;
+    const trimmedAssistant = resolveChannelFallbackText({
+      extractedText: assistantText,
+      sawBusinessToolCall: extractedDeliverable.sawBusinessToolCall,
+      sentToCurrentCount: prog.sent_to_current_count,
+      hasDeliveredCurrentAgentSend: prog.has_delivered_current_agent_send,
+      hasFailedCurrentAgentSend: prog.has_failed_current_agent_send,
+      strictDeliverableTextEnabled: strictDeliverable,
+      legacyText: deliverableAcc.legacyResult(),
+    });
+    const hasUnresolvedAgentSendImages =
+      prog.has_unresolved_current_agent_send_images === true;
+    const liveResolvedImageUrls: Record<string, string> = {
+      ...(prog.resolved_run_images ?? {}),
+      ...deliverableAcc.getGlobalImageUrlMap(),
+    };
+    const liveResolvedImagesByMessage = mergeImagesByMessage(
+      prog.resolved_run_images_by_message,
+      deliverableAcc.getImagesByMessage(),
+    );
+    const liveToolCallMessageIds = deliverableAcc.getToolCallMessageIds();
     if (
       !sawInterrupt &&
-      trimmedAssistant.length > 0 &&
+      (trimmedAssistant.length > 0 || hasUnresolvedAgentSendImages) &&
       !prog.has_in_flight_or_unknown_current_text &&
       currentRunId
     ) {
@@ -5386,6 +5399,11 @@ export class ChannelGatewayOrchestrator {
         activityOrigin: params.isAttachedStream ? "replay" : "conversation",
         trimmedText: trimmedAssistant,
         sentToCurrentCount: prog.sent_to_current_count,
+        hasUnresolvedCurrentAgentSendImages: hasUnresolvedAgentSendImages,
+        unresolvedCurrentAgentSends: prog.unresolved_current_agent_sends,
+        resolvedImageUrls: liveResolvedImageUrls,
+        resolvedImagesByMessage: liveResolvedImagesByMessage,
+        toolCallMessageIds: liveToolCallMessageIds,
       });
       if (!settledOk) {
         fallbackDeliveryFailed = true;
@@ -5394,6 +5412,8 @@ export class ChannelGatewayOrchestrator {
       !sawInterrupt &&
       params.isAttachedStream &&
       trimmedAssistant.length === 0 &&
+      !extractedDeliverable.sawBusinessToolCall &&
+      !prog.has_delivered_current_agent_send &&
       !prog.has_in_flight_or_unknown_current_text &&
       currentThreadId
     ) {
@@ -5862,6 +5882,11 @@ export class ChannelGatewayOrchestrator {
     } = params;
 
     let foundText = "";
+    let foundLegacyText = "";
+    let foundSawBusinessToolCall = false;
+    let foundImageUrls: Record<string, string> = {};
+    let foundImagesByMessage: Record<string, Record<string, string>> = {};
+    let foundToolCallMsgIds: Record<string, string> = {};
     let foundTargetTurn = false;
     let resolvedRunId = runId;
     let anyPageSucceeded = false;
@@ -5903,8 +5928,24 @@ export class ChannelGatewayOrchestrator {
         let currentEventRunId: string | null = null;
         let earliestTurnInBatch: number | null = null;
         let latestTurnInBatch: number | null = null;
-        const textsByTurn = new Map<number, string>();
-        const textsByRun = new Map<string, string>();
+        const accByTurn = new Map<number, DeliverableTextAccumulator>();
+        const accByRun = new Map<string, DeliverableTextAccumulator>();
+        const getTurnAcc = (tIdx: number): DeliverableTextAccumulator => {
+          let acc = accByTurn.get(tIdx);
+          if (!acc) {
+            acc = new DeliverableTextAccumulator();
+            accByTurn.set(tIdx, acc);
+          }
+          return acc;
+        };
+        const getRunAcc = (rId: string): DeliverableTextAccumulator => {
+          let acc = accByRun.get(rId);
+          if (!acc) {
+            acc = new DeliverableTextAccumulator();
+            accByRun.set(rId, acc);
+          }
+          return acc;
+        };
         const turnToRunId = new Map<number, string>();
         const userMsgRunIdByTurn = new Map<number, string | null>();
         const userMsgCompletedAtByTurn = new Map<number, string | null>();
@@ -5917,10 +5958,7 @@ export class ChannelGatewayOrchestrator {
         const settledTurnsInBatch = new Set<number>();
         const seenRunsInBatch = new Set<string>();
         const settledRunsInBatch = new Set<string>();
-        const pendingResetTurns = new Set<number>();
-        const pendingResetRuns = new Set<string>();
-        let pendingResetLastTurn = false;
-        let lastTurnText = "";
+        let lastTurnAcc = new DeliverableTextAccumulator();
         let pendingTipInterrupt: Record<string, unknown> | null = null;
         let activeMainRunFromSnapshot: {
           runId: string;
@@ -5962,8 +6000,8 @@ export class ChannelGatewayOrchestrator {
           currentEventRunId = null;
           earliestTurnInBatch = null;
           latestTurnInBatch = null;
-          textsByTurn.clear();
-          textsByRun.clear();
+          accByTurn.clear();
+          accByRun.clear();
           turnToRunId.clear();
           userMsgRunIdByTurn.clear();
           userMsgCompletedAtByTurn.clear();
@@ -5976,10 +6014,7 @@ export class ChannelGatewayOrchestrator {
           settledTurnsInBatch.clear();
           seenRunsInBatch.clear();
           settledRunsInBatch.clear();
-          pendingResetTurns.clear();
-          pendingResetRuns.clear();
-          pendingResetLastTurn = false;
-          lastTurnText = "";
+          lastTurnAcc = new DeliverableTextAccumulator();
           pendingTipInterrupt = null;
           activeMainRunFromSnapshot = null;
           replayDoneMeta = {};
@@ -6168,6 +6203,7 @@ export class ChannelGatewayOrchestrator {
 
             if (
               sse.event === "tool_call_result" ||
+              sse.event === "tool_call_start" ||
               sse.event === "credit_usage" ||
               sse.event === "turn_end"
             ) {
@@ -6206,11 +6242,22 @@ export class ChannelGatewayOrchestrator {
                   );
                 }
               }
+              if (
+                (sse.event === "tool_call_result" ||
+                  sse.event === "tool_call_start") &&
+                this.isMainAgentLane(data.agent)
+              ) {
+                if (tIdx !== null) {
+                  getTurnAcc(tIdx).pushEvent(sse.event, data);
+                }
+                if (rId) {
+                  getRunAcc(rId).pushEvent(sse.event, data);
+                }
+                lastTurnAcc.pushEvent(sse.event, data);
+              }
               continue;
             }
 
-            // When main agent makes tool calls, mark pre-tool preamble for reset on the next post-tool text chunk
-            // so that if no post-tool text follows (e.g. a failed `send_message` as the final step), pre-tool text is preserved.
             if (sse.event === "tool_calls") {
               if (this.isMainAgentLane(data.agent)) {
                 const tIdx =
@@ -6228,13 +6275,39 @@ export class ChannelGatewayOrchestrator {
                 }
                 if (tIdx !== null) {
                   settledTurnsInBatch.add(tIdx);
-                  pendingResetTurns.add(tIdx);
+                  getTurnAcc(tIdx).pushEvent("tool_calls", data);
                 }
                 if (rId) {
                   settledRunsInBatch.add(rId);
-                  pendingResetRuns.add(rId);
+                  getRunAcc(rId).pushEvent("tool_calls", data);
                 }
-                pendingResetLastTurn = true;
+                lastTurnAcc.pushEvent("tool_calls", data);
+              }
+              continue;
+            }
+
+            if (sse.event === "message_discarded") {
+              if (this.isMainAgentLane(data.agent)) {
+                const tIdx =
+                  typeof data.turn_index === "number"
+                    ? data.turn_index
+                    : currentEventTurnIndex;
+                const rId =
+                  typeof data.response_id === "string"
+                    ? data.response_id
+                    : typeof data.run_id === "string"
+                      ? data.run_id
+                      : currentEventRunId;
+                if (tIdx !== null && mismatchedAttemptTurnsInBatch.has(tIdx)) {
+                  continue;
+                }
+                if (tIdx !== null) {
+                  getTurnAcc(tIdx).pushEvent("message_discarded", data);
+                }
+                if (rId) {
+                  getRunAcc(rId).pushEvent("message_discarded", data);
+                }
+                lastTurnAcc.pushEvent("message_discarded", data);
               }
               continue;
             }
@@ -6250,7 +6323,7 @@ export class ChannelGatewayOrchestrator {
               const role =
                 typeof data.role === "string" ? data.role : "assistant";
               if (role === "user") continue;
-              // Only concatenate `content_type == "text"` (skip `"reasoning"` / `"reasoning_signal"`)
+              // Only accumulate `content_type == "text"` (skip `"reasoning"` / `"reasoning_signal"`)
               if (
                 typeof data.content_type === "string" &&
                 data.content_type !== "text"
@@ -6287,44 +6360,36 @@ export class ChannelGatewayOrchestrator {
                   : typeof data.text === "string"
                     ? data.text
                     : "";
-              if (!chunk) continue;
+              if (!chunk && data.finish_reason !== "tool_calls") continue;
 
               if (tIdx !== null && mismatchedAttemptTurnsInBatch.has(tIdx)) {
                 continue;
               }
 
               if (tIdx !== null) {
-                seenTurnsInBatch.add(tIdx);
-                settledTurnsInBatch.add(tIdx);
-                if (pendingResetTurns.has(tIdx)) {
-                  textsByTurn.set(tIdx, "");
-                  pendingResetTurns.delete(tIdx);
+                if (chunk) {
+                  seenTurnsInBatch.add(tIdx);
+                  settledTurnsInBatch.add(tIdx);
+                  if (earliestTurnInBatch === null || tIdx < earliestTurnInBatch) {
+                    earliestTurnInBatch = tIdx;
+                  }
+                  if (latestTurnInBatch === null || tIdx > latestTurnInBatch) {
+                    latestTurnInBatch = tIdx;
+                  }
+                  if (rId && !turnToRunId.has(tIdx)) {
+                    turnToRunId.set(tIdx, rId);
+                  }
                 }
-                textsByTurn.set(tIdx, (textsByTurn.get(tIdx) ?? "") + chunk);
-                if (earliestTurnInBatch === null || tIdx < earliestTurnInBatch) {
-                  earliestTurnInBatch = tIdx;
-                }
-                if (latestTurnInBatch === null || tIdx > latestTurnInBatch) {
-                  latestTurnInBatch = tIdx;
-                }
-                if (rId && !turnToRunId.has(tIdx)) {
-                  turnToRunId.set(tIdx, rId);
-                }
+                getTurnAcc(tIdx).pushEvent(sse.event, data);
               }
               if (rId) {
-                seenRunsInBatch.add(rId);
-                settledRunsInBatch.add(rId);
-                if (pendingResetRuns.has(rId)) {
-                  textsByRun.set(rId, "");
-                  pendingResetRuns.delete(rId);
+                if (chunk) {
+                  seenRunsInBatch.add(rId);
+                  settledRunsInBatch.add(rId);
                 }
-                textsByRun.set(rId, (textsByRun.get(rId) ?? "") + chunk);
+                getRunAcc(rId).pushEvent(sse.event, data);
               }
-              if (pendingResetLastTurn) {
-                lastTurnText = "";
-                pendingResetLastTurn = false;
-              }
-              lastTurnText += chunk;
+              lastTurnAcc.pushEvent(sse.event, data);
               continue;
             }
 
@@ -6464,9 +6529,15 @@ export class ChannelGatewayOrchestrator {
           if (matchesTargetTurn) {
             const preCursorText =
               (latestTurnInBatch !== null
-                ? textsByTurn.get(latestTurnInBatch)
+                ? accByTurn.get(latestTurnInBatch)?.result().text
                 : undefined) ??
-              textsByRun.get(activeMainRunFromSnapshot.runId) ??
+              accByRun.get(activeMainRunFromSnapshot.runId)?.result().text ??
+              "";
+            const preCursorLegacyText =
+              (latestTurnInBatch !== null
+                ? accByTurn.get(latestTurnInBatch)?.legacyResult()
+                : undefined) ??
+              accByRun.get(activeMainRunFromSnapshot.runId)?.legacyResult() ??
               "";
             const liveSettled = await this.consumeInFlightReplayRunStream({
               userId,
@@ -6474,6 +6545,7 @@ export class ChannelGatewayOrchestrator {
               runId: activeMainRunFromSnapshot.runId,
               lastEventId: activeMainRunFromSnapshot.lastEventId,
               preCursorText,
+              preCursorLegacyText,
               turnIndex: latestTurnInBatch ?? turnIndex,
               platform,
               targetAddress,
@@ -6492,6 +6564,21 @@ export class ChannelGatewayOrchestrator {
               break;
             }
             foundText = liveSettled.assistantText;
+            foundLegacyText = liveSettled.legacyText;
+            foundSawBusinessToolCall =
+              foundSawBusinessToolCall || liveSettled.sawBusinessToolCall;
+            foundImageUrls = {
+              ...foundImageUrls,
+              ...(liveSettled.resolvedImageUrls ?? {}),
+            };
+            foundImagesByMessage = mergeImagesByMessage(
+              foundImagesByMessage,
+              liveSettled.resolvedImagesByMessage,
+            );
+            foundToolCallMsgIds = {
+              ...foundToolCallMsgIds,
+              ...(liveSettled.toolCallMessageIds ?? {}),
+            };
             foundTargetTurn = true;
             resolvedRunId = activeMainRunFromSnapshot.runId;
             if (liveSettled.charts.length > 0) {
@@ -6750,6 +6837,19 @@ export class ChannelGatewayOrchestrator {
           return false;
         };
 
+        const collectAccImages = (acc: DeliverableTextAccumulator | undefined): void => {
+          if (!acc) return;
+          foundImageUrls = { ...foundImageUrls, ...acc.getGlobalImageUrlMap() };
+          foundImagesByMessage = mergeImagesByMessage(
+            foundImagesByMessage,
+            acc.getImagesByMessage(),
+          );
+          foundToolCallMsgIds = {
+            ...foundToolCallMsgIds,
+            ...acc.getToolCallMessageIds(),
+          };
+        };
+
         // Target turn matching:
         // 1. If `turnIndex` is explicitly specified, ONLY match that `turnIndex` — and ONLY if:
         //    (a) it has settled in this page,
@@ -6763,7 +6863,10 @@ export class ChannelGatewayOrchestrator {
             (turnUserMsgRunId !== null
               ? turnUserMsgRunId === runId
               : turnToRunId.get(turnIndex) === runId);
-          const candidateText = textsByTurn.get(turnIndex) ?? "";
+          const turnAccRes = accByTurn.get(turnIndex)?.result();
+          const candidateText = turnAccRes?.text ?? "";
+          const candidateLegacyText = accByTurn.get(turnIndex)?.legacyResult() ?? "";
+          const candidateSawTools = Boolean(turnAccRes?.sawBusinessToolCall);
           const isTipTurnWithHandledInterrupt =
             isFirstPage &&
             latestTurnInBatch === turnIndex &&
@@ -6774,6 +6877,9 @@ export class ChannelGatewayOrchestrator {
             (candidateText.trim().length > 0 || isTipTurnWithHandledInterrupt)
           ) {
             foundText = candidateText;
+            foundLegacyText = candidateLegacyText;
+            foundSawBusinessToolCall = candidateSawTools;
+            collectAccImages(accByTurn.get(turnIndex));
             foundTargetTurn = true;
             if (isTipTurnWithHandledInterrupt && candidateText.trim().length === 0) {
               terminalEmptyOutcome = "interrupted";
@@ -6806,6 +6912,9 @@ export class ChannelGatewayOrchestrator {
               (await resolveTerminalEmptyTurn(turnIndex, candidateRunId))
             ) {
               foundText = "";
+              foundLegacyText = candidateLegacyText;
+              foundSawBusinessToolCall = candidateSawTools;
+              collectAccImages(accByTurn.get(turnIndex));
               foundTargetTurn = true;
               if (!resolvedRunId && candidateRunId) {
                 resolvedRunId = candidateRunId;
@@ -6816,17 +6925,31 @@ export class ChannelGatewayOrchestrator {
             break;
           }
         } else if (runId) {
-          const runCandidateText = textsByRun.get(runId) ?? "";
+          const runAccRes = accByRun.get(runId)?.result();
+          const runCandidateText = runAccRes?.text ?? "";
+          const runCandidateLegacyText = accByRun.get(runId)?.legacyResult() ?? "";
+          const runCandidateSawTools = Boolean(runAccRes?.sawBusinessToolCall);
           if (
             settledRunsInBatch.has(runId) &&
             runCandidateText.trim().length > 0
           ) {
             foundText = runCandidateText;
+            foundLegacyText = runCandidateLegacyText;
+            foundSawBusinessToolCall = runCandidateSawTools;
+            collectAccImages(accByRun.get(runId));
             foundTargetTurn = true;
             break;
           }
           // When `turnIndex` was null and `replay` chunks don't carry `run_id`/`response_id`, match the single latest settled turn on the first page
           // ONLY if its `user_message.run_id` (and `replay_done.latest_run_id`) matches `runId` and its text is non-empty!
+          const latestTurnRes =
+            latestTurnInBatch !== null
+              ? accByTurn.get(latestTurnInBatch)?.result()
+              : undefined;
+          const latestTurnLegacy =
+            latestTurnInBatch !== null
+              ? (accByTurn.get(latestTurnInBatch)?.legacyResult() ?? "")
+              : "";
           if (
             isFirstPage &&
             latestTurnInBatch !== null &&
@@ -6834,9 +6957,12 @@ export class ChannelGatewayOrchestrator {
             (userMsgRunIdByTurn.get(latestTurnInBatch) ?? null) === runId &&
             (!replayDoneMeta.latest_run_id ||
               replayDoneMeta.latest_run_id === runId) &&
-            (textsByTurn.get(latestTurnInBatch) ?? "").trim().length > 0
+            (latestTurnRes?.text ?? "").trim().length > 0
           ) {
-            foundText = textsByTurn.get(latestTurnInBatch) ?? "";
+            foundText = latestTurnRes?.text ?? "";
+            foundLegacyText = latestTurnLegacy;
+            foundSawBusinessToolCall = Boolean(latestTurnRes?.sawBusinessToolCall);
+            collectAccImages(accByTurn.get(latestTurnInBatch));
             foundTargetTurn = true;
             break;
           }
@@ -6856,6 +6982,18 @@ export class ChannelGatewayOrchestrator {
           ) {
             if (await resolveTerminalEmptyTurn(runCandidateTurnIdx, runId)) {
               foundText = "";
+              foundLegacyText = runCandidateLegacyText || latestTurnLegacy;
+              foundSawBusinessToolCall =
+                runCandidateSawTools ||
+                Boolean(
+                  runCandidateTurnIdx !== null
+                    ? accByTurn.get(runCandidateTurnIdx)?.sawBusinessToolCall
+                    : false,
+                );
+              collectAccImages(accByRun.get(runId));
+              if (runCandidateTurnIdx !== null) {
+                collectAccImages(accByTurn.get(runCandidateTurnIdx));
+              }
               foundTargetTurn = true;
               resolvedRunId = runId;
               break;
@@ -6865,12 +7003,24 @@ export class ChannelGatewayOrchestrator {
           }
         } else {
           // Neither `turnIndex` nor `runId` specified: take latest settled turn on first page
+          const latestTurnRes =
+            latestTurnInBatch !== null
+              ? accByTurn.get(latestTurnInBatch)?.result()
+              : undefined;
+          const latestTurnLegacy =
+            latestTurnInBatch !== null
+              ? (accByTurn.get(latestTurnInBatch)?.legacyResult() ?? "")
+              : "";
+          const lastTurnRes = lastTurnAcc.result();
           if (
             latestTurnInBatch !== null &&
             settledTurnsInBatch.has(latestTurnInBatch) &&
-            (textsByTurn.get(latestTurnInBatch) ?? "").trim().length > 0
+            (latestTurnRes?.text ?? "").trim().length > 0
           ) {
-            foundText = textsByTurn.get(latestTurnInBatch) ?? "";
+            foundText = latestTurnRes?.text ?? "";
+            foundLegacyText = latestTurnLegacy;
+            foundSawBusinessToolCall = Boolean(latestTurnRes?.sawBusinessToolCall);
+            collectAccImages(accByTurn.get(latestTurnInBatch));
             foundTargetTurn = true;
             if (!resolvedRunId) {
               if (turnToRunId.has(latestTurnInBatch)) {
@@ -6881,8 +7031,11 @@ export class ChannelGatewayOrchestrator {
             }
             break;
           }
-          if (lastTurnText.trim().length > 0 && textsByTurn.size === 0) {
-            foundText = lastTurnText;
+          if (lastTurnRes.text.trim().length > 0 && accByTurn.size === 0) {
+            foundText = lastTurnRes.text;
+            foundLegacyText = lastTurnAcc.legacyResult();
+            foundSawBusinessToolCall = lastTurnRes.sawBusinessToolCall;
+            collectAccImages(lastTurnAcc);
             foundTargetTurn = true;
             if (!resolvedRunId && replayDoneMeta.latest_run_id) {
               resolvedRunId = replayDoneMeta.latest_run_id;
@@ -6892,7 +7045,7 @@ export class ChannelGatewayOrchestrator {
           if (
             latestTurnInBatch !== null &&
             (!settledTurnsInBatch.has(latestTurnInBatch) ||
-              (textsByTurn.get(latestTurnInBatch) ?? "").trim().length === 0)
+              (latestTurnRes?.text ?? "").trim().length === 0)
           ) {
             const latestCandidateRunId =
               turnToRunId.get(latestTurnInBatch) ??
@@ -6905,6 +7058,8 @@ export class ChannelGatewayOrchestrator {
               )
             ) {
               foundText = "";
+              foundSawBusinessToolCall = Boolean(latestTurnRes?.sawBusinessToolCall);
+              collectAccImages(accByTurn.get(latestTurnInBatch));
               foundTargetTurn = true;
               if (!resolvedRunId && latestCandidateRunId) {
                 resolvedRunId = latestCandidateRunId;
@@ -7144,14 +7299,33 @@ export class ChannelGatewayOrchestrator {
       }
     }
 
+    const effectiveFallbackText = resolveChannelFallbackText({
+      extractedText: foundText,
+      sawBusinessToolCall: foundSawBusinessToolCall,
+      sentToCurrentCount: prog.sent_to_current_count,
+      hasDeliveredCurrentAgentSend: prog.has_delivered_current_agent_send,
+      hasFailedCurrentAgentSend: prog.has_failed_current_agent_send,
+      strictDeliverableTextEnabled: prog.strict_deliverable_text_enabled !== false,
+      legacyText: foundLegacyText,
+    });
     const fallbackDeliveryKey = resolvedRunId
       ? `fallback:${resolvedRunId}`
       : `fallback:${threadId}:turn:${turnIndex}`;
     const partialNoticeKeyId =
       resolvedRunId ?? `${threadId}:turn:${turnIndex ?? "latest"}`;
+    const hasUnresolvedAgentSendImages =
+      prog.has_unresolved_current_agent_send_images === true;
+    const replayResolvedImageUrls: Record<string, string> = {
+      ...(prog.resolved_run_images ?? {}),
+      ...foundImageUrls,
+    };
+    const replayResolvedImagesByMessage = mergeImagesByMessage(
+      prog.resolved_run_images_by_message,
+      foundImagesByMessage,
+    );
     const canSettleFallback =
       foundTargetTurn &&
-      trimmed.length > 0 &&
+      (effectiveFallbackText.length > 0 || hasUnresolvedAgentSendImages) &&
       (resolvedRunId !== null ||
         (turnIndex !== null && turnIndex !== undefined)) &&
       !prog.has_in_flight_or_unknown_current_text;
@@ -7172,8 +7346,13 @@ export class ChannelGatewayOrchestrator {
         sourceGeneration: generation ?? null,
         activityOrigin:
           activityOrigin ?? (isBackgroundRun ? "notification" : "replay"),
-        trimmedText: trimmed,
+        trimmedText: effectiveFallbackText,
         sentToCurrentCount: prog.sent_to_current_count,
+        hasUnresolvedCurrentAgentSendImages: hasUnresolvedAgentSendImages,
+        unresolvedCurrentAgentSends: prog.unresolved_current_agent_sends,
+        resolvedImageUrls: replayResolvedImageUrls,
+        resolvedImagesByMessage: replayResolvedImagesByMessage,
+        toolCallMessageIds: foundToolCallMsgIds,
       });
       if (!settledOk) {
         fallbackTextDeliveryFailed = true;
@@ -7311,6 +7490,7 @@ export class ChannelGatewayOrchestrator {
     runId: string;
     lastEventId: string | null;
     preCursorText?: string;
+    preCursorLegacyText?: string;
     turnIndex: number | null;
     platform: ChannelPlatform;
     targetAddress: string;
@@ -7321,16 +7501,26 @@ export class ChannelGatewayOrchestrator {
     settled: boolean;
     runEnded: boolean;
     assistantText: string;
+    legacyText: string;
+    sawBusinessToolCall: boolean;
     charts: CollectedChartLayerRef[];
     widgets: CollectedHtmlWidgetRef[];
     chartSnapshots: ChartSnapshotItem[];
     outboundBlocked?: boolean;
+    resolvedImageUrls?: Record<string, string>;
+    resolvedImagesByMessage?: Record<string, Record<string, string>>;
+    toolCallMessageIds?: Record<string, string>;
   }> {
     const emptyArtifacts = {
+      legacyText: "",
+      sawBusinessToolCall: false,
       charts: [] as CollectedChartLayerRef[],
       widgets: [] as CollectedHtmlWidgetRef[],
       chartSnapshots: [] as ChartSnapshotItem[],
       outboundBlocked: undefined as boolean | undefined,
+      resolvedImageUrls: {} as Record<string, string>,
+      resolvedImagesByMessage: {} as Record<string, Record<string, string>>,
+      toolCallMessageIds: {} as Record<string, string>,
     };
     try {
       const streamResp = await this.backend.streamThreadMessages(
@@ -7343,8 +7533,8 @@ export class ChannelGatewayOrchestrator {
       }
 
       const preCursorText = params.preCursorText ?? "";
-      let currentSegmentText = "";
-      let lastCompletedSegmentText = "";
+      const preCursorLegacyText = params.preCursorLegacyText ?? preCursorText;
+      const deliverableAcc = new DeliverableTextAccumulator();
       let sawPostCursorToolCalls = false;
       let sawStreamGap = false;
       let sawRunEnd = false;
@@ -7395,16 +7585,38 @@ export class ChannelGatewayOrchestrator {
               collectedCharts,
             );
           }
+          if (this.isMainAgentLane(payload.agent)) {
+            deliverableAcc.pushEvent("tool_call_result", payload);
+            if (deliverableAcc.sawBusinessToolCall) {
+              sawPostCursorToolCalls = true;
+            }
+          }
+          continue;
+        }
+
+        if (sse.event === "tool_call_start") {
+          if (this.isMainAgentLane(payload.agent)) {
+            deliverableAcc.pushEvent("tool_call_start", payload);
+            if (deliverableAcc.sawBusinessToolCall) {
+              sawPostCursorToolCalls = true;
+            }
+          }
           continue;
         }
 
         if (sse.event === "tool_calls") {
           if (this.isMainAgentLane(payload.agent)) {
-            sawPostCursorToolCalls = true;
-            if (currentSegmentText.trim().length > 0) {
-              lastCompletedSegmentText = currentSegmentText;
-              currentSegmentText = "";
+            deliverableAcc.pushEvent("tool_calls", payload);
+            if (deliverableAcc.sawBusinessToolCall) {
+              sawPostCursorToolCalls = true;
             }
+          }
+          continue;
+        }
+
+        if (sse.event === "message_discarded") {
+          if (this.isMainAgentLane(payload.agent)) {
+            deliverableAcc.pushEvent("message_discarded", payload);
           }
           continue;
         }
@@ -7414,43 +7626,15 @@ export class ChannelGatewayOrchestrator {
           sse.event === "text" ||
           sse.event === "content_block_delta"
         ) {
-          if (!this.isMainAgentLane(payload.agent)) {
-            continue;
-          }
-          if (
-            typeof payload.content_type === "string" &&
-            payload.content_type !== "text"
-          ) {
-            continue;
-          }
-          const delta =
-            typeof payload.content === "string"
-              ? payload.content
-              : typeof payload.text === "string"
-                ? payload.text
-                : typeof payload.delta === "string"
-                  ? payload.delta
-                  : "";
-          if (delta && payload.role !== "user") {
-            currentSegmentText += delta;
-          }
-          if (payload.finish_reason === "tool_calls") {
-            sawPostCursorToolCalls = true;
-            if (currentSegmentText.trim().length > 0) {
-              lastCompletedSegmentText = currentSegmentText;
-              currentSegmentText = "";
-            }
+          if (this.isMainAgentLane(payload.agent)) {
+            deliverableAcc.pushEvent(sse.event, payload);
           }
           continue;
         }
 
         if (sse.event === "message") {
-          if (
-            this.isMainAgentLane(payload.agent) &&
-            payload.role === "assistant" &&
-            typeof payload.content === "string"
-          ) {
-            currentSegmentText = payload.content;
+          if (this.isMainAgentLane(payload.agent)) {
+            deliverableAcc.pushEvent("message", payload);
           }
           continue;
         }
@@ -7484,6 +7668,7 @@ export class ChannelGatewayOrchestrator {
                 : "completed";
           runEndChartSnapshots = parseChartSnapshotsList(payload.chart_snapshots);
           collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+          deliverableAcc.pushEvent("run_end", payload);
           if (typeof payload.outbound_blocked === "boolean") {
             runEndOutboundBlocked = payload.outbound_blocked;
           }
@@ -7500,10 +7685,9 @@ export class ChannelGatewayOrchestrator {
         };
       }
       if (sawRunEnd && runEndOutcome === "completed") {
-        const postCursorText =
-          currentSegmentText.trim().length > 0
-            ? currentSegmentText
-            : lastCompletedSegmentText;
+        const postCursorRes = deliverableAcc.result();
+        const postCursorText = postCursorRes.text;
+        const postCursorLegacyText = deliverableAcc.legacyResult();
         // Backend `src/server/handlers/chat/run_stream_reader.py:183` only yields events strictly AFTER `last_event_id`
         // (`cursor = f"{last_event_id}-0"`), and `src/server/services/history/replay/stubs.py:88` emits `archived = []`
         // (only `user_message`) for an in-flight turn (`open_run`). Even if a post-cursor `tool_calls` started a new
@@ -7513,14 +7697,25 @@ export class ChannelGatewayOrchestrator {
         // pre-cursor replay content (or on `sawStreamGap` / empty text) so `deliverReplayFallback` immediately re-reads
         // the full committed `/messages/replay` before settling.
         const missingPreCursorPrefix =
-          params.lastEventId !== null && preCursorText.length === 0;
+          params.lastEventId !== null &&
+          preCursorText.length === 0 &&
+          preCursorLegacyText.length === 0;
         const combinedText = sawPostCursorToolCalls
           ? postCursorText
           : `${preCursorText}${postCursorText}`;
+        const combinedLegacyText = sawPostCursorToolCalls
+          ? postCursorLegacyText.trim().length > 0
+            ? postCursorLegacyText
+            : preCursorLegacyText
+          : `${preCursorLegacyText}${postCursorLegacyText}`;
+        const combinedSawTool =
+          sawPostCursorToolCalls || postCursorRes.sawBusinessToolCall;
         if (
           sawStreamGap ||
           missingPreCursorPrefix ||
-          combinedText.trim().length === 0
+          (combinedText.trim().length === 0 &&
+            combinedLegacyText.trim().length === 0 &&
+            !combinedSawTool)
         ) {
           return { settled: false, runEnded: true, assistantText: "", ...emptyArtifacts };
         }
@@ -7528,10 +7723,15 @@ export class ChannelGatewayOrchestrator {
           settled: true,
           runEnded: true,
           assistantText: combinedText,
+          legacyText: combinedLegacyText,
+          sawBusinessToolCall: combinedSawTool,
           charts: [...collectedCharts.values()],
           widgets: [...collectedWidgets.values()],
           chartSnapshots: runEndChartSnapshots,
           outboundBlocked: runEndOutboundBlocked,
+          resolvedImageUrls: deliverableAcc.getGlobalImageUrlMap(),
+          resolvedImagesByMessage: deliverableAcc.getImagesByMessage(),
+          toolCallMessageIds: deliverableAcc.getToolCallMessageIds(),
         };
       }
       return { settled: false, runEnded: sawRunEnd, assistantText: "", ...emptyArtifacts };
@@ -8583,8 +8783,7 @@ export class ChannelGatewayOrchestrator {
     turnIndex: number;
   }): Promise<boolean> {
     const { handle, runId, turnIndex } = params;
-    let currentSegmentText = "";
-    let lastCompletedSegmentText = "";
+    const deliverableAcc = new DeliverableTextAccumulator();
     let isQuiet = false;
     let sawStreamErrorOrGap = false;
     let sawRunEnd = false;
@@ -8615,10 +8814,14 @@ export class ChannelGatewayOrchestrator {
 
           if (sse.event === "tool_calls") {
             if (this.isMainAgentLane(payload.agent)) {
-              if (currentSegmentText.trim().length > 0) {
-                lastCompletedSegmentText = currentSegmentText;
-                currentSegmentText = "";
-              }
+              deliverableAcc.pushEvent("tool_calls", payload);
+            }
+            continue;
+          }
+
+          if (sse.event === "message_discarded") {
+            if (this.isMainAgentLane(payload.agent)) {
+              deliverableAcc.pushEvent("message_discarded", payload);
             }
             continue;
           }
@@ -8637,6 +8840,13 @@ export class ChannelGatewayOrchestrator {
             continue;
           }
 
+          if (sse.event === "tool_call_start") {
+            if (this.isMainAgentLane(payload.agent)) {
+              deliverableAcc.pushEvent("tool_call_start", payload);
+            }
+            continue;
+          }
+
           if (sse.event === "tool_call_result") {
             if (
               payload.artifact &&
@@ -8647,6 +8857,9 @@ export class ChannelGatewayOrchestrator {
                 (payload.artifact as Record<string, unknown>).chart_layers,
                 collectedCharts,
               );
+            }
+            if (this.isMainAgentLane(payload.agent)) {
+              deliverableAcc.pushEvent("tool_call_result", payload);
             }
             continue;
           }
@@ -8676,6 +8889,7 @@ export class ChannelGatewayOrchestrator {
               payload.chart_snapshots,
             );
             collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+            deliverableAcc.pushEvent("run_end", payload);
             if (typeof payload.outbound_blocked === "boolean") {
               runEndOutboundBlocked = payload.outbound_blocked;
             }
@@ -8687,37 +8901,12 @@ export class ChannelGatewayOrchestrator {
             sse.event === "text" ||
             sse.event === "content_block_delta"
           ) {
-            if (!this.isMainAgentLane(payload.agent)) {
-              continue;
-            }
-            if (
-              typeof payload.content_type === "string" &&
-              payload.content_type !== "text"
-            ) {
-              continue;
-            }
-            const delta =
-              typeof payload.content === "string"
-                ? payload.content
-                : typeof payload.text === "string"
-                  ? payload.text
-                  : "";
-            if (delta && payload.role !== "user") {
-              currentSegmentText += delta;
-            }
-            if (payload.finish_reason === "tool_calls") {
-              if (currentSegmentText.trim().length > 0) {
-                lastCompletedSegmentText = currentSegmentText;
-                currentSegmentText = "";
-              }
+            if (this.isMainAgentLane(payload.agent)) {
+              deliverableAcc.pushEvent(sse.event, payload);
             }
           } else if (sse.event === "message") {
-            if (
-              this.isMainAgentLane(payload.agent) &&
-              payload.role === "assistant" &&
-              typeof payload.content === "string"
-            ) {
-              currentSegmentText = payload.content;
+            if (this.isMainAgentLane(payload.agent)) {
+              deliverableAcc.pushEvent("message", payload);
             }
           } else if (sse.event === "interrupt") {
             sawInterrupt = true;
@@ -8798,10 +8987,8 @@ export class ChannelGatewayOrchestrator {
         return true;
       }
 
-      const assistantText =
-        currentSegmentText.trim().length > 0
-          ? currentSegmentText
-          : lastCompletedSegmentText;
+      const bgExtracted = deliverableAcc.result();
+      const assistantText = bgExtracted.text;
 
       let keepFallbackPending = sawInterrupt && !interruptDelivered;
       if (!isQuiet && !sawInterrupt) {
@@ -8815,11 +9002,30 @@ export class ChannelGatewayOrchestrator {
         ) {
           keepFallbackPending = true;
         } else {
-          const trimmed = assistantText.trim();
+          const trimmed = resolveChannelFallbackText({
+            extractedText: assistantText,
+            sawBusinessToolCall: bgExtracted.sawBusinessToolCall,
+            sentToCurrentCount: prog.sent_to_current_count,
+            hasDeliveredCurrentAgentSend: prog.has_delivered_current_agent_send,
+            hasFailedCurrentAgentSend: prog.has_failed_current_agent_send,
+            strictDeliverableTextEnabled: prog.strict_deliverable_text_enabled !== false,
+            legacyText: deliverableAcc.legacyResult(),
+          });
           const bgFallbackDeliveryKey = `fallback:${runId}`;
+          const bgHasUnresolvedAgentSendImages =
+            prog.has_unresolved_current_agent_send_images === true;
+          const bgResolvedImageUrls: Record<string, string> = {
+            ...(prog.resolved_run_images ?? {}),
+            ...deliverableAcc.getGlobalImageUrlMap(),
+          };
+          const bgResolvedImagesByMessage = mergeImagesByMessage(
+            prog.resolved_run_images_by_message,
+            deliverableAcc.getImagesByMessage(),
+          );
+          const bgToolCallMessageIds = deliverableAcc.getToolCallMessageIds();
           if (
             !sawStreamErrorOrGap &&
-            trimmed.length > 0 &&
+            (trimmed.length > 0 || bgHasUnresolvedAgentSendImages) &&
             !prog.has_in_flight_or_unknown_current_text
           ) {
             const settledOk = await this.settleTurnFallbackAndPartialNotice({
@@ -8836,6 +9042,11 @@ export class ChannelGatewayOrchestrator {
               activityOrigin: "notification",
               trimmedText: trimmed,
               sentToCurrentCount: prog.sent_to_current_count,
+              hasUnresolvedCurrentAgentSendImages: bgHasUnresolvedAgentSendImages,
+              unresolvedCurrentAgentSends: prog.unresolved_current_agent_sends,
+              resolvedImageUrls: bgResolvedImageUrls,
+              resolvedImagesByMessage: bgResolvedImagesByMessage,
+              toolCallMessageIds: bgToolCallMessageIds,
             });
             if (settledOk) {
               handle.pendingReplayFallbacks?.delete(runId);
@@ -9454,7 +9665,10 @@ export class ChannelGatewayOrchestrator {
         this.recoverSingleThreadWatch(w),
       ),
       ...(recovery.automation_runs ?? []).map((autoRun) =>
-        this.recoverSingleAutomationRun(autoRun),
+        this.recoverSingleAutomationRun(
+          autoRun,
+          recovery.strict_deliverable_text_enabled,
+        ),
       ),
     ]);
   }
@@ -10448,6 +10662,7 @@ export class ChannelGatewayOrchestrator {
 
   private async recoverSingleAutomationRun(
     autoRun: RecoverAutomationRunRow,
+    recoveryStrictDeliverableTextEnabled?: boolean,
   ): Promise<void> {
     if (autoRun.status !== "finishing") return;
     await this.agentRoutes.executeAutomationRunFinish({
@@ -10460,6 +10675,9 @@ export class ChannelGatewayOrchestrator {
       automationName: autoRun.automation_name,
       finishStatus: autoRun.finish_status ?? "completed",
       finalText: autoRun.final_text,
+      strictDeliverableTextEnabled:
+        autoRun.strict_deliverable_text_enabled ??
+        recoveryStrictDeliverableTextEnabled,
       targets: autoRun.targets ?? [],
     });
   }
@@ -10993,9 +11211,78 @@ export class ChannelGatewayOrchestrator {
     activityOrigin?: DeliveryActivityOrigin | null;
     trimmedText: string;
     sentToCurrentCount: number;
+    hasUnresolvedCurrentAgentSendImages?: boolean;
+    unresolvedCurrentAgentSends?: UnresolvedCurrentAgentSend[];
+    resolvedImageUrls?: Record<string, string>;
+    resolvedImagesByMessage?: Record<string, Record<string, string>>;
+    toolCallMessageIds?: Record<string, string>;
   }): Promise<boolean> {
     let needsPartialNotice = false;
-    if (params.sentToCurrentCount === 0) {
+    const deliverAgentSendImageCorrections = async (): Promise<boolean> => {
+      if (params.hasUnresolvedCurrentAgentSendImages !== true) {
+        return true;
+      }
+      const originals = params.unresolvedCurrentAgentSends ?? [];
+      if (originals.length === 0) {
+        return true;
+      }
+      for (let idx = 0; idx < originals.length; idx += 1) {
+        const orig = originals[idx]!;
+        const perDeliveryImageUrls = resolveDeliveryImageUrls({
+          deliveryKey: orig.delivery_key,
+          runId: params.runId,
+          sourceMessageId: orig.source_message_id,
+          capturedImages: orig.captured_images,
+          imagesByMessage: params.resolvedImagesByMessage,
+          toolCallMessageIds: params.toolCallMessageIds,
+          globalImages: params.resolvedImageUrls,
+        });
+        const correctedText = buildImageCorrectionText({
+          originalText: orig.delivered_text,
+          unresolvedImagePaths: orig.unresolved_image_paths,
+          resolvedImageUrls: perDeliveryImageUrls,
+        });
+        if (!correctedText) {
+          continue;
+        }
+        const fixDeliveryKey =
+          idx === 0
+            ? `${params.fallbackDeliveryKey}:imgfix`
+            : `${params.fallbackDeliveryKey}:imgfix:${idx}`;
+        const fixRes = await this.deliveryService.executeDelivery({
+          deliveryKey: fixDeliveryKey,
+          kind: "fallback",
+          userId: params.userId,
+          threadId: params.threadId,
+          runId: params.runId,
+          platform: params.platform,
+          target: params.targetAddress,
+          inboundMessageId: params.inboundMessageId ?? null,
+          text: correctedText,
+          replyToMessageId: params.replyToMessageId ?? null,
+          threadScopeKey: params.threadScopeKey ?? null,
+          sourceScopeKey:
+            params.sourceScopeKey ?? params.threadScopeKey ?? null,
+          sourceGeneration: params.sourceGeneration ?? null,
+          activityOrigin: params.activityOrigin ?? null,
+        });
+        if (fixRes.status !== "sent" && fixRes.status !== "partial") {
+          return false;
+        }
+        if (fixRes.status === "partial") {
+          needsPartialNotice = true;
+        }
+      }
+      return true;
+    };
+
+    if (params.trimmedText.length === 0) {
+      // Empty fallback text: never claim/deliver fallback text, but still run
+      // original-bound :imgfix corrections for prior delivered agent_send messages.
+      if (!(await deliverAgentSendImageCorrections())) {
+        return false;
+      }
+    } else if (params.sentToCurrentCount === 0) {
       const deliveryRes = await this.deliveryService.executeDelivery({
         deliveryKey: params.fallbackDeliveryKey,
         kind: "fallback",
@@ -11054,9 +11341,52 @@ export class ChannelGatewayOrchestrator {
       );
       this.deliveryService.assertNotLeaseLost("fallback.post_claim");
       if (claim.claim_status === "already_completed") {
-        const prev = (claim.first_response_json ?? {}) as { status?: string };
+        const prev = (claim.first_response_json ?? {}) as {
+          status?: string;
+          unresolved_sandbox_images?: boolean;
+          unresolved_sandbox_image_paths?: string[];
+          delivered_text?: string;
+        };
         const ledgerStatus = prev.status ?? claim.status ?? "sent";
-        if (ledgerStatus === "partial") {
+        const fallbackCorrectionText =
+          prev.unresolved_sandbox_images === true
+            ? typeof prev.delivered_text === "string"
+              ? buildImageCorrectionText({
+                  originalText: prev.delivered_text,
+                  unresolvedImagePaths: prev.unresolved_sandbox_image_paths,
+                  resolvedImageUrls: params.resolvedImageUrls,
+                })
+              : !containsUnresolvedSandboxImagePath(params.trimmedText)
+                ? params.trimmedText
+                : null
+            : null;
+        if (fallbackCorrectionText) {
+          // Earlier fallback delivered an unresolved sandbox image path; send the
+          // corrected reply generated from the original delivered text.
+          const fixRes = await this.deliveryService.executeDelivery({
+            deliveryKey: `${params.fallbackDeliveryKey}:imgfix`,
+            kind: "fallback",
+            userId: params.userId,
+            threadId: params.threadId,
+            runId: params.runId,
+            platform: params.platform,
+            target: params.targetAddress,
+            inboundMessageId: params.inboundMessageId ?? null,
+            text: fallbackCorrectionText,
+            replyToMessageId: params.replyToMessageId ?? null,
+            threadScopeKey: params.threadScopeKey ?? null,
+            sourceScopeKey:
+              params.sourceScopeKey ?? params.threadScopeKey ?? null,
+            sourceGeneration: params.sourceGeneration ?? null,
+            activityOrigin: params.activityOrigin ?? null,
+          });
+          if (fixRes.status !== "sent" && fixRes.status !== "partial") {
+            return false;
+          }
+          if (fixRes.status === "partial") {
+            needsPartialNotice = true;
+          }
+        } else if (ledgerStatus === "partial") {
           needsPartialNotice = true;
         }
       } else if (
@@ -11088,6 +11418,9 @@ export class ChannelGatewayOrchestrator {
           },
           { platform: claim.platform ?? params.platform },
         );
+        if (!(await deliverAgentSendImageCorrections())) {
+          return false;
+        }
       }
     }
 

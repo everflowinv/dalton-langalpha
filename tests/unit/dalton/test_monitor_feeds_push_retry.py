@@ -29,7 +29,12 @@ def test_failed_push_retries_on_next_tick_when_not_superseded_and_clears_on_succ
         *,
         as_of: str | None = None,
         backend_url: str | None = None,
+        attempt_seq: int | None = None,
+        is_stale: bool = False,
+        error: str | None = None,
+        last_attempt_at: str | None = None,
     ) -> dict[str, Any]:
+        del attempt_seq, is_stale, error, last_attempt_at
         pushed_calls.append((slug, data_key, dict(payload), as_of))
         if fail_first["should_fail"]:
             fail_first["should_fail"] = False
@@ -107,7 +112,12 @@ def test_newer_snapshot_supersedes_pending_failed_push(tmp_path: Path) -> None:
         *,
         as_of: str | None = None,
         backend_url: str | None = None,
+        attempt_seq: int | None = None,
+        is_stale: bool = False,
+        error: str | None = None,
+        last_attempt_at: str | None = None,
     ) -> dict[str, Any]:
+        del attempt_seq, is_stale, error, last_attempt_at
         pushed_as_of.append(str(as_of))
         if payload.get("seq") == 1:
             raise RuntimeError("transient error on seq 1")
@@ -191,7 +201,12 @@ def test_collect_exception_retries_newer_pending_push_without_overwriting_with_o
         *,
         as_of: str | None = None,
         backend_url: str | None = None,
+        attempt_seq: int | None = None,
+        is_stale: bool = False,
+        error: str | None = None,
+        last_attempt_at: str | None = None,
     ) -> dict[str, Any]:
+        del attempt_seq, is_stale, error, last_attempt_at
         pushed_calls.append((dict(payload), as_of))
         if len(pushed_calls) == 2:
             raise RuntimeError("502 Bad Gateway")
@@ -255,28 +270,42 @@ def test_upsert_monitor_data_conditional_as_of_idempotent_replay_and_stale_rejec
 
         async def execute(self, sql: str, params: tuple[Any, ...]) -> None:
             sql_norm = " ".join(sql.split()).upper()
-            if sql_norm.startswith("INSERT INTO DALTON_MONITOR_DATA"):
-                mid, dkey, canonical, ts, digest = params
-                assert "WHERE EXCLUDED.AS_OF > DALTON_MONITOR_DATA.AS_OF" in sql_norm
-                key = (mid, dkey)
-                existing = store.get(key)
-                if existing is None or ts > existing["as_of"]:
-                    new_row = {
-                        "monitor_id": mid,
-                        "data_key": dkey,
-                        "payload": canonical,
-                        "as_of": ts,
-                        "sha256": digest,
-                        "updated_at": clock["now"],
-                    }
-                    store[key] = new_row
-                    self._row = dict(new_row)
-                else:
-                    self._row = None
-            elif sql_norm.startswith("SELECT MONITOR_ID::TEXT"):
+            if sql_norm.startswith("SELECT MONITOR_ID::TEXT"):
                 mid, dkey = params
                 existing = store.get((mid, dkey))
                 self._row = dict(existing) if existing is not None else None
+            elif sql_norm.startswith("INSERT INTO DALTON_MONITOR_DATA"):
+                mid, dkey, canonical, ts, digest, aseq, is_st, last_att, last_err = params
+                new_row = {
+                    "monitor_id": mid,
+                    "data_key": dkey,
+                    "payload": canonical,
+                    "as_of": ts,
+                    "sha256": digest,
+                    "updated_at": clock["now"],
+                    "attempt_seq": aseq,
+                    "is_stale": is_st,
+                    "last_attempt_at": last_att,
+                    "last_error": last_err,
+                }
+                store[(mid, dkey)] = new_row
+                self._row = dict(new_row)
+            elif sql_norm.startswith("UPDATE DALTON_MONITOR_DATA"):
+                canonical, ts, digest, aseq, is_st, last_att, last_err, mid, dkey = params
+                existing = store[(mid, dkey)]
+                new_row = {
+                    **existing,
+                    "payload": canonical,
+                    "as_of": ts,
+                    "sha256": digest,
+                    "updated_at": clock["now"],
+                    "attempt_seq": aseq,
+                    "is_stale": is_st,
+                    "last_attempt_at": last_att,
+                    "last_error": last_err,
+                }
+                store[(mid, dkey)] = new_row
+                self._row = dict(new_row)
             else:
                 raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -286,6 +315,10 @@ def test_upsert_monitor_data_conditional_as_of_idempotent_replay_and_stale_rejec
     class _FakeConn:
         def cursor(self, row_factory: Any = None) -> _FakeCursor:
             return _FakeCursor()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
 
     @asynccontextmanager
     async def _fake_get_db_connection():
@@ -347,7 +380,12 @@ def test_calendar_error_preserves_newer_pending_push_and_409_clears_stale_pendin
         *,
         as_of: str | None = None,
         backend_url: str | None = None,
+        attempt_seq: int | None = None,
+        is_stale: bool = False,
+        error: str | None = None,
+        last_attempt_at: str | None = None,
     ) -> dict[str, Any]:
+        del attempt_seq, is_stale, error, last_attempt_at
         pushed.append({"slug": slug, "data_key": data_key, "as_of": as_of, "payload": payload})
         return {"ok": True}
 

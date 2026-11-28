@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
+import akshare as ak
 import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
@@ -77,13 +78,13 @@ def _make_pm_sdks(cfg: dict[str, Any]):
     us_df = pd.DataFrame(data, index=dates, columns=cols)
 
     class _FakeAk:
-        def stock_zh_index_daily(self, symbol: str) -> pd.DataFrame:
+        def stock_zh_index_daily_tx(self, symbol: str) -> pd.DataFrame:
             return pd.DataFrame(
                 {"date": dates.strftime("%Y-%m-%d"), "close": np.linspace(3500.0, 4050.0, len(dates))}
             )
 
         def stock_zh_index_daily_em(self, symbol: str) -> pd.DataFrame:
-            return self.stock_zh_index_daily(symbol)
+            return self.stock_zh_index_daily_tx(symbol)
 
         def sw_index_first_info(self) -> pd.DataFrame:
             return pd.DataFrame(
@@ -109,13 +110,15 @@ def _make_pm_sdks(cfg: dict[str, Any]):
             )
 
         def index_analysis_week_month_sw(self, symbol: str = "week") -> pd.DataFrame:
-            return pd.DataFrame({"date": ["2025-12-19", "2025-12-26"]})
+            wk_dates = feeds_common.completed_trading_weeks("cn", "2021-12-31", date(2026, 11, 16))
+            return pd.DataFrame({"date": wk_dates})
 
         def index_analysis_weekly_sw(self, symbol: str, date: str) -> pd.DataFrame:
             codes = ["801010", "801080"] if symbol == "一级行业" else ["801081", "801012"]
+            pub_dt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             return pd.DataFrame(
                 [
-                    {"指数代码": f"{c}.SI", "市盈率": 24.0 + i, "市净率": 2.3, "股息率": 1.4}
+                    {"指数代码": f"{c}.SI", "发布日期": pub_dt, "市盈率": 24.0 + i, "市净率": 2.3, "股息率": 1.4}
                     for i, c in enumerate(codes)
                 ]
             )
@@ -132,7 +135,7 @@ def _make_pm_sdks(cfg: dict[str, Any]):
     real_ak = _FakeAk()
     fake_yf = SimpleNamespace(download=create_autospec(yf.download, side_effect=lambda *_a, **_kw: us_df.copy()))
     fake_ak = SimpleNamespace(
-        stock_zh_index_daily=create_autospec(real_ak.stock_zh_index_daily, side_effect=real_ak.stock_zh_index_daily),
+        stock_zh_index_daily_tx=create_autospec(ak.stock_zh_index_daily_tx, side_effect=real_ak.stock_zh_index_daily_tx),
         stock_zh_index_daily_em=create_autospec(real_ak.stock_zh_index_daily_em, side_effect=real_ak.stock_zh_index_daily_em),
         sw_index_first_info=create_autospec(real_ak.sw_index_first_info, side_effect=real_ak.sw_index_first_info),
         sw_index_second_info=create_autospec(real_ak.sw_index_second_info, side_effect=real_ak.sw_index_second_info),
@@ -481,10 +484,14 @@ def test_hkmom_month_end_success_e2e_real_compute_and_freeze(
 @pytest.mark.parametrize(
     ("source", "mode", "expected_exit", "expect_advance"),
     [
-        ("us", "exception", 1, False),
-        ("us", "empty", 1, False),
-        ("us", "partial", 1, False),
-        ("us", "duplicate_or_meta", 1, False),
+        # Under per_panel publishing, isolated US source failures exit 0 while CN succeeds
+        # so the healthy CN panel still publishes; US panel is blocked via status.json.
+        # Symmetrically, isolated CN / CN-valuation failures exit 0 so the US panel publishes;
+        # the CN panel is blocked per panel and records 最近一次更新未生效.
+        ("us", "exception", 0, False),
+        ("us", "empty", 0, False),
+        ("us", "partial", 0, False),
+        ("us", "duplicate_or_meta", 0, False),
         ("us", "success", 0, True),
         ("cn", "exception", 0, False),
         ("cn", "empty", 0, False),
@@ -510,6 +517,8 @@ def test_pm_cockpit_parametrized_failure_matrix(
 ) -> None:
     """Real pm_cockpit.run.main() across all sources & failure modes."""
     monkeypatch.setattr(pm_collect.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(pm_collect, "now_us", lambda: datetime(2026, 11, 16, 17, 15, tzinfo=feeds_common.US_TZ))
+    monkeypatch.setattr(pm_collect, "now_cn", lambda: datetime(2026, 11, 16, 16, 0, tzinfo=feeds_common.CN_TZ))
     cfg = pm_collect.load_config()
     st_dir = tmp_path / "pm_state"
     out_dir = tmp_path / "pm_out"
@@ -560,7 +569,7 @@ def test_pm_cockpit_parametrized_failure_matrix(
     if source == "cn":
         orig_hist_sw = fake_ak.index_hist_sw.side_effect
         if mode == "exception":
-            fake_ak.stock_zh_index_daily.side_effect = RuntimeError("sina down")
+            fake_ak.stock_zh_index_daily_tx.side_effect = RuntimeError("tx down")
             fake_ak.stock_zh_index_daily_em.side_effect = RuntimeError("em down")
         elif mode == "empty":
             fake_ak.sw_index_first_info.side_effect = lambda: pd.DataFrame()
@@ -572,22 +581,29 @@ def test_pm_cockpit_parametrized_failure_matrix(
             fake_ak.sw_index_second_info.side_effect = lambda: pd.DataFrame()
 
     if source == "cn_valuation":
-        # Add an uncollected week 2026-01-02 so weekly valuation executes!
-        fake_ak.index_analysis_week_month_sw.side_effect = None
-        fake_ak.index_analysis_week_month_sw.return_value = pd.DataFrame({"date": ["2025-12-19", "2025-12-26", "2026-01-02"]})
+        # Unmark latest completed week 2026-11-13 so weekly valuation executes!
+        prog_p = st_dir / "raw" / "cn_sw_val_progress.json"
+        prog_d = json.loads(prog_p.read_text(encoding="utf-8"))
+        prog_d.get("done", {}).pop("2026-11-13", None)
+        prog_p.write_text(json.dumps(prog_d, ensure_ascii=False), encoding="utf-8")
+        wk_csv_p = st_dir / "raw" / "cn_sw_val_weekly.csv"
+        wk_df_old = pd.read_csv(wk_csv_p, dtype={"code": str})
+        wk_df_old[wk_df_old["date"].astype(str) != "2026-11-13"].to_csv(wk_csv_p, index=False)
+
         orig_weekly = fake_ak.index_analysis_weekly_sw.side_effect
         orig_daily_val = fake_ak.index_analysis_daily_sw.side_effect
         if mode == "exception":
             fake_ak.index_analysis_weekly_sw.side_effect = RuntimeError("weekly val 502")
         elif mode == "empty":
-            fake_ak.index_analysis_weekly_sw.side_effect = lambda symbol, date: pd.DataFrame() if date == "20260102" else orig_weekly(symbol, date)
+            fake_ak.index_analysis_weekly_sw.side_effect = lambda symbol, date: pd.DataFrame() if date == "20261113" else orig_weekly(symbol, date)
         elif mode == "partial":
             # Only L1 daily valuation returns empty while L2 succeeds -> must fail!
             fake_ak.index_analysis_daily_sw.side_effect = lambda symbol, start_date, end_date: (
                 pd.DataFrame() if symbol == "一级行业" else orig_daily_val(symbol, start_date, end_date)
             )
         elif mode == "duplicate_or_meta":
-            fake_ak.index_analysis_week_month_sw.return_value = pd.DataFrame({"bad_col": ["2026-01-02"]})
+            fake_ak.index_analysis_week_month_sw.side_effect = None
+            fake_ak.index_analysis_week_month_sw.return_value = pd.DataFrame({"bad_col": ["2026-11-13"]})
 
     mod_yf.download = fake_yf.download  # type: ignore[attr-defined]
     for k, v in vars(fake_ak).items():
@@ -632,7 +648,7 @@ def test_pm_cockpit_parametrized_failure_matrix(
 
     if source == "cn_valuation" and mode == "empty":
         prog = json.loads((st_dir / "raw" / "cn_sw_val_progress.json").read_text(encoding="utf-8"))
-        assert "2026-01-02" not in prog.get("done", {}), "Empty weekly valuation must stay pending!"
+        assert "2026-11-13" not in prog.get("done", {}), "Empty weekly valuation must stay pending!"
 
     if source not in ("pm_compute", "pm_render") and not expect_advance:
         target_html = (out_dir / "pm-market-state" / "index.html") if source == "us" else (out_dir / "cn-sector-rotation" / "index.html")
@@ -1387,11 +1403,12 @@ def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatc
     raw_dir.mkdir(parents=True)
 
     # Seed clean baseline CN meta & valuation first
+    as_of = date(2026, 11, 16)
     _, fake_ak_ok = _make_pm_sdks(cfg)
-    cn_ok = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok)
+    cn_ok = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok, as_of_date=as_of)
     assert cn_ok["source_status"]["ok"] is True
     seed_meta = json.loads((raw_dir / "cn_sw_meta.json").read_text(encoding="utf-8"))
-    val_ok = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok)
+    val_ok = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok, as_of_date=as_of)
     assert val_ok["source_status"]["ok"] is True
 
     # 1) fetch_cn: omit an expected L1 code present in prior cn_sw_meta.json -> MUST fail & preserve cn_sw_meta.json
@@ -1399,7 +1416,7 @@ def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatc
     orig_l1 = fake_ak_missing_l1.sw_index_first_info()
     dropped_l1 = orig_l1.iloc[1:].copy()
     fake_ak_missing_l1.sw_index_first_info = lambda: dropped_l1
-    cn_bad = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_missing_l1)
+    cn_bad = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_missing_l1, as_of_date=as_of)
     assert cn_bad["source_status"]["ok"] is False
     assert "缺失" in (cn_bad["source_status"]["reason"] or "")
     assert json.loads((raw_dir / "cn_sw_meta.json").read_text(encoding="utf-8")) == seed_meta
@@ -1419,7 +1436,7 @@ def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatc
 
     fake_ak_missing_val.index_analysis_daily_sw.side_effect = _drop_l2_daily
     with pytest.raises(RuntimeError, match="二级行业"):
-        pm_collect.fetch_cn_val_latest(raw_dir=raw_dir, ak_module=fake_ak_missing_val)
+        pm_collect.fetch_cn_val_latest(raw_dir=raw_dir, ak_module=fake_ak_missing_val, as_of_date=as_of)
 
     # 3) fetch_cn_valuation: weekly valuation missing an expected L1 code retroactively un-marks done_map and keeps (date, level) pending
     prog_path = raw_dir / "cn_sw_val_progress.json"
@@ -1441,12 +1458,8 @@ def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatc
         return df
 
     fake_ak_bad_week.index_analysis_weekly_sw.side_effect = _drop_one_code_week
-    fake_ak_bad_week.index_analysis_week_month_sw.side_effect = None
-    fake_ak_bad_week.index_analysis_week_month_sw.return_value = pd.DataFrame(
-        {"date": ["2025-12-19", "2025-12-26", "2026-01-02"]}
-    )
 
-    val_partial = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_bad_week)
+    val_partial = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_bad_week, as_of_date=as_of)
     assert val_partial["source_status"]["ok"] is False
     prog_after = json.loads(prog_path.read_text(encoding="utf-8"))
     assert "一级行业" not in prog_after["done"].get("2025-12-26", [])
@@ -1454,15 +1467,11 @@ def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatc
 
     # When missing code recovers, re-run completes cleanly!
     _, fake_ak_recovered = _make_pm_sdks(cfg)
-    fake_ak_recovered.index_analysis_week_month_sw.side_effect = None
-    fake_ak_recovered.index_analysis_week_month_sw.return_value = pd.DataFrame(
-        {"date": ["2025-12-19", "2025-12-26", "2026-01-02"]}
-    )
-    val_recovered = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_recovered)
+    val_recovered = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_recovered, as_of_date=as_of)
     assert val_recovered["source_status"]["ok"] is True
     prog_recovered = json.loads(prog_path.read_text(encoding="utf-8"))
     assert set(prog_recovered["done"].get("2025-12-26", [])) == {"一级行业", "二级行业"}
-    assert set(prog_recovered["done"].get("2026-01-02", [])) == {"一级行业", "二级行业"}
+    assert set(prog_recovered["done"].get("2026-11-13", [])) == {"一级行业", "二级行业"}
 
 
 def test_ashare_official_shares_date_and_szse_hardening(tmp_path: Path) -> None:
@@ -1926,9 +1935,10 @@ def test_pm_weekly_valuation_missing_csv_recollects_even_with_done_map(
     raw_dir = tmp_path / "pm_missing_csv"
     raw_dir.mkdir(parents=True)
 
+    as_of = date(2026, 11, 16)
     _, fake_ak = _make_pm_sdks(cfg)
-    assert pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak)["source_status"]["ok"] is True
-    seed_val = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak)
+    assert pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak, as_of_date=as_of)["source_status"]["ok"] is True
+    seed_val = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak, as_of_date=as_of)
     assert seed_val["source_status"]["ok"] is True
     csv_path = raw_dir / "cn_sw_val_weekly.csv"
     prog_path = raw_dir / "cn_sw_val_progress.json"
@@ -1941,14 +1951,14 @@ def test_pm_weekly_valuation_missing_csv_recollects_even_with_done_map(
     # 1) When weekly endpoint fails after CSV loss: MUST clear done_map, keep ok=False, n_rows=0
     _, fake_ak_fail = _make_pm_sdks(cfg)
     fake_ak_fail.index_analysis_weekly_sw.side_effect = RuntimeError("weekly down")
-    res_fail = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_fail)
+    res_fail = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_fail, as_of_date=as_of)
     assert res_fail["ok"] is False and res_fail["stale"] is True
     assert res_fail["n_rows"] == 0
     assert json.loads(prog_path.read_text(encoding="utf-8"))["done"] == {}
 
     # 2) When weekly endpoint recovers: MUST actually re-fetch & rebuild cn_sw_val_weekly.csv!
     _, fake_ak_rec = _make_pm_sdks(cfg)
-    res_rec = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_rec)
+    res_rec = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_rec, as_of_date=as_of)
     assert res_rec["ok"] is True
     assert res_rec["weeks_fetched_pairs"] > 0
     assert res_rec["n_rows"] > 0
@@ -2162,7 +2172,9 @@ def test_hkmom_first_run_without_universe_csv(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_close, "session": sub_sess}))
 
     res_mem = hkmom_run.run_daily_job(state_dir=st_mem, output_dir=out_mem)
-    assert res_mem["publish_ok"] is True
+    # Unified daily required-source gate: ggt_list failure blocks BOTH persistence (froze=False)
+    # and publish exit-0 (publish_ok=False), while still computing in-memory without FileNotFoundError.
+    assert res_mem["publish_ok"] is False
     assert res_mem["froze"] is False
     assert not (st_mem / "universe.csv").is_file()
     assert not (st_mem / "frozen_history.json").is_file()

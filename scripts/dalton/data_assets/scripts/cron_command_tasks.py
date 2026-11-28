@@ -8,6 +8,14 @@ DALTON_PYTHON_BIN (falling back to sys.executable) without run.sh venv/pip boots
 retains per-run chart copies under .dalton-runs/<run_id>/attachments/, updates last-run.json
 without touching legacy pending/inflight/receipts files, and writes a preview payload to
 DALTON_OUTBOX_FILE in tmpfs.
+
+配置项（优先读环境变量，其次读 $DALTON_DATA_TASKS_CONFIG 或 <runtime_workspace>/config/data_tasks.env）：
+- DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID  飞书 Tracking 群 chat_id（兼容 DALTON_FEISHU_TRACKING_CHAT_ID）
+- DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID      飞书 Semi 群 chat_id（兼容 DALTON_FEISHU_SEMI_CHAT_ID）
+- DALTON_DATA_TASK_FEISHU_ASIA_TARGET       飞书 Market Alert 目标（兼容 DALTON_FEISHU_ASIA_TARGET，如 chat:oc_...）
+- DALTON_DATA_TASK_DISCORD_DM_TARGET        Discord 个人私聊目标（如 user:<id>）
+- DALTON_DATA_TASK_DISCORD_DEV_CHANNEL      Discord Dev 频道目标（如 channel:<id>）
+- DALTON_DATA_TASK_OPENCLAW_BACKUP_DIR      OpenClaw 备份校验目录（可选，兼容 DALTON_OPENCLAW_BACKUP_DIR）
 """
 from __future__ import annotations
 
@@ -28,12 +36,90 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-WS = Path(__file__).resolve().parents[1]
-TRACKING = 'oc_397207208fb52a0b09969794ef3cd421'
-SEMI = 'oc_a49280092f9c099d429f9412ad038f65'
-ASIA = 'chat:oc_a6b59323f034cb246c80e1b3684e71d1'
-V_DM = 'user:1134818575211839498'
-DEV = 'channel:1481256083589697566'
+
+def _resolve_workspace() -> Path:
+    for var in ('DALTON_DATA_TASK_WORKSPACE', 'DALTON_WORKSPACE', 'OPENCLAW_WORKSPACE', 'WORKDIR'):
+        val = (os.environ.get(var) or '').strip()
+        if val:
+            return Path(val)
+    return Path.cwd()
+
+
+WS = _resolve_workspace()
+
+
+def _read_data_task_config_file(config_path: Path) -> dict[str, str]:
+    if not config_path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in config_path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[len('export '):].strip()
+        if '=' not in line:
+            continue
+        key, val = line.split('=', 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            values[key] = val
+    return values
+
+
+def _get_config_value(*keys: str) -> str:
+    for key in keys:
+        env_val = (os.environ.get(key) or '').strip()
+        if env_val:
+            return env_val
+    cfg_override = (os.environ.get('DALTON_DATA_TASKS_CONFIG') or '').strip()
+    cfg_path = Path(cfg_override) if cfg_override else (_resolve_workspace() / 'config' / 'data_tasks.env')
+    cfg = _read_data_task_config_file(cfg_path)
+    for key in keys:
+        val = cfg.get(key, '').strip()
+        if val:
+            return val
+    return ''
+
+
+def _require_config(primary_key: str, current: str, *fallback_keys: str) -> str:
+    resolved = (current or _get_config_value(primary_key, *fallback_keys)).strip()
+    if not resolved:
+        alias_note = f'（兼容 {" / ".join(fallback_keys)}）' if fallback_keys else ''
+        raise ValueError(f'未配置 {primary_key}{alias_note}（请设置环境变量或在 config/data_tasks.env 中配置）')
+    return resolved
+
+
+TRACKING = _get_config_value('DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID', 'DALTON_FEISHU_TRACKING_CHAT_ID')
+SEMI = _get_config_value('DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID', 'DALTON_FEISHU_SEMI_CHAT_ID')
+ASIA = _get_config_value('DALTON_DATA_TASK_FEISHU_ASIA_TARGET', 'DALTON_FEISHU_ASIA_TARGET')
+V_DM = _get_config_value('DALTON_DATA_TASK_DISCORD_DM_TARGET')
+DEV = _get_config_value('DALTON_DATA_TASK_DISCORD_DEV_CHANNEL')
+
+
+def _require_tracking() -> str:
+    return _require_config('DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID', TRACKING, 'DALTON_FEISHU_TRACKING_CHAT_ID')
+
+
+def _require_semi() -> str:
+    return _require_config('DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID', SEMI, 'DALTON_FEISHU_SEMI_CHAT_ID')
+
+
+def _require_asia() -> str:
+    return _require_config('DALTON_DATA_TASK_FEISHU_ASIA_TARGET', ASIA, 'DALTON_FEISHU_ASIA_TARGET')
+
+
+def _require_v_dm() -> str:
+    return _require_config('DALTON_DATA_TASK_DISCORD_DM_TARGET', V_DM)
+
+
+def _require_dev() -> str:
+    return _require_config('DALTON_DATA_TASK_DISCORD_DEV_CHANNEL', DEV)
+
+
 SIMPLE = {
     'memory-merge-daily': [['bash', 'scripts/merge_daily_memory.sh', str(p / 'memory')]
                            for p in (WS, WS.parent / 'workspace-marco')],
@@ -47,6 +133,18 @@ SIMPLE = {
     'weekly-token-usage': [['python3', 'scripts/token_weekly_usage_tracker.py', '--send', '--to', TRACKING]],
     'us-etf-monthly-flows': [['python3', 'scripts/etf_monthly_flows_tracker.py', '--send', '--to', TRACKING]],
 }
+
+
+def _build_simple_commands(name: str) -> list[list[str]]:
+    if name == 'softbank-nav-monitor':
+        return [['python3', 'scripts/softbank_nav_monitor.py', '--feishu', _require_semi()]]
+    if name == 'tsmc-adr-premium':
+        return [['python3', 'scripts/tsmc_adr_premium.py', '--feishu', _require_semi()]]
+    if name == 'weekly-token-usage':
+        return [['python3', 'scripts/token_weekly_usage_tracker.py', '--send', '--to', _require_tracking()]]
+    if name == 'us-etf-monthly-flows':
+        return [['python3', 'scripts/etf_monthly_flows_tracker.py', '--send', '--to', _require_tracking()]]
+    return SIMPLE[name]
 SPECIAL = ['ai-chain-daily', 'e-watch-daily', 'pt-watchlist-asia', 'pt-watchlist-us',
            'china-2c-hk-monitor', 'china-2c-us-monitor', 'us-topbottom-dm-v23',
            'vol-surface-daily-snapshot', 'hk-momentum-weekly']
@@ -604,11 +702,12 @@ def ai_chain_delivery_spec(obj):
     and target stay the same string the cron adapter would build.
     """
     if not obj.get('sent') and (not obj.get('quiet') or '🟡' in obj.get('summary', '')):
-        if obj['target'] != DEV:
+        dev = _require_dev()
+        if obj['target'] != dev:
             raise ValueError('ai-chain 投递目标与原任务不一致')
-        spec = [{'channel': 'discord', 'target': DEV, 'text': obj['summary'], 'media': None}]
+        spec = [{'channel': 'discord', 'target': dev, 'text': obj['summary'], 'media': None}]
         spec += [
-            {'channel': 'discord', 'target': DEV, 'text': '', 'media': p}
+            {'channel': 'discord', 'target': dev, 'text': '', 'media': p}
             for p in obj['high_cards']
         ]
         return spec
@@ -672,6 +771,7 @@ def _split_feishu_card_chunks(card: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def etf_dry_run_outbox(stdout):
+    tracking = _require_tracking()
     card = parse_etf_dry_run_card(stdout)
     cards = _split_feishu_card_chunks(card)
     return {
@@ -679,11 +779,11 @@ def etf_dry_run_outbox(stdout):
         'task_code': 'T76',
         'job_key': ETF_TASK,
         'channel': 'feishu',
-        'chat_id': TRACKING,
-        'feishu_cards': [{'card': c, 'images': [], 'chat_id': TRACKING} for c in cards],
+        'chat_id': tracking,
+        'feishu_cards': [{'card': c, 'images': [], 'chat_id': tracking} for c in cards],
         'delivery_writeback': {
             'kind': 'etf_discord_mirror',
-            'chat_id': TRACKING,
+            'chat_id': tracking,
             'receive_id_type': 'chat_id',
             'label': 'ETF 月度资金流',
         },
@@ -712,6 +812,7 @@ def _run_workspace_argv(argv, ws_root, accepted=(0,), timeout=540):
 def _write_ai_chain_failure_outbox(exc):
     text = ai_chain_failure_text(exc)
     try:
+        dev = _require_dev()
         ws_root, raw_ws = _resolve_dalton_workspace()
         run_id = _resolve_dalton_run_id()
         run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
@@ -723,13 +824,13 @@ def _write_ai_chain_failure_outbox(exc):
         'task_code': 'T20',
         'job_key': AI_CHAIN_TASK,
         'channel': 'discord',
-        'target': DEV,
+        'target': dev,
         'text': text,
         'notify_on_failure': True,
         'items': [{
             'index': 0,
             'channel': 'discord',
-            'target': DEV,
+            'target': dev,
             'text': text,
             'preserve_exact_text': True,
         }],
@@ -813,13 +914,14 @@ def _run_dalton_ai_chain_preview_body():
                 item['chart_bytes'] = chart_bytes
                 item['chart_sha256'] = chart_sha
             outbox_items.append(item)
+        dev = _require_dev()
         _atomic_write_json(staging, {
             'schema_version': 1,
             'task_code': 'T20',
             'job_key': AI_CHAIN_TASK,
             'run_id': run_id,
             'channel': 'discord',
-            'target': DEV,
+            'target': dev,
             'text': '\n\n'.join(item['text'] for item in outbox_items if item.get('text')),
             'items': outbox_items,
             'delivery_writeback': {
@@ -844,9 +946,10 @@ def run_dalton_etf_preview():
         lock_fd = None
         try:
             lock_fd = _acquire_preview_lock(ws_root, ETF_TASK)
+            tracking = _require_tracking()
             python_bin = _resolve_dalton_python_bin()
             result = _run_workspace_argv(
-                [python_bin, 'scripts/etf_monthly_flows_tracker.py', '--dry-run', '--to', TRACKING],
+                [python_bin, 'scripts/etf_monthly_flows_tracker.py', '--dry-run', '--to', tracking],
                 ws_root,
             )
             _atomic_write_json(staging, etf_dry_run_outbox(result.stdout or ''))
@@ -988,6 +1091,7 @@ def run_dalton_us_topbottom_preview() -> int:
         )
         attachments_dir.mkdir(parents=True, exist_ok=True)
 
+        v_dm = _require_v_dm()
         collected: list[dict[str, Any]] = []
         errors: list[str] = []
         for skill, cli_rel_path in US_TOPBOTTOM_COLLECTORS:
@@ -1008,7 +1112,7 @@ def run_dalton_us_topbottom_preview() -> int:
                     'index': idx,
                     'skill': skill,
                     'channel': 'discord',
-                    'target': V_DM,
+                    'target': v_dm,
                     'text': msg_text,
                     'retained_chart': retained_chart,
                     'media_rel_run': f'attachments/{idx}{suffix}',
@@ -1053,14 +1157,14 @@ def run_dalton_us_topbottom_preview() -> int:
             total_fail_text = '顶部和底部监控均失败：\n' + error
             plan_items.append({
                 'channel': 'discord',
-                'target': V_DM,
+                'target': v_dm,
                 'text': total_fail_text,
             })
             outbox_items.append({
                 'index': 0,
                 'skill': None,
                 'channel': 'discord',
-                'target': V_DM,
+                'target': v_dm,
                 'text': total_fail_text,
                 'media': None,
                 'delivered': False,
@@ -1093,7 +1197,7 @@ def run_dalton_us_topbottom_preview() -> int:
             'delivered': False,
             'delivery_status': 'failed' if error else 'preview_only',
             'channel': 'discord',
-            'target': V_DM,
+            'target': v_dm,
             'text': '\n\n'.join(item['text'] for item in outbox_items if item.get('text')),
             'error': error,
             'items': outbox_items,
@@ -1128,13 +1232,14 @@ def e_watch_daily_delivery_spec(obj):
     Each ``messages`` entry is its own message. The full-text file is one more
     message after those, even when ``messages`` is empty.
     """
+    v_dm = _require_v_dm()
     spec = [
-        {'channel': 'discord', 'target': V_DM, 'text': text, 'media': None}
+        {'channel': 'discord', 'target': v_dm, 'text': text, 'media': None}
         for text in obj['messages']
     ]
     spec.append({
         'channel': 'discord',
-        'target': V_DM,
+        'target': v_dm,
         'text': E_WATCH_ATTACHMENT_TEXT,
         'media': obj['report_file'],
     })
@@ -1147,11 +1252,12 @@ def e_watch_daily_failure_text(exc):
 
 def pt_watchlist_delivery_spec(obj):
     """One Feishu message, plus a second only when ``jepq_message`` is truthy."""
-    if obj['feishu_target'] != ASIA:
+    asia = _require_asia()
+    if obj['feishu_target'] != asia:
         raise ValueError('投递目标与原任务不一致，请检查脚本配置')
-    spec = [{'channel': 'feishu', 'target': ASIA, 'text': obj['main_message'], 'media': None}]
+    spec = [{'channel': 'feishu', 'target': asia, 'text': obj['main_message'], 'media': None}]
     if obj.get('jepq_message'):
-        spec.append({'channel': 'feishu', 'target': ASIA, 'text': obj['jepq_message'], 'media': None})
+        spec.append({'channel': 'feishu', 'target': asia, 'text': obj['jepq_message'], 'media': None})
     return spec
 
 
@@ -1159,7 +1265,8 @@ def china_2c_delivery_spec(raw):
     """One Feishu message: the monitor's stdout, including its trailing newline."""
     if not raw.strip():
         raise ValueError('消费监控输出为空')
-    return [{'channel': 'feishu', 'target': ASIA, 'text': raw, 'media': None}]
+    asia = _require_asia()
+    return [{'channel': 'feishu', 'target': asia, 'text': raw, 'media': None}]
 
 
 def _monitor_obj(raw, context='采集输出'):
@@ -1246,6 +1353,7 @@ def _write_e_watch_failure_outbox(exc):
     """Stage the failure DM. Any error here is ignored so the caller can still print it."""
     text = e_watch_daily_failure_text(exc)
     try:
+        v_dm = _require_v_dm()
         ws_root, raw_ws = _resolve_dalton_workspace()
         run_id = _resolve_dalton_run_id()
         run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
@@ -1255,12 +1363,12 @@ def _write_e_watch_failure_outbox(exc):
             task_code='T35',
             job_key=E_WATCH_DAILY_TASK,
             channel='discord',
-            target=V_DM,
+            target=v_dm,
             run_id=run_id,
             items=[{
                 'index': 0,
                 'channel': 'discord',
-                'target': V_DM,
+                'target': v_dm,
                 'text': text,
                 'preserve_exact_text': True,
             }],
@@ -1302,12 +1410,13 @@ def _run_dalton_e_watch_daily_preview_body():
         items = stage_delivery_items(
             spec, ws_root, raw_ws, run_dir, allowed_suffixes=E_WATCH_REPORT_SUFFIXES,
         )
+        v_dm = _require_v_dm()
         _write_staged_monitor_outbox(
             staging,
             task_code='T35',
             job_key=E_WATCH_DAILY_TASK,
             channel='discord',
-            target=V_DM,
+            target=v_dm,
             run_id=run_id,
             items=items,
         )
@@ -1352,7 +1461,7 @@ def _run_dalton_pt_watchlist_preview_body(task):
             task_code=PT_TASK_CODES[task],
             job_key=task,
             channel='feishu',
-            target=ASIA,
+            target=_require_asia(),
             run_id=run_id,
             items=items,
         )
@@ -1397,7 +1506,7 @@ def _run_dalton_china_2c_preview_body(task):
             task_code=CHINA_TASK_CODES[task],
             job_key=task,
             channel='feishu',
-            target=ASIA,
+            target=_require_asia(),
             run_id=run_id,
             items=items,
         )
@@ -1448,7 +1557,7 @@ class Runner:
         name = self.name
         items, text, error, after = [], 'NO_REPLY', '', None
         if name in SIMPLE:
-            outputs = [self.run(c) for c in SIMPLE[name]]
+            outputs = [self.run(c) for c in _build_simple_commands(name)]
             raw = '\n'.join(outputs)
             if name == 'memory-merge-daily':
                 for output in outputs:
@@ -1485,9 +1594,10 @@ class Runner:
             path = WS / 'skills/ai-chain/state/daily_push.json'
             obj = json.loads(path.read_text())
             spec = ai_chain_delivery_spec(obj)
+            dev = _require_dev() if spec else ''
             items = [
-                message('discord', DEV, entry['text'], entry['media']) if entry.get('media')
-                else message('discord', DEV, entry['text'])
+                message('discord', dev, entry['text'], entry['media']) if entry.get('media')
+                else message('discord', dev, entry['text'])
                 for entry in spec
             ]
             if items:
@@ -1498,13 +1608,14 @@ class Runner:
             today = datetime.now(ZoneInfo('Asia/Hong_Kong')).date()
             if (today - asof).days > 7 or asof > today:
                 raise ValueError('港股动量数据日期异常：' + obj['asof'])
-            items = [message('feishu', TRACKING, media=WS / 'temp/hk_momentum_1y.png')]
+            items = [message('feishu', _require_tracking(), media=WS / 'temp/hk_momentum_1y.png')]
         elif name == 'us-topbottom-dm-v23':
+            v_dm = _require_v_dm()
             results, errors = [], []
             for skill in ('us-bottom-monitor', 'us-top-monitor'):
                 try:
                     obj = self.obj(['bash', f'skills/{skill}/run.sh', '--json', 'run'])
-                    results.append(message('discord', V_DM, obj['feishu_message'], obj['chart']))
+                    results.append(message('discord', v_dm, obj['feishu_message'], obj['chart']))
                 except (RuntimeError, ValueError) as exc:
                     errors.append(f'{skill}：{exc}')
             if errors:
@@ -1512,7 +1623,7 @@ class Runner:
                 if results:
                     results[-1]['text'] += '\n⚠️ 另一份未取得：' + error
                 else:
-                    results = [message('discord', V_DM, '顶部和底部监控均失败：\n' + error)]
+                    results = [message('discord', v_dm, '顶部和底部监控均失败：\n' + error)]
             items = results
         elif name == 'vol-surface-daily-snapshot':
             results, gaps = [], []
@@ -1613,15 +1724,21 @@ def main():
         except Exception as exc:
             error = f'{args.task} 执行失败：{exc}'
             if args.task == 'openclaw-config-backup':
-                dest = Path.home() / 'Library/CloudStorage/GoogleDrive-richard.lu.everflowinv@gmail.com/我的云端硬盘/OpenClawBackup'
-                yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
-                exists = (dest / f'openclaw-config-{yesterday}.tar.gz.enc').exists()
-                error += '\n昨日备份文件：' + ('存在，尚未验证可还原' if exists else '未找到')
+                backup_dir = _get_config_value('DALTON_DATA_TASK_OPENCLAW_BACKUP_DIR', 'DALTON_OPENCLAW_BACKUP_DIR')
+                if backup_dir:
+                    dest = Path(backup_dir).expanduser()
+                    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+                    exists = (dest / f'openclaw-config-{yesterday}.tar.gz.enc').exists()
+                    error += '\n昨日备份文件：' + ('存在，尚未验证可还原' if exists else '未找到')
             print(error)
             if 'plan' not in runner.state:
-                route = {'e-watch-daily': ('discord', V_DM), 'ai-chain-daily': ('discord', DEV),
-                         'hk-momentum-weekly': ('feishu', TRACKING)}.get(args.task)
-                if route and not is_dalton_mode() and not os.environ.get('PYTEST_CURRENT_TEST'):
+                route_map = {
+                    'e-watch-daily': ('discord', V_DM or _get_config_value('DALTON_DATA_TASK_DISCORD_DM_TARGET')),
+                    'ai-chain-daily': ('discord', DEV or _get_config_value('DALTON_DATA_TASK_DISCORD_DEV_CHANNEL')),
+                    'hk-momentum-weekly': ('feishu', TRACKING or _get_config_value('DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID', 'DALTON_FEISHU_TRACKING_CHAT_ID')),
+                }
+                route = route_map.get(args.task)
+                if route and route[1] and not is_dalton_mode() and not os.environ.get('PYTEST_CURRENT_TEST'):
                     try:
                         send(message(*route, error))
                     except Exception as send_error:

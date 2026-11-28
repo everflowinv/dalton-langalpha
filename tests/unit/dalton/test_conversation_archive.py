@@ -1169,7 +1169,15 @@ def test_integration_conftest_sessionstart_test_db_guard(
     before any DB connection or destructive SQL when explicit test DB config is missing or when
     the configured DB name does not end with `_test`.
     """
-    from tests.integration.dalton import conftest as dalton_int_conftest
+    had_dotenv_disabled = "PYTHON_DOTENV_DISABLED" in os.environ
+    prev_dotenv_disabled = os.environ.get("PYTHON_DOTENV_DISABLED")
+    try:
+        from tests.integration.dalton import conftest as dalton_int_conftest
+    finally:
+        if had_dotenv_disabled and prev_dotenv_disabled is not None:
+            os.environ["PYTHON_DOTENV_DISABLED"] = prev_dotenv_disabled
+        else:
+            os.environ.pop("PYTHON_DOTENV_DISABLED", None)
 
     mock_session = create_autospec(pytest.Session, instance=True)
 

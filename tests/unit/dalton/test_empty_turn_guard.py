@@ -212,8 +212,8 @@ class TestEmptyTurnGuard:
         ):
             result = mw.wrap_model_call(request, handler)
 
-        # 1 initial + 2 retries, then the last reply is replaced outright.
-        assert handler.call_count == 3
+        # Non-refusal empty_reply shares a 1-retry sub-budget (§6.3): 1 initial + 1 retry = 2 calls.
+        assert handler.call_count == 2
         assert len(result.result) == 1
         assert result.result[0].content == _EMPTY_REPLY_NOTICE
         assert any("65c4641e" in record.message for record in caplog.records)
@@ -522,7 +522,7 @@ class TestEmptyTurnGuard:
             mw.wrap_model_call(request, handler)
 
         retrying = [r for r in caplog.records if "retrying" in r.message]
-        assert len(retrying) == 2
+        assert len(retrying) == 1
         assert not any("(3/2)" in r.message for r in caplog.records)
 
     def test_consecutive_same_kind_non_sanitized_retry_replaces_reply_with_latest(self, monkeypatch):
@@ -548,11 +548,11 @@ class TestEmptyTurnGuard:
         req_empty = _make_request([HumanMessage(content="hello")])
         empty1 = AIMessage(
             content=[{"type": "thinking", "thinking": "t1", "signature": "s1"}],
-            response_metadata={"stop_reason": "end_turn", "model_name": "claude-sonnet-5-5"},
+            response_metadata={"stop_reason": "refusal", "model_name": "claude-sonnet-5-5"},
         )
         empty2 = AIMessage(
             content=[{"type": "thinking", "thinking": "t2", "signature": "s2"}],
-            response_metadata={"stop_reason": "end_turn", "model_name": "claude-sonnet-5-5"},
+            response_metadata={"stop_reason": "refusal", "model_name": "claude-sonnet-5-5"},
         )
         mw.wrap_model_call(req_empty, MagicMock(side_effect=[_resp(empty1), _resp(empty2), _resp(good)]))
         assert req_empty.messages[-2] is empty2

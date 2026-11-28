@@ -61,6 +61,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     queryKey: publicMode ? ['dalton', 'monitors', 'public', slug] : queryKeys.daltonMonitors.detail(slug),
     queryFn: () => (publicMode ? getPublicMonitorDetail(slug) : getMonitorDetail(slug)),
     staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
     retry: (count, err) => {
       const status = apiErrorStatus(err);
       if (status === 403 || status === 404) return false;
@@ -126,6 +128,11 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             expiresIn: next.expires_in,
             receivedAt: Date.now(),
           });
+          const curVerified = detail.monitor.last_verified_seq ?? detail.monitor.published_seq;
+          const nextVerified = next.last_verified_seq ?? next.published_seq;
+          if (typeof nextVerified === 'number' && nextVerified > curVerified) {
+            void detailQuery.refetch();
+          }
         })
         .catch(() => {
           void detailQuery.refetch();
@@ -134,9 +141,12 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     return () => window.clearTimeout(timer);
   }, [publicMode, activeGrant, detail, slug, detailQuery]);
 
+  const latestVerifiedSeq = monitor
+    ? (monitor.last_verified_seq ?? monitor.published_seq)
+    : undefined;
   const effectiveSeq = publicMode
-    ? (monitor?.published_seq || 1)
-    : (selectedSeq ?? (monitor?.published_seq || detail?.versions[0]?.seq || 1));
+    ? (latestVerifiedSeq || 1)
+    : (selectedSeq ?? (latestVerifiedSeq || detail?.versions[0]?.seq || 1));
   const selectedVersion = !publicMode
     ? detail?.versions.find((v) => v.seq === effectiveSeq)
     : undefined;
@@ -408,7 +418,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         </div>
       </header>
 
-      {monitor.last_publish_error && monitor.last_publish_failed_at && (
+      {monitor.last_publish_error && monitor.last_publish_failed_at ? (
         <div
           data-testid="monitor-publish-error"
           role="status"
@@ -429,7 +439,25 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             )}
           </span>
         </div>
-      )}
+      ) : monitor.has_recent_publish_issue ? (
+        <div
+          data-testid="monitor-publish-issue"
+          role="status"
+          className="flex items-start gap-2 border-b px-4 py-1.5 text-xs whitespace-normal break-words"
+          style={{
+            borderColor: 'var(--color-border-muted)',
+            backgroundColor: 'var(--color-bg-subtle, transparent)',
+            color: 'var(--color-warning)',
+          }}
+        >
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 whitespace-normal break-words leading-relaxed">
+            {t('monitors:recentPublishIssue', {
+              defaultValue: '最近一次更新未生效，当前展示上一可用版本',
+            })}
+          </span>
+        </div>
+      ) : null}
 
       {/* DALTON-HOOK(monitors): expose docState on monitor host and wire BridgedFrame expectedDocKey & onDocStateChange */}
       <div className="monitors-frame-host" data-doc-state={docState.kind}>

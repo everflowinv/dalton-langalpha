@@ -19,10 +19,6 @@ import psycopg
 import pytest
 
 from src.dalton.data_jobs.batch3_messages import (
-    A_SHARE_FEISHU_DM,
-    E_WATCH_DISCORD_DM,
-    FDE_WEEKLY_DISCORD_TARGET,
-    SEMI_BOTTOM_DISCORD_TARGET,
     SUPPRESS_OUTBOX,
     adjust_batch3_payload,
     apply_confirmed_delivery_writeback,
@@ -204,7 +200,20 @@ def _overlay():
     spec = importlib.util.spec_from_file_location("batch4_cron_command_tasks_overlay", OVERLAY_SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    overrides = {
+        "DALTON_DATA_TASK_FEISHU_ASIA_TARGET": ASIA,
+        "DALTON_DATA_TASK_DISCORD_DM_TARGET": V_DM,
+    }
+    prev = {k: os.environ.get(k) for k in overrides}
+    os.environ.update(overrides)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
     return module
 
 
@@ -427,14 +436,20 @@ def test_china_stdout_keeps_the_trailing_newline(tmp_path: Path) -> None:
     assert plan.items[0].text == raw
 
 
-def test_announce_stdout_matches_openclaw_and_drops_silence(tmp_path: Path) -> None:
+def test_announce_stdout_matches_openclaw_and_drops_silence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a_share_target = FEISHU_DM.removeprefix("feishu:")
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DM_TARGET", V_DM)
+    monkeypatch.setenv("DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET", a_share_target)
     intraday = "⚡ **e-watch 盘中｜11/12 HKT**　用的是没收盘的日线\n第二行\n"
     saved = _persist(tmp_path / "intra", "e-watch-intraday", intraday)
     assert saved is not None
     assert saved["text"] == intraday
     assert saved["feishu_message"] == intraday
     assert saved["channel"] == "discord"
-    assert saved["target"] == E_WATCH_DISCORD_DM == V_DM
+    assert saved["target"] == V_DM
     assert saved["route_target"] == DISCORD_DM
     assert saved["format"] == "text"
     assert saved["preserve_exact_text"] is True
@@ -455,7 +470,7 @@ def test_announce_stdout_matches_openclaw_and_drops_silence(tmp_path: Path) -> N
     assert share is not None
     assert share["text"] == A_SHARE_FAIL
     assert share["channel"] == "feishu"
-    assert share["target"] == A_SHARE_FEISHU_DM
+    assert share["target"] == a_share_target
     assert share["route_target"] == FEISHU_DM
     assert share["notify_on_failure"] is True
     assert "delivery_writeback" not in share
@@ -527,7 +542,11 @@ def test_preview_outbox_is_kept_when_stdout_is_no_reply(tmp_path: Path) -> None:
     ) is None
 
 
-def test_batch3_announce_rules_stay_unchanged() -> None:
+def test_batch3_announce_rules_stay_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    semi_bottom_target = "channel:100000000000000003"
+    fde_dev_target = "channel:100000000000000002"
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL", semi_bottom_target)
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DEV_CHANNEL", fde_dev_target)
     assert adjust_batch3_payload(
         job_key="semi-bottom-checklist-1030et",
         payload=None,
@@ -540,7 +559,7 @@ def test_batch3_announce_rules_stay_unchanged() -> None:
     )
     assert isinstance(kept, dict)
     assert kept["channel"] == "discord"
-    assert kept["target"] == SEMI_BOTTOM_DISCORD_TARGET
+    assert kept["target"] == semi_bottom_target
     assert "notify_on_failure" not in kept
     assert "route_target" not in kept
 
@@ -552,7 +571,7 @@ def test_batch3_announce_rules_stay_unchanged() -> None:
     )
     assert isinstance(failed, dict)
     assert failed["notify_on_failure"] is True
-    assert failed["target"] == FDE_WEEKLY_DISCORD_TARGET
+    assert failed["target"] == fde_dev_target
     plain = adjust_batch3_payload(
         job_key="fde-hiring-weekly-report",
         payload=None,
@@ -634,7 +653,7 @@ async def test_personal_targets_use_the_binding_check(monkeypatch: pytest.Monkey
     assert is_valid_dalton_personal_target(FEISHU_CHAT) is False
     assert is_valid_dalton_notify_target(FEISHU_CHAT) is True
     assert canonical_route_target("discord", V_DM) == DISCORD_DM
-    assert canonical_route_target("feishu", A_SHARE_FEISHU_DM) == FEISHU_DM
+    assert canonical_route_target("feishu", FEISHU_DM.removeprefix("feishu:")) == FEISHU_DM
     assert canonical_route_target("feishu", ASIA) == FEISHU_CHAT
     assert canonical_route_target("feishu", "oc_a6b59323f034cb246c80e1b3684e71d1") == FEISHU_CHAT
 
@@ -779,6 +798,8 @@ def _child_env(workspace: Path, staging: Path, job_key: str) -> dict[str, str]:
     assert env["PYTHONPATH"] == str(CHILD_SITE_DIR)
     assert "src" not in env["PYTHONPATH"].split(os.pathsep)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["DALTON_DATA_TASK_FEISHU_ASIA_TARGET"] = ASIA
+    env["DALTON_DATA_TASK_DISCORD_DM_TARGET"] = V_DM
     return env
 
 

@@ -23,6 +23,11 @@ export interface ContentSegmentRecord extends Partial<Omit<NotificationSegment, 
   order: number;
   /** Text-only: where each live chunk ended (see `session/stream/textChunks`). */
   chunks?: TextChunkMark;
+  // DALTON-HOOK(deliverable-text): preserve text phase, server messageId, continuation link, and per-segment captured images
+  phase?: 'commentary' | 'final_answer';
+  messageId?: string;
+  continuedFromMessageId?: string;
+  capturedImages?: Record<string, string>;
   reasoningId?: string;
   toolCallId?: string;
   subagentId?: string;

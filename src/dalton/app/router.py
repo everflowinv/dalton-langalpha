@@ -3546,6 +3546,19 @@ async def dalton_notify_test_endpoint(
     return await send_dalton_notify_test(user_id, body.target)
 
 
+@router.get("/admin/diagnostics/redis")
+@handle_api_exceptions("get redis diagnostics", logger)
+async def get_admin_redis_diagnostics_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.auth_guards import require_admin_member
+    from src.dalton.observability.redis_diagnostics import aggregate_redis_diagnostics
+
+    await require_admin_member(user_id)
+    return aggregate_redis_diagnostics(include_live_worker=False)
+
+
 @router.get("/search")
 @handle_api_exceptions("global search", logger)
 async def global_search_endpoint(

@@ -370,6 +370,8 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     attempt_id: str | None = None
     reclaim_stale_attempt_id: str | None = None
     reclaim_stale_source_attempt_id: str | None = None
+    retry_dedup_by_target: bool = False
+    payload_digest: str | None = None
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -1531,6 +1533,8 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             attempt_id=body.attempt_id,
             reclaim_stale_attempt_id=body.reclaim_stale_attempt_id,
             reclaim_stale_source_attempt_id=body.reclaim_stale_source_attempt_id,
+            retry_dedup_by_target=body.retry_dedup_by_target,
+            payload_digest=body.payload_digest,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )

@@ -143,6 +143,8 @@ class MonitorRecord:
     last_publish_run_id: str | None = None
     last_publish_error: str | None = None
     last_publish_failed_at: datetime | None = None
+    last_verified_seq: int | None = None
+    last_verified_at: datetime | None = None
     # Joined fields from share_links / users / dalton_monitor_data
     artifact_code: str | None = None
     workspace_id: str | None = None
@@ -152,15 +154,25 @@ class MonitorRecord:
     data_as_of: datetime | None = None
     member_user_ids: tuple[str, ...] = field(default_factory=tuple)
 
+    @property
+    def effective_seq(self) -> int:
+        # Prefer the higher of last_verified_seq and published_seq so rolling upgrades
+        # (where an old worker advances published_seq after d061 backfill) never regress visitors.
+        return max(int(self.last_verified_seq or 0), int(self.published_seq or 0))
+
 
 @dataclass(frozen=True)
 class MonitorDataEntry:
     monitor_id: str
     data_key: str
     payload: Any
-    as_of: datetime
-    sha256: str
+    as_of: datetime | None
+    sha256: str | None
     updated_at: datetime
+    attempt_seq: int = 0
+    is_stale: bool = False
+    last_attempt_at: datetime | None = None
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,8 +236,12 @@ class MonitorDataPutRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    data: Any
+    data: Any = None
     as_of: datetime | None = None
+    attempt_seq: int | None = Field(default=None, ge=0)
+    is_stale: bool = False
+    error: str | None = Field(default=None, max_length=2000)
+    last_attempt_at: datetime | None = None
 
 
 class DataJobMonitorPublishRequest(BaseModel):

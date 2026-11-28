@@ -367,6 +367,11 @@ export interface AgentSendRequest {
   reply?: boolean;
   new_thread?: boolean;
   automation_execution_id?: string | null;
+  idempotency_key?: string | null;
+  retry_dedup_by_target?: boolean;
+  payload_digest?: string | null;
+  source_message_id?: string | null;
+  captured_images?: Record<string, string> | null;
 }
 
 export interface TurnDeliverableItem {

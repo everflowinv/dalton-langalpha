@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { zhCN, lookup } from '@/test/catalogs';
+
+// Pin self-hosted (oss) mode so a prior test file's top-level `vi.stubEnv('VITE_HOST_MODE', 'platform')`
+// in the shared vmThreads worker (or a local web/.env) never flips `isPlatformMode` to true.
+vi.mock('@/config/hostMode', () => ({ HOST_MODE: 'oss', isPlatformMode: false }));
+
 import {
   EVERFLOW_DEFAULT_CAPABILITY_SET,
   CORE_DEFAULT_CAPABILITY_SET,

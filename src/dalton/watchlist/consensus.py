@@ -27,7 +27,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -61,6 +61,15 @@ _REDIS_WRITE_TIMEOUT_SECONDS = 2.0
 
 # 52/53-week fiscal calendars can shift fiscal year end date by up to ~10 days year over year.
 _FISCAL_YEAR_MATCH_TOLERANCE_DAYS = 15
+
+# Cross-validation threshold for ADR share-unit verification using Yahoo `info["forwardEps"]`
+# (quote currency, per quote unit). Candidate hypotheses are "per ADS" (target=1.0) and
+# "per ordinary share" (target=verified N when N != 1.0). A hypothesis is compatible only if
+# EVERY positive FY EPS from the same source satisfies |ln(r / target)| <= ln(1.5), and it is
+# accepted only when EXACTLY ONE hypothesis is compatible (disagreement across FY1/FY2 or
+# overlap where both hypotheses fit fails closed to `unit_unverified`).
+_ADR_CROSS_CHECK_LOG_TOLERANCE = math.log(1.5)
+_UNSET_FORWARD_EPS: Any = object()
 
 VALUATION_STATUSES: frozenset[str] = frozenset(
     {
@@ -661,9 +670,16 @@ class RawConsensusRecord:
     last_reported_fy_end: str | None = None
     fy1_unit_unverified: bool = False
     fy2_unit_unverified: bool = False
+    provider_forward_eps_per_quote_unit: float | None = None
+    fy1_provider: str | None = None
+    fy2_provider: str | None = None
+    provider_forward_eps_source: str | None = None
+    legacy_missing_forward_eps_key: bool = field(default=False, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("legacy_missing_forward_eps_key", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RawConsensusRecord:
@@ -693,7 +709,53 @@ class RawConsensusRecord:
             else None,
             fy1_unit_unverified=bool(data.get("fy1_unit_unverified", False)),
             fy2_unit_unverified=bool(data.get("fy2_unit_unverified", False)),
+            provider_forward_eps_per_quote_unit=_finite_float(
+                data.get("provider_forward_eps_per_quote_unit")
+            ),
+            fy1_provider=str(data["fy1_provider"]).strip()
+            if data.get("fy1_provider")
+            else None,
+            fy2_provider=str(data["fy2_provider"]).strip()
+            if data.get("fy2_provider")
+            else None,
+            provider_forward_eps_source=str(data["provider_forward_eps_source"]).strip()
+            if data.get("provider_forward_eps_source")
+            else None,
+            legacy_missing_forward_eps_key=(
+                "provider_forward_eps_per_quote_unit" not in data
+            ),
         )
+
+
+def _record_year_provider(record: RawConsensusRecord, slot: int) -> str | None:
+    """Return effective source provider for FY1 (slot=1) or FY2 (slot=2)."""
+    per_year = record.fy1_provider if slot == 1 else record.fy2_provider
+    return per_year or record.provider
+
+
+def _record_forward_eps_for_source(
+    record: RawConsensusRecord, source: str | None
+) -> float | None:
+    """Return positive forwardEps anchor only if it belongs to *source*."""
+    fwd = _positive_float(record.provider_forward_eps_per_quote_unit)
+    if fwd is None:
+        return None
+    anchor_source = record.provider_forward_eps_source or record.provider
+    if anchor_source == source:
+        return fwd
+    return None
+
+
+def _can_cross_validate_adr(record: RawConsensusRecord) -> bool:
+    """Return True if *record* has positive provider forwardEps matching at least one positive FY EPS from the same source."""
+    if _positive_float(record.provider_forward_eps_per_quote_unit) is None:
+        return False
+    for slot, raw_eps in ((1, record.fy1_eps), (2, record.fy2_eps)):
+        if _positive_float(raw_eps) is None:
+            continue
+        if _record_forward_eps_for_source(record, _record_year_provider(record, slot)) is not None:
+            return True
+    return False
 
 
 def _resolve_adr_conversion(
@@ -703,44 +765,193 @@ def _resolve_adr_conversion(
     est_ccy: str | None,
     q_ccy: str | None,
     row_adr_ratio: float | None,
-) -> tuple[bool, float | None, bool]:
-    """Resolve ``(unit_verified, shares_per_quote_unit, needs_fx)`` for an ADR security.
+    fx_rate: float | None = None,
+    est_scale: float = 1.0,
+    eps_values: tuple[float | None, ...] | None = None,
+    forward_eps: Any = _UNSET_FORWARD_EPS,
+) -> tuple[bool, float | None, bool, str | None]:
+    """Resolve ``(unit_verified, shares_per_quote_unit, needs_fx, method)`` for an ADR security.
 
     Strict share-unit rule (§6.3):
     1. Provider explicitly attests ``eps_per_quote_unit_confirmed=True`` (EPS is per ADR)
-       with ``est_ccy == q_ccy`` -> 1:1, no FX needed.
-    2. Coverage row has explicit ``aliases.adr_ratio`` / ``extra.adr_ratio`` -> apply ratio
-       (+ FX if ``est_ccy != q_ccy``).
-    3. Curated ``VERIFIED_ADR_SHARES_PER_UNIT`` has a verified record for ``symbol`` AND:
-       - ``shares_per_adr == 1.0`` (1:1 ADR -> safe regardless of currency, + FX if ``est_ccy != q_ccy``), OR
-       - ``est_ccy == entry.underlying_currency`` AND ``est_ccy != q_ccy`` (foreign reporting currency
-         proves EPS is per ordinary share -> multiply by verified ratio and apply FX).
-       When ``shares_per_adr != 1.0`` and ``est_ccy == q_ccy`` without explicit confirmation,
-       we cannot prove whether EPS is per ordinary share or already per ADS -> ``unit_unverified``.
-    4. Otherwise -> ``(False, None, False)`` (``unit_unverified``, displays ``—``).
+       with ``est_ccy == q_ccy`` -> 1:1, no FX needed (``method="provider_confirmed"``).
+    2. Legacy cached ADR records missing the ``provider_forward_eps_per_quote_unit`` key
+       fail closed to ``unit_unverified`` (including 1:1 table entries and explicit
+       ``adr_ratio=1``) until refreshed.
+    3. Verified 1:1 ADR (explicit ``row_adr_ratio == 1.0``, or curated
+       ``VERIFIED_ADR_SHARES_PER_UNIT`` with ``shares_per_adr == 1.0`` and no conflicting
+       row override) -> 1:1 (+ FX if ``est_ccy != q_ccy``; ``method="explicit_ratio"`` or
+       ``"verified_table"``). Since 1 ADS = 1 ordinary share, there is no share-unit ambiguity.
+    4. Cross-validation against provider per-quote-unit forward EPS
+       (``record.provider_forward_eps_per_quote_unit``, e.g. Yahoo ``info["forwardEps"]`` in
+       quote currency per ADS) when positive forward EPS, positive FY EPS from the same source,
+       and FX (when ``est_ccy != q_ccy``) are available:
+       - Convert positive FY EPS into quote currency and compute
+         ``r = forward_eps / (eps_major * eff_fx)``.
+       - Candidate hypotheses:
+         * "per ADS": target ratio = ``1.0`` -> ``shares_per_quote_unit = 1.0``
+           (``method="cross_check_per_ads"``).
+         * "per ordinary share": target ratio = verified ``N`` (from ``row_adr_ratio`` if
+           present, else ``VERIFIED_ADR_SHARES_PER_UNIT``) -> ``shares_per_quote_unit = N``
+           (``method="cross_check_per_ordinary"``). Omitted when no verified ``N`` exists or ``N == 1.0``.
+       - A hypothesis ``H`` is eligible only if EVERY comparable positive FY EPS satisfies
+         ``d_y = |ln(r_y / target_H)| <= ln(1.5)``. Its score is ``S_H = sum(d_y ** 2)``.
+       - If exactly one hypothesis is eligible, adopt it. If both hypotheses are eligible,
+         if two fiscal years have different nearest hypotheses fail closed to ``unit_unverified``;
+         otherwise adopt the lower-scoring hypothesis only when ``S_best == 0`` or
+         ``S_other >= 2 * S_best``; otherwise (or when neither is eligible) fail closed to
+         ``unit_unverified``.
+    5. Fallback when cross-validation cannot run (no ``forwardEps``, no FX, or no positive EPS):
+       - Explicit coverage-row ``aliases.adr_ratio`` / ``extra.adr_ratio`` -> apply ratio
+         (+ FX if ``est_ccy != q_ccy``; ``method="explicit_ratio"``).
+       - Otherwise -> ``(False, None, False, None)`` (``unit_unverified``, displays ``—``).
     """
     sym = _canonical_symbol(symbol)
-    if record.eps_per_quote_unit_confirmed and est_ccy is not None and est_ccy == q_ccy:
-        return True, 1.0, False
+    needs_fx = bool(est_ccy and q_ccy and est_ccy != q_ccy)
 
-    if row_adr_ratio is not None:
-        needs_fx = bool(est_ccy and q_ccy and est_ccy != q_ccy)
-        return True, float(row_adr_ratio), needs_fx
+    if record.eps_per_quote_unit_confirmed and est_ccy is not None and est_ccy == q_ccy:
+        return True, 1.0, False, "provider_confirmed"
+
+    # Legacy cached ADR records missing `provider_forward_eps_per_quote_unit` must wait for
+    # background refresh (including 1:1 table and explicit `adr_ratio=1`).
+    if record.legacy_missing_forward_eps_key:
+        return False, None, False, None
 
     entry = VERIFIED_ADR_SHARES_PER_UNIT.get(sym)
-    if entry is not None:
-        if entry.shares_per_adr == 1.0:
-            needs_fx = bool(est_ccy and q_ccy and est_ccy != q_ccy)
-            return True, 1.0, needs_fx
-        if (
-            est_ccy is not None
-            and q_ccy is not None
-            and est_ccy == entry.underlying_currency
-            and est_ccy != q_ccy
-        ):
-            return True, float(entry.shares_per_adr), True
+    verified_n: float | None = (
+        float(row_adr_ratio)
+        if row_adr_ratio is not None
+        else (float(entry.shares_per_adr) if entry is not None else None)
+    )
 
-    return False, None, False
+    # 1:1 ADR has identical per-ADS and per-ordinary units regardless of estimate currency.
+    if row_adr_ratio is not None and float(row_adr_ratio) == 1.0:
+        return True, 1.0, needs_fx, "explicit_ratio"
+    if row_adr_ratio is None and entry is not None and entry.shares_per_adr == 1.0:
+        return True, 1.0, needs_fx, "verified_table"
+
+    # Cross-validate against provider per-quote-unit forwardEps when FX (if needed) is available.
+    raw_fwd = (
+        record.provider_forward_eps_per_quote_unit
+        if forward_eps is _UNSET_FORWARD_EPS
+        else forward_eps
+    )
+    fwd_eps = _positive_float(raw_fwd)
+    eff_fx: float | None = None
+    if est_ccy is not None and q_ccy is not None:
+        eff_fx = 1.0 if est_ccy == q_ccy else _positive_float(fx_rate)
+
+    raw_eps_seq = (record.fy1_eps, record.fy2_eps) if eps_values is None else eps_values
+    eps_candidates = [
+        eps_major
+        for raw_eps in raw_eps_seq
+        if (pos_eps := _positive_float(raw_eps)) is not None
+        and (eps_major := _scale_eps(pos_eps, est_scale)) is not None
+        and eps_major > 0
+    ]
+
+    if fwd_eps is not None and eff_fx is not None and eps_candidates:
+        ratios = [fwd_eps / (eps_major * eff_fx) for eps_major in eps_candidates]
+        ads_dists = [abs(math.log(r)) for r in ratios]
+        ads_ok = all(d <= _ADR_CROSS_CHECK_LOG_TOLERANCE for d in ads_dists)
+        ads_score = sum(d * d for d in ads_dists)
+
+        has_ord_hypothesis = verified_n is not None and verified_n > 0 and verified_n != 1.0
+        if has_ord_hypothesis:
+            assert verified_n is not None
+            ord_dists = [abs(math.log(r / verified_n)) for r in ratios]
+            ord_ok = all(d <= _ADR_CROSS_CHECK_LOG_TOLERANCE for d in ord_dists)
+            ord_score = sum(d * d for d in ord_dists)
+        else:
+            ord_ok = False
+            ord_score = math.inf
+
+        if ads_ok and not ord_ok:
+            return True, 1.0, needs_fx, "cross_check_per_ads"
+        if ord_ok and not ads_ok:
+            assert verified_n is not None
+            return True, verified_n, needs_fx, "cross_check_per_ordinary"
+        if ads_ok and ord_ok:
+            year_preferences = {
+                "ads" if d_ads < d_ord else "ord"
+                for d_ads, d_ord in zip(ads_dists, ord_dists)
+                if d_ads != d_ord
+            }
+            if len(year_preferences) <= 1:
+                if ads_score < ord_score and (ads_score == 0.0 or ord_score >= 2.0 * ads_score):
+                    return True, 1.0, needs_fx, "cross_check_per_ads"
+                if ord_score < ads_score and (ord_score == 0.0 or ads_score >= 2.0 * ord_score):
+                    assert verified_n is not None
+                    return True, verified_n, needs_fx, "cross_check_per_ordinary"
+        return False, None, False, None
+
+    # Fallback when cross-validation cannot run (missing/non-positive forwardEps, missing FX, or no positive EPS).
+    if row_adr_ratio is not None:
+        return True, float(row_adr_ratio), needs_fx, "explicit_ratio"
+
+    return False, None, False, None
+
+
+def _resolve_adr_per_year(
+    symbol: str,
+    *,
+    record: RawConsensusRecord,
+    est_ccy: str | None,
+    q_ccy: str | None,
+    row_adr_ratio: float | None,
+    fx_rate: float | None = None,
+    est_scale: float = 1.0,
+) -> tuple[
+    tuple[bool, float | None, bool, str | None],
+    tuple[bool, float | None, bool, str | None],
+]:
+    """Resolve ADR share-unit verification independently per source provider and fiscal year.
+
+    Years coming from the same provider (e.g. Yahoo FY1 & FY2) are cross-checked jointly so
+    both years must agree on a single hypothesis; when a fallback provider (e.g. FMP) fills
+    one missing year, each source is verified with only its own anchor so an unverified FMP
+    year never clears Yahoo's verified year.
+    """
+    fy1_src = _record_year_provider(record, 1)
+    fy2_src = _record_year_provider(record, 2)
+
+    if fy1_src == fy2_src:
+        res = _resolve_adr_conversion(
+            symbol,
+            record=record,
+            est_ccy=est_ccy,
+            q_ccy=q_ccy,
+            row_adr_ratio=row_adr_ratio,
+            fx_rate=fx_rate,
+            est_scale=est_scale,
+            eps_values=(record.fy1_eps, record.fy2_eps),
+            forward_eps=_record_forward_eps_for_source(record, fy1_src),
+        )
+        return res, res
+
+    res1 = _resolve_adr_conversion(
+        symbol,
+        record=record,
+        est_ccy=est_ccy,
+        q_ccy=q_ccy,
+        row_adr_ratio=row_adr_ratio,
+        fx_rate=fx_rate,
+        est_scale=est_scale,
+        eps_values=(record.fy1_eps,),
+        forward_eps=_record_forward_eps_for_source(record, fy1_src),
+    )
+    res2 = _resolve_adr_conversion(
+        symbol,
+        record=record,
+        est_ccy=est_ccy,
+        q_ccy=q_ccy,
+        row_adr_ratio=row_adr_ratio,
+        fx_rate=fx_rate,
+        est_scale=est_scale,
+        eps_values=(record.fy2_eps,),
+        forward_eps=_record_forward_eps_for_source(record, fy2_src),
+    )
+    return res1, res2
 
 
 def _determine_fx_requirement(
@@ -774,16 +985,28 @@ def _determine_fx_requirement(
         is_adr_flag=record.is_adr,
     )
     if not is_adr:
+        has_positive_eps = (
+            _positive_float(record.fy1_eps) is not None
+            or _positive_float(record.fy2_eps) is not None
+        )
+        return has_positive_eps, est_ccy, q_ccy
+
+    # Cross-validation for cross-currency ADRs needs spot FX to convert positive FY EPS into quote currency.
+    if _can_cross_validate_adr(record):
         return True, est_ccy, q_ccy
 
-    verified, _, needs_fx = _resolve_adr_conversion(
+    res1, res2 = _resolve_adr_per_year(
         sym,
         record=record,
         est_ccy=est_ccy,
         q_ccy=q_ccy,
         row_adr_ratio=row_adr_ratio,
     )
-    return (verified and needs_fx), est_ccy, q_ccy
+    needs_fx_any = (
+        (_positive_float(record.fy1_eps) is not None and res1[0] and res1[2])
+        or (_positive_float(record.fy2_eps) is not None and res2[0] and res2[2])
+    )
+    return needs_fx_any, est_ccy, q_ccy
 
 
 def _consensus_cache_key(symbol: str, provider_tag: str = "public") -> str:
@@ -1186,12 +1409,52 @@ def _is_record_rolled_past_fy(
     return False
 
 
+def _is_legacy_adr_missing_forward_eps_key(
+    symbol: str,
+    record_dict: Mapping[str, Any],
+    *,
+    quote_currency_override: str | None = None,
+    coverage_row: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True if a cached ADR record predates ``provider_forward_eps_per_quote_unit``.
+
+    Distinguishes legacy cache entries (key absent -> needs refresh) from new entries
+    where the provider explicitly persisted ``null`` (key present with value ``None``).
+    """
+    if "provider_forward_eps_per_quote_unit" in record_dict:
+        return False
+    sym = _canonical_symbol(symbol or str(record_dict.get("symbol") or ""))
+    raw_q_ccy = (
+        quote_currency_override
+        or record_dict.get("quote_currency")
+        or infer_quote_currency(sym)
+    )
+    q_ccy, _ = _normalize_currency(raw_q_ccy)
+    est_ccy, _ = _normalize_currency(record_dict.get("estimate_currency"))
+    row_adr_ratio = _extract_row_adr_ratio(coverage_row)
+    return _is_adr_security(
+        sym,
+        quote_type=str(record_dict.get("quote_type") or "").strip() or None,
+        security_name=str(record_dict.get("security_name") or "").strip() or None,
+        quote_currency=q_ccy,
+        estimate_currency=est_ccy,
+        row_adr_ratio=row_adr_ratio,
+        is_adr_flag=(
+            record_dict.get("is_adr")
+            if isinstance(record_dict.get("is_adr"), bool)
+            else None
+        ),
+    )
+
+
 async def _read_consensus_cache(
     symbol: str,
     *,
     provider_tag: str = "public",
     today: date | None = None,
     last_reported_fy_end: str | None = None,
+    quote_currency_override: str | None = None,
+    coverage_row: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Return ``(cached_record_dict, is_fresh)`` from L3 memory/Redis cache."""
     key = _consensus_cache_key(symbol, provider_tag)
@@ -1205,7 +1468,17 @@ async def _read_consensus_cache(
         rolled = _is_record_rolled_past_fy(
             payload, today=ref_day, last_reported_fy_end=last_reported_fy_end
         )
-        is_fresh = (age < CONSENSUS_CACHE_TTL_SECONDS) and (not rolled)
+        legacy_adr_missing_fwd = _is_legacy_adr_missing_forward_eps_key(
+            symbol,
+            payload,
+            quote_currency_override=quote_currency_override,
+            coverage_row=coverage_row,
+        )
+        is_fresh = (
+            (age < CONSENSUS_CACHE_TTL_SECONDS)
+            and (not rolled)
+            and (not legacy_adr_missing_fwd)
+        )
         return payload, is_fresh
 
     mem = _CONSENSUS_CACHE.get(key)
@@ -1382,17 +1655,17 @@ def _filter_consensus_record_fiscal_years(
     """
     eff_reported = _max_iso_date(last_reported_fy_end, record.last_reported_fy_end)
     dropped_any = False
-    kept_dated: list[tuple[str, float | None, bool]] = []
+    kept_dated: list[tuple[str, float | None, bool, str | None]] = []
 
-    for end_raw, eps_val, unit_unv in (
-        (record.fy1_end, record.fy1_eps, record.fy1_unit_unverified),
-        (record.fy2_end, record.fy2_eps, record.fy2_unit_unverified),
+    for end_raw, eps_val, unit_unv, fy_prov in (
+        (record.fy1_end, record.fy1_eps, record.fy1_unit_unverified, record.fy1_provider),
+        (record.fy2_end, record.fy2_eps, record.fy2_unit_unverified, record.fy2_provider),
     ):
         parsed = _parse_iso_date(end_raw)
         if parsed is not None:
             iso = parsed.isoformat()
             if _is_eligible_fy_end(iso, today=today, last_reported_fy_end=eff_reported):
-                kept_dated.append((iso, eps_val, unit_unv))
+                kept_dated.append((iso, eps_val, unit_unv, fy_prov))
             else:
                 dropped_any = True
         elif eps_val is not None:
@@ -1400,12 +1673,12 @@ def _filter_consensus_record_fiscal_years(
             dropped_any = True
 
     kept_dated.sort(key=lambda item: item[0])
-    slots: list[tuple[str | None, float | None, bool]] = list(kept_dated)
-    new_fy1_end, new_fy1_eps, new_fy1_unv = (
-        slots[0] if len(slots) >= 1 else (None, None, False)
+    slots: list[tuple[str | None, float | None, bool, str | None]] = list(kept_dated)
+    new_fy1_end, new_fy1_eps, new_fy1_unv, new_fy1_prov = (
+        slots[0] if len(slots) >= 1 else (None, None, False, None)
     )
-    new_fy2_end, new_fy2_eps, new_fy2_unv = (
-        slots[1] if len(slots) >= 2 else (None, None, False)
+    new_fy2_end, new_fy2_eps, new_fy2_unv, new_fy2_prov = (
+        slots[1] if len(slots) >= 2 else (None, None, False, None)
     )
 
     has_any_eps = new_fy1_eps is not None or new_fy2_eps is not None
@@ -1419,6 +1692,8 @@ def _filter_consensus_record_fiscal_years(
         and new_fy2_eps == record.fy2_eps
         and new_fy1_unv == record.fy1_unit_unverified
         and new_fy2_unv == record.fy2_unit_unverified
+        and new_fy1_prov == record.fy1_provider
+        and new_fy2_prov == record.fy2_provider
         and eff_reported == record.last_reported_fy_end
         and new_analysts == record.analyst_count
     ):
@@ -1443,6 +1718,10 @@ def _filter_consensus_record_fiscal_years(
             last_reported_fy_end=eff_reported,
             fy1_unit_unverified=new_fy1_unv,
             fy2_unit_unverified=new_fy2_unv,
+            provider_forward_eps_per_quote_unit=record.provider_forward_eps_per_quote_unit,
+            fy1_provider=new_fy1_prov,
+            fy2_provider=new_fy2_prov,
+            provider_forward_eps_source=record.provider_forward_eps_source,
         ),
         dropped_any,
     )
@@ -1530,6 +1809,7 @@ def _fetch_yfinance_consensus_result_sync(
     raw_info_earn_ccy = info.get("earningsCurrency")
     quote_type = str(info.get("quoteType") or "").strip() or None
     sec_name = str(info.get("longName") or info.get("shortName") or "").strip() or None
+    provider_forward_eps = _finite_float(info.get("forwardEps"))
 
     explicit_earn_ccy = trend_earnings_ccy or (
         str(raw_info_earn_ccy).strip() if raw_info_earn_ccy else None
@@ -1539,7 +1819,8 @@ def _fetch_yfinance_consensus_result_sync(
     )
 
     # IMPORTANT (§6.3): `earningsCurrency == quote_currency` does NOT prove EPS is reported per ADR.
-    # yfinance provides no share-unit attestation, so `eps_per_quote_unit_confirmed` stays False.
+    # yfinance provides no share-unit attestation, so `eps_per_quote_unit_confirmed` stays False;
+    # ADR share-unit verification cross-checks `info["forwardEps"]` (quote currency, per quote unit).
     rec = RawConsensusRecord(
         symbol=sym,
         fy1_eps=fy1_eps,
@@ -1555,6 +1836,10 @@ def _fetch_yfinance_consensus_result_sync(
         security_name=sec_name,
         eps_per_quote_unit_confirmed=False,
         last_reported_fy_end=eff_reported_fy_end,
+        provider_forward_eps_per_quote_unit=provider_forward_eps,
+        fy1_provider="yfinance" if fy1_eps is not None else None,
+        fy2_provider="yfinance" if fy2_eps is not None else None,
+        provider_forward_eps_source="yfinance" if provider_forward_eps is not None else None,
     )
     return rec, dropped_rolled_fy
 
@@ -1683,7 +1968,7 @@ def _merge_partial_consensus_record(
         fallback.last_reported_fy_end,
     )
 
-    # Buckets: [end_date_iso, p_eps_major, p_analysts, p_unverified, f_eps_major, f_analysts, f_unverified]
+    # Buckets: [end_date_iso, p_eps_major, p_analysts, p_unverified, p_provider, f_eps_major, f_analysts, f_unverified, f_provider]
     buckets: list[list[Any]] = []
 
     def _upsert_primary(
@@ -1692,6 +1977,7 @@ def _merge_partial_consensus_record(
         analysts: int | None,
         *,
         existing_unverified: bool = False,
+        source_provider: str | None = None,
     ) -> None:
         parsed = _parse_iso_date(end_raw)
         if parsed is None:
@@ -1710,6 +1996,7 @@ def _merge_partial_consensus_record(
                 if b[1] is None and scaled_eps is not None:
                     b[1] = scaled_eps
                     b[2] = analysts
+                    b[4] = source_provider
                 if unverified:
                     b[3] = True
                 return
@@ -1719,9 +2006,11 @@ def _merge_partial_consensus_record(
                 scaled_eps,
                 analysts if scaled_eps is not None else None,
                 unverified,
+                source_provider if scaled_eps is not None else None,
                 None,
                 None,
                 False,
+                None,
             ]
         )
 
@@ -1729,6 +2018,8 @@ def _merge_partial_consensus_record(
         end_raw: str | None,
         eps_val: float | None,
         analysts: int | None,
+        *,
+        source_provider: str | None = None,
     ) -> None:
         parsed = _parse_iso_date(end_raw)
         if parsed is None:
@@ -1744,11 +2035,12 @@ def _merge_partial_consensus_record(
             unverified = eps_val is not None
         for b in buckets:
             if _dates_match_fiscal_year(b[0], iso):
-                if b[4] is None and scaled_eps is not None:
-                    b[4] = scaled_eps
-                    b[5] = analysts
+                if b[5] is None and scaled_eps is not None:
+                    b[5] = scaled_eps
+                    b[6] = analysts
+                    b[8] = source_provider
                 if unverified:
-                    b[6] = True
+                    b[7] = True
                 return
         buckets.append(
             [
@@ -1756,17 +2048,19 @@ def _merge_partial_consensus_record(
                 None,
                 None,
                 False,
+                None,
                 scaled_eps,
                 analysts if scaled_eps is not None else None,
                 unverified,
+                source_provider if scaled_eps is not None else None,
             ]
         )
 
     # 1. Insert eligible dated fiscal years from primary (sorted chronologically)
-    primary_dated: list[tuple[str, float | None, int | None, bool]] = []
-    for end_raw, eps_val, existing_unv in (
-        (primary.fy1_end, primary.fy1_eps, primary.fy1_unit_unverified),
-        (primary.fy2_end, primary.fy2_eps, primary.fy2_unit_unverified),
+    primary_dated: list[tuple[str, float | None, int | None, bool, str | None]] = []
+    for end_raw, eps_val, existing_unv, slot_prov in (
+        (primary.fy1_end, primary.fy1_eps, primary.fy1_unit_unverified, primary.fy1_provider or primary.provider),
+        (primary.fy2_end, primary.fy2_eps, primary.fy2_unit_unverified, primary.fy2_provider or primary.provider),
     ):
         parsed = _parse_iso_date(end_raw)
         if parsed is not None:
@@ -1776,11 +2070,18 @@ def _merge_partial_consensus_record(
                     eps_val,
                     primary.analyst_count if eps_val is not None else None,
                     existing_unv,
+                    slot_prov,
                 )
             )
     primary_dated.sort(key=lambda item: item[0])
-    for iso, eps_val, analysts, existing_unv in primary_dated:
-        _upsert_primary(iso, eps_val, analysts, existing_unverified=existing_unv)
+    for iso, eps_val, analysts, existing_unv, slot_prov in primary_dated:
+        _upsert_primary(
+            iso,
+            eps_val,
+            analysts,
+            existing_unverified=existing_unv,
+            source_provider=slot_prov,
+        )
 
     # 2. Insert eligible dated fiscal years from FMP annual rows + fallback record (never resurrect excluded FYs)
     eligible_rows = _filter_fmp_eligible_estimates(
@@ -1789,12 +2090,22 @@ def _merge_partial_consensus_record(
         last_reported_fy_end=eff_reported,
     )
     for row in eligible_rows:
-        _upsert_fallback(row.get("date"), _fmp_row_eps(row), _fmp_row_analysts(row))
-    for end_raw, eps_val in (
-        (fallback.fy1_end, fallback.fy1_eps),
-        (fallback.fy2_end, fallback.fy2_eps),
+        _upsert_fallback(
+            row.get("date"),
+            _fmp_row_eps(row),
+            _fmp_row_analysts(row),
+            source_provider=fallback.provider,
+        )
+    for end_raw, eps_val, slot_prov in (
+        (fallback.fy1_end, fallback.fy1_eps, fallback.fy1_provider or fallback.provider),
+        (fallback.fy2_end, fallback.fy2_eps, fallback.fy2_provider or fallback.provider),
     ):
-        _upsert_fallback(end_raw, eps_val, fallback.analyst_count if eps_val is not None else None)
+        _upsert_fallback(
+            end_raw,
+            eps_val,
+            fallback.analyst_count if eps_val is not None else None,
+            source_provider=slot_prov,
+        )
 
     if not buckets:
         return primary
@@ -1804,20 +2115,20 @@ def _merge_partial_consensus_record(
 
     def _resolve_slot(
         bucket: list[Any] | None,
-    ) -> tuple[str | None, float | None, int | None, bool, bool, bool]:
+    ) -> tuple[str | None, float | None, int | None, bool, bool, bool, str | None]:
         if bucket is None:
-            return None, None, None, False, False, False
-        end_iso, p_eps, p_an, p_unv, f_eps, f_an, f_unv = bucket
+            return None, None, None, False, False, False, None
+        end_iso, p_eps, p_an, p_unv, p_prov, f_eps, f_an, f_unv, f_prov = bucket
         if p_eps is not None:
-            return end_iso, p_eps, p_an, False, True, False
+            return end_iso, p_eps, p_an, False, True, False, p_prov
         if f_eps is not None:
-            return end_iso, f_eps, f_an, False, False, True
-        return end_iso, None, None, bool(p_unv or f_unv), False, False
+            return end_iso, f_eps, f_an, False, False, True, f_prov
+        return end_iso, None, None, bool(p_unv or f_unv), False, False, None
 
-    fy1_end, fy1_eps, fy1_an, fy1_unv, used_p1, used_f1 = _resolve_slot(
+    fy1_end, fy1_eps, fy1_an, fy1_unv, used_p1, used_f1, fy1_prov = _resolve_slot(
         selected[0] if len(selected) >= 1 else None
     )
-    fy2_end, fy2_eps, fy2_an, fy2_unv, used_p2, used_f2 = _resolve_slot(
+    fy2_end, fy2_eps, fy2_an, fy2_unv, used_p2, used_f2, fy2_prov = _resolve_slot(
         selected[1] if len(selected) >= 2 else None
     )
 
@@ -1851,6 +2162,8 @@ def _merge_partial_consensus_record(
         else None
     )
 
+    merged_fwd_eps: float | None
+    merged_fwd_source: str | None
     if used_primary_eps and used_fallback_eps:
         combined_provider = (
             f"{primary.provider}+{fallback.provider}"
@@ -1858,12 +2171,66 @@ def _merge_partial_consensus_record(
             else (primary.provider or fallback.provider)
         )
         confirmed = primary.eps_per_quote_unit_confirmed and fallback.eps_per_quote_unit_confirmed
+        # Ensure primary and fallback slots remain distinguishable for per-source unit verification
+        # even if a synthetic caller left both providers identical or unset.
+        p_slot_src = primary.provider or "primary"
+        f_slot_src = fallback.provider or "fallback"
+        if p_slot_src == f_slot_src:
+            p_slot_src = f"{p_slot_src}:primary"
+            f_slot_src = f"{f_slot_src}:fallback"
+            if used_p1:
+                fy1_prov = p_slot_src
+            elif used_f1:
+                fy1_prov = f_slot_src
+            if used_p2:
+                fy2_prov = p_slot_src
+            elif used_f2:
+                fy2_prov = f_slot_src
+        else:
+            if used_p1 and not fy1_prov:
+                fy1_prov = p_slot_src
+            elif used_f1 and not fy1_prov:
+                fy1_prov = f_slot_src
+            if used_p2 and not fy2_prov:
+                fy2_prov = p_slot_src
+            elif used_f2 and not fy2_prov:
+                fy2_prov = f_slot_src
+
+        if primary.provider_forward_eps_per_quote_unit is not None:
+            merged_fwd_eps = primary.provider_forward_eps_per_quote_unit
+            merged_fwd_source = (
+                p_slot_src
+                if p_slot_src.endswith(":primary")
+                else (primary.provider_forward_eps_source or p_slot_src)
+            )
+        elif fallback.provider_forward_eps_per_quote_unit is not None:
+            merged_fwd_eps = fallback.provider_forward_eps_per_quote_unit
+            merged_fwd_source = (
+                f_slot_src
+                if f_slot_src.endswith(":fallback")
+                else (fallback.provider_forward_eps_source or f_slot_src)
+            )
+        else:
+            merged_fwd_eps = None
+            merged_fwd_source = None
     elif used_fallback_eps:
         combined_provider = fallback.provider or primary.provider
         confirmed = fallback.eps_per_quote_unit_confirmed
+        merged_fwd_eps = fallback.provider_forward_eps_per_quote_unit
+        merged_fwd_source = (
+            fallback.provider_forward_eps_source or combined_provider
+            if merged_fwd_eps is not None
+            else None
+        )
     else:
         combined_provider = primary.provider
         confirmed = primary.eps_per_quote_unit_confirmed
+        merged_fwd_eps = primary.provider_forward_eps_per_quote_unit
+        merged_fwd_source = (
+            primary.provider_forward_eps_source or combined_provider
+            if merged_fwd_eps is not None
+            else None
+        )
 
     return RawConsensusRecord(
         symbol=_canonical_symbol(primary.symbol),
@@ -1883,6 +2250,10 @@ def _merge_partial_consensus_record(
         last_reported_fy_end=eff_reported,
         fy1_unit_unverified=fy1_unv,
         fy2_unit_unverified=fy2_unv,
+        provider_forward_eps_per_quote_unit=merged_fwd_eps,
+        fy1_provider=fy1_prov,
+        fy2_provider=fy2_prov,
+        provider_forward_eps_source=merged_fwd_source,
     )
 
 
@@ -1911,6 +2282,7 @@ def _compute_valuation_from_record(
         q_ccy: str | None = None,
         shares_per_unit: float | None = None,
         unit_verified: bool = False,
+        unit_verification_method: str | None = None,
         pending: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -1923,6 +2295,7 @@ def _compute_valuation_from_record(
             "quote_currency": q_ccy,
             "shares_per_quote_unit": shares_per_unit,
             "unit_verified": unit_verified,
+            "unit_verification_method": unit_verification_method,
             "analyst_count": record.analyst_count if record is not None else None,
             "provider": record.provider if record is not None else None,
             "as_of": record.as_of if record is not None else None,
@@ -2018,133 +2391,228 @@ def _compute_valuation_from_record(
 
     shares_per_quote_unit: float | None = None
     unit_verified = False
+    unit_verification_method: str | None = None
     eff_fx: float | None = 1.0
+    unit_unverified_reason = "待核对存托凭证换算比例"
+
+    fy1_eps_major = _scale_eps(record.fy1_eps, est_scale)
+    fy2_eps_major = _scale_eps(record.fy2_eps, est_scale)
+
+    fy1_adr_verified = False
+    fy2_adr_verified = False
+    fy1_shares: float | None = None
+    fy2_shares: float | None = None
+    fy1_eff_fx: float | None = None
+    fy2_eff_fx: float | None = None
+    fy1_fx_unready = False
+    fy2_fx_unready = False
+    fx_unready_status: str | None = None
+    pos_fx = _positive_float(fx_rate)
 
     if not is_adr:
         shares_per_quote_unit = 1.0
+        fy1_adr_verified = True
+        fy2_adr_verified = True
+        fy1_shares = 1.0
+        fy2_shares = 1.0
         if est_ccy == q_ccy:
             eff_fx = 1.0
             unit_verified = True
+            fy1_eff_fx = 1.0
+            fy2_eff_fx = 1.0
+        elif pos_fx is not None:
+            eff_fx = pos_fx
+            unit_verified = True
+            fy1_eff_fx = pos_fx
+            fy2_eff_fx = pos_fx
         else:
-            eff_fx = _positive_float(fx_rate)
-            if eff_fx is not None:
-                unit_verified = True
-            else:
-                if is_loading:
-                    return _empty_payload(
-                        "loading",
-                        reason="正在加载即期汇率，请稍后重试",
-                        est_ccy=est_ccy,
-                        q_ccy=q_ccy,
-                        shares_per_unit=1.0,
-                        unit_verified=False,
-                        pending=True,
-                    )
-                if is_rate_limited:
-                    return _empty_payload(
-                        "rate_limited",
-                        reason="即期汇率接口限流（429），请稍后重试",
-                        est_ccy=est_ccy,
-                        q_ccy=q_ccy,
-                        shares_per_unit=1.0,
-                        unit_verified=False,
-                    )
-                return _empty_payload(
-                    "no_coverage",
-                    reason=f"缺少 {est_ccy}->{q_ccy} 即期汇率",
-                    est_ccy=est_ccy,
-                    q_ccy=q_ccy,
-                    shares_per_unit=1.0,
-                    unit_verified=False,
-                )
+            eff_fx = None
+            unit_verified = False
+            fy1_fx_unready = fy1_eps_major is not None and fy1_eps_major > 0
+            fy2_fx_unready = fy2_eps_major is not None and fy2_eps_major > 0
+            fx_unready_status = (
+                "loading"
+                if is_loading
+                else ("rate_limited" if is_rate_limited else "no_coverage")
+            )
     else:
-        adr_ok, adr_ratio, adr_needs_fx = _resolve_adr_conversion(
+        fy1_waiting_fx_for_xcheck = (
+            est_ccy != q_ccy
+            and pos_fx is None
+            and fy1_eps_major is not None
+            and fy1_eps_major > 0
+            and not record.fy1_unit_unverified
+            and _record_forward_eps_for_source(record, _record_year_provider(record, 1))
+            is not None
+        )
+        fy2_waiting_fx_for_xcheck = (
+            est_ccy != q_ccy
+            and pos_fx is None
+            and fy2_eps_major is not None
+            and fy2_eps_major > 0
+            and not record.fy2_unit_unverified
+            and _record_forward_eps_for_source(record, _record_year_provider(record, 2))
+            is not None
+        )
+
+        (fy1_ok, fy1_ratio, fy1_needs_fx, fy1_method), (
+            fy2_ok,
+            fy2_ratio,
+            fy2_needs_fx,
+            fy2_method,
+        ) = _resolve_adr_per_year(
             sym,
             record=record,
             est_ccy=est_ccy,
             q_ccy=q_ccy,
             row_adr_ratio=row_adr_ratio,
+            fx_rate=fx_rate,
+            est_scale=est_scale,
         )
-        if not adr_ok or adr_ratio is None:
-            return _empty_payload(
-                "unit_unverified",
-                reason="待核对存托凭证换算比例",
-                est_ccy=est_ccy,
-                q_ccy=q_ccy,
-                shares_per_unit=None,
-                unit_verified=False,
+        logger.debug(
+            "[WATCHLIST_CONSENSUS] ADR unit resolution for %s: fy1=(%s,%s,%s) fy2=(%s,%s,%s)",
+            sym,
+            fy1_ok,
+            fy1_method,
+            fy1_ratio,
+            fy2_ok,
+            fy2_method,
+            fy2_ratio,
+        )
+
+        def _finalize_adr_year(
+            eps_major: float | None,
+            ok: bool,
+            ratio: float | None,
+            needs_fx: bool,
+            method: str | None,
+            waiting_fx_for_xcheck: bool,
+        ) -> tuple[bool, float | None, float | None, bool, str | None]:
+            """Return ``(verified, shares, year_fx, fx_unready, eff_method)`` for one ADR fiscal year."""
+            if waiting_fx_for_xcheck and not (
+                ok and ratio == 1.0 and method in ("verified_table", "explicit_ratio")
+            ):
+                return False, None, None, True, None
+            if not ok or ratio is None:
+                return False, None, None, False, method
+            if not needs_fx:
+                return True, ratio, 1.0, False, method
+            if pos_fx is not None:
+                return True, ratio, pos_fx, False, method
+            return False, ratio, None, (eps_major is not None and eps_major > 0), method
+
+        fy1_adr_verified, fy1_shares, fy1_eff_fx, fy1_fx_unready, fy1_eff_method = (
+            _finalize_adr_year(
+                fy1_eps_major,
+                fy1_ok,
+                fy1_ratio,
+                fy1_needs_fx,
+                fy1_method,
+                fy1_waiting_fx_for_xcheck,
             )
-        shares_per_quote_unit = adr_ratio
-        if not adr_needs_fx:
-            eff_fx = 1.0
+        )
+        fy2_adr_verified, fy2_shares, fy2_eff_fx, fy2_fx_unready, fy2_eff_method = (
+            _finalize_adr_year(
+                fy2_eps_major,
+                fy2_ok,
+                fy2_ratio,
+                fy2_needs_fx,
+                fy2_method,
+                fy2_waiting_fx_for_xcheck,
+            )
+        )
+
+        if fy1_fx_unready or fy2_fx_unready:
+            fx_unready_status = (
+                "loading"
+                if is_loading
+                else ("rate_limited" if is_rate_limited else "unit_unverified")
+            )
+            if not is_loading and not is_rate_limited:
+                unit_unverified_reason = f"缺少 {est_ccy}->{q_ccy} 即期汇率，暂不折算"
+
+        verified_entries: list[tuple[float, float, str | None]] = []
+        if (
+            fy1_adr_verified
+            and fy1_shares is not None
+            and fy1_eff_fx is not None
+            and fy1_eps_major is not None
+        ):
+            verified_entries.append((fy1_shares, fy1_eff_fx, fy1_eff_method))
+        if (
+            fy2_adr_verified
+            and fy2_shares is not None
+            and fy2_eff_fx is not None
+            and fy2_eps_major is not None
+        ):
+            verified_entries.append((fy2_shares, fy2_eff_fx, fy2_eff_method))
+
+        if verified_entries:
             unit_verified = True
+            shares_per_quote_unit, eff_fx, unit_verification_method = verified_entries[0]
         else:
-            eff_fx = _positive_float(fx_rate)
-            if eff_fx is not None:
-                unit_verified = True
-            else:
-                if is_loading:
-                    return _empty_payload(
-                        "loading",
-                        reason="正在加载即期汇率，请稍后重试",
-                        est_ccy=est_ccy,
-                        q_ccy=q_ccy,
-                        shares_per_unit=shares_per_quote_unit,
-                        unit_verified=False,
-                        pending=True,
-                    )
-                if is_rate_limited:
-                    return _empty_payload(
-                        "rate_limited",
-                        reason="即期汇率接口限流（429），请稍后重试",
-                        est_ccy=est_ccy,
-                        q_ccy=q_ccy,
-                        shares_per_unit=shares_per_quote_unit,
-                        unit_verified=False,
-                    )
-                return _empty_payload(
-                    "unit_unverified",
-                    reason=f"缺少 {est_ccy}->{q_ccy} 即期汇率，暂不折算",
-                    est_ccy=est_ccy,
-                    q_ccy=q_ccy,
-                    shares_per_unit=shares_per_quote_unit,
-                    unit_verified=False,
-                )
+            unit_verified = False
+            shares_per_quote_unit = (
+                fy1_shares
+                if fy1_fx_unready
+                else (fy2_shares if fy2_fx_unready else None)
+            )
+            unit_verification_method = (
+                fy1_eff_method
+                if fy1_fx_unready
+                else (fy2_eff_method if fy2_fx_unready else None)
+            )
+            eff_fx = None
 
     # Convert EPS into major quote currency per quote unit, and normalize price into major quote currency
-    assert shares_per_quote_unit is not None and eff_fx is not None
     price_major = (
         float(latest_price) * q_scale
         if _positive_float(latest_price) is not None
         else None
     )
-    fy1_eps_major = _scale_eps(record.fy1_eps, est_scale)
-    fy2_eps_major = _scale_eps(record.fy2_eps, est_scale)
 
     def _calc_pe(
         eps_major: float | None,
         *,
-        year_unit_unverified: bool = False,
+        record_year_unit_unverified: bool = False,
+        year_adr_verified: bool = True,
+        year_shares_per_unit: float | None = None,
+        year_eff_fx: float | None = None,
+        year_fx_unready: bool = False,
     ) -> tuple[float | None, str]:
-        if year_unit_unverified:
+        if record_year_unit_unverified:
             return None, "unit_unverified"
         if eps_major is None:
             return None, "no_coverage"
         if eps_major <= 0:
             return None, "loss"
+        if year_fx_unready:
+            return None, fx_unready_status or "unit_unverified"
+        if not year_adr_verified or year_shares_per_unit is None or year_eff_fx is None:
+            return None, "unit_unverified"
         if price_major is None:
             return None, "stale" if is_stale else "no_coverage"
-        eps_quote_unit = eps_major * shares_per_quote_unit * eff_fx
+        eps_quote_unit = eps_major * year_shares_per_unit * year_eff_fx
         if eps_quote_unit <= 0:
             return None, "loss"
         pe = round(price_major / eps_quote_unit, 2)
         return pe, ("stale" if is_stale else "ok")
 
     pe_fy1, pe_fy1_status = _calc_pe(
-        fy1_eps_major, year_unit_unverified=record.fy1_unit_unverified
+        fy1_eps_major,
+        record_year_unit_unverified=record.fy1_unit_unverified,
+        year_adr_verified=fy1_adr_verified,
+        year_shares_per_unit=fy1_shares,
+        year_eff_fx=fy1_eff_fx,
+        year_fx_unready=fy1_fx_unready,
     )
     pe_fy2, pe_fy2_status = _calc_pe(
-        fy2_eps_major, year_unit_unverified=record.fy2_unit_unverified
+        fy2_eps_major,
+        record_year_unit_unverified=record.fy2_unit_unverified,
+        year_adr_verified=fy2_adr_verified,
+        year_shares_per_unit=fy2_shares,
+        year_eff_fx=fy2_eff_fx,
+        year_fx_unready=fy2_fx_unready,
     )
 
     eps_growth_fy2: float | None = None
@@ -2154,25 +2622,73 @@ def _compute_valuation_from_record(
         eps_growth_status = "no_coverage"
     elif fy1_eps_major <= 0:
         eps_growth_status = "loss"
+    elif fy1_fx_unready or fy2_fx_unready:
+        eps_growth_status = fx_unready_status or "unit_unverified"
+    elif (
+        not fy1_adr_verified
+        or not fy2_adr_verified
+        or fy1_shares is None
+        or fy2_shares is None
+        or fy1_eff_fx is None
+        or fy2_eff_fx is None
+    ):
+        eps_growth_status = "unit_unverified"
     else:
-        eps_growth_fy2 = round(((fy2_eps_major - fy1_eps_major) / fy1_eps_major) * 100.0, 2)
-        eps_growth_status = "stale" if is_stale else "ok"
+        fy1_factor = fy1_shares * fy1_eff_fx
+        fy2_factor = fy2_shares * fy2_eff_fx
+        if fy1_factor == fy2_factor:
+            eps_growth_fy2 = round(
+                ((fy2_eps_major - fy1_eps_major) / fy1_eps_major) * 100.0, 2
+            )
+            eps_growth_status = "stale" if is_stale else "ok"
+        else:
+            fy1_per_unit = fy1_eps_major * fy1_factor
+            fy2_per_unit = fy2_eps_major * fy2_factor
+            if fy1_per_unit <= 0:
+                eps_growth_status = "loss"
+            else:
+                eps_growth_fy2 = round(
+                    ((fy2_per_unit - fy1_per_unit) / fy1_per_unit) * 100.0, 2
+                )
+                eps_growth_status = "stale" if is_stale else "ok"
+
+    has_loading = pe_fy1_status == "loading" or pe_fy2_status == "loading"
+    has_rate_limited = pe_fy1_status == "rate_limited" or pe_fy2_status == "rate_limited"
 
     # Overall symbol valuation status
     if is_stale and (pe_fy1 is not None or pe_fy2 is not None or eps_growth_fy2 is not None):
         overall_status = "stale"
     elif pe_fy1_status == "ok" or pe_fy2_status == "ok":
         overall_status = "ok"
+    elif has_loading:
+        overall_status = "loading"
+    elif has_rate_limited:
+        overall_status = "rate_limited"
     elif pe_fy1_status == "loss" or pe_fy2_status == "loss":
         overall_status = "loss"
-    elif is_stale:
-        overall_status = "stale"
     elif pe_fy1_status == "unit_unverified" or pe_fy2_status == "unit_unverified":
         overall_status = "unit_unverified"
+    elif is_stale:
+        overall_status = "stale"
     else:
         overall_status = "no_coverage"
 
-    return {
+    if overall_status == "stale":
+        status_reason: str | None = "缓存数据已过期，正在后台刷新"
+    elif overall_status == "loading":
+        status_reason = "正在加载即期汇率，请稍后重试"
+    elif overall_status == "rate_limited":
+        status_reason = "即期汇率接口限流（429），请稍后重试"
+    elif overall_status == "loss":
+        status_reason = "盈利为负（NM）"
+    elif overall_status == "unit_unverified":
+        status_reason = unit_unverified_reason
+    elif overall_status == "no_coverage" and (fy1_fx_unready or fy2_fx_unready):
+        status_reason = f"缺少 {est_ccy}->{q_ccy} 即期汇率"
+    else:
+        status_reason = None
+
+    payload: dict[str, Any] = {
         "ticker": sym,
         "fy1_eps": fy1_eps_major,
         "fy2_eps": fy2_eps_major,
@@ -2182,10 +2698,11 @@ def _compute_valuation_from_record(
         "quote_currency": q_ccy,
         "shares_per_quote_unit": shares_per_quote_unit,
         "unit_verified": unit_verified,
+        "unit_verification_method": unit_verification_method,
         "analyst_count": record.analyst_count,
         "provider": record.provider,
         "as_of": record.as_of,
-        "fx_rate": round(eff_fx, 6),
+        "fx_rate": round(eff_fx, 6) if eff_fx is not None else fx_rate,
         "status": overall_status,
         "pe_fy1": pe_fy1,
         "pe_fy2": pe_fy2,
@@ -2193,12 +2710,11 @@ def _compute_valuation_from_record(
         "pe_fy1_status": pe_fy1_status,
         "pe_fy2_status": pe_fy2_status,
         "eps_growth_fy2_status": eps_growth_status,
-        "status_reason": (
-            "缓存数据已过期，正在后台刷新"
-            if overall_status == "stale"
-            else ("盈利为负（NM）" if overall_status == "loss" else None)
-        ),
+        "status_reason": status_reason,
     }
+    if has_loading:
+        payload["pending"] = True
+    return payload
 
 
 class WatchlistConsensusAdapter:
@@ -2583,12 +3099,18 @@ class WatchlistConsensusAdapter:
         symbol: str,
         *,
         last_reported_fy_end: str | None = None,
+        quote_currency_override: str | None = None,
+        coverage_row: Mapping[str, Any] | None = None,
     ) -> tuple[RawConsensusRecord | None, bool, bool, bool]:
         """Return ``(record, is_stale, is_rate_limited, is_loading)`` using L3 cache + cross-process singleflight."""
         sym = _canonical_symbol(symbol)
         ref_today = self._today()
         cached_dict, is_fresh = await _read_consensus_cache(
-            sym, today=ref_today, last_reported_fy_end=last_reported_fy_end
+            sym,
+            today=ref_today,
+            last_reported_fy_end=last_reported_fy_end,
+            quote_currency_override=quote_currency_override,
+            coverage_row=coverage_row,
         )
         if cached_dict is not None and is_fresh:
             return RawConsensusRecord.from_dict(cached_dict), False, False, False
@@ -2645,7 +3167,11 @@ class WatchlistConsensusAdapter:
                     while time.monotonic() < wait_deadline:
                         await asyncio.sleep(_REDIS_INFLIGHT_POLL_SECONDS)
                         r_cached, r_fresh = await _read_consensus_cache(
-                            sym, today=ref_today, last_reported_fy_end=last_reported_fy_end
+                            sym,
+                            today=ref_today,
+                            last_reported_fy_end=last_reported_fy_end,
+                            quote_currency_override=quote_currency_override,
+                            coverage_row=coverage_row,
                         )
                         if r_cached is not None and r_fresh:
                             return r_cached
@@ -2663,7 +3189,11 @@ class WatchlistConsensusAdapter:
                             break
                     if not held_inflight_lock and not redis_degraded:
                         r_cached, r_fresh = await _read_consensus_cache(
-                            sym, today=ref_today, last_reported_fy_end=last_reported_fy_end
+                            sym,
+                            today=ref_today,
+                            last_reported_fy_end=last_reported_fy_end,
+                            quote_currency_override=quote_currency_override,
+                            coverage_row=coverage_row,
                         )
                         if r_cached is not None and r_fresh:
                             return r_cached
@@ -2685,7 +3215,11 @@ class WatchlistConsensusAdapter:
 
                 # Re-read cache and shared cooldown AFTER acquiring singleflight lock, BEFORE slot/upstream!
                 r_cached, r_fresh = await _read_consensus_cache(
-                    sym, today=ref_today, last_reported_fy_end=last_reported_fy_end
+                    sym,
+                    today=ref_today,
+                    last_reported_fy_end=last_reported_fy_end,
+                    quote_currency_override=quote_currency_override,
+                    coverage_row=coverage_row,
                 )
                 if r_cached is not None and r_fresh:
                     return r_cached
@@ -2936,7 +3470,10 @@ class WatchlistConsensusAdapter:
         async def _bg() -> None:
             try:
                 rec, _, _, _ = await self._fetch_raw_consensus_singleflight(
-                    sym, last_reported_fy_end=eff_reported
+                    sym,
+                    last_reported_fy_end=eff_reported,
+                    quote_currency_override=quote_currency,
+                    coverage_row=coverage_row,
                 )
                 needs_fx, est_ccy, q_ccy = _determine_fx_requirement(
                     rec,
@@ -2979,7 +3516,11 @@ class WatchlistConsensusAdapter:
 
         explicit_reported = _extract_explicit_last_reported_fy_end(coverage_row)
         cached_dict, is_fresh = await _read_consensus_cache(
-            sym, today=self._today(), last_reported_fy_end=explicit_reported
+            sym,
+            today=self._today(),
+            last_reported_fy_end=explicit_reported,
+            quote_currency_override=quote_currency,
+            coverage_row=coverage_row,
         )
         if cached_dict is None:
             err_kind, cd_rec = await _read_consensus_cooldown_entry(sym)
@@ -3023,9 +3564,10 @@ class WatchlistConsensusAdapter:
             coverage_row=coverage_row,
         )
 
-        fx_rate: float | None = 1.0
+        fx_rate: float | None = None
         fx_stale = False
         fx_rate_limited = False
+        fx_loading = False
         fx_needs_warmup = False
         if needs_fx and est_ccy and q_ccy:
             cached_fx, fx_fresh = await _read_fx_cache(est_ccy, q_ccy)
@@ -3037,7 +3579,9 @@ class WatchlistConsensusAdapter:
                     fx_rate_limited = fx_cd == "rate_limited"
                     fx_needs_warmup = False
                 else:
-                    return None, True
+                    fx_rate = None
+                    fx_loading = True
+                    fx_needs_warmup = True
             else:
                 fx_rate = cached_fx
                 fx_stale = not fx_fresh
@@ -3055,6 +3599,7 @@ class WatchlistConsensusAdapter:
             is_private=False,
             is_stale=(not is_fresh) or fx_stale,
             is_rate_limited=fx_rate_limited,
+            is_loading=fx_loading,
         )
         return val, (consensus_needs_warmup or fx_needs_warmup)
 
@@ -3076,7 +3621,10 @@ class WatchlistConsensusAdapter:
 
         last_reported_fy_end = _extract_explicit_last_reported_fy_end(coverage_row)
         rec, rec_stale, rec_rate_limited, rec_loading = await self._fetch_raw_consensus_singleflight(
-            sym, last_reported_fy_end=last_reported_fy_end
+            sym,
+            last_reported_fy_end=last_reported_fy_end,
+            quote_currency_override=quote_currency,
+            coverage_row=coverage_row,
         )
 
         if rec is None:
@@ -3091,7 +3639,7 @@ class WatchlistConsensusAdapter:
                 is_loading=rec_loading,
             )
 
-        fx_rate: float | None = 1.0
+        fx_rate: float | None = None
         fx_stale = False
         fx_rate_limited = False
         fx_loading = False

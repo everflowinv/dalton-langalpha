@@ -24,8 +24,6 @@ import pytest
 
 from src.dalton.data_jobs import batch3_messages
 from src.dalton.data_jobs.batch3_messages import (
-    FDE_WEEKLY_DISCORD_TARGET,
-    SEMI_BOTTOM_DISCORD_TARGET,
     SUPPRESS_OUTBOX,
     adjust_batch3_payload,
     apply_confirmed_delivery_writeback,
@@ -145,9 +143,9 @@ BATCH3_EXPECTATIONS: dict[str, dict[str, object]] = {
         "output_max_bytes": 50000,
         "runner": "host",
         "host_mode": "run",
-        "command": "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python -I scripts/gs_pb_weekly.py run --json",
+        "command": "${DALTON_DATA_TASK_GS_PB_PYTHON} -I scripts/gs_pb_weekly.py run --json",
         "command_argv": [
-            "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python",
+            "${DALTON_DATA_TASK_GS_PB_PYTHON}",
             "-I",
             "scripts/gs_pb_weekly.py",
             "run",
@@ -263,7 +261,20 @@ def _overlay():
     spec = importlib.util.spec_from_file_location("batch3_cron_command_tasks_overlay", OVERLAY_SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    overrides = {
+        "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID": TRACKING,
+        "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL": DEV,
+    }
+    prev = {k: os.environ.get(k) for k in overrides}
+    os.environ.update(overrides)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
     return module
 
 
@@ -438,9 +449,12 @@ def test_silent_jobs_produce_no_outbox(tmp_path: Path) -> None:
     ) is SUPPRESS_OUTBOX
 
 
-def test_fde_weekly_and_semi_bottom_keep_stdout_bytes(tmp_path: Path) -> None:
-    assert FDE_WEEKLY_DISCORD_TARGET == DEV
-    assert SEMI_BOTTOM_DISCORD_TARGET == SEMI_BOTTOM
+def test_fde_weekly_and_semi_bottom_keep_stdout_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DEV_CHANNEL", DEV)
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL", SEMI_BOTTOM)
     success = "FDE 招聘周报\n第二行\n"
     saved = _persist(tmp_path / "ok", "fde-hiring-weekly-report", success)
     assert saved is not None
@@ -1158,11 +1172,15 @@ def test_discord_channel_route_is_not_a_personal_or_feishu_target() -> None:
     ) == ["feishu:user:ou_me_1"]
 
 
-def test_host_command_spec_accepts_only_manifest_host_entries(tmp_path: Path) -> None:
+def test_host_command_spec_accepts_only_manifest_host_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     data = tmp_path / "data"
     ocw = tmp_path / "ocw"
     data.mkdir()
     ocw.mkdir()
+    monkeypatch.setenv("DALTON_DATA_TASK_GS_PB_PYTHON", "/opt/test/gs-pb/bin/python")
     manifest_argv = list(
         load_data_task_manifest().by_job_key()["gs-pb-weekly-rundown"].command_argv
     )
@@ -1187,7 +1205,7 @@ def test_host_command_spec_accepts_only_manifest_host_entries(tmp_path: Path) ->
         data_root=data,
         ocw_root=ocw,
     )
-    assert accepted["command_argv"] == manifest_argv
+    assert accepted["command_argv"] == ["/opt/test/gs-pb/bin/python", *manifest_argv[1:]]
     assert accepted["cwd"] == str(data)
     assert accepted["workspace_env"] == str(data)
 
@@ -1244,7 +1262,10 @@ async def test_host_run_rejects_non_manifest_command_before_launch(
         }
     )
     assert status == 400
-    assert body == {"ok": False, "rejected": True, "error": "host_command_rejected"}
+    assert body["ok"] is False
+    assert body["rejected"] is True
+    assert body["error"] == "host_command_rejected"
+    assert "detail" in body
     assert launched == []
 
 

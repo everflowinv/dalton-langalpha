@@ -361,9 +361,12 @@ class ThreadOutputResponse(BaseModel):
     workspace_id: Optional[str]
     status: str
     text: str
+    # DALTON-HOOK(deliverable-text): current turn's own deliverable answer ("" when empty)
+    answer: Optional[str] = None
 
 
-@router.get("/{thread_id}/output", response_model=ThreadOutputResponse)
+# DALTON-HOOK(deliverable-text): exclude optional answer when strict deliverable text is disabled
+@router.get("/{thread_id}/output", response_model=ThreadOutputResponse, response_model_exclude_unset=True)
 async def get_thread_output(
     thread_id: str,
     x_user_id: ReadUserId,
@@ -390,7 +393,13 @@ async def get_thread_output(
     # The read is by id alone, and a deleted thread's id can be taken again,
     # so it is the caller's only if the thread still is.
     await thread_access(thread_id, x_user_id)
-    return ThreadOutputResponse(thread_id=thread_id, **output._asdict())
+    # DALTON-HOOK(deliverable-text): expose answer field only when strict deliverable text is enabled
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+
+    payload = output._asdict()
+    if not is_strict_deliverable_text_enabled():
+        payload.pop("answer", None)
+    return ThreadOutputResponse(thread_id=thread_id, **payload)
 
 
 class ThreadSeenRequest(BaseModel):

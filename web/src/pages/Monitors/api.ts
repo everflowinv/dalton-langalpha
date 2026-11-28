@@ -34,12 +34,14 @@ export interface MonitorSummary {
   visibility: MonitorVisibility;
   member_user_ids: string[];
   published_seq: number;
+  last_verified_seq?: number | null;
   keep_updated: boolean;
   source_kind: 'workspace' | 'data_job';
   source_ref: string | null;
   acl_revision: number;
   last_publish_error: string | null;
   last_publish_failed_at: string | null;
+  has_recent_publish_issue?: boolean;
   data_as_of: string | null;
   created_at: string;
   updated_at: string;
@@ -75,6 +77,10 @@ export interface MonitorGrantResponse {
   data_base: string;
   expires_in: number;
   acl_revision: number;
+  published_seq?: number;
+  last_verified_seq?: number | null;
+  entry_path?: string | null;
+  updated_at?: string;
 }
 
 export interface CompanyMemberOption {

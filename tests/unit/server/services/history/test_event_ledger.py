@@ -35,6 +35,7 @@ _SCAN_ROOTS = (
     SRC / "server" / "services" / "home_placement.py",
     SRC / "server" / "app" / "threads",
     SRC / "llms" / "claude_code.py",  # QUEUE_EVENT_TYPE
+    SRC / "dalton" / "channels" / "sse_control.py",  # DALTON-HOOK(empty-turn-guard)
 )
 
 CHECKPOINT_PROJECTED = {
@@ -115,6 +116,7 @@ LIVE_ONLY = {
     # asked for; a socket-level acknowledgement, nothing to replay
     "resync_required",  # mux: a channel's cursor fell off its stream, reload
     # from history; a socket-level instruction, nothing to replay
+    "message_discarded",  # DALTON-HOOK(empty-turn-guard): transient live retraction of retried fragment
 }
 
 _CATEGORIES = {

@@ -2,11 +2,13 @@ import { registerAuthReset } from '@/lib/authResets';
 import type { PendingToolCallChunk } from '@/types/chat';
 import type { ChartKey } from '@/pages/MarketView/utils/chartInstanceKey';
 import type { ChartLayersCard } from '../chartLayerGrouping';
-import { buildRenderBlocks, groupSegments, HIDDEN_TOOL_CALL_NAMES, textBlockKey, type NotificationRenderBlock, type RenderBlock } from './buildRenderBlocks';
+import { buildRenderBlocks, groupSegments, HIDDEN_TOOL_CALL_NAMES, type NotificationRenderBlock, type RenderBlock } from './buildRenderBlocks';
 import { preparingCallsOf, samePreparing } from './pendingToolCalls';
 import { retainsNotice } from './notices';
 import { isContextNotice } from './messagePredicates';
 import { ANSWER_SCORE_HELD, ANSWER_SCORE_SHOWN, answerScore } from './answerText';
+// DALTON-HOOK(deliverable-text): shared phase/tool-boundary/continuation deliverable selector
+import { readDeliverableTextFollows, selectCollapsedAnswerTextKeys } from '@/lib/dalton/deliverableProjection';
 import type { ActivityItem, PreparingToolCallData } from './activityTypes';
 import { EMPTY_OBJ, type ContentSegmentRecord, type FoldState, type MessageRecord, type ToolCallProcessRecord } from './types';
 import type { ProjectedMessage } from './turnProjection';
@@ -81,7 +83,8 @@ const RETAINED_TYPES = new Set<RenderBlock['type']>([
 const RETAINED_ARTIFACTS = new Set(['preview_url', 'order_receipt', 'message_delivery', 'artifact_comment']);
 
 function foldRole(block: RenderBlock): FoldRole {
-  if (block.type === 'text') return 'text';
+  // DALTON-HOOK(deliverable-text): treat phase="commentary" text as foldable process, kept in expanded view
+  if (block.type === 'text') return block.segment.phase === 'commentary' ? 'process' : 'text';
   if (RETAINED_TYPES.has(block.type)) return 'retain';
   if (block.type === 'compact_artifact' && block.card && RETAINED_ARTIFACTS.has(block.card.type)) return 'retain';
   if (block.type === 'notification' && retainsNotice(block.segment)) return 'retain';
@@ -177,45 +180,14 @@ function hasText(content: string | undefined): content is string {
   return !!content && NON_BLANK.test(content);
 }
 
-/** Cards that wait on the user. Each stays in a folded turn, and the text
- *  leading into one is what it asks about. */
-const ASKS_USER = new Set([
-  'user_question', 'tool_approval', 'create_workspace', 'start_question', 'ptc_agent',
-  'delete_workspace', 'stop_workspace', 'delete_thread', 'archive_workspace', // DALTON-HOOK(cos-settings-tools)
-  'credit_pause',
-]);
-/** Calls that record the work rather than do it. An answer often ends on one,
- *  ticking the plan, so it says nothing about whether the turn went on. An
- *  older thread's plan is a `TodoWrite`. */
-const BOOKKEEPING_TOOLS = new Set(['UpdatePlan', 'TodoWrite']);
-
-/** What the agent did after each text before its next one. Reasoning opens the
- *  next model call and a notice is not the agent's, so neither counts. */
+/** What the agent did after each text before its next one. Delegates to
+ *  `readDeliverableTextFollows` so collapsed view and copy share one rule. */
+// DALTON-HOOK(deliverable-text): delegate follow classification so commentary is excluded before tool attribution
 function readFollows(
   groups: readonly ContentSegmentRecord[],
   toolCallProcesses: Record<string, ToolCallProcessRecord>,
 ): Map<string, TextFollow> {
-  const follows = new Map<string, TextFollow>();
-  let key: string | null = null;
-  for (const group of groups) {
-    if (group.type === 'text') {
-      if (!hasText(group.content)) continue;
-      key = textBlockKey(group.order);
-      follows.set(key, 'nothing');
-    } else if (key === null || group.type === 'reasoning' || group.type === 'notification') {
-      continue;
-    } else if (ASKS_USER.has(group.type)) {
-      follows.set(key, 'ask');
-    } else if (follows.get(key) === 'nothing' && !isBookkeeping(group, toolCallProcesses)) {
-      follows.set(key, 'work');
-    }
-  }
-  return follows;
-}
-
-function isBookkeeping(group: ContentSegmentRecord, toolCallProcesses: Record<string, ToolCallProcessRecord>): boolean {
-  const name = group.type === 'tool_call' && group.toolCallId ? toolCallProcesses[group.toolCallId]?.toolName : undefined;
-  return name !== undefined && BOOKKEEPING_TOOLS.has(name);
+  return readDeliverableTextFollows(groups, toolCallProcesses);
 }
 
 function sameFollows(a: ReadonlyMap<string, TextFollow>, b: ReadonlyMap<string, TextFollow>): boolean {
@@ -245,7 +217,7 @@ export function projectContent(input: ContentInput, prev?: ContentProjection): C
   for (const block of blocks) {
     const role = foldRole(block);
     roles.set(block.key, role);
-    if (block.type === 'text' && hasText(block.segment.content)) {
+    if (block.type === 'text' && role === 'text' && hasText(block.segment.content)) {
       lastTextKey = block.key;
       textCount++;
     }
@@ -469,21 +441,12 @@ function shownTexts(projection: ContentProjection, endsReply: boolean): Readonly
   let byEnd = shownByProjection.get(projection);
   const known = byEnd?.get(endsReply);
   if (known) return known;
-  const closing = closingTextKey(projection, endsReply);
-  const shown = new Set<string>();
-  for (const block of projection.blocks) {
-    if (block.type !== 'text') continue;
-    const follow = projection.textsFollowed.get(block.key);
-    if (follow === undefined) continue;
-    if (block.key === closing || follow === 'ask') {
-      shown.add(block.key);
-      continue;
-    }
-    // A reply's last text, which the turn went on working after, needs less to
-    // stand as its answer than an earlier text does to join it.
-    const threshold = endsReply && block.key === projection.lastTextKey ? ANSWER_SCORE_HELD : ANSWER_SCORE_SHOWN;
-    if (answerScore(block.segment.content ?? '') >= threshold) shown.add(block.key);
-  }
+  // DALTON-HOOK(deliverable-text): select collapsed final text by phase, tool boundary, and continuation chain
+  const shown = selectCollapsedAnswerTextKeys({
+    blocks: projection.blocks, roles: projection.roles, textsFollowed: projection.textsFollowed,
+    closingKey: closingTextKey(projection, endsReply), lastTextKey: projection.lastTextKey,
+    endsReply, answerScore, heldThreshold: ANSWER_SCORE_HELD, shownThreshold: ANSWER_SCORE_SHOWN,
+  });
   if (!byEnd) shownByProjection.set(projection, byEnd = new Map());
   byEnd.set(endsReply, shown);
   return shown;
