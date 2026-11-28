@@ -4,12 +4,14 @@
 
 set -euo pipefail
 set -E
+{ set +x; set +v; } 2>/dev/null
 umask 077
 
 BACKUP_ALERT_EMITTED=0
 BACKUP_COMPLETED_OK=0
 BACKUP_CLEANUP_FN=""
 _DALTON_TRAP_INSTALLED=0
+_DALTON_CLEANUP_RAN=0
 _DALTON_LAST_ERR_LINE=""
 _DALTON_LAST_ERR_CMD=""
 
@@ -43,6 +45,7 @@ init_default_alert_paths() {
 init_default_alert_paths
 
 load_offsite_backup_env() {
+    { set +x; set +v; } 2>/dev/null
     init_default_alert_paths
     local env_file="${DALTON_OFFSITE_BACKUP_ENV_FILE:-${HOME}/.config/dalton/offsite-backup.env}"
     if [[ -L "${env_file}" ]]; then
@@ -78,6 +81,14 @@ rclone_noproxy() {
         rclone "$@"
 }
 
+# Frozen upload helper: strips proxy vars AND suppresses HTTP/auth dump & debug logging.
+rclone_noproxy_nodump() {
+    (
+        unset RCLONE_DUMP RCLONE_DUMP_HEADERS RCLONE_DUMP_BODIES RCLONE_LOG_LEVEL RCLONE_VERBOSE
+        rclone_noproxy "$@" --dump= --dump-headers=false --dump-bodies=false --log-level INFO
+    )
+}
+
 log_msg() {
     local level="$1"
     shift
@@ -93,6 +104,7 @@ log_msg() {
 }
 
 emit_alert() {
+    { set +x; set +v; } 2>/dev/null
     local level="$1"
     local code="$2"
     shift 2
@@ -152,8 +164,24 @@ _dalton_on_err() {
     _DALTON_LAST_ERR_CMD="${2:-}"
 }
 
+_dalton_on_signal() {
+    local sig_name="$1"
+    local sig_rc="$2"
+    trap '' INT TERM HUP
+    set +e
+    _DALTON_LAST_ERR_CMD="signal:${sig_name}"
+    local child_pids=""
+    child_pids="$(jobs -p 2>/dev/null || true)"
+    if [[ -n "${child_pids}" ]]; then
+        kill -"${sig_name}" ${child_pids} 2>/dev/null || true
+    fi
+    wait 2>/dev/null || true
+    exit "${sig_rc}"
+}
+
 _dalton_on_exit() {
     local rc=$?
+    trap '' INT TERM HUP
     set +e
     if [[ "${rc}" -eq 0 ]] && [[ "${BACKUP_COMPLETED_OK:-0}" != "1" ]]; then
         # Bash 3.2 enters EXIT trap with $?=0 when aborted by `set -u` unbound variable.
@@ -164,12 +192,17 @@ _dalton_on_exit() {
         local detail="Unexpected failure (exit=${rc})"
         if [[ -n "${_DALTON_LAST_ERR_LINE:-}" ]]; then
             detail="Unexpected failure at line ${_DALTON_LAST_ERR_LINE} (${_DALTON_LAST_ERR_CMD:-unknown}, exit=${rc})"
+        elif [[ -n "${_DALTON_LAST_ERR_CMD:-}" ]]; then
+            detail="Unexpected failure (${_DALTON_LAST_ERR_CMD}, exit=${rc})"
         fi
         emit_alert "ERROR" "UNEXPECTED_FAILURE" "${detail}" || true
         log_msg "ERROR" "${detail}" || true
     fi
-    if [[ -n "${BACKUP_CLEANUP_FN:-}" ]] && declare -F "${BACKUP_CLEANUP_FN}" >/dev/null 2>&1; then
-        "${BACKUP_CLEANUP_FN}" "${rc}" || true
+    if [[ "${_DALTON_CLEANUP_RAN:-0}" != "1" ]]; then
+        _DALTON_CLEANUP_RAN=1
+        if [[ -n "${BACKUP_CLEANUP_FN:-}" ]] && declare -F "${BACKUP_CLEANUP_FN}" >/dev/null 2>&1; then
+            "${BACKUP_CLEANUP_FN}" "${rc}" || true
+        fi
     fi
     exit "${rc}"
 }
@@ -178,6 +211,9 @@ install_failure_trap() {
     BACKUP_CLEANUP_FN="${1:-}"
     _DALTON_TRAP_INSTALLED=1
     trap '_dalton_on_err "${LINENO}" "${BASH_COMMAND:-unknown}"' ERR
+    trap '_dalton_on_signal INT 130' INT
+    trap '_dalton_on_signal TERM 143' TERM
+    trap '_dalton_on_signal HUP 129' HUP
     trap _dalton_on_exit EXIT
 }
 
@@ -223,6 +259,50 @@ ensure_backup_key() {
         BACKUP_ALERT_EMITTED=1
         emit_alert "ERROR" "EMPTY_KEY_FILE" "Backup key file is empty: ${key_file}" || true
         log_msg "ERROR" "Backup key file is empty: ${key_file}" || true
+        return 1
+    fi
+    return 0
+}
+
+require_existing_backup_key() {
+    { set +x; set +v; } 2>/dev/null
+    local key_file="${DALTON_BACKUP_KEY_FILE:-${HOME}/.config/dalton/backup.key}"
+    if [[ -L "${key_file}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "INVALID_KEY_FILE" "Backup key path is a symlink: ${key_file}" || true
+        log_msg "ERROR" "Backup key path must not be a symlink: ${key_file}" || true
+        return 1
+    fi
+    if [[ ! -f "${key_file}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "MISSING_KEY_FILE" "Existing backup key file not found: ${key_file}" || true
+        log_msg "ERROR" "Existing backup key file not found: ${key_file}" || true
+        return 1
+    fi
+    if [[ ! -r "${key_file}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "UNREADABLE_KEY_FILE" "Backup key file is not readable: ${key_file}" || true
+        log_msg "ERROR" "Backup key file is not readable: ${key_file}" || true
+        return 1
+    fi
+    if [[ ! -s "${key_file}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "EMPTY_KEY_FILE" "Backup key file is empty: ${key_file}" || true
+        log_msg "ERROR" "Backup key file is empty: ${key_file}" || true
+        return 1
+    fi
+    local first_line=""
+    if ! IFS= read -r first_line < "${key_file}" && [[ -z "${first_line}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "EMPTY_KEY_FILE" "Backup key file first line is empty: ${key_file}" || true
+        log_msg "ERROR" "Backup key file first line is empty: ${key_file}" || true
+        return 1
+    fi
+    first_line="${first_line%$'\r'}"
+    if [[ -z "${first_line}" ]]; then
+        BACKUP_ALERT_EMITTED=1
+        emit_alert "ERROR" "EMPTY_KEY_FILE" "Backup key file first line is empty: ${key_file}" || true
+        log_msg "ERROR" "Backup key file first line is empty: ${key_file}" || true
         return 1
     fi
     return 0
