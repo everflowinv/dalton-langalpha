@@ -8,7 +8,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
@@ -22,6 +22,7 @@ from scripts.dalton.monitor_feeds.common import (  # noqa: E402
     SourceStatusStore,
     format_source_statuses,
     make_source_result,
+    pm_required_sources,
     resolve_state_dir,
 )
 from scripts.dalton.monitor_feeds.pm_cockpit.collect import collect_all  # noqa: E402
@@ -77,6 +78,7 @@ def _pm_publish_ok(
     sources: dict[str, dict[str, Any]],
     compute_ok: bool,
     render_ok: bool,
+    required_sources: Iterable[str] | None = None,
 ) -> bool:
     """Exit 0 iff render+compute succeed AND at least one target panel's required sources are clean.
 
@@ -111,15 +113,7 @@ def main() -> int:
 
     collect_meta: dict[str, Any] | None = None
     collect_statuses: list[SourceStatus] = []
-    req_collect: list[str] = (
-        ["us", "cn", "cn_valuation"]
-        if args.mode == "all"
-        else (
-            ["us"]
-            if args.mode == "us"
-            else (["cn", "cn_valuation"] if args.mode == "cn" else ["cn_valuation"])
-        )
-    )
+    req_collect: list[str] = list(pm_required_sources(args.mode))
 
     if not args.skip_collect:
         try:
@@ -248,14 +242,19 @@ def main() -> int:
         sources=final_doc["sources"],
         compute_ok=comp_st.is_clean,
         render_ok=rend_st.is_clean,
+        required_sources=req_collect,
     )
+    failure_reason = overall.get("reason") if not publish_ok else None
     summary = {
         "ok": bool(overall.get("ok")),
         "publish_ok": bool(publish_ok),
         "panels": panel_statuses,
+        "required_sources": req_collect,
         "us_data_as_of": panels.get("us_data_as_of"),
         "us_stale": (panels.get("us_status") or {}).get("stale", False),
         "cn_stale": (panels.get("cn_status") or {}).get("stale", False),
+        "stale_reason": failure_reason,
+        "failure_summary": failure_reason,
         "last_success_at": overall.get("last_success_at"),
         "sources": final_doc["sources"],
         "overall": overall,

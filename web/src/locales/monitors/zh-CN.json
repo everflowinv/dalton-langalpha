@@ -14,7 +14,7 @@
   "pageUpdatedAt": "页面更新时间：{{time}}",
   "dataUpdatedAt": "数据时间：{{time}}",
   "ownerLabel": "发布人：{{owner}}",
-  "lastPublishFailed": "最近一次更新失败：{{time}}",
+  "lastPublishFailed": "最近一次更新未生效：{{time}}",
   "recentPublishIssue": "最近一次更新未生效，当前展示上一可用版本",
   "forbiddenTitle": "无权查看此监控面板",
   "forbiddenDesc": "请联系面板所有者或管理员开通访问权限。",
