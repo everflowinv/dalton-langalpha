@@ -90,8 +90,10 @@ UPSTREAM_STOPWORDS = {
     "vision", "voice", "web", "workflow",
     # Address parts and generic words that grouped unrelated repos (11-28 report:
     # com, org, github, software, community, design, daily, pro ...).
-    "com", "org", "io", "www", "http", "https", "github", "gitlab", "html",
-    "and", "for", "the", "with", "your", "rust", "java", "golang", "swift", "kotlin",
+    "com", "org", "www", "http", "https", "github", "gitlab", "html",
+    "and", "for", "from", "the", "with", "your", "scratch",
+    "rust", "cpp", "java", "typescript", "golang", "swift", "kotlin",
+    "windows", "linux", "macos", "android", "ios",
     "anything", "best", "build", "builder", "community", "control",
     "daily", "design", "downloader", "easy", "engineer", "engineering", "guide",
     "learn", "manager", "modern", "online", "pro", "protocol", "simple", "software",
@@ -168,9 +170,22 @@ def name_tokens(item: dict[str, Any]) -> set[str]:
     return _tokens(str(item.get("full_name") or "").replace("/", " "))
 
 
+HOSTING_SUFFIXES = (
+    "github.io", "gitlab.io", "vercel.app", "netlify.app", "pages.dev", "web.app",
+    "readthedocs.io", "hf.space", "huggingface.co", "streamlit.app", "fly.dev",
+)
+
+
 def _homepage_name(url: str) -> str:
-    """Host labels of a homepage without its top-level domain (`foo.net` -> `foo`)."""
-    host = urlparse(url if "://" in url else f"https://{url}").hostname or ""
+    """The project's own labels in a homepage host: no top-level domain, no hosting service.
+
+    `foo.net` -> `foo`; `foo.vercel.app` -> `foo` (otherwise `vercel` would group a
+    hosted page with the owner `vercel-labs`).
+    """
+    host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()
+    for suffix in HOSTING_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return host[: -len(suffix)].strip(".").replace(".", " ")
     labels = [label for label in host.split(".") if label]
     return " ".join(labels[:-1] if len(labels) > 1 else labels)
 
@@ -215,7 +230,7 @@ def recent_repo_tokens(
             )
             # Snapshots written before token storage existed still yield name tokens.
             fallback = _tokens(str(full_name).replace("/", " "))
-            # Stored tokens predate later stopwords; filter them again here.
+            # Keep stored tokens in line with the current stopwords (easier to inspect).
             entry["name_tokens"] |= set(meta.get("name_tokens") or fallback) - UPSTREAM_STOPWORDS
             entry["mention_tokens"] |= set(meta.get("mention_tokens") or fallback) - UPSTREAM_STOPWORDS
     return seen

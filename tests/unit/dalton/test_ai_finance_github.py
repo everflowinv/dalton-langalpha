@@ -290,6 +290,14 @@ def test_tokens_stored_before_new_stopwords_are_filtered_again():
 
 def test_homepage_top_level_domain_is_dropped_but_a_real_net_name_is_kept():
     assert trending._homepage_name("https://www.foo.net/docs") == "www foo"
+    assert trending._homepage_name("https://foo.vercel.app") == "foo"
+    items_hosted = [
+        {"full_name": "vercel-labs/agent-kit", "description": "x"},
+        {"full_name": "carol/demo", "description": "y", "github": {"homepage": "https://demo.vercel.app"}},
+    ]
+    assert trending.upstream_clusters(items_hosted, {"snapshots": []}) == []
+    langs = [{"full_name": "alice/rust-agent", "description": "x"}, {"full_name": "bob/fast-rust-llm", "description": "y"}]
+    assert trending.upstream_clusters(langs, {"snapshots": []}) == []
     items = [
         {"full_name": "alice/ml-net-tools", "description": "x"},
         {"full_name": "bob/sample", "description": "built on ML.NET"},
