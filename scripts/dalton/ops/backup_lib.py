@@ -1243,12 +1243,15 @@ def _inspect_active_docker_endpoint(
     run_fn: Callable[..., subprocess.CompletedProcess[str]],
     timeout_s: float = 10.0,
 ) -> tuple[str | None, str | None, str | None]:
-    """Return ``(endpoint_url, context_name, error_reason)`` for the active Docker daemon."""
+    """Return ``(endpoint_url, context_name, error_reason)`` for the active Docker daemon.
+
+    Matches Docker CLI precedence: ``DOCKER_CONTEXT`` > ``DOCKER_HOST`` > current Docker context.
+    """
+    ctx_env = (env.get("DOCKER_CONTEXT") or "").strip()
     docker_host = (env.get("DOCKER_HOST") or "").strip()
-    if docker_host:
+    if not ctx_env and docker_host:
         return docker_host, None, None
 
-    ctx_env = (env.get("DOCKER_CONTEXT") or "").strip()
     inspect_cmd = ["docker", "context", "inspect"]
     if ctx_env:
         inspect_cmd.append(ctx_env)
@@ -1301,12 +1304,12 @@ def resolve_active_colima_config(
 ) -> tuple[Path, str]:
     """Resolve the active Colima home directory and profile from the actual Docker context/host.
 
-    Priority:
-    - Explicit ``colima_profile`` / ``COLIMA_PROFILE`` override: honors explicit ``colima_dir`` /
-      ``COLIMA_HOME`` / ``~/.colima`` directly.
-    - Otherwise, resolves the active Docker daemon from ``DOCKER_HOST`` or the active Docker
-      context (``DOCKER_CONTEXT`` / ``docker context inspect``) and maps its endpoint to the
-      exact Colima home and profile.
+    Priority matches Docker CLI:
+    - Resolves the active Docker daemon in order ``DOCKER_CONTEXT`` > ``DOCKER_HOST`` >
+      active Docker context (``docker context inspect``) and maps its endpoint to the exact
+      Colima home and profile.
+    - Explicit ``colima_dir`` and ``colima_profile`` / ``COLIMA_PROFILE`` are validated against
+      the active Docker endpoint; any mismatch fails closed with :class:`ColimaConfigResolutionError`.
     - Fails closed with :class:`ColimaConfigResolutionError` if the active Docker context/host
       cannot be determined or cannot be mapped unambiguously to a running Colima profile.
     """
@@ -1319,16 +1322,19 @@ def resolve_active_colima_config(
     else:
         home_path = Path.home() / ".colima"
 
-    if colima_profile is not None and str(colima_profile).strip():
-        return home_path, str(colima_profile).strip()
-    env_prof = (em.get("COLIMA_PROFILE") or "").strip()
-    if env_prof:
-        return home_path, env_prof
+    requested_profile = (
+        str(colima_profile).strip()
+        if colima_profile is not None and str(colima_profile).strip()
+        else (em.get("COLIMA_PROFILE") or "").strip()
+    )
 
     runner = run_fn if run_fn is not None else subprocess.run
-    sub_env = dict(os.environ)
-    for k, v in em.items():
-        sub_env[str(k)] = str(v)
+    if env is None:
+        sub_env = dict(os.environ)
+    else:
+        sub_env = {str(k): str(v) for k, v in em.items()}
+        if "PATH" not in sub_env and "PATH" in os.environ:
+            sub_env["PATH"] = os.environ["PATH"]
     sub_env["COLIMA_HOME"] = str(home_path)
 
     docker_endpoint, docker_context, docker_err = _inspect_active_docker_endpoint(
@@ -1352,6 +1358,13 @@ def resolve_active_colima_config(
             f"Active Docker endpoint {docker_endpoint!r} "
             f"(context={docker_context or 'DOCKER_HOST'}) does not map to a Colima socket; "
             "refusing to guess Colima profile or virtual disk location"
+        )
+
+    if requested_profile and requested_profile != sock_profile:
+        raise ColimaConfigResolutionError(
+            f"Active Docker endpoint {docker_endpoint!r} "
+            f"(context={docker_context or 'DOCKER_HOST'}) uses Colima profile {sock_profile!r} "
+            f"under {sock_home}, which conflicts with specified Colima profile {requested_profile!r}"
         )
 
     # Use the actual Colima home indicated by the Docker context socket so preflight checks

@@ -1493,7 +1493,7 @@ PG_DUMP_PID=""
 PG_DUMP_CONTAINER_PIDFILE=""
 BUNDLE_TAR_PID=""
 CTL_IN_FIFO=""
-CTL_ERR_FIFO=""
+CTL_ERR_FILE=""
 BUNDLE_OUT_FIFO=""
 
 terminate_container_pg_dump() {
@@ -1547,9 +1547,9 @@ stop_consistent_backup_children() {
     rm -f "$CTL_IN_FIFO" 2>/dev/null || true
     CTL_IN_FIFO=""
   fi
-  if [[ -n "${CTL_ERR_FIFO:-}" ]]; then
-    rm -f "$CTL_ERR_FIFO" 2>/dev/null || true
-    CTL_ERR_FIFO=""
+  if [[ -n "${CTL_ERR_FILE:-}" ]]; then
+    rm -f "$CTL_ERR_FILE" 2>/dev/null || true
+    CTL_ERR_FILE=""
   fi
   if [[ -n "${BUNDLE_OUT_FIFO:-}" ]]; then
     rm -f "$BUNDLE_OUT_FIFO" 2>/dev/null || true
@@ -1637,13 +1637,32 @@ LOCK_TIMEOUT_S="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"
 SNAP_IMPORT_TIMEOUT_S="${DALTON_BACKUP_SNAPSHOT_IMPORT_TIMEOUT_S:-120}"
 PG_DUMP_TIMEOUT_S="${DALTON_BACKUP_PG_DUMP_TIMEOUT_S:-7200}"
 CTL_IN_FIFO="${STAGE_DIR}/.consistent-ctl.in"
-CTL_ERR_FIFO="${STAGE_DIR}/.consistent-ctl.err"
+CTL_ERR_FILE="${STAGE_DIR}/.consistent-ctl.err"
 BUNDLE_OUT_FIFO="${STAGE_DIR}/.consistent-bundle.out"
-mkfifo "$CTL_IN_FIFO" "$CTL_ERR_FIFO" "$BUNDLE_OUT_FIFO"
+mkfifo "$CTL_IN_FIFO" "$BUNDLE_OUT_FIFO"
+: > "$CTL_ERR_FILE"
+chmod 600 "$CTL_ERR_FILE"
 
 # Hold write-end of CTL_IN_FIFO open on fd 5 so backend waits for explicit handshake tokens.
+# Use a regular file on fd 6 for stderr control lines (portable across Bash 3.2 on macOS
+# where `read -t 0.1` is invalid, avoids read-write FIFO EOF stalls, and never back-pressures).
 exec 5<>"$CTL_IN_FIFO"
-exec 6<>"$CTL_ERR_FIFO"
+exec 6<"$CTL_ERR_FILE"
+CTL_ERR_PARTIAL=""
+CTL_LINE=""
+
+read_ctl_err_line() {
+  local chunk=""
+  if IFS= read -r chunk <&6; then
+    CTL_LINE="${CTL_ERR_PARTIAL}${chunk}"
+    CTL_ERR_PARTIAL=""
+    return 0
+  fi
+  if [[ -n "$chunk" ]]; then
+    CTL_ERR_PARTIAL+="$chunk"
+  fi
+  return 1
+}
 
 # Extract streamed tar bundle (minio-objects.tar.gz + optional asr-jobs.tar.gz) directly into STAGE_DIR.
 tar -xf "$BUNDLE_OUT_FIFO" -C "${STAGE_DIR}" &
@@ -1666,7 +1685,7 @@ fi
 
 LOCK_START_TS="$(date +%s)"
 SNAP_READY_DEADLINE=$(( LOCK_START_TS + LOCK_TIMEOUT_S ))
-DALTON_BACKUP_PG_DSN="$PG_TARGET_DSN" compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"$BUNDLE_OUT_FIFO" 2>"$CTL_ERR_FIFO" &
+DALTON_BACKUP_PG_DSN="$PG_TARGET_DSN" compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"$BUNDLE_OUT_FIFO" 2>"$CTL_ERR_FILE" &
 CONSISTENT_BACKEND_PID=$!
 
 SNAPSHOT_ID=""
@@ -1679,12 +1698,13 @@ while true; do
     stop_consistent_backup_children
     exit 1
   fi
-  if IFS= read -r -t 1 ctl_line <&6; then
+  while read_ctl_err_line; do
+    ctl_line="$CTL_LINE"
     case "$ctl_line" in
       "@@DALTON_CTL@@ SNAPSHOT_READY "*)
         SNAPSHOT_ID="${ctl_line#@@DALTON_CTL@@ SNAPSHOT_READY }"
         SNAPSHOT_ID="${SNAPSHOT_ID//$'\r'/}"
-        break
+        break 2
         ;;
       "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
         err "consistent_backup lock-phase supervisor requested abort before snapshot export."
@@ -1698,14 +1718,39 @@ while true; do
         printf '%s\n' "$ctl_line" >&2
         ;;
     esac
-  else
-    if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
-      break
-    fi
+  done
+  if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+    while read_ctl_err_line; do
+      ctl_line="$CTL_LINE"
+      case "$ctl_line" in
+        "@@DALTON_CTL@@ SNAPSHOT_READY "*)
+          SNAPSHOT_ID="${ctl_line#@@DALTON_CTL@@ SNAPSHOT_READY }"
+          SNAPSHOT_ID="${SNAPSHOT_ID//$'\r'/}"
+          break 2
+          ;;
+        "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
+          err "consistent_backup lock-phase supervisor requested abort before snapshot export."
+          exec 5>&- 6<&- || true
+          stop_consistent_backup_children
+          exit 1
+          ;;
+        "@@DALTON_CTL@@ "*)
+          ;;
+        *)
+          printf '%s\n' "$ctl_line" >&2
+          ;;
+      esac
+    done
+    break
   fi
+  sleep 0.05
 done
 
 if [[ -z "$SNAPSHOT_ID" ]]; then
+  if [[ -n "$CTL_ERR_PARTIAL" ]]; then
+    printf '%s\n' "$CTL_ERR_PARTIAL" >&2
+    CTL_ERR_PARTIAL=""
+  fi
   exec 5>&- 6<&- || true
   wait "$CONSISTENT_BACKEND_PID" 2>/dev/null || true
   CONSISTENT_BACKEND_PID=""
@@ -1735,6 +1780,22 @@ while true; do
     DUMP_IMPORTED=1
     break
   fi
+  while read_ctl_err_line; do
+    ctl_line="$CTL_LINE"
+    case "$ctl_line" in
+      "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
+        err "consistent_backup lock-phase supervisor requested in-container pg_dump termination during snapshot import."
+        exec 5>&- 6<&- || true
+        stop_consistent_backup_children
+        exit 1
+        ;;
+      "@@DALTON_CTL@@ "*)
+        ;;
+      *)
+        printf '%s\n' "$ctl_line" >&2
+        ;;
+    esac
+  done
   if ! kill -0 "$PG_DUMP_PID" 2>/dev/null; then
     break
   fi
@@ -1751,21 +1812,7 @@ while true; do
     stop_consistent_backup_children
     exit 1
   fi
-  if IFS= read -r -t 0.1 ctl_line <&6; then
-    case "$ctl_line" in
-      "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
-        err "consistent_backup lock-phase supervisor requested in-container pg_dump termination during snapshot import."
-        exec 5>&- 6<&- || true
-        stop_consistent_backup_children
-        exit 1
-        ;;
-      "@@DALTON_CTL@@ "*)
-        ;;
-      *)
-        printf '%s\n' "$ctl_line" >&2
-        ;;
-    esac
-  fi
+  sleep 0.05
 done
 
 if [[ "$DUMP_IMPORTED" -eq 0 ]]; then
@@ -1794,20 +1841,8 @@ if (( SNAP_READY_DEADLINE < DUMP_DEADLINE )); then
 fi
 if [[ -n "$PG_DUMP_PID" ]]; then
   while kill -0 "$PG_DUMP_PID" 2>/dev/null; do
-    if (( $(date +%s) >= DUMP_DEADLINE )); then
-      err "pg_dump --snapshot exceeded shared lock/dump hard timeout; terminating in-container pg_dump."
-      printf 'PG_DUMP_FAILED\n' >&5 || true
-      exec 5>&- 6<&- || true
-      stop_consistent_backup_children
-      exit 1
-    fi
-    if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
-      err "consistent_backup lock-phase supervisor exited before pg_dump completed; terminating in-container pg_dump."
-      exec 5>&- 6<&- || true
-      stop_consistent_backup_children
-      exit 1
-    fi
-    if IFS= read -r -t 0.2 ctl_line <&6; then
+    while read_ctl_err_line; do
+      ctl_line="$CTL_LINE"
       case "$ctl_line" in
         "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
           err "consistent_backup lock-phase watchdog expired; terminating in-container pg_dump immediately."
@@ -1824,7 +1859,21 @@ if [[ -n "$PG_DUMP_PID" ]]; then
           printf '%s\n' "$ctl_line" >&2
           ;;
       esac
+    done
+    if (( $(date +%s) >= DUMP_DEADLINE )); then
+      err "pg_dump --snapshot exceeded shared lock/dump hard timeout; terminating in-container pg_dump."
+      printf 'PG_DUMP_FAILED\n' >&5 || true
+      exec 5>&- 6<&- || true
+      stop_consistent_backup_children
+      exit 1
     fi
+    if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+      err "consistent_backup lock-phase supervisor exited before pg_dump completed; terminating in-container pg_dump."
+      exec 5>&- 6<&- || true
+      stop_consistent_backup_children
+      exit 1
+    fi
+    sleep 0.05
   done
   set +e
   wait "$PG_DUMP_PID"
@@ -1853,7 +1902,8 @@ exec 5>&-
 
 # Drain remaining stderr lines from consistent_backup until it exits.
 while kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; do
-  if IFS= read -r -t 1 ctl_line <&6; then
+  while read_ctl_err_line; do
+    ctl_line="$CTL_LINE"
     case "$ctl_line" in
       "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
         info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
@@ -1864,9 +1914,21 @@ while kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; do
         printf '%s\n' "$ctl_line" >&2
         ;;
     esac
+  done
+  if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+    break
   fi
+  sleep 0.05
 done
-while IFS= read -r -t 0.1 ctl_line <&6; do
+
+set +e
+wait "$CONSISTENT_BACKEND_PID"
+cb_rc=$?
+wait "$BUNDLE_TAR_PID"
+bundle_tar_rc=$?
+set -e
+while read_ctl_err_line; do
+  ctl_line="$CTL_LINE"
   case "$ctl_line" in
     "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
       info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
@@ -1878,19 +1940,16 @@ while IFS= read -r -t 0.1 ctl_line <&6; do
       ;;
   esac
 done
+if [[ -n "$CTL_ERR_PARTIAL" ]]; then
+  printf '%s\n' "$CTL_ERR_PARTIAL" >&2
+  CTL_ERR_PARTIAL=""
+fi
 exec 6<&-
-
-set +e
-wait "$CONSISTENT_BACKEND_PID"
-cb_rc=$?
-wait "$BUNDLE_TAR_PID"
-bundle_tar_rc=$?
-set -e
 CONSISTENT_BACKEND_PID=""
 BUNDLE_TAR_PID=""
-rm -f "$CTL_IN_FIFO" "$CTL_ERR_FIFO" "$BUNDLE_OUT_FIFO"
+rm -f "$CTL_IN_FIFO" "$CTL_ERR_FILE" "$BUNDLE_OUT_FIFO"
 CTL_IN_FIFO=""
-CTL_ERR_FIFO=""
+CTL_ERR_FILE=""
 BUNDLE_OUT_FIFO=""
 
 if [[ "$cb_rc" -ne 0 ]]; then

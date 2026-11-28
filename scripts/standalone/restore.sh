@@ -1320,9 +1320,13 @@ expected_objects = [
     item for item in (manifest.get("objects") or [])
     if item.get("key") != RESTORE_MARKER_KEY
 ]
-manifest_by_pair: dict[tuple[str, str], dict[str, object]] = {
-    (str(item["bucket"]), str(item["key"])): item for item in expected_objects
-}
+manifest_by_pair: dict[tuple[str, str], dict[str, object]] = {}
+for item in expected_objects:
+    pair = (str(item["bucket"]), str(item["key"]).lstrip("/"))
+    if pair in manifest_by_pair:
+        print(f"ERROR: Manifest contains duplicate object {pair!r}", file=sys.stderr)
+        sys.exit(1)
+    manifest_by_pair[pair] = item
 
 source_buckets: set[str] = set(manifest.get("buckets") or [])
 for item in expected_objects:

@@ -201,6 +201,38 @@ class BucketArchiveSpec:
     key_prefix: str = ""
     s3_client: Any = None
     versioning_enabled: bool | None = None  # None = auto-detect via get_bucket_versioning
+    endpoint: str = ""
+
+
+def _spec_endpoint_identity(spec: BucketArchiveSpec) -> str:
+    """Normalize endpoint identity for deduplicating overlapping specs against one bucket."""
+    ep = (spec.endpoint or "").strip().rstrip("/").lower()
+    if ep:
+        return ep
+    client_ep = getattr(getattr(spec.s3_client, "_endpoint", None), "host", None)
+    if isinstance(client_ep, str) and client_ep.strip():
+        return client_ep.strip().rstrip("/").lower()
+    return ""
+
+
+def _deduplicate_selections(
+    selections: Sequence[tuple[BucketArchiveSpec, VersionSelectionResult]],
+) -> list[tuple[BucketArchiveSpec, VersionSelectionResult]]:
+    """Deduplicate selected objects by ``(endpoint, bucket, full_key)`` before archiving."""
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[tuple[BucketArchiveSpec, VersionSelectionResult]] = []
+    for spec, sel in selections:
+        ep_id = _spec_endpoint_identity(spec)
+        unique_items: list[SelectedObjectVersion] = []
+        for obj in sel.selected:
+            full_key = str(obj.key).lstrip("/")
+            dedup_key = (ep_id, str(obj.bucket), full_key)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            unique_items.append(obj)
+        deduped.append((spec, dataclasses.replace(sel, selected=tuple(unique_items))))
+    return deduped
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,6 +507,7 @@ def resolve_runtime_bucket_specs(
                 roles=tuple(dict.fromkeys(item["roles"])),
                 key_prefix=item["prefix"],
                 s3_client=client,
+                endpoint=item["endpoint"] or "",
             )
         )
     return out
@@ -719,14 +752,18 @@ async def acquire_gc_advisory_locks(
 
 
 async def release_gc_advisory_locks(conn: Any) -> None:
-    """Release both GC session advisory locks (best-effort safe for ``finally`` blocks)."""
+    """Release both GC session advisory locks."""
     async with conn.cursor() as cur:
         await cur.execute(
             "SELECT pg_advisory_unlock(hashtextextended(%s, 0)), "
             "pg_advisory_unlock(hashtextextended(%s, 0))",
             (WORKSPACE_FILE_BLOBS_GC_LOCK_KEY, PROVENANCE_GC_LOCK_KEY),
         )
-        await cur.fetchone()
+        row = await cur.fetchone()
+        if isinstance(row, (tuple, list)) and len(row) >= 2 and (row[0] is False or row[1] is False):
+            raise ConsistentBackupError(
+                f"pg_advisory_unlock failed to release one or both GC locks: {row!r}"
+            )
 
 
 async def begin_exported_snapshot(conn: Any) -> str:
@@ -1437,6 +1474,14 @@ class MirrorPoolSink:
         return rec
 
     def finalize(self) -> tuple[ArchivedObjectRecord, ...]:
+        seen: set[tuple[str, str]] = set()
+        for rec in self.records:
+            pair = (str(rec.bucket), str(rec.key).lstrip("/"))
+            if pair in seen:
+                raise ConsistentBackupError(
+                    f"Duplicate archived object in mirror pool manifest: {pair[0]}/{pair[1]}"
+                )
+            seen.add(pair)
         return tuple(self.records)
 
 
@@ -1459,6 +1504,7 @@ class TarGzObjectSink:
         self._tf = tarfile.open(self._tmp_tar, "w:gz", format=tarfile.PAX_FORMAT)
         self._manifest_extra = dict(manifest_extra or {})
         self.records: list[ArchivedObjectRecord] = []
+        self._seen_pairs: set[tuple[str, str]] = set()
         self._closed = False
 
     def archive_object(
@@ -1470,6 +1516,11 @@ class TarGzObjectSink:
         on_stream_open: Callable[[Any], None] | None = None,
         on_stream_close: Callable[[Any], None] | None = None,
     ) -> ArchivedObjectRecord:
+        pair = (str(item.bucket), str(item.key).lstrip("/"))
+        if pair in self._seen_pairs:
+            raise ConsistentBackupError(
+                f"Duplicate archived object for tar sink: {pair[0]}/{pair[1]}"
+            )
         if deadline is not None:
             _remaining_or_raise(deadline, f"get_object({item.bucket}/{item.key})")
         body, content_type = _fetch_s3_object_stream(
@@ -1522,12 +1573,21 @@ class TarGzObjectSink:
             archived_sha256=digest,
             content_type=content_type,
         )
+        self._seen_pairs.add(pair)
         self.records.append(rec)
         return rec
 
     def finalize(self) -> tuple[ArchivedObjectRecord, ...]:
         if self._closed:
             return tuple(self.records)
+        seen: set[tuple[str, str]] = set()
+        for rec in self.records:
+            pair = (str(rec.bucket), str(rec.key).lstrip("/"))
+            if pair in seen:
+                raise ConsistentBackupError(
+                    f"Duplicate archived object in tar manifest: {pair[0]}/{pair[1]}"
+                )
+            seen.add(pair)
         manifest_payload: dict[str, Any] = {
             "version": 2,
             "buckets": sorted({r.bucket for r in self.records}),
@@ -1889,18 +1949,43 @@ async def run_consistent_backup(
     asr_proc: AsrArchiveProcess | None = None
     watchdog: _LockPhaseWatchdog | None = None
 
-    async def _release_locks_now() -> None:
+    async def _release_locks_now(*, strict: bool = False, deadline: float | None = None) -> None:
         nonlocal locks_held
         if not locks_held:
             return
         if watchdog is not None and watchdog.db_closed_by_watchdog:
             locks_held = False
+            if strict:
+                raise BackupTimeoutError(
+                    f"Consistent backup exceeded hard lock-phase deadline during {watchdog.timeout_phase}"
+                )
             return
         try:
-            await asyncio.wait_for(release_gc_advisory_locks(conn), timeout=10.0)
-        except Exception as exc:
-            logger.warning("Failed releasing GC advisory locks: %s", exc)
-        finally:
+            unlock_timeout = 10.0
+            if deadline is not None:
+                unlock_timeout = min(
+                    unlock_timeout,
+                    _remaining_or_raise(deadline, "release_gc_advisory_locks"),
+                )
+            await asyncio.wait_for(release_gc_advisory_locks(conn), timeout=unlock_timeout)
+        except BaseException as exc:
+            # Close the dedicated control session immediately so locks are dropped even if
+            # unlock stalled or failed; on the normal path (strict=True) abort the backup.
+            if not (watchdog is not None and watchdog.db_closed_by_watchdog):
+                await _force_close_db_connection_async(conn)
+            locks_held = False
+            if strict:
+                if isinstance(exc, (TimeoutError, BackupTimeoutError)):
+                    raise BackupTimeoutError(
+                        "Failed releasing GC advisory locks within deadline; closed DB session"
+                    ) from exc
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise ConsistentBackupError(
+                    f"Failed releasing GC advisory locks; closed DB session: {exc}"
+                ) from exc
+            logger.warning("Failed releasing GC advisory locks (closed DB session): %s", exc)
+        else:
             locks_held = False
 
     def _terminate_dump_if_running() -> None:
@@ -1931,20 +2016,29 @@ async def run_consistent_backup(
         current_task = asyncio.current_task()
         assert current_task is not None
 
-        # Step 1: hold both GC session advisory locks (bounded lock_timeout)
-        await acquire_gc_advisory_locks(conn, lock_timeout=lock_timeout)
-        locks_held = True
+        # Start hard lock-phase watchdog BEFORE acquiring the first advisory lock so a stalled
+        # DB session during or immediately after lock acquisition is still bounded and closed.
         lock_deadline = time.monotonic() + max(0.05, eff_lock_timeout)
-
         watchdog = _LockPhaseWatchdog(
             deadline=lock_deadline,
             conn=conn,
             loop=loop,
             task=current_task,
         )
+        watchdog.set_phase("acquire_gc_advisory_locks")
         watchdog.set_dump_terminator(_terminate_dump_if_running)
         watchdog.set_asr_terminator(_terminate_asr_if_running)
         watchdog.start()
+
+        # Step 1: hold both GC session advisory locks (bounded lock_timeout + active watchdog)
+        locks_held = True
+        try:
+            await asyncio.wait_for(
+                acquire_gc_advisory_locks(conn, lock_timeout=lock_timeout),
+                timeout=_remaining_or_raise(lock_deadline, "acquire_gc_advisory_locks"),
+            )
+        except TimeoutError as exc:
+            raise BackupTimeoutError("acquire_gc_advisory_locks exceeded hard deadline") from exc
 
         # Step 2: REPEATABLE READ READ ONLY + pg_export_snapshot()
         watchdog.set_phase("begin_exported_snapshot")
@@ -2086,6 +2180,10 @@ async def run_consistent_backup(
                 warnings.append(sel.warning)
             selections.append((spec, sel))
 
+        # Deduplicate across overlapping specs (e.g. shared bucket with empty main prefix
+        # and non-empty chat_upload prefix) by (endpoint, bucket, full_key) before archiving.
+        selections = _deduplicate_selections(selections)
+
         # Step 3b: pack terminal ASR jobs only + asr_usage.jsonl in its own process group
         asr_summary: AsrArchiveSummary | None = None
         if asr_jobs_dir is not None and asr_archive_path is not None:
@@ -2136,8 +2234,10 @@ async def run_consistent_backup(
                     on_stream_close=watchdog.unregister_stream,
                 )
 
-        # Release both GC session advisory locks & disarm watchdog before multi-hour versioned mirroring
-        await _release_locks_now()
+        # Release both GC session advisory locks BEFORE disarming watchdog and before versioned mirroring.
+        # Any unlock failure closes the dedicated DB session and aborts the backup instead of continuing.
+        watchdog.set_phase("release_gc_advisory_locks")
+        await _release_locks_now(strict=True, deadline=lock_deadline)
         watchdog.disarm()
         return snapshot_id, inventory, bucket_targets, selections, asr_summary
 

@@ -3902,18 +3902,31 @@ _pg_backup_job_running() {
   printf '%s\n' "$out" | grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'
 }
 
-# Find the terminal dalton-pg-backup.log line matching a waited-on backup ID (set=<id>),
-# or (for legacy/mock logs without set=<id>) the latest terminal line strictly after $3.
+# Find the terminal dalton-pg-backup.log line matching a waited-on backup ID (set=<id>).
+# When wait_id is non-empty, ONLY a terminal line with exact token "set=<wait_id>" matches
+# (never falls back to lines without set= or with another set=). When wait_id is empty,
+# falls back to the latest terminal line strictly after $3.
 _find_completed_backup_for_wait() {
   local log_file="$1" wait_id="$2" before_line="$3"
   [ -f "$log_file" ] || return 1
   local found=""
   if [ -n "$wait_id" ]; then
-    found=$(grep -E "(^|[[:space:]])set=${wait_id}([[:space:]]|$)" "$log_file" 2>/dev/null | tail -1 || true)
-    if [ -n "$found" ] && _is_terminal_pg_backup_line "$found"; then
+    found=$(awk -v target="set=${wait_id}" '
+      !/^\[backup\]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i == target) {
+            last = $0
+            break
+          }
+        }
+      }
+      END { if (last != "") print last }
+    ' "$log_file" 2>/dev/null || true)
+    if [ -n "$found" ] && [ "$found" != "$before_line" ] && _is_terminal_pg_backup_line "$found"; then
       printf '%s\n' "$found"
       return 0
     fi
+    return 1
   fi
   local candidate=""
   if [ -n "$before_line" ]; then
@@ -3934,24 +3947,13 @@ _find_completed_backup_for_wait() {
   if ! _is_terminal_pg_backup_line "$candidate"; then
     return 1
   fi
-  # If we are waiting for a specific backup ID and the candidate explicitly names a DIFFERENT set=<other>,
-  # do not treat that unrelated backup as ours.
-  if [ -n "$wait_id" ]; then
-    case "$candidate" in
-      *" set="*)
-        case "$candidate" in
-          *" set=${wait_id}"|*" set=${wait_id} "*) ;;
-          *) return 1 ;;
-        esac
-        ;;
-    esac
-  fi
   printf '%s\n' "$candidate"
   return 0
 }
 
 # Verify that a completed consistent backup-set log line ("... ok <size> <dump_path> set=<id>")
-# still has its dump file (and set metadata when a sets/ directory exists alongside it) on disk.
+# has its backup-set metadata AND every referenced artifact (PG dump, object manifest + pool
+# objects, and ASR archive when recorded) intact on disk with matching SHA-256 digests.
 # Legacy mock lines without "set=<id>" pass unless DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE=1.
 _verify_completed_backup_artifact() {
   local line="$1"
@@ -3966,20 +3968,186 @@ _verify_completed_backup_artifact() {
   # Log format: YYYY-mm-dd HH:MM:SS ok <size> <dump_path> [set=<id>]
   dump_path="$(printf '%s\n' "$line" | awk '{print $5}')"
   if [ -n "$set_id" ]; then
-    if [ -z "$dump_path" ] || [ ! -s "$dump_path" ]; then
+    if [ -z "$dump_path" ] || [ ! -f "$dump_path" ] || [ ! -s "$dump_path" ]; then
       echo "backup: verified dump file missing or empty for set=${set_id} (path=${dump_path:-<empty>})" >&2
       return 1
     fi
-    local parent_dir="" backups_root="" set_json=""
+    local parent_dir="" backups_root="" set_json="" py=""
     parent_dir="$(dirname "$dump_path")"
     backups_root="$(dirname "$parent_dir")"
-    if [ -d "${backups_root}/sets" ]; then
-      set_json="${backups_root}/sets/backup-set-${set_id}.json"
-      if [ ! -s "$set_json" ]; then
-        echo "backup: backup-set metadata missing or empty for set=${set_id} (${set_json})" >&2
-        return 1
-      fi
+    set_json="${backups_root}/sets/backup-set-${set_id}.json"
+    if [ ! -f "$set_json" ] || [ ! -s "$set_json" ]; then
+      echo "backup: backup-set metadata missing or empty for set=${set_id} (${set_json})" >&2
+      return 1
     fi
+    py=$(_resolve_deploy_python) || return 1
+    "$py" - "$set_id" "$dump_path" "$set_json" "$backups_root" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+set_id, log_dump_path, set_json_path, backups_root = sys.argv[1:5]
+hex64_re = re.compile(r"^[0-9a-f]{64}$")
+
+def fail(msg: str) -> None:
+    print(f"backup: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def sha256_and_size(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    total = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), total
+
+try:
+    meta = json.loads(Path(set_json_path).read_text(encoding="utf-8"))
+except Exception as exc:
+    fail(f"failed reading backup-set metadata {set_json_path}: {exc}")
+
+if not isinstance(meta, dict):
+    fail(f"invalid backup-set metadata structure in {set_json_path}")
+if str(meta.get("backup_set_id") or "").strip() != set_id:
+    fail(
+        f"backup-set id mismatch in {set_json_path}: "
+        f"got={meta.get('backup_set_id')!r}, expected={set_id!r}"
+    )
+if meta.get("reconcile_ok") is not True:
+    fail(f"backup-set {set_id} is not marked reconcile_ok=true")
+
+# 1. Verify PostgreSQL dump exists, matches log path, size, and SHA-256.
+meta_dump_raw = str(meta.get("dump_path") or "").strip()
+meta_dump_sha = str(meta.get("dump_sha256") or "").strip().lower()
+if not meta_dump_raw:
+    fail(f"backup-set {set_id} metadata missing dump_path")
+if not hex64_re.fullmatch(meta_dump_sha):
+    fail(f"backup-set {set_id} metadata missing valid dump_sha256")
+meta_dump = Path(meta_dump_raw)
+if not meta_dump.is_file() or meta_dump.is_symlink():
+    fail(f"backup-set {set_id} dump file missing: {meta_dump}")
+if os.path.realpath(str(meta_dump)) != os.path.realpath(log_dump_path):
+    fail(
+        f"backup-set {set_id} dump_path mismatch: "
+        f"metadata={meta_dump}, log={log_dump_path}"
+    )
+actual_dump_sha, actual_dump_size = sha256_and_size(meta_dump)
+if actual_dump_size <= 0:
+    fail(f"backup-set {set_id} dump file is empty: {meta_dump}")
+if meta.get("dump_size_bytes") is not None and actual_dump_size != int(meta["dump_size_bytes"]):
+    fail(
+        f"backup-set {set_id} dump size mismatch: "
+        f"actual={actual_dump_size}, expected={meta['dump_size_bytes']}"
+    )
+if actual_dump_sha != meta_dump_sha:
+    fail(
+        f"backup-set {set_id} dump SHA-256 mismatch: "
+        f"actual={actual_dump_sha}, expected={meta_dump_sha}"
+    )
+
+# 2. Verify object manifest exists, optional manifest_sha256 matches, and every
+#    referenced mirror-pool object exists with matching size and archived_sha256.
+manifest_raw = str(meta.get("manifest_path") or "").strip()
+if not manifest_raw:
+    fail(f"backup-set {set_id} metadata missing manifest_path")
+manifest_path = Path(manifest_raw)
+if not manifest_path.is_file() or manifest_path.is_symlink():
+    fail(f"backup-set {set_id} object manifest missing: {manifest_path}")
+meta_manifest_sha = str(meta.get("manifest_sha256") or "").strip().lower()
+if meta_manifest_sha:
+    if not hex64_re.fullmatch(meta_manifest_sha):
+        fail(f"backup-set {set_id} metadata has invalid manifest_sha256")
+    actual_manifest_sha, _ = sha256_and_size(manifest_path)
+    if actual_manifest_sha != meta_manifest_sha:
+        fail(
+            f"backup-set {set_id} object manifest SHA-256 mismatch: "
+            f"actual={actual_manifest_sha}, expected={meta_manifest_sha}"
+        )
+try:
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    fail(f"backup-set {set_id} failed reading object manifest {manifest_path}: {exc}")
+if not isinstance(manifest_data, dict) or not isinstance(manifest_data.get("objects"), list):
+    fail(f"backup-set {set_id} object manifest {manifest_path} missing valid 'objects' list")
+objects = manifest_data["objects"]
+if meta.get("object_count") is not None and len(objects) != int(meta["object_count"]):
+    fail(
+        f"backup-set {set_id} object_count mismatch: "
+        f"manifest={len(objects)}, metadata={meta['object_count']}"
+    )
+pool_dir = Path(backups_root) / "minio-mirror" / "objects"
+verified_pool: dict[str, int] = {}
+seen_pairs: set[tuple[str, str]] = set()
+for obj in objects:
+    if not isinstance(obj, dict):
+        fail(f"backup-set {set_id} manifest contains non-object entry")
+    bkt = str(obj.get("bucket") or "")
+    key = str(obj.get("key") or "").lstrip("/")
+    if not bkt or not key:
+        fail(f"backup-set {set_id} manifest entry missing bucket/key")
+    pair = (bkt, key)
+    if pair in seen_pairs:
+        fail(f"backup-set {set_id} manifest contains duplicate object {bkt}/{key}")
+    seen_pairs.add(pair)
+    sha = str(obj.get("archived_sha256") or "").strip().lower()
+    if not hex64_re.fullmatch(sha):
+        fail(f"backup-set {set_id} manifest entry {bkt}/{key} missing valid archived_sha256")
+    raw_sz = obj.get("size")
+    if raw_sz is None or int(raw_sz) < 0:
+        fail(f"backup-set {set_id} manifest entry {bkt}/{key} missing valid size")
+    exp_sz = int(raw_sz)
+    if sha in verified_pool:
+        if verified_pool[sha] != exp_sz:
+            fail(f"backup-set {set_id} mirror object size mismatch for {bkt}/{key}")
+        continue
+    obj_path = pool_dir / sha[:2] / sha
+    if not obj_path.is_file() or obj_path.is_symlink():
+        fail(f"backup-set {set_id} mirror object missing for {bkt}/{key}: {obj_path}")
+    got_sha, got_sz = sha256_and_size(obj_path)
+    if got_sha != sha:
+        fail(
+            f"backup-set {set_id} mirror object SHA-256 mismatch for {bkt}/{key}: "
+            f"actual={got_sha}, expected={sha}"
+        )
+    if got_sz != exp_sz:
+        fail(
+            f"backup-set {set_id} mirror object size mismatch for {bkt}/{key}: "
+            f"actual={got_sz}, expected={exp_sz}"
+        )
+    verified_pool[sha] = got_sz
+
+# 3. Verify ASR jobs archive when recorded in metadata.
+asr_raw = str(meta.get("asr_archive_path") or "").strip()
+asr_sha = str(meta.get("asr_archive_sha256") or "").strip().lower()
+asr_size = meta.get("asr_archive_size_bytes")
+if asr_raw or asr_sha or asr_size is not None:
+    if not asr_raw:
+        fail(f"backup-set {set_id} metadata has ASR digest/size but missing asr_archive_path")
+    if not hex64_re.fullmatch(asr_sha):
+        fail(f"backup-set {set_id} metadata missing valid asr_archive_sha256")
+    asr_path = Path(asr_raw)
+    if not asr_path.is_file() or asr_path.is_symlink():
+        fail(f"backup-set {set_id} ASR archive missing: {asr_path}")
+    actual_asr_sha, actual_asr_size = sha256_and_size(asr_path)
+    if asr_size is not None and actual_asr_size != int(asr_size):
+        fail(
+            f"backup-set {set_id} ASR archive size mismatch: "
+            f"actual={actual_asr_size}, expected={asr_size}"
+        )
+    if actual_asr_sha != asr_sha:
+        fail(
+            f"backup-set {set_id} ASR archive SHA-256 mismatch: "
+            f"actual={actual_asr_sha}, expected={asr_sha}"
+        )
+PY
+    return $?
   elif [ "${DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE:-0}" = "1" ]; then
     if [ -z "$dump_path" ] || [ ! -s "$dump_path" ]; then
       echo "backup: dump file missing or empty (path=${dump_path:-<empty>})" >&2

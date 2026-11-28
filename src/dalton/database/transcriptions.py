@@ -131,6 +131,7 @@ async def create_transcription_job(
     status: str | TranscriptionJobStatus = TranscriptionJobStatus.AWAITING_UPLOAD,
     stage: str | None = None,
     job_id: str | UUID | None = None,
+    usage: Mapping[str, Any] | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Insert a transcription job or return the existing row on idempotency_key conflict."""
@@ -149,6 +150,7 @@ async def create_transcription_job(
         for w in (hotwords or [])
         if str(w).strip()
     ]
+    clean_usage = dict(usage) if isinstance(usage, Mapping) else {}
     size_val = int(source_size_bytes)
     if size_val < 0:
         raise ValueError("source_size_bytes must be >= 0")
@@ -182,7 +184,7 @@ async def create_transcription_job(
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s::jsonb, %s, %s,
-                    0, 0, '[]'::jsonb, '{{}}'::jsonb,
+                    0, 0, '[]'::jsonb, %s::jsonb,
                     NULL, NULL, NULL, %s, 1
                 )
                 ON CONFLICT (idempotency_key) DO NOTHING
@@ -200,6 +202,7 @@ async def create_transcription_job(
                     json.dumps(clean_hotwords, ensure_ascii=False),
                     clean_status,
                     clean_stage,
+                    json.dumps(clean_usage, ensure_ascii=False),
                     clean_idemp,
                 ),
             )

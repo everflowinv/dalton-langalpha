@@ -3443,22 +3443,37 @@ async def enumerate_snapshot_refs(
     return inv
 
 
-def _index_manifest_objects(
+def _index_manifest_objects_with_duplicates(
     manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, str], Mapping[str, Any]]:
+) -> tuple[dict[tuple[str, str], Mapping[str, Any]], list[tuple[str, str]]]:
     if isinstance(manifest_objects, Mapping):
-        return {
-            (str(k[0]), str(k[1]).lstrip("/")): v
-            for k, v in manifest_objects.items()
-        }
+        return (
+            {
+                (str(k[0]), str(k[1]).lstrip("/")): v
+                for k, v in manifest_objects.items()
+            },
+            [],
+        )
     indexed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    duplicates: list[tuple[str, str]] = []
     for entry in manifest_objects:
         if not isinstance(entry, Mapping):
             continue
         bucket = str(entry.get("bucket") or "")
         key = str(entry.get("key") or "").lstrip("/")
         if bucket and key:
-            indexed[(bucket, key)] = entry
+            pair = (bucket, key)
+            if pair in indexed:
+                duplicates.append(pair)
+                continue
+            indexed[pair] = entry
+    return indexed, duplicates
+
+
+def _index_manifest_objects(
+    manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    indexed, _dups = _index_manifest_objects_with_duplicates(manifest_objects)
     return indexed
 
 
@@ -3526,10 +3541,21 @@ def reconcile_inventory_against_manifest(
       and ``raw_response.json`` whenever the job writes it.
     """
     log = target_logger or logger
-    index = _index_manifest_objects(manifest_objects)
+    index, duplicate_pairs = _index_manifest_objects_with_duplicates(manifest_objects)
     errors: list[ReconcileIssue] = []
     warnings: list[ReconcileIssue] = []
     checked_refs = 0
+
+    for dup_bucket, dup_key in duplicate_pairs:
+        errors.append(
+            ReconcileIssue(
+                consumer="backup_manifest",
+                code="duplicate_manifest_object",
+                row_id=f"{dup_bucket}/{dup_key}",
+                object_key=f"{dup_bucket}/{dup_key}",
+                detail=f"Duplicate manifest entry for object {dup_bucket}/{dup_key}",
+            )
+        )
 
     for ref in inventory.references:
         checked_refs += 1

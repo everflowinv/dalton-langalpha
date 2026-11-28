@@ -127,9 +127,10 @@ class PublishedBackupSet:
     asr_archive_sha256: str | None
     object_count: int
     reconcile_ok: bool
+    manifest_sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "version": 1,
             "backup_set_id": self.backup_set_id,
             "tag": self.tag,
@@ -146,6 +147,9 @@ class PublishedBackupSet:
             "object_count": self.object_count,
             "reconcile_ok": self.reconcile_ok,
         }
+        if self.manifest_sha256:
+            out["manifest_sha256"] = self.manifest_sha256
+        return out
 
 
 def resolve_everflow_bucket_specs(
@@ -249,6 +253,15 @@ def publish_local_backup_set(
     if not reconcile_ok:
         raise RuntimeError("Refusing to publish backup set that failed reconciliation")
 
+    seen_manifest_pairs: set[tuple[str, str]] = set()
+    for rec in manifest_objects:
+        pair = (str(rec.bucket), str(rec.key).lstrip("/"))
+        if pair in seen_manifest_pairs:
+            raise RuntimeError(
+                f"Refusing to publish backup set with duplicate manifest object: {pair[0]}/{pair[1]}"
+            )
+        seen_manifest_pairs.add(pair)
+
     with backup_pool_lock(backups_root):
         verify_mirror_pool_objects(backups_root, manifest_objects)
 
@@ -296,6 +309,8 @@ def publish_local_backup_set(
             },
         )
 
+        manifest_sha = _sha256_file(manifest_path)
+
         set_path = sets_dir / f"backup-set-{backup_set_id}.json"
         published = PublishedBackupSet(
             backup_set_id=backup_set_id,
@@ -312,6 +327,7 @@ def publish_local_backup_set(
             asr_archive_sha256=asr_sha,
             object_count=len(manifest_objects),
             reconcile_ok=True,
+            manifest_sha256=manifest_sha,
         )
         _atomic_write_json(set_path, published.to_dict())
         _atomic_write_json(sets_dir / "latest-verified-set.json", published.to_dict())
