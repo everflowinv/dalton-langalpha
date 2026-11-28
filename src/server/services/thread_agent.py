@@ -207,6 +207,21 @@ class AgentInputs:
 
         thread_is_shared = True if identity.shared else await is_thread_shared(thread_id)
         borrowed = ThreadStart.of(fork).borrowed
+        # DALTON-HOOK(personal-integrations): personal-integration threads are excluded from the shared computer mount, so request creator-verified ThreadHistory only for shared workspaces or personal-integration threads
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        needs_private_history = bool(
+            thread_id
+            and (
+                identity.shared
+                or (
+                    bool(identity.sender)
+                    and await is_thread_personal_private(thread_id)
+                )
+            )
+        )
         return cls(
             identity=identity,
             # DALTON-HOOK(colleague-dispatch): store workspace owner identity
@@ -230,8 +245,7 @@ class AgentInputs:
                     identity.sender,
                     tuple(files.thread_id for files in borrowed),
                 )
-                # DALTON-HOOK(personal-integrations): also allow creator-verified ThreadHistory for personal-integration threads excluded from shared mount
-                if thread_id and (identity.shared or identity.sender)
+                if needs_private_history
                 else None
             ),
             transcript_borrowed=borrowed,

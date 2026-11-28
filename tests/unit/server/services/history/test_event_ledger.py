@@ -75,6 +75,7 @@ TABLE_SOURCED = {
     # a run settled before those facts has it in its turn's legacy facts. The
     # main thread's hands chat-app steers back to their gateway on the run's
     # own stream, which resubmits them as its next turn; nothing replays it.
+    "personal_integration_notice",  # DALTON-HOOK(personal-integrations): conversation_threads.metadata.personal_first_touch_event
 }
 
 LIVE_ONLY = {

@@ -1356,6 +1356,8 @@ async def settle_thread_execution_if_idle(thread_id: str) -> Optional[Outcome]:
             thread_id=thread_id,
             workspace_id=workspace_id,
             expected_run_id=run_id,
+            # DALTON-HOOK(automation-capacity-retry): a timed-out firing that never reached START leaves its thread in_progress otherwise
+            reset_prestart_thread_status=(run is None and run_id is None),
         )
         if settled is not None:
             last_settled = settled

@@ -239,7 +239,9 @@ async def test_an_id_that_resolves_to_nothing_is_said_and_the_rest_still_goes_in
     assert len(sandbox.files) == 1
 
 
-async def test_history_links_a_stored_upload_without_storing_it_again():
+async def test_history_links_a_stored_upload_without_storing_it_again(monkeypatch):
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs when exercising upstream attachment links
+    monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
     request = _request(("file", CSV_ID, "prices.csv"), ("pdf", IMAGE_ID, "memo.pdf"))
     rows = [
         _stored(CSV_ID, "prices.csv", "text/csv", 40),
@@ -380,7 +382,9 @@ async def test_a_steer_naming_uploaded_files_is_allowed_to_steer():
     assert steer_allowed(inline, dispatched=False, steerable=True)
 
 
-async def test_a_history_link_keeps_a_name_with_url_characters_whole():
+async def test_a_history_link_keeps_a_name_with_url_characters_whole(monkeypatch):
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs when exercising upstream link encoding
+    monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
     key = f"attachments/{CSV_ID}/chart#1 v2?.png"
     attachments = TurnAttachments([turns._from_row(_stored(CSV_ID, "chart#1 v2?.png", "image/png", 4) | {"object_key": key}, None)])
     with patch("src.server.utils.multimodal_context.get_public_url", lambda k: f"https://cdn.invalid/{k}"):
@@ -440,7 +444,9 @@ def test_a_file_the_browser_sent_without_a_type_takes_the_type_its_name_implies(
     assert declared_type("", "blob.unknownext") == "application/octet-stream"
 
 
-async def test_two_inline_files_of_one_name_are_two_objects():
+async def test_two_inline_files_of_one_name_are_two_objects(monkeypatch):
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs when exercising upstream attachment uploads
+    monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
     data = "data:text/csv;base64," + base64.b64encode(b"a,b\n").decode()
     ctx = [{"type": "file", "data": data, "description": "same.csv"}] * 2
     attachments = await turns.resolve_turn_attachments(ctx, USER)

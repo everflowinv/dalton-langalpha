@@ -47,10 +47,15 @@ from src.dalton.settings import (
     is_dalton_enabled,
     is_dalton_sharing_auth_enabled,
 )
+from src.server.database import pool as _db_pool
 from src.server.database.home_workspace import is_home_row, is_home_stand_in_row
-from src.server.database.pool import get_db_connection
 from src.server.database.shared_workspaces import is_holder
 from src.server.utils.pg_sanitize import normalize_uuid
+
+
+def get_db_connection(conn: Any = None):
+    """Delegate dynamically to ``pool.get_db_connection`` so lazy imports never bind a stale mock."""
+    return _db_pool.get_db_connection(conn)
 
 logger = logging.getLogger(__name__)
 
