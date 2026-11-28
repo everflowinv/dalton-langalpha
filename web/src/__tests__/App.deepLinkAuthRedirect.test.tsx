@@ -10,8 +10,11 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthContext, _localDevValue } from '@/contexts/AuthContext';
+import { ThemeProvider } from '@/contexts/ThemeContext';
 import { clearAuthToken } from '@/lib/authToken';
 import { LocalAuthProvider } from '@/lib/dalton/LocalAuthProvider';
+import { queryKeys } from '@/lib/queryKeys';
+import { setStorageUser, userLocalStorage } from '@/lib/userStorage';
 import { computeAgentArtifactRouting } from '@/pages/ChatAgent/utils/agentArtifactRouting';
 import {
   normalizeAgentPath,
@@ -60,10 +63,46 @@ vi.mock('@/components/Main/Main', () => ({
       >
         {loc.pathname}
         {loc.search}
+        {loc.hash}
       </div>
     );
   },
   preloadRouteChunk: () => {},
+}));
+vi.mock('@/pages/SharedChat/SharePage', () => ({
+  default: function MockSharePage() {
+    const loc = useLocation();
+    return (
+      <div data-testid="share-screen">
+        {loc.pathname}
+        {loc.search}
+        {loc.hash}
+      </div>
+    );
+  },
+}));
+vi.mock('@/pages/Legal/Legal', () => ({
+  default: function MockLegalPage() {
+    const loc = useLocation();
+    return <div data-testid="legal-screen">{loc.pathname}</div>;
+  },
+}));
+vi.mock('@/pages/Monitors/PublicMonitorPage', () => ({
+  default: function MockPublicMonitorPage() {
+    const loc = useLocation();
+    return <div data-testid="public-monitor-screen">{loc.pathname}</div>;
+  },
+}));
+vi.mock('@/pages/Setup/SetupWizard', () => ({
+  default: function MockSetupWizard() {
+    const loc = useLocation();
+    return (
+      <div data-testid="setup-screen">
+        {loc.pathname}
+        {loc.search}
+      </div>
+    );
+  },
 }));
 vi.mock('@/pages/Onboarding', () => ({
   OnboardingProvider: ({ children }: { children: React.ReactNode }) => children,
@@ -104,25 +143,40 @@ function TestAuthProvider({
   );
 }
 
-function renderAppAt(initialEntry: string, initialLoggedIn = false) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderAppAt(
+  initialEntry: string,
+  initialLoggedIn = false,
+  options?: { queryClient?: QueryClient },
+) {
+  const qc = options?.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TestAuthProvider initialLoggedIn={initialLoggedIn}>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          <App />
-        </MemoryRouter>
-      </TestAuthProvider>
+      <ThemeProvider>
+        <TestAuthProvider initialLoggedIn={initialLoggedIn}>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <App />
+          </MemoryRouter>
+        </TestAuthProvider>
+      </ThemeProvider>
     </QueryClientProvider>,
   );
 }
 
 beforeEach(() => {
   window.history.replaceState({}, '', '/');
+  localStorage.clear();
+  sessionStorage.clear();
+  setStorageUser(null);
+  if (!Element.prototype.scrollIntoView) {
+    Element.prototype.scrollIntoView = vi.fn();
+  }
 });
 
 afterEach(() => {
   clearAuthToken();
+  setStorageUser(null);
+  localStorage.clear();
+  sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -192,6 +246,12 @@ describe('deep-link preservation across login', () => {
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         );
       }
+      if (url.endsWith('/api/v1/features')) {
+        return new Response(JSON.stringify({ features: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(JSON.stringify({}), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -202,11 +262,13 @@ describe('deep-link preservation across login', () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <LocalAuthProvider>
-          <MemoryRouter initialEntries={[deepLink]}>
-            <App />
-          </MemoryRouter>
-        </LocalAuthProvider>
+        <ThemeProvider>
+          <LocalAuthProvider>
+            <MemoryRouter initialEntries={[deepLink]}>
+              <App />
+            </MemoryRouter>
+          </LocalAuthProvider>
+        </ThemeProvider>
       </QueryClientProvider>,
     );
 
@@ -232,6 +294,117 @@ describe('deep-link preservation across login', () => {
     '/?redirect=%2F%3Floop%3D1',
   ])('rejects open redirect %s and falls back to /dashboard after login', async (entry) => {
     renderAppAt(entry, true);
+
+    const mainScreen = await screen.findByTestId('main-screen');
+    expect(mainScreen.textContent).toBe('/dashboard');
+  });
+
+  it('preserves settings deep links (/settings?tab=...#anchor) across login and restores query + hash', async () => {
+    const deepLink = '/settings?tab=teamChannels#feishu';
+    renderAppAt(deepLink, false);
+
+    const loginScreen = await screen.findByTestId('login-screen');
+    expect(loginScreen.textContent).toBe(`/?redirect=${encodeURIComponent(deepLink)}`);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+
+    const mainScreen = await screen.findByTestId('main-screen');
+    expect(mainScreen.textContent).toBe(deepLink);
+  });
+
+  it('preserves protected /setup/* deep links across login', async () => {
+    const deepLink = '/setup/model?step=default';
+    renderAppAt(deepLink, false);
+
+    const loginScreen = await screen.findByTestId('login-screen');
+    expect(loginScreen.textContent).toBe(`/?redirect=${encodeURIComponent(deepLink)}`);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+
+    const setupScreen = await screen.findByTestId('setup-screen');
+    expect(setupScreen.textContent).toBe(deepLink);
+  });
+
+  it.each([
+    ['/s/public-thread-token', 'share-screen'],
+    ['/a/public-app-token?path=sub%2Findex.html', 'share-screen'],
+    ['/m/public-pulse', 'public-monitor-screen'],
+    ['/legal', 'legal-screen'],
+  ])('renders pre-login public route %s without redirecting to login', async (route, testId) => {
+    renderAppAt(route, false);
+
+    const screenEl = await screen.findByTestId(testId);
+    expect(screenEl.textContent).toBe(route);
+    expect(screen.queryByTestId('login-screen')).toBeNull();
+  });
+
+  it('restores a members-only /s/:shareToken link after sign-in via ?redirect=', async () => {
+    const shareLink = '/s/private-share-token?as=member#turn-2';
+    renderAppAt(`/?redirect=${encodeURIComponent(shareLink)}`, false);
+
+    const loginScreen = await screen.findByTestId('login-screen');
+    expect(loginScreen.textContent).toBe(`/?redirect=${encodeURIComponent(shareLink)}`);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+
+    const shareScreen = await screen.findByTestId('share-screen');
+    expect(shareScreen.textContent).toBe(shareLink);
+  });
+
+  it('resumes a valid saved front page tab when page_tabs is enabled and no ?redirect= is given', async () => {
+    setStorageUser('u-1');
+    userLocalStorage.setItem(
+      'app-page-tabs',
+      JSON.stringify({
+        activeId: 'tab-1',
+        tabs: [{ id: 'tab-1', path: '/market' }],
+      }),
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.features.list(), [{ key: 'page_tabs', enabled: true }]);
+
+    renderAppAt('/', true, { queryClient: qc });
+
+    const mainScreen = await screen.findByTestId('main-screen');
+    expect(mainScreen.textContent).toBe('/market');
+  });
+
+  it('prefers explicit ?redirect= deep link over a saved front page tab when page_tabs is enabled', async () => {
+    setStorageUser('u-1');
+    userLocalStorage.setItem(
+      'app-page-tabs',
+      JSON.stringify({
+        activeId: 'tab-1',
+        tabs: [{ id: 'tab-1', path: '/market' }],
+      }),
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.features.list(), [{ key: 'page_tabs', enabled: true }]);
+
+    const deepLink = '/chat/t/11111111-2222-3333-4444-555555555555?file=results%2Freport.md';
+    renderAppAt(`/?redirect=${encodeURIComponent(deepLink)}`, true, { queryClient: qc });
+
+    const mainScreen = await screen.findByTestId('main-screen');
+    expect(mainScreen.textContent).toBe(deepLink);
+  });
+
+  it.each([
+    '/..//evil.example/phish',
+    '/%2F%2Fevil.example/phish',
+    '/./?loop=1',
+  ])('falls back to /dashboard when saved page tab path is unsafe (%s)', async (unsafePath) => {
+    setStorageUser('u-1');
+    userLocalStorage.setItem(
+      'app-page-tabs',
+      JSON.stringify({
+        activeId: 'tab-1',
+        tabs: [{ id: 'tab-1', path: unsafePath }],
+      }),
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.features.list(), [{ key: 'page_tabs', enabled: true }]);
+
+    renderAppAt('/', true, { queryClient: qc });
 
     const mainScreen = await screen.findByTestId('main-screen');
     expect(mainScreen.textContent).toBe('/dashboard');

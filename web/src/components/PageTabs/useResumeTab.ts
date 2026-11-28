@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { APP_ENTRY_PATH } from '@/config/hostMode';
 import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { inAppPath } from '@/lib/inAppPath'; // DALTON-HOOK(channel-links): normalize and validate resumed tab path
 import { useStorageUser } from '@/lib/userStorage';
 import { PAGE_TABS_FEATURE } from './pageTabsContext';
 import { savedFrontTabPath } from './pageTabsStorage';
@@ -17,7 +18,8 @@ import { savedFrontTabPath } from './pageTabsStorage';
 export function useResumeTab(): string | null | undefined {
   const isMobile = useIsMobile();
   const user = useStorageUser();
-  const [saved] = useState(() => savedFrontTabPath(user));
+  // DALTON-HOOK(channel-links): normalize via inAppPath so dot-segment open redirects or entry-path loops (e.g. /./?loop=1) cannot bypass checks
+  const [saved] = useState(() => inAppPath(savedFrontTabPath(user)));
   const { data, isPending } = useFeatures();
   if (isMobile || !saved || saved.split(/[?#]/)[0] === APP_ENTRY_PATH) return null;
   if (isPending) return undefined;

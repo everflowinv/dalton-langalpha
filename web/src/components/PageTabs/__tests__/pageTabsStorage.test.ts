@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setStorageUser } from '@/lib/userStorage';
-import { loadHistory, saveHistory } from '../pageTabsStorage';
+import { loadHistory, savedFrontTabPath, saveHistory } from '../pageTabsStorage'; // DALTON-HOOK(channel-links): also test savedFrontTabPath open-redirect rejection
 
 // A platform build, where storage is keyed by the signed-in account.
 vi.mock('@/config/hostMode', async (original) => ({ ...(await original<object>()), isPlatformMode: true }));
@@ -50,5 +50,20 @@ describe("the tabs' history kept across a reload", () => {
     saveHistory({ owners: {}, closed: [{ tab: { id: 'm', path: '/market' }, index: 0 }] });
     setStorageUser('u2');
     expect(loadHistory().closed).toEqual([]);
+  });
+
+  // DALTON-HOOK(channel-links): reject dot-segment, encoded-slash, and control-char open redirects in persisted tabs
+  it('drops persisted tabs whose paths fail full inAppPath validation', () => {
+    localStorage.setItem('user:u1:app-page-tabs', JSON.stringify({
+      activeId: 't1',
+      tabs: [
+        { id: 't1', path: '/..//evil.example/phish' },
+        { id: 't2', path: '/%2F%2Fevil.example/phish' },
+        { id: 't3', path: '/\t/evil.example/phish' },
+        { id: 't4', path: '/%5Cevil.example/phish' },
+      ],
+    }));
+    expect(savedFrontTabPath('u1')).toBeNull();
+    localStorage.removeItem('user:u1:app-page-tabs');
   });
 });

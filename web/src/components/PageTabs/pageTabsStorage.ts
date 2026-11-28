@@ -1,4 +1,5 @@
 import * as z from 'zod/mini';
+import { inAppPath } from '@/lib/inAppPath'; // DALTON-HOOK(channel-links): validate persisted tab paths with inAppPath
 import { getUserLocalItem, userLocalStorage, userSessionStorage } from '@/lib/userStorage';
 import type { PageTab } from './pageTabsContext';
 
@@ -32,7 +33,8 @@ const tabSchema = z.object({
   id: z.string().check(z.minLength(1)),
   // An app path: `//host` or `/\host` would be another origin to the router
   // and to the URL parser.
-  path: z.string().check(z.regex(/^\/(?![/\\])/)),
+  // DALTON-HOOK(channel-links): enforce full inAppPath validation on persisted tab paths
+  path: z.string().check(z.refine((value) => inAppPath(value) !== null)),
   title: optionalText,
   key: optionalText,
 });
