@@ -2,16 +2,17 @@
 # One-click idempotent rollback script for Everflow Research Host cutover.
 #
 # Flow:
-#   1. Close & verify host maintenance admission gate FIRST (file + DB lock
-#      readback; falling back to emergency --no-db-lock write + readback if
-#      Postgres is unavailable), then resolve & verify snapshot (including
-#      target frontend release directory & version.json match before stopping
-#      any service), verify running backend with SNAPSHOT .env (falling back
-#      to current .env on HTTP 401), and run database idle check independently
-#      of backend HTTP (skipped only with --skip-idle-wait)
+#   1. Close & verify host maintenance admission gate FIRST (bounded DB-locked
+#      write + readback; after timeout/confirmed exit or DB failure, falling
+#      back to emergency --no-db-lock write + readback), then resolve & verify
+#      snapshot (including target frontend release directory & full version.json
+#      match before stopping any service), verify running backend with SNAPSHOT
+#      .env (falling back on HTTP 401 to saved pre-restore token file or current
+#      .env), and run database idle check independently of backend HTTP (skipped
+#      only with --skip-idle-wait)
 #   2. Drain legacy bridge :8960 FIRST via /admin/drain (timeout >= 240s to
 #      cover 180s ingest limit; falling back to verified snapshot admin token
-#      on HTTP 401; failing before stopping any refresher service) until
+#      on HTTP 401/403; failing before stopping any refresher service) until
 #      inflight/queued/ingest_inflight == 0 & stop :8960, THEN drain
 #      (controlled refresh if TTL <= 60s, /admin/drain, in_flight == 0,
 #      no .guidepoint_mcp_tokens.*.tmp; --allow-down skips only when unloaded
@@ -49,6 +50,7 @@ SKIP_IDLE_WAIT=0
 IDLE_WAIT_SECONDS="${DALTON_ROLLBACK_IDLE_WAIT_S:-120}"
 SERVICE_TIMEOUT="${DALTON_ROLLBACK_SERVICE_TIMEOUT_S:-30}"
 BRIDGE_DRAIN_TIMEOUT="${DALTON_ROLLBACK_BRIDGE_DRAIN_TIMEOUT_S:-240}"
+GATE_CLOSE_LOCK_TIMEOUT="${DALTON_ROLLBACK_GATE_CLOSE_LOCK_TIMEOUT_S:-10}"
 GATE_VERIFY_TIMEOUT="${DALTON_ROLLBACK_GATE_VERIFY_TIMEOUT_S:-30}"
 PROBE_TIMEOUT="${DALTON_ROLLBACK_PROBE_TIMEOUT_S:-15}"
 PROBE_RETRIES="${DALTON_ROLLBACK_PROBE_RETRIES:-3}"
@@ -78,6 +80,7 @@ Options:
   --idle-wait-seconds N          Max seconds to wait for backend idle (default: 120)
   --service-timeout N            Max seconds to wait for service start/stop (default: 30)
   --bridge-drain-timeout N       Max seconds to wait for :8960 /admin/drain (default: 240; covers 180s ingest limit)
+  --gate-close-lock-timeout N    Max seconds to wait for DB-locked initial gate close before emergency fallback (default: 10)
   --gate-verify-timeout N        Max seconds to wait for container gate check (default: 30)
   --probe-timeout N              HTTP timeout per live probe call in seconds (default: 15)
   --probe-retries N              Retry count per live probe (default: 3)
@@ -125,6 +128,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bridge-drain-timeout)
       BRIDGE_DRAIN_TIMEOUT="${2:?missing --bridge-drain-timeout value}"
+      shift 2
+      ;;
+    --gate-close-lock-timeout)
+      GATE_CLOSE_LOCK_TIMEOUT="${2:?missing --gate-close-lock-timeout value}"
       shift 2
       ;;
     --gate-verify-timeout)
@@ -328,8 +335,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   fi
   echo "=== DRY-RUN: Research Host Rollback Plan ==="
   echo "Snapshot: ${SNAPSHOT_DIR} (SHA-256 verified)"
-  echo "1. Close & verify host maintenance admission gate FIRST (${RH_ADMISSION_FILE}, with --no-db-lock fallback on DB failure), verify snapshot & frontend release target, verify running backend using snapshot .env (fallback to current .env on HTTP 401), and run database idle check via wait_backend_idle.sh"
-  echo "2. Drain legacy bridge :8960 FIRST via /admin/drain (timeout ${BRIDGE_DRAIN_TIMEOUT}s, snapshot token fallback on 401, inflight=0/queued=0/ingest_inflight=0) & stop :8960, then drain com.dalton.research-host (${RESEARCH_HOST_URL}: controlled refresh if TTL<=60s, /admin/drain, in_flight=0, no .tmp) and stop via launchctl bootout"
+  echo "1. Close & verify host maintenance admission gate FIRST (${RH_ADMISSION_FILE}, DB lock timeout ${GATE_CLOSE_LOCK_TIMEOUT}s with confirmed-exit --no-db-lock fallback), verify snapshot & full frontend version.json target, verify running backend using snapshot .env (fallback to saved pre-restore token / current .env on HTTP 401), and run database idle check via wait_backend_idle.sh"
+  echo "2. Drain legacy bridge :8960 FIRST via /admin/drain (timeout ${BRIDGE_DRAIN_TIMEOUT}s, snapshot token fallback on 401/403, inflight=0/queued=0/ingest_inflight=0) & stop :8960, then drain com.dalton.research-host (${RESEARCH_HOST_URL}: controlled refresh if TTL<=60s, /admin/drain, in_flight=0, no .tmp) and stop via launchctl bootout"
   echo "3. Drain & stop :8943, verify .guidepoint.owner.lock is free, then restore files (preserving newer live Guidepoint tokens):"
   rh_snapshot_restore --snapshot-dir "${SNAPSHOT_DIR}" --dry-run
   echo "4. Start com.dalton.guidepoint-mcp-proxy (${PROXY_PLIST}, verify owner_lock_held) and com.dalton.researchdata-bridge (${BRIDGE_PLIST})"
@@ -365,17 +372,77 @@ run_gate_set() {
 
 LAST_CLOSE_USED_NO_DB_LOCK=0
 
+run_locked_gate_set_with_timeout() {
+  local timeout_s="$1"
+  shift
+  rh_paths
+  local marker=""
+  marker="$(mktemp "${TMPDIR:-/tmp}/dalton_gate_to.XXXXXX")" || return 1
+  rm -f "${marker}"
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" gate-set \
+    --repo "${RH_REPO_ROOT}" \
+    --lock-timeout-s "${timeout_s}" \
+    "$@" >/dev/null &
+  local cmd_pid=$!
+  (
+    sleep_pid=""
+    trap 'if [[ -n "${sleep_pid}" ]]; then kill "${sleep_pid}" 2>/dev/null || true; fi; exit 0' TERM INT
+    sleep "${timeout_s}" &
+    sleep_pid=$!
+    wait "${sleep_pid}" 2>/dev/null || exit 0
+    if kill -0 "${cmd_pid}" 2>/dev/null; then
+      : > "${marker}"
+      kill -TERM "${cmd_pid}" 2>/dev/null || true
+      sleep 1 &
+      sleep_pid=$!
+      wait "${sleep_pid}" 2>/dev/null || exit 0
+      if kill -0 "${cmd_pid}" 2>/dev/null; then
+        kill -KILL "${cmd_pid}" 2>/dev/null || true
+      fi
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  local timer_pid=$!
+  local rc=0
+  set +e
+  wait "${cmd_pid}"
+  rc=$?
+  set -e
+  kill "${timer_pid}" 2>/dev/null || true
+  wait "${timer_pid}" 2>/dev/null || true
+  if [[ -f "${marker}" ]]; then
+    rm -f "${marker}"
+    return 124
+  fi
+  rm -f "${marker}"
+  return "${rc}"
+}
+
 close_gate_with_emergency_fallback() {
   local reason="$1"
   LAST_CLOSE_USED_NO_DB_LOCK=0
-  if ! run_gate_set --paused true --pause-host-direct true --operation rollback --reason "${reason}"; then
-    if [[ "${NO_DB_LOCK}" -eq 0 ]]; then
-      echo "  WARN: locked gate close failed (e.g. Postgres unavailable); falling back to emergency --no-db-lock write..." >&2
-      if rh_gate_set --paused true --pause-host-direct true --operation rollback --reason "${reason}" --no-db-lock >/dev/null; then
-        LAST_CLOSE_USED_NO_DB_LOCK=1
-      else
-        return 1
-      fi
+  if [[ "${NO_DB_LOCK}" -eq 1 ]]; then
+    rh_gate_set --paused true --pause-host-direct true --operation rollback --reason "${reason}" --no-db-lock >/dev/null || return 1
+    is_gate_fully_closed || return 1
+    return 0
+  fi
+  local locked_rc=0
+  set +e
+  run_locked_gate_set_with_timeout "${GATE_CLOSE_LOCK_TIMEOUT}" \
+    --paused true --pause-host-direct true --operation rollback --reason "${reason}"
+  locked_rc=$?
+  set -e
+  if [[ "${locked_rc}" -ne 0 ]]; then
+    if [[ "${locked_rc}" -eq 125 ]]; then
+      echo "  ERROR: timed-out locked gate-set process could not be confirmed exited; refusing concurrent --no-db-lock write" >&2
+      return 1
+    fi
+    if [[ "${locked_rc}" -eq 124 ]]; then
+      echo "  WARN: locked gate close timed out after ${GATE_CLOSE_LOCK_TIMEOUT}s (process exited); falling back to emergency --no-db-lock write..." >&2
+    else
+      echo "  WARN: locked gate close failed (rc=${locked_rc}; e.g. Postgres unavailable); falling back to emergency --no-db-lock write..." >&2
+    fi
+    if rh_gate_set --paused true --pause-host-direct true --operation rollback --reason "${reason}" --no-db-lock >/dev/null; then
+      LAST_CLOSE_USED_NO_DB_LOCK=1
     else
       return 1
     fi
@@ -415,10 +482,103 @@ fi
 load_snapshot_manifest_paths
 SNAPSHOT_REPO_ENV="${SNAPSHOT_DIR}/files/repo.env"
 LIVE_REPO_ENV="${REPO_ENV_PATH:-${RH_REPO_ROOT}/.env}"
+PRE_RESTORE_BACKEND_TOKEN_FILE="${SNAPSHOT_DIR}/.pre-restore-backend-token.env"
+
+preserve_pre_restore_backend_token() {
+  [[ -n "${LIVE_REPO_ENV}" && -f "${LIVE_REPO_ENV}" ]] || return 0
+  if [[ -f "${SNAPSHOT_REPO_ENV}" ]] && cmp -s "${LIVE_REPO_ENV}" "${SNAPSHOT_REPO_ENV}"; then
+    return 0
+  fi
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B - \
+    "${LIVE_REPO_ENV}" "${SNAPSHOT_REPO_ENV}" "${PRE_RESTORE_BACKEND_TOKEN_FILE}" <<'PY'
+import os
+import re
+import secrets
+import sys
+from pathlib import Path
+
+def _strip_val(raw_val: str) -> str:
+    val = raw_val.strip()
+    if not val:
+        return ""
+    if val[0] == '"':
+        end = val.find('"', 1)
+        return val[1:end] if end > 0 else val[1:]
+    if val[0] == "'":
+        end = val.find("'", 1)
+        return val[1:end] if end > 0 else val[1:]
+    return re.sub(r"[ \t]+#.*$", "", val).strip()
+
+def _parse_service_token(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    tok = ""
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, val = line.split("=", 1)
+        if key.strip() == "INTERNAL_SERVICE_TOKEN":
+            tok = _strip_val(val).strip()
+    return tok
+
+live_path = Path(sys.argv[1])
+snap_path = Path(sys.argv[2])
+out_path = Path(sys.argv[3])
+
+if out_path.is_symlink():
+    raise SystemExit(f"ERROR: refusing symlink pre-restore token file: {out_path}")
+
+live_tok = _parse_service_token(live_path)
+snap_tok = _parse_service_token(snap_path) if snap_path.is_file() else ""
+
+# Keep any existing pre-restore token file untouched on reruns after Step 3
+# already restored .env (where live_tok == snap_tok). Only write/update when
+# live .env holds a distinct non-empty token.
+if not live_tok or live_tok == snap_tok:
+    sys.exit(0)
+if "\n" in live_tok or "\r" in live_tok:
+    raise SystemExit("ERROR: INTERNAL_SERVICE_TOKEN contains invalid newline character")
+
+if "'" not in live_tok and any(ch in live_tok for ch in (" ", "\t", "#", '"')):
+    line = f"INTERNAL_SERVICE_TOKEN='{live_tok}'\n"
+elif '"' not in live_tok and any(ch in live_tok for ch in (" ", "\t", "#", "'")):
+    line = f'INTERNAL_SERVICE_TOKEN="{live_tok}"\n'
+else:
+    line = f"INTERNAL_SERVICE_TOKEN={live_tok}\n"
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+tmp_path = out_path.parent / f".pre-restore-backend-token.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, out_path)
+    dir_fd = os.open(str(out_path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+except BaseException:
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    except OSError:
+        pass
+    raise
+PY
+}
 
 # Step 1c: Verify still-running backend container sees closed gate:
 # prefer SNAPSHOT .env token first (immune to corrupted live .env before recreate),
-# and fall back to current live .env token on HTTP 401 (if backend was already recreated with a new token).
+# and fall back on HTTP 401 to saved pre-restore token file (for reruns after Step 3)
+# or current live .env token (if backend was already recreated with a new token).
 pre_verify_args=(
   --expected-paused true
   --backend-url "${BACKEND_URL}"
@@ -428,14 +588,20 @@ pre_verify_args=(
 )
 if [[ -f "${SNAPSHOT_REPO_ENV}" ]]; then
   pre_verify_args+=(--repo-env "${SNAPSHOT_REPO_ENV}")
+  if [[ -f "${PRE_RESTORE_BACKEND_TOKEN_FILE}" && ! -L "${PRE_RESTORE_BACKEND_TOKEN_FILE}" ]]; then
+    pre_verify_args+=(--fallback-repo-env "${PRE_RESTORE_BACKEND_TOKEN_FILE}")
+  fi
   if [[ -n "${LIVE_REPO_ENV}" && -f "${LIVE_REPO_ENV}" ]]; then
     pre_verify_args+=(--fallback-repo-env "${LIVE_REPO_ENV}")
   fi
 elif [[ -n "${LIVE_REPO_ENV}" ]]; then
   pre_verify_args+=(--repo-env "${LIVE_REPO_ENV}")
+  if [[ -f "${PRE_RESTORE_BACKEND_TOKEN_FILE}" && ! -L "${PRE_RESTORE_BACKEND_TOKEN_FILE}" ]]; then
+    pre_verify_args+=(--fallback-repo-env "${PRE_RESTORE_BACKEND_TOKEN_FILE}")
+  fi
 fi
 rh_gate_verify "${pre_verify_args[@]}" >/dev/null \
-  || fail_gate_state_unknown "1/7 verify-gate" "Backend container is running but rejected closed-gate verification (tried snapshot .env and current .env on HTTP 401). Host gate file remains closed (paused=true); inspect ${CONTAINER_NAME} logs, INTERNAL_SERVICE_TOKEN, and /app/var/dalton/maintenance-admission.json."
+  || fail_gate_state_unknown "1/7 verify-gate" "Backend container is running but rejected closed-gate verification (tried snapshot .env and fallback pre-restore/current .env on HTTP 401). Host gate file remains closed (paused=true); inspect ${CONTAINER_NAME} logs, INTERNAL_SERVICE_TOKEN, and /app/var/dalton/maintenance-admission.json."
 
 gate_verify_extra=()
 if [[ -n "${REPO_ENV_PATH}" ]]; then
@@ -545,6 +711,9 @@ wait_url_down "${PROXY_URL%/}/healthz" "${SERVICE_TIMEOUT}" \
 rh_wait_lock_free --timeout "${SERVICE_TIMEOUT}" "${drain_common_args[@]}" >/dev/null \
   || fail_with_gate_closed "3/7 wait-owner-lock-free" "Guidepoint .guidepoint.owner.lock is still held after stopping refreshers. Stop any lingering process holding the lock before retrying."
 
+preserve_pre_restore_backend_token \
+  || fail_with_gate_closed "3/7 preserve-backend-token" "Failed to save pre-restore INTERNAL_SERVICE_TOKEN into ${PRE_RESTORE_BACKEND_TOKEN_FILE} before restoring ${LIVE_REPO_ENV}."
+
 rh_snapshot_restore --snapshot-dir "${SNAPSHOT_DIR}" \
   || fail_with_gate_closed "3/7 restore-snapshot" "Failed to restore files or web/releases/current from ${SNAPSHOT_DIR}. Inspect permissions, disk space, and target frontend release directory, then re-run rollback."
 
@@ -573,6 +742,7 @@ rh_wait_health --url "${BACKEND_URL%/}/health" --timeout "${SERVICE_TIMEOUT}" >/
 
 run_gate_verify --expected-paused true --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" >/dev/null \
   || fail_with_gate_closed "5/7 verify-post-recreate-gate" "Backend came up but closed-gate verification failed. Confirm /app/var/dalton/maintenance-admission.json is mounted properly."
+rm -f "${PRE_RESTORE_BACKEND_TOKEN_FILE}"
 
 echo "[6/7] Running live probes (Wiki search & Guidepoint search_library)..."
 probe_args=(

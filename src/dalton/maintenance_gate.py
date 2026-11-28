@@ -610,21 +610,32 @@ def update_maintenance_state_under_db_lock(
     state_file: Path | str | None = None,
     dsn: str | None = None,
     conn_factory: Callable[[], Any] | None = None,
+    lock_timeout_s: float | None = None,
 ) -> MaintenanceAdmissionState:
     """Host-side synchronous gate update serialized with ``pg_advisory_xact_lock``."""
+    import math
     import psycopg
 
     from src.server.database.pool import get_db_connection_string
 
     resolved_path = resolve_maintenance_state_file(state_file)
-    conn_cm = (
-        conn_factory()
-        if conn_factory is not None
-        else psycopg.connect(dsn or get_db_connection_string(), autocommit=False)
-    )
+    eff_timeout_s: float | None = None
+    if lock_timeout_s is not None:
+        eff_timeout_s = max(0.1, float(lock_timeout_s))
+    if conn_factory is not None:
+        conn_cm = conn_factory()
+    else:
+        connect_kwargs: dict[str, Any] = {"autocommit": False}
+        if eff_timeout_s is not None:
+            connect_kwargs["connect_timeout"] = max(1, int(math.ceil(eff_timeout_s)))
+        conn_cm = psycopg.connect(dsn or get_db_connection_string(), **connect_kwargs)
     with conn_cm as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                if eff_timeout_s is not None:
+                    timeout_ms = max(100, int(eff_timeout_s * 1000))
+                    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{timeout_ms}ms",))
+                    cur.execute("SELECT set_config('statement_timeout', %s, true)", (f"{timeout_ms}ms",))
                 cur.execute(MAINTENANCE_EXCLUSIVE_LOCK_SQL)
             current = read_maintenance_state(resolved_path)
             next_state = _build_next_state(

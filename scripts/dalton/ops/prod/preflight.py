@@ -3771,14 +3771,29 @@ def _parse_frontend_version_json(path: Path) -> tuple[dict[str, Any] | None, str
     return raw, None
 
 
-def _frontend_version_identity(payload: Mapping[str, Any]) -> dict[str, str]:
-    """Extract canonical non-empty identity fields from a frontend `version.json` payload."""
-    ident: dict[str, str] = {}
-    for field in ("build", "release", "help_hash", "build_id"):
-        val = payload.get(field)
-        if isinstance(val, str) and val.strip():
-            ident[field] = val.strip()
-    return ident
+def _diff_frontend_version_json(
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+    *,
+    actual_label: str = "actual",
+    expected_label: str = "expected",
+) -> list[str]:
+    """Compare full `version.json` JSON objects (including `entry`) and return field mismatch descriptions."""
+    exp_dict = dict(expected)
+    act_dict = dict(actual)
+    if json.dumps(act_dict, sort_keys=True) == json.dumps(exp_dict, sort_keys=True):
+        return []
+    mismatches: list[str] = []
+    for key in sorted(set(exp_dict.keys()) | set(act_dict.keys())):
+        if key not in act_dict:
+            mismatches.append(f"{key}: missing in {actual_label} ({expected_label}={exp_dict[key]!r})")
+        elif key not in exp_dict:
+            mismatches.append(f"{key}: unexpected in {actual_label} ({actual_label}={act_dict[key]!r})")
+        elif json.dumps(act_dict[key], sort_keys=True) != json.dumps(exp_dict[key], sort_keys=True):
+            mismatches.append(
+                f"{key}: {actual_label}={act_dict[key]!r} {expected_label}={exp_dict[key]!r}"
+            )
+    return mismatches
 
 
 def _validate_web_releases_current_for_snapshot(
@@ -3867,14 +3882,16 @@ def _verify_snapshot_frontend_target(
         if snap_ver_err or snap_ver_obj is None:
             errors.append(f"web_releases_current snapshot version.json invalid ({snap_ver_err})")
             return errors
-    expected_ident = _frontend_version_identity(snap_ver_obj)
-    target_ident = _frontend_version_identity(target_ver_obj)
-    for field, exp_val in expected_ident.items():
-        if target_ident.get(field) != exp_val:
-            errors.append(
-                f"web_releases_current target {resolved_abs}/version.json "
-                f"{field}={target_ident.get(field)!r} does not match snapshot {exp_val!r}"
-            )
+    mismatches = _diff_frontend_version_json(
+        snap_ver_obj,
+        target_ver_obj,
+        actual_label="target",
+        expected_label="snapshot",
+    )
+    for msg in mismatches:
+        errors.append(
+            f"web_releases_current target {resolved_abs}/version.json mismatch ({msg})"
+        )
     return errors
 
 
@@ -4568,6 +4585,7 @@ def cmd_gate_set(args: argparse.Namespace) -> int:
                 operation=args.operation,
                 state_file=state_file,
                 dsn=args.dsn,
+                lock_timeout_s=getattr(args, "lock_timeout_s", None),
             )
     except Exception as exc:
         print(f"ERROR: failed to update maintenance admission gate: {exc}", file=sys.stderr)
@@ -4604,15 +4622,23 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
             str(os.environ.get("INTERNAL_SERVICE_TOKEN") or "").strip()
             or str(repo_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
         )
-    fallback_svc_tok = ""
-    if getattr(args, "fallback_repo_env", None):
-        fb_env_path = Path(args.fallback_repo_env).expanduser().resolve()
+    raw_fb = getattr(args, "fallback_repo_env", None)
+    fb_paths: list[str] = [raw_fb] if isinstance(raw_fb, str) else list(raw_fb or [])
+    fallback_svc_toks: list[str] = []
+    for fb_item in fb_paths:
+        if not fb_item:
+            continue
+        fb_env_path = Path(fb_item).expanduser().resolve()
         fb_vals = _parse_simple_env_file(fb_env_path)
-        fallback_svc_tok = str(fb_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
+        fb_tok = str(fb_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
+        if fb_tok and fb_tok != svc_tok and fb_tok not in fallback_svc_toks:
+            fallback_svc_toks.append(fb_tok)
     docker_bin = os.environ.get("DOCKER_BIN", "docker")
 
     def _docker_runner(d_args: list[str], timeout_s: float) -> tuple[int, str, str]:
         return _run_cmd([docker_bin, *d_args], timeout_s=timeout_s)
+
+    saw_unauthorized = False
 
     def _http_requester(
         method: str,
@@ -4622,6 +4648,7 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
         body: bytes | None,
         timeout_s: float,
     ) -> tuple[int | None, dict[str, Any] | None, str]:
+        nonlocal saw_unauthorized
         code, parsed, err = _http_request(
             method,
             url,
@@ -4629,20 +4656,28 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
             body=body,
             timeout_s=timeout_s,
         )
-        if (
-            code == 401
-            and fallback_svc_tok
-            and fallback_svc_tok != str(headers.get("X-Service-Token") or "").strip()
-        ):
-            fb_headers = dict(headers)
-            fb_headers["X-Service-Token"] = fallback_svc_tok
-            code, parsed, err = _http_request(
-                method,
-                url,
-                headers=fb_headers,
-                body=body,
-                timeout_s=timeout_s,
-            )
+        attempt_saw_401 = False
+        if code == 401:
+            attempt_saw_401 = True
+            primary_tok = str(headers.get("X-Service-Token") or "").strip()
+            for fb_tok in fallback_svc_toks:
+                if fb_tok == primary_tok:
+                    continue
+                fb_headers = dict(headers)
+                fb_headers["X-Service-Token"] = fb_tok
+                code, parsed, err = _http_request(
+                    method,
+                    url,
+                    headers=fb_headers,
+                    body=body,
+                    timeout_s=timeout_s,
+                )
+                if code != 401:
+                    if code is not None:
+                        attempt_saw_401 = False
+                    break
+        if attempt_saw_401:
+            saw_unauthorized = True
         return code, (parsed if isinstance(parsed, dict) else None), (err or "")
 
     res = mg.verify_container_maintenance_gate(
@@ -4656,9 +4691,19 @@ def cmd_gate_verify(args: argparse.Namespace) -> int:
         docker_runner=_docker_runner,
         http_requester=_http_requester,
     )
-    print(json.dumps(res.to_dict(), ensure_ascii=False))
+    out_dict = res.to_dict()
     if res.status == "verified":
+        print(json.dumps(out_dict, ensure_ascii=False))
         return 0
+    if saw_unauthorized or res.probe_status_code == 401:
+        if out_dict.get("status") == "unavailable":
+            out_dict["status"] = "mismatch"
+            out_dict["container_available"] = True
+            orig_reason = str(out_dict.get("reason") or "")
+            out_dict["reason"] = f"probe_unauthorized_401:{orig_reason}" if orig_reason else "probe_unauthorized_401"
+        print(json.dumps(out_dict, ensure_ascii=False))
+        return 1
+    print(json.dumps(out_dict, ensure_ascii=False))
     if res.status == "unavailable" and args.allow_unavailable:
         return 0
     return 1
@@ -5870,7 +5915,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
     """Drain legacy researchdata bridge (`:8960`) via `/admin/drain` before `launchctl bootout`.
 
     1. Sends `POST /admin/drain` (`{"drain": true}`) using `DALTON_BRIDGE_ADMIN_TOKEN` from
-       current config; on HTTP `401` (or missing current token) when `--snapshot-dir` is given,
+       current config; on HTTP `401` or `403` (or missing current token) when `--snapshot-dir` is given,
        verifies the snapshot and retries with the snapshot's saved `DALTON_BRIDGE_ADMIN_TOKEN`.
     2. Polls `GET /admin/drain` until `draining=true`, `inflight == 0`, `queued == 0`, and
        `ingest_inflight == 0` (default timeout 240s to cover the 180s ingest limit).
@@ -5982,7 +6027,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
         return True, vals, f"draining=True, {vals}"
 
     # Phase 1: Enter drain mode via POST /admin/drain (bounded retry on transient connectivity;
-    # fallback to verified snapshot admin token on HTTP 401)
+    # fallback to verified snapshot admin token on HTTP 401/403)
     last_post_err = "no response received"
     while True:
         tok_source, active_tok = candidate_tokens[active_idx]
@@ -6000,7 +6045,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
         )
         if not d_err and d_code == 200 and isinstance(d_body, dict):
             break
-        if d_code == 401 and active_idx + 1 < len(candidate_tokens):
+        if d_code in (401, 403) and active_idx + 1 < len(candidate_tokens):
             active_idx += 1
             continue
         if d_code in (401, 403):
@@ -6060,7 +6105,7 @@ def cmd_drain_bridge(args: argparse.Namespace) -> int:
             headers={"Authorization": f"Bearer {active_tok}"},
             timeout_s=req_t,
         )
-        if g_code == 401 and active_idx + 1 < len(candidate_tokens):
+        if g_code in (401, 403) and active_idx + 1 < len(candidate_tokens):
             active_idx += 1
             continue
         if g_code in (401, 403):
@@ -6159,7 +6204,6 @@ def cmd_verify_frontend_version(args: argparse.Namespace) -> int:
         return 1
 
     expected_ver = dict(disk_ver)
-    expected_ident = _frontend_version_identity(disk_ver)
 
     if getattr(args, "snapshot_dir", None):
         snap_path = Path(args.snapshot_dir).expanduser().resolve()
@@ -6177,17 +6221,20 @@ def cmd_verify_frontend_version(args: argparse.Namespace) -> int:
         if snap_ver_err or snap_ver is None:
             print(f"ERROR: verify-frontend-version invalid snapshot version.json: {snap_ver_err}", file=sys.stderr)
             return 1
-        snap_ident = _frontend_version_identity(snap_ver)
-        for field, exp_val in snap_ident.items():
-            if expected_ident.get(field) != exp_val:
-                print(
-                    f"ERROR: verify-frontend-version disk web/releases/current/version.json "
-                    f"{field}={expected_ident.get(field)!r} does not match snapshot {exp_val!r}",
-                    file=sys.stderr,
-                )
-                return 1
+        disk_mismatches = _diff_frontend_version_json(
+            snap_ver,
+            disk_ver,
+            actual_label="disk",
+            expected_label="snapshot",
+        )
+        if disk_mismatches:
+            print(
+                "ERROR: verify-frontend-version disk web/releases/current/version.json mismatch: "
+                + "; ".join(disk_mismatches),
+                file=sys.stderr,
+            )
+            return 1
         expected_ver = dict(snap_ver)
-        expected_ident = snap_ident
 
     edge_url_raw = str(getattr(args, "edge_url", None) or "").strip()
     if not edge_url_raw:
@@ -6211,12 +6258,12 @@ def cmd_verify_frontend_version(args: argparse.Namespace) -> int:
         if err or code != 200 or not isinstance(body, dict):
             last_reason = f"GET {version_url} -> {code} ({err or 'unexpected non-JSON/status response'})"
         else:
-            served_ident = _frontend_version_identity(body)
-            mismatches = [
-                f"{field}: served={served_ident.get(field)!r} expected={exp_val!r}"
-                for field, exp_val in expected_ident.items()
-                if served_ident.get(field) != exp_val
-            ]
+            mismatches = _diff_frontend_version_json(
+                expected_ver,
+                body,
+                actual_label="served",
+                expected_label="expected",
+            )
             if not mismatches:
                 print(
                     json.dumps(
@@ -6399,13 +6446,14 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_gset.add_argument("--reason", default="")
     p_gset.add_argument("--operation", default="")
     p_gset.add_argument("--dsn", default=None)
+    p_gset.add_argument("--lock-timeout-s", type=float, default=None)
     p_gset.add_argument("--no-db-lock", action="store_true")
 
     p_gver = sub.add_parser("gate-verify")
     p_gver.add_argument("--repo", required=True)
     p_gver.add_argument("--state-file", default=None)
     p_gver.add_argument("--repo-env", default=None)
-    p_gver.add_argument("--fallback-repo-env", default=None)
+    p_gver.add_argument("--fallback-repo-env", action="append", default=[])
     p_gver.add_argument("--expected-revision", type=int, default=None)
     p_gver.add_argument("--expected-paused", default="true", choices=("true", "false"))
     p_gver.add_argument("--backend-url", default="http://127.0.0.1:8000")

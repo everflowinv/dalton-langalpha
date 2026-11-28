@@ -359,6 +359,9 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
 
             if cmd == "exec":
                 if "cat" in args and any("maintenance-admission.json" in a for a in args):
+                    if os.environ.get("FAKE_FAIL_DOCKER_EXEC_CAT") == "1":
+                        print("simulated docker exec cat failure", file=sys.stderr)
+                        sys.exit(1)
                     if not state.get("backend_running", True):
                         sys.exit(1)
                     if adm_file.is_file():
@@ -441,6 +444,7 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             web_cur_path = Path({str(web_cur)!r})
             expected_rh_admin = {rh_admin_token!r}
             expected_proxy_admin = {proxy_admin_token!r}
+            expected_bridge_token = {bridge_token!r}
             expected_bridge_admin = "test-bridge-admin-tok"
             expected_svc_token = {svc_token!r}
 
@@ -671,6 +675,8 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     conn_refused()
                 if url.endswith("/admin/drain"):
                     eff_bridge_admin = str(state.get("bridge_admin_token") or expected_bridge_admin)
+                    if cfg_headers.get("authorization") == f"Bearer {{expected_bridge_token}}" and eff_bridge_admin != expected_bridge_token:
+                        emit(403, {{"ok": False, "error": "Forbidden: MCP token cannot call admin endpoint"}})
                     if cfg_headers.get("authorization") != f"Bearer {{eff_bridge_admin}}":
                         emit(401, {{"ok": False, "error": "Unauthorized"}})
                     if method == "POST":
@@ -770,6 +776,9 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             if ":8088" in url and url.endswith("/version.json"):
                 if os.environ.get("FAKE_FAIL_EDGE_VERSION") == "1":
                     emit(503, {{"error": "edge unavailable"}})
+                override_ver_json = os.environ.get("FAKE_SERVED_FRONTEND_VERSION_JSON", "").strip()
+                if override_ver_json:
+                    emit(200, json.loads(override_ver_json))
                 override_build = os.environ.get("FAKE_SERVED_FRONTEND_BUILD", "").strip()
                 if override_build:
                     emit(200, {{"build": override_build}})
@@ -4103,4 +4112,632 @@ def test_r5_frontend_rollback_target_verified_before_stopping_services_and_on_au
     assert r_none.returncode != 0
     assert "1/7 resolve-snapshot" in r_none.stderr
     assert "launchctl bootout" not in h["calls_log"].read_text(encoding="utf-8")
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
+
+
+# ---------------------------------------------------------------------------
+# 12. Round-6 review fixes: Items 1..5 targeted regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_r6_rerun_rollback_preserves_pre_restore_backend_token_until_recreate_verified(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 1: Step 3 saves pre-restore INTERNAL_SERVICE_TOKEN to a 0600 file in snapshot dir so verbatim reruns after Step 4/5 failures pass 1/7 verify-gate until Step 5 post-recreate verification succeeds with snapshot token."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r6-rerun-tok", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = Path(r_snap.stdout.strip())
+    pre_restore_file = snap_dir / ".pre-restore-backend-token.env"
+
+    _simulate_post_cutover_state(h)
+    new_svc_tok = "test-internal-svc-rotated-r6-rerun"
+    h["repo_env"].write_text(
+        f"APP_ENV=dalton\nDALTON_ENABLED=true\nINTERNAL_SERVICE_TOKEN={new_svc_tok}\n"
+        "DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951\n",
+        encoding="utf-8",
+    )
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["backend_service_token"] = new_svc_tok
+    st["backend_adopts_repo_env_token"] = True
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["curl_argv_log"].write_text("", encoding="utf-8")
+
+    # Attempt 1: Step 1c passes via live .env, Step 3 saves pre-restore token (0600) & restores .env,
+    # then Step 4 fails before backend is recreated (backend container still uses new_svc_tok).
+    r_fail_step4 = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_REQUIRE_SERVICE_TOKEN": "1",
+            "FAKE_FAIL_BOOTSTRAP_LABEL": "com.dalton.researchdata-bridge",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_fail_step4.returncode != 0
+    assert "4/7 start-legacy-bridge" in r_fail_step4.stderr
+    assert "INTERNAL_SERVICE_TOKEN=test-internal-svc-secret-delta" in h["repo_env"].read_text(encoding="utf-8")
+    assert pre_restore_file.is_file() and not pre_restore_file.is_symlink()
+    assert stat.S_IMODE(pre_restore_file.stat().st_mode) == 0o600
+    assert pre_restore_file.read_text(encoding="utf-8").strip() == f"INTERNAL_SERVICE_TOKEN={new_svc_tok}"
+    st_mid = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    assert st_mid["recreate_count"] == 0
+    assert st_mid["backend_service_token"] == new_svc_tok
+
+    # Attempt 2: Verbatim rerun now sees restored .env on disk, passes 1/7 via saved pre-restore file,
+    # and fails at Step 5 (docker compose up) — MUST keep pre-restore file intact without overwriting it!
+    r_fail_step5 = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_REQUIRE_SERVICE_TOKEN": "1",
+            "FAKE_FAIL_COMPOSE": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_fail_step5.returncode != 0
+    assert "5/7 recreate-backend" in r_fail_step5.stderr
+    assert pre_restore_file.is_file()
+    assert stat.S_IMODE(pre_restore_file.stat().st_mode) == 0o600
+    assert pre_restore_file.read_text(encoding="utf-8").strip() == f"INTERNAL_SERVICE_TOKEN={new_svc_tok}"
+
+    # Attempt 3: Verbatim rerun succeeds through Step 5 recreate & snapshot-token gate verification,
+    # removes the saved pre-restore token file, and finishes ROLLBACK_OK without leaking token in argv.
+    r_ok = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={**h["env"], "FAKE_REQUIRE_SERVICE_TOKEN": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_ok.returncode == 0, r_ok.stdout + r_ok.stderr
+    assert "ROLLBACK_OK" in r_ok.stdout
+    assert not pre_restore_file.exists()
+    st_done = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    assert st_done["recreate_count"] == 1
+    assert st_done["backend_service_token"] == "test-internal-svc-secret-delta"
+    assert new_svc_tok not in h["curl_argv_log"].read_text(encoding="utf-8")
+
+
+def test_r6_gate_verify_fails_when_both_tokens_401_even_if_container_file_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6 Item 2: gate-verify MUST fail (even with --allow-unavailable) whenever HTTP 401 was received and verification did not succeed, even if docker exec cat fails."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r6-double-401", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = Path(r_snap.stdout.strip())
+
+    live_tok = "test-internal-svc-r6-other"
+    h["repo_env"].write_text(
+        f"APP_ENV=dalton\nDALTON_ENABLED=true\nINTERNAL_SERVICE_TOKEN={live_tok}\n",
+        encoding="utf-8",
+    )
+    h["adm_file"].write_text(
+        json.dumps({"version": 1, "revision": 2, "paused": True, "pause_host_direct": True, "allow_workspace_ids": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    orig_run_cmd = preflight._run_cmd
+    orig_http = preflight._http_request
+    seen_tokens: list[str] = []
+
+    def _fake_docker_cat_fails(cmd: list[str], *, timeout_s: float = 10.0) -> tuple[int, str, str]:
+        if "inspect" in cmd:
+            return 0, "true\n", ""
+        if "cat" in cmd:
+            return 1, "", "cat: cannot read /app/var/dalton/maintenance-admission.json"
+        return 0, "", ""
+
+    def _fake_http_both_401(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        seen_tokens.append(str((headers or {}).get("X-Service-Token") or ""))
+        return 401, {"detail": "Invalid service token"}, None
+
+    monkeypatch.setattr(preflight, "_run_cmd", create_autospec(orig_run_cmd, spec_set=True, side_effect=_fake_docker_cat_fails))
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_http_both_401))
+
+    rc_401 = preflight.main(
+        [
+            "gate-verify",
+            "--repo", str(h["repo"]),
+            "--repo-env", str(snap_dir / "files" / "repo.env"),
+            "--fallback-repo-env", str(h["repo_env"]),
+            "--expected-paused", "true",
+            "--deadline-s", "0.2",
+            "--poll-interval-s", "0.05",
+            "--allow-unavailable",
+        ]
+    )
+    out_401 = json.loads(capsys.readouterr().out)
+    assert rc_401 == 1
+    assert out_401["status"] == "mismatch"
+    assert out_401["probe_status_code"] == 401
+    assert "test-internal-svc-secret-delta" in seen_tokens
+    assert live_tok in seen_tokens
+
+    # Control: when HTTP probe genuinely cannot connect (no 401) and cat fails, --allow-unavailable still allows 0.
+    monkeypatch.setattr(
+        preflight,
+        "_http_request",
+        create_autospec(orig_http, spec_set=True, return_value=(None, None, "Connection refused")),
+    )
+    rc_unavail = preflight.main(
+        [
+            "gate-verify",
+            "--repo", str(h["repo"]),
+            "--repo-env", str(snap_dir / "files" / "repo.env"),
+            "--fallback-repo-env", str(h["repo_env"]),
+            "--expected-paused", "true",
+            "--deadline-s", "0.2",
+            "--poll-interval-s", "0.05",
+            "--allow-unavailable",
+        ]
+    )
+    out_unavail = json.loads(capsys.readouterr().out)
+    assert rc_unavail == 0
+    assert out_unavail["status"] == "unavailable"
+
+    # End-to-end rollback: both tokens return 401 AND docker exec cat fails -> MUST abort at 1/7 verify-gate!
+    monkeypatch.undo()
+    _simulate_post_cutover_state(h)
+    h["repo_env"].write_text(
+        f"APP_ENV=dalton\nDALTON_ENABLED=true\nINTERNAL_SERVICE_TOKEN={live_tok}\n",
+        encoding="utf-8",
+    )
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["backend_service_token"] = "third-unmatched-r6-token"
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["calls_log"].write_text("", encoding="utf-8")
+
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_REQUIRE_SERVICE_TOKEN": "1",
+            "FAKE_FAIL_DOCKER_EXEC_CAT": "1",
+            "DALTON_ROLLBACK_GATE_VERIFY_TIMEOUT_S": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_rb.returncode != 0
+    assert "1/7 verify-gate" in r_rb.stderr
+    assert "launchctl bootout" not in h["calls_log"].read_text(encoding="utf-8")
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
+
+
+def test_r6_initial_close_gate_times_out_locked_db_and_waits_exit_before_emergency_write(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 3: DB-locked initial gate close sets explicit timeout (SQL lock/statement timeout + process watchdog) and confirms the hung process exited BEFORE running emergency --no-db-lock write & readback."""
+    from src.dalton import maintenance_gate as mg
+
+    # A. Unit check: update_maintenance_state_under_db_lock sets local lock_timeout & statement_timeout before pg_advisory_xact_lock
+    executed_sql: list[tuple[str, Any]] = []
+
+    class _FakeCursor:
+        def __enter__(self) -> "_FakeCursor":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            executed_sql.append((sql, params))
+
+    class _FakeTxn:
+        def __enter__(self) -> "_FakeTxn":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    class _FakeConn:
+        def __enter__(self) -> "_FakeConn":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+        def transaction(self) -> _FakeTxn:
+            return _FakeTxn()
+
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    adm_unit = tmp_path / "unit-adm.json"
+    st_unit = mg.update_maintenance_state_under_db_lock(
+        paused=True,
+        pause_host_direct=True,
+        reason="r6_lock_timeout_check",
+        operation="rollback",
+        state_file=adm_unit,
+        conn_factory=_FakeConn,
+        lock_timeout_s=2.5,
+    )
+    assert st_unit.paused is True
+    assert executed_sql == [
+        ("SELECT set_config('lock_timeout', %s, true)", ("2500ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("2500ms",)),
+        (mg.MAINTENANCE_EXCLUSIVE_LOCK_SQL, None),
+    ]
+
+    # B. End-to-end rollback: locked gate-set hangs (even ignoring SIGTERM) holding an OS flock;
+    #    rollback times out, kills & confirms exit, and ONLY THEN executes emergency --no-db-lock write + readback!
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r6-lock-to", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+    _simulate_post_cutover_state(h)
+    h["adm_file"].write_text(
+        json.dumps({"version": 1, "revision": 3, "paused": False, "pause_host_direct": False, "allow_workspace_ids": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    hung_pid_file = tmp_path / "hung_locked_gate_set.pid"
+    hung_lock_file = tmp_path / "hung_locked_gate_set.lock"
+    emergency_check_file = tmp_path / "emergency_saw_hung_exited.txt"
+
+    hung_py = _write_exec(
+        tmp_path / "py_hung_locked_gate_set",
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import fcntl, os, signal, sys, time
+            from pathlib import Path
+
+            pid_file = Path({str(hung_pid_file)!r})
+            lock_file = Path({str(hung_lock_file)!r})
+            check_file = Path({str(emergency_check_file)!r})
+
+            if "gate-set" in sys.argv:
+                if "--no-db-lock" not in sys.argv:
+                    assert "--lock-timeout-s" in sys.argv
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    fh = lock_file.open("w", encoding="utf-8")
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+                    time.sleep(30.0)
+                    sys.exit(0)
+                else:
+                    # Emergency fallback MUST only run after hung locked process has exited & released its flock
+                    hung_pid = int(pid_file.read_text(encoding="utf-8").strip())
+                    alive = True
+                    try:
+                        os.kill(hung_pid, 0)
+                    except ProcessLookupError:
+                        alive = False
+                    lock_free = False
+                    with lock_file.open("a+", encoding="utf-8") as lfh:
+                        try:
+                            fcntl.flock(lfh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            lock_free = True
+                        except BlockingIOError:
+                            lock_free = False
+                    check_file.write_text(f"alive={{alive}} lock_free={{lock_free}}\\n", encoding="utf-8")
+            os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+            """
+        ),
+    )
+
+    env_hung = {
+        **{k: v for k, v in h["env"].items() if k != "DALTON_MAINTENANCE_NO_DB_LOCK"},
+        "DALTON_PYTHON_BIN": str(hung_py),
+        "DALTON_ROLLBACK_GATE_CLOSE_LOCK_TIMEOUT_S": "1",
+        "FAKE_PG_DOWN": "1",
+        "DALTON_ROLLBACK_IDLE_WAIT_S": "1",
+    }
+    t0 = time.monotonic()
+    r_to = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env=env_hung,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10.0, f"rollback hung too long: {elapsed:.2f}s"
+    assert r_to.returncode != 0
+    assert "1/7 wait-backend-idle" in r_to.stderr
+    assert "timed out" in r_to.stderr
+    assert "--no-db-lock" in r_to.stderr or "--no-db-lock" in r_to.stdout
+    assert emergency_check_file.read_text(encoding="utf-8").strip() == "alive=False lock_free=True"
+    adm_after = json.loads(h["adm_file"].read_text(encoding="utf-8"))
+    assert adm_after["paused"] is True and adm_after["pause_host_direct"] is True and adm_after["allow_workspace_ids"] == []
+
+
+def test_r6_drain_bridge_retries_snapshot_token_on_http_403_for_post_and_get(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6 Item 4: drain-bridge retries verified snapshot admin token on HTTP 403 (e.g. MCP token mistakenly placed in DALTON_BRIDGE_ADMIN_TOKEN) for both POST and GET."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r6-bridge-403", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = Path(r_snap.stdout.strip())
+
+    # Mistakenly put MCP token (DALTON_BRIDGE_TOKEN) into DALTON_BRIDGE_ADMIN_TOKEN
+    mcp_tok = "test-bridge-secret-token-alpha"
+    h["bridge_env"].write_text(
+        f"DALTON_BRIDGE_TOKEN={mcp_tok}\n"
+        f"DALTON_BRIDGE_ADMIN_TOKEN={mcp_tok}\n"
+        "DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8951/mcp/guidepoint\n",
+        encoding="utf-8",
+    )
+
+    # A. Unit check (POST -> 403 with MCP token -> retries snapshot admin token -> succeeds)
+    orig_http = preflight._http_request
+    seen_post_403: list[str] = []
+
+    def _fake_post_403(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        auth = str((headers or {}).get("Authorization") or "")
+        seen_post_403.append(f"{method}:{auth}")
+        if auth == f"Bearer {mcp_tok}":
+            return 403, {"ok": False, "error": "Forbidden"}, None
+        if auth == "Bearer test-bridge-admin-tok":
+            return 200, {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 0}, None
+        return 401, {"ok": False, "error": "Unauthorized"}, None
+
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_post_403))
+    rc_post = preflight.main(
+        [
+            "drain-bridge",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--bridge-env", str(h["bridge_env"]),
+            "--snapshot-dir", str(snap_dir),
+            "--url", "http://127.0.0.1:8960",
+            "--timeout", "3",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_post == 0
+    assert seen_post_403 == [
+        f"POST:Bearer {mcp_tok}",
+        "POST:Bearer test-bridge-admin-tok",
+        "GET:Bearer test-bridge-admin-tok",
+    ]
+
+    # B. Unit check (GET -> 403 -> retries snapshot admin token -> succeeds)
+    seen_get_403: list[str] = []
+
+    def _fake_get_403(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        auth = str((headers or {}).get("Authorization") or "")
+        seen_get_403.append(f"{method}:{auth}")
+        if method == "POST":
+            return 200, {"ok": True, "draining": True, "inflight": 1, "queued": 0, "ingest_inflight": 0}, None
+        if auth == f"Bearer {mcp_tok}":
+            return 403, {"ok": False, "error": "Forbidden"}, None
+        return 200, {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 0}, None
+
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_get_403))
+    rc_get = preflight.main(
+        [
+            "drain-bridge",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--bridge-env", str(h["bridge_env"]),
+            "--snapshot-dir", str(snap_dir),
+            "--url", "http://127.0.0.1:8960",
+            "--timeout", "3",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_get == 0
+    assert seen_get_403 == [
+        f"POST:Bearer {mcp_tok}",
+        f"GET:Bearer {mcp_tok}",
+        "GET:Bearer test-bridge-admin-tok",
+    ]
+
+    # C. End-to-end rollback with MCP token mistakenly placed in live DALTON_BRIDGE_ADMIN_TOKEN:
+    #    fake :8960 returns 403 for MCP token -> rollback retries snapshot token, drains :8960, and succeeds!
+    monkeypatch.undo()
+    _simulate_post_cutover_state(h)
+    h["bridge_env"].write_text(
+        f"DALTON_BRIDGE_TOKEN={mcp_tok}\n"
+        f"DALTON_BRIDGE_ADMIN_TOKEN={mcp_tok}\n"
+        "DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8951/mcp/guidepoint\n",
+        encoding="utf-8",
+    )
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_rb.returncode == 0, r_rb.stdout + r_rb.stderr
+    assert "ROLLBACK_OK" in r_rb.stdout
+    assert "DALTON_BRIDGE_ADMIN_TOKEN=test-bridge-admin-tok" in h["bridge_env"].read_text(encoding="utf-8")
+
+
+def test_r6_frontend_version_compares_full_version_json_including_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6 Item 5: both pre-stop target verification and pre-open served /version.json verification compare the full version.json object including `entry`."""
+    h = _build_isolated_harness(tmp_path)
+    rel_before = h["repo"] / "web" / "releases" / "rel-before"
+    full_ver = {
+        "build": "index-AAA111.js+help-1234567890abcdef@rel-before",
+        "release": "index-AAA111.js+help-1234567890abcdef@rel-before",
+        "release_id": "rel-before",
+        "help_hash": "1234567890abcdef",
+        "entry": "index-AAA111.js",
+    }
+    (rel_before / "version.json").write_text(json.dumps(full_ver) + "\n", encoding="utf-8")
+
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r6-fe-entry", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = Path(r_snap.stdout.strip())
+    assert preflight.verify_cutover_snapshot(snap_dir) == []
+
+    # A. Only `entry` modified in target release dir -> verify_cutover_snapshot & rollback Step 1b MUST fail before stopping services!
+    _simulate_post_cutover_state(h)
+    (rel_before / "version.json").write_text(
+        json.dumps({**full_ver, "entry": "index-TAMPERED999.js"}) + "\n",
+        encoding="utf-8",
+    )
+    errs_mod = preflight.verify_cutover_snapshot(snap_dir)
+    assert errs_mod and any("entry" in e for e in errs_mod)
+
+    h["calls_log"].write_text("", encoding="utf-8")
+    r_pre_stop = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_pre_stop.returncode != 0
+    assert "1/7 verify-snapshot" in r_pre_stop.stderr
+    assert "launchctl bootout" not in h["calls_log"].read_text(encoding="utf-8")
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
+
+    # B. Only `entry` missing in target release dir -> verify_cutover_snapshot MUST fail!
+    ver_no_entry = {k: v for k, v in full_ver.items() if k != "entry"}
+    (rel_before / "version.json").write_text(json.dumps(ver_no_entry) + "\n", encoding="utf-8")
+    errs_missing = preflight.verify_cutover_snapshot(snap_dir)
+    assert errs_missing and any("entry" in e for e in errs_missing)
+
+    # Restore exact target version.json and web/releases/current -> rel-before for served-response checks
+    (rel_before / "version.json").write_text(json.dumps(full_ver) + "\n", encoding="utf-8")
+    tmp_lnk = h["web_cur"].parent / ".cur-r6-restore"
+    os.symlink("rel-before", tmp_lnk)
+    os.replace(tmp_lnk, h["web_cur"])
+    assert preflight.verify_cutover_snapshot(snap_dir) == []
+
+    # C. Unit check (create_autospec): verify-frontend-version fails when served /version.json differs ONLY in `entry` (modified or missing), passes on exact match
+    orig_http = preflight._http_request
+    for bad_served in ({**full_ver, "entry": "index-WRONG.js"}, ver_no_entry):
+        monkeypatch.setattr(
+            preflight,
+            "_http_request",
+            create_autospec(orig_http, spec_set=True, return_value=(200, bad_served, None)),
+        )
+        assert (
+            preflight.main(
+                [
+                    "verify-frontend-version",
+                    "--repo", str(h["repo"]),
+                    "--snapshot-dir", str(snap_dir),
+                    "--edge-url", "http://127.0.0.1:8088",
+                    "--timeout", "0.5",
+                    "--poll-interval", "0.05",
+                ]
+            )
+            == 1
+        )
+
+    monkeypatch.setattr(
+        preflight,
+        "_http_request",
+        create_autospec(orig_http, spec_set=True, return_value=(200, dict(full_ver), None)),
+    )
+    assert (
+        preflight.main(
+            [
+                "verify-frontend-version",
+                "--repo", str(h["repo"]),
+                "--snapshot-dir", str(snap_dir),
+                "--edge-url", "http://127.0.0.1:8088",
+                "--timeout", "1",
+                "--poll-interval", "0.05",
+            ]
+        )
+        == 0
+    )
+
+    # D. End-to-end rollback: served /version.json matches build/release/help_hash/release_id but differs in `entry` ->
+    #    MUST stop at 6/7 verify-frontend-version BEFORE opening gate!
+    monkeypatch.undo()
+    _simulate_post_cutover_state(h)
+    r_bad_entry = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_SERVED_FRONTEND_VERSION_JSON": json.dumps({**full_ver, "entry": "index-SERVED-STALE.js"}),
+            "DALTON_ROLLBACK_PROBE_TIMEOUT_S": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_bad_entry.returncode != 0
+    assert "6/7 verify-frontend-version" in r_bad_entry.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_bad_entry.stderr
     assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
