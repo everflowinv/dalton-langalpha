@@ -687,7 +687,6 @@ def create_run_workflow_tool(
         lock_handed_to_driver = False
 
         try:
-<<<<<<< HEAD
             try:
                 if needs_modeling_lock(meta.name, params):
                     try:
@@ -732,33 +731,57 @@ def create_run_workflow_tool(
                         )
                     except ResumeRefused as error:
                         raise _Refused(str(error)) from error
-            except BaseException as launch_error:
-                if admitted:
-                    # The row is in the ledger and the namespace fence is held —
-                    # the post-INSERT arm settles it as a terminal error and
-                    # releases both; discard_unstarted refuses settled runs.
-                    await mw._abort_admitted_run(run_task, launch_error)
-                else:
-                    await registry.discard_unstarted(launch_tool_call_id)
-                raise
 
-            # DALTON-HOOK(modeling-lock): abort the admitted run if cancelled
-            # while snapshotting workflow.js/args.json before spawn_task_writer
-            # takes over ownership.
-            try:
+                # DALTON-HOOK(workflow-discovered-tools): bind the server-computed
+                # internal-memory decision for `topic-research` ONLY to
+                # `(short_thread_id, run_task.task_id)` with an HMAC before
+                # snapshotting `args.json`, and refuse launch (aborting the admitted
+                # run) when `args.json` cannot be persisted. Kept inside the
+                # post-admission `try` so `CancelledError` during snapshot writes
+                # also runs terminal cleanup before propagating.
+                if isinstance(params, dict) and meta.name == "topic-research":
+                    from src.dalton.content_assembly import (
+                        sign_topic_research_internal_memory_decision,
+                    )
+
+                    params = sign_topic_research_internal_memory_decision(
+                        params,
+                        short_thread_id=short_thread_id,
+                        run_id=run_task.task_id,
+                        workflow_name=meta.name,
+                    )
+
                 artifacts = {
                     "workflow.js": script,
                     "args.json": json.dumps(params, ensure_ascii=False, default=str),
                 }
                 for filename, content in artifacts.items():
+                    # DALTON-HOOK(workflow-discovered-tools): fail closed if `args.json`
+                    # fails to persist (exception or explicit False / ok=False) on
+                    # `topic-research` runs that depend on the launch decision snapshot.
+                    args_snapshot_required = (
+                        filename == "args.json" and meta.name == "topic-research"
+                    )
                     try:
-                        await backend.awrite_text(f"{base_rel}/{filename}", content)
-                    except Exception:
+                        write_res = await backend.awrite_text(f"{base_rel}/{filename}", content)
+                        if args_snapshot_required and (
+                            write_res is False
+                            or (hasattr(write_res, "ok") and write_res.ok is False)
+                        ):
+                            raise OSError(
+                                f"snapshot write returned failure for {base_rel}/{filename}"
+                            )
+                    except Exception as snap_error:
                         logger.warning(
                             "Failed to snapshot workflow artifact",
                             path=f"{base_rel}/{filename}",
                             exc_info=True,
                         )
+                        if args_snapshot_required:
+                            raise _Refused(
+                                f"failed to snapshot launch args ({base_rel}/args.json) — refusing to start {meta.name}.",
+                                failure="SnapshotWriteError",
+                            ) from snap_error
 
                 spec = WorkflowRunSpec(
                     run_task=run_task,
@@ -784,9 +807,31 @@ def create_run_workflow_tool(
                     modeling_lock_held=modeling_lock_acquired,
                 )
                 driver = WorkflowDriver(spec)
-            except BaseException as pre_spawn_error:
-                await mw._abort_admitted_run(run_task, pre_spawn_error)
+            except BaseException as launch_error:
+                if admitted:
+                    # The row is in the ledger and the namespace fence is held —
+                    # settle it through the owner terminal pipeline and release
+                    # both; discard_unstarted refuses settled runs.
+                    if isinstance(launch_error, asyncio.CancelledError):
+                        if not run_task.completed:
+                            run_task.mark_cancelled("Cancelled before spawn")
+                        # A second cancel must not cut the ledger/namespace settle short.
+                        await asyncio.shield(mw._finalize_cancelled_before_spawn(run_task))
+                    else:
+                        if not run_task.completed:
+                            run_task.mark_never_started(
+                                f"setup failed before spawn: {launch_error}"
+                            )
+                        await mw._abort_admitted_run(run_task, launch_error)
+                else:
+                    if (
+                        isinstance(launch_error, asyncio.CancelledError)
+                        and not run_task.completed
+                    ):
+                        run_task.mark_never_started("cancelled before admission")
+                    await registry.discard_unstarted(launch_tool_call_id)
                 raise
+
             try:
                 await spawn_task_writer(
                     mw,
@@ -820,149 +865,6 @@ def create_run_workflow_tool(
                         workspace_id=configurable.get("workspace_id"),
                     )
                 )
-=======
-            await _admit_run(
-                run_task,
-                caps,
-                description=launch_description,
-                launch_tool_call_id=launch_tool_call_id,
-            )
-            admitted = True
-            # DALTON-HOOK(workflow-resume): claim the resume the moment
-            # admission accepts — marker written under one advisory lock, so
-            # two workers can never both resume the same old run even when
-            # neither has replayed a dispatch yet.
-            if journal_source is not None:
-                from src.dalton.workflows.journal import ResumeRefused, claim_resume
-
-                try:
-                    await claim_resume(
-                        backend,
-                        registry,
-                        source_dir=journal_source,
-                        resume=resume,
-                        marker_path=f"{base_rel}/resume.json",
-                        run_dir_for=lambda task_id: run_dir(short_thread_id, task_id),
-                        claimant=launch_tool_call_id,
-                        task_id=run_task.task_id,
-                    )
-                except ResumeRefused as error:
-                    raise _Refused(str(error)) from error
-
-            # DALTON-HOOK(workflow-discovered-tools): bind the server-computed
-            # internal-memory decision for `topic-research` ONLY to
-            # `(short_thread_id, run_task.task_id)` with an HMAC before
-            # snapshotting `args.json`, and refuse launch (aborting the admitted
-            # run) when `args.json` cannot be persisted. Kept inside the
-            # post-admission `try` so `CancelledError` during snapshot writes
-            # also runs terminal cleanup before propagating.
-            if isinstance(params, dict) and meta.name == "topic-research":
-                from src.dalton.content_assembly import (
-                    sign_topic_research_internal_memory_decision,
-                )
-
-                params = sign_topic_research_internal_memory_decision(
-                    params,
-                    short_thread_id=short_thread_id,
-                    run_id=run_task.task_id,
-                    workflow_name=meta.name,
-                )
-
-            artifacts = {
-                "workflow.js": script,
-                "args.json": json.dumps(params, ensure_ascii=False, default=str),
-            }
-            for filename, content in artifacts.items():
-                # DALTON-HOOK(workflow-discovered-tools): fail closed if `args.json`
-                # fails to persist (exception or explicit False / ok=False) on
-                # `topic-research` runs that depend on the launch decision snapshot.
-                args_snapshot_required = (
-                    filename == "args.json" and meta.name == "topic-research"
-                )
-                try:
-                    write_res = await backend.awrite_text(f"{base_rel}/{filename}", content)
-                    if args_snapshot_required and (
-                        write_res is False
-                        or (hasattr(write_res, "ok") and write_res.ok is False)
-                    ):
-                        raise OSError(
-                            f"snapshot write returned failure for {base_rel}/{filename}"
-                        )
-                except Exception as snap_error:
-                    logger.warning(
-                        "Failed to snapshot workflow artifact",
-                        path=f"{base_rel}/{filename}",
-                        exc_info=True,
-                    )
-                    if args_snapshot_required:
-                        raise _Refused(
-                            f"failed to snapshot launch args ({base_rel}/args.json) — refusing to start {meta.name}.",
-                            failure="SnapshotWriteError",
-                        ) from snap_error
-        except BaseException as launch_error:
-            if admitted:
-                # The row is in the ledger and the namespace fence is held —
-                # settle it through the owner terminal pipeline and release
-                # both; discard_unstarted refuses settled runs.
-                if isinstance(launch_error, asyncio.CancelledError):
-                    if not run_task.completed:
-                        run_task.mark_cancelled("Cancelled before spawn")
-                    # A second cancel must not cut the ledger/namespace settle short.
-                    await asyncio.shield(mw._finalize_cancelled_before_spawn(run_task))
-                else:
-                    if not run_task.completed:
-                        run_task.mark_never_started(
-                            f"setup failed before spawn: {launch_error}"
-                        )
-                    await mw._abort_admitted_run(run_task, launch_error)
-            else:
-                if (
-                    isinstance(launch_error, asyncio.CancelledError)
-                    and not run_task.completed
-                ):
-                    run_task.mark_never_started("cancelled before admission")
-                await registry.discard_unstarted(launch_tool_call_id)
-            raise
-
-        spec = WorkflowRunSpec(
-            run_task=run_task,
-            registry=registry,
-            dispatcher=dispatcher,
-            backend=backend,
-            checkpointer=mw.checkpointer,
-            thread_id=thread_id,
-            short_thread_id=short_thread_id,
-            script=script,
-            script_args=params,
-            meta=meta,
-            source=script_source,
-            base_configurable=configurable,
-            caps=caps,
-            project=current_project(),
-            # DALTON-HOOK(workflow-journal): the resume source dir and the
-            # progress marker path the driver's journal keeps current.
-            journal_source=journal_source,
-            progress_path=progress_path,
-        )
-        driver = WorkflowDriver(spec)
-        try:
-            await spawn_task_writer(
-                mw,
-                run_task,
-                driver.run,
-                prompt=launch_description,
-                label="Workflow run",
-                name=f"workflow_run_{run_task.display_id}",
-                action="init",
-            )
-        except SpawnStoppedError:
-            return _stopped_reply(run_task, tool_call_id)
-        except SpawnError as error:
-            raise _Refused(
-                f"could not start {run_task.display_id} — {error}.",
-                failure=type(error).__name__,
-            ) from error
->>>>>>> origin/dalton/main
 
         logger.info(
             "Workflow run started",

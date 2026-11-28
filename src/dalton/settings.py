@@ -2101,14 +2101,6 @@ def get_stop_backup_close_timeout_s() -> float:
     )
 
 
-<<<<<<< HEAD
-BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH = (
-    "plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx"
-)
-WORKSPACE_CUSTOM_MODEL_TEMPLATE_RELPATH = (
-    ".agents/modeling_cache/custom_default_template.xlsx"
-)
-=======
 def _parse_bool_env_or_section_yaml(
     env_var: str, section: str, yaml_key: str, default: bool = True
 ) -> bool:
@@ -2191,7 +2183,14 @@ def is_near_empty_retry_enabled() -> bool:
         "near_empty_retry_enabled",
         default=True,
     )
->>>>>>> origin/dalton/main
+
+
+BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH = (
+    "plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx"
+)
+WORKSPACE_CUSTOM_MODEL_TEMPLATE_RELPATH = (
+    ".agents/modeling_cache/custom_default_template.xlsx"
+)
 
 
 def get_dalton_model_default_template_path() -> str:

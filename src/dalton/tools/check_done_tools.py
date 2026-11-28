@@ -1154,7 +1154,6 @@ async def _latest_run_dir(
     return best_dir
 
 
-<<<<<<< HEAD
 async def _resolve_located_run_dir(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> tuple[str | None, str | None]:
@@ -1260,7 +1259,9 @@ async def _run_args_doc(
     if run_dir is None:
         return None
     doc, _args_err = await _read_run_args_checked(backend, run_dir)
-=======
+    return doc
+
+
 def _parse_run_dir_identity(run_dir: str | None) -> tuple[str | None, str | None]:
     """Extract ``(short_thread_id, run_id)`` from ``.agents/threads/<short>/workflows/<run_id>``."""
     if not isinstance(run_dir, str) or not run_dir:
@@ -1371,7 +1372,6 @@ async def _load_run_args(
     doc, _ = await _load_run_args_with_dir(
         backend, workflow, run_id, thread_id, allow_missing_status=True
     )
->>>>>>> origin/dalton/main
     return doc
 
 
@@ -1386,18 +1386,12 @@ async def _run_args_as_of(
     the run's artifacts are keyed on. An unreadable record inherits nothing;
     the missing-parameter check then names the gap honestly.
     """
-<<<<<<< HEAD
-    doc = await _run_args_doc(backend, workflow, run_id, thread_id)
-    if not doc:
-=======
     doc = await _load_run_args(backend, workflow, run_id, thread_id)
     if not isinstance(doc, dict):
->>>>>>> origin/dalton/main
         return None
     as_of = doc.get("as_of")
     if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
         return as_of.strip()
-<<<<<<< HEAD
     return None
 
 
@@ -1412,8 +1406,6 @@ async def _run_args_model_path(
     model_path = doc.get("model_path")
     if isinstance(model_path, str) and model_path.strip():
         return model_path.strip()
-=======
->>>>>>> origin/dalton/main
     return None
 
 
@@ -4413,7 +4405,7 @@ async def run_check_done(
 
     try:
         contract = load_contract(workflow)
-        run_args, resolved_run_dir = (
+        signed_run_args, resolved_run_dir = (
             await _load_run_args_with_dir(backend, workflow, run_id, thread_id)
             if backend is not None
             else (None, None)
@@ -4424,7 +4416,7 @@ async def run_check_done(
         # passes check_done while forged/tampered decisions are rejected.
         contract = _apply_run_internal_memory_decision(
             contract,
-            run_args,
+            signed_run_args,
             run_dir=resolved_run_dir,
             run_id=run_id,
             thread_id=thread_id,
@@ -4449,16 +4441,10 @@ async def run_check_done(
                 run_args, args_err = await _read_run_args_checked(
                     backend, located_run_dir
                 )
-            elif (
-                workflow != "earnings-deep-update"
-                and isinstance(run_id, str)
-                and run_id.strip()
-                and thread_id
-            ):
-                # Legacy non-deep tests that write args.json without status.json
-                run_args, _ = await _read_run_args_checked(
-                    backend, f"{_thread_prefix(thread_id)}{run_id.strip()}"
-                )
+            elif workflow != "earnings-deep-update":
+                # Non-deep runs whose status.json was not written still inherit
+                # launch args (while a present mismatching status.json stays rejected).
+                run_args = await _load_run_args(backend, workflow, run_id, thread_id)
 
             current = params.get("as_of")
             if not (
@@ -4466,13 +4452,6 @@ async def run_check_done(
                 and current.strip()
                 and current.strip() != "latest"
             ):
-<<<<<<< HEAD
-                inherited = None
-                if isinstance(run_args, dict):
-                    raw_as_of = run_args.get("as_of")
-                    if isinstance(raw_as_of, str) and raw_as_of.strip() and raw_as_of.strip() != "latest":
-                        inherited = raw_as_of.strip()
-=======
                 inherited = (
                     run_args.get("as_of").strip()
                     if isinstance(run_args, dict)
@@ -4481,7 +4460,6 @@ async def run_check_done(
                     and run_args.get("as_of").strip() != "latest"
                     else None
                 )
->>>>>>> origin/dalton/main
                 if inherited:
                     params = {**params, "as_of": inherited}
             deep_args_valid = True
