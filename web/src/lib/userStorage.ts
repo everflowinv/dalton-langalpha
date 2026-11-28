@@ -48,8 +48,8 @@ export function subscribeStorageUser(listener: () => void): () => void {
  * client, a platform build without its Supabase env included.
  */
 function currentUser(): string | null {
-  // DALTON-HOOK(dalton-auth): scope storage by signed-in user when Dalton auth is enabled
-  return (isPlatformMode || isDaltonAuth) && hasAuthEnv ? platformUser : LOCAL_USER_ID;
+  // DALTON-HOOK(dalton-auth): scope storage by signed-in user for both Supabase auth and local auth (which has no Supabase env)
+  return (isPlatformMode && hasAuthEnv) || isDaltonAuth ? platformUser : LOCAL_USER_ID;
 }
 
 /**

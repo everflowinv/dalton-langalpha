@@ -33,6 +33,8 @@ export interface HtmlWidgetData {
   title: string;
   /** Inline data file contents — injected as window.__WIDGET_DATA__ in the iframe. */
   data?: Record<string, string>;
+  // DALTON-HOOK(channel-deep-links): persistent widget id shared across live push, replay, deep links, and widgetStorage
+  widget_id?: string;
   // DALTON-HOOK(share-redaction): static redacted placeholder marker for allow_files=false shared replays
   redacted?: boolean;
 }

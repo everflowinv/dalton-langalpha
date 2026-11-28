@@ -44,11 +44,13 @@ describe('memoState', () => {
 });
 
 describe('resolveFileView', () => {
-  it('gives a memo its four views, a former memo its record, a plain file its document', () => {
+  it('gives a memo its four views, and a former memo or plain file its record and version deep links', () => {
     expect(resolveFileView(file(mark()), at({ tab: 'who' }), false).view).toBe('who');
     expect(resolveFileView(file(mark({ marked: false })), at({ tab: 'record' }), false).view).toBe('record');
     expect(resolveFileView(file(mark({ marked: false })), at({ tab: 'changes' }), false).view).toBe('document');
-    expect(resolveFileView(file(null), at({ tab: 'record', version: 2 }), false)).toEqual({ view: 'document', version: null, against: null });
+    expect(resolveFileView(file(null), at({ tab: 'record', version: 2 }), false)).toEqual({ view: 'record', version: null, against: null });
+    expect(resolveFileView(file(null), at({ version: 2 }), false)).toEqual({ view: 'document', version: 2, against: null });
+    expect(resolveFileView(file(null), at({ tab: 'changes', version: 2, against: 1 }), false)).toEqual({ view: 'document', version: 2, against: null });
   });
 
   it('opens an old history link on a former memo at its record', () => {

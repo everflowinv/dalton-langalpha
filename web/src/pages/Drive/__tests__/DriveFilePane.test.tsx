@@ -11,7 +11,7 @@ import type { MemoTab } from '@/lib/driveLinks';
 import type { DriveEntry, DriveVersion } from '@/types/drive';
 import { getRecord } from '@/api/drive';
 import { DriveFilePane } from '../components/DriveFilePane';
-import { memoState, resolveFileView, type FileAddress } from '../memoMarks';
+import { resolveFileView, type FileAddress } from '../memoMarks';
 import { driveBodyKey } from '../driveBody';
 import { DriveContext, type DriveContextValue } from '../driveContext';
 import type { DriveActions } from '../useDriveActions';
@@ -85,7 +85,7 @@ function Pane({ file, at, editor, ...rest }: Omit<React.ComponentProps<typeof Dr
   file: DriveEntry;
   at: FileAddress;
 }) {
-  const versions = useDriveVersions(SPACE, file.id, memoState(file).kind !== 'plain');
+  const versions = useDriveVersions(SPACE, file.id, true);
   const fileView = resolveFileView(file, at, !!editor.session, versions.data?.versions.map((v) => v.seq));
   return <DriveFilePane path={file.path} entry={file} entryError={null} onRetry={vi.fn()} fileView={fileView} versions={versions} editor={editor} {...rest} />;
 }
@@ -159,9 +159,21 @@ describe('DriveFilePane', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
-  it('opens the record tab on an ordinary file (an old history link) as the file itself', () => {
+  it('opens the record tab (history list) and past versions with Restore on an ordinary file', async () => {
     renderPane(viewing, null, { file: plain, tab: 'record' });
-    expect(screen.getByTestId('viewer')).toHaveTextContent('v2 text');
+    expect(await screen.findByRole('list', { name: 'Record' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Back to the file' })).toBeInTheDocument();
+  });
+
+  it('shows a plain file past version deep link in place of the head, with Restore and Back to current', () => {
+    const { go, actions } = renderPane(viewing, 1, { file: plain });
+    expect(screen.getByText(/^Version 1,/)).toBeInTheDocument();
+    expect(screen.getByTestId('viewer')).toHaveTextContent('v1 text');
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
+    expect(actions.restoreVersion).toHaveBeenCalledWith(plain, 1);
+    fireEvent.click(screen.getByRole('button', { name: 'Back to current' }));
+    expect(go).toHaveBeenCalledWith({ file: plain.path, tab: null, version: null, against: null });
   });
 
   it("opens a memo's record tab", async () => {

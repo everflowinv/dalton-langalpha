@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Plus, Layers, Search, MessageSquare, AlertTriangle, RefreshCw, Sliders } from 'lucide-react';
+import { SidebarReveal } from '@/components/Sidebar/SidebarReveal';
 import type { ComposerScope } from '@/components/ui/chat-input.types';
 import type { Workspace } from '@/types/api';
 import { useToast } from '@/components/ui/use-toast';
@@ -412,6 +413,7 @@ export function WatchlistWorkspace({
           style={{ borderColor: 'var(--color-border-muted)' }}
         >
           <div className="flex flex-wrap items-center gap-1.5">
+            <SidebarReveal titlebar />
             <h2 className="text-sm font-semibold mr-2" style={{ color: 'var(--color-text-primary)' }}>
               {t('marketView:watchlist.title')}
             </h2>

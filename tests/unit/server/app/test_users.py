@@ -2223,28 +2223,7 @@ async def test_delete_preferences_preserves_data_task_routes_for_primary_admin_o
         system_jobs_mod, "record_auto_pruned_data_task_routes", audit_mock
     )
 
-    locked_with_notify = {
-        "model_preference": {
-            "preferred_model": "gpt-5",
-            "dalton_notify_enabled": True,
-            "dalton_notify_targets": ["feishu:user:ou_me_1"],
-            "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
-            "dalton_notify_overrides": {"Morning Macro Digest": False},
-            "dalton_notify_routes": {
-                "data:cn-leverage-daily": ["feishu:chat:oc_grp1"],
-                "automation:a-1": ["feishu:user:ou_me_1"],
-            },
-            "dalton_notify_extra_flag": "kept",
-        },
-        "risk_preference": {"risk_level": "moderate"},
-        "investment_preference": {"markets": ["us"]},
-        "agent_preference": {"tone": "terse"},
-        "other_preference": {"search_provider": "tavily"},
-    }
     get_user_mock = create_autospec(users_mod.db_get_user, return_value=_user())
-    lock_prefs_mock = create_autospec(
-        user_db_mod.lock_user_preferences, return_value=locked_with_notify
-    )
     upsert_mock = create_autospec(
         users_mod.upsert_user_preferences, return_value=_prefs()
     )
@@ -2255,9 +2234,11 @@ async def test_delete_preferences_preserves_data_task_routes_for_primary_admin_o
         users_mod.db_update_user, return_value=_user()
     )
 
+    # Primary admin delegates to the shared `db_delete_user_preferences` reset with
+    # `preserve_dalton_notify=True`, keeping both model settings and `dalton_notify*`
+    # keys in one transaction without writing an audit entry or calling upsert.
     with (
         patch.object(users_mod, "db_get_user", new=get_user_mock),
-        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_mock),
         patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
         patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
         patch.object(users_mod, "db_update_user", new=update_user_mock),
@@ -2265,71 +2246,20 @@ async def test_delete_preferences_preserves_data_task_routes_for_primary_admin_o
         resp = await client.delete("/api/v1/users/me/preferences")
 
     assert resp.status_code == 200
-    lock_prefs_mock.assert_awaited_once()
-    upsert_mock.assert_awaited_once()
-    assert (
-        upsert_mock.await_args.kwargs["conn"]
-        is lock_prefs_mock.await_args.kwargs["conn"]
+    delete_mock.assert_awaited_once_with(
+        "test-user-123",
+        keep_overrides=users_mod.granted_override_keys(),
+        preserve_dalton_notify=True,
     )
-    assert upsert_mock.await_args.kwargs["conn"] is not None
-    assert upsert_mock.await_args.kwargs["replace"] is True
-    assert upsert_mock.await_args.kwargs["risk_preference"] == {}
-    assert upsert_mock.await_args.kwargs["investment_preference"] == {}
-    assert upsert_mock.await_args.kwargs["agent_preference"] == {}
-    assert upsert_mock.await_args.kwargs["other_preference"] == {}
-    assert upsert_mock.await_args.kwargs["model_preference"] == {
-        "dalton_notify_enabled": True,
-        "dalton_notify_targets": ["feishu:user:ou_me_1"],
-        "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
-        "dalton_notify_overrides": {"Morning Macro Digest": False},
-        "dalton_notify_routes": {
-            "data:cn-leverage-daily": ["feishu:chat:oc_grp1"],
-            "automation:a-1": ["feishu:user:ou_me_1"],
-        },
-        "dalton_notify_extra_flag": "kept",
-    }
-    delete_mock.assert_not_awaited()
-    audit_mock.assert_not_awaited()
-
-    # Primary admin with NO `dalton_notify*` keys deletes the row in the same
-    # transaction and lock (passing the exact same `conn` to `db_delete_user_preferences`).
-    locked_without_notify = {
-        "model_preference": {"preferred_model": "gpt-5"},
-        "risk_preference": {"risk_level": "moderate"},
-        "other_preference": {},
-    }
-    lock_prefs_empty_mock = create_autospec(
-        user_db_mod.lock_user_preferences, return_value=locked_without_notify
-    )
-    upsert_mock.reset_mock()
-    delete_mock.reset_mock()
-    with (
-        patch.object(users_mod, "db_get_user", new=get_user_mock),
-        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_empty_mock),
-        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
-        patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
-        patch.object(users_mod, "db_update_user", new=update_user_mock),
-    ):
-        resp_empty_pm = await client.delete("/api/v1/users/me/preferences")
-
-    assert resp_empty_pm.status_code == 200
-    lock_prefs_empty_mock.assert_awaited_once()
-    delete_mock.assert_awaited_once()
-    assert (
-        delete_mock.await_args.kwargs["conn"]
-        is lock_prefs_empty_mock.await_args.kwargs["conn"]
-    )
-    assert delete_mock.await_args.kwargs["conn"] is not None
     upsert_mock.assert_not_awaited()
     audit_mock.assert_not_awaited()
 
-    # Non-primary-admin user deletes preferences row normally
+    # Non-primary-admin user calls the exact same reset function without preserve_dalton_notify
     monkeypatch.setenv("DALTON_PM_USER_IDS", "other-primary-admin")
     upsert_mock.reset_mock()
     delete_mock.reset_mock()
     with (
         patch.object(users_mod, "db_get_user", new=get_user_mock),
-        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_mock),
         patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
         patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
         patch.object(users_mod, "db_update_user", new=update_user_mock),

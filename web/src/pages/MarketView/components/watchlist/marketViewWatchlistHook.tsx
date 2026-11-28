@@ -21,7 +21,7 @@ export function shouldShowDaltonWatchlist(searchParams: URLSearchParams): boolea
 }
 
 export function shouldConsumeMarketRouteParam(key: string): boolean {
-  if (key === 'thread' || key === 'symbol') return false;
+  if (key === 'thread' || key === 'symbol' || key === 'ws' || key === 'returnTo') return false;
   if (isDaltonBuild && key === 'tf') return false;
   return true;
 }
@@ -94,8 +94,12 @@ export function navigateDaltonChartJump(
   timeframe: string | undefined,
   fromWatchlistView: boolean,
   locationState?: unknown,
+  currentSearchParams?: URLSearchParams,
 ): void {
   if (!isDaltonBuild) return;
+  const currentRoute = !fromWatchlistView && currentSearchParams
+    ? readMarketViewRoute(currentSearchParams)
+    : null;
   const nextState = fromWatchlistView
     ? {
         ...(locationState && typeof locationState === 'object'
@@ -108,6 +112,8 @@ export function navigateDaltonChartJump(
     buildMarketViewUrl({
       symbol,
       ...(timeframe ? { timeframe } : {}),
+      ...(currentRoute?.workspaceId ? { workspaceId: currentRoute.workspaceId } : {}),
+      ...(currentRoute?.returnTo ? { returnTo: currentRoute.returnTo } : {}),
     }),
     {
       replace: !fromWatchlistView,

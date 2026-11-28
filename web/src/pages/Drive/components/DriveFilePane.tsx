@@ -147,11 +147,12 @@ export function DriveFilePane({ path, entry, entryError, onRetry, fileView, vers
       </DriveBar>,
     );
   }
-  if (!session && entry && state.kind !== 'memo' && view === 'document') bars.push(<UndoSave key="undo" entry={entry} />);
-  if (entry && state.kind === 'former' && view === 'record') {
+  if (!session && entry && state.kind !== 'memo' && view === 'document' && !viewed) bars.push(<UndoSave key="undo" entry={entry} />);
+  // DALTON-HOOK(drive-long-history): show Back to file bar when viewing history record of a plain file or former memo.
+  if (entry && state.kind !== 'memo' && view === 'record') {
     bars.push(
       <DriveBar key="was-memo" role="status" actions={<HeaderButton variant="ghost" onClick={() => goTo({ view: 'document' })}>{t('drive:record.backToFile')}</HeaderButton>}>
-        {t('drive:record.wasMemo')}
+        {state.kind === 'former' ? t('drive:record.wasMemo') : t('drive:memo.tabs.record')}
       </DriveBar>,
     );
   }

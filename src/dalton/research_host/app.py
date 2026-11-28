@@ -371,6 +371,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        from src.server.utils.child_fds import keep_descriptors_from_children
+
+        keep_descriptors_from_children()
         yield
         await rt.shutdown()
 

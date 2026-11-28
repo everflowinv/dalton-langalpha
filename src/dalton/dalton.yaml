@@ -36,11 +36,6 @@ problem_reports:
 widget_render:
   enabled: false
 
-# uvloop 事件循环开关（上游 #883）。默认关闭（Everflow 与核心安装均默认 false）：
-# 关闭时 server.py 保持标准 asyncio 事件循环。
-uvloop:
-  enabled: false
-
 # 覆盖单元登记表（d023/d041）：关闭时工作区覆盖身份仅走兼容规则；
 # 默认开启，注册到工作区的 active 单元优先于兼容规则，并通过 d041 保持团队唯一。
 coverage_units:

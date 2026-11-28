@@ -1,13 +1,45 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { setStorageUser } from '@/lib/userStorage';
-import { loadHistory, savedFrontTabPath, saveHistory } from '../pageTabsStorage'; // DALTON-HOOK(channel-links): also test savedFrontTabPath open-redirect rejection
 
-// A platform build, where storage is keyed by the signed-in account.
-vi.mock('@/config/hostMode', async (original) => ({ ...(await original<object>()), isPlatformMode: true }));
-vi.mock('@/config/localUser', async (original) => ({ ...(await original<object>()), hasAuthEnv: true }));
+const authMode = vi.hoisted(() => ({
+  platform: true,
+  authEnv: true,
+  daltonAuth: false,
+  daltonLocalAuth: false,
+}));
+
+// A platform build by default, where storage is keyed by the signed-in account.
+vi.mock('@/config/hostMode', async (original) => ({
+  ...(await original<object>()),
+  get isPlatformMode() { return authMode.platform; },
+}));
+vi.mock('@/config/localUser', async (original) => ({
+  ...(await original<object>()),
+  LOCAL_USER_ID: 'local-dev-user',
+  get hasAuthEnv() { return authMode.authEnv; },
+}));
+vi.mock('@/config/daltonAuth', async (original) => ({
+  ...(await original<object>()),
+  get isDaltonAuth() { return authMode.daltonAuth; },
+  get isDaltonLocalAuth() { return authMode.daltonLocalAuth; },
+}));
+
+import { setStorageUser, storageUser } from '@/lib/userStorage';
+import {
+  loadHistory,
+  loadTabs,
+  savedFrontTabPath,
+  saveHistory,
+  saveTabs,
+  tabsRecord,
+} from '../pageTabsStorage'; // DALTON-HOOK(channel-links): also test savedFrontTabPath open-redirect rejection
 
 beforeEach(() => {
+  localStorage.clear();
   sessionStorage.clear();
+  authMode.platform = true;
+  authMode.authEnv = true;
+  authMode.daltonAuth = false;
+  authMode.daltonLocalAuth = false;
   setStorageUser('u1');
 });
 afterEach(() => setStorageUser(null));
@@ -65,5 +97,67 @@ describe("the tabs' history kept across a reload", () => {
     }));
     expect(savedFrontTabPath('u1')).toBeNull();
     localStorage.removeItem('user:u1:app-page-tabs');
+  });
+
+  // DALTON-HOOK(dalton-auth): isolate page tabs per local account and discard legacy shared local-dev-user tabs
+  it('isolates page tabs across two local-auth accounts and discards legacy shared local-dev-user tabs', () => {
+    authMode.platform = false;
+    authMode.authEnv = false;
+    authMode.daltonAuth = true;
+    authMode.daltonLocalAuth = true;
+
+    // Seed legacy tabs written to the shared local-dev-user key by an earlier build.
+    localStorage.setItem('user:local-dev-user:app-page-tabs', JSON.stringify({
+      activeId: 'legacy-1',
+      tabs: [{ id: 'legacy-1', path: '/chat/t/private-legacy-thread', title: 'Secret Legacy Thread' }],
+    }));
+    sessionStorage.setItem('user:local-dev-user:app-page-tab-history', JSON.stringify({
+      owners: { k0: 'legacy-1' },
+      closed: [{ tab: { id: 'legacy-1', path: '/chat/t/private-legacy-thread', title: 'Secret Legacy Thread' }, index: 0 }],
+    }));
+
+    // Account A logs in: must not see legacy shared tabs, and legacy shared keys are discarded.
+    setStorageUser('acct-a');
+    expect(storageUser()).toBe('acct-a');
+    const aInitial = loadTabs('/home', storageUser());
+    expect(aInitial.tabs.map((t) => t.path)).toEqual(['/home']);
+    expect(localStorage.getItem('user:local-dev-user:app-page-tabs')).toBeNull();
+    expect(sessionStorage.getItem('user:local-dev-user:app-page-tab-history')).toBeNull();
+    expect(loadHistory().closed).toEqual([]);
+
+    // Account A saves a private thread tab.
+    saveTabs(tabsRecord({
+      activeId: 'tab-a',
+      tabs: [{ id: 'tab-a', path: '/chat/t/acct-a-secret', title: 'Account A Secret' }],
+    }));
+    saveHistory({
+      owners: { ka: 'tab-a' },
+      closed: [{ tab: { id: 'tab-a-closed', path: '/chat/t/acct-a-closed', title: 'A Closed' }, index: 0 }],
+    });
+    expect(localStorage.getItem('user:local-dev-user:app-page-tabs')).toBeNull();
+    expect(savedFrontTabPath(storageUser())).toBe('/chat/t/acct-a-secret');
+
+    // Switch to Account B: must NOT see Account A's private thread tabs or closed history.
+    setStorageUser(null);
+    setStorageUser('acct-b');
+    expect(storageUser()).toBe('acct-b');
+    const bInitial = loadTabs('/home', storageUser());
+    expect(bInitial.tabs.map((t) => t.path)).toEqual(['/home']);
+    expect(savedFrontTabPath(storageUser())).toBeNull();
+    expect(loadHistory().closed).toEqual([]);
+
+    // Account B saves its own tab.
+    saveTabs(tabsRecord({
+      activeId: 'tab-b',
+      tabs: [{ id: 'tab-b', path: '/chat/t/acct-b-thread', title: 'Account B Thread' }],
+    }));
+
+    // Switch back to Account A: sees only Account A's own tab, never Account B's.
+    setStorageUser('acct-a');
+    const aRestored = loadTabs('/home', storageUser());
+    expect(aRestored.tabs).toEqual([
+      { id: 'tab-a', path: '/chat/t/acct-a-secret', title: 'Account A Secret' },
+    ]);
+    expect(savedFrontTabPath('local-dev-user')).toBeNull();
   });
 });

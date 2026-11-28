@@ -24,9 +24,6 @@ problem_reports:
 widget_render:
   enabled: false
 
-uvloop:
-  enabled: false
-
 coverage_units:
   enabled: true
 

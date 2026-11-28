@@ -1033,6 +1033,10 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
       if (payload.data) {
         widgetEntry.data = payload.data;
       }
+      // DALTON-HOOK(channel-deep-links): preserve ShowWidget's persistent widget_id for unified storage & deep-link identity
+      if (typeof payload.widget_id === 'string' && payload.widget_id.trim()) {
+        widgetEntry.widget_id = payload.widget_id.trim();
+      }
       // DALTON-HOOK(share-redaction): preserve redacted placeholder flag from strict shared replays
       if (payload.redacted === true) {
         widgetEntry.redacted = true;

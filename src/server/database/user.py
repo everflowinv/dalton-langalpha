@@ -872,6 +872,7 @@ async def delete_user_preferences(  # DALTON-HOOK(data-jobs): allow callers to d
     conn=None,
     *,
     keep_overrides: Collection[str] = (),
+    preserve_dalton_notify: bool = False,
 ) -> bool:
     """
     Delete a user's preferences, except their model settings, the
@@ -911,6 +912,13 @@ async def delete_user_preferences(  # DALTON-HOOK(data-jobs): allow callers to d
                 saved["feature_overrides"] = kept
             if other.get(ACCOUNT_SETUP_KEY) is not None:
                 saved[ACCOUNT_SETUP_KEY] = other[ACCOUNT_SETUP_KEY]
+            # DALTON-HOOK(data-jobs): preserve primary admin's `dalton_notify*` keys
+            # alongside model settings in the same transaction.
+            if preserve_dalton_notify:
+                model = dict(model)
+                for k, v in other.items():
+                    if isinstance(k, str) and k.strip().startswith("dalton_notify"):
+                        model.setdefault(k.strip(), v)
             if saved or model:
                 await cur.execute(
                     "INSERT INTO user_preferences (user_id, other_preference, model_preference)"

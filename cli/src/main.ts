@@ -1,5 +1,5 @@
 import { bind, type Command, flagList, GLOBAL, parseFor, select, synopsis } from "./commands/command.js";
-import { COMMANDS } from "./commands/index.js";
+import { availableCommands } from "./commands/index.js";
 import { resolveCredential } from "./credentials.js";
 import { CliError, Exit } from "./errors.js";
 import { Api, VERSION } from "./http.js";
@@ -18,10 +18,10 @@ function commandLines(commands: readonly Command[]): string {
     .join("\n");
 }
 
-function help(): string {
+function help(commands: readonly Command[]): string {
   // One-word commands (login, logout, whoami) stand together.
   const group = (c: Command) => (c.words.length > 1 ? c.words[0] : "");
-  const groups = [...new Set(COMMANDS.map(group))].map((g) => commandLines(COMMANDS.filter((c) => group(c) === g)));
+  const groups = [...new Set(commands.map(group))].map((g) => commandLines(commands.filter((c) => group(c) === g)));
   return `langalpha ${VERSION}: LangAlpha from the command line
 
 Usage: ${CLI_NAME} <command> [options]          ${CLI_NAME} <command> --help shows its options
@@ -46,27 +46,28 @@ function commandHelp(c: Command): string {
 }
 
 /** No command matched: help when asked or when a group's commands are wanted. */
-function unmatched(words: readonly string[], asked: boolean): number {
+function unmatched(commands: readonly Command[], words: readonly string[], asked: boolean): number {
   if (words.length === 0 || words[0] === "help") {
-    process.stdout.write(help());
+    process.stdout.write(help(commands));
     return words.length || asked ? Exit.ok : Exit.usage;
   }
-  const group = COMMANDS.filter((c) => c.words[0] === words[0]);
+  const group = commands.filter((c) => c.words[0] === words[0]);
   asked ||= words.includes("--help") || words.includes("-h");
   if (group.length && (words.length === 1 || words[1]!.startsWith("-"))) {
     (asked ? process.stdout : process.stderr).write(`${commandLines(group)}\n`);
     return asked ? Exit.ok : Exit.usage;
   }
   const named = words.slice(0, group.length ? 2 : 1).join(" ");
-  process.stderr.write(`Unknown command: ${printable(named)}\n\n${group.length ? `${commandLines(group)}\n` : help()}`);
+  process.stderr.write(`Unknown command: ${printable(named)}\n\n${group.length ? `${commandLines(group)}\n` : help(commands)}`);
   return Exit.usage;
 }
 
-export async function main(argv: string[]): Promise<number> {
+export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   let json = argv.includes("--json");
   let command: Command | undefined;
   try {
-    const selection = select(COMMANDS, argv);
+    const commands = availableCommands(env);
+    const selection = select(commands, argv);
     command = selection.command;
     const parsed = parseFor(command, selection.rest);
     const { values } = parsed;
@@ -75,7 +76,7 @@ export async function main(argv: string[]): Promise<number> {
       process.stdout.write(`${VERSION}\n`);
       return Exit.ok;
     }
-    if (!command) return unmatched(selection.words, values.has("help"));
+    if (!command) return unmatched(commands, selection.words, values.has("help"));
     if (values.has("help")) {
       process.stdout.write(commandHelp(command));
       return Exit.ok;

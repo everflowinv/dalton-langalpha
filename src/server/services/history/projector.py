@@ -475,13 +475,6 @@ def _derive_artifact(
         artifact_id = tool_call_id
         if artifact_type == "preview_url" and tool_artifact.get("port") is not None:
             artifact_id = f"preview_{tool_artifact['port']}"
-        # DALTON-HOOK(channel-deep-links): preserve ShowWidget's persisted widget_id across checkpoint replay
-        elif (
-            artifact_type == "html_widget"
-            and isinstance(tool_artifact.get("widget_id"), str)
-            and tool_artifact["widget_id"].strip()
-        ):
-            artifact_id = tool_artifact["widget_id"].strip()
         return {
             "artifact_type": artifact_type,
             "artifact_id": artifact_id,

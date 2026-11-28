@@ -82,9 +82,10 @@ export function resolveFileView(entry: DriveEntry | undefined, at: FileAddress, 
   const state = memoState(entry);
   const head = entry?.version ?? null;
   let view: MemoView = 'document';
+  // DALTON-HOOK(drive-long-history): ordinary files retain long history, so they also open their record and version deep links.
   if (!editing && state.kind === 'memo') view = at.tab ?? 'document';
-  else if (!editing && state.kind === 'former' && at.tab === 'record') view = 'record';
-  const named = state.kind !== 'plain' && at.version !== head ? at.version : null;
+  else if (!editing && at.tab === 'record') view = 'record';
+  const named = at.version !== head ? at.version : null;
   const version = view === 'document' || view === 'changes' ? named : null;
   const shown = version ?? head;
   const comparable = at.against !== null && at.against !== shown && (!kept || kept.includes(at.against));

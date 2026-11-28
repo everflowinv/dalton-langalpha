@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type React from 'react';
@@ -128,7 +128,13 @@ const mocks = vi.hoisted(() => ({
     pending_symbols: [],
     as_of: '2026-11-26T10:00:00Z',
   },
-  capturedChatProps: [] as Array<{ watchlistContext?: string | null; scope: string; symbol: string }>,
+  capturedChatProps: [] as Array<{
+    watchlistContext?: string | null;
+    scope: string;
+    symbol: string;
+    activeWorkspaceId?: string | null;
+    onReturnToChat?: () => void;
+  }>,
   activeWorkspaceObj: { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false } as Record<string, unknown>,
   isColleague: false,
   previewMutateMock: vi.fn(),
@@ -240,11 +246,19 @@ vi.mock('../components/MarketChart', () => ({
   ),
 }));
 vi.mock('../components/MarketChatPanel', () => ({
-  default: (props: { watchlistContext?: string | null; scope: string; symbol: string; onReturnToChat?: () => void }) => {
+  default: (props: {
+    watchlistContext?: string | null;
+    scope: string;
+    symbol: string;
+    activeWorkspaceId?: string | null;
+    onReturnToChat?: () => void;
+  }) => {
     mocks.capturedChatProps.push({
       watchlistContext: props.watchlistContext,
       scope: props.scope,
       symbol: props.symbol,
+      activeWorkspaceId: props.activeWorkspaceId,
+      onReturnToChat: props.onReturnToChat,
     });
     return (
       <div
@@ -275,14 +289,20 @@ vi.mock('../hooks/useStockData', () => ({
 }));
 vi.mock('../hooks/useStockQuoteModel', () => ({ useStockQuoteModel: () => ({}) }));
 vi.mock('../hooks/useChartLegendSlots', () => ({ useChartLegendSlots: () => ({ toolbarLead: null }) }));
-vi.mock('../hooks/useRestoredWorkspace', () => ({
-  useRestoredWorkspace: ({ linkedId }: { linkedId?: string | null }) => ({
-    selectedWorkspaceId: linkedId || 'ws-1',
-    pending: false,
-    select: vi.fn(),
-    workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }],
-  }),
-}));
+vi.mock('../hooks/useRestoredWorkspace', async () => {
+  const { useState } = await import('react');
+  return {
+    useRestoredWorkspace: ({ linkedId }: { linkedId?: string | null }) => {
+      const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(linkedId || 'ws-1');
+      return {
+        selectedWorkspaceId,
+        pending: false,
+        select: setSelectedWorkspaceId,
+        workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }],
+      };
+    },
+  };
+});
 vi.mock('@/hooks/useWorkspaces', () => ({
   useWorkspaces: () => ({
     data: { workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }], total: 1 },
@@ -297,6 +317,7 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => ({
   getHomeWorkspace: vi.fn().mockResolvedValue({ workspace_id: 'home-ws', status: 'running', is_home: true }),
 }));
 
+import { SidebarRevealContext } from '@/components/Sidebar/sidebarRevealContext';
 import MarketView from '../MarketView';
 import { savePref } from '../utils/prefs';
 
@@ -385,8 +406,8 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     expect(screen.getByTestId('loc-display').textContent).toBe('/market?symbol=NVDA');
   });
 
-  it('preserves symbol, tf, and thread while consuming ws and returnTo on deep-link', async () => {
-    renderAt(['/market?symbol=NVDA&tf=1hour&ws=ws-7&thread=th-9&returnTo=/chat/t/th-9']);
+  it('preserves symbol, tf, ws, thread, and returnTo while consuming one-shot comment param on deep-link', async () => {
+    renderAt(['/market?symbol=NVDA&tf=1hour&ws=ws-7&thread=th-9&returnTo=/chat/t/th-9&comment=c-1']);
 
     await waitFor(() => {
       expect(screen.getByTestId('market-chart')).toBeTruthy();
@@ -400,8 +421,9 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
       expect(locText).toContain('symbol=NVDA');
       expect(locText).toContain('tf=1hour');
       expect(locText).toContain('thread=th-9');
-      expect(locText).not.toContain('ws=');
-      expect(locText).not.toContain('returnTo=');
+      expect(locText).toContain('ws=ws-7');
+      expect(locText).toContain('returnTo=%2Fchat%2Ft%2Fth-9');
+      expect(locText).not.toContain('comment=');
     });
   });
 
@@ -1615,5 +1637,87 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     expect(mvPriceCell.querySelector('.dash-ext')).toBeNull();
     unmountDash();
     unmountMv();
+  });
+
+  it('renders SidebarReveal in the watchlist toolbar when the sidebar is hidden', async () => {
+    const onToggle = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.workspaces.home(), { workspace_id: 'home-ws', is_home: true });
+    qc.setQueryData(['portfolioHoldings'], [{ symbol: 'NVDA' }]);
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarRevealContext.Provider value={{ onToggle, hover: undefined }}>
+          <MemoryRouter initialEntries={['/market']}>
+            <Routes>
+              <Route path="/market" element={<MarketView />} />
+            </Routes>
+          </MemoryRouter>
+        </SidebarRevealContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    const workspace = await screen.findByTestId('watchlist-workspace');
+    const toggleBtn = workspace.querySelector('.sidebar-reveal button') as HTMLButtonElement | null;
+    expect(toggleBtn).not.toBeNull();
+    fireEvent.click(toggleBtn!);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps ws and returnTo in tab URLs and restores each tab workspace and return path when switching tabs', async () => {
+    const tab1 = '/market?symbol=AAPL&ws=ws-alpha&returnTo=%2Fchat%2Ft%2Fthread-alpha';
+    const tab2 = '/market?symbol=NVDA&ws=ws-beta&returnTo=%2Fchat%2Ft%2Fthread-beta';
+
+    function TabSwitcher() {
+      const nav = useNavigate();
+      return (
+        <div>
+          <button type="button" data-testid="switch-tab-1" onClick={() => nav(tab1)}>tab1</button>
+          <button type="button" data-testid="switch-tab-2" onClick={() => nav(tab2)}>tab2</button>
+        </div>
+      );
+    }
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(queryKeys.workspaces.home(), { workspace_id: 'home-ws', is_home: true });
+    qc.setQueryData(['portfolioHoldings'], [{ symbol: 'NVDA' }]);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[tab1]}>
+          <LocationProbe />
+          <TabSwitcher />
+          <Routes>
+            <Route path="/market" element={<MarketView />} />
+            <Route path="/chat/*" element={<div data-testid="chat-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Tab 1 keeps ws and returnTo in the URL (never strips them).
+    await waitFor(() => {
+      const loc = screen.getByTestId('loc-display').textContent ?? '';
+      expect(loc).toContain('ws=ws-alpha');
+      expect(loc).toContain('returnTo=%2Fchat%2Ft%2Fthread-alpha');
+    });
+    expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-alpha');
+
+    // Switch to Tab 2: URL and chat panel move to ws-beta + thread-beta.
+    fireEvent.click(screen.getByTestId('switch-tab-2'));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-beta');
+    });
+    expect(screen.getByTestId('loc-display').textContent).toContain('ws=ws-beta');
+
+    // Switch back to Tab 1: restores ws-alpha and /chat/t/thread-alpha (not stuck on Tab 2!).
+    fireEvent.click(screen.getByTestId('switch-tab-1'));
+    await waitFor(() => {
+      expect(mocks.capturedChatProps.at(-1)?.activeWorkspaceId).toBe('ws-alpha');
+    });
+    const onReturn = mocks.capturedChatProps.at(-1)?.onReturnToChat as (() => void) | undefined;
+    expect(typeof onReturn).toBe('function');
+    act(() => { onReturn!(); });
+    await waitFor(() => {
+      expect(screen.getByTestId('loc-display').textContent).toBe('/chat/t/thread-alpha');
+    });
   });
 });

@@ -1,6 +1,8 @@
 import * as z from 'zod/mini';
+import { isDaltonLocalAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): discard legacy shared local-dev-user tabs under local auth
+import { LOCAL_USER_ID } from '@/config/localUser';
 import { inAppPath } from '@/lib/inAppPath'; // DALTON-HOOK(channel-links): validate persisted tab paths with inAppPath
-import { getUserLocalItem, userLocalStorage, userSessionStorage } from '@/lib/userStorage';
+import { getUserLocalItem, removeUserLocalItem, userLocalStorage, userSessionStorage } from '@/lib/userStorage';
 import type { PageTab } from './pageTabsContext';
 
 // The tabs name threads and workspaces, so they are kept per user.
@@ -85,8 +87,19 @@ function readRecord(): unknown {
   return owners ? { owners: JSON.parse(owners) } : null;
 }
 
+function discardSharedLocalDevTabs(): void {
+  // DALTON-HOOK(dalton-auth): stop reading and purge tabs previously stored under the shared local-dev-user key in local-auth mode
+  if (!isDaltonLocalAuth) return;
+  removeUserLocalItem(LOCAL_USER_ID, STORAGE_KEY);
+  try {
+    sessionStorage.removeItem(`user:${LOCAL_USER_ID}:${HISTORY_KEY}`);
+    sessionStorage.removeItem(`user:${LOCAL_USER_ID}:${OWNERS_KEY}`);
+  } catch { /* blocked */ }
+}
+
 /** This browser tab's history of tabs, as last saved here. */
 export function loadHistory(): TabHistory {
+  discardSharedLocalDevTabs();
   try {
     const record = readRecord();
     const parsed = record ? historySchema.safeParse(record) : null;
@@ -136,7 +149,8 @@ export const newId = () => (crypto.randomUUID?.() ?? `${Date.now()}-${Math.rando
  *  unreadable. The account is an argument rather than whoever is signed in
  *  when it runs, so a caller reading it in render names what it depends on. */
 function readSaved(user: string | null): Tabs | null {
-  if (!user) return null;
+  discardSharedLocalDevTabs();
+  if (!user || (isDaltonLocalAuth && user === LOCAL_USER_ID)) return null;
   try {
     const raw = getUserLocalItem(user, STORAGE_KEY);
     const parsed = raw ? stateSchema.safeParse(JSON.parse(raw)) : null;

@@ -286,16 +286,6 @@ class DaltonWidgetRenderConfig(BaseModel):
     enabled: bool = False
 
 
-class DaltonUvloopConfig(BaseModel):
-    """Master flag for #883's uvloop uvicorn event loop.
-
-    Off (the default in both Everflow and Core): server.py runs uvicorn on the
-    standard asyncio loop unless explicitly opted in.
-    """
-
-    enabled: bool = False
-
-
 class DaltonCoverageUnitsConfig(BaseModel):
     """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
 
@@ -470,9 +460,6 @@ class DaltonConfig(BaseModel):
     )
     widget_render: DaltonWidgetRenderConfig = Field(
         default_factory=DaltonWidgetRenderConfig
-    )
-    uvloop: DaltonUvloopConfig = Field(
-        default_factory=DaltonUvloopConfig
     )
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
@@ -690,14 +677,6 @@ def is_widget_ssr_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().widget_render.enabled
-
-
-def is_uvloop_enabled() -> bool:
-    """Whether #883's uvloop event loop is enabled in server.py (default False)."""
-    env_flag = os.getenv("DALTON_UVLOOP_ENABLED")
-    if env_flag is not None:
-        return env_flag.strip().lower() in ("1", "true", "yes")
-    return get_dalton_config().uvloop.enabled
 
 
 def is_coverage_units_enabled() -> bool:

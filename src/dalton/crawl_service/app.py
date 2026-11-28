@@ -27,7 +27,8 @@ import logging
 import os
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -140,11 +141,21 @@ def create_app(
     gate = _LoopLocalGate(max(1, int(browser_concurrency)))
     margin = WORKER_WAIT_MARGIN_S if wait_margin_s is None else float(wait_margin_s)
 
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # uvloop spawns subprocesses without close_fds; mark listening sockets
+        # non-inheritable before any /fetch spawns a supervised reaper/worker.
+        from src.server.utils.child_fds import keep_descriptors_from_children
+
+        keep_descriptors_from_children()
+        yield
+
     app = FastAPI(
         title="dalton-crawl-service",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_lifespan,
     )
 
     @app.get("/health")

@@ -160,10 +160,12 @@ describe('Drive page: back from an open file, on a phone', () => {
     expect(await screen.findByTestId('editor')).toBeInTheDocument();
   });
 
-  it('drops a version and a tab from the address of a plain file', async () => {
+  it('drops memo-only tabs from a plain file address while keeping its version deep link and querying versions', async () => {
+    vi.mocked(listVersions).mockClear();
     vi.mocked(getEntry).mockResolvedValue({ ...file, memo: null } as never);
     setup('/drive?file=research%2Faapl.md&tab=changes&v=3&vs=1');
     vi.mocked(getEntry).mockResolvedValue({ ...file, memo: null } as never);
-    await vi.waitFor(() => expect(screen.getByTestId('where')).toHaveTextContent(/^\/drive\?file=research%2Faapl\.md$/));
+    await vi.waitFor(() => expect(screen.getByTestId('where')).toHaveTextContent(/^\/drive\?file=research%2Faapl\.md&v=3$/));
+    expect(listVersions).toHaveBeenCalledWith('personal', file.id);
   });
 });

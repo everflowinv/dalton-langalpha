@@ -613,6 +613,10 @@ export function handleHtmlWidget({ assistantMessageId, artifactType, artifactId,
       if (payload.data) {
         widgetEntry.data = payload.data;
       }
+      // DALTON-HOOK(channel-deep-links): preserve ShowWidget's persistent widget_id for unified storage & deep-link identity
+      if (typeof payload.widget_id === 'string' && payload.widget_id.trim()) {
+        widgetEntry.widget_id = payload.widget_id.trim();
+      }
       htmlWidgetProcesses[segmentId] = widgetEntry;
 
       // The artifact's id is its call's, so it takes the place of the

@@ -385,6 +385,55 @@ async def test_delete_user_preferences_keeps_model_settings(user_mock_db, mock_c
 
 
 @pytest.mark.asyncio
+async def test_delete_user_preferences_preserves_model_and_dalton_notify_together(
+    user_mock_db, mock_cursor
+):
+    """Primary admin reset keeps default/custom model settings, tuning, grants, AND dalton_notify* in one transaction."""
+    from src.server.database.user import delete_user_preferences
+
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchone.return_value = {
+        "other_preference": {
+            "theme": "dark",
+            "search_provider": "tavily",
+            "feature_overrides": {"claude_oauth": True, "market_watch": True},
+            "dalton_notify_legacy": "from-other",
+            "dalton_notify_enabled": False,
+        },
+        "model_preference": {
+            "preferred_model": "gpt-5",
+            "custom_providers": [{"name": "mine"}],
+            "reasoning_effort": "high",
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+        },
+    }
+
+    assert (
+        await delete_user_preferences(
+            "admin-1",
+            keep_overrides=["claude_oauth"],
+            preserve_dalton_notify=True,
+        )
+        is True
+    )
+    sql, params = mock_cursor.execute.call_args[0]
+    assert "INSERT INTO user_preferences" in sql
+    assert params[1].obj == {
+        "search_provider": "tavily",
+        "feature_overrides": {"claude_oauth": True},
+    }
+    assert params[2].obj == {
+        "preferred_model": "gpt-5",
+        "custom_providers": [{"name": "mine"}],
+        "reasoning_effort": "high",
+        "dalton_notify_enabled": True,
+        "dalton_notify_targets": ["feishu:user:ou_me_1"],
+        "dalton_notify_legacy": "from-other",
+    }
+
+
+@pytest.mark.asyncio
 async def test_delete_user_preferences_writes_nothing_back_without_a_kept_override(user_mock_db, mock_cursor):
     from src.server.database.user import delete_user_preferences
 

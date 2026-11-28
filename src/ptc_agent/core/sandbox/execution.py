@@ -300,6 +300,15 @@ def _job_env(
         env[_ALLOWED_SERVERS_ENV] = _allowed_servers_value(context.allowed_servers)
     if context.call_id:
         env[livefs_protocol.CALL_ENV] = context.call_id
+    # DALTON-HOOK(drive-kill-switch): advertise Drive / Drive-memo availability to sandbox `la` CLI
+    try:
+        from src.config.features import system_flag
+
+        _drive_on = bool(system_flag("drive").enabled)
+    except Exception:
+        _drive_on = False
+    env.setdefault("LANGALPHA_DRIVE_ENABLED", "1" if _drive_on else "0")
+    env.setdefault("LANGALPHA_DRIVE_MEMOS_ENABLED", "1" if _drive_on else "0")
     # DALTON-HOOK(sandbox-caller-identity): the calling turn's identity (set
     # around the code run, upstream of here) reaches the sandbox as plain env
     # vars, so the MCP client can stamp them on its bridge requests. A

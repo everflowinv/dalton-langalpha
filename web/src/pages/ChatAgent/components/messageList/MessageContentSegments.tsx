@@ -26,6 +26,7 @@ import TextMessageContent from '../TextMessageContent';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import WidgetBlock from '../viewers/WidgetBlock';
+import { widgetSegmentId } from '../../session/stream/widgetIds'; // DALTON-HOOK(channel-deep-links)
 import type { HtmlWidgetData } from '../../hooks/utils/types';
 import { renderNotification } from './notices';
 import { normalizeSubagentText } from './normalizeSubagentText';
@@ -458,11 +459,12 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           const { widgetId, preview } = block as HtmlWidgetRenderBlock;
           const widget = htmlWidgetProcesses[widgetId];
           if (!widget && !preview) return null;
-          // DALTON-HOOK(channel-deep-links): expose stable data-widget-id matching ShowWidget's persistent artifact_id
-          const rawWidgetId = (widget as (HtmlWidgetData & { widget_id?: string }) | undefined)?.widget_id ?? widgetId;
-          const deepLinkWidgetId = rawWidgetId?.startsWith('widget-')
-            ? rawWidgetId.slice('widget-'.length)
-            : rawWidgetId;
+          // DALTON-HOOK(channel-deep-links): preview matching uses call-based segment widgetId,
+          // while deep links and browser storage uniformly use ShowWidget's persistent widget_id.
+          const persistedId = widget?.widget_id?.trim() || null;
+          const deepLinkWidgetId = persistedId
+            ?? (widgetId.startsWith('widget-') ? widgetId.slice('widget-'.length) : widgetId);
+          const storageWidgetId = persistedId ? widgetSegmentId(persistedId) : widgetId;
           return (
             // Keep the widget's own margins inside a stable transcript block.
             // Otherwise the list's gap overrides them until the preceding fold hides,
@@ -474,7 +476,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               <WidgetBlock
                 widget={widget}
                 preview={preview}
-                widgetId={widgetId}
+                widgetId={storageWidgetId}
                 prompts={widgetPrompts}
                 exports={widgetExports} // DALTON-HOOK(shared-widgets)
               />

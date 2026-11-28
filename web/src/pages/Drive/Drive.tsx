@@ -21,7 +21,7 @@ import { UploadTray } from './components/UploadTray';
 import { DriveProvider } from './DriveProvider';
 import { useDriveBody } from './driveBody';
 import { driveLinkPath, followMove, isWithinKey, linkedFile, parentOf } from './drivePaths';
-import { fileAddress, memoState, resolveFileView } from './memoMarks';
+import { fileAddress, resolveFileView } from './memoMarks';
 import { useDriveActions } from './useDriveActions';
 import { useDriveEditor } from './useDriveEditor';
 import { useDriveUpload } from './useDriveUpload';
@@ -69,8 +69,9 @@ function Drive() {
   // The address as the open file reads it; what it names and the file does
   // not have (a version on a plain file, the head as a version, a tab it has
   // no view for) is dropped from the address below.
-  // A memo's versions, which the address may name: one gone is not compared with.
-  const versions = useDriveVersions(space, fileEntry?.id ?? null, memoState(fileEntry).kind !== 'plain');
+  // DALTON-HOOK(drive-long-history): query versions for ordinary files too so their
+  // long history list, old-version deep links (?v=), and restore bar work.
+  const versions = useDriveVersions(space, fileEntry?.id ?? null, !!fileEntry);
   const kept = versions.data?.versions.map((v) => v.seq);
   const shown = resolveFileView(fileEntry, loc, false, kept);
   const head = useDriveBody(space, fileEntry ?? null, null);

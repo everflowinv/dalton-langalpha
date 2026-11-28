@@ -48,8 +48,8 @@ export function EntryMenuItems({ entry, parts: { Item, Separator } }: { entry: D
               {t('drive:actions.markMemo')}
             </Item>
           )}
-          {/* Un-marked, a former memo keeps its record, reached from here. */}
-          {state.kind === 'former' && (
+          {/* DALTON-HOOK(drive-long-history): ordinary files and former memos reach their version history record from here. */}
+          {state.kind !== 'memo' && (
             <Item onSelect={() => go({ file: entry.path, tab: 'record' })}>
               <ListTree className="h-3.5 w-3.5" aria-hidden="true" />
               {t('drive:actions.record')}
