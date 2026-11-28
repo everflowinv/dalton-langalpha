@@ -239,6 +239,12 @@ class PTCSandbox:
         return type(self.provider).installs_browser
 
     @property
+    def serves_toolset(self) -> bool:
+        """Whether the server converges this computer's machine onto the tool
+        table."""
+        return type(self.provider).serves_toolset
+
+    @property
     def recreatable(self) -> bool:
         """Whether the server rebuilds this computer, and so lays its files
         unasked; on one its owner brought, a missing folder is theirs to restore."""
@@ -477,6 +483,8 @@ class PTCSandbox:
         name check costs one var instead of every sandbox create.
         """
         import os
+        # DALTON-HOOK(deployment-credentials): block server-only credential names in sandbox env
+        from src.dalton.settings import is_server_only_credential_env_name
 
         withhold_credentials = platform_secrets_required(self.config)
         # The host's credentials by value: config loading expands ${VAR}, so an
@@ -508,8 +516,9 @@ class PTCSandbox:
             if hasattr(server, "env") and server.env:
                 for key, value in server.env.items():
                     # DALTON-HOOK(bridge-admin-token)
-                    if key in ("INTERNAL_SERVICE_TOKEN", "DALTON_BRIDGE_ADMIN_TOKEN"):
-                        continue  # Never inject platform or bridge admin token into sandbox
+                    # DALTON-HOOK(deployment-credentials): block server-only credential target keys
+                    if is_server_only_credential_env_name(key):
+                        continue  # Never inject server-only credential into sandbox
                     if key in platform_secret_bindings:
                         # The provider puts an opaque placeholder there for a
                         # managed platform Secret. Never put the real host
@@ -519,9 +528,10 @@ class PTCSandbox:
                     if value.startswith("${") and value.endswith("}"):
                         var_name = value[2:-1]
                         # DALTON-HOOK(bridge-admin-token)
-                        if var_name in ("INTERNAL_SERVICE_TOKEN", "DALTON_BRIDGE_ADMIN_TOKEN"):
-                            # A config key of any name may reference the host's
-                            # platform or bridge admin token; never resolve it in.
+                        # DALTON-HOOK(deployment-credentials): block ${VAR} refs to server-only credentials
+                        if is_server_only_credential_env_name(var_name):
+                            # A config key of any name may reference a server-only
+                            # credential; never resolve it in.
                             continue
                         resolved_value = os.getenv(var_name) or ""
                         if not resolved_value:

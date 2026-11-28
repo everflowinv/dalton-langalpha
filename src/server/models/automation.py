@@ -782,10 +782,10 @@ ExecutionStatus = Literal[
 # on (a machine of the user's own) could not be reached: not back before the
 # automation's next firing, or not answering when its turn started.
 SkipReason = Literal["user", "thread_busy", "interrupted", "precheck", "computer_unreachable"]  # DALTON-HOOK(precheck-skip-reason)
-# What a ``waiting`` firing waits for: the turn running in its thread, or the
-# computer its turn runs on to be reachable again. Kept once the wait ends,
-# each a wait that can end in the skip of the same name.
-WaitReason = Literal["thread_busy", "computer_unreachable"]
+# What a ``waiting`` firing waits for: the turn running in its thread, the
+# computer its turn runs on to be reachable again, or server capacity to open.
+# Kept once the wait ends, each a wait that can end in the skip/failure of the same name.
+WaitReason = Literal["thread_busy", "computer_unreachable", "capacity_limit"]  # DALTON-HOOK(automation-capacity-retry)
 # Why a ``failed`` firing failed, when it was not the automation's own doing:
 # a usage limit refused it or paused its run, the Claude plan of its Claude
 # Code model refused or stopped it (``claude_plan``), another subscription's
@@ -829,6 +829,31 @@ class ExecutionDeliverySummary(BaseModel):
     targets: List[ExecutionDeliveryTarget] = Field(default_factory=list)
 
 
+# DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary attached on read
+class FailureNoticeSummary(BaseModel):
+    """Compact durable failure-notice receipt state from ``dalton_failure_notices``."""
+
+    notice_id: str
+    subject_kind: str
+    status: str
+    failure_reason: Optional[str] = None
+    total_targets: int = 0
+    sent_count: int = 0
+    failed_count: int = 0
+    retrying_count: int = 0
+    last_error_code: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+# DALTON-HOOK(execution-delivery-status): preserve original execution payload shape when failure_notice switch is OFF
+def _exclude_disabled_failure_notice(value: Any) -> bool:
+    if value is not None:
+        return False
+    from src.dalton.settings import is_failure_notice_enabled
+
+    return not is_failure_notice_enabled()
+
+
 class AutomationExecutionResponse(BaseModel):
     """One execution: a history row, and an automation's newest run."""
 
@@ -850,6 +875,11 @@ class AutomationExecutionResponse(BaseModel):
     delivery_result: Optional[List[Dict[str, Any]]] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery status across notify ledger and delivery_result
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary (omitted when switch is OFF)
+    failure_notice: Optional[FailureNoticeSummary] = Field(
+        default=None,
+        exclude_if=_exclude_disabled_failure_notice,
+    )
     created_at: datetime
     # When the user took this failed run out of Needs attention.
     dismissed_at: Optional[datetime] = None
@@ -965,6 +995,11 @@ class ScriptExecutionResponse(BaseModel):
     notify_status: Optional[str] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary for script runs (omitted when switch is OFF)
+    failure_notice: Optional[FailureNoticeSummary] = Field(
+        default=None,
+        exclude_if=_exclude_disabled_failure_notice,
+    )
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None
@@ -1044,6 +1079,11 @@ class ScriptRunResponse(BaseModel):
     notify_status: Optional[str] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary for script runs (omitted when switch is OFF)
+    failure_notice: Optional[FailureNoticeSummary] = Field(
+        default=None,
+        exclude_if=_exclude_disabled_failure_notice,
+    )
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None

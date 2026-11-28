@@ -10,7 +10,7 @@ import type { HitlDecisionBody, HitlResponseBody, HitlResumeEntry } from '@/type
 import type { AssistantMessage, PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
 import type { ReportBackWatch } from '../../hooks/useReportBackWatch';
 import type { PendingInterrupt, SetMessages } from '../types';
-import type { AnswerBoard } from './answerBoard';
+import type { AnswerBoard, ToolApprovalDecisionExtra } from './answerBoard'; // DALTON-HOOK(personal-integrations)
 import { PROPOSAL_DATA_KEY_MAP, setCardFields, setCardStatus } from './buckets';
 // DALTON-HOOK(watchlist): unified proposal interrupt target & status resolution
 import { resolveProposalAnswerTarget } from '@/lib/dalton/interruptProposalTarget';
@@ -176,7 +176,7 @@ export function useInterruptAnswers({
     approvalId: string,
     interruptId: string,
     position: ToolApprovalPosition,
-    click: { approved: boolean; message?: string },
+    click: { approved: boolean; message?: string } & ToolApprovalDecisionExtra,
     attemptId?: string,
   ) => {
     if (!approvalId || !interruptId) return;
@@ -185,15 +185,24 @@ export function useInterruptAnswers({
   }, [collectHitlResponseAndMaybeResume, answerBoard]);
 
   const handleApproveToolCall = useCallback((
-    approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string,
+    approvalId: string,
+    interruptId: string,
+    position: ToolApprovalPosition,
+    attemptId?: string,
+    extra?: ToolApprovalDecisionExtra, // DALTON-HOOK(personal-integrations)
   ) => {
-    settleToolApproval(approvalId, interruptId, position, { approved: true }, attemptId);
+    settleToolApproval(approvalId, interruptId, position, { approved: true, ...extra }, attemptId);
   }, [settleToolApproval]);
 
   const handleRejectToolCall = useCallback((
-    approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string,
+    approvalId: string,
+    interruptId: string,
+    position: ToolApprovalPosition,
+    message?: string,
+    attemptId?: string,
+    extra?: ToolApprovalDecisionExtra, // DALTON-HOOK(personal-integrations)
   ) => {
-    settleToolApproval(approvalId, interruptId, position, { approved: false, message }, attemptId);
+    settleToolApproval(approvalId, interruptId, position, { approved: false, message, ...extra }, attemptId);
   }, [settleToolApproval]);
 
   return {

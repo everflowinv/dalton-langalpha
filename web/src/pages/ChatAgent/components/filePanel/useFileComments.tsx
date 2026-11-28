@@ -98,7 +98,7 @@ export function useFileComments({
   const root = useWorkspaceFolders()?.rootDir;
   const path = ui && commentViewer === 'html' ? file : null;
   const target = useMemo(
-    () => (ui && file && commentViewer && commentViewer !== 'html' ? { workspaceId, path: file, tabId, ui, active } : null),
+    () => (ui && file && commentViewer && commentViewer !== 'html' ? { workspaceId, kind: 'file' as const, path: file, tabId, ui, active } : null),
     [ui, file, commentViewer, workspaceId, tabId, active],
   );
   const stores = usePanelVersionStores();
@@ -132,7 +132,7 @@ export function useFileComments({
       <CommentTools
         tabId={tabId}
         workspaceId={workspaceId}
-        path={target.path}
+        target={target}
         ui={target.ui}
         variant="crumb"
         modeTitle={t('pageViewer:comments.modeTitleFile')}
@@ -142,7 +142,7 @@ export function useFileComments({
         <CommentTools
           tabId={tabId}
           workspaceId={workspaceId}
-          path={path}
+          target={{ kind: 'file', path }}
           ui={ui}
           variant="crumb"
           // A version is read only, and the markup has no spots to pick.

@@ -61,6 +61,9 @@ async def index_turns(
     indexed with its message alone and counted ``unread``; its row keeps an
     answer read before."""
     from src.server.services.history.committed import read_committed_texts
+    # DALTON-HOOK(personal-integrations): read purge state before checkpoints and write guarded search turns
+    from src.dalton.services.purge_fence import read_thread_purge_state, write_guarded_search_turns
+    purge_state = await read_thread_purge_state(thread_id)
 
     sources, read_at = await db.turns_to_index(
         thread_id, turn_indexes=turn_indexes, newest=newest
@@ -74,22 +77,7 @@ async def index_turns(
         {s.response_id: s.turn_index for s in sources},
         schedule_claims_pass=False,
     )
-    written = await db.write_turns(
-        thread_id,
-        [
-            db.IndexedTurn(
-                response_id=s.response_id,
-                user_text=""
-                if s.query_type in NOTIFICATION_QUERY_TYPES
-                else _clean(s.user_text),
-                answer_text=_clean(read.texts.get(s.response_id)),
-                answer_read=s.response_id not in read.unread,
-                turn_at=s.turn_at,
-            )
-            for s in sources
-        ],
-        read_at=read_at,
-    )
+    written = await write_guarded_search_turns(db.write_turns, thread_id, sources, read, purge_state, read_at, _clean, NOTIFICATION_QUERY_TYPES)
     return Indexed(written, len(read.unread))
 
 

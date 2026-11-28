@@ -60,6 +60,7 @@ import { resolvePublishStatus } from '@/lib/dalton/publishStatus';
 import { isHtmlFile } from '../utils/filePaths';
 import { pageLoadsOf } from '@/lib/pageLoads';
 import { usePageScout } from './viewers/html/usePageScout';
+import { targetFor } from '@/lib/artifactTarget';
 import type {
   ArtifactStatus,
   ArtifactVersion,
@@ -489,7 +490,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   const isIdentityBlocked = identity.status !== 'ready' || identity.isConfirming;
 
   // A file never recorded has no status to review, so this makes its private record.
-  const owned = useOwnedArtifact(workspaceId, path, { root });
+  const owned = useOwnedArtifact(workspaceId, targetFor('file', path, root));
   const artifact = owned.record ?? null;
   const latestSeq = artifact?.latest_seq ?? 0;
   // What the dialog says of visitors is said of their version, not the newest.

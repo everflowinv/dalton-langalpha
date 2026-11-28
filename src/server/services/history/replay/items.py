@@ -387,6 +387,23 @@ def _failed_steer_item(thread_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     return {"event": "steering_returned", "data": data}
 
 
+# DALTON-HOOK(personal-integrations): table-sourced replay item for first-touch personal-integration privacy notice
+def _personal_integration_notice_item(
+    thread_id: str, entry: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "event": "personal_integration_notice",
+        "data": {
+            "thread_id": thread_id,
+            "agent": "main",
+            "service": entry.get("service"),
+            "provider": entry.get("provider"),
+            "turn_index": entry.get("turn_index"),
+            "message": str(entry.get("message") or ""),
+        },
+    }
+
+
 def _enrich(
     item: dict[str, Any],
     thread_id: str,

@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 
 import { requestShowLayers } from '@/pages/MarketView/stores/layerViewStore';
-import { chartKeyFor } from '@/pages/MarketView/utils/chartInstanceKey';
+import { chartKeyFor } from '@/lib/bars/chartId';
 
 export interface ChartDeepLinkTarget {
   symbol: string;

@@ -771,16 +771,25 @@ class AutomationExecutor:
                 f"execution_id={execution_id}"
             )
             return
+        # DALTON-HOOK(automation-capacity-retry): hydrate persisted delivery registration across retries so edits and default targets re-resolve and clears revoke
+        from src.dalton.automations.capacity_retry import (
+            delivery_id_for_start,
+            has_default_delivery_entry,
+            hydrate_delivery_state_for_firing,
+            sync_delivery_state_after_start,
+        )
+
+        await hydrate_delivery_state_for_firing(execution_id, firing)
         entries = automation_delivery.entries_of(firing.automation)
-        if firing.delivery_starts and entries == firing.delivery_entries:
+        if (
+            firing.delivery_starts
+            and entries == firing.delivery_entries
+            and not has_default_delivery_entry(entries)
+        ):
             return
         firing.delivery_starts += 1
         firing.delivery_entries = entries
-        delivery_id = (
-            execution_id
-            if firing.delivery_starts == 1
-            else f"{execution_id}.{firing.delivery_starts}"
-        )
+        delivery_id = delivery_id_for_start(execution_id, firing.delivery_starts)
         if firing.delivery_starts > 1:
             logger.info(
                 f"[AUTOMATION_EXEC] Delivery changed during the wait, starting it "
@@ -793,6 +802,15 @@ class AutomationExecutor:
         )
         if firing.delivery is not None or kept is not None:
             await _keep_delivery(execution_id, firing.delivery)
+        # DALTON-HOOK(automation-capacity-retry): persist delivery_meta and revoke cleared unstarted channel registration
+        await sync_delivery_state_after_start(
+            execution_id,
+            automation=firing.automation,
+            entries=entries,
+            delivery=firing.delivery,
+            delivery_starts=firing.delivery_starts,
+            had_prior_registration=kept is not None,
+        )
 
     async def _start_delivery_unstarted(
         self, execution_id: str, firing: _Firing
@@ -1010,6 +1028,13 @@ class AutomationExecutor:
 
         while True:
             automation = firing.automation
+            # DALTON-HOOK(maintenance-gate): block automation turn execution during maintenance window
+            from src.dalton.maintenance_gate import enforce_maintenance_admission
+
+            enforce_maintenance_admission(
+                workspace_id=str(automation.get("workspace_id") or "") or None,
+                context="automation_run_turn",
+            )
             user_id = automation["user_id"]
             recorded_as = carried_recorded_as(automation)
             instruction = automation["instruction"]
@@ -1258,7 +1283,13 @@ class AutomationExecutor:
             has_byok, has_cred = await _credentials(user_id)
             await enforce_credit_limit(recorded_as, byok=has_cred)
 
-    async def execute(self, automation: Dict[str, Any], execution_id: str) -> None:
+    async def execute(
+        self,
+        automation: Dict[str, Any],
+        execution_id: str,
+        *,
+        claim_token: Optional[str] = None,  # DALTON-HOOK(automation-capacity-retry)
+    ) -> None:
         """Run one firing of ``automation`` until it settles or its run does.
 
         It starts only from ``pending``: the sweep may have settled it while
@@ -1285,9 +1316,13 @@ class AutomationExecutor:
         )
         try:
             # DALTON-HOOK(company-automations): pending→running only while the parent is not deleted
+            # DALTON-HOOK(automation-capacity-retry): pass claim_token when dispatched from capacity queue
+            begin_kwargs: Dict[str, Any] = {"started_at": datetime.now(timezone.utc)}
+            if claim_token is not None:
+                begin_kwargs["claim_token"] = claim_token
             started = await exec_db.begin_execution_if_not_deleted(
                 execution_id,
-                started_at=datetime.now(timezone.utc),
+                **begin_kwargs,
             )
             if not started:
                 logger.warning(
@@ -1478,11 +1513,28 @@ class AutomationExecutor:
             await hand_off(
                 firing.automation, execution_id, firing.thread_id, from_status="running"
             )
+            # DALTON-HOOK(automation-capacity-retry): clear pre-START in_progress thread status on hand-off
+            from src.dalton.automations.capacity_retry import (
+                reset_thread_status_after_prestart_exit,
+            )
+
+            await reset_thread_status_after_prestart_exit(firing.thread_id, outcome=None)
             _exec_span.set_attribute("status", "handed_off")
         except Exception as e:
             _exec_span.record_exception(e)
             if await self._left_to_run(execution_id, e, firing):
                 _exec_span.set_attribute("status", "handed_to_run")
+                return
+            # DALTON-HOOK(automation-capacity-retry): defer and retry capacity failures in Postgres before settling
+            from src.dalton.automations.capacity_retry import try_park_for_capacity
+
+            if await try_park_for_capacity(
+                e,
+                automation=firing.automation,
+                execution_id=execution_id,
+                thread_id=firing.thread_id,
+            ):
+                _exec_span.set_attribute("status", "waiting_for_capacity")
                 return
             outcome, error_msg = await _failure_outcome(e, user_id)
             failed = outcome in (Outcome.FAILED, Outcome.FAILED_OURS)
@@ -1514,13 +1566,46 @@ class AutomationExecutor:
                     exc_info=True,
                 )
                 excerpt = None
-            settled = await settle(
-                firing.automation, execution_id, outcome,
-                thread_id=firing.thread_id,
-                workspace_id=firing.workspace_id or automation.get("workspace_id"),
-                error=error_msg, delivery=firing.delivery, excerpt=excerpt,
-                release_pre_start_signals=True,
-            )
+            # DALTON-HOOK(dalton-notify): persist original settlement parameters if settle rolls back
+            # (e.g. transient failure-notice enqueue SQL error) so abandoned-firing recovery retries
+            # with the exact same outcome, failure_reason, quota flag, and one-shot schedule policy.
+            # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically in the settlement transaction
+            eff_workspace_id = firing.workspace_id or automation.get("workspace_id")
+            try:
+                settled = await settle(
+                    firing.automation, execution_id, outcome,
+                    thread_id=firing.thread_id,
+                    workspace_id=eff_workspace_id,
+                    error=error_msg, delivery=firing.delivery, excerpt=excerpt,
+                    release_pre_start_signals=True,
+                    reset_prestart_thread_status=True,
+                )
+            except Exception:
+                from src.dalton.notify.failure_receipts import (
+                    build_pending_settlement_record,
+                    persist_pending_settlement,
+                )
+                from src.server.services.automation_outcomes import POLICIES, schedule_action
+
+                policy = POLICIES[outcome]
+                await persist_pending_settlement(
+                    execution_id,
+                    build_pending_settlement_record(
+                        outcome=outcome.value,
+                        failure_reason=policy.failure_reason,
+                        is_quota_limit=(outcome in LIMITS),
+                        schedule_policy=policy.schedule,
+                        schedule_action=schedule_action(
+                            policy, firing.automation, outcome=outcome, excerpt=excerpt
+                        ),
+                        error=error_msg,
+                        excerpt=excerpt,
+                        workspace_id=eff_workspace_id,
+                        thread_id=firing.thread_id,
+                        release_pre_start_signals=True,
+                    ),
+                )
+                raise
             _exec_span.set_attribute(
                 "status",
                 "settled_elsewhere" if not settled
@@ -1536,11 +1621,13 @@ class AutomationExecutor:
             try:
                 if not await self._hand_to_run(execution_id, firing):
                     # DALTON-HOOK(preflight): fall back to automation["workspace_id"] before route bind
+                    # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically on cancellation
                     await settle(
                         firing.automation, execution_id, Outcome.INTERRUPTED,
                         thread_id=firing.thread_id,
                         workspace_id=firing.workspace_id or automation.get("workspace_id"),
                         delivery=firing.delivery,
+                        reset_prestart_thread_status=True,
                     )
             except Exception as e:
                 # The sweep settles it once the heartbeat stops.

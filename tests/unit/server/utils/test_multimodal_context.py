@@ -184,7 +184,9 @@ class TestBuildAttachmentMetadata:
             yield
 
     @pytest.fixture()
-    def _enable_storage(self):
+    def _enable_storage(self, monkeypatch):
+        # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs when exercising upstream attachment uploads
+        monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
         with patch("src.server.utils.multimodal_context.is_storage_enabled", return_value=True):
             yield
 
@@ -238,8 +240,10 @@ class TestBuildAttachmentMetadata:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_disable_storage")
-    async def test_thread_id_in_prefix(self):
+    async def test_thread_id_in_prefix(self, monkeypatch):
         """When thread_id is provided, the storage key prefix includes it."""
+        # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs to test key prefix
+        monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
         with (
             patch("src.server.utils.multimodal_context.is_storage_enabled", return_value=True),
             patch("src.server.utils.multimodal_context.upload_bytes", return_value=True) as mock_upload,
@@ -251,8 +255,10 @@ class TestBuildAttachmentMetadata:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_disable_storage")
-    async def test_no_thread_id_in_prefix(self):
+    async def test_no_thread_id_in_prefix(self, monkeypatch):
         """When thread_id is empty, the key has no thread segment."""
+        # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs to test key prefix
+        monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
         with (
             patch("src.server.utils.multimodal_context.is_storage_enabled", return_value=True),
             patch("src.server.utils.multimodal_context.upload_bytes", return_value=True) as mock_upload,

@@ -379,7 +379,24 @@ exit 0
     (fake_bin / "launchctl").write_text(
         f"""#!/bin/bash
 if [ "$1" = "kickstart" ]; then
-  echo "2026-11-20 00:01:00 ok fresh" >> "{backup_log}"
+  _nid_file="${{DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}}"
+  _sid="$(tr -d '[:space:]' < "$_nid_file" 2>/dev/null || true)"
+  if [ -n "$_sid" ]; then
+    _broot="{tmp_path}/mock-backups"
+    mkdir -p "$_broot/pg" "$_broot/sets"
+    _dump="$_broot/pg/dalton-pg-${{_sid}}.dump"
+    printf 'PGDMP-%s' "$_sid" > "$_dump"
+    _man="$_broot/sets/minio-manifest-${{_sid}}.json"
+    printf '{{"version":2,"backup_set_id":"%s","objects":[]}}\\n' "$_sid" > "$_man"
+    _dsha="$(shasum -a 256 "$_dump" | awk '{{print $1}}')"
+    _dsz="$(wc -c < "$_dump" | tr -d '[:space:]')"
+    _msha="$(shasum -a 256 "$_man" | awk '{{print $1}}')"
+    printf '{{"version":1,"backup_set_id":"%s","dump_path":"%s","dump_size_bytes":%s,"dump_sha256":"%s","manifest_path":"%s","manifest_sha256":"%s","object_count":0,"reconcile_ok":true}}\\n' \\
+      "$_sid" "$_dump" "$_dsz" "$_dsha" "$_man" "$_msha" > "$_broot/sets/backup-set-${{_sid}}.json"
+    echo "2026-11-20 00:01:00 ok  16G ${{_dump}} set=${{_sid}}" >> "{backup_log}"
+  else
+    echo "2026-11-20 00:01:00 ok fresh" >> "{backup_log}"
+  fi
 fi
 exit 0
 """
@@ -938,7 +955,29 @@ exit 0
     wait_idle.write_text("#!/bin/bash\nexit 0\n")
     wait_idle.chmod(0o755)
     (fake_bin / "launchctl").write_text(
-        f'#!/bin/bash\n[ "$1" = "kickstart" ] && echo "2026-11-20 00:01:00 ok fresh" >> "{backup_log}"\nexit 0\n'
+        f"""#!/bin/bash
+if [ "$1" = "kickstart" ]; then
+  _nid_file="${{DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}}"
+  _sid="$(tr -d '[:space:]' < "$_nid_file" 2>/dev/null || true)"
+  if [ -n "$_sid" ]; then
+    _broot="{tmp_path}/mock-backups-logs"
+    mkdir -p "$_broot/pg" "$_broot/sets"
+    _dump="$_broot/pg/dalton-pg-${{_sid}}.dump"
+    printf 'PGDMP-%s' "$_sid" > "$_dump"
+    _man="$_broot/sets/minio-manifest-${{_sid}}.json"
+    printf '{{"version":2,"backup_set_id":"%s","objects":[]}}\\n' "$_sid" > "$_man"
+    _dsha="$(shasum -a 256 "$_dump" | awk '{{print $1}}')"
+    _dsz="$(wc -c < "$_dump" | tr -d '[:space:]')"
+    _msha="$(shasum -a 256 "$_man" | awk '{{print $1}}')"
+    printf '{{"version":1,"backup_set_id":"%s","dump_path":"%s","dump_size_bytes":%s,"dump_sha256":"%s","manifest_path":"%s","manifest_sha256":"%s","object_count":0,"reconcile_ok":true}}\\n' \\
+      "$_sid" "$_dump" "$_dsz" "$_dsha" "$_man" "$_msha" > "$_broot/sets/backup-set-${{_sid}}.json"
+    echo "2026-11-20 00:01:00 ok  16G ${{_dump}} set=${{_sid}}" >> "{backup_log}"
+  else
+    echo "2026-11-20 00:01:00 ok fresh" >> "{backup_log}"
+  fi
+fi
+exit 0
+"""
     )
     (fake_bin / "curl").write_text("#!/bin/bash\necho 200\nexit 0\n")
     (fake_bin / "uv").write_text("#!/bin/bash\nexit 0\n")

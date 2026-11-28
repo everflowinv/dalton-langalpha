@@ -8,11 +8,12 @@ collide with upstream linear revisions.
 import os
 from logging.config import fileConfig
 from pathlib import Path
-from urllib.parse import quote_plus
 
 from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
+
+from src.dalton.pg_config import resolve_pg_dsn
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
@@ -22,17 +23,13 @@ config = context.config
 _PLACEHOLDER = "driver://user:pass@localhost/dbname"
 current_url = config.get_main_option("sqlalchemy.url")
 if not current_url or current_url == _PLACEHOLDER:
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "postgres")
-    db_user = os.getenv("DB_USER", "postgres")
-    db_password = os.getenv("DB_PASSWORD", "postgres")
-    sslmode = os.getenv("DB_SSLMODE", "prefer")
-
-    database_url = (
-        f"postgresql+psycopg://{quote_plus(db_user)}:{quote_plus(db_password)}"
-        f"@{db_host}:{db_port}/{db_name}?sslmode={sslmode}"
-    )
+    raw_dsn = resolve_pg_dsn(default_host="localhost", default_sslmode=os.getenv("DB_SSLMODE", "prefer"))
+    if raw_dsn.startswith("postgresql://"):
+        database_url = "postgresql+psycopg://" + raw_dsn[len("postgresql://") :]
+    elif raw_dsn.startswith("postgres://"):
+        database_url = "postgresql+psycopg://" + raw_dsn[len("postgres://") :]
+    else:
+        database_url = raw_dsn
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:

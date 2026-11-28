@@ -75,6 +75,7 @@ TABLE_SOURCED = {
     # a run settled before those facts has it in its turn's legacy facts. The
     # main thread's hands chat-app steers back to their gateway on the run's
     # own stream, which resubmits them as its next turn; nothing replays it.
+    "personal_integration_notice",  # DALTON-HOOK(personal-integrations): conversation_threads.metadata.personal_first_touch_event
 }
 
 LIVE_ONLY = {
@@ -93,6 +94,8 @@ LIVE_ONLY = {
     "run_end",  # post-CAS terminal frame closing the run stream (I6)
     "replay_done",  # replay sentinel
     "history_page",  # paged replay header: oldest turn sent, older remain
+    "fork_divider",  # built at read time like history_page: where a fork's
+    # borrowed turns end and its own begin, with each source's current state
     "snapshot",  # read-time cursors for the runs replay could not project;
     # recomputed from ledger+Redis on every load, never replayed from a store
     "market_watch_update",  # transient stamp notice; the durable watchlist

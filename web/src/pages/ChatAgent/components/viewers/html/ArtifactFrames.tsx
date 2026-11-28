@@ -196,7 +196,7 @@ export function ArtifactFrames({
                 <CommentLayer
                   tabId={view.tabId}
                   workspaceId={workspaceId}
-                  path={filePath}
+                  target={{ kind: 'file', path: filePath }}
                   bridge={bridge}
                   view={frameView}
                   active={liveShown}

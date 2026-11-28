@@ -449,19 +449,12 @@ def build_route_probe_spec(
         # Login state only. A search probe is not an operation this route accepts.
         return "research", {"route": "tmeet", "operation": "auth_status"}
     if rid == "gcal":
-        # Valid short read for contract checks. The health loop does not call it.
-        start = datetime.combine(
-            _probe_today(), datetime.min.time(), tzinfo=ZoneInfo("America/New_York")
-        )
-        end = start + timedelta(days=1)
+        # Read-only health_check probe for contract checks. The health loop leaves gcal unprobed.
         return (
             "research",
             {
                 "route": "gcal",
-                "operation": "list_events",
-                "time_min": start.isoformat(),
-                "time_max": end.isoformat(),
-                "limit": 1,
+                "operation": "health_check",
             },
         )
     if rid == "discord-history":

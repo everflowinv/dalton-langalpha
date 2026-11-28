@@ -65,6 +65,7 @@ import {
 import type { SharedThreadMetadata, SSEEvent } from './api';
 import ShareUnavailable from './ShareUnavailable';
 import type { TextSegment } from '@/types/chat';
+import type { ForkDividerEvent } from '@/types/api';
 import { isTaskAgentId } from '../ChatAgent/utils/agentId';
 import type { FileLocation } from '../ChatAgent/utils/fileLocation';
 import { computeAgentArtifactRouting } from '../ChatAgent/utils/agentArtifactRouting';
@@ -106,10 +107,16 @@ interface SharedChatViewProps {
 async function replaySharedPage(
   token: string,
   opts: { beforeTurn?: number; signal?: AbortSignal } = {},
-): Promise<{ messages: MessageRecord[]; firstTurnIndex: number | null; hasMore: boolean }> {
+): Promise<{
+  messages: MessageRecord[];
+  firstTurnIndex: number | null;
+  hasMore: boolean;
+  forkDivider: ForkDividerEvent | null;
+}> {
   let pageMessages: MessageRecord[] = [];
   let firstTurnIndex: number | null = null;
   let hasMore = false;
+  let forkDivider: ForkDividerEvent | null = null;
   const assistantMessagesByPair = new Map<number, string>();
   const pairStateByPair = new Map<number, PairState>();
   const runSettledAtByPair = new Map<number, number>();
@@ -151,6 +158,12 @@ async function replaySharedPage(
 
     if (eventType === 'replay_done') {
       stampSettledTurns();
+      return;
+    }
+
+    // DALTON-HOOK(share-redaction): capture fork_divider frame from paginated public replay
+    if (eventType === 'fork_divider') {
+      forkDivider = event as unknown as ForkDividerEvent;
       return;
     }
 
@@ -319,6 +332,7 @@ async function replaySharedPage(
     messages: pageMessages.map((m) => ({ ...m, isStreaming: false })),
     firstTurnIndex,
     hasMore,
+    forkDivider,
   };
 }
 
@@ -338,6 +352,8 @@ export default function SharedChatView({
   }, [access]);
 
   const [messages, setMessages] = useState<MessageRecord[]>([]);
+  // Where a fork's borrowed turns end, as the replay said.
+  const [forkDivider, setForkDivider] = useState<ForkDividerEvent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -452,6 +468,7 @@ export default function SharedChatView({
       if (accessRef.current !== shareToken) revokeSharedImageScope(accessRef.current);
       void clearSharedFileBodies(queryClient);
       setMessages([]);
+      setForkDivider(null);
       setFiles([]);
       setShowFilePanel(false);
       setFilePanelTarget(null);
@@ -494,6 +511,7 @@ export default function SharedChatView({
         if (cancelled || controller.signal.aborted) return;
         shouldAutoScrollRef.current = true;
         setMessages(result.messages);
+        setForkDivider(result.forkDivider);
         setHistoryPage({ firstTurnIndex: result.firstTurnIndex, hasMore: result.hasMore });
         setLoading(false);
       } catch (e: unknown) {
@@ -530,6 +548,7 @@ export default function SharedChatView({
         const freshOlder = older.messages.filter((m) => !seen.has(m.id));
         return [...freshOlder, ...prev];
       });
+      if (older.forkDivider) setForkDivider(older.forkDivider);
       setHistoryPage({ firstTurnIndex: older.firstTurnIndex, hasMore: older.hasMore });
     } catch (e: unknown) {
       if (!controller.signal.aborted && (e as { name?: string })?.name !== 'AbortError') {
@@ -926,6 +945,7 @@ export default function SharedChatView({
                           readOnly={true}
                           allowFiles={canBrowseFiles}
                           plans={plans}
+                          forkDivider={forkDivider}
                         />
                       {/* DALTON-HOOK(share-redaction): end redaction context */}
                       </SharedRedactionProvider>

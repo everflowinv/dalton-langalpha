@@ -329,6 +329,7 @@ const SKIP_REASON_NOTE: Record<SkipReason, string | null> = {
 const WAIT_REASON_NOTE: Record<WaitReason, string> = {
   thread_busy: 'automation:waitingNote',
   computer_unreachable: 'automation:waitingForComputerNote',
+  capacity_limit: 'automation:waitingForCapacityNote', // DALTON-HOOK(automation-capacity-retry)
 };
 
 /** The line a failed run carries when the failure was not the automation's.

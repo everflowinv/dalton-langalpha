@@ -26,7 +26,7 @@
 - `employee`[community/员工评论|未体检]:员工侧情绪与组织变化。(blind/summary免费;付费须allow_paid=True)
 - `last30days`[community/跨平台社区情绪|未体检]:跨平台与StockTwits/Polymarket情绪。(query+days≤30)
 - `x-timeline`[community/X固定账号时间线|未体检]:固定账号建不漏底表；跨账号观点与媒体补充用x_search。(tweets/tweet/thread/search,count≤100;与x_search按原帖URL去重)
-- `gcal`[research/Richard 财报日历|未体检]:只读写 Richard 财报跟踪日历上的 tracker 事件。日历 ID 来自宿主机配置。(不并入 all;日历 ID 不由调用方传入;删除前核对 tracker 标记;写操作不用于健康探测)
+- `gcal`[research/Richard 财报日历|未体检]:只读写 Richard 财报跟踪日历上的 tracker 事件，支持 health_check 自检。日历 ID 来自服务端或宿主机配置。(不并入 all;日历 ID 不由调用方传入;删除前核对 tracker 标记;自检使用只读 health_check)
 
 ### 3. 明确没有的数据（切勿以为查过）
 - 期货与大宗商品实时(非延迟)行情:yfinance期货延迟约15分钟，注明延迟。

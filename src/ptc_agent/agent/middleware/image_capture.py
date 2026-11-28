@@ -114,7 +114,6 @@ async def capture_sandbox_images(
     default savefig target). Folding to a work-dir-relative form first would
     re-root those under the work dir and the image would vanish.
     """
-
     async def _capture_one(path: str) -> tuple[str, str] | None:
         try:
             normalized = (
@@ -133,7 +132,9 @@ async def capture_sandbox_images(
             # upload_bytes is sync (boto3) — run in thread to avoid blocking
             if await asyncio.to_thread(upload_bytes, key, content, content_type):
                 logger.info(f"[IMAGE_CAPTURE] Uploaded {path} → {key}")
-                return path, get_public_url(key)
+                # DALTON-HOOK(storage-private-bucket-urls): store private key ref (served via AU1 media route) when public_bucket_urls=false
+                from src.dalton.private_bucket_urls import format_captured_image_ref
+                return path, format_captured_image_ref(key, public_url_fn=get_public_url)
         except Exception as e:
             logger.warning(f"[IMAGE_CAPTURE] Failed to capture {path}: {e}")
         return None

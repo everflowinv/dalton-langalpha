@@ -1994,30 +1994,26 @@ def _freeze_execution_day(monkeypatch: pytest.MonkeyPatch, day: str) -> None:
 async def test_modified_on_today_ignores_report_dates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``modified_on: "today"`` floors at the EXECUTION day: a model written
+    """``modified_on: "today"`` floors at the EXECUTION day: a file written
     on the release date — between release_date and today — is not fresh,
     even though release_date sits in the params."""
+    from src.dalton.tools.check_done_tools import _check_artifact
+
     release_day = "2026-10-20"
     params = {
         "ticker": "META",
         "quarter": "FY26Q3",
         "workspace_dir": ".",
         "release_date": release_day,
-        "model_path": "model/META-model-v01.xlsx",
     }
-    files = {
-        "drafts/2026-10-20-deep-FY26Q3.md": "深度" * 300,
-        "research/2026-10-20-deep-FY26Q3/reconcile.md": "对账" * 50,
-        "research/2026-10-20-deep-FY26Q3/reconcile.json": '{"wrong": 0, "partial": 0}',
-        "research/2026-10-20-deep-FY26Q3/thesis-calibration.md": "校准" * 100,
-        "research/2026-10-20-deep-FY26Q3/management-delta.md": "指引" * 50,
-        "research/2026-10-20-deep-FY26Q3/knowledge-revision.json": '{"thesis": {}}',
-        "research/2026-10-20-deep-FY26Q3/mapping.md": "映射" * 50,
-        "research/2026-10-20-deep-FY26Q3/model-delta.md": "模型增量" * 50,
-        "model/META-model-v01.xlsx": "x" * 1200,
+    artifact = {
+        "path": "model/{ticker}-model-v*.xlsx",
+        "glob": True,
+        "min_count": 1,
+        "min_bytes": 1000,
+        "modified_on": "today",
     }
-    _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+    files = {"model/META-model-v01.xlsx": "x" * 1200}
     _freeze_execution_day(monkeypatch, "2026-10-23")
 
     from datetime import datetime as _dt
@@ -2026,24 +2022,20 @@ async def test_modified_on_today_ignores_report_dates(
     # Explicitly between the release day (10-20) and the execution day (10-23).
     stale = int(_dt(2026, 10, 20, 12, tzinfo=_tz.utc).timestamp())
     execution_day_start = int(_dt(2026, 10, 23, tzinfo=_tz.utc).timestamp())
-    mtimes = {"model/META-model-v01.xlsx": stale}
-    result = await run_check_done(
-        workflow="earnings-deep-update",
-        params=params,
-        backend=_make_backend(files, mtimes=mtimes),
-        workspace_id=WS,
+    gap, _warn, _res = await _check_artifact(
+        _make_backend(files, mtimes={"model/META-model-v01.xlsx": stale}),
+        artifact,
+        params,
     )
-    assert any("不是本轮写的" in item and "model-v01" in item for item in result["missing"])
+    assert any("不是本轮写的" in item and "model-v01" in item for item in gap)
 
     # Written ON the execution day (any time of it) is fresh.
-    mtimes["model/META-model-v01.xlsx"] = execution_day_start
-    result = await run_check_done(
-        workflow="earnings-deep-update",
-        params=params,
-        backend=_make_backend(files, mtimes=mtimes),
-        workspace_id=WS,
+    gap2, _warn2, _res2 = await _check_artifact(
+        _make_backend(files, mtimes={"model/META-model-v01.xlsx": execution_day_start}),
+        artifact,
+        params,
     )
-    assert not any("不是本轮写的" in item for item in result["missing"])
+    assert not any("不是本轮写的" in item for item in gap2)
 
 
 @pytest.mark.asyncio
@@ -2055,55 +2047,50 @@ async def test_one_final_model_version_across_checks(
     and a stale v02 does."""
     from datetime import datetime as _dt
     from datetime import timezone as _tz
+    from src.dalton.tools.check_done_tools import _check_artifact
 
     params = {
         "ticker": "META",
         "quarter": "FY26Q3",
         "workspace_dir": ".",
         "release_date": "2026-10-20",
-        "model_path": "model/META-model-v01.xlsx",
+    }
+    artifact = {
+        "path": "model/{ticker}-model-v*.xlsx",
+        "glob": True,
+        "min_count": 1,
+        "min_bytes": 1000,
+        "modified_on": "today",
     }
     files = {
-        "drafts/2026-10-20-deep-FY26Q3.md": "深度" * 300,
-        "research/2026-10-20-deep-FY26Q3/reconcile.md": "对账" * 50,
-        "research/2026-10-20-deep-FY26Q3/reconcile.json": '{"wrong": 0, "partial": 0}',
-        "research/2026-10-20-deep-FY26Q3/thesis-calibration.md": "校准" * 100,
-        "research/2026-10-20-deep-FY26Q3/management-delta.md": "指引" * 50,
-        "research/2026-10-20-deep-FY26Q3/knowledge-revision.json": '{"thesis": {}}',
-        "research/2026-10-20-deep-FY26Q3/mapping.md": "映射" * 50,
-        "research/2026-10-20-deep-FY26Q3/model-delta.md": "模型增量" * 50,
         "model/META-model-v01.xlsx": "x" * 1200,
         "model/META-model-v02.xlsx": "y" * 1200,
     }
-    _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
     _freeze_execution_day(monkeypatch, "2026-10-23")
 
     old = int(_dt(2026, 10, 20, 12, tzinfo=_tz.utc).timestamp())
     fresh = int(_dt(2026, 10, 23, tzinfo=_tz.utc).timestamp())
     # v01 old, v02 fresh: only v02 is checked — v01's stale mtime is history.
-    result = await run_check_done(
-        workflow="earnings-deep-update",
-        params=params,
-        backend=_make_backend(
+    gap, _w, _r = await _check_artifact(
+        _make_backend(
             files,
             mtimes={"model/META-model-v01.xlsx": old, "model/META-model-v02.xlsx": fresh},
         ),
-        workspace_id=WS,
+        artifact,
+        params,
     )
-    assert not any("不是本轮写的" in item for item in result["missing"])
+    assert not any("不是本轮写的" in item for item in gap)
 
     # v02 stale → the ONE final file fails freshness.
-    result = await run_check_done(
-        workflow="earnings-deep-update",
-        params=params,
-        backend=_make_backend(
+    gap2, _w2, _r2 = await _check_artifact(
+        _make_backend(
             files,
             mtimes={"model/META-model-v01.xlsx": old, "model/META-model-v02.xlsx": old},
         ),
-        workspace_id=WS,
+        artifact,
+        params,
     )
-    flagged = [item for item in result["missing"] if "不是本轮写的" in item]
+    flagged = [item for item in gap2 if "不是本轮写的" in item]
     assert flagged and all("model-v02" in item for item in flagged), flagged
 
 
@@ -6180,26 +6167,129 @@ class _FcRunHost:
                 if line.startswith("- ") and "|" not in line
             ]
             return {"files": [f"{p}|ok" for p in paths]}
-        if label == "建模":
+        if label == "建模准备":
+            self.files[f"{R}/model_dump/META-fingerprint.json"] = '{"schema_version": 2}'
+            return {
+                "files": [f"{R}/model_dump/META-fingerprint.json"],
+                "summary": "指纹提取完成",
+                "mode": "build",
+                "baseline_path": None,
+                "baseline_sha256": None,
+                "fingerprint_path": f"{R}/model_dump/META-fingerprint.json",
+                "consensus_path": "data/consensus/2026-10-23_0900.json",
+                "baseline_health_warning": None,
+            }
+        if label == "读取运行ID":
+            return {"run_id": "task-run-1"}
+        if label == "模型构建与落盘":
             self.files["model/META-model-v01.xlsx"] = "x" * 1200
             return {
                 "files": ["model/META-model-v01.xlsx"],
-                "summary": "recalc / model_scan.py --recalc / Checks 全部通过",
-                "sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
-                "checks_passed": True,
+                "summary": "模型构建与落盘完成",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            self.files[f"{R}/model_dump/consensus-diff.md"] = "# consensus diff\n"
+            self.files[f"{R}/model_dump/consensus-diff.json"] = "{}"
+            return {
+                "files": [
+                    "model/META-model-v01.xlsx",
+                    f"{R}/model_dump/consensus-diff.md",
+                    f"{R}/model_dump/consensus-diff.json",
+                ],
+                "summary": "一致预期对照完成",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if label == "模型本轮范围检查":
+            model_sha = _draft_hash(self.files["model/META-model-v01.xlsx"])
+            self.files[f"{R}/model_dump/model-check.md"] = "# model check\n"
+            self.files[f"{R}/model_dump/model-review-pack.md"] = "# review pack\n"
+            self.files[f"{R}/model_dump/model-verification.json"] = json.dumps(
+                {
+                    "schema_version": 2,
+                    "workflow": "full-coverage",
+                    "mode": "build",
+                    "ticker": "META",
+                    "run_id": "task-run-1",
+                    "final_status": "pass",
+                    "fix_rounds": 0,
+                    "failed_stages": [],
+                    "final_model_path": "model/META-model-v01.xlsx",
+                    "final_model_sha256": model_sha,
+                    "rounds": [],
+                },
+                ensure_ascii=False,
+            )
+            return {
+                "files": [
+                    f"{R}/model_dump/model-check.md",
+                    f"{R}/model_dump/model-review-pack.md",
+                    f"{R}/model_dump/model-verification.json",
+                ],
+                "summary": "本轮范围检查 0 actionable",
+                "readable": True,
+                "final_status": "pass",
+                "model_sha256": model_sha,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "baseline_legacy_issues": [],
+                "missing_evidence_issues": [],
+                "not_applicable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": None,
+                "summary_10lines": "v01 pass",
+            }
+        if label == "绑定输出路径":
+            return {
+                "files": [f"{R}/model_dump/planned-output.json"],
+                "summary": "bound v01",
+                "next_path": "model/META-model-v01.xlsx",
+            }
+        if label == "核验候选落盘":
+            return {
+                "path": "model/META-model-v01.xlsx",
+                "exists": True,
+                "readable": True,
+                "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "run_matched": True,
+            }
+        if label == "完整覆盖页签核验":
+            return {
+                "path": "model/META-model-v01.xlsx",
+                "status": "complete",
+                "sheet_names": [
+                    "README & Changelog",
+                    "Cover",
+                    "Facts",
+                    "Revenue Model",
+                    "Income Statement",
+                    "Cash Flow Statement",
+                    "Balance Sheet",
+                    "Scenarios",
+                    "Guidance vs Actual",
+                    "Street vs House",
+                    "DCF Inputs",
+                    "DCF",
+                    "Sensitivity Analysis",
+                    "Comparable Companies",
+                    "Valuation Summary",
+                    "Checks",
+                ],
+                "missing_required_sheets": [],
+                "summary": "all required sheets present",
             }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
             return {"files": [f"{m.group(1)}|absent"]}
-        if label == "模型可读性核验":
-            m = re.search(r"f='([^']+)'", prompt)
-            return {"files": [f"{m.group(1)}|readable_ok"]}
         if label == "成稿":
             self.files["drafts/2026-10-23-memo.md"] = FC_MEMO
             return self._out("drafts/2026-10-23-memo.md", "成稿，validate 0 FAIL")
-        if label == "只读审模型":
-            self.files[f"{R}/model-check.md"] = "# 只读审模型报告\n\n" + "核查结论：" * 40
-            return self._out(f"{R}/model-check.md")
         if label == "语言审查 1":
             memo = "drafts/2026-10-23-memo.md"
             self._append_round(memo, 1)
@@ -6213,7 +6303,6 @@ class _FcRunHost:
                 f"{R}/eb.md",
                 f"{R}/ec.md",
                 f"{R}/ed.md",
-                f"{R}/model-check.md",
             ):
                 self._two_round_sidecar(rel)
             return {"files": [f"{R}/facts.md"], "summary": "笔记两轮完成"}
@@ -6276,7 +6365,11 @@ async def test_full_coverage_workflow_run_satisfies_check_done(
     spec_host.agent.side_effect = host.agent
     spec_host.phase.side_effect = host.phase
     spec_host.log.side_effect = host.log
-    script = (FC_REPO_ROOT / "workflows" / "full-coverage" / "workflow.js").read_text(encoding="utf-8")
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    script = read_assembled_workflow_file(FC_REPO_ROOT / "workflows" / "full-coverage" / "workflow.js")
     outcome = await run_workflow_script(
         script, PARAMS, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0)
     )
@@ -6295,6 +6388,25 @@ async def test_full_coverage_workflow_run_satisfies_check_done(
     assert host.review_sha == memo_sha
     files[".agents/threads/short-1/workflows/task-run-1/status.json"] = json.dumps(
         {"run_id": "task-run-1", "name": "full-coverage", "status": "completed", "updated_at": 2.0}
+    )
+    files[".agents/threads/short-1/workflows/task-run-1/journal/建模准备.json"] = json.dumps(
+        {
+            "label": "建模准备",
+            "dispatches": [
+                {
+                    "label": "建模准备",
+                    "status": "ok",
+                    "seq": 3,
+                    "recorded_at": 1.5,
+                    "result": {
+                        "files": ["research/2026-10-23-fc/model_dump/META-fingerprint.json"],
+                        "summary": "指纹提取完成",
+                        "mode": "build",
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
     )
     files[".agents/threads/short-1/workflows/task-run-1/journal/独立审稿.json"] = json.dumps(
         {
@@ -6334,11 +6446,12 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Modeling Batch 2 r3 (#2, #9): both full-coverage and earnings-deep-update
-    completion contracts run `model_readable.py` (openpyxl read_only + worksheet
-    XML check). Real openpyxl workbooks pass; missing files, valid ZIPs with
-    corrupt worksheet XML, and non-ZIP files all fail both directly and through
-    `run_check_done`."""
+    """Modeling v2 P0-b: company-model, full-coverage, and earnings-deep-update
+    completion contracts run `model_check.py verify-done` (which checks workbook
+    readability via `model_readable.py` plus terminal ledger closure). Real openpyxl
+    workbooks pass; missing files, valid ZIPs with corrupt worksheet XML, and non-ZIP
+    files all fail both directly and through `run_check_done`."""
+    import hashlib
     import shutil
     import subprocess
     import sys
@@ -6348,24 +6461,19 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
 
     from src.dalton.workflows.contracts import load_workflow_contract, render_command
 
-    script_src = (
-        FC_REPO_ROOT
-        / "plugins"
-        / "dalton"
-        / "skills"
-        / "dalton-model"
-        / "scripts"
-        / "model_readable.py"
+    scripts_src_dir = (
+        FC_REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
     )
     run_env = {
         **os.environ,
         "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
     }
 
-    def _install_script(workspace: Path) -> None:
-        dst = workspace / ".agents" / "skills" / "dalton-model" / "scripts" / "model_readable.py"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(script_src, dst)
+    def _install_scripts(workspace: Path) -> None:
+        dst_dir = workspace / ".agents" / "skills" / "dalton-model" / "scripts"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for src in scripts_src_dir.glob("*.py"):
+            shutil.copyfile(src, dst_dir / src.name)
 
     def _write_real_openpyxl_xlsx(target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -6379,6 +6487,9 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
         ws2 = wb.create_sheet("Checks")
         ws2["A1"] = "Check"
         ws2["B1"] = "OK"
+        for sh_extra in ("Facts", "Guidance vs Actual", "Street vs House"):
+            ws_e = wb.create_sheet(sh_extra)
+            ws_e["A1"] = sh_extra
         wb.save(target)
 
     def _write_corrupt_sheet_xml_zip(target: Path) -> None:
@@ -6392,17 +6503,77 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
                 else:
                     zout.writestr(info.filename, data)
 
-    def _run_validator(workflow_name: str, workspace: Path) -> subprocess.CompletedProcess[str]:
+    def _write_ledger_for(workspace: Path, wf_name: str, research_rel: str, model_path: Path) -> Path:
+        rdir = workspace / research_rel
+        dump = rdir / "model_dump"
+        dump.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.is_file() else "0" * 64
+        rem = dump / "remaining-issues.md"
+        rem.write_text(
+            f"> - `[阶段降级记录]` failed_stages: check, consensus (candidate `{sha[:12]}`)\n",
+            encoding="utf-8",
+        )
+        if wf_name == "earnings-deep-update":
+            (rdir / "mapping.md").write_text("映射内容" * 30, encoding="utf-8")
+            (rdir / "model-delta.md").write_text("变动拆解" * 30, encoding="utf-8")
+        ledger_path = dump / "model-verification.json"
+        ledger_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "workflow": wf_name,
+                    "mode": "update",
+                    "ticker": "META",
+                    "run_id": None,
+                    "calc_engine": "libreoffice",
+                    "independent_verify": False,
+                    "enabled_stages": ["check", "consensus"],
+                    "fix_rounds": 0,
+                    "failed_stages": ["check", "consensus"],
+                    "rounds": [
+                        {
+                            "round_index": 1,
+                            "kind": "modeling",
+                            "candidate_path": "model/META-model-v01.xlsx",
+                            "model_sha256": sha,
+                            "failed_stages": ["check", "consensus"],
+                            "evidence": {},
+                        }
+                    ],
+                    "final_status": "delivered_with_open_issues",
+                    "final_model_path": "model/META-model-v01.xlsx",
+                    "final_model_sha256": sha,
+                    "remaining_issues_path": f"{research_rel}/model_dump/remaining-issues.md",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return ledger_path
+
+    wf_cases = (
+        ("company-model", {"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"}, "research/2026-10-28-model-META"),
+        ("full-coverage", {"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"}, "research/2026-10-28-fc"),
+        (
+            "earnings-deep-update",
+            {"ticker": "META", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-10-28"},
+            "research/2026-10-28-deep-FY26Q3",
+        ),
+    )
+
+    def _run_validator(workflow_name: str, params_map: dict[str, str], workspace: Path) -> subprocess.CompletedProcess[str]:
         contract = load_workflow_contract(workflow_name)
         cmds = [
-            render_command(v["command"], {"ticker": "META"})
+            render_command(v["command"], params_map)
             for stage in contract["stages"]
             for v in stage.get("validators") or []
-            if "model_readable.py" in v.get("command", "")
+            if "model_check.py verify-done" in v.get("command", "")
         ]
         assert len(cmds) == 1, (workflow_name, cmds)
+        extra_flags = " --manual --expected-mode update" if workflow_name == "full-coverage" else " --manual"
         return subprocess.run(
-            ["bash", "-c", cmds[0]],
+            ["bash", "-c", cmds[0] + extra_flags],
             cwd=workspace,
             env=run_env,
             capture_output=True,
@@ -6410,73 +6581,82 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
             check=False,
         )
 
-    for wf in ("full-coverage", "earnings-deep-update"):
+    for wf, pmap, r_rel in wf_cases:
         ws_dir = tmp_path / wf
         ws_dir.mkdir(parents=True, exist_ok=True)
-        _install_script(ws_dir)
+        _install_scripts(ws_dir)
         xlsx_path = ws_dir / "model" / "META-model-v01.xlsx"
 
         # 1. Missing model file -> validator exits non-zero
-        res_missing = _run_validator(wf, ws_dir)
+        _write_ledger_for(ws_dir, wf, r_rel, xlsx_path)
+        res_missing = _run_validator(wf, pmap, ws_dir)
         assert res_missing.returncode != 0, wf
 
-        # 2. Non-ZIP file -> validator exits non-zero with reason
+        # 2. Non-ZIP file -> validator exits non-zero
         xlsx_path.parent.mkdir(parents=True, exist_ok=True)
         xlsx_path.write_bytes(b"not-a-valid-xlsx" * 100)
-        res_non_zip = _run_validator(wf, ws_dir)
-        assert res_non_zip.returncode != 0 and res_non_zip.stderr.strip(), wf
+        _write_ledger_for(ws_dir, wf, r_rel, xlsx_path)
+        res_non_zip = _run_validator(wf, pmap, ws_dir)
+        assert res_non_zip.returncode != 0, wf
 
-        # 3. Valid ZIP whose worksheet XML is corrupt -> validator exits non-zero with reason
+        # 3. Valid ZIP whose worksheet XML is corrupt -> validator exits non-zero
         _write_corrupt_sheet_xml_zip(xlsx_path)
-        res_bad_xml = _run_validator(wf, ws_dir)
-        assert res_bad_xml.returncode != 0 and "XML" in res_bad_xml.stderr, (wf, res_bad_xml.stderr)
+        _write_ledger_for(ws_dir, wf, r_rel, xlsx_path)
+        res_bad_xml = _run_validator(wf, pmap, ws_dir)
+        assert res_bad_xml.returncode != 0 and "XML" in (res_bad_xml.stdout + res_bad_xml.stderr), (wf, res_bad_xml.stdout, res_bad_xml.stderr)
 
         # 4. Real openpyxl workbook -> validator exits zero
         _write_real_openpyxl_xlsx(xlsx_path)
-        res_ok = _run_validator(wf, ws_dir)
-        assert res_ok.returncode == 0, (wf, res_ok.stderr)
+        _write_ledger_for(ws_dir, wf, r_rel, xlsx_path)
+        res_ok = _run_validator(wf, pmap, ws_dir)
+        assert res_ok.returncode == 0, (wf, res_ok.stdout, res_ok.stderr)
 
-    # Wire the real model_readable.py validator through run_check_done with a real workspace_dir
+    # Wire the real model_check.py verify-done validator through run_check_done with a real workspace_dir
     check_ws = tmp_path / "check_done_ws"
     check_ws.mkdir(parents=True, exist_ok=True)
-    _install_script(check_ws)
+    _install_scripts(check_ws)
     check_xlsx = check_ws / "model" / "META-model-v01.xlsx"
+    deep_r = "research/2026-10-28-deep-FY26Q3"
 
-    base_files = {
-        "drafts/2026-10-28-deep-FY26Q3.md": "深度" * 300,
-        "research/2026-10-28-deep-FY26Q3/reconcile.md": "对账" * 50,
-        "research/2026-10-28-deep-FY26Q3/reconcile.json": '{"wrong": 0, "partial": 0}',
-        "research/2026-10-28-deep-FY26Q3/thesis-calibration.md": "校准" * 100,
-        "research/2026-10-28-deep-FY26Q3/management-delta.md": "指引" * 50,
-        "research/2026-10-28-deep-FY26Q3/knowledge-revision.json": '{"thesis": {}}',
-        "research/2026-10-28-deep-FY26Q3/mapping.md": "映射" * 50,
-        "research/2026-10-28-deep-FY26Q3/model-delta.md": "模型增量" * 50,
-        "model/META-model-v01.xlsx": "x" * 1200,
-    }
-    backend = _make_backend(base_files)
-    backend.workspace_dir = str(check_ws)
-    orig_exec = backend.aexecute.side_effect
+    def _build_check_backend(ledger_text: str) -> Any:
+        base_files = {
+            "drafts/2026-10-28-deep-FY26Q3.md": "深度" * 300,
+            f"{deep_r}/reconcile.md": "对账" * 50,
+            f"{deep_r}/reconcile.json": '{"wrong": 0, "partial": 0}',
+            f"{deep_r}/thesis-calibration.md": "校准" * 100,
+            f"{deep_r}/management-delta.md": "指引" * 50,
+            f"{deep_r}/knowledge-revision.json": '{"thesis": {}}',
+            f"{deep_r}/mapping.md": "映射" * 50,
+            f"{deep_r}/model-delta.md": "模型增量" * 50,
+            f"{deep_r}/model_dump/model-verification.json": ledger_text,
+            "model/META-model-v01.xlsx": "x" * 1200,
+        }
+        b = _make_backend(base_files)
+        b.workspace_dir = str(check_ws)
+        orig_exec = b.aexecute.side_effect
 
-    async def _exec_with_real_model_readable(command: str, *, timeout: int | None = None) -> Any:
-        if "model_readable.py" in command:
-            proc = subprocess.run(
-                ["bash", "-c", command],
-                cwd=check_ws,
-                env=run_env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        async def _exec_with_real_verify_done(command: str, *, timeout: int | None = None) -> Any:
+            if "model_check.py verify-done" in command:
+                proc = subprocess.run(
+                    ["bash", "-c", command],
+                    cwd=check_ws,
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
 
-            class _Resp:
-                def __init__(self, out: str, rc: int) -> None:
-                    self.output = out
-                    self.exit_code = rc
+                class _Resp:
+                    def __init__(self, out: str, rc: int) -> None:
+                        self.output = out
+                        self.exit_code = rc
 
-            return _Resp(proc.stdout + proc.stderr, proc.returncode)
-        return await orig_exec(command, timeout=timeout)
+                return _Resp(proc.stdout + proc.stderr, proc.returncode)
+            return await orig_exec(command, timeout=timeout)
 
-    backend.aexecute.side_effect = _exec_with_real_model_readable
+        b.aexecute.side_effect = _exec_with_real_verify_done
+        return b
+
     _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management", "models"])
     _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
     deep_params = {
@@ -6485,15 +6665,17 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
         "workspace_dir": ".",
         "release_date": "2026-10-28",
         "model_path": "model/META-model-v01.xlsx",
+        "manual": True,
     }
 
     # Non-ZIP file fails check_done validator
     check_xlsx.parent.mkdir(parents=True, exist_ok=True)
     check_xlsx.write_bytes(b"corrupt-bytes" * 120)
+    lp = _write_ledger_for(check_ws, "earnings-deep-update", deep_r, check_xlsx)
     res_non_zip_cd = await run_check_done(
         workflow="earnings-deep-update",
         params=deep_params,
-        backend=backend,
+        backend=_build_check_backend(lp.read_text(encoding="utf-8")),
         workspace_id=WS,
     )
     assert not res_non_zip_cd["done"]
@@ -6501,10 +6683,11 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
 
     # Valid ZIP with corrupt worksheet XML also fails check_done validator
     _write_corrupt_sheet_xml_zip(check_xlsx)
+    lp = _write_ledger_for(check_ws, "earnings-deep-update", deep_r, check_xlsx)
     res_bad_xml_cd = await run_check_done(
         workflow="earnings-deep-update",
         params=deep_params,
-        backend=backend,
+        backend=_build_check_backend(lp.read_text(encoding="utf-8")),
         workspace_id=WS,
     )
     assert not res_bad_xml_cd["done"]
@@ -6512,13 +6695,202 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
 
     # Real openpyxl workbook passes check_done validator
     _write_real_openpyxl_xlsx(check_xlsx)
+    lp = _write_ledger_for(check_ws, "earnings-deep-update", deep_r, check_xlsx)
     res_valid_cd = await run_check_done(
         workflow="earnings-deep-update",
         params=deep_params,
-        backend=backend,
+        backend=_build_check_backend(lp.read_text(encoding="utf-8")),
         workspace_id=WS,
     )
     assert not any("校验未通过" in item for item in res_valid_cd["missing"]), res_valid_cd["missing"]
+
+    # R2 #6a: Tampering ledger workflow to "company-model" on earnings-deep-update is caught by --expected-workflow
+    tampered_doc = json.loads(lp.read_text(encoding="utf-8"))
+    tampered_doc["workflow"] = "company-model"
+    tampered_text = json.dumps(tampered_doc, ensure_ascii=False)
+    lp.write_text(tampered_text, encoding="utf-8")
+    res_tampered_wf = await run_check_done(
+        workflow="earnings-deep-update",
+        params=deep_params,
+        backend=_build_check_backend(tampered_text),
+        workspace_id=WS,
+    )
+    assert not res_tampered_wf["done"]
+    assert any("校验未通过" in item and "workflow mismatch" in item for item in res_tampered_wf["missing"]), res_tampered_wf["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_check_done_anti_bypass_args_model_path_and_nonexistent_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 #6b & #6c:
+    - earnings-deep-update modeling branch is decided by args.json; omitting model_path
+      still enforces modeling + models doc, passing null or conflicting model_path fails.
+    - explicit run_id MUST locate this thread's completed run dir + status.json; missing
+      directory or non-terminal status fails without falling back to manual window."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-args"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    base_files = _with_full_language_sidecars(
+        {
+            draft_path: draft_text,
+            f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+            f"{r_rel}/management-delta.md": "指引兑现" * 25,
+            f"{r_rel}/reconcile.md": "对账说明" * 25,
+            f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+            f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+            "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
+            f"{run_dir}/status.json": json.dumps(
+                {"run_id": "run-deep-args", "name": "earnings-deep-update", "status": "completed", "updated_at": 100.0}
+            ),
+            f"{run_dir}/args.json": json.dumps(
+                {
+                    "ticker": "META",
+                    "quarter": "FY26Q3",
+                    "workspace_dir": ".",
+                    "release_date": "2026-10-28",
+                    "model_path": "model/META-model-v01.xlsx",
+                }
+            ),
+            f"{run_dir}/journal/审稿.json": json.dumps(
+                {
+                    "label": "审稿",
+                    "dispatches": [
+                        {
+                            "label": "审稿",
+                            "status": "ok",
+                            "seq": 1,
+                            "recorded_at": 50.0,
+                            "draft_sha256": _draft_hash(draft_text),
+                            "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+
+    # 1a. Omitting model_path at closing STILL enforces modeling stage + models doc from args.json
+    res_omit = await run_check_done(
+        workflow="earnings-deep-update",
+        params={"ticker": "META", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-10-28"},
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_omit["done"]
+    assert any("model-verification.json" in m for m in res_omit["missing"]), res_omit["missing"]
+    assert any("models" in m for m in res_omit["missing"]), res_omit["missing"]
+
+    # 1b. Explicitly passing model_path=None conflicts with args.json
+    res_null = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": None,
+        },
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_null["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_null["missing"]), res_null["missing"]
+
+    # 1c. Passing a different model_path conflicts with args.json
+    res_diff = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": "model/OTHER-model-v01.xlsx",
+        },
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_diff["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_diff["missing"]), res_diff["missing"]
+
+    # 1d. Launch had NO model_path, caller passes model_path -> conflict
+    no_model_files = dict(base_files)
+    no_model_files[f"{run_dir}/args.json"] = json.dumps(
+        {"ticker": "META", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-10-28"}
+    )
+    res_extra = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": "model/META-model-v01.xlsx",
+        },
+        backend=_make_backend(no_model_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_extra["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_extra["missing"]), res_extra["missing"]
+
+    # 2. Explicit run_id whose run directory does NOT exist must fail (never fall back to manual window!)
+    _patch_knowledge(monkeypatch, ["models"])
+    forged_files = {
+        "research/2026-10-28-model-META/model_dump/model-verification.json": json.dumps(
+            {
+                "schema_version": 2,
+                "workflow": "company-model",
+                "ticker": "META",
+                "run_id": "run-ghost-404",
+                "final_status": "delivered_with_open_issues",
+                "fix_rounds": 0,
+                "failed_stages": ["check", "consensus"],
+                "final_model_path": "model/META-model-v01.xlsx",
+                "final_model_sha256": "a" * 64,
+                "rounds": [],
+            }
+        )
+    }
+    res_ghost = await run_check_done(
+        workflow="company-model",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"},
+        backend=_make_backend(forged_files),
+        workspace_id=WS,
+        run_id="run-ghost-404",
+        thread_id="short-ghost",
+    )
+    assert not res_ghost["done"]
+    assert any("run-ghost-404" in m and "不得退回手动窗口" in m for m in res_ghost["missing"]), res_ghost["missing"]
+
+    # 3. Explicit run_id whose status.json is non-terminal ("running" or "failed") also fails
+    unfinished_files = dict(forged_files)
+    unfinished_files[".agents/threads/short-gh/workflows/run-ghost-404/status.json"] = json.dumps(
+        {"run_id": "run-ghost-404", "name": "company-model", "status": "failed", "updated_at": 100.0}
+    )
+    res_failed_status = await run_check_done(
+        workflow="company-model",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"},
+        backend=_make_backend(unfinished_files),
+        workspace_id=WS,
+        run_id="run-ghost-404",
+        thread_id="short-ghost",
+    )
+    assert not res_failed_status["done"]
+    assert any("非 completed" in m for m in res_failed_status["missing"]), res_failed_status["missing"]
 
 
 # --- Batch 5b: two freshness metrics on coverage board & 3 completion checks ---
@@ -7402,3 +7774,537 @@ async def test_b5b_earnings_calendar_scan_persisted_and_dates_confirmed_or_pendi
         thread_id="short-1",
     )
     assert res_already_reported["done"] is True, res_already_reported["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r3_deep_update_args_json_missing_corrupt_or_unreadable_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 #1: Once an earnings-deep-update run is located (status.json + journals present),
+    a missing, corrupt, or unreadable args.json MUST fail check_done rather than falling
+    back to caller params (omitting model_path); and status, journals, and args.json
+    resolve from the exact same run directory (even when thread_id is omitted)."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-r3"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    params_no_model = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-10-28",
+    }
+
+    def _deep_files(args_text: str | None) -> dict[str, str]:
+        files = _with_full_language_sidecars(
+            {
+                draft_path: draft_text,
+                f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+                f"{r_rel}/management-delta.md": "指引兑现" * 25,
+                f"{r_rel}/reconcile.md": "对账说明" * 25,
+                f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+                f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+                f"{run_dir}/status.json": json.dumps(
+                    {"run_id": "run-deep-r3", "name": "earnings-deep-update", "status": "completed", "updated_at": 100.0}
+                ),
+                f"{run_dir}/journal/审稿.json": json.dumps(
+                    {
+                        "label": "审稿",
+                        "dispatches": [
+                            {
+                                "label": "审稿",
+                                "status": "ok",
+                                "seq": 1,
+                                "recorded_at": 50.0,
+                                "draft_sha256": _draft_hash(draft_text),
+                                "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+        if args_text is not None:
+            files[f"{run_dir}/args.json"] = args_text
+        return files
+
+    # (a) Missing args.json -> MUST fail (cannot skip model verification)
+    res_missing = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(None)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_missing["done"] is False
+    assert any("args.json" in m and "启动记录" in m for m in res_missing["missing"]), res_missing["missing"]
+
+    # (b) Corrupt args.json -> MUST fail
+    res_corrupt = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files("{not-valid-json")),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_corrupt["done"] is False
+    assert any("args.json" in m and "损坏" in m for m in res_corrupt["missing"]), res_corrupt["missing"]
+
+    # (c) Unreadable args.json (transport/IO error) -> MUST fail
+    err_backend = _make_backend(_deep_files("{}"))
+    orig_aread = err_backend.aread_text.side_effect
+
+    async def _fail_args_read(path: str) -> str | None:
+        if path.endswith("/args.json"):
+            raise OSError("disk I/O error reading args.json")
+        return await orig_aread(path)
+
+    err_backend.aread_text.side_effect = _fail_args_read
+    res_io = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=err_backend,
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_io["done"] is False
+    assert any("args.json" in m and "读取失败" in m for m in res_io["missing"]), res_io["missing"]
+
+    # (d) Same run_dir resolution when explicit run_id is passed WITHOUT thread_id:
+    # status.json, journal/*.json, and args.json all resolve from the exact same run_dir!
+    with_model_args = json.dumps(
+        {**params_no_model, "model_path": "model/META-model-v01.xlsx"}
+    )
+    res_no_tid = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(with_model_args)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id=None,
+    )
+    assert res_no_tid["done"] is False
+    assert any("model-verification.json" in m for m in res_no_tid["missing"]), res_no_tid["missing"]
+    assert any("models" in m for m in res_no_tid["missing"]), res_no_tid["missing"]
+
+    # And missing args.json with run_id & thread_id=None ALSO fails cleanly
+    res_no_tid_missing = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(None)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id=None,
+    )
+    assert res_no_tid_missing["done"] is False
+    assert any("args.json" in m for m in res_no_tid_missing["missing"]), res_no_tid_missing["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r4_deep_update_args_json_empty_missing_fields_type_or_mismatch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 #1: earnings-deep-update launch args.json MUST validate required fields,
+    types, and consistency with closing params; `{}` or missing/mistyped/mismatched
+    fields MUST fail check_done instead of taking the no-model branch."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+    import src.dalton.tools.check_done_tools as _cdt_mod
+
+    monkeypatch.setattr(
+        _cdt_mod,
+        "_push_draft_since_epoch",
+        create_autospec(_cdt_mod._push_draft_since_epoch, return_value=10),
+    )
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-r4"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    params_no_model = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-10-28",
+    }
+
+    def _make_files(args_obj: dict[str, Any]) -> dict[str, str]:
+        return _with_full_language_sidecars(
+            {
+                draft_path: draft_text,
+                "drafts/2026-10-28-deep-FY26Q3.audit.md": _sidecar_for(draft_text),
+                f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+                f"{r_rel}/management-delta.md": "指引兑现" * 25,
+                f"{r_rel}/reconcile.md": "对账说明" * 25,
+                f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+                f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+                "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
+                f"{run_dir}/status.json": json.dumps(
+                    {
+                        "run_id": "run-deep-r4",
+                        "name": "earnings-deep-update",
+                        "status": "completed",
+                        "started_at": 10.0,
+                        "updated_at": 100.0,
+                    }
+                ),
+                f"{run_dir}/args.json": json.dumps(args_obj),
+                f"{run_dir}/journal/审稿.json": json.dumps(
+                    {
+                        "label": "审稿",
+                        "dispatches": [
+                            {
+                                "label": "审稿",
+                                "status": "ok",
+                                "seq": 1,
+                                "recorded_at": 50.0,
+                                "draft_sha256": _draft_hash(draft_text),
+                                "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    async def _check(args_obj: dict[str, Any]) -> dict[str, Any]:
+        return await run_check_done(
+            workflow="earnings-deep-update",
+            params=params_no_model,
+            backend=_make_backend(_make_files(args_obj)),
+            workspace_id=WS,
+            run_id="run-deep-r4",
+            thread_id="short-deep-uuid",
+        )
+
+    # 1. Empty JSON object `{}` MUST fail (previously skipped model_verification & models doc!)
+    res_empty = await _check({})
+    assert res_empty["done"] is False
+    assert any("args.json" in m and "必填字段" in m for m in res_empty["missing"]), res_empty["missing"]
+
+    # 2. Missing a required field (`quarter`) MUST fail
+    res_missing_field = await _check({"ticker": "META", "workspace_dir": ".", "release_date": "2026-10-28"})
+    assert res_missing_field["done"] is False
+    assert any("quarter" in m for m in res_missing_field["missing"]), res_missing_field["missing"]
+
+    # 3. Wrong type on required field or optional `model_path` MUST fail
+    res_bad_req_type = await _check({**params_no_model, "ticker": 123})
+    assert res_bad_req_type["done"] is False
+    assert any("ticker" in m for m in res_bad_req_type["missing"]), res_bad_req_type["missing"]
+
+    res_bad_mp_type = await _check({**params_no_model, "model_path": 999})
+    assert res_bad_mp_type["done"] is False
+    assert any("model_path" in m and "类型异常" in m for m in res_bad_mp_type["missing"]), res_bad_mp_type["missing"]
+
+    # 4. Closing param mismatch with args.json MUST fail
+    res_mismatch = await _check({**params_no_model, "quarter": "FY26Q2"})
+    assert res_mismatch["done"] is False
+    assert any("quarter" in m and "不一致" in m for m in res_mismatch["missing"]), res_mismatch["missing"]
+
+    # 5. Complete, correctly typed, consistent args.json without model_path passes cleanly
+    res_valid = await _check(params_no_model)
+    assert res_valid["done"] is True, res_valid["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r5_full_coverage_verify_done_enforces_prepare_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 #4: `dalton_check_done` for `full-coverage` extracts the effective mode from
+    this run's `建模准备` journal dispatch, passes `--expected-mode` to `model_check.py verify-done`,
+    and rejects a tampered `mode=update` ledger (and 4-sheet workbook) on a `build` run."""
+    import importlib.util
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import openpyxl
+
+    scripts_src = Path(__file__).resolve().parents[3] / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    ws = tmp_path / "ws_fc_mode_r5"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
+
+    if str(scripts_src) not in sys.path:
+        sys.path.insert(0, str(scripts_src))
+    spec = importlib.util.spec_from_file_location("_mchk_r5_cd", scripts_src / "model_check.py")
+    assert spec and spec.loader
+    mchk_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mchk_mod)
+
+    # Create a 4-sheet update workbook (missing build-only sheets like DCF / Scenarios)
+    r_rel = "research/2026-10-23-fc"
+    xlsx_p = ws / "model" / "META-model-v01.xlsx"
+    xlsx_p.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    wb.active.title = "README & Changelog"
+    wb.active["A1"] = "v01"
+    for sh in ("Facts", "Guidance vs Actual", "Street vs House", "Checks"):
+        wb.create_sheet(sh)["A1"] = sh
+    wb.save(xlsx_p)
+    wb.close()
+
+    # Write a ledger whose mode was tampered to "update" (so without --expected-mode it passes!)
+    mchk_mod.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="META",
+        research_dir=ws / r_rel,
+        candidate_path=xlsx_p,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id="run-fc-r5-build",
+        workflow="full-coverage",
+        mode="update",
+    )
+    ledger_text = (ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8")
+
+    memo_text = "# 深度备忘录\n" + "核心分析内容。" * 150
+    memo_sha = _draft_hash(memo_text)
+    run_prefix = ".agents/threads/short-fc/workflows/run-fc-r5-build"
+    base_files = {
+        f"{r_rel}/facts.md": "<!-- FACTS-LEDGER\n{}\n-->\n" + "底表" * 300,
+        f"{r_rel}/questions.md": "# 12 问\n" + "问题" * 150,
+        f"{r_rel}/ea.md": "A" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/eb.md": "B" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ec.md": "C" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ed.md": "D" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/model_dump/model-verification.json": ledger_text,
+        "model/META-model-v01.xlsx": "x" * 1200,
+        "drafts/2026-10-23-memo.md": memo_text,
+        "drafts/2026-10-23-memo.audit.md": f"# 数字核验报告\n- **草稿哈希**：`{memo_sha[:16]}…`\n",
+        f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}),
+        f"{run_prefix}/status.json": json.dumps(
+            {"run_id": "run-fc-r5-build", "name": "full-coverage", "status": "completed", "updated_at": 2.0}
+        ),
+        f"{run_prefix}/journal/建模准备.json": json.dumps(
+            {
+                "label": "建模准备",
+                "dispatches": [
+                    {
+                        "label": "建模准备",
+                        "status": "ok",
+                        "seq": 3,
+                        "recorded_at": 1.2,
+                        "result": {"files": ["fp.json"], "summary": "build mode", "mode": "build"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        f"{run_prefix}/journal/独立审稿.json": json.dumps(
+            {
+                "label": "独立审稿",
+                "dispatches": [
+                    {
+                        "label": "独立审稿",
+                        "status": "ok",
+                        "seq": 9,
+                        "recorded_at": 1.9,
+                        "draft_sha256": memo_sha,
+                        "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    seen_verify_cmds: list[str] = []
+    run_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
+    backend = _make_backend(base_files)
+    backend.workspace_dir = str(ws)
+    orig_exec = backend.aexecute.side_effect
+
+    async def _exec_real_verify_done(command: str, *, timeout: int | None = None) -> Any:
+        if "model_check.py verify-done" in command:
+            seen_verify_cmds.append(command)
+            proc = subprocess.run(
+                ["bash", "-c", command.replace("python3 ", f"{sys.executable} ")],
+                cwd=ws,
+                env=run_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            class _Resp:
+                def __init__(self, out: str, rc: int) -> None:
+                    self.output = out
+                    self.exit_code = rc
+
+            return _Resp(proc.stdout + proc.stderr, proc.returncode)
+        return await orig_exec(command, timeout=timeout)
+
+    backend.aexecute.side_effect = _exec_real_verify_done
+    _patch_knowledge(monkeypatch, ["company", "thesis", "debate", "drivers", "management", "models"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED")])
+
+    res = await run_check_done(
+        workflow="full-coverage",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-23"},
+        backend=backend,
+        workspace_id=WS,
+        run_id="run-fc-r5-build",
+        thread_id="short-fc",
+    )
+    assert seen_verify_cmds and "--expected-mode build" in seen_verify_cmds[0], seen_verify_cmds
+    assert res["done"] is False
+    assert any("模式" in m and "不一致" in m for m in res["missing"]), res["missing"]
+    assert any("mode mismatch" in m or "DCF" in m for m in res["missing"]), res["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r6_full_coverage_manual_requires_explicit_mode_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6 #6: Manual `full-coverage` `dalton_check_done` (`manual=True`) requires explicit
+    `params['mode']` (`build` or `update`). Missing or invalid `mode` fails closed instead of
+    falling back to the self-reported ledger mode; SKILL.md manual example carries `mode`."""
+    import importlib.util
+    import shutil
+    import subprocess
+    import sys
+    import openpyxl
+
+    repo_root = Path(__file__).resolve().parents[3]
+    fc_skill_text = (repo_root / "plugins" / "dalton" / "skills" / "dalton-full-coverage" / "SKILL.md").read_text(encoding="utf-8")
+    assert '"mode": "<build|update>", "manual": true' in fc_skill_text
+
+    scripts_src = repo_root / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    ws = tmp_path / "ws_fc_manual_r6"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
+
+    if str(scripts_src) not in sys.path:
+        sys.path.insert(0, str(scripts_src))
+    spec = importlib.util.spec_from_file_location("_mchk_r6_cd", scripts_src / "model_check.py")
+    assert spec and spec.loader
+    mchk_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mchk_mod)
+
+    r_rel = "research/2026-10-23-fc"
+    xlsx_p = ws / "model" / "META-model-v01.xlsx"
+    xlsx_p.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    wb.active.title = "README & Changelog"
+    wb.active["A1"] = "v01"
+    for sh in ("Facts", "Guidance vs Actual", "Street vs House", "Checks"):
+        wb.create_sheet(sh)["A1"] = sh
+    wb.save(xlsx_p)
+    wb.close()
+
+    # Manual ledger (run_id=None) claiming mode="update" on 4-sheet workbook
+    mchk_mod.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="META",
+        research_dir=ws / r_rel,
+        candidate_path=xlsx_p,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id=None,
+        workflow="full-coverage",
+        mode="update",
+    )
+    ledger_text = (ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8")
+
+    memo_text = "# 深度备忘录\n" + "核心分析内容。" * 150
+    memo_sha = _draft_hash(memo_text)
+    base_files = {
+        f"{r_rel}/facts.md": "<!-- FACTS-LEDGER\n{}\n-->\n" + "底表" * 300,
+        f"{r_rel}/questions.md": "# 12 问\n" + "问题" * 150,
+        f"{r_rel}/ea.md": "A" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/eb.md": "B" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ec.md": "C" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ed.md": "D" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/model_dump/model-verification.json": ledger_text,
+        "model/META-model-v01.xlsx": "x" * 1200,
+        "drafts/2026-10-23-memo.md": memo_text,
+        "drafts/2026-10-23-memo.audit.md": f"# 数字核验报告\n- **草稿哈希**：`{memo_sha[:16]}…`\n",
+        f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}),
+        f"{r_rel}/review.json": json.dumps(
+            {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": [], "draft_sha256": memo_sha},
+            ensure_ascii=False,
+        ),
+    }
+    _with_full_language_sidecars(base_files)
+
+    run_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
+    _patch_knowledge(monkeypatch, ["company", "thesis", "debate", "drivers", "management", "models"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED")])
+
+    async def _run_manual(extra_params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        seen_cmds: list[str] = []
+        backend = _make_backend(base_files)
+        backend.workspace_dir = str(ws)
+        orig_exec = backend.aexecute.side_effect
+
+        async def _exec(command: str, *, timeout: int | None = None) -> Any:
+            if "model_check.py verify-done" in command:
+                seen_cmds.append(command)
+                proc = subprocess.run(
+                    ["bash", "-c", command.replace("python3 ", f"{sys.executable} ")],
+                    cwd=ws,
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                class _Resp:
+                    def __init__(self, out: str, rc: int) -> None:
+                        self.output = out
+                        self.exit_code = rc
+
+                return _Resp(proc.stdout + proc.stderr, proc.returncode)
+            return await orig_exec(command, timeout=timeout)
+
+        backend.aexecute.side_effect = _exec
+        res = await run_check_done(
+            workflow="full-coverage",
+            params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-23", "manual": True, **extra_params},
+            backend=backend,
+            workspace_id=WS,
+            thread_id="short-fc-manual",
+        )
+        return res, seen_cmds
+
+    # 1. Missing mode -> FAILS CLOSED (never falls back to self-reported ledger mode, even with model_path!)
+    res_missing, cmds_missing = await _run_manual({})
+    assert res_missing["done"] is False
+    assert any("mode" in m for m in res_missing["missing"]), res_missing["missing"]
+    assert cmds_missing and "--expected-mode" not in cmds_missing[0]
+
+    res_missing_with_mp, _ = await _run_manual({"model_path": "model/META-model-v01.xlsx"})
+    assert res_missing_with_mp["done"] is False
+    assert any("mode" in m for m in res_missing_with_mp["missing"]), res_missing_with_mp["missing"]
+
+    # 2. Invalid mode -> FAILS CLOSED
+    res_invalid, _ = await _run_manual({"mode": "auto"})
+    assert res_invalid["done"] is False
+    assert any("params.mode 无效" in m for m in res_invalid["missing"]), res_invalid["missing"]
+
+    # 3. mode="build" on tampered mode="update" 4-sheet workbook -> FAILS with mode mismatch & missing build sheets
+    res_build, cmds_build = await _run_manual({"mode": "build"})
+    assert res_build["done"] is False
+    assert cmds_build and "--expected-mode build" in cmds_build[0]
+    assert any("不一致" in m for m in res_build["missing"]), res_build["missing"]
+    assert any("DCF" in m or "mode mismatch" in m for m in res_build["missing"]), res_build["missing"]
+
+    # 4. mode="update" matching 4-sheet update workbook -> PASSES
+    res_update, cmds_update = await _run_manual({"mode": "update"})
+    assert cmds_update and "--expected-mode update" in cmds_update[0]
+    assert res_update["done"] is True, res_update["missing"]

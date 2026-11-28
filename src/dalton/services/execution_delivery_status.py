@@ -927,6 +927,20 @@ def _set_delivery_summary(item: Any, summary: dict[str, Any] | None) -> None:
             item.delivery_summary = ExecutionDeliverySummary.model_validate(summary)
 
 
+def _set_failure_notice_summary(item: Any, summary: dict[str, Any] | None) -> None:
+    if isinstance(item, MutableMapping):
+        if summary is not None or "failure_notice" in item:
+            item["failure_notice"] = summary
+        return
+    if hasattr(item, "failure_notice"):
+        if summary is None:
+            item.failure_notice = None
+        else:
+            from src.server.models.automation import FailureNoticeSummary
+
+            item.failure_notice = FailureNoticeSummary.model_validate(summary)
+
+
 async def enrich_executions_with_delivery_summary(
     executions: Sequence[Any],
     *,
@@ -935,7 +949,7 @@ async def enrich_executions_with_delivery_summary(
     conn: Any = None,
     now: datetime | None = None,
 ) -> None:
-    """Attach ``delivery_summary`` onto each execution dict or response model in-place."""
+    """Attach ``delivery_summary`` (and ``failure_notice`` when enabled) onto each execution in-place."""
     if not executions:
         return
 
@@ -948,6 +962,7 @@ async def enrich_executions_with_delivery_summary(
                 exec_ids.append(clean)
 
     notify_by_exec: dict[str, list[dict[str, Any]]] = {}
+    failure_notice_by_exec: dict[str, dict[str, Any]] = {}
     if exec_ids and is_dalton_enabled():
         try:
             notify_by_exec = await load_execution_notify_rows(exec_ids, conn=conn)
@@ -959,6 +974,21 @@ async def enrich_executions_with_delivery_summary(
                 len(exec_ids),
                 type(exc).__name__,
             )
+        from src.dalton.settings import is_failure_notice_enabled
+
+        if is_failure_notice_enabled():
+            try:
+                from src.dalton.notify.failure_receipts import load_failure_notice_summaries
+
+                failure_notice_by_exec = await load_failure_notice_summaries(exec_ids, conn=conn)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - failure-notice enrichment must not fail execution reads
+                logger.warning(
+                    "[EXEC_DELIVERY_STATUS] Failed loading dalton_failure_notices for %d execution(s): %s",
+                    len(exec_ids),
+                    type(exc).__name__,
+                )
 
     for item in executions:
         raw_id = _get_field(item, "automation_execution_id") or _get_field(item, "run_id")
@@ -973,6 +1003,8 @@ async def enrich_executions_with_delivery_summary(
             now=now,
         )
         _set_delivery_summary(item, summary)
+        if eid in failure_notice_by_exec:
+            _set_failure_notice_summary(item, failure_notice_by_exec[eid])
 
 
 async def enrich_automations_with_delivery_summary(

@@ -532,3 +532,121 @@ class TestAutomationRunsListResponse:
     def test_empty(self):
         resp = AutomationRunsListResponse(executions=[], has_more=False)
         assert resp.has_more is False
+
+
+# DALTON-HOOK(execution-delivery-status): verify /openapi.json keeps full execution response schemas
+def test_openapi_json_preserves_execution_response_schemas_with_switch_off_and_on(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Execution response models retain full typed schemas in /openapi.json regardless of
+    DALTON_FAILURE_NOTICE_ENABLED while still omitting null failure_notice when OFF."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.server.app import automations as automations_app
+    from src.server.models.automation import (
+        AutomationRunResponse,
+        ScriptExecutionResponse,
+        ScriptRunResponse,
+    )
+
+    app = FastAPI()
+    app.include_router(automations_app.router)
+    client = TestClient(app)
+
+    expected_models = {
+        "AutomationExecutionResponse": {
+            "automation_execution_id",
+            "automation_id",
+            "status",
+            "scheduled_at",
+            "failure_reason",
+            "delivery_summary",
+            "failure_notice",
+            "created_at",
+        },
+        "AutomationRunResponse": {
+            "automation_execution_id",
+            "automation_id",
+            "automation_name",
+            "trigger_type",
+            "status",
+            "failure_notice",
+        },
+        "ScriptExecutionResponse": {
+            "automation_execution_id",
+            "automation_id",
+            "status",
+            "scheduled_at",
+            "engine_kind",
+            "failure_notice",
+        },
+        "ScriptRunResponse": {
+            "automation_execution_id",
+            "automation_id",
+            "automation_name",
+            "status",
+            "engine_kind",
+            "failure_notice",
+        },
+    }
+
+    for flag in ("0", "1"):
+        monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", flag)
+        app.openapi_schema = None
+        resp = client.get("/openapi.json")
+        assert resp.status_code == 200
+        schemas = resp.json()["components"]["schemas"]
+        for model_name, required_props in expected_models.items():
+            assert model_name in schemas, f"{model_name} missing from /openapi.json"
+            schema = schemas[model_name]
+            assert schema.get("type") == "object"
+            props = schema.get("properties") or {}
+            assert required_props.issubset(props.keys()), (
+                f"{model_name} missing properties: {required_props - set(props.keys())}"
+            )
+
+    # Verify field-level switch behavior on serialization
+    exec_id = uuid.uuid4()
+    auto_id = uuid.uuid4()
+    exec_model = AutomationExecutionResponse(
+        automation_execution_id=exec_id,
+        automation_id=auto_id,
+        status="failed",
+        scheduled_at=NOW,
+        created_at=NOW,
+    )
+    run_model = AutomationRunResponse(
+        automation_execution_id=exec_id,
+        automation_id=auto_id,
+        automation_name="Daily",
+        trigger_type="cron",
+        status="failed",
+        scheduled_at=NOW,
+        created_at=NOW,
+    )
+    script_exec = ScriptExecutionResponse(
+        automation_execution_id=exec_id,
+        automation_id="data:pm-market-state",
+        status="failed",
+        scheduled_at=NOW,
+        created_at=NOW,
+    )
+    script_run = ScriptRunResponse(
+        automation_execution_id=exec_id,
+        automation_id="data:pm-market-state",
+        automation_name="PM Market State",
+        status="failed",
+        scheduled_at=NOW,
+        created_at=NOW,
+    )
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    for m in (exec_model, run_model, script_exec, script_run):
+        assert "failure_notice" not in m.model_dump()
+        assert "failure_notice" not in m.model_dump(mode="json")
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    for m in (exec_model, run_model, script_exec, script_run):
+        assert "failure_notice" in m.model_dump()
+        assert m.model_dump()["failure_notice"] is None

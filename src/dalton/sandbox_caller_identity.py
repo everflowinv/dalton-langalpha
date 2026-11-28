@@ -29,7 +29,7 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-__all__ = ["bound_caller", "caller_env", "sign_caller_token"]
+__all__ = ["bound_caller", "caller_env", "sign_caller_token", "verify_caller_token"]
 
 _CALLER_TOKEN_HKDF_INFO = b"dalton-bridge-caller-v1"
 _DEFAULT_EXP_FALLBACK_S = 21600
@@ -56,6 +56,16 @@ def _clean(value: Any) -> str:
 
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode_strict(segment: str) -> bytes:
+    if not segment or "=" in segment:
+        raise ValueError("invalid base64url segment")
+    padded = segment + "=" * ((4 - len(segment) % 4) % 4)
+    decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    if _b64url_encode(decoded) != segment:
+        raise ValueError("non-canonical base64url segment")
+    return decoded
 
 
 def _derive_caller_hmac_key(admin_token: str | None = None) -> bytes | None:
@@ -100,7 +110,12 @@ def sign_caller_token(
     exp: int | float | None = None,
     admin_token: str | None = None,
 ) -> str | None:
-    """Sign ``{user, workspace, thread, run_origin, exp}`` with the derived HKDF subkey."""
+    """Sign caller identity and execution claims with the derived HKDF subkey.
+
+    Payload fields: ``user``, ``workspace``, ``thread``, ``run_origin``,
+    ``run_id``, ``turn_origin_automation_id``, ``automation_execution_id``,
+    and ``exp``.
+    """
     hmac_key = _derive_caller_hmac_key(admin_token)
     if hmac_key is None:
         return None
@@ -110,6 +125,9 @@ def sign_caller_token(
         "workspace": _clean(claims.get("workspace")),
         "thread": _clean(claims.get("thread")),
         "run_origin": "automation" if raw_origin == "automation" else "",
+        "run_id": _clean(claims.get("run_id")),
+        "turn_origin_automation_id": _clean(claims.get("turn_origin_automation_id")),
+        "automation_execution_id": _clean(claims.get("automation_execution_id")),
         "exp": _coerce_exp(exp if exp is not None else claims.get("exp")),
     }
     payload_bytes = json.dumps(
@@ -120,6 +138,59 @@ def sign_caller_token(
     return f"{payload_b64}.{_b64url_encode(sig)}"
 
 
+def verify_caller_token(
+    token: str,
+    *,
+    admin_token: str | None = None,
+    now_ts: float | None = None,
+) -> dict[str, str] | None:
+    """Verify HMAC-SHA256 signature and ``exp`` on an opaque ``DALTON_CALLER_TOKEN``.
+
+    Returns the full claim dictionary ``{user, workspace, thread, run_origin,
+    run_id, turn_origin_automation_id, automation_execution_id}`` on success,
+    or ``None`` on any format, signature, or expiry failure.
+    """
+    try:
+        hmac_key = _derive_caller_hmac_key(admin_token)
+        if hmac_key is None:
+            return None
+        raw = str(token or "").strip()
+        parts = raw.split(".")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        payload_b64, sig_b64 = parts[0], parts[1]
+        payload_ascii = payload_b64.encode("ascii")
+        supplied_sig = _b64url_decode_strict(sig_b64)
+        expected_sig = hmac.new(hmac_key, payload_ascii, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_sig, expected_sig):
+            return None
+        claims = json.loads(_b64url_decode_strict(payload_b64).decode("utf-8"))
+        if not isinstance(claims, dict):
+            return None
+        exp = claims.get("exp")
+        if (
+            not isinstance(exp, (int, float))
+            or isinstance(exp, bool)
+            or not math.isfinite(exp)
+        ):
+            return None
+        now = float(now_ts) if now_ts is not None else time.time()
+        if now > float(exp):
+            return None
+        raw_origin = _clean(claims.get("run_origin")).lower()
+        return {
+            "user": _clean(claims.get("user")),
+            "workspace": _clean(claims.get("workspace")),
+            "thread": _clean(claims.get("thread")),
+            "run_origin": "automation" if raw_origin == "automation" else "",
+            "run_id": _clean(claims.get("run_id")),
+            "turn_origin_automation_id": _clean(claims.get("turn_origin_automation_id")),
+            "automation_execution_id": _clean(claims.get("automation_execution_id")),
+        }
+    except Exception:
+        return None
+
+
 @contextlib.contextmanager
 def bound_caller(
     user_id: Any,
@@ -127,6 +198,9 @@ def bound_caller(
     thread_id: Any,
     *,
     run_origin: Any = None,
+    run_id: Any = None,
+    turn_origin_automation_id: Any = None,
+    automation_execution_id: Any = None,
     exp: int | float | None = None,
 ) -> Iterator[None]:
     """Bind the caller's identity for the awaited body, best effort.
@@ -141,6 +215,9 @@ def bound_caller(
             ("workspace", workspace_id),
             ("thread", thread_id),
             ("run_origin", run_origin),
+            ("run_id", run_id),
+            ("turn_origin_automation_id", turn_origin_automation_id),
+            ("automation_execution_id", automation_execution_id),
         )
         if (cleaned := _clean(raw))
     }

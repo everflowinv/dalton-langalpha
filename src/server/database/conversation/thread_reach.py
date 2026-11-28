@@ -28,8 +28,9 @@ def served_on_computer_sql(thread: str) -> str:
     there, where no person asks: every thread of a personal workspace, and a
     shared workspace's once shared with it. The workspace's own row decides
     which kind it is."""
-    return f"""({thread}.workspace_shared_at IS NOT NULL OR NOT EXISTS (
-        SELECT 1 FROM shared_workspaces s WHERE s.workspace_id = {thread}.workspace_id))"""
+    # DALTON-HOOK(personal-integrations): exclude personal-integration threads from shared computer transcript mount
+    return f"""(NOT COALESCE({thread}.has_personal_integration_data, FALSE) AND ({thread}.workspace_shared_at IS NOT NULL OR NOT EXISTS (
+        SELECT 1 FROM shared_workspaces s WHERE s.workspace_id = {thread}.workspace_id)))"""
 
 
 def reaches_sql(thread: str, user: str) -> str:
@@ -122,6 +123,23 @@ async def unreached_folders(
     return set(names) - reached
 
 
+async def served_on_computer(thread_id: str, *, conn=None) -> bool:
+    """Whether the thread's computer serves its transcript to any agent there
+    (``served_on_computer_sql``); False for no such thread."""
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return False
+    async with pool.get_db_connection(conn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT {served_on_computer_sql('t')} FROM conversation_threads t"
+                " WHERE t.conversation_thread_id = %s",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
+    return bool(row and row[0])
+
+
 async def private_to(thread_id: str, *, conn=None) -> Optional[str]:
     """The one person the thread's events are for: its starter while they
     keep it private, None once it is shared, outside a shared workspace,
@@ -131,9 +149,14 @@ async def private_to(thread_id: str, *, conn=None) -> Optional[str]:
         return None
     async with pool.get_db_connection(conn) as conn:
         async with conn.cursor() as cur:
+            # DALTON-HOOK(personal-integrations): resolve creator for personal-integration threads excluded from shared computer mount
             await cur.execute(
-                "SELECT created_by FROM conversation_threads"
-                " WHERE conversation_thread_id = %s AND workspace_shared_at IS NULL",
+                "SELECT CASE WHEN COALESCE(t.has_personal_integration_data, FALSE)"
+                "            THEN COALESCE(t.created_by, t.user_id, w.user_id)"
+                "            ELSE t.created_by END"
+                " FROM conversation_threads t"
+                " JOIN workspaces w ON w.workspace_id = t.workspace_id"
+                " WHERE t.conversation_thread_id = %s AND t.workspace_shared_at IS NULL",
                 (thread_id,),
             )
             row = await cur.fetchone()
@@ -188,9 +211,10 @@ async def set_shared(thread_id: str, user_id: str, shared: bool) -> SetResult:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    "SELECT created_by, workspace_shared_at, is_shared, share_permissions"
+                    "SELECT created_by, workspace_shared_at, is_shared, share_permissions,"
+                    " COALESCE(has_personal_integration_data, FALSE) AS has_personal_integration_data"
                     " FROM conversation_threads"
-                    " WHERE conversation_thread_id = %s FOR UPDATE",
+                    " WHERE conversation_thread_id = %s FOR UPDATE",  # DALTON-HOOK(personal-integrations)
                     (thread_id,),
                 )
                 row = await cur.fetchone()
@@ -198,6 +222,10 @@ async def set_shared(thread_id: str, user_id: str, shared: bool) -> SetResult:
                     return "missing", None, None
                 if row["created_by"] != user_id:
                     return "not_starter", None, None
+                # DALTON-HOOK(personal-integrations): block workspace sharing of personal-integration threads under FOR UPDATE
+                if shared and row.get("has_personal_integration_data"):
+                    from src.dalton.services.personal_integration_guard import PersonalIntegrationNotSharableError
+                    raise PersonalIntegrationNotSharableError()
                 if not shared and row["workspace_shared_at"] is not None:
                     await cur.execute(
                         f"SELECT {OTHERS_SENT_SQL} AS others FROM conversation_threads t"

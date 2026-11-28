@@ -74,6 +74,8 @@ def storage(monkeypatch):
         return True
 
     monkeypatch.setattr(ic, "is_storage_enabled", lambda: True)
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs when exercising upstream image-capture rewrite
+    monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
     monkeypatch.setattr(ic, "upload_bytes", upload_bytes)
     monkeypatch.setattr(ic, "get_public_url", lambda key: f"https://cdn.test/{key}")
     return uploads
@@ -207,6 +209,8 @@ async def test_download_failure_leaves_path(storage):
 @pytest.mark.asyncio
 async def test_upload_failure_leaves_path(monkeypatch):
     monkeypatch.setattr(ic, "is_storage_enabled", lambda: True)
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs to exercise upload-failure fallback
+    monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
     monkeypatch.setattr(ic, "upload_bytes", lambda *a, **k: False)
     monkeypatch.setattr(ic, "get_public_url", lambda key: f"https://cdn.test/{key}")
     sandbox = _FakeSandbox({"/home/workspace/a.png": PNG})

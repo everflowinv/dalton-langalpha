@@ -116,6 +116,7 @@ class TaskEvaluationResult:
     failure_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
+    failure_code: str | None = None
 
 
 EvaluatorFn = Callable[[TaskEvaluationContext], TaskEvaluationResult]
@@ -609,6 +610,7 @@ def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
             ok=False,
             status="timed_out",
             failure_reason=reason,
+            failure_code=reason,
             details={"timeout_kind": kind},
         )
     if ctx.oom_killed:
@@ -616,43 +618,61 @@ def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
             ok=False,
             status="failed",
             failure_reason="oom_killed",
+            failure_code="oom_killed",
         )
     if ctx.exit_code != 0:
         last_obj = extract_last_json_object(ctx.stdout)
         if isinstance(last_obj, dict):
+            raw_index_dates = last_obj.get("index_dates")
+            clean_index_dates = (
+                {
+                    str(k): str(v).strip()
+                    for k, v in raw_index_dates.items()
+                    if v is not None and str(v).strip()
+                }
+                if isinstance(raw_index_dates, dict)
+                else {}
+            )
             failure_summary = last_obj.get("failure_summary")
             if isinstance(failure_summary, str) and failure_summary.strip():
+                details_map: dict[str, Any] = {"failure_summary": failure_summary.strip()}
+                if clean_index_dates:
+                    details_map["index_dates"] = clean_index_dates
                 return TaskEvaluationResult(
                     ok=False,
                     status="failed",
                     failure_reason=failure_summary.strip(),
+                    failure_code=f"exit_code_{ctx.exit_code}",
+                    details=details_map,
                 )
             err_reason = (
                 last_obj.get("stale_reason")
                 or last_obj.get("reason")
                 or last_obj.get("error")
             )
-            index_dates = last_obj.get("index_dates")
             dates_suffix = ""
-            if isinstance(index_dates, dict) and index_dates:
-                parts = [
-                    f"{k}={v}"
-                    for k, v in index_dates.items()
-                    if v is not None and str(v).strip()
-                ]
-                if parts:
-                    dates_suffix = f" | 数据日期: {', '.join(parts)}"
+            if clean_index_dates:
+                parts = [f"{k}={v}" for k, v in clean_index_dates.items()]
+                dates_suffix = f" | 数据日期: {', '.join(parts)}"
             if isinstance(err_reason, str) and err_reason.strip():
+                err_str = err_reason.strip()
+                details_map = {"raw_error": err_str}
+                if clean_index_dates:
+                    details_map["index_dates"] = clean_index_dates
                 return TaskEvaluationResult(
                     ok=False,
                     status="failed",
-                    failure_reason=f"{err_reason.strip()}{dates_suffix}",
+                    failure_reason=f"{err_str}{dates_suffix}",
+                    failure_code=None,
+                    details=details_map,
                 )
             if dates_suffix:
                 return TaskEvaluationResult(
                     ok=False,
                     status="failed",
                     failure_reason=f"exit_code_{ctx.exit_code}{dates_suffix}",
+                    failure_code=f"exit_code_{ctx.exit_code}",
+                    details={"index_dates": clean_index_dates},
                 )
         if ctx.job_key in (T1_JOB_KEY, T29_JOB_KEY, "T1", "T29"):
             if "openclaw_not_updated" in (ctx.stdout or ""):
@@ -660,11 +680,13 @@ def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
                     ok=False,
                     status="failed",
                     failure_reason="openclaw_not_updated",
+                    failure_code="openclaw_not_updated",
                 )
         return TaskEvaluationResult(
             ok=False,
             status="failed",
             failure_reason=f"exit_code_{ctx.exit_code}",
+            failure_code=f"exit_code_{ctx.exit_code}",
         )
 
     evaluator = get_evaluator(ctx.job_key)

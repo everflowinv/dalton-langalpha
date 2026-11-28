@@ -23,6 +23,7 @@ from src.dalton.database.channel_gateway import (
 )
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import (
+    _build_feishu_personal_redirect_notice_card,
     _default_notify_admin,
     _resolve_unit_managed_notify_gate,
     _split_target_channel,
@@ -307,12 +308,42 @@ async def _dm_identity_matches(
     return (await cur.fetchone()) is not None
 
 
+async def _read_thread_personal_owner(
+    cur: Any,
+    thread_id: str | None,
+) -> tuple[bool, str | None]:
+    """Return ``(has_personal_integration_data, thread_creator_user_id)`` from ``conversation_threads``."""
+    if cur is None or not thread_id:
+        return False, None
+    cleaned = str(thread_id).strip()
+    try:
+        UUID(cleaned)
+    except ValueError:
+        return False, None
+    await cur.execute(
+        """
+        SELECT COALESCE(has_personal_integration_data, FALSE) AS has_personal_integration_data,
+               user_id AS thread_user_id
+        FROM conversation_threads
+        WHERE conversation_thread_id = %s::uuid
+        LIMIT 1
+        """,
+        (cleaned,),
+    )
+    row = await cur.fetchone()
+    if not isinstance(row, Mapping):
+        return False, None
+    owner = str(row.get("thread_user_id") or "").strip() or None
+    return bool(row.get("has_personal_integration_data")), owner
+
+
 async def _eligibility(
     row: Mapping[str, Any],
     payload: Mapping[str, Any],
     target: str,
     *,
     cur: Any = None,
+    allow_personal_dm_redirect: bool = False,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]],
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]],
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]],
@@ -403,11 +434,12 @@ async def _eligibility(
     )
     if not gate_ok:
         return False, gate_reason
-    allowed, reason, _targets = await evaluate_user_notify_eligibility(
+    allowed, reason, _effective_targets = await evaluate_user_notify_eligibility(
         user_id,
         automation,
         target=target,
         include_chat_targets=gate_include_chats,
+        allow_personal_dm_redirect=allow_personal_dm_redirect,
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,
@@ -496,11 +528,85 @@ async def decide_automation_notification_plan(
             requested_target=target,
         )
 
+    thread_id = (
+        str(
+            payload.get("thread_id")
+            or payload.get("conversation_thread_id")
+            or row.get("conversation_thread_id")
+            or row.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
+    thread_is_personal_private, thread_owner_id = await _read_thread_personal_owner(
+        cur, thread_id
+    )
+    is_personal_group_notice = bool(payload.get("personal_private_group_notice"))
+    is_personal_dm_redirect = bool(payload.get("personal_private_dm_redirect"))
+    is_personal_private = (
+        thread_is_personal_private
+        or is_personal_group_notice
+        or is_personal_dm_redirect
+    )
+
+    allow_personal_dm_redirect = False
+    if is_personal_private:
+        from src.dalton.capabilities import is_channel_target_enabled
+        from src.dalton.services.personal_integration_guard import (
+            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+        )
+
+        if is_personal_group_notice:
+            if parsed["target_kind"] != "group":
+                return _deny(
+                    "skipped",
+                    "invalid_notice_target",
+                    "Personal redirect notice can only target a group.",
+                    requested_target=target,
+                )
+            # Enforce sanitized group notice content (never leak private body to groups).
+            payload = {
+                **payload,
+                "text": PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+            }
+            if parsed["platform"] == "feishu":
+                card = _build_feishu_personal_redirect_notice_card(
+                    PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                )
+        else:
+            if parsed["target_kind"] != "dm":
+                return _deny(
+                    "skipped",
+                    "personal_integration_private_only",
+                    "Personal calendar notification body can only be sent to the thread creator's verified 1:1 DM.",
+                    requested_target=target,
+                )
+            if not is_channel_target_enabled(target):
+                return _deny(
+                    "skipped",
+                    "capability_disabled",
+                    "Target channel capability is disabled.",
+                    requested_target=target,
+                )
+            if (
+                not thread_owner_id
+                or cur is None
+                or not await _dm_identity_matches(cur, thread_owner_id, target)
+            ):
+                return _deny(
+                    "skipped",
+                    "personal_dm_recipient_unverified",
+                    "DM recipient is not currently bound to the thread creator.",
+                    requested_target=target,
+                )
+            allow_personal_dm_redirect = True
+
     allowed, skip_reason = await _eligibility(
         row,
         payload,
         target,
         cur=cur,
+        allow_personal_dm_redirect=allow_personal_dm_redirect,
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,
@@ -562,16 +668,6 @@ async def decide_automation_notification_plan(
         "recipient_id": parsed["recipient_id"],
         "items": [item],
     }
-    thread_id = (
-        str(
-            payload.get("thread_id")
-            or payload.get("conversation_thread_id")
-            or row.get("conversation_thread_id")
-            or row.get("thread_id")
-            or ""
-        ).strip()
-        or None
-    )
     workspace_id = (
         str(
             payload.get("workspace_id")

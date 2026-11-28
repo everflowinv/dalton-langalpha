@@ -40,6 +40,7 @@ const sidebar = [
       },
       { label: '第一次使用', slug: 'get-started/first-use' },
       { label: '界面导览', slug: 'get-started/interface-tour' },
+      { label: '集成凭据配置', slug: 'get-started/admin-integrations' },
     ],
   },
   {

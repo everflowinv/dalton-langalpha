@@ -254,7 +254,7 @@ async def test_browser_routes_and_view_helpers_unavailable_under_dalton_overlay(
 
     # Direct browser_view service calls also short-circuit without touching the sandbox.
     sandbox, runtime = _sandbox_double(installs_browser=True)
-    assert await browser_view_module.browser_view(sandbox, _WS_ID, start=True) == (
+    assert await browser_view_module.browser_view(sandbox, _WS_ID, None, start=True) == (
         browser_view_module.BrowserView("unavailable")
     )
     assert await browser_view_module.browser_control(sandbox, holder="view-1", action="take") is False
@@ -302,7 +302,7 @@ async def test_browser_settings_everyday_provisioning_and_routes_blocked_under_d
     monkeypatch.setattr(provisioning_module, "get_computer", get_comp_prov)
 
     binding = ComputerManager._binding_from_computer(_WS_ID, comp)
-    await ComputerManager._keep_browser_settings(binding, sandbox)
+    await ComputerManager._after_machine_sync(binding, sandbox)
     manager = create_autospec(ComputerManager, instance=True)
     await ComputerManager._keep_published_browser_settings(manager, binding, sandbox)
     keep_stub.assert_not_awaited()

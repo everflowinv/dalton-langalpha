@@ -23,6 +23,7 @@ _SENDER = "u-colleague-chao"
 def _artifact(artifact_id: str) -> Artifact:
     return Artifact(
         artifact_id=artifact_id,
+        kind="file",
         code="c0de" + artifact_id[-4:],
         workspace_id="ws-1",
         path="report.html",

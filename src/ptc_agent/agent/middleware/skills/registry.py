@@ -124,11 +124,13 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         # frontmatter, both are live (this one drives PTC discovery; the
         # frontmatter drives the sandbox skill manifest), so they must not
         # drift.
+        # DALTON-HOOK(artifact-publishing-off): gate chart comment reply summary on the file-comments switch.
         description=(
             "Drawing on the user's chart from Python with chartkit, as one "
             "chart layer per analysis (levels, lines, zones, indicators, "
-            "channels, fibs, projections, trade setups). Also answering a "
-            "chart selection the user sends."
+            "channels, fibs, projections, trade setups)."
+            "<!-- DALTON_CAP:artifact_comments --> Also answering a "
+            "comment the user leaves on a chart.<!-- /DALTON_CAP -->"
         ),
         switched_tools=("manage_chart_layers",),
         skill_md_path="skills/chart-annotation/SKILL.md",

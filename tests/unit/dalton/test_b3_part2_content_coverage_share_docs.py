@@ -744,6 +744,9 @@ for (const [label, badSrc, expectRe] of [
 // 3) Full corpus Core scan with expanded blacklist and special BRAND_NAME YAML check
 const docsRoot = path.resolve('docs-site/src/content/docs');
 const forbidden = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|feishu|飞书|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
+// Per deployment-credentials §4.2, only get-started/admin-integrations.mdx permits neutral
+// Feishu personal-connector credential docs while still blocking proprietary bot/wiki terms.
+const forbiddenAdminIntegrations = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|飞书文档|知识库|群聊绑定|机器人|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
 
 function walk(dir) {
   const out = [];
@@ -769,7 +772,8 @@ for (const fp of walk(docsRoot)) {
   const raw = fs.readFileSync(fp, 'utf-8');
   const coreText = transformDocSource(raw, { isCore: true, brandName: 'Dalton', filePath: rel });
   if (/dalton_doc/i.test(coreText)) failures.push(`${rel}: leftover DALTON_DOC marker`);
-  if (forbidden.test(coreText)) failures.push(`${rel}: matched ${coreText.match(forbidden)?.[0]}`);
+  const activeForbidden = rel === 'get-started/admin-integrations.mdx' ? forbiddenAdminIntegrations : forbidden;
+  if (activeForbidden.test(coreText)) failures.push(`${rel}: matched ${coreText.match(activeForbidden)?.[0]}`);
   if (/\beverflow\b/i.test(coreText)) failures.push(`${rel}: matched Everflow`);
 
   const specialBrandText = transformDocSource(raw, {
@@ -809,6 +813,127 @@ console.log(JSON.stringify({ included, excluded, frontmatters }));
             encoding="utf-8"
         )
         assert "everflow" not in core_favicon.lower()
+
+    def test_admin_integrations_doc_coverage_core_vs_everflow_and_frontend_help_links(
+        self,
+    ) -> None:
+        """Verify admin-integrations.mdx content in Core/Everflow and frontend /help link targets (§4.2, §5)."""
+        script = r"""
+import fs from 'node:fs';
+import path from 'node:path';
+import { isDocIncluded, transformDocSource } from './docs-site/src/integrations/profile-filter.mjs';
+
+const adminDocPath = path.resolve('docs-site/src/content/docs/get-started/admin-integrations.mdx');
+const raw = fs.readFileSync(adminDocPath, 'utf-8');
+const coreOut = transformDocSource(raw, { isCore: true, brandName: 'Dalton', filePath: 'get-started/admin-integrations.mdx' });
+const efOut = transformDocSource(raw, { isCore: false, brandName: 'Everflow', filePath: 'get-started/admin-integrations.mdx' });
+
+// Both profiles include Google callback prerequisites & Feishu event verification keys
+for (const [label, text] of [['core', coreOut], ['everflow', efOut]]) {
+  for (const required of [
+    'DALTON_GOOGLE_OAUTH_CLIENT_ID',
+    'DALTON_GOOGLE_OAUTH_CLIENT_SECRET',
+    'DALTON_FEISHU_APP_ID',
+    'DALTON_FEISHU_APP_SECRET',
+    'DALTON_FEISHU_ENCRYPT_KEY',
+    'DALTON_FEISHU_VERIFICATION_TOKEN',
+    'Public Suffix',
+    'http://localhost',
+    'DALTON_AUTH_MODE=local',
+    '事件订阅上线后再登记请求地址',
+  ]) {
+    if (!text.includes(required)) {
+      throw new Error(`${label} admin-integrations.mdx missing required content: ${required}`);
+    }
+  }
+}
+
+// Everflow conditional block appears only in Everflow output, never in Core output
+if (!efOut.includes('现网飞书机器人使用中（只读 · 第 3 批迁移后可在此修改）')) {
+  throw new Error('Everflow admin-integrations.mdx missing Batch 1 Vault read-only guidance');
+}
+if (coreOut.includes('现网飞书机器人') || /\beverflow\b/i.test(coreOut)) {
+  throw new Error('Core admin-integrations.mdx leaked Everflow-only block');
+}
+
+// Verify frontend /help links added for deployment credentials resolve to existing docs-site pages
+const credsSrc = fs.readFileSync(path.resolve('web/src/lib/dalton/deploymentCredentials.ts'), 'utf-8');
+const matches = [...credsSrc.matchAll(/['"`](\/help\/[^'"`\s)]*)['"`]/g)].map((m) => m[1]);
+if (!matches.includes('/help/get-started/admin-integrations/')) {
+  throw new Error(`Expected /help/get-started/admin-integrations/ in deploymentCredentials.ts, got ${JSON.stringify(matches)}`);
+}
+for (const url of matches) {
+  const relSlug = url.replace(/^\/help\/?/, '').replace(/\/+$/, '');
+  const mdxPath = path.resolve('docs-site/src/content/docs', `${relSlug}.mdx`);
+  if (!fs.existsSync(mdxPath)) {
+    throw new Error(`Missing docs-site source page for ${url}: ${mdxPath}`);
+  }
+  if (!isDocIncluded(`${relSlug}.mdx`, { isCore: true })) {
+    throw new Error(`Core build unexpectedly excluded ${relSlug}.mdx`);
+  }
+}
+console.log(JSON.stringify({ ok: true, links: matches }));
+"""
+        proc = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert proc.returncode == 0, f"admin-integrations check failed:\n{proc.stderr}\n{proc.stdout}"
+        assert json.loads(proc.stdout.strip())["ok"] is True
+
+    def test_standalone_dockerfile_edge_copies_site_artifacts_sources_and_sets_core_profile(
+        self,
+    ) -> None:
+        """Verify Dockerfile.edge docs-builder copies every frontend file scanned by site-artifacts.mjs and sets Core profile."""
+        site_artifacts_src = (
+            REPO_ROOT / "docs-site" / "src" / "integrations" / "site-artifacts.mjs"
+        ).read_text(encoding="utf-8")
+        dockerfile_src = (
+            REPO_ROOT / "deploy" / "standalone" / "Dockerfile.edge"
+        ).read_text(encoding="utf-8")
+
+        # Extract the docs-builder stage from Dockerfile.edge
+        stage_match = re.search(
+            r"FROM\s+\S+\s+AS\s+docs-builder\b([\s\S]*?)^FROM\s+",
+            dockerfile_src,
+            flags=re.MULTILINE,
+        )
+        assert stage_match is not None, "Expected docs-builder stage in deploy/standalone/Dockerfile.edge"
+        docs_stage = stage_match.group(1)
+
+        # Extract every `path.join(repoRoot, 'web', ...)` read by collectFrontendHelpLinks
+        frontend_paths: list[str] = []
+        for m in re.finditer(
+            r"path\.join\(\s*repoRoot\s*,\s*['\"]web['\"]((?:\s*,\s*['\"][^'\"]+['\"])+)\s*\)",
+            site_artifacts_src,
+        ):
+            parts = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+            frontend_paths.append("web/" + "/".join(parts))
+
+        assert "web/src/lib/dalton/deploymentCredentials.ts" in frontend_paths
+        for rel_path in frontend_paths:
+            expected_copy = f"COPY {rel_path} /{rel_path}"
+            assert expected_copy in docs_stage, (
+                f"deploy/standalone/Dockerfile.edge docs-builder missing `{expected_copy}` "
+                "required by docs-site/src/integrations/site-artifacts.mjs"
+            )
+
+        # docs-builder must explicitly build the Core docs profile so Everflow blocks are stripped
+        assert re.search(r'^ARG\s+DALTON_PROFILE="core"', docs_stage, flags=re.MULTILINE)
+        assert re.search(
+            r"^ENV\s+DALTON_PROFILE=\$\{DALTON_PROFILE\}",
+            docs_stage,
+            flags=re.MULTILINE,
+        )
+        assert re.search(
+            r"^ENV\s+BRAND_NAME=\$\{VITE_BRAND_NAME\}",
+            docs_stage,
+            flags=re.MULTILINE,
+        )
 
     def test_everflow_docs_site_output_matches_pre_change_sha256_verbatim(self) -> None:
         baseline_path = (

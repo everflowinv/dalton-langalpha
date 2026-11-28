@@ -444,6 +444,120 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
     ]);
   });
 
+  it("unifies automation finish delivery dedup key across <uuid>.2 alias and startup recovery (Codex r2 #5)", async () => {
+    const canonicalExecId = "22222222-3333-4444-5555-888888888888";
+    const retryAliasId = `${canonicalExecId}.2`;
+
+    // Backend normalizes `<uuid>.2` to the canonical DB UUID in I-8 finishAutomationRun response
+    vi.mocked(h.backend.finishAutomationRun).mockImplementationOnce(
+      async () => ({
+        status: 200,
+        data: {
+          execution_id: canonicalExecId,
+          status: "finishing",
+          previous_status: "registered",
+          user_id: USER_ID,
+          workspace_id: WORKSPACE_ID,
+          thread_id: THREAD_ID,
+          run_id: null,
+          automation_name: "Delta Report",
+          finish_status: "completed",
+          final_text: "Summary after recipient edit.",
+          targets: [
+            {
+              entry: "feishu:oc_new_group",
+              address: "feishu:oc_new_group",
+              name: "New Group",
+              ok: true,
+              message: null,
+              agent_sent: false,
+            },
+          ],
+        },
+      }),
+    );
+    // Simulate gateway crash right before mark_finished=true write completes
+    vi.mocked(h.backend.finishAutomationRun).mockResolvedValueOnce({
+      status: 500,
+      data: null,
+    });
+
+    const seenKeys = new Set<string>();
+    const origClaim = vi.mocked(h.backend.authorizeAndClaimDelivery).getMockImplementation();
+    vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      if (seenKeys.has(req.delivery_key)) {
+        const targetAddress = req.target ?? "";
+        return {
+          claim_status: "already_completed",
+          status: "sent",
+          platform: "feishu",
+          target_address: targetAddress,
+          is_current: true,
+          first_response_json: {
+            status: "sent",
+            code: null,
+            address: targetAddress,
+            current: true,
+            message: `Delivered to ${targetAddress}.`,
+            files: [],
+          },
+        };
+      }
+      seenKeys.add(req.delivery_key);
+      return origClaim!(req);
+    });
+
+    // 1. Normal `/finish` called with `<uuid>.2` alias -> sends using canonical UUID key
+    await h.app.agentRoutes.handleFinishAutomationRun(USER_ID, retryAliasId, {
+      status: "completed",
+      final_text: "Summary after recipient edit.",
+    });
+
+    // 2. Startup recovery runs with canonical DB UUID (`dalton_channel_automation_runs.execution_id`)
+    vi.mocked(h.backend.finishAutomationRun).mockResolvedValueOnce({
+      status: 200,
+      data: {
+        execution_id: canonicalExecId,
+        status: "finished",
+        previous_status: "finishing",
+        user_id: USER_ID,
+        workspace_id: WORKSPACE_ID,
+        thread_id: THREAD_ID,
+        run_id: null,
+        automation_name: "Delta Report",
+        finish_status: "completed",
+        final_text: "Summary after recipient edit.",
+        targets: [],
+      },
+    });
+    await h.app.agentRoutes.executeAutomationRunFinish({
+      executionId: canonicalExecId,
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      runId: null,
+      automationName: "Delta Report",
+      finishStatus: "completed",
+      finalText: "Summary after recipient edit.",
+      targets: [
+        {
+          entry: "feishu:oc_new_group",
+          address: "feishu:oc_new_group",
+          name: "New Group",
+          ok: true,
+          message: null,
+          agent_sent: false,
+        },
+      ],
+    });
+
+    const expectedKey = `automation:${canonicalExecId}:feishu:oc_new_group:summary`;
+    const deliveryKeys = h.backend.deliveryClaims.map((c) => c.delivery_key);
+    expect(deliveryKeys).toEqual([expectedKey, expectedKey]);
+    expect(deliveryKeys.every((k) => !k.includes(".2"))).toBe(true);
+    // Platform adapter sent strictly once despite crash before mark_finished
+    expect(h.feishuAdapter.sentTexts).toHaveLength(1);
+  });
+
   it("rewrites sandbox links before chunking across Feishu, Discord, and Weixin deliveries and falls back on localhost WEB_BASE_URL", async () => {
     const sampleText = [
       "详见 [季报](/home/workspace/results/Q3 报告.md) 与 [外部](https://example.com/a)。",

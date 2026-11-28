@@ -4,11 +4,13 @@
 Used by skills/subagents that need Guidepoint expert-transcript search from bash.
 The proxy (LaunchAgent ai.openclaw.guidepoint-mcp-proxy) handles OAuth token refresh.
 """
+import http.client
 import argparse
 import json
 import os
 from pathlib import Path
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -55,6 +57,47 @@ def _resolve_host_token():
     )
 
 
+def _is_host_direct_paused() -> bool:
+    """Return True when external host-direct Guidepoint calls are paused for maintenance (§6.4b (1) #2)."""
+    if os.environ.get("DALTON_BRIDGE_INTERNAL_CALL", "").strip() == "1":
+        return False
+    if os.environ.get("DALTON_OPS_CONTROLLED_PROBE", "").strip() == "1":
+        return False
+    env_flag = (
+        os.environ.get("DALTON_HOST_DIRECT_PAUSED", "").strip()
+        or _read_bridge_env_fallback("DALTON_HOST_DIRECT_PAUSED").strip()
+    )
+    if env_flag.lower() in ("1", "true", "yes", "on"):
+        return True
+    gate_override = os.environ.get("DALTON_MAINTENANCE_ADMISSION_FILE", "").strip()
+    if gate_override:
+        gate_path = Path(gate_override).expanduser()
+    else:
+        gate_path = Path(__file__).resolve().parents[6] / "var" / "dalton" / "maintenance-admission.json"
+    if gate_path.exists():
+        try:
+            data = json.loads(gate_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return True
+            if bool(data.get("pause_host_direct", False)):
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _resolve_deadline_timeout_s(requested_timeout_s: float) -> float:
+    eff = max(0.1, float(requested_timeout_s))
+    raw_ms = os.environ.get("DALTON_REQUEST_DEADLINE_EPOCH_MS", "").strip()
+    if raw_ms:
+        try:
+            rem = (int(raw_ms) / 1000.0) - time.time()
+            eff = min(eff, max(0.1, rem))
+        except ValueError:
+            pass
+    return max(0.1, eff)
+
+
 def _extract_transcripts(res: dict) -> list:
     """Extract transcript rows from both legacy `:8943` and Batch 3 `:8951/mcp/guidepoint` responses."""
     candidates = []
@@ -85,10 +128,12 @@ def _extract_transcripts(res: dict) -> list:
     return []
 
 
-def rpc(payload, session_id=None):
+def rpc(payload, session_id=None, *, timeout_s: float = 120.0):
+    eff_timeout_s = max(0.1, float(timeout_s))
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        "X-Dalton-Request-Timeout-Ms": str(max(100, int(eff_timeout_s * 1000))),
     }
     host_token = _resolve_host_token()
     if host_token:
@@ -97,7 +142,7 @@ def rpc(payload, session_id=None):
         headers["Mcp-Session-Id"] = session_id
     req = urllib.request.Request(_resolve_base_url(), data=json.dumps(payload).encode(), headers=headers, method="POST")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=120) as resp:
+    with opener.open(req, timeout=eff_timeout_s) as resp:
         sid = resp.headers.get("Mcp-Session-Id")
         raw = resp.read().decode()
         ctype = resp.headers.get("Content-Type", "")
@@ -112,7 +157,10 @@ def rpc(payload, session_id=None):
     return body, sid
 
 
-def mcp_session():
+def mcp_session(*, deadline_mono: float | None = None):
+    def _rem() -> float:
+        return 120.0 if deadline_mono is None else max(0.1, deadline_mono - time.monotonic())
+
     init, sid = rpc({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
@@ -120,22 +168,27 @@ def mcp_session():
             "capabilities": {},
             "clientInfo": {"name": "eve-gp-cli", "version": "1.0"},
         },
-    })
+    }, timeout_s=_rem())
     if not init or "result" not in init:
         raise RuntimeError(f"initialize failed: {init}")
     try:
-        rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+        rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid, timeout_s=_rem())
     except Exception:
         pass
     return init["result"], sid
 
 
-def cmd_self_test(_args):
+def cmd_self_test(args):
+    if _is_host_direct_paused():
+        print("FAIL: maintenance_host_direct_paused (external host-direct Guidepoint calls paused)", file=sys.stderr)
+        return 1
+    eff_timeout_s = _resolve_deadline_timeout_s(getattr(args, "timeout", 120) or 120)
+    deadline_mono = time.monotonic() + eff_timeout_s
     try:
-        result, sid = mcp_session()
-    except (urllib.error.URLError, ConnectionError) as e:
-        print(f"FAIL: proxy unreachable at {BASE} ({e})")
-        print("Hint: launchctl kickstart -k gui/$UID/ai.openclaw.guidepoint-mcp-proxy")
+        result, sid = mcp_session(deadline_mono=deadline_mono)
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException) as e:
+        print(f"FAIL: proxy unreachable at {_resolve_base_url()} ({e})")
+        print("Hint: launchctl kickstart -k gui/$UID/com.dalton.guidepoint-mcp-proxy")
         return 1
     except Exception as e:
         print(f"FAIL: initialize error: {e}")
@@ -143,7 +196,7 @@ def cmd_self_test(_args):
         return 1
     server = result.get("serverInfo", {})
     print(f"OK: connected to {server.get('name')} v{server.get('version')}")
-    tools, _ = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, sid)
+    tools, _ = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, sid, timeout_s=max(0.1, deadline_mono - time.monotonic()))
     names = [t["name"] for t in tools.get("result", {}).get("tools", [])]
     print(f"tools: {names}")
     if "search_library" not in names:
@@ -154,6 +207,22 @@ def cmd_self_test(_args):
 
 
 def cmd_search(args):
+    if _is_host_direct_paused():
+        err_obj = {
+            "ok": False,
+            "status": "maintenance_host_direct_paused",
+            "error_code": "maintenance_host_direct_paused",
+            "error": "External host-direct Guidepoint calls are paused during maintenance.",
+        }
+        if args.json:
+            json.dump(err_obj, sys.stdout, ensure_ascii=False, indent=2)
+            print()
+        else:
+            print(f"ERROR: {err_obj['error_code']}: {err_obj['error']}", file=sys.stderr)
+        return 1
+
+    eff_timeout_s = _resolve_deadline_timeout_s(getattr(args, "timeout", 120) or 120)
+    deadline_mono = time.monotonic() + eff_timeout_s
     arguments = {"query": args.query}
     if args.keywords:
         arguments["keywords"] = args.keywords
@@ -167,14 +236,17 @@ def cmd_search(args):
         arguments["end_date"] = args.end_date
 
     try:
-        _, sid = mcp_session()
+        _, sid = mcp_session(deadline_mono=deadline_mono)
+        rem_s = max(0.1, deadline_mono - time.monotonic())
+        call_arguments = dict(arguments)
+        call_arguments["timeout"] = max(1, int(rem_s)) if rem_s >= 1.0 else rem_s
         res, _ = rpc({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "search_library", "arguments": arguments},
-        }, sid)
-    except (urllib.error.URLError, ConnectionError) as e:
-        print(f"ERROR: proxy unreachable at {BASE} ({e})", file=sys.stderr)
-        print("Hint: launchctl kickstart -k gui/$UID/ai.openclaw.guidepoint-mcp-proxy", file=sys.stderr)
+            "params": {"name": "search_library", "arguments": call_arguments},
+        }, sid, timeout_s=rem_s)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        print(f"ERROR: proxy unreachable at {_resolve_base_url()} ({e})", file=sys.stderr)
+        print("Hint: launchctl kickstart -k gui/$UID/com.dalton.guidepoint-mcp-proxy", file=sys.stderr)
         return 1
 
     if res.get("error"):
@@ -274,7 +346,8 @@ def main():
     p = argparse.ArgumentParser(description="Guidepoint expert transcript search (via local MCP proxy)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("self-test", help="check proxy + upstream connectivity")
+    st = sub.add_parser("self-test", help="check proxy + upstream connectivity")
+    st.add_argument("--timeout", type=int, default=120, help="request timeout in seconds (1–600; default 120)")
 
     s = sub.add_parser("search", help="run search_library")
     s.add_argument("--query", required=True, help="thematic research question")
@@ -283,9 +356,13 @@ def main():
     s.add_argument("--recency-bias", type=int, choices=range(1, 101), metavar="1..100", help="newer-result ranking bias; dates are the hard UTC calendar filter")
     s.add_argument("--start-date", help="YYYY-MM-DD")
     s.add_argument("--end-date", help="YYYY-MM-DD")
+    s.add_argument("--timeout", type=int, default=120, help="request timeout in seconds (1–600; default 120)")
     s.add_argument("--json", action="store_true", help="raw JSON output")
 
     args = p.parse_args()
+    if not 1 <= int(args.timeout) <= 600:
+        print("ERROR: --timeout must be between 1 and 600 seconds", file=sys.stderr)
+        sys.exit(2)
     if args.cmd == "self-test":
         sys.exit(cmd_self_test(args))
     sys.exit(cmd_search(args))

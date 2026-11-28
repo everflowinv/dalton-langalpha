@@ -528,6 +528,24 @@ async def _send(
 
         if await is_run_outbound_blocked(config, role=role):
             return _refusal("failed", "colleague_outbound_blocked", OUTBOUND_GUARD_REFUSAL_MESSAGE)
+    # DALTON-HOOK(personal-integrations): restrict outbound send_message from personal-integration threads to verified self 1:1 DM
+    from src.dalton.services.personal_integration_guard import (
+        check_personal_thread_send_allowed,
+    )
+
+    send_ok, send_err = await check_personal_thread_send_allowed(
+        thread_id=turn["thread_id"],
+        caller_user_id=turn["user_id"],
+        run_id=turn["run_id"],
+        target=target,
+        turn_platform=turn["turn_platform"],
+    )
+    if not send_ok:
+        return _refusal(
+            "failed",
+            "personal_integration_outbound_blocked",
+            send_err or "该对话包含个人日历/邮箱私密数据，仅允许发送至本人已验证的 1:1 私聊。",
+        )
     if await _in_shared_workspace(turn):
         return _refusal("failed", "unavailable", f"{_SHARED_REFUSAL} Nothing was sent.")
     text = text or ""

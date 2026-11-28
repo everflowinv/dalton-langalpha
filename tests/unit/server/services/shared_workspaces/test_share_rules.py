@@ -122,7 +122,7 @@ async def test_a_files_first_publish_takes_the_members_audience(accounts):
             return_value=True,
         ),
         patch(
-            "src.server.app.artifacts.records.reached",
+            "src.server.app.artifacts.records.reached_file",
             new_callable=AsyncMock,
             return_value=(artifact, Access(HOLDER, SharedAccess(SHARED, OWNER, "member"))),
         ),

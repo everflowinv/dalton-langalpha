@@ -213,6 +213,13 @@ async def start_run(
     }
     if thread_id:
         body["thread_id"] = str(thread_id)
+        # DALTON-HOOK(personal-integrations): inform gateway when thread carries personal integration data so group targets redirect to verified 1:1 DM
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        if await is_thread_personal_private(str(thread_id)):
+            body["has_personal_integration_data"] = True
     answer = await _ask_start(automation["user_id"], body)
     if _asks_again(answer):
         logger.warning(
@@ -581,6 +588,8 @@ async def finish_run(
     thread_id: Optional[str] = None,
     # DALTON-HOOK(channel-chart-snapshot): pass the settlement task's own run_id so channel gateway settles charts/widgets for that exact run
     run_id: Optional[str] = None,
+    # DALTON-HOOK(dalton-notify): tell gateway this is the final finish attempt so transient notice errors still seal the run
+    final_attempt: bool = False,
 ) -> Finish:
     """Ask the messaging service to end the run, once.
 
@@ -599,9 +608,19 @@ async def finish_run(
     body: Dict[str, Any] = {"status": status}
     if thread_id:
         body["thread_id"] = str(thread_id)
+        # DALTON-HOOK(personal-integrations): inform gateway when thread carries personal integration data so group targets redirect to verified 1:1 DM
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        if await is_thread_personal_private(str(thread_id)):
+            body["has_personal_integration_data"] = True
     # DALTON-HOOK(channel-chart-snapshot): include run_id in automation finish request body
     if run_id:
         body["run_id"] = str(run_id)
+    # DALTON-HOOK(dalton-notify): forward final_attempt so gateway seals finishing runs when retries exhaust
+    if final_attempt:
+        body["final_attempt"] = True
     if status == "completed" and final_text and final_text.strip():
         # DALTON-HOOK(standalone-core): rewrite same-origin /monitors/... links and avoid cutting mid-link when truncating for channel-gateway fallback delivery
         from src.dalton.notify.dispatch import (

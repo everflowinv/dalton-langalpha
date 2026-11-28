@@ -39,7 +39,7 @@ from src.server.services.shared_workspaces.access import (
     thread_access,
 )
 from src.server.services.shared_workspaces.turn import TurnIdentity
-from src.server.services.shared_workspaces.viewer import name_steer_senders, name_turn_senders
+from src.server.services.shared_workspaces.viewer import name_steer_senders
 from src.server.database.shared_workspaces import is_holder
 from src.server.services.shared_workspaces.turns import (
     refuse_crossing_workspaces,
@@ -277,6 +277,16 @@ async def _admit(
     from_path: bool = False,
 ) -> AdmittedTurn:
     body = _client_body(body, raw_request)
+    # DALTON-HOOK(maintenance-gate): block new turns during maintenance window (503 maintenance_in_progress)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
+
+    await enforce_maintenance_admission_for_thread(
+        workspace_id=body.workspace_id, thread_id=thread_id, context="thread_message"
+    )
+    # DALTON-HOOK(personal-integrations): fast-reject HTTP sends while personal data purge is active (409 + Retry-After: 3)
+    from src.dalton.services.purge_fence import check_thread_not_purging_fast
+
+    await check_thread_not_purging_fast(thread_id)
     checked = await cli_approval.admit_turn(
         raw_request, principal, body, thread_id, from_path=from_path
     )
@@ -401,6 +411,7 @@ _SERVER_ONLY_FIELDS = (
     "resume_of_run_id",
     "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
     "restart_from_run_id",  # DALTON-HOOK(cos-settings-tools)
+    "approved_dispatch_payloads",  # DALTON-HOOK(cos-verbatim-forward)
 )
 
 
@@ -510,8 +521,18 @@ async def _settle_against_branch(
         settle_fork_request,
         settle_resume_request,
     )
+    from src.server.services.history.branch import read_borrowing
 
     try:
+        # Checked on its own: a request naming no checkpoint skips the
+        # settle below, and a borrowed turn has no rows here to rewrite.
+        # Before the settle, whose branch lists only the fork's own turns: a
+        # borrowed turn's number can ride the snapshot's own checkpoint,
+        # which forks a real turn.
+        if request.fork_from_turn is not None:
+            borrow = await read_borrowing(thread_id)
+            if borrow is not None:
+                borrow.require_own(request.fork_from_turn)
         if request.fork_from_turn is not None and request.checkpoint_id:
             return await settle_fork_request(thread_id, request)
         if request.hitl_response:
@@ -1183,32 +1204,41 @@ async def _handle_send_message(
 
     if not is_dispatch:
         from src.dalton.auth.dispatch import make_prestart_chat_cleanup, wrap_local_sse_stream  # DALTON-HOOK(standalone-core): recheck local session <=30s and clean up prestart upload claims on initial reject
-        return SetupKeepaliveResponse(
-            wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate live chat stream promptly on local session revocation
-                end_after_failure_frame(
-                    observe_chat_stream(
-                        gen,
-                        model=_model,
-                        user_id=user_id,
-                        workspace_id=workspace_id,
-                        thread_id=thread_id,
-                    )
-                ),
-                raw_request,
-                user_id,
-                on_initial_reject=make_prestart_chat_cleanup(  # DALTON-HOOK(standalone-core): release provisional upload claims and burst slot if initial session recheck rejects
+        # DALTON-HOOK(storage-private-bucket-urls): rewrite live run_end private media refs to AU1 controlled media URLs
+        from src.dalton.share_media import wrap_owner_live_sse_media
+        live_stream = wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate live chat stream promptly on local session revocation
+            end_after_failure_frame(
+                observe_chat_stream(
+                    gen,
+                    model=_model,
                     user_id=user_id,
-                    upload_claim_key=upload_claim_key,
-                    request_key=request.request_key,
-                    additional_context=request.additional_context,
-                    release_slot=scope.release_slot,
-                ),
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                )
             ),
+            raw_request,
+            user_id,
+            on_initial_reject=make_prestart_chat_cleanup(  # DALTON-HOOK(standalone-core): release provisional upload claims and burst slot if initial session recheck rejects
+                user_id=user_id,
+                upload_claim_key=upload_claim_key,
+                request_key=request.request_key,
+                additional_context=request.additional_context,
+                release_slot=scope.release_slot,
+            ),
+        )
+        live_stream, _live_media_cookies = wrap_owner_live_sse_media(
+            live_stream, raw_request, thread_id=thread_id, viewer_id=user_id
+        )
+        resp = SetupKeepaliveResponse(
+            live_stream,
             media_type="text/event-stream",
             headers=sse_headers_with_loc,
             interval=get_sse_keepalive_interval(),
             setup_over=setup_over,
         )
+        for _sc in _live_media_cookies:
+            resp.headers.append("set-cookie", _sc)
+        return resp
 
     return await _prime_dispatch(
         gen,
@@ -1531,11 +1561,19 @@ async def reconnect_to_stream(
             logger.error(f"[PTC_RECONNECT] Error: {e}", exc_info=True)
             yield f'event: error\ndata: {{"error": "Reconnection failed: {str(e)}"}}\n\n'
 
-    return StreamingResponse(
-        stream_reconnection(),
+    # DALTON-HOOK(storage-private-bucket-urls): rewrite reconnect run_end private media refs to AU1 controlled media URLs
+    from src.dalton.share_media import wrap_owner_live_sse_media
+    wrapped_reconnect, _reconnect_media_cookies = wrap_owner_live_sse_media(
+        stream_reconnection(), request, thread_id=thread_id, viewer_id=x_user_id
+    )
+    resp = StreamingResponse(
+        wrapped_reconnect,
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+    for _sc in _reconnect_media_cookies:
+        resp.headers.append("set-cookie", _sc)
+    return resp
 
 
 
@@ -1647,6 +1685,8 @@ async def replay_thread_messages(
     - user_message: emitted once per turn_index (query content)
     - message_chunk/tool_* events: projected from checkpoints; a turn they
       cannot cover sends only its closing rows (``source=auto``)
+    - fork_divider: in a fork that shows its source's turns, once, after
+      them and before its own (``history/replay/borrowed.py``)
     - snapshot: cursors for the runs replay could not project (newest page only)
     - replay_done: terminal sentinel; on the newest page it also names the
       thread's newest run (``latest_run_id``), read before the transcript
@@ -1688,9 +1728,8 @@ async def replay_thread_messages(
         from src.server.services.history.replay import (
             CheckpointReplayUnavailable,
             PageBudget,
-            finish_lines,
-            read_replay_page,
         )
+        from src.server.services.history.replay.borrowed import read_thread_page
 
         budget = (
             PageBudget(min_turns=min_turns, max_bytes=max_bytes)
@@ -1698,9 +1737,12 @@ async def replay_thread_messages(
             else None
         )
         try:
+            # A fork's turns before its own are read from the threads that
+            # hold them, as this viewer.
             # DALTON-HOOK(team-sharing): non-owner reads project in memory without DB writeback
-            page, resolved_source = await read_replay_page(
+            page = await read_thread_page(
                 rows,
+                x_user_id,
                 source=source,
                 before_turn=before_turn,
                 limit=limit,
@@ -1715,18 +1757,17 @@ async def replay_thread_messages(
 
         # After source selection and outside the stored lines: task artifacts
         # replay their spawn-time payload, so the card's status is stamped
-        # here from current liveness (see history/task_status.py).
-        replay_lines = page.lines
-        await finish_lines(thread_id, replay_lines)
-        if is_holder(rows.owner_id):
-            await name_turn_senders(thread_id, replay_lines)
+        # here from current liveness (see history/task_status.py), against
+        # the thread each part's turns belong to.
+        replay_lines = await page.finish()
+        resolved_source = page.source
         paged = limit is not None or before_turn is not None
 
-        # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs
+        # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs per PagePart
         from src.dalton.share_media import prepare_owner_replay_media
 
         replay_lines, _media_set_cookies = await prepare_owner_replay_media(
-            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id
+            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id, page=page
         )
 
         async def event_generator():
@@ -2203,13 +2244,16 @@ async def get_thread_turns(thread_id: str, x_user_id: ReadUserId):
     - retry_checkpoint_id: most recent checkpoint (for retrying after failure)
     """
     await thread_access(thread_id, x_user_id)
+    from src.server.database.conversation import threads_read
     from src.server.handlers.checkpoint_handler import (
         get_thread_turns as _get_thread_turns,
     )
-    from src.server.database.conversation import get_thread_checkpoint_id
+    from src.server.services.history.branch import borrowing_of
 
-    branch_tip = await get_thread_checkpoint_id(thread_id)
-    return await _get_thread_turns(thread_id, branch_tip_checkpoint_id=branch_tip)
+    branch = await threads_read.get_thread_branch_read(thread_id)
+    return await _get_thread_turns(
+        thread_id, branch_tip_checkpoint_id=branch.checkpoint_id, borrow=borrowing_of(branch)
+    )
 
 
 @router.post("/{thread_id}/retry")
@@ -2248,6 +2292,12 @@ async def retry_thread(
         retried_wake_fields,
     )
 
+    # DALTON-HOOK(maintenance-gate): block retry turns during maintenance window (503 maintenance_in_progress)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
+
+    await enforce_maintenance_admission_for_thread(
+        thread_id=thread_id, context="thread_retry"
+    )
     checked = await cli_approval.admit_retry(raw_request, principal, thread_id, body)
     auth = await limit(principal.user_id)
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)

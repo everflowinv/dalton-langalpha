@@ -32,9 +32,21 @@ export const CAPABILITY_IDS = [
   'transcription',
   'colleague_sharing',
   'fund_automations',
+  // DALTON-HOOK(personal-integrations): personal Google & Feishu calendar/mail capabilities
+  'google_calendar',
+  'feishu_calendar',
+  'feishu_mail',
+  'google_gmail',
 ] as const;
 
 export type CapabilityId = (typeof CAPABILITY_IDS)[number];
+
+export const PERSONAL_INTEGRATION_CAPABILITIES: readonly CapabilityId[] = [
+  'google_calendar',
+  'feishu_calendar',
+  'feishu_mail',
+  'google_gmail',
+];
 
 /**
  * Everflow build default capability set (all optional capabilities except
@@ -59,6 +71,11 @@ export const EVERFLOW_DEFAULT_CAPABILITIES: readonly CapabilityId[] = [
   'native_oauth_sync',
   'colleague_sharing',
   'fund_automations',
+  // DALTON-HOOK(personal-integrations): enabled by default in Everflow builds
+  'google_calendar',
+  'feishu_calendar',
+  'feishu_mail',
+  'google_gmail',
 ];
 
 /**
@@ -108,6 +125,8 @@ export interface CapabilitiesApiResponse {
   };
   ticker_logos?: boolean;
   market_enabled?: boolean;
+  /** Whether file and chart comments are on (`dalton.artifact_publishing`). */
+  artifact_comments?: boolean;
 }
 
 export async function fetchDaltonCapabilities(): Promise<CapabilitiesApiResponse> {
@@ -125,6 +144,8 @@ export interface UseCapabilitiesResult {
   tickerLogosEnabled: boolean;
   /** Whether the market / watchlist surface (`/market`) is enabled for this deployment. */
   marketEnabled?: boolean;
+  /** Whether file and chart comments are on for this deployment (`dalton.artifact_publishing`). */
+  artifactCommentsEnabled: boolean;
   /**
    * True only during initial load of a Core profile build so Core UI can render
    * a lightweight placeholder while avoiding any flash of proprietary cards.
@@ -155,7 +176,8 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
       queryKey: queryKeys.dalton.capabilities(),
       queryFn: fetchDaltonCapabilities,
       enabled: queryEnabled,
-      staleTime: 5 * 60_000,
+      staleTime: 60_000,
+      refetchOnWindowFocus: true,
       retry: 1,
     },
     contextClient ?? FALLBACK_QUERY_CLIENT,
@@ -180,6 +202,10 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
     ? query.data.ticker_logos === true
     : !isCoreProfileBuild;
   const marketEnabled = isLoaded ? query.data.market_enabled !== false : true;
+  // Off until the deployment says so in a Core build; Everflow ships it on.
+  const artifactCommentsEnabled = isLoaded
+    ? query.data.artifact_comments !== false
+    : !isCoreProfileBuild;
 
   const hasCapability = useMemo(
     () => (required: CapabilityRequirement) => hasRequiredCapability(capabilities, required),
@@ -194,6 +220,7 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
     fingerprint: query.data?.fingerprint ?? null,
     tickerLogosEnabled,
     marketEnabled,
+    artifactCommentsEnabled,
     isLoading,
     isLoaded,
     isCoreBuild: isCoreProfileBuild,

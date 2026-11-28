@@ -115,7 +115,7 @@ vi.mock('@/hooks/useArtifact', async (importOriginal) => {
       mockOwnedArtifact(...args);
       return { record: undefined, error: null, fetching: false };
     },
-    useArtifactByPath: (wsId: string | null | undefined) => {
+    useArtifactRecord: (wsId: string | null | undefined) => {
       mockArtifactByPath(wsId);
       return { data: wsId ? mockArtifactByPathResult.data : undefined };
     },
@@ -200,6 +200,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
   useChatMessages: (): ReturnType<typeof useChatMessagesType> => ({
     messages: mockMessages.current,
     liveMessages: STABLE_CHAT_HELPERS.liveMessages,
+    forkDivider: null,
     isLoading: false,
     turnStatus: { workspaceStarting: false, turnHeld: null, cliQueue: null },
     hasActiveSubagents: false,
@@ -631,7 +632,7 @@ describe('Dalton Team Sharing', () => {
     // No owner file grant for a teammate's mirror panel, and no artifact
     // record made for it (the owner-only create path receives null).
     expect(mockGrant).toHaveBeenCalledWith(null);
-    expect(mockOwnedArtifact).toHaveBeenCalledWith(null, 'results/report.html', expect.anything());
+    expect(mockOwnedArtifact).toHaveBeenCalledWith(null, { kind: 'file', path: 'results/report.html' });
 
     const iframe = screen.getByTitle('report.html') as HTMLIFrameElement;
     expect(iframe).toBeInTheDocument();
@@ -810,7 +811,7 @@ describe('Dalton Team Sharing', () => {
       // its published record is looked up (never made) for the /a/ page.
       expect(mockGrant).toHaveBeenCalledWith('ws-sibling');
       expect(mockArtifactByPath).toHaveBeenCalledWith('ws-sibling');
-      expect(mockOwnedArtifact).toHaveBeenCalledWith(null, 'results/report.html', expect.anything());
+      expect(mockOwnedArtifact).toHaveBeenCalledWith(null, { kind: 'file', path: 'results/report.html' });
 
       // HTML open-in-new-tab button is rendered and opens the record's page
       const openNewTabBtn = screen.getByTitle(/new tab|新标签/i);

@@ -141,6 +141,9 @@ services:
       - backend
     ports:
       - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
+    environment:
+      STORAGE_BUCKET_NAME: ${STORAGE_BUCKET_NAME:-${S3_BUCKET_NAME:-dalton-main}}
+      STORAGE_KEY_PREFIX: ${STORAGE_KEY_PREFIX:-}
     volumes:
       - ./deploy/dalton/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./web/releases:/srv-releases:ro

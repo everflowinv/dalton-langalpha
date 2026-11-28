@@ -39,7 +39,10 @@ class ShownComment(BaseModel):
     comment_id: str
     artifact_id: str
     workspace_id: str
+    #: A file's path, or a chart's id.
     path: str
+    #: Rows written before charts had comments hold files.
+    kind: Literal["file", "chart"] = "file"
     title: Optional[str] = None
     number: int
     #: The owner's words this send carried, clipped.
@@ -52,6 +55,11 @@ class ShownComment(BaseModel):
     quote: Optional[str] = None
 
 
+#: What the agent's guidance for a send of comments says beyond how to answer
+#: any, which ``ptc_agent/agent/middleware/comment_guidance.py`` words.
+GuidancePart = Literal["computer", "pictures", "chart"]
+
+
 class ShownSend(BaseModel):
     """What a reader is shown for a message carrying file comments: the note
     the owner typed and a chip per comment. It rides the query row, a steer's
@@ -60,6 +68,9 @@ class ShownSend(BaseModel):
     note: str
     reading: Literal["chat", "file"]
     comments: List[ShownComment]
+    #: Not shown: the parts of the agent's guidance this send needs, which a
+    #: runtime-context row states once while in view.
+    guidance: List[GuidancePart] = Field(default_factory=list)
 
 # Roles the chat path can VALIDLY persist into the ``messages`` channel. The
 # chat path writes ``{"role", "content"}`` dicts straight in; under DeltaChannel
@@ -120,6 +131,19 @@ class HITLDecision(BaseModel):
     confirm_token: Optional[str] = Field(  # DALTON-HOOK(notify-routes)
         default=None,
         description="Confirmation token echoed back for Dalton notify approvals",
+    )
+    # DALTON-HOOK(personal-integrations): L2 confirmation receipt and Google MCP form elicitation responses
+    second_confirm_acknowledged: Optional[bool] = Field(
+        default=None,
+        description="Explicit second confirmation checkbox acknowledgement for L2 personal integration actions",
+    )
+    confirmed_payload_sha256: Optional[str] = Field(
+        default=None,
+        description="SHA-256 digest of the payload presented to and confirmed by the user",
+    )
+    elicitation_responses: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Per-request-key responses mapped to Google Workspace MCP params.inputResponses",
     )
 
 
@@ -555,6 +579,12 @@ class ChatRequest(BaseModel):
         default=None,
         description="Newest run sequence read with the pause a HITL answer "
         "resumes. Server-stamped.",
+    )
+    # DALTON-HOOK(cos-verbatim-forward): server-stamped approval-bound ptc_agent dispatch payloads read during HITL validation
+    approved_dispatch_payloads: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Approval-bound ptc_agent dispatch payloads extracted during "
+        "HITL resume validation. Server-stamped.",
     )
 
     # Localization and context

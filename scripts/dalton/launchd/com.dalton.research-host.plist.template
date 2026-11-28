@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Everflow host research service `com.dalton.research-host` (127.0.0.1:8951).
+  Loads public `src.dalton.research_host` plus private Everflow connectors (`host_connectors`)
+  and shares persistent Guidepoint ownership (`handoff-journal.json`) and `.env` capability config.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.research-host</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>src.dalton.research_host</string>
+        <string>--env-file</string>
+        <string>__RESEARCH_HOST_ENV_FILE__</string>
+        <string>--repo-env-file</string>
+        <string>__REPO_ENV_FILE__</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__REPO__/src:__REPO__</string>
+        <key>DALTON_REPO_ENV_FILE</key>
+        <string>__REPO_ENV_FILE__</string>
+        <key>DALTON_RESEARCH_HOST_ENV_FILE</key>
+        <string>__RESEARCH_HOST_ENV_FILE__</string>
+        <key>DALTON_RESEARCH_CODE</key>
+        <string>__RESEARCH_CODE__</string>
+        <key>DALTON_RESEARCH_HOME</key>
+        <string>__RESEARCH_HOME__</string>
+        <key>DALTON_RESEARCH_HOST_BIND</key>
+        <string>127.0.0.1</string>
+        <key>DALTON_RESEARCH_HOST_PORT</key>
+        <string>8951</string>
+        <key>DALTON_RESEARCH_HOST_EXTRA_MODULES</key>
+        <string>host_connectors</string>
+        <key>DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH</key>
+        <string>__REPO__/scripts/dalton/research_runtime</string>
+        <key>DALTON_GUIDEPOINT_OWNERSHIP_FILE</key>
+        <string>__GUIDEPOINT_OWNERSHIP_FILE__</string>
+        <key>GUIDEPOINT_TOKENS_FILE</key>
+        <string>__GUIDEPOINT_TOKENS_FILE__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-research-host.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-research-host.err.log</string>
+</dict>
+</plist>

@@ -221,7 +221,7 @@ def test_skill_tree_has_no_recipient_or_real_email() -> None:
 def test_self_test_and_list(tmp_path: Path) -> None:
     module = _load()
     workspace = _workspace(tmp_path)
-    calls = _prepare(module, [_list_ok()])
+    calls = _prepare(module, [{"ok": True, "status": "ok", "data": {"calendar_ok": True}}])
     code, body = _run(module, _argv(workspace, "self-test"))
     assert code == 0
     assert body["ok"] is True
@@ -230,11 +230,7 @@ def test_self_test_and_list(tmp_path: Path) -> None:
     assert body["universe_count"] == 105
     assert body["watchlist_exists"] is False
     assert body["report_run_id"] == "richard-earnings-2026-11-14"
-    assert calls[0]["route"] == "gcal"
-    assert calls[0]["operation"] == "list_events"
-    assert calls[0]["limit"] == 1
-    assert calls[0]["time_min"] == "2026-11-14T00:00:00-05:00"
-    assert calls[0]["time_max"] == "2026-11-15T00:00:00-05:00"
+    assert calls[0] == {"route": "gcal", "operation": "health_check"}
     _prepare(module, [])
     code, listed = _run(module, _argv(workspace, "list"))
     assert code == 0

@@ -42,6 +42,7 @@ MESSAGE = (
 def _gated() -> set:
     from src.dalton import share_media  # DALTON-HOOK(share-redaction)
     from src.dalton.app import transcriptions  # DALTON-HOOK(dalton-auth)
+    from src.dalton.deployment_credentials import auth as deployment_auth  # DALTON-HOOK(deployment-credentials)
     from src.server.app import drive_mount, livefs
 
     return {
@@ -57,6 +58,8 @@ def _gated() -> set:
         transcriptions._transcription_caller_gate,
         # DALTON-HOOK(share-redaction): owner media route verifies token + account standing via route dependency.
         share_media._owner_media_caller_gate,
+        # DALTON-HOOK(deployment-credentials): the admin session resolver calls admit_caller.
+        deployment_auth.require_deployment_admin_session,
     }
 
 
@@ -173,6 +176,7 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/channels/internal/deliveries/progress"),
     ("POST", "/api/v1/dalton/channels/internal/deliveries/{delivery_key}/preflight-send"),
     ("POST", "/api/v1/dalton/channels/internal/deliveries/{delivery_key}/verify-dm-recipient"),
+    ("POST", "/api/v1/dalton/channels/internal/failure-notices/plan"),
     ("GET", "/api/v1/dalton/channels/internal/deliverables/download"),
     ("POST", "/api/v1/dalton/channels/internal/topics/lookup"),
     ("GET", "/api/v1/dalton/channels/internal/snapshots/status"),
@@ -193,6 +197,17 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/internal/llm/complete"),
     ("POST", "/api/v1/dalton/internal/model-availability/check"),
     ("PUT", "/api/v1/dalton/channels/internal/settings"),
+    # DALTON-HOOK(maintenance-gate): host-side maintenance probes authenticated by X-Service-Token.
+    ("GET", "/api/v1/dalton/maintenance/admission"),
+    ("POST", "/api/v1/dalton/maintenance/admission/probe"),
+    # DALTON-HOOK(personal-integrations): a personal connector sign-in's return, bound to
+    # the state its start minted; Feishu's signed event push; the gateway's forward of it
+    # behind X-Service-Token; and the tracker-calendar MCP gate endpoint authenticated by
+    # X-Dalton-Bridge-Token + signed X-Dalton-Caller-Token (no user session credential).
+    ("GET", "/api/v1/dalton/integrations/{provider}/callback"),
+    ("POST", "/api/v1/dalton/integrations/feishu/events"),
+    ("POST", "/api/v1/dalton/integrations/internal/feishu/events"),
+    ("POST", "/api/v1/dalton/mcp/tracker-calendar"),
 }
 
 

@@ -10,6 +10,11 @@ save touches only its agent's files. A render renders only the segments whose
 shape changed since the stored copy, and a save writes only the rows that
 differ. A small file's bytes sit in its row; a larger one's in the per-user
 blob registry when there is object storage.
+
+A snapshot fork's transcript holds only its own turns. Its checkpoint starts
+with the source's messages up to the cut, which the source's transcript
+already renders, so its own files number on from the cut (``ForkHead``) and
+its manifest names the files it borrows (``forked_from``).
 """
 
 from __future__ import annotations
@@ -37,6 +42,8 @@ from ptc_agent.agent.transcript import (
 from ptc_agent.agent.transcript.render import SCHEMA_VERSION
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.path_fold import THREAD_INDEX
+from src.server.services.forks.model import ForkLineage
+from src.server.services.forks.start import ThreadStart
 
 if TYPE_CHECKING:
     from src.server.database.thread_transcripts import TaskRun
@@ -151,6 +158,14 @@ class _Job:
     window: Window
     #: A task's render from the checkpoint: the run it read.
     run: TaskRun | None = None
+    #: The window at the thread's start (``ThreadStart.head``): its runs
+    #: are files of the chats it was forked from, and its own number on
+    #: from there. Empty for an ordinary thread and for a task.
+    head: Window = Window()
+    # DALTON-HOOK(personal-integrations): purge generation read before checkpoints for FOR SHARE writeback fence
+    expected_purge_gen: int | None = None
+    # DALTON-HOOK(personal-integrations): 1-based first segment tainted by personal-integration data across turns
+    first_personal_segment: int | None = None
 
     def render(self, *, inline: bool, full: bool = False) -> _Rendered:
         """The copy, each file named by digest. Only the segments that changed
@@ -166,6 +181,8 @@ class _Job:
             header=self.header,
             previous=None if full else load_manifest(self.previous),
             window=self.window,
+            borrowed=self.head.runs,
+            first_personal_segment=self.first_personal_segment,
         )
         copy = StoredTranscript(
             self.fingerprint, self.checkpoint_id, directory.manifest, run=self.run
@@ -193,15 +210,18 @@ async def _whole(job: _Job) -> _Job:
     """``job`` over the thread's whole message list: the runs the window
     trimmed are read back from the turn slices, for a render with no stored
     copy to carry them from (a first export, a schema change, a fork that
-    dropped the copy, a copy moved under its render)."""
+    dropped the copy, a copy moved under its render). A snapshot fork's
+    are read back to its cut only, its start."""
     from src.server.services.history.window import earlier_runs
 
-    earlier = await earlier_runs(job.agent.thread_id, job.checkpoint_id, job.window)
+    earlier = await earlier_runs(
+        job.agent.thread_id, job.checkpoint_id, job.window, after=job.head
+    )
     if earlier is None:
         raise EarlierTurnsMissing(
             f"{job.agent.directory}: {job.window.runs} trimmed runs unreadable"
         )
-    return replace(job, messages=[*earlier, *job.messages], window=Window())
+    return replace(job, messages=[*earlier, *job.messages], window=job.head)
 
 
 async def _render_job(job: _Job, *, inline: bool, full: bool = False) -> _Rendered:
@@ -220,6 +240,10 @@ async def _save(target: _Target, job: _Job, rendered: _Rendered) -> bool:
     from src.server.database.workspace_file_blobs import store_unregistered_blobs
 
     agent = job.agent
+    # DALTON-HOOK(personal-integrations): delegate fenced saves to save_transcript_with_stale_retry
+    if job.expected_purge_gen is not None:
+        from src.dalton.services.purge_fence import save_transcript_with_stale_retry
+        return await save_transcript_with_stale_retry(target, job, rendered, _render_job, _BLOB_UPLOAD_CONCURRENCY)
     try:
         await store_unregistered_blobs(
             target.user_id, rendered.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
@@ -248,6 +272,8 @@ class Behind:
     agents: set[str]
     #: Stored agents whose task is gone (a truncation deleted it).
     gone: set[str]
+    #: Where the thread's own agent starts, read with its checkpoint.
+    start: ThreadStart = ThreadStart()
 
 
 async def behind_in_store(threads: list[tuple[str, str | None]]) -> list[Behind]:
@@ -285,12 +311,35 @@ async def _render_and_save(target: _Target, job: _Job) -> bool:
     return await _save(target, job, rendered)
 
 
+def _past_head(
+    messages: list[AnyMessage], window: Window, head: Window
+) -> tuple[list[AnyMessage], Window]:
+    """``messages`` from the thread's start on, and the window they follow:
+    unchanged for an empty ``head`` or a window already past it (the fork's
+    own trim). A window short of a fork's cut leaves the source's messages at
+    the head of the list, which the source's transcript renders. Raises
+    ``EarlierTurnsMissing`` when the head is not the cut's messages."""
+    if window.messages >= head.messages:
+        return messages, window
+    drop = head.messages - window.messages
+    if len(messages) < drop or not head.holds(messages[:drop], window):
+        raise EarlierTurnsMissing(f"the {drop} messages before the fork's cut do not match it")
+    return messages[drop:], head
+
+
 async def _render_own(
     target: _Target, thread: Behind, own: Any, reader: Any
 ) -> bool | None:
     """Render the thread's own agent from its checkpoint and store it:
     whether the save landed. None when it stands down, the stored copy being
     newer or the checkpoint empty."""
+    # DALTON-HOOK(personal-integrations): capture purge generation and first personal-touch segment before reading checkpoint state
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+    expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(thread.thread_id)
     state = await reader.aget_state(thread.thread_id, thread.checkpoint_id)
     rendered_at = (state.config or {}).get("configurable", {}).get("checkpoint_id")
     if own is not None and _newer(own.checkpoint_id, rendered_at):
@@ -301,14 +350,21 @@ async def _render_own(
         # Nothing to show; a copy already stored is left for the next
         # render that has something, rather than emptied.
         return None
+    start = thread.start
+    messages, window = await asyncio.to_thread(
+        _past_head, messages, Window.of(values), start.head
+    )
     job = _Job(
         TranscriptTarget(thread.thread_id),
         messages,
-        {"thread_id": thread.thread_id, "checkpoint_id": rendered_at},
+        {"thread_id": thread.thread_id, "checkpoint_id": rendered_at} | start.header(),
         _fingerprint(thread.checkpoint_id),
         rendered_at,
         own.manifest if own is not None else None,
-        Window.of(values),
+        window,
+        head=start.head,
+        expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     return await _render_and_save(target, job)
 
@@ -321,6 +377,15 @@ async def _render_task(
     it has got."""
     row = thread.tasks[task_id]
     run = _task_run(task_id, row)
+    # DALTON-HOOK(personal-integrations): capture purge generation and private-thread taint before reading task history
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+    expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(
+        thread.thread_id, is_task=True
+    )
     history = await reader.aget_task_history(thread.thread_id, task_id)
     header = {
         "task_id": task_id,
@@ -340,6 +405,8 @@ async def _render_task(
         # Only the main agent's checkpoint is trimmed (``with_window``).
         Window(),
         run,
+        expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     return await _render_and_save(target, job)
 
@@ -398,29 +465,26 @@ async def _render(target: _Target, thread: Behind, stored: dict[str, Any]) -> bo
 async def _export(thread_id: str, workspace_id: str | None) -> dict[str, int]:
     """Render the thread's agents whose stored copy is behind its latest
     checkpoint. Only ``_export_once`` calls this."""
-    from src.server.database.conversation import (
-        get_thread_by_id,
-        get_thread_checkpoint_id,
-    )
-    from src.server.database.thread_transcripts import load_stored
+    from src.server.database.thread_transcripts import load_stored, thread_checkpoint
 
     counts = {"stored": 0, "failed": 0}
     if workspace_id is None:
-        thread = await get_thread_by_id(thread_id)
-        if not thread or not thread.get("workspace_id"):
+        row = await thread_checkpoint(thread_id)
+        if row is None or row.workspace_id is None:
             return counts
-        workspace_id = str(thread["workspace_id"])
-    checkpoint_id, target = await asyncio.gather(
-        get_thread_checkpoint_id(thread_id), _target(workspace_id)
-    )
-    if target is None:
+        workspace_id = row.workspace_id
+        target = await _target(workspace_id)
+    else:
+        row, target = await asyncio.gather(thread_checkpoint(thread_id), _target(workspace_id))
+    if target is None or row is None:
         return counts
-    behind = await behind_in_store([(thread_id, checkpoint_id)])
+    behind = await behind_in_store([(thread_id, row.checkpoint_id)])
     if not behind:
         return counts
+    thread = replace(behind[0], start=ThreadStart.parse(row.fork))
     stored = await load_stored([thread_id])
     try:
-        counts["stored"] += await _render(target, behind[0], stored.get(thread_id, {}))
+        counts["stored"] += await _render(target, thread, stored.get(thread_id, {}))
     except Exception as e:
         counts["failed"] += 1
         logger.warning(f"Transcript export failed for thread {thread_id}: {e}")
@@ -523,8 +587,12 @@ async def sync_workspace(workspace_id: str) -> dict[str, int]:
 
 
 async def save_live(
-    transcript: TranscriptTarget, messages: Sequence[AnyMessage], *, window: Window
-) -> bool:
+    transcript: TranscriptTarget,
+    messages: Sequence[AnyMessage],
+    *,
+    window: Window,
+    reader: str | None = None,
+) -> TranscriptTarget | None:
     """Store one agent's transcript from messages in hand, ahead of the render
     from the checkpoint: compaction points the model at it mid-turn, before
     the turn end renders it. Only the segments that changed since the stored
@@ -535,8 +603,11 @@ async def save_live(
     not landed, an export that read a running task before this compaction)
     leaves the copy in place; the next checkpoint the agent writes still
     renders over it, and only what came after this save. ``window`` was
-    trimmed from the head of ``messages``. Returns whether it landed or had
-    nothing to change."""
+    trimmed from the head of ``messages``. Returns, when it landed or had
+    nothing to change: the target as it landed, a snapshot fork's own agent's
+    naming the files it borrows and whether each still matches, to ``reader``
+    in a shared workspace, or None.
+    """
     from src.server.database.conversation import (
         get_thread_by_id,
         get_thread_checkpoint_id,
@@ -547,16 +618,25 @@ async def save_live(
     thread_id = transcript.thread_id
     thread = await get_thread_by_id(thread_id)
     if not thread or not thread.get("workspace_id"):
-        return False
+        return None
     target = await _target(str(thread["workspace_id"]))
     if target is None:
-        return False
+        return None
     prefix = transcript.prefix
     stored = (await load_stored([thread_id], prefix)).get(thread_id, {}).get(prefix)
     held = load_manifest(stored.manifest) if stored is not None else {}
-    header = {k: v for k, v in held.items() if k not in ("schema", "segments")}
-    reader = CheckpointHistoryReader.get_instance()
+    header = {
+        k: v for k, v in held.items() if k not in ("schema", "segments", "first", "forked_from")
+    }
+    checkpoints = CheckpointHistoryReader.get_instance()
+    messages = list(messages)
+    # Only the thread's own agent starts where the thread does; a task's
+    # runs are its own from the first.
+    start = ThreadStart()
     if transcript.task_id is None:
+        start = ThreadStart.of(ForkLineage.of(thread.get("metadata")))
+        messages, window = await asyncio.to_thread(_past_head, messages, window, start.head)
+        header |= start.header()
         header["thread_id"] = thread_id
         # A first turn has no stamp yet, and a copy labelled with none is
         # replaced by any render, one that read the checkpoint before this
@@ -564,25 +644,39 @@ async def save_live(
         # past the stamp would stand the turn end's render down with it.
         latest = await get_thread_checkpoint_id(
             thread_id
-        ) or await reader.alatest_checkpoint_id(thread_id)
+        ) or await checkpoints.alatest_checkpoint_id(thread_id)
     else:
         header["task_id"] = transcript.task_id
-        latest = await reader.alatest_checkpoint_id(thread_id, transcript.checkpoint_ns)
+        latest = await checkpoints.alatest_checkpoint_id(thread_id, transcript.checkpoint_ns)
     held_at = stored.checkpoint_id if stored is not None else None
     checkpoint_id = max(filter(None, (held_at, latest)), default=None)
+    # DALTON-HOOK(personal-integrations): capture purge generation and first personal-touch segment before rendering live transcript
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
+    from src.dalton.services.purge_fence import read_expected_purge_generation
+    expected_purge_gen = await read_expected_purge_generation(thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(
+        thread_id, is_task=(transcript.task_id is not None)
+    )
     job = _Job(
         transcript,
-        list(messages),
+        messages,
         header,
         LIVE_FINGERPRINT,
         checkpoint_id,
         stored.manifest if stored is not None else None,
         window,
+        head=start.head,
+        expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     rendered = await _render_job(job, inline=target.inline)
-    if stored is not None and rendered.copy.manifest == stored.manifest:
-        return True
-    return await _save(target, job, rendered)
+    if stored is None or rendered.copy.manifest != stored.manifest:
+        if not await _save(target, job, rendered):
+            return None
+    borrowed = await start.borrowed_now(reader)
+    return replace(transcript, borrowed=borrowed) if borrowed else transcript
 
 
 _exports: dict[str, asyncio.Task] = {}

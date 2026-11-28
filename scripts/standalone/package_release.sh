@@ -41,10 +41,10 @@ Options:
   --ref <git-ref>     Git commit/tag/branch to export from (default: HEAD)
   --output <dir>      Export clean release tree into this directory (created fresh)
   --tar <file.tar.gz> Write compressed release tarball to this path
-  --report <file>     Also write the proprietary-term scan report to this path
+  --report <file>     Also write the release verification report to this path
   --include-ci        Also export CI compose overlay & standalone test harness
                       (docker-compose.ci.yml, tests/fakes, tests/standalone)
-  --strict-scan       Enforce zero-leak scan on exported artifact (enabled by default)
+  --strict-scan       Enforce out-of-package zero-leak check on exported artifact (enabled by default)
   -h, --help          Show this help
 EOF
 }
@@ -172,22 +172,9 @@ SHORT_SHA="${COMMIT_SHA:0:9}"
 RELEASE_TOP_DIR="dalton-core-${SHORT_SHA}"
 
 # Explicit allowlist of paths required to build and run Standalone Core.
-# Proprietary / Everflow-only paths are excluded by omission:
-#   - plugins/dalton_data/  (excluded in Batch 1: backend starts cleanly because
-#       src/dalton/data_map/health.py:539 lazy-imports dalton_sec_mcp_server inside
-#       fault-isolated _run_single_probe; Batch 2 extracts open-source plugins/dalton_sec/)
-#   - scripts/dalton/researchdata_bridge.py
-#   - scripts/dalton/research_runtime/
-#   - scripts/dalton/ops/
-#   - scripts/dalton/launchd/
-#   - scripts/dalton/data_assets/skills/ (and Everflow-only scripts listed in
-#       scripts/dalton/data_assets/everflow_only.txt, stripped post-extract)
-#   - scripts/dalton/monitor_feeds/
-#   - scripts/dalton/realrun/
-#   - integrations/dalton-channel-gateway/
-#   - deploy/dalton/
-#   - agent_config.dalton.yaml, config.dalton.yaml, docker-compose.dalton.yml
-#   - web/.env.dalton
+# Host-only Everflow runtime, ops, launchd, channel gateway, Everflow-only
+# data-asset scripts/skills, and *.dalton.* deployment overlays are excluded
+# by omission and post-extract stripping.
 ALLOWLIST_REQUIRED=(
   "LICENSE"
   "README.md"
@@ -233,6 +220,7 @@ ALLOWLIST_REQUIRED=(
   "scripts/dalton/docker_entrypoint_dalton.sh"
   "scripts/dalton/configure_minio.sh"
   "scripts/dalton/log_redaction.py"
+  "scripts/dalton/sql/personal_integrations_restore_reset.sql"
   "web"
   "docs-site"
 )
@@ -314,6 +302,7 @@ DENY_PATHS=(
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"
+  "scripts/dalton/launchd"
   "scripts/standalone/package_release.sh"
   "scripts/standalone/verify_release_tarball.py"
   "src/dalton/data_jobs/everflow_defaults.yaml"
@@ -408,96 +397,31 @@ find "$EXPORT_ROOT" -type f -name '*.dalton.yaml' -delete
 # Record release provenance metadata (clean, no working-tree state)
 printf '%s\n' "$COMMIT_SHA" > "${EXPORT_ROOT}/.release_git_sha"
 
-# Scan exported tree for proprietary/Everflow terms.
-# Batch 1: report-only (never fails exit code). Batch 2/3 will promote hits to errors.
-SCAN_TERMS=(
-  "everflowinv"
-  "Proprietary"
-  "researchdata_bridge"
-  "alphaengine"
-  "guidepoint"
-)
-
-# Regex rules for Everflow proprietary values (company domain, personal/Everflow home paths,
-# Windows paths, Feishu/Discord long IDs) that must NEVER ship in Standalone Core.
-FORBIDDEN_REGEX_NAMES=(
-  "everflow_company_domain"
-  "personal_home_path"
-  "everflow_home_path"
-  "windows_eve_path"
-  "feishu_chat_id"
-  "feishu_user_id"
-  "discord_target_id"
-)
-FORBIDDEN_REGEX_PATTERNS=(
-  'everflowinv'
-  '/Users/richardlu'
-  '/Users/everflow'
-  '(^|[^A-Za-z0-9_])[A-Za-z]:[/\\]Eve([^A-Za-z0-9_]|$)'
-  'oc_[0-9a-f]{20,}'
-  'ou_[0-9a-f]{20,}'
-  '(user|channel):[0-9]{15,}'
-)
-
-SYMLINK_MANIFEST="$STAGE_DIR/symlink_targets.txt"
-: > "$SYMLINK_MANIFEST"
-while IFS= read -r -d '' link_path; do
-  rel_link="${link_path#"${EXPORT_ROOT}/"}"
-  link_target="$(readlink "$link_path" 2>/dev/null || true)"
-  printf '%s -> %s\n' "$rel_link" "$link_target" >> "$SYMLINK_MANIFEST"
-done < <(find "$EXPORT_ROOT" -type l -print0 2>/dev/null)
-
-STRICT_VIOLATIONS=0
+# Out-of-package release gate check (when invoked from full repo checkout with ops checker present).
+# Keeps proprietary scan lists and regex patterns outside package_release.sh and customer releases.
 SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
-{
-  echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
-  echo "Mode: zero-leak gate (any forbidden Everflow/proprietary match fails packaging)"
-  for term in "${SCAN_TERMS[@]}"; do
-    echo ""
-    echo "--- Term: ${term} ---"
-    file_hits="$(grep -rnI --binary-files=without-match -F "$term" "$EXPORT_ROOT" 2>/dev/null || true)"
-    link_hits="$(grep -n -F "$term" "$SYMLINK_MANIFEST" 2>/dev/null | sed 's/^/[symlink] /' || true)"
-    hits="${file_hits}"
-    if [[ -n "$link_hits" ]]; then
-      hits="${hits:+${hits}$'\n'}${link_hits}"
-    fi
-    if [[ -z "$hits" ]]; then
-      echo "(0 matches)"
+TOOL_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+OUT_OF_PKG_CHECKER=""
+if [[ -f "${TOOL_REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; then
+  OUT_OF_PKG_CHECKER="${TOOL_REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py"
+elif [[ -f "${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; then
+  OUT_OF_PKG_CHECKER="${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py"
+fi
+CHECKER_RC=0
+if [[ -n "$OUT_OF_PKG_CHECKER" ]]; then
+  python3 "$OUT_OF_PKG_CHECKER" --export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT" > "$SCAN_OUTPUT" 2>&1 || CHECKER_RC=$?
+else
+  {
+    echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
+    if [[ "$STRICT_SCAN" -eq 1 ]]; then
+      echo "status: FAIL"
+      echo "ERROR: Out-of-package checker scripts/dalton/ops/check_core_release_package.py not found."
+      CHECKER_RC=1
     else
-      count="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
-      echo "Total matches: ${count}"
-      # sed stops after 40 lines itself; `| head` would close the pipe early and
-      # fail the export under pipefail (SIGPIPE) once there are many hits.
-      printf '%s\n' "$hits" | sed -n "1,40{s|${EXPORT_ROOT}/||g;p;}"
-      if [[ "$count" -gt 40 ]]; then
-        echo "... ($((count - 40)) more lines truncated)"
-      fi
+      echo "Exported clean allowlisted Standalone Core release tree."
     fi
-  done
-  for i in "${!FORBIDDEN_REGEX_NAMES[@]}"; do
-    rname="${FORBIDDEN_REGEX_NAMES[$i]}"
-    rpat="${FORBIDDEN_REGEX_PATTERNS[$i]}"
-    echo ""
-    echo "--- Forbidden Pattern: ${rname} ---"
-    file_hits="$(grep -rnIEi --binary-files=without-match "$rpat" "$EXPORT_ROOT" 2>/dev/null || true)"
-    link_hits="$(grep -nEi "$rpat" "$SYMLINK_MANIFEST" 2>/dev/null | sed 's/^/[symlink] /' || true)"
-    hits="${file_hits}"
-    if [[ -n "$link_hits" ]]; then
-      hits="${hits:+${hits}$'\n'}${link_hits}"
-    fi
-    if [[ -z "$hits" ]]; then
-      echo "(0 matches)"
-    else
-      count="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
-      echo "Total matches: ${count}"
-      printf '%s\n' "$hits" | sed -n "1,40{s|${EXPORT_ROOT}/||g;p;}"
-      if [[ "$count" -gt 40 ]]; then
-        echo "... ($((count - 40)) more lines truncated)"
-      fi
-      STRICT_VIOLATIONS=$((STRICT_VIOLATIONS + count))
-    fi
-  done
-} > "$SCAN_OUTPUT"
+  } > "$SCAN_OUTPUT"
+fi
 
 cat "$SCAN_OUTPUT"
 
@@ -506,9 +430,9 @@ if [[ -n "$REPORT_PATH" ]]; then
   cp "$SCAN_OUTPUT" "$REPORT_PATH"
 fi
 
-if [[ "$STRICT_SCAN" -eq 1 && "$STRICT_VIOLATIONS" -gt 0 ]]; then
-  echo "ERROR: Standalone Core release failed zero-leak scan with ${STRICT_VIOLATIONS} forbidden match(es)" >&2
-  exit 1
+if [[ "$STRICT_SCAN" -eq 1 && "$CHECKER_RC" -ne 0 ]]; then
+  echo "ERROR: Out-of-package Core release failed zero-leak scan (rc=${CHECKER_RC})." >&2
+  exit "$CHECKER_RC"
 fi
 
 if [[ -n "$OUTPUT_DIR_ABS" ]]; then

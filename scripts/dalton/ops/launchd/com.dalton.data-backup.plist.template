@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>__REPO_ROOT__/scripts/dalton/ops/dalton_data_backup.sh</string>
+        <string>__REPO_ROOT__/scripts/dalton/ops/prod/data_backup.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__REPO_ROOT__</string>
@@ -19,6 +19,10 @@
         <string>__HOME__</string>
         <key>DALTON_REPO_PYTHON</key>
         <string>__PYTHON_BIN__</string>
+        <key>DALTON_EXTERNAL_MOUNT_ROOT</key>
+        <string>/Volumes/EveSSD</string>
+        <key>DALTON_BACKUP_ROOT</key>
+        <string>/Volumes/EveSSD/Dalton/backups</string>
         <key>DALTON_OFFSITE_BACKUP_ENV_FILE</key>
         <string>__HOME__/.config/dalton/offsite-backup.env</string>
     </dict>

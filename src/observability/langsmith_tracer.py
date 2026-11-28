@@ -135,6 +135,8 @@ class NonRetainingTracer(LangChainTracer):
         # tell whether they changed since. Shared with copies, which may close
         # a run another opened.
         self._posted_inputs: dict[UUID, Any] = {}
+        # DALTON-HOOK(personal-integrations): shared per-trace flag suppressing export on already-private threads
+        self._personal_private: list[bool] = [False]
 
     def copy_with_metadata_defaults(
         self,
@@ -149,9 +151,41 @@ class NonRetainingTracer(LangChainTracer):
         )
         copy._pricer = self._pricer
         copy._posted_inputs = self._posted_inputs
+        # DALTON-HOOK(personal-integrations): share private-thread suppression flag across child copies
+        copy._personal_private = self._personal_private
         return copy
 
+    def _persist_run_single(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): skip LangSmith create_run export on private threads
+        if self._personal_private[0]:
+            run.extra["__disabled"] = True
+            return
+        super()._persist_run_single(run)
+
+    def _update_run_single(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): skip LangSmith update_run export on private threads
+        if self._personal_private[0]:
+            run.extra["__disabled"] = True
+            return
+        super()._update_run_single(run)
+
     def _start_trace(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): arm suppression when a run carries personal-integration tool data
+        from src.dalton.services.personal_integration_trace import (
+            is_personal_integration_tool,
+            messages_contain_personal_integration_data,
+        )
+
+        if (
+            self._personal_private[0]
+            or (
+                run.run_type == "tool"
+                and is_personal_integration_tool(run.name)
+            )
+            or messages_contain_personal_integration_data(run.inputs)
+        ):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
         super()._start_trace(run)
         # On each run rather than in tracing_metadata, so the tracer stays
         # configured exactly as the one langchain_core would have built.
@@ -212,6 +246,16 @@ class NonRetainingTracer(LangChainTracer):
             self._stamp_cost(run)
         except Exception as e:
             logger.debug("LangSmith cost stamp failed: %s", e)
+        # DALTON-HOOK(personal-integrations): suppress export when LLM output references a personal-integration tool
+        from src.dalton.services.personal_integration_trace import (
+            llm_outputs_contain_personal_tool_call,
+        )
+
+        if self._personal_private[0] or llm_outputs_contain_personal_tool_call(
+            run.outputs
+        ):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
         super()._on_llm_end(run)
 
     def _stamp_cost(self, run: Run) -> None:
@@ -264,11 +308,38 @@ class NonRetainingTracer(LangChainTracer):
 
     def _on_tool_end(self, run: Run) -> None:
         _settle_tool_run(run, None)
+        # DALTON-HOOK(personal-integrations): suppress export for personal-integration tool runs
+        from src.dalton.services.personal_integration_trace import (
+            is_personal_integration_tool,
+        )
+
+        if self._personal_private[0] or is_personal_integration_tool(run.name):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
         super()._on_tool_end(run)
+
+    def _on_tool_error(self, run: Run) -> None:
+        # DALTON-HOOK(personal-integrations): suppress export on errored personal-integration tool runs
+        from src.dalton.services.personal_integration_trace import (
+            is_personal_integration_tool,
+        )
+
+        if self._personal_private[0] or is_personal_integration_tool(run.name):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
+        super()._on_tool_error(run)
 
     def _errored_tool_run(self, error: BaseException, run_id: UUID) -> Run:
         run = super()._errored_tool_run(error, run_id)
         _settle_tool_run(run, error)
+        # DALTON-HOOK(personal-integrations): suppress export for errored personal-integration tool runs
+        from src.dalton.services.personal_integration_trace import (
+            is_personal_integration_tool,
+        )
+
+        if self._personal_private[0] or is_personal_integration_tool(run.name):
+            self._personal_private[0] = True
+            run.extra["__disabled"] = True
         return run
 
 
@@ -403,6 +474,13 @@ def with_run_tracer(config: dict[str, Any]) -> dict[str, Any]:
     tracer = _ambient_equivalent()
     if tracer is None:
         return config
+    # DALTON-HOOK(personal-integrations): pre-arm suppression on already-private threads
+    cfg_part = config.get("configurable") if isinstance(config.get("configurable"), Mapping) else {}
+    meta_part = config.get("metadata") if isinstance(config.get("metadata"), Mapping) else {}
+    if cfg_part.get("has_personal_integration_data") or meta_part.get(
+        "has_personal_integration_data"
+    ):
+        tracer._personal_private[0] = True
     return {**config, "callbacks": [*(callbacks or []), tracer]}
 
 

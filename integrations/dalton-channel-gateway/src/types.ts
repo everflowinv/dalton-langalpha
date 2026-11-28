@@ -402,6 +402,7 @@ export interface AgentSendResponse {
   code:
     | "not_linked"
     | "not_allowed"
+    | "personal_integration_private_only"
     | "no_current_conversation"
     | "target_not_found"
     | "rate_limited"
@@ -541,6 +542,8 @@ export interface AgentAutomationRunFinishRequest {
   thread_id?: string | null;
   run_id?: string | null;
   final_text?: string | null;
+  has_personal_integration_data?: boolean;
+  final_attempt?: boolean;
 }
 
 export interface AgentAutomationRunFinishTargetRow {

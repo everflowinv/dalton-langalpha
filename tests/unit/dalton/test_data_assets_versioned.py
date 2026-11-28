@@ -943,6 +943,7 @@ def test_package_release_core_strict_scan_and_end_to_end_core_seed(tmp_path: Pat
         "scripts/dalton/docker_entrypoint_dalton.sh",
         "scripts/dalton/configure_minio.sh",
         "scripts/dalton/log_redaction.py",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
         "web/package.json",
         "docs-site/package.json",
     ]
@@ -974,6 +975,12 @@ def test_package_release_core_strict_scan_and_end_to_end_core_seed(tmp_path: Pat
         shutil.copy2(REPO_ROOT / rel_src, dst)
 
     shutil.copy2(SEED_SCRIPT, repo / "scripts" / "dalton" / "seed_openclaw_data.sh")
+    reset_sql_dst = repo / "scripts" / "dalton" / "sql" / "personal_integrations_restore_reset.sql"
+    reset_sql_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        REPO_ROOT / "scripts" / "dalton" / "sql" / "personal_integrations_restore_reset.sql",
+        reset_sql_dst,
+    )
     shutil.copytree(
         DATA_ASSETS_SCRIPTS_DIR,
         repo / "scripts" / "dalton" / "data_assets" / "scripts",
@@ -1942,6 +1949,7 @@ def test_package_release_real_repo_passes_zero_leak_gate_and_rejects_injected_le
         "scripts/dalton/docker_entrypoint_dalton.sh",
         "scripts/dalton/configure_minio.sh",
         "scripts/dalton/log_redaction.py",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
         "web/package.json",
         "docs-site/package.json",
     ):

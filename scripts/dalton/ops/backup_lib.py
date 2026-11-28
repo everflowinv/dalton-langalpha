@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 # Secret filename suffixes/patterns (B2).
 _SECRET_EXACT_NAMES = frozenset({".env", ".netrc"})
@@ -966,16 +966,71 @@ def stage_config_repo(
     )
 
 
+STANDARD_BACKUP_SUBDIRS: tuple[str, ...] = (
+    "pg",
+    "frozen",
+    "minio-mirror",
+    "asr-jobs",
+    "sets",
+    ".tmp",
+)
+
+PREFLIGHT_EXT_SSD_MIN_GB = 150
+PREFLIGHT_INTERNAL_ROOT_MIN_GB = 10
+PREFLIGHT_COLIMA_DOCKER_MIN_GB = 55
+_BYTES_PER_GB = 1024 * 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflightDiskCheckItem:
+    """One disk/mount preflight gate result (§2.1 step 0)."""
+
+    name: str
+    ok: bool
+    detail: str
+    free_bytes: int | None = None
+    required_bytes: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflightDiskReport:
+    """Aggregate result of ``preflight-disk-space`` (§2.1 step 0)."""
+
+    ok: bool
+    colima_resolved_path: str
+    checks: tuple[PreflightDiskCheckItem, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "colima_resolved_path": self.colima_resolved_path,
+            "checks": [dataclasses.asdict(c) for c in self.checks],
+        }
+
+
+def _nearest_existing_path(path: Path) -> Path:
+    """Return ``path`` if it exists, otherwise walk upward to the nearest existing ancestor."""
+    cur = path
+    while not cur.exists():
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return cur
+
+
 def verify_external_mount(
     mount_root: Path,
     target_path: Path,
     *,
     is_mount_fn: Callable[[Path], bool] = os.path.ismount,
+    stat_fn: Callable[[Path], Any] = os.stat,
 ) -> None:
-    """Ensure ``mount_root`` is a mounted volume and ``target_path`` lives inside it.
+    """Ensure ``mount_root`` is a mounted volume and ``target_path`` lives on the same filesystem device.
 
-    Refuses to run if ``mount_root`` is missing or merely an unmounted folder on ``/``,
-    preventing weekly backups from spilling onto the internal disk.
+    Checks both canonical path containment and actual filesystem device ID (``st_dev``) of
+    ``target_path`` (or its nearest existing ancestor), preventing nested mounts or internal
+    symlinks from spilling onto the internal disk.
     """
     if not mount_root.exists() or not mount_root.is_dir():
         raise MountCheckError(f"External mount root does not exist: {mount_root}")
@@ -993,6 +1048,703 @@ def verify_external_mount(
         raise MountCheckError(
             f"Backup target {resolved_target} is outside external mount {resolved_mount}"
         ) from exc
+
+    existing_target = _nearest_existing_path(resolved_target)
+    try:
+        mount_dev = stat_fn(resolved_mount).st_dev
+        target_dev = stat_fn(existing_target).st_dev
+    except OSError as exc:
+        raise MountCheckError(
+            f"Cannot inspect device ID for {existing_target} against {resolved_mount}: {exc}"
+        ) from exc
+    if target_dev != mount_dev:
+        raise MountCheckError(
+            f"Target {resolved_target} (nearest existing {existing_target}, st_dev={target_dev}) "
+            f"is on a different device than external mount {resolved_mount} (st_dev={mount_dev})"
+        )
+
+
+def verify_backup_mount_layout(
+    mount_root: Path,
+    backups_root: Path,
+    *,
+    subdirs: Sequence[str] = STANDARD_BACKUP_SUBDIRS,
+    is_mount_fn: Callable[[Path], bool] = os.path.ismount,
+    stat_fn: Callable[[Path], Any] = os.stat,
+) -> list[Path]:
+    """Verify ``backups_root`` and all standard backup subdirs reside on ``mount_root`` (§2.1 step 1)."""
+    checked: list[Path] = []
+    verify_external_mount(mount_root, backups_root, is_mount_fn=is_mount_fn, stat_fn=stat_fn)
+    checked.append(backups_root)
+    for sub in subdirs:
+        target = backups_root / sub
+        verify_external_mount(mount_root, target, is_mount_fn=is_mount_fn, stat_fn=stat_fn)
+        checked.append(target)
+    return checked
+
+
+_COLIMA_DISK_NAMES = frozenset({"diffdisk", "basedisk", "datadisk", "disk"})
+_COLIMA_DISK_SUFFIXES = (".img", ".qcow2", ".raw")
+
+
+def _is_colima_disk_file_name(name: str) -> bool:
+    low = name.lower()
+    return low in _COLIMA_DISK_NAMES or low.endswith(_COLIMA_DISK_SUFFIXES)
+
+
+def _discover_colima_disk_paths(
+    colima_dir: Path,
+    *,
+    profile: str = "default",
+) -> tuple[list[Path], list[Path]]:
+    """Return ``(all_paths, disk_files)`` for the active Colima profile's Lima dir and virtual disks."""
+    prof = (profile or "default").strip() or "default"
+    instance_name = "colima" if prof == "default" else f"colima-{prof}"
+    lima_root = colima_dir / "_lima"
+    instance_dir = lima_root / instance_name
+    candidates: list[Path] = []
+    disk_files: list[Path] = []
+
+    def _record_disk(p: Path) -> None:
+        if p.exists() or p.is_symlink():
+            candidates.append(p)
+            # Treat existing regular files (or symlinks resolving to files, or dangling disk symlinks
+            # which verify_external_mount will catch) as located virtual disk targets.
+            if p.is_file() or (p.is_symlink() and not p.is_dir()):
+                disk_files.append(p)
+
+    if lima_root.exists() or lima_root.is_symlink():
+        candidates.append(lima_root)
+    if instance_dir.exists() or instance_dir.is_symlink():
+        candidates.append(instance_dir)
+        for name in sorted(_COLIMA_DISK_NAMES):
+            _record_disk(instance_dir / name)
+        try:
+            for child in sorted(instance_dir.iterdir()):
+                if _is_colima_disk_file_name(child.name) and child not in candidates:
+                    _record_disk(child)
+        except OSError:
+            pass
+
+    disks_root = lima_root / "_disks"
+    if disks_root.is_dir():
+        for disk_dir in sorted(disks_root.iterdir()):
+            if disk_dir.is_dir() or disk_dir.is_symlink():
+                candidates.append(disk_dir)
+                for name in sorted(_COLIMA_DISK_NAMES):
+                    _record_disk(disk_dir / name)
+                try:
+                    for child in sorted(disk_dir.iterdir()):
+                        if _is_colima_disk_file_name(child.name) and child not in candidates:
+                            _record_disk(child)
+                except OSError:
+                    pass
+
+    profile_dir = colima_dir / prof
+    if profile_dir.exists() or profile_dir.is_symlink():
+        candidates.append(profile_dir)
+        for child_name in ("disk", "diffdisk", "basedisk", "datadisk"):
+            _record_disk(profile_dir / child_name)
+        try:
+            for child in sorted(profile_dir.iterdir()):
+                if _is_colima_disk_file_name(child.name) and child not in candidates:
+                    _record_disk(child)
+        except OSError:
+            pass
+
+    def _dedup(items: list[Path]) -> list[Path]:
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for p in items:
+            if p not in seen:
+                seen.add(p)
+                unique.append(p)
+        return unique
+
+    return _dedup(candidates), _dedup(disk_files)
+
+
+class ColimaConfigResolutionError(RuntimeError):
+    """Raised when the active Docker host/context cannot be mapped unambiguously to a Colima profile."""
+
+
+def _parse_colima_socket_path(
+    endpoint: str,
+    *,
+    expected_home: Path | None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+) -> tuple[Path | None, str | None]:
+    """Extract ``(colima_home, profile)`` from a ``unix://`` Docker endpoint pointing to Colima."""
+    ep = (endpoint or "").strip()
+    if not ep.startswith("unix://"):
+        return None, None
+    raw_sock = ep[len("unix://") :]
+    if not raw_sock:
+        return None, None
+
+    expected_real = Path(realpath_fn(str(expected_home))) if expected_home is not None else None
+    candidates = [Path(raw_sock)]
+    try:
+        real_sock = Path(realpath_fn(raw_sock))
+        if real_sock not in candidates:
+            candidates.append(real_sock)
+    except OSError:
+        pass
+
+    for sock in candidates:
+        if sock.name != "docker.sock":
+            continue
+        # Pattern 1: <colima_home>/_lima/colima[-<profile>]/sock/docker.sock
+        if (
+            sock.parent.name == "sock"
+            and sock.parent.parent.parent.name == "_lima"
+            and (
+                sock.parent.parent.name == "colima"
+                or sock.parent.parent.name.startswith("colima-")
+            )
+        ):
+            lima_name = sock.parent.parent.name
+            prof = "default" if lima_name == "colima" else lima_name[len("colima-") :]
+            home = sock.parent.parent.parent.parent
+            if prof:
+                return home, prof
+
+        # Pattern 2: <colima_home>/<profile>/docker.sock
+        prof_dir = sock.parent
+        home_dir = prof_dir.parent
+        prof_name = prof_dir.name
+        if not prof_name or home_dir == prof_dir:
+            continue
+        is_expected_home = False
+        if expected_home is not None:
+            try:
+                home_real = Path(realpath_fn(str(home_dir)))
+            except OSError:
+                home_real = home_dir
+            if home_dir == expected_home or (
+                expected_real is not None and home_real == expected_real
+            ):
+                is_expected_home = True
+        looks_like_colima_home = (
+            is_expected_home
+            or home_dir.name in (".colima", "colima")
+            or "colima" in home_dir.name.lower()
+            or (home_dir / "_lima").is_dir()
+        )
+        if looks_like_colima_home:
+            return home_dir, prof_name
+
+    return None, None
+
+
+def _inspect_active_docker_endpoint(
+    *,
+    env: Mapping[str, str],
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    timeout_s: float = 10.0,
+) -> tuple[str | None, str | None, str | None]:
+    """Return ``(endpoint_url, context_name, error_reason)`` for the active Docker daemon.
+
+    Matches Docker CLI precedence: ``DOCKER_CONTEXT`` > ``DOCKER_HOST`` > current Docker context.
+    """
+    ctx_env = (env.get("DOCKER_CONTEXT") or "").strip()
+    docker_host = (env.get("DOCKER_HOST") or "").strip()
+    if not ctx_env and docker_host:
+        return docker_host, None, None
+
+    inspect_cmd = ["docker", "context", "inspect"]
+    if ctx_env:
+        inspect_cmd.append(ctx_env)
+    try:
+        proc = run_fn(
+            inspect_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env=dict(env),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, ctx_env or None, f"failed running {' '.join(inspect_cmd)!r}: {exc}"
+
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        err_msg = (proc.stderr or "").strip() or f"rc={proc.returncode}"
+        return None, ctx_env or None, f"{' '.join(inspect_cmd)!r} failed ({err_msg})"
+
+    try:
+        parsed = json.loads(proc.stdout)
+    except ValueError as exc:
+        return None, ctx_env or None, f"invalid JSON from {' '.join(inspect_cmd)!r}: {exc}"
+
+    if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], dict):
+        return None, ctx_env or None, f"unexpected JSON shape from {' '.join(inspect_cmd)!r}"
+
+    entry = parsed[0]
+    ctx_name = str(entry.get("Name") or ctx_env or "").strip() or None
+    endpoints = entry.get("Endpoints")
+    docker_ep_obj = endpoints.get("docker") if isinstance(endpoints, dict) else None
+    endpoint_url = (
+        str(docker_ep_obj.get("Host") or "").strip()
+        if isinstance(docker_ep_obj, dict)
+        else ""
+    )
+    if not endpoint_url:
+        return None, ctx_name, f"Docker context {ctx_name!r} has no Endpoints.docker.Host"
+    return endpoint_url, ctx_name, None
+
+
+def resolve_active_colima_config(
+    *,
+    colima_dir: Path | None = None,
+    colima_profile: str | None = None,
+    env: Mapping[str, str] | None = None,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+    timeout_s: float = 10.0,
+) -> tuple[Path, str]:
+    """Resolve the active Colima home directory and profile from the actual Docker context/host.
+
+    Priority matches Docker CLI:
+    - Resolves the active Docker daemon in order ``DOCKER_CONTEXT`` > ``DOCKER_HOST`` >
+      active Docker context (``docker context inspect``) and maps its endpoint to the exact
+      Colima home and profile.
+    - Explicit ``colima_dir`` and ``colima_profile`` / ``COLIMA_PROFILE`` are validated against
+      the active Docker endpoint; any mismatch fails closed with :class:`ColimaConfigResolutionError`.
+    - Fails closed with :class:`ColimaConfigResolutionError` if the active Docker context/host
+      cannot be determined or cannot be mapped unambiguously to a running Colima profile.
+    """
+    em = os.environ if env is None else env
+    raw_home = (em.get("COLIMA_HOME") or "").strip()
+    if colima_dir is not None:
+        home_path = colima_dir
+    elif raw_home:
+        home_path = Path(raw_home).expanduser()
+    else:
+        home_path = Path.home() / ".colima"
+
+    requested_profile = (
+        str(colima_profile).strip()
+        if colima_profile is not None and str(colima_profile).strip()
+        else (em.get("COLIMA_PROFILE") or "").strip()
+    )
+
+    runner = run_fn if run_fn is not None else subprocess.run
+    if env is None:
+        sub_env = dict(os.environ)
+    else:
+        sub_env = {str(k): str(v) for k, v in em.items()}
+        if "PATH" not in sub_env and "PATH" in os.environ:
+            sub_env["PATH"] = os.environ["PATH"]
+    sub_env["COLIMA_HOME"] = str(home_path)
+
+    docker_endpoint, docker_context, docker_err = _inspect_active_docker_endpoint(
+        env=sub_env,
+        run_fn=runner,
+        timeout_s=timeout_s,
+    )
+    if docker_err is not None or not docker_endpoint:
+        raise ColimaConfigResolutionError(
+            "Cannot determine active Docker context/endpoint to map Colima configuration: "
+            f"{docker_err or 'empty endpoint'}"
+        )
+
+    sock_home, sock_profile = _parse_colima_socket_path(
+        docker_endpoint,
+        expected_home=home_path,
+        realpath_fn=realpath_fn,
+    )
+    if sock_profile is None or sock_home is None:
+        raise ColimaConfigResolutionError(
+            f"Active Docker endpoint {docker_endpoint!r} "
+            f"(context={docker_context or 'DOCKER_HOST'}) does not map to a Colima socket; "
+            "refusing to guess Colima profile or virtual disk location"
+        )
+
+    if requested_profile and requested_profile != sock_profile:
+        raise ColimaConfigResolutionError(
+            f"Active Docker endpoint {docker_endpoint!r} "
+            f"(context={docker_context or 'DOCKER_HOST'}) uses Colima profile {sock_profile!r} "
+            f"under {sock_home}, which conflicts with specified Colima profile {requested_profile!r}"
+        )
+
+    # Use the actual Colima home indicated by the Docker context socket so preflight checks
+    # the real virtual disk file (not an unrelated default ~/.colima). If caller explicitly
+    # pinned a conflicting colima_dir, fail closed instead of silently checking the wrong home.
+    resolved_home = sock_home
+    if colima_dir is not None:
+        try:
+            pinned_real = Path(realpath_fn(str(colima_dir)))
+            sock_home_real = Path(realpath_fn(str(sock_home)))
+        except OSError:
+            pinned_real = colima_dir
+            sock_home_real = sock_home
+        if pinned_real != sock_home_real:
+            raise ColimaConfigResolutionError(
+                f"Active Docker endpoint {docker_endpoint!r} uses Colima home {sock_home} "
+                f"(profile={sock_profile!r}), which conflicts with specified colima_dir={colima_dir}"
+            )
+        resolved_home = colima_dir
+
+    # Verify against `colima list --json` under the resolved Colima home when available:
+    # if `colima list --json` reports running profiles and the Docker context's profile is NOT
+    # running there, fail closed so we never check a stopped/mismatched profile.
+    sub_env["COLIMA_HOME"] = str(resolved_home)
+    running_profiles: list[str] = []
+    colima_list_ok = False
+    try:
+        proc = runner(
+            ["colima", "list", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env=sub_env,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            colima_list_ok = True
+            for line in proc.stdout.splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and str(entry.get("status") or "").strip().lower() == "running":
+                    name = str(entry.get("name") or "").strip()
+                    if name:
+                        running_profiles.append(name)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    if colima_list_ok and sock_profile not in running_profiles:
+        raise ColimaConfigResolutionError(
+            f"Active Docker context ({docker_context or 'DOCKER_HOST'}, endpoint={docker_endpoint!r}) "
+            f"maps to Colima profile {sock_profile!r} under {resolved_home}, but that profile is not "
+            f"running according to `colima list --json` (running={running_profiles})"
+        )
+
+    return resolved_home, sock_profile
+
+
+def parse_df_available_bytes(df_stdout: str) -> int | None:
+    """Parse available bytes from POSIX ``df -Pk <path>`` output (1024-byte blocks)."""
+    lines = [line.strip() for line in df_stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    parts = lines[-1].split()
+    if len(parts) < 4:
+        return None
+    # In POSIX df -Pk: Filesystem 1024-blocks Used Available Capacity Mounted-on
+    # Take parts[-3] if Filesystem name contains spaces, else parts[3] when numeric.
+    avail_tok = parts[3] if parts[3].isdigit() else (parts[-3] if len(parts) >= 5 and parts[-3].isdigit() else "")
+    if not avail_tok.isdigit():
+        return None
+    return int(avail_tok) * 1024
+
+
+def _probe_colima_docker_free_bytes(
+    *,
+    colima_home: Path | None = None,
+    profile: str = "default",
+    env: Mapping[str, str] | None = None,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout_s: float = 15.0,
+) -> int | None:
+    """Query free space inside the active Colima profile's ``/var/lib/docker`` with a bounded timeout."""
+    prof = (profile or "default").strip() or "default"
+    cmd = ["colima", "ssh", "--profile", prof, "--", "df", "-Pk", "/var/lib/docker"]
+    sub_env = dict(os.environ if env is None else env)
+    if colima_home is not None:
+        sub_env["COLIMA_HOME"] = str(colima_home)
+    try:
+        proc = run_fn(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env=sub_env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_df_available_bytes(proc.stdout)
+
+
+def preflight_disk_space(
+    *,
+    external_mount_root: Path = Path("/Volumes/EveSSD"),
+    internal_root: Path = Path("/"),
+    colima_dir: Path | None = None,
+    colima_profile: str | None = None,
+    env: Mapping[str, str] | None = None,
+    min_external_gb: int = PREFLIGHT_EXT_SSD_MIN_GB,
+    min_internal_gb: int = PREFLIGHT_INTERNAL_ROOT_MIN_GB,
+    min_colima_docker_gb: int = PREFLIGHT_COLIMA_DOCKER_MIN_GB,
+    is_mount_fn: Callable[[Path], bool] = os.path.ismount,
+    disk_usage_fn: Callable[[Path], Any] = shutil.disk_usage,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+    stat_fn: Callable[[Path], Any] = os.stat,
+    colima_docker_free_bytes_fn: Callable[[], int | None] | None = None,
+    colima_run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> PreflightDiskReport:
+    """Run §2.1 Step 0 preflight gates before any write/migration starts.
+
+    Gates:
+    1. Active Colima home (respecting ``COLIMA_HOME``) AND the active Colima profile's
+       actual virtual disk file(s) must exist and reside on the mounted external volume
+       with matching device ID (``st_dev``). Fails closed if no virtual disk file is found.
+    2. External volume free space >= ``min_external_gb`` (default 150 GB).
+    3. Host internal root ``/`` free space >= ``min_internal_gb`` (default 10 GB).
+    4. Active Colima profile's ``/var/lib/docker`` free space >= ``min_colima_docker_gb`` (default 55 GB).
+    """
+    checks: list[PreflightDiskCheckItem] = []
+    colima_target: Path | None = None
+    active_profile = ""
+    resolved_colima_str = ""
+    colima_resolution_err: str | None = None
+    try:
+        colima_target, active_profile = resolve_active_colima_config(
+            colima_dir=colima_dir,
+            colima_profile=colima_profile,
+            env=env,
+            run_fn=colima_run_fn,
+            realpath_fn=realpath_fn,
+        )
+        resolved_colima = Path(realpath_fn(str(colima_target)))
+        resolved_colima_str = str(resolved_colima)
+    except ColimaConfigResolutionError as exc:
+        colima_resolution_err = str(exc)
+        resolved_colima = None
+
+    # Gate 0: Colima root AND active profile virtual disk file(s) must exist on external mount's st_dev
+    if colima_resolution_err is not None or colima_target is None or resolved_colima is None:
+        checks.append(
+            PreflightDiskCheckItem(
+                name="colima_location",
+                ok=False,
+                detail=colima_resolution_err or "Failed resolving active Colima configuration",
+            )
+        )
+    elif not colima_target.exists() and not colima_target.is_symlink():
+        checks.append(
+            PreflightDiskCheckItem(
+                name="colima_location",
+                ok=False,
+                detail=(
+                    f"Colima path {colima_target} (profile={active_profile}) does not exist; "
+                    f"verify Colima is installed and located on external volume {external_mount_root}"
+                ),
+            )
+        )
+    else:
+        try:
+            verify_external_mount(
+                external_mount_root,
+                resolved_colima,
+                is_mount_fn=is_mount_fn,
+                stat_fn=stat_fn,
+            )
+            disk_paths, disk_files = _discover_colima_disk_paths(
+                resolved_colima, profile=active_profile
+            )
+            verified_paths: list[str] = []
+            for dp in disk_paths:
+                resolved_dp = Path(realpath_fn(str(dp)))
+                verify_external_mount(
+                    external_mount_root,
+                    resolved_dp,
+                    is_mount_fn=is_mount_fn,
+                    stat_fn=stat_fn,
+                )
+                verified_paths.append(str(resolved_dp))
+            if not disk_files:
+                checks.append(
+                    PreflightDiskCheckItem(
+                        name="colima_location",
+                        ok=False,
+                        detail=(
+                            f"No Colima virtual disk file (diffdisk/basedisk/datadisk/*.img/*.qcow2/*.raw) "
+                            f"found under {resolved_colima} for active profile {active_profile!r}; "
+                            "cannot verify virtual disk placement on external volume"
+                        ),
+                    )
+                )
+            else:
+                checks.append(
+                    PreflightDiskCheckItem(
+                        name="colima_location",
+                        ok=True,
+                        detail=(
+                            f"{colima_target} -> {resolved_colima} (profile={active_profile}) is on "
+                            f"external volume {external_mount_root}; verified {len(disk_files)} "
+                            f"disk file(s) across {len(verified_paths)} path(s)"
+                        ),
+                    )
+                )
+        except MountCheckError as exc:
+            checks.append(
+                PreflightDiskCheckItem(
+                    name="colima_location",
+                    ok=False,
+                    detail=(
+                        f"Colima virtual disk ({colima_target} -> {resolved_colima}, profile={active_profile}) "
+                        f"is not on external volume {external_mount_root} (likely on internal disk '/'): {exc}. "
+                        "Move Colima home and its active disk files to the external SSD before proceeding."
+                    ),
+                )
+            )
+
+    # Gate 1: External SSD >= 150 GB
+    req_ext = int(min_external_gb) * _BYTES_PER_GB
+    try:
+        verify_external_mount(
+            external_mount_root,
+            external_mount_root,
+            is_mount_fn=is_mount_fn,
+            stat_fn=stat_fn,
+        )
+        ext_free = int(disk_usage_fn(external_mount_root).free)
+        ok_ext = ext_free >= req_ext
+        checks.append(
+            PreflightDiskCheckItem(
+                name="external_ssd_free",
+                ok=ok_ext,
+                free_bytes=ext_free,
+                required_bytes=req_ext,
+                detail=(
+                    f"{external_mount_root} free={ext_free / _BYTES_PER_GB:.1f} GB "
+                    f"(required >= {min_external_gb} GB)"
+                ),
+            )
+        )
+    except (MountCheckError, OSError) as exc:
+        checks.append(
+            PreflightDiskCheckItem(
+                name="external_ssd_free",
+                ok=False,
+                required_bytes=req_ext,
+                detail=f"Cannot inspect external volume {external_mount_root}: {exc}",
+            )
+        )
+
+    # Gate 2: Internal root '/' >= 10 GB
+    req_int = int(min_internal_gb) * _BYTES_PER_GB
+    try:
+        int_free = int(disk_usage_fn(internal_root).free)
+        ok_int = int_free >= req_int
+        checks.append(
+            PreflightDiskCheckItem(
+                name="internal_root_free",
+                ok=ok_int,
+                free_bytes=int_free,
+                required_bytes=req_int,
+                detail=(
+                    f"{internal_root} free={int_free / _BYTES_PER_GB:.1f} GB "
+                    f"(required >= {min_internal_gb} GB)"
+                ),
+            )
+        )
+    except OSError as exc:
+        checks.append(
+            PreflightDiskCheckItem(
+                name="internal_root_free",
+                ok=False,
+                required_bytes=req_int,
+                detail=f"Cannot inspect internal root {internal_root}: {exc}",
+            )
+        )
+
+    # Gate 3: Active Colima profile's /var/lib/docker >= 55 GB (using the SAME resolved Colima config)
+    req_colima = int(min_colima_docker_gb) * _BYTES_PER_GB
+    if colima_resolution_err is not None or colima_target is None:
+        checks.append(
+            PreflightDiskCheckItem(
+                name="colima_docker_free",
+                ok=False,
+                required_bytes=req_colima,
+                detail=f"Cannot probe Colima /var/lib/docker free space: {colima_resolution_err}",
+            )
+        )
+    else:
+        if colima_docker_free_bytes_fn is not None:
+            colima_free = colima_docker_free_bytes_fn()
+        else:
+            colima_free = _probe_colima_docker_free_bytes(
+                colima_home=colima_target,
+                profile=active_profile,
+                env=env,
+                run_fn=colima_run_fn if colima_run_fn is not None else subprocess.run,
+            )
+        if colima_free is None:
+            checks.append(
+                PreflightDiskCheckItem(
+                    name="colima_docker_free",
+                    ok=False,
+                    required_bytes=req_colima,
+                    detail=(
+                        "Failed probing Colima /var/lib/docker free space "
+                        f"(required >= {min_colima_docker_gb} GB)"
+                    ),
+                )
+            )
+        else:
+            ok_colima = int(colima_free) >= req_colima
+            checks.append(
+                PreflightDiskCheckItem(
+                    name="colima_docker_free",
+                    ok=ok_colima,
+                    free_bytes=int(colima_free),
+                    required_bytes=req_colima,
+                    detail=(
+                        f"Colima /var/lib/docker free={int(colima_free) / _BYTES_PER_GB:.1f} GB "
+                        f"(required >= {min_colima_docker_gb} GB)"
+                    ),
+                )
+            )
+
+    return PreflightDiskReport(
+        ok=all(c.ok for c in checks),
+        colima_resolved_path=resolved_colima_str,
+        checks=tuple(checks),
+    )
+
+
+def select_orphan_objects_to_reap(
+    bucket_objects: Iterable[Mapping[str, Any]],
+    registered_keys: Iterable[str],
+    *,
+    older_than_hours: float = 48.0,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Select unregistered objects older than ``older_than_hours`` eligible for orphan cleanup (§1.4)."""
+    ref_now = now or dt.datetime.now(dt.timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=dt.timezone.utc)
+    cutoff = ref_now - dt.timedelta(hours=float(older_than_hours))
+    registered = {str(k).strip().lstrip("/") for k in registered_keys if str(k).strip()}
+    orphans: list[str] = []
+    for item in bucket_objects:
+        key = str(item.get("Key") or item.get("key") or "").strip().lstrip("/")
+        if not key or key in registered:
+            continue
+        lm = item.get("LastModified") or item.get("last_modified")
+        if isinstance(lm, str):
+            try:
+                lm_dt = dt.datetime.fromisoformat(lm.strip().replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        elif isinstance(lm, dt.datetime):
+            lm_dt = lm
+        else:
+            continue
+        if lm_dt.tzinfo is None:
+            lm_dt = lm_dt.replace(tzinfo=dt.timezone.utc)
+        if lm_dt <= cutoff:
+            orphans.append(key)
+    return sorted(orphans)
 
 
 def find_latest_pg_dump(pg_backup_dir: Path) -> Path | None:
@@ -1524,13 +2276,63 @@ def _cmd_scan_plaintext(args: argparse.Namespace) -> int:
 
 def _cmd_verify_mount(args: argparse.Namespace) -> int:
     mount_root = Path(args.mount_root)
-    for raw_target in args.target_path:
+    targets = list(args.target_path or ())
+    if not targets and not args.backups_root:
+        print("verify-mount requires --target-path and/or --backups-root", file=sys.stderr)
+        return 2
+    if args.backups_root:
+        try:
+            verify_backup_mount_layout(mount_root, Path(args.backups_root))
+        except MountCheckError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    for raw_target in targets:
         try:
             verify_external_mount(mount_root, Path(raw_target))
         except MountCheckError as exc:
             print(str(exc), file=sys.stderr)
             return 1
     return 0
+
+
+def _cmd_preflight_disk_space(args: argparse.Namespace) -> int:
+    colima_fn = None
+    if args.colima_df_file:
+        df_text = Path(args.colima_df_file).read_text(encoding="utf-8")
+        colima_fn = lambda: parse_df_available_bytes(df_text)  # noqa: E731
+    report = preflight_disk_space(
+        external_mount_root=Path(args.mount_root),
+        internal_root=Path(args.internal_root),
+        colima_dir=Path(args.colima_dir) if args.colima_dir else None,
+        colima_profile=args.colima_profile or None,
+        min_external_gb=int(args.min_external_gb),
+        min_internal_gb=int(args.min_internal_gb),
+        min_colima_docker_gb=int(args.min_colima_gb),
+        colima_docker_free_bytes_fn=colima_fn,
+    )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    if not report.ok:
+        for item in report.checks:
+            if not item.ok:
+                print(f"PREFLIGHT_FAIL [{item.name}]: {item.detail}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_reconcile_restored_inflight_states(args: argparse.Namespace) -> int:
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from src.dalton import consistent_backup
+
+    sub_argv = ["reconcile-restored-inflight-states"]
+    if args.skip_object_check:
+        sub_argv.append("--skip-object-check")
+    if args.asr_jobs_dir:
+        sub_argv.extend(["--asr-jobs-dir", args.asr_jobs_dir])
+    if args.restored_before:
+        sub_argv.extend(["--restored-before", args.restored_before])
+    return consistent_backup.main(sub_argv)
 
 
 def _cmd_latest_pg_dump(args: argparse.Namespace) -> int:
@@ -1774,8 +2576,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_mount = sub.add_parser("verify-mount")
     p_mount.add_argument("--mount-root", required=True)
-    p_mount.add_argument("--target-path", nargs="+", required=True)
+    p_mount.add_argument("--target-path", nargs="+", default=[])
+    p_mount.add_argument("--backups-root", default="")
     p_mount.set_defaults(func=_cmd_verify_mount)
+
+    p_preflight = sub.add_parser("preflight-disk-space")
+    p_preflight.add_argument("--mount-root", default="/Volumes/EveSSD")
+    p_preflight.add_argument("--internal-root", default="/")
+    p_preflight.add_argument("--colima-dir", default="")
+    p_preflight.add_argument("--colima-profile", default="")
+    p_preflight.add_argument("--min-external-gb", type=int, default=PREFLIGHT_EXT_SSD_MIN_GB)
+    p_preflight.add_argument("--min-internal-gb", type=int, default=PREFLIGHT_INTERNAL_ROOT_MIN_GB)
+    p_preflight.add_argument("--min-colima-gb", type=int, default=PREFLIGHT_COLIMA_DOCKER_MIN_GB)
+    p_preflight.add_argument("--colima-df-file", default="")
+    p_preflight.set_defaults(func=_cmd_preflight_disk_space)
+
+    p_rri = sub.add_parser("reconcile-restored-inflight-states")
+    p_rri.add_argument("--skip-object-check", action="store_true")
+    p_rri.add_argument("--asr-jobs-dir", default="")
+    p_rri.add_argument("--restored-before", default="")
+    p_rri.set_defaults(func=_cmd_reconcile_restored_inflight_states)
 
     p_pg = sub.add_parser("latest-pg-dump")
     p_pg.add_argument("--pg-dir", required=True)

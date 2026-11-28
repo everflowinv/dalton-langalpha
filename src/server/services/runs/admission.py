@@ -535,13 +535,6 @@ async def begin_run(
         recorded_as=recorded_as,
         is_byok=is_byok,
     )
-    # DALTON-HOOK(chat-large-upload): confirm request attachment retention inside START's transaction
-    from src.dalton.services.chat_uploads import extract_chat_upload_contexts
-
-    has_chat_uploads = bool(
-        not request.hitl_response
-        and extract_chat_upload_contexts(request.additional_context)
-    )
     started: list = []
     start = spawn_protected(
         RunCoordinator.get_instance().start_run(
@@ -598,25 +591,16 @@ async def begin_run(
             pending_input=executor_input_stamp(request),
             on_started=started.append,
             # DALTON-HOOK(chat-large-upload): confirm chat_uploads inside the durable START transaction
-            before_commit=(
-                partial(
-                    _start_checks,
-                    request,
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    then=in_start,
-                    runs_in=runs_in,
-                )
-                if (
-                    request.request_key
-                    or request.steer_job_id
-                    or request.checked_computer_id
-                    or has_chat_uploads
-                    or in_start
-                )
-                else None
+            # DALTON-HOOK(maintenance-gate): unconditionally attach before_commit to acquire shared PG advisory lock
+            before_commit=partial(
+                _start_checks,
+                request,
+                thread_id=thread_id,
+                run_id=run_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                then=in_start,
+                runs_in=runs_in,
             ),
         ),
         f"start-{run_id}",
@@ -656,6 +640,12 @@ async def _start_checks(
     then: Optional[Callable[[Any], Awaitable[None]]] = None,
     runs_in: Optional[str] = None,
 ) -> None:
+    # DALTON-HOOK(maintenance-gate): serialize START commit against host-side maintenance pause via PG shared advisory lock
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_in_txn
+
+    await enforce_maintenance_admission_in_txn(
+        conn, workspace_id=workspace_id, runs_in=runs_in, context="start_before_commit"
+    )
     if request.request_key:
         await refuse_copy_read_as_steer(
             thread_id, request.request_key, conn, except_job_id=request.steer_job_id

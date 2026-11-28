@@ -41,7 +41,7 @@ from src.server.utils.content_normalizer import (
 # DALTON-HOOK(thinking-leak): live assistant text is filtered before it is framed.
 from src.server.utils.thinking_leak import ThinkingLeakGate
 from src.server.utils.pg_sanitize import finite_json_dumps
-from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, queue_record
+from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, computer_lost, queue_record
 from src.server.contracts.status import classify_interrupts
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
 from src.server.database.runs.lifecycle import ProducerRecord
@@ -390,6 +390,8 @@ class RunSSEProducer:
         self.interrupt_reason: Optional[str] = None
         # A credit pause's denial, which the finalize stamps on the row.
         self.pause_message: Optional[str] = None
+        # DALTON-HOOK(personal-integrations): redact SSE log bodies once a thread carries personal integration data
+        self._personal_integration_sse_redacted: bool = False
 
     def _open_compaction_window(self, ns_key: tuple) -> None:
         """Track a newly-opened compaction window. The FIRST window on this
@@ -488,6 +490,25 @@ class RunSSEProducer:
             from src.tools.decorators import _tool_usage_context
             _tool_usage_context.set(self.tool_tracker)
             logger.debug(f"[RunSSEProducer] Tool usage tracking ContextVar set for thread_id={self.thread_id}")
+
+        # DALTON-HOOK(personal-integrations): pre-check whether this thread already carries personal
+        # integration data. Only the SSE event log reads the flag, so skip the lookup when that log is
+        # off; a failed lookup logs ids and types only instead of ending the turn.
+        if SSE_EVENT_LOG_ENABLED and not getattr(self, "_personal_integration_sse_redacted", False):
+            from src.dalton.services.personal_integration_guard import (
+                is_thread_sse_log_redacted,
+            )
+
+            try:
+                self._personal_integration_sse_redacted = await is_thread_sse_log_redacted(
+                    self.thread_id
+                )
+            except Exception:
+                logger.warning(
+                    "[RunSSEProducer] personal-private lookup failed; SSE log keeps ids and types only",
+                    exc_info=True,
+                )
+                self._personal_integration_sse_redacted = True
 
         _stream_span = _otel_tracer.start_span(
             "chat.turn.stream",
@@ -843,6 +864,22 @@ class RunSSEProducer:
                             )
                             continue
 
+                        # DALTON-HOOK(personal-integrations): emit live first-touch privacy notice onto the turn stream
+                        if event_type == "personal_integration_notice":
+                            self._personal_integration_sse_redacted = True
+                            yield self._build_sse_event(
+                                "personal_integration_notice",
+                                {
+                                    "thread_id": self.thread_id,
+                                    "agent": "main",
+                                    "service": event_data.get("service"),
+                                    "provider": event_data.get("provider"),
+                                    "turn_index": event_data.get("turn_index"),
+                                    "message": event_data.get("message", ""),
+                                },
+                            )
+                            continue
+
                         # Check if this is an artifact event from middleware
                         # Generic handler: any event with artifact_type is emitted as artifact SSE
                         artifact_type = event_data.get("artifact_type")
@@ -1038,12 +1075,17 @@ class RunSSEProducer:
             # Don't yield error event - this is expected behavior
             raise
         except Exception as e:
+            # A turn that lost its Claude Code computer is stopped to be
+            # resumed, not failed: its run_end says so, with no error frame.
+            lost = computer_lost(e) is not None
             if isinstance(e, TurnTimeLimitError):
                 # A planned stop the [TIMEOUT_ERROR] line has already named;
                 # its traceback is only this generator's own raise.
                 logger.warning(
                     f"Turn stopped at its time limit for thread_id={self.thread_id}: {e}"
                 )
+            elif lost:
+                logger.warning(f"Turn lost its Claude Code computer for thread_id={self.thread_id}: {e}")
             else:
                 logger.exception(f"Error in stream generator for thread_id={self.thread_id}: {e}")
             _stream_span.record_exception(e)
@@ -1053,9 +1095,9 @@ class RunSSEProducer:
             # marked not executed when retries fail before opening a new message.
             for frame in self.flush_pending_tool_calls():
                 yield frame
-            if not isinstance(e, TurnTimeLimitError):
+            if not (isinstance(e, TurnTimeLimitError) or lost):
                 yield await self._build_error_event(str(e), exc=e)
-            raise  # Re-raise so the run executor finalizes as failed
+            raise  # Re-raise so the run executor finalizes it
         finally:
             # Safety net: if the stream ends (timeout / error / CancelledError /
             # aclose()) while a compaction window is still open, release the
@@ -2193,7 +2235,18 @@ class RunSSEProducer:
 
         # Log SSE events to dedicated logger if enabled
         if SSE_EVENT_LOG_ENABLED:
-            sse_logger.info(f"{result}")
+            # DALTON-HOOK(personal-integrations): log only sequence id and event type on personal-private threads
+            from src.dalton.services.personal_integration_guard import (
+                is_thread_personal_private_runtime,
+            )
+
+            if getattr(self, "_personal_integration_sse_redacted", False) or (
+                is_thread_personal_private_runtime(self.thread_id)
+            ):
+                self._personal_integration_sse_redacted = True
+                sse_logger.info(f"id: {self.event_sequence}\nevent: {event_type}\n\n")
+            else:
+                sse_logger.info(f"{result}")
 
         return result
 

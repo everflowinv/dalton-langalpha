@@ -154,6 +154,8 @@ def render_segment(
     *,
     unit: str = "turn",
     tool_names: dict[str, str] | None = None,
+    # DALTON-HOOK(personal-integrations): carry persistent private-thread taint across turns
+    initially_tainted: bool = False,
 ) -> Segment:
     """Render one turn.
 
@@ -166,6 +168,14 @@ def render_segment(
     # The model the lines written so far last stated. An answer that writes
     # no line states nothing, so it leaves this where it was.
     current: str | None = None
+    # DALTON-HOOK(personal-integrations): redact private calendar/mail tool payloads and subsequent messages in stored transcripts
+    from src.dalton.services.personal_integration_trace import (
+        REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
+        is_personal_integration_tool,
+        redact_personal_tool_args,
+    )
+
+    personal_tainted = bool(initially_tainted)
 
     def emit(event: dict[str, Any], message: AnyMessage) -> None:
         segment.lines.append(
@@ -187,27 +197,67 @@ def render_segment(
             if kind not in ("plain", "steering"):
                 continue
             if kind == "steering":
-                _emit_steering(message, emit)
+                if personal_tainted:
+                    emit(
+                        {
+                            "type": "user",
+                            "id": message.id,
+                            "text": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
+                            "steering": True,
+                        },
+                        message,
+                    )
+                else:
+                    _emit_steering(message, emit)
                 continue
-            event = {"type": "user", "id": message.id, "text": visible_text(message.content)}
+            event = {
+                "type": "user",
+                "id": message.id,
+                "text": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+                if personal_tainted
+                else visible_text(message.content),
+            }
             # In a shared workspace, the member who wrote it.
             if (sender := MemberSender.of(message)) is not None:
                 event["sender"] = sender.name
             emit(event, message)
         elif isinstance(message, AIMessage):
             events: list[dict[str, Any]] = []
+            # DALTON-HOOK(personal-integrations): taint before emitting assistant prose on the first personal tool call
+            if any(
+                is_personal_integration_tool(call["name"])
+                for call in (message.tool_calls or ())
+            ):
+                personal_tainted = True
             text = visible_text(message.content, attachments=False)
             if text.strip():
-                events.append({"type": "assistant", "id": message.id, "text": text})
+                events.append(
+                    {
+                        "type": "assistant",
+                        "id": message.id,
+                        "text": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+                        if personal_tainted
+                        else text,
+                    }
+                )
             for call in message.tool_calls or ():
                 names[call["id"]] = call["name"]
+                is_priv_call = is_personal_integration_tool(call["name"])
+                if is_priv_call:
+                    personal_tainted = True
                 events.append(
                     {
                         "type": "tool_call",
                         "id": message.id,
                         "call_id": call["id"],
                         "tool": call["name"],
-                        "args": call.get("args", {}),
+                        "args": redact_personal_tool_args(call.get("args", {}))
+                        if is_priv_call
+                        else (
+                            {"redacted": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER}
+                            if personal_tainted
+                            else call.get("args", {})
+                        ),
                     }
                 )
             model = answered_on(message)
@@ -221,16 +271,22 @@ def render_segment(
             for event in events:
                 emit(event, message)
         elif isinstance(message, ToolMessage):
+            tool_name = names.get(message.tool_call_id) or message.name
+            is_priv_res = is_personal_integration_tool(tool_name)
+            if is_priv_res:
+                personal_tainted = True
             event = {
                 "type": "tool_result",
                 "id": message.id,
                 "call_id": message.tool_call_id,
-                "tool": names.get(message.tool_call_id) or message.name,
+                "tool": tool_name,
                 "status": message.status,
-                "text": visible_text(message.content),
+                "text": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+                if is_priv_res or personal_tainted
+                else visible_text(message.content),
             }
             path = evicted_path(message)
-            if path:
+            if path and not is_priv_res and not personal_tainted:
                 event["evicted"] = path
             emit(event, message)
 
@@ -258,6 +314,8 @@ def segment_shape(
     unit: str,
     previous: str,
     tool_names: dict[str, str],
+    # DALTON-HOOK(personal-integrations): include taint state in segment shape so cached turns re-render when private
+    personal_tainted: bool = False,
 ) -> str:
     """A key that changes whenever the segment's render would.
 
@@ -271,6 +329,9 @@ def segment_shape(
     segment needs.
     """
     parts = [f"{SCHEMA_VERSION}|{unit}|{number}|{previous}"]
+    # DALTON-HOOK(personal-integrations): bump segment shape when personal-integration taint applies
+    if personal_tainted:
+        parts[0] += "|pt=1"
     for message in messages:
         part = f"{type(message).__name__}|{message.id}"
         if isinstance(message, AIMessage):

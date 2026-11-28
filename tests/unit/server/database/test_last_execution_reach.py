@@ -1006,6 +1006,7 @@ async def test_colleague_workspace_thread_preserves_original_workspace_id_after_
         ALTER TABLE conversation_threads ADD COLUMN fast_mode INTEGER DEFAULT 0;
         ALTER TABLE conversation_threads ADD COLUMN title TEXT;
         ALTER TABLE conversation_threads ADD COLUMN created_at TEXT;
+        ALTER TABLE conversation_threads ADD COLUMN has_personal_integration_data INTEGER NOT NULL DEFAULT 0;
         """
     )
     get_conn, _, _ = _sqlite_async_db(sq)

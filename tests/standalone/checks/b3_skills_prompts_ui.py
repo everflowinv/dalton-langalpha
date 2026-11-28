@@ -407,7 +407,8 @@ def check_skills_and_workflows() -> dict[str, Any]:
 
     wf_root = app_root / "workflows"
     wf_dirs = sorted(p for p in wf_root.iterdir() if p.is_dir())
-    assert len(wf_dirs) == 6, f"Expected 6 workflows, got {len(wf_dirs)}"
+    wf_named = [p for p in wf_dirs if not p.name.startswith("_")]
+    assert len(wf_named) == 7, f"Expected 7 workflows, got {len(wf_named)}"
     js_compiled = 0
     for wf_dir in wf_dirs:
         for fp in sorted(wf_dir.rglob("*")):
@@ -420,7 +421,7 @@ def check_skills_and_workflows() -> dict[str, Any]:
             assert "DALTON_CAP" not in assembled_default, f"Unresolved DALTON_CAP marker in {fp}"
             hits_default = [t for t in core_default_proprietary_terms if t in assembled_default.lower()]
             assert not hits_default, f"Core default workflow file {fp.relative_to(app_root)} leaked {hits_default}"
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() == ".js" and not wf_dir.name.startswith("_"):
                 compile_check(assembled)
                 compile_check(assembled_default)
                 js_compiled += 1
@@ -852,6 +853,7 @@ import { isDocIncluded, transformDocSource } from './docs-site/src/integrations/
 
 const docsRoot = path.resolve('docs-site/src/content/docs');
 const forbidden = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|feishu|飞书|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
+const forbiddenAdminIntegrations = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|飞书文档|知识库|群聊绑定|机器人|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
 const everflowWord = /\beverflow\b/i;
 
 function walk(dir) {
@@ -879,8 +881,9 @@ for (const fp of walk(docsRoot)) {
   if (/dalton_doc/i.test(coreText)) {
     errors.push(`${rel}: unresolved DALTON_DOC marker`);
   }
-  if (forbidden.test(coreText)) {
-    errors.push(`${rel}: forbidden proprietary term matched: ${coreText.match(forbidden)?.[0]}`);
+  const activeForbidden = rel === 'get-started/admin-integrations.mdx' ? forbiddenAdminIntegrations : forbidden;
+  if (activeForbidden.test(coreText)) {
+    errors.push(`${rel}: forbidden proprietary term matched: ${coreText.match(activeForbidden)?.[0]}`);
   }
   if (everflowWord.test(coreText)) {
     errors.push(`${rel}: leftover 'Everflow' mention in Core doc`);

@@ -523,6 +523,10 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # Research-host cutover Batch 3b: persistent maintenance admission gate coordinated by
+  # PostgreSQL transaction advisory locks across messaging, automations, wakeups,
+  # report-back, START before_commit, and subagent_runs.
+  "maintenance-gate"
   # BY4 prod audit fix: clear ambient ProjectContext before relayed staging uploads so path
   # folding cannot redirect .wsfiles-relay-* into another workspace, and disable orphan sweep
   # in unlocked _restamp_dirs (src/server/services/persistence/restore.py).
@@ -574,6 +578,7 @@ ALLOWED_HOOKS=(
   "workspace-file-write-mode"
   "workspace-file-exclusions"
   "workspace-file-download-ticket"
+  "storage-private-bucket-urls"
   # Prod Audit 2 Batch 1 (§4): Redis write-timeout diagnostics (InstrumentedAsyncConnection,
   # per-worker client windows, dedicated PG advisory-lock leader sampler, and heavy_task tags).
   "redis-write-diag"
@@ -583,6 +588,27 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
+  # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
+  # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
+  "xlsx-preserve-calcpr"
+  "xlsx-recalc-keep-cache"
+  # Modeling v2 P0-b: Chief of Staff delegate_to_analyst appends latest user verbatim
+  # request when omitted from question, and guides serial per-company modeling dispatch.
+  "cos-verbatim-forward"
+  # Modeling v2 P0-b: per-workspace exclusive modeling lock at RunWorkflow / WorkflowDriver
+  # entry for company-model, earnings-deep-update (with model_path), and full-coverage.
+  "modeling-lock"
+  # Personal calendar & mail integrations Batch 1 (r1): START/HTTP/Fork purge gates,
+  # FOR SHARE dual-generation writeback fences (replay, search, transcripts), closed-range
+  # search guard & truncate/fork clipping, startup purge resume, and callback query redaction.
+  "personal-integrations"
+  # Deployment credentials Batch 1: setup_settings thin hooks, vault invalidation sync,
+  # and deployment secret redaction.
+  "deployment-credentials"
+  # Production fix: defer and retry automation capacity failures (WriterGuardUnavailable,
+  # quota burst 429, credit-gate 503) in Postgres via wait_reason='capacity_limit' up to 15m,
+  # and reset conversation_threads.current_status on pre-START automation failure/exit.
+  "automation-capacity-retry"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

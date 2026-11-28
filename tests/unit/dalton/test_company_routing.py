@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -812,6 +813,145 @@ async def test_launch_routing_allows_readonly_colleague_with_hint_but_refuses_de
             "full-coverage",
             {"ticker": "NVDA", "workspace_dir": "."},
             {"user_id": U1, "workspace_id": WS_CURRENT},
+        )
+
+
+@pytest.mark.asyncio
+async def test_company_model_sector_workspace_in_place_passthrough_serial_pdd_to_jd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Modeling v2 §3.4 & R2 #9: company-model in a sector workspace passes both
+    launch routing and check_done routing ONLY when model_path exists on disk,
+    resolves (after symlinks) inside <workspace>/model/, and ends with .xlsx."""
+    import subprocess
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+
+    assert "company-model" in COMPANY_WORKFLOWS
+    sector_ws = tmp_path / "中国电商"
+    model_dir = sector_ws / "model"
+    model_dir.mkdir(parents=True)
+    v1 = model_dir / "China_Ecommerce_v01.xlsx"
+    v2 = model_dir / "China_Ecommerce_v02.xlsx"
+    v1.write_bytes(b"PK\x03\x04dummy-v1")
+    v2.write_bytes(b"PK\x03\x04dummy-v2")
+    (sector_ws / "readme.md").write_text("not a workbook", encoding="utf-8")
+    (model_dir / "notes.txt").write_text("not xlsx", encoding="utf-8")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_xlsx = outside_dir / "secret.xlsx"
+    outside_xlsx.write_bytes(b"PK\x03\x04outside")
+    (model_dir / "escape.xlsx").symlink_to(outside_xlsx)
+    (model_dir / "bad_ext.xlsx").symlink_to(model_dir / "notes.txt")
+    (model_dir / "alias_v01.xlsx").symlink_to(v1)
+
+    sector_root = str(sector_ws)
+
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = sector_root
+
+    async def _aexec(command: str, *, timeout: int | None = None) -> Any:
+        proc = subprocess.run(
+            ["bash", "-c", command],
+            cwd=sector_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        class _R:
+            output = proc.stdout + proc.stderr
+            exit_code = proc.returncode
+
+        return _R()
+
+    backend.aexecute.side_effect = _aexec
+
+    # Both PDD and JD have their own dedicated company workspaces.
+    _current(monkeypatch, WorkspaceCoverageIdentity(KIND_SECTOR, SOURCE_COMPAT), is_sector=True)
+    finder = _finder(monkeypatch, [_ws(WS_OTHER, "拼多多-PDD")])
+
+    # 1. Serial PDD -> JD in-place on real sector workbook (local root + sandbox backend):
+    for ticker, mp in (
+        ("PDD", "model/China_Ecommerce_v01.xlsx"),
+        ("JD", "model/China_Ecommerce_v02.xlsx"),
+        ("JD", f"{sector_root}/model/China_Ecommerce_v02.xlsx"),
+        ("PDD", "model/alias_v01.xlsx"),
+    ):
+        for bk in (None, backend):
+            note = await resolve_launch_company_routing(
+                "company-model",
+                {"ticker": ticker, "workspace_dir": ".", "model_path": mp},
+                {"user_id": U1, "workspace_id": WS_CURRENT},
+                workspace_root=sector_root,
+                backend=bk,
+            )
+            assert note is None, (ticker, mp, bk is not None)
+            hint = await routing_hint_for_check(
+                {"ticker": ticker, "workspace_dir": ".", "model_path": mp},
+                U1,
+                WS_CURRENT,
+                workflow="company-model",
+                workspace_root=sector_root,
+                backend=bk,
+            )
+            assert hint is None, (ticker, mp, bk is not None)
+    finder.assert_not_awaited()
+
+    # 2. workspace_dir escape is still refused even on the sector in-place path.
+    with pytest.raises(CompanyRoutingRefused, match="越出了当前工作区"):
+        await resolve_launch_company_routing(
+            "company-model",
+            {
+                "ticker": "PDD",
+                "workspace_dir": "../拼多多-PDD",
+                "model_path": "model/China_Ecommerce_v01.xlsx",
+            },
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+            workspace_root=sector_root,
+            backend=backend,
+        )
+
+    # 3. Missing model_path, non-existent file, non-model/, non-.xlsx, or symlink escaping workspace
+    #    must NOT receive single-track pass-through and fall back to normal refusal.
+    for bad_params in (
+        {"ticker": "PDD", "workspace_dir": "."},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "../拼多多-PDD/model/PDD-model-v01.xlsx"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "/home/daytona/workspace/拼多多-PDD/model/PDD-model-v01.xlsx"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/does_not_exist.xlsx"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "readme.md"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/notes.txt"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/escape.xlsx"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/bad_ext.xlsx"},
+    ):
+        for bk in (None, backend):
+            with pytest.raises(CompanyRoutingRefused, match="「拼多多-PDD」"):
+                await resolve_launch_company_routing(
+                    "company-model",
+                    bad_params,
+                    {"user_id": U1, "workspace_id": WS_CURRENT},
+                    workspace_root=sector_root,
+                    backend=bk,
+                )
+            hint = await routing_hint_for_check(
+                bad_params,
+                U1,
+                WS_CURRENT,
+                workflow="company-model",
+                workspace_root=sector_root,
+                backend=bk,
+            )
+            assert hint is not None and "「拼多多-PDD」" in hint, (bad_params, bk is not None)
+
+    # 4. Non-sector workspace (e.g. JD's workspace trying to update PDD with model_path) is still refused.
+    _current(monkeypatch, _company_identity("JD"), is_sector=False)
+    with pytest.raises(CompanyRoutingRefused, match="「拼多多-PDD」"):
+        await resolve_launch_company_routing(
+            "company-model",
+            {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/China_Ecommerce_v01.xlsx"},
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+            workspace_root=sector_root,
+            backend=backend,
         )
 
 

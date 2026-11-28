@@ -409,8 +409,9 @@ async def test_get_user_preferences_cache_hit():
     conn.cursor = _cursor_cm
 
     @asynccontextmanager
-    async def _fake_db():
-        yield conn
+    async def _fake_db(db_conn=None):
+        # DALTON-HOOK(dalton-notify): get_user_preferences passes optional conn to get_db_connection
+        yield db_conn if db_conn is not None else conn
 
     with patch(
         "src.utils.cache.redis_cache.get_cache_client", return_value=cache
@@ -446,8 +447,9 @@ async def test_get_user_preferences_cache_miss():
     conn.cursor = _cursor_cm
 
     @asynccontextmanager
-    async def _fake_db():
-        yield conn
+    async def _fake_db(db_conn=None):
+        # DALTON-HOOK(dalton-notify): get_user_preferences passes optional conn to get_db_connection
+        yield db_conn if db_conn is not None else conn
 
     with patch(
         "src.utils.cache.redis_cache.get_cache_client", return_value=cache
@@ -486,8 +488,9 @@ async def test_get_user_preferences_uncached_reads_the_row_and_leaves_the_cache_
     conn.cursor = _cursor_cm
 
     @asynccontextmanager
-    async def _fake_db():
-        yield conn
+    async def _fake_db(db_conn=None):
+        # DALTON-HOOK(dalton-notify): get_user_preferences passes optional conn to get_db_connection
+        yield db_conn if db_conn is not None else conn
 
     with patch(
         "src.utils.cache.redis_cache.get_cache_client", return_value=cache

@@ -177,6 +177,7 @@ export type MockBackend = BackendClient &
       | "setOnStaleGatewayEpoch"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
+      | "authorizeFailureNoticePlan"
       | "downloadDataTaskRunArtifact"
     >
   > & {
@@ -1128,6 +1129,13 @@ export function createMockBackend(): MockBackend {
       message: "Delivery not configured in mock backend",
     })),
 
+    authorizeFailureNoticePlan: vi.fn(async () => ({
+      authorized: false,
+      status: "failed" as const,
+      code: "claim_expired_or_superseded",
+      message: "Failure notice plan not configured in mock backend",
+    })),
+
     downloadDataTaskRunArtifact: vi.fn(async () => ({
       content: Buffer.from("\x89PNG\r\n\x1a\n", "binary"),
       mimeType: "image/png",
@@ -1220,7 +1228,9 @@ export async function fetchGatewayServer(
     return await fetch(url, init);
   } catch (err) {
     const cause = (err as { cause?: { code?: string } })?.cause;
-    if (cause?.code !== "EPERM") {
+    // EPERM: a sandbox that blocks loopback connect(). ECONNREFUSED: a test that addresses the
+    // app by a portless URL without starting a listener. Both are served in process below.
+    if (cause?.code !== "EPERM" && cause?.code !== "ECONNREFUSED") {
       throw err;
     }
     // Fallback when running inside a restricted sandbox that blocks loopback TCP `connect()`

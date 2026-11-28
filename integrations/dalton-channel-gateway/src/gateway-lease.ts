@@ -76,6 +76,7 @@ export interface GatewayLeaseBackend {
   acquireGatewayLease(req: {
     instance_id: string;
     ttl_seconds: number;
+    feishu_app_id?: string | null;
   }): Promise<{
     granted: boolean;
     epoch: number;
@@ -86,6 +87,7 @@ export interface GatewayLeaseBackend {
     instance_id: string;
     epoch: number;
     ttl_seconds: number;
+    feishu_app_id?: string | null;
   }): Promise<{
     ok: boolean;
     epoch: number;
@@ -107,6 +109,7 @@ export interface GatewayLeaseManagerOptions {
   heartbeatIntervalMs?: number;
   safetyMarginMs?: number;
   acquireRetryMs?: number;
+  feishuAppId?: string;
   logger?: SubsystemLogger;
   onEpochAcquired?: (epoch: number) => void;
   onLeaseLost?: (reason: string, error?: unknown) => void;
@@ -151,6 +154,7 @@ export class GatewayLeaseManager {
   private readonly heartbeatIntervalMs: number;
   private readonly safetyMarginMs: number;
   private readonly acquireRetryMs: number;
+  private readonly feishuAppId?: string;
   private readonly logger: SubsystemLogger;
   private readonly onEpochAcquired?: (epoch: number) => void;
   private readonly onLeaseLost?: (reason: string, error?: unknown) => void;
@@ -179,6 +183,8 @@ export class GatewayLeaseManager {
       options.safetyMarginMs ?? DEFAULT_GATEWAY_LEASE_SAFETY_MARGIN_MS;
     this.acquireRetryMs =
       options.acquireRetryMs ?? DEFAULT_GATEWAY_LEASE_ACQUIRE_RETRY_MS;
+    const cleanedFeishuAppId = options.feishuAppId?.trim();
+    this.feishuAppId = cleanedFeishuAppId || undefined;
     this.logger = options.logger ?? createSubsystemLogger("gateway-lease");
     this.onEpochAcquired = options.onEpochAcquired;
     this.onLeaseLost = options.onLeaseLost;
@@ -286,6 +292,7 @@ export class GatewayLeaseManager {
         const res = await this.backend.acquireGatewayLease({
           instance_id: this.instanceId,
           ttl_seconds: this.ttlSeconds,
+          ...(this.feishuAppId ? { feishu_app_id: this.feishuAppId } : {}),
         });
         if (res.granted && Number.isInteger(res.epoch) && res.epoch > 0) {
           this.currentEpoch = res.epoch;
@@ -389,6 +396,7 @@ export class GatewayLeaseManager {
         instance_id: this.instanceId,
         epoch,
         ttl_seconds: this.ttlSeconds,
+        ...(this.feishuAppId ? { feishu_app_id: this.feishuAppId } : {}),
       });
       if (this.stopped || this.leaseLost) {
         return false;

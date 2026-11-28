@@ -23,26 +23,15 @@
       "requires_param": "model_path",
       "artifacts": [
         {
-          "path": "research/{release_date}-deep-{quarter}/mapping.md",
+          "path": "research/{release_date}-deep-{quarter}/model_dump/model-verification.json",
           "min_bytes": 50
-        },
-        {
-          "path": "research/{release_date}-deep-{quarter}/model-delta.md",
-          "min_bytes": 50
-        },
-        {
-          "path": "model/{ticker}-model-v*.xlsx",
-          "glob": true,
-          "min_count": 1,
-          "min_bytes": 1000,
-          "modified_on": "today"
         }
       ],
       "validators": [
         {
-          "command": "python3 .agents/skills/dalton-model/scripts/model_readable.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\"",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{release_date}-deep-{quarter} --expected-workflow earnings-deep-update",
           "pass_when": "exit_zero",
-          "description": "核对新版本模型文件存在且可由 openpyxl 正常打开读取（不因提示性扫描阻断）"
+          "description": "按终态账本核对最终模型可读性、哈希、已完成阶段证据、失败阶段记录及 mapping.md / model-delta.md 状态"
         }
       ]
     },

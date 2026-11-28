@@ -66,7 +66,12 @@ cd /opt/dalton
 
 ### 第 2 步：运行初始化脚本
 
-执行 `scripts/standalone/init.sh`，脚本会自动检测系统环境、按目标域名写入认证模式与监听地址、配置 `COMPOSE_FILE` 与可信代理参数、生成全套随机密钥（写入权限为 `0600` 的 `.env` 文件），并构建代码沙箱镜像 `langalpha-sandbox:latest`：
+独立核心版提供两条清晰的安装路径：
+
+- **路径 A：标准登录部署（推荐，公网 HTTPS 或企业内网 TLS，`DALTON_AUTH_MODE=local`）**：传入公网域名或企业内网域名时，`init.sh` 自动写入 `DALTON_AUTH_MODE=local` 与 `VITE_DALTON_AUTH=local`，生成全套随机密钥与一次性 `BOOTSTRAP_SETUP_TOKEN` 写入 `.env`（权限 `0600`），并构建代码沙箱镜像 `langalpha-sandbox:latest`。启动后依次在网页完成 `/setup/admin` 管理员自举、`/setup/model` 首个模型配置，即可直接前往 **「设置 → 团队管理 → 集成凭据」** 网页管理第三方连接器凭据，全程无需手工修改 `.env`。
+- **路径 B：本机回环试用（`--domain localhost --tls-mode loopback`，`DALTON_AUTH_MODE=oss`）**：仅发布 `http://127.0.0.1:8088` 供单机快速体验对话；点击侧栏「集成凭据」或访问 `?tab=deploymentCredentials` 时显示切换至管理员登录模式的引导页，按 §4.1 切换为 `DALTON_AUTH_MODE=local` 后即可使用网页凭据管理。
+
+执行 `scripts/standalone/init.sh`：
 
 ```bash
 # 公网域名部署（启用本地登录、自动 HTTPS 与 0.0.0.0 监听）
@@ -286,15 +291,17 @@ Dalton 核心版采用 BYOK（Bring Your Own Key，自带模型密钥）模式�
 ### 5.1 配置方式
 
 - **方式 A（网页向导，推荐）**：首次进入应用后在 `/setup` 引导页或 **设置 → 模型与供应商** 中填入主流模型提供商的 API Key（OpenAI、Anthropic、Google Gemini、DeepSeek 等），或添加自定义 OpenAI 兼容模型地址。密钥在数据库中经 `BYOK_ENCRYPTION_KEY` 加密保存。
-- **方式 B（命令行向导）**：在服务器上运行 `make config`，按提示填写环境变量与默认模型，然后重启后端生效：
+- **方式 B（命令行向导）**：在服务器上运行 `make config`，按提示填写环境变量与默认模型，然后重建 `backend` 容器使新 `.env` 生效（启用 HTTPS 时一并附加对应的 TLS 叠加文件）：
   ```bash
   make config
-  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env restart backend
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d backend
   ```
+
+> **`.env` 改动生效约定**：修改 `.env` 中的环境变量后，请执行 `docker compose ... up -d <service>` 重建对应容器以注入新环境（`docker compose restart` 会沿用容器创建时的旧环境快照）。
 
 ### 5.2 企业内网模型网关白名单
 
-为防范 SSRF（服务端请求伪造），多用户本地认证模式下后端默认拦截指向私网或回环地址的自定义模型地址。如需接入企业内网自建模型网关，由运维管理员在 `.env` 中显式登记白名单地址（多个地址以英文逗号分隔）并重启 `backend`：
+为防范 SSRF（服务端请求伪造），多用户本地认证模式下后端默认拦截指向私网或回环地址的自定义模型地址。如需接入企业内网自建模型网关，由运维管理员在 `.env` 中显式登记白名单地址（多个地址以英文逗号分隔），再执行 `docker compose ... up -d backend` 重建 `backend`：
 
 ```dotenv
 DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
@@ -302,7 +309,7 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 
 ### 5.3 合规标识与可选增强密钥
 
-在 `.env` 中按需补充以下配置并重启 `backend`：
+在 `.env` 中按需补充以下配置，再执行 `docker compose ... up -d backend` 重建 `backend` 容器使新配置生效：
 
 | 环境变量 | 用途 | 默认行为 |
 |---|---|---|
@@ -386,6 +393,16 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
 
 `healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。
 
+### 5.5 网页管理部署级集成凭据（Google OAuth 与飞书开放平台）
+
+在标准登录部署模式（`DALTON_AUTH_MODE=local`）完成首位管理员创建与模型配置后，管理员可直接前往 **「设置 → 团队管理 → 集成凭据」**（`/settings?tab=deploymentCredentials`，页面内提供 `/help/get-started/admin-integrations/` 图文指南）加密配置以下部署级凭据并立即热生效：
+
+- **Google OAuth 2.0（开放授权协议）客户端凭据**：`DALTON_GOOGLE_OAUTH_CLIENT_ID` 与 `DALTON_GOOGLE_OAUTH_CLIENT_SECRET`。
+  - **回调域名条件**：Google OAuth 2.0 Web 客户端要求由 `PUBLIC_APP_URL` 拼接生成的 Redirect URI（授权回调地址）为公网可达且具备 Public Suffix（公共顶级域名后缀，如 `.com`、`.cn`、`.org`）的 `https://` 地址，或 Google 允许的本机回环地址（`http://localhost` / `http://127.0.0.1` 配合 `DALTON_AUTH_MODE=local`）。企业内网部署如需启用 Google 连接器，可在企业公网主域名下分配内网解析子域（例如 `https://dalton.corp.example.com`）并搭配 `--tls-mode internal` 或 `--tls-mode custom`；使用裸局域网 IP 或 `.internal` 等私有后缀时，页面会展示具体原因横幅并置灰相关 Google 开关，模型对话与飞书自建应用照常可用。
+- **飞书开放平台应用与事件验签凭据**：企业自建应用双键 `DALTON_FEISHU_APP_ID` / `DALTON_FEISHU_APP_SECRET` 以及事件订阅验签双键 `DALTON_FEISHU_ENCRYPT_KEY` / `DALTON_FEISHU_VERIFICATION_TOKEN`。
+
+所有在网页保存的凭据与审计记录均保存在 PostgreSQL 主库（`deployment_settings`、`dalton_deployment_settings_meta` 与 `dalton_deployment_settings_audit`），随 `scripts/standalone/backup.sh` 与 `restore.sh` 一并备份与恢复（解密依赖原 `.env` 中的 `BYOK_ENCRYPTION_KEY`）。
+
 停服维护前，在 `transcription` 容器内携带容器环境变量 `DALTON_TRANSCRIPTION_TOKEN` 发起停止接单，并轮询确认 `ready_for_handoff` 为 `true` 且 `active_jobs` 归零后再重启容器：
 
 ```bash
@@ -402,7 +419,7 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
 
 ## 6. 备份、恢复与平滑升级
 
-> **适用范围（外部数据库说明）**：`backup.sh`、`restore.sh` 与 `upgrade.sh` 仅管理 Compose 编排的 `postgres` 容器（`.env` 中 `DB_HOST=postgres`）。如果部署接入了外部 PostgreSQL 实例，请直接使用 `pg_dump` / `pg_restore` 自行备份与恢复数据库。
+> **适用范围（外部数据库说明）**：`backup.sh`、`restore.sh` 与 `upgrade.sh` 仅管理 Compose 编排的 `postgres` 容器（`.env` 中 `DB_HOST=postgres`）。如果部署接入了外部 PostgreSQL 实例，请直接使用 `pg_dump` / `pg_restore` 自行备份与恢复数据库；自行 `pg_restore` 并完成数据库迁移后、启动 `backend` 前，请使用 `psql -v ON_ERROR_STOP=1 -f scripts/dalton/sql/personal_integrations_restore_reset.sql` 执行同一份前置清空 SQL，清空恢复库中的个人集成令牌与临时授权状态并将既有连接置为待重新授权。
 
 ### 6.1 正式备份（在线执行）
 

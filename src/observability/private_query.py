@@ -50,6 +50,9 @@ def is_private(path: str, query: str) -> bool:
     if is_download_ticket_path(path):
         return True
     mount, folders = _markers()
+    # DALTON-HOOK(personal-integrations): strip OAuth callback query strings (code/state) from access logs and spans
+    if "/api/v1/dalton/integrations/" in path and path.rstrip("/").endswith("/callback"):
+        return True
     # Anywhere in the path, so a server mounted under a root path matches
     # too; anywhere in the decoded query, so any spelling of the folder does.
     # A false match only loses a query string from a log line.
@@ -62,7 +65,10 @@ _NAMED_PATH = re.compile(r"(/api/v1/subagents/)[^?#]+")
 
 
 def _fold_names(target: str) -> str:
-    return _NAMED_PATH.sub(r"\1{name}", target)
+    folded = _NAMED_PATH.sub(r"\1{name}", target)
+    # DALTON-HOOK(storage-private-bucket-urls): redact public share tokens in access logs and spans
+    from src.dalton.private_bucket_urls import redact_share_token_in_text
+    return redact_share_token_in_text(folded)
 
 
 def _logged_target(value: Any) -> Any:

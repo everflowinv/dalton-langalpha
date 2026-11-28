@@ -328,7 +328,7 @@ async def list_automation_runs(
             "agent thread."
         ),
     ),
-    wait_reason: Literal["thread_busy", "computer_unreachable"] | None = Query(None),
+    wait_reason: Literal["thread_busy", "computer_unreachable", "capacity_limit"] | None = Query(None),  # DALTON-HOOK(automation-capacity-retry)
 ):
     """List executions. Omitted scope stays the caller's own agent runs.
 
@@ -882,6 +882,12 @@ async def trigger_automation(
     http_request: Request,
 ):
     """Manually trigger an automation immediately (doesn't affect next_run_at)."""
+    # DALTON-HOOK(maintenance-gate): block manual automation triggers during maintenance window
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_automation
+
+    await enforce_maintenance_admission_for_automation(
+        str(automation_id), user_id=principal.user_id
+    )
     checked = await cli_approval.automation_runs(
         http_request, principal, "trigger", automation_id=str(automation_id)
     )

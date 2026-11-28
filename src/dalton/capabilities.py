@@ -25,6 +25,7 @@ import sys
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeVar
 
@@ -108,6 +109,10 @@ class CapabilityId(StrEnum):
     PROBLEM_REPORTS = "problem_reports"  # 内部运行问题工单上报工具（report_issue）
     NATIVE_OAUTH_SYNC = "native_oauth_sync"  # 私有订阅 OAuth 模型目录与同步面板
     COLLEAGUE_SHARING = "colleague_sharing"  # 同事工作区共享与智能体跨区访问
+    GOOGLE_CALENDAR = "google_calendar"  # 个人 Google 日历 OAuth 连接与对话工具
+    FEISHU_CALENDAR = "feishu_calendar"  # 个人飞书日历 OAuth 连接与对话工具
+    FEISHU_MAIL = "feishu_mail"  # 个人飞书邮箱 OAuth 连接与对话工具
+    GOOGLE_GMAIL = "google_gmail"  # 个人 Gmail OAuth 连接与对话工具
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,38 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.colleague_sharing",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.GOOGLE_CALENDAR,
+        description="个人 Google 日历连接与日程读写",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.google_calendar",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.FEISHU_CALENDAR,
+        description="个人飞书日历连接与日程读写",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.feishu_calendar",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.FEISHU_MAIL,
+        description="个人飞书邮箱连接与邮件检索收发",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.feishu_mail",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.GOOGLE_GMAIL,
+        description="个人 Gmail 连接与读信建草稿",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.google_gmail",),
     ),
 )
 
@@ -503,26 +540,189 @@ def has_capability(
     return cap_id in active
 
 
+PERSONAL_INTEGRATION_CAPABILITIES: tuple[CapabilityId, ...] = (
+    CapabilityId.GOOGLE_CALENDAR,
+    CapabilityId.FEISHU_CALENDAR,
+    CapabilityId.FEISHU_MAIL,
+    CapabilityId.GOOGLE_GMAIL,
+)
+
+_PERSONAL_INTEGRATION_CAP_MAP: Mapping[tuple[str, str], CapabilityId] = MappingProxyType(
+    {
+        ("google", "calendar"): CapabilityId.GOOGLE_CALENDAR,
+        ("feishu", "calendar"): CapabilityId.FEISHU_CALENDAR,
+        ("feishu", "mail"): CapabilityId.FEISHU_MAIL,
+        ("google", "mail"): CapabilityId.GOOGLE_GMAIL,
+    }
+)
+
+
+def personal_integration_capability(provider: str, service: str) -> CapabilityId | None:
+    """Map ``(provider, service)`` to its single personal integration ``CapabilityId`` (§6)."""
+    return _PERSONAL_INTEGRATION_CAP_MAP.get(
+        (str(provider or "").strip().lower(), str(service or "").strip().lower())
+    )
+
+
+def is_langsmith_tracing_active(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when LangSmith tracing is enabled via env vars, runtime context, or config."""
+    env = os.environ if environ is None else environ
+    for key in (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_TRACING_V2",
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_TRACING",
+    ):
+        raw = env.get(key)
+        if raw is not None and raw.strip().lower() in _TRUTHY_VALUES:
+            return True
+    if environ is None:
+        try:
+            from langchain_core.tracers.context import (
+                _tracing_v2_is_enabled,
+                tracing_v2_callback_var,
+            )
+
+            if _tracing_v2_is_enabled() or tracing_v2_callback_var.get() is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            from src.config.settings import is_langsmith_tracing_enabled
+
+            if is_langsmith_tracing_enabled():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def is_connector_service_ready(
+    provider_summary: Mapping[str, Any] | None,
+    service: str,
+) -> bool:
+    """Return whether ``service`` (``calendar`` or ``mail``) is ready on ``provider_summary``.
+
+    LangSmith tracing mutual exclusion applies only to ``calendar``; ``mail``
+    readiness depends strictly on provider OAuth/origin/encryption setup.
+    """
+    if not isinstance(provider_summary, Mapping):
+        return False
+    norm_service = str(service or "").strip().lower()
+    services_map = provider_summary.get("services")
+    if isinstance(services_map, Mapping):
+        svc_info = services_map.get(norm_service)
+        if isinstance(svc_info, Mapping) and "ready" in svc_info:
+            return bool(svc_info["ready"])
+    if not bool(provider_summary.get("ready")):
+        return False
+    if norm_service == "calendar" and bool(
+        provider_summary.get("langsmith_tracing_enabled")
+    ):
+        return False
+    return True
+
+
+def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
+    """Return a redacted readiness summary for personal integration providers (§6).
+
+    Reads deployment credentials exclusively via ``get_credential_group(...)`` and
+    never includes secret values or client secrets.
+    """
+    from src.dalton.deployment_credentials.redirect_uri import (
+        google_redirect_uri_eligible,
+    )
+    from src.dalton.deployment_credentials.snapshot import get_credential_group
+    from src.dalton.settings import get_dalton_public_app_url
+    from src.server.database.encryption import encryption_configured
+
+    public_url = get_dalton_public_app_url().strip()
+    enc_ok = bool(encryption_configured())
+    langsmith_tracing_on = is_langsmith_tracing_active()
+    g_group = get_credential_group("google_oauth")
+    g_uri_ok, g_uri_reason = google_redirect_uri_eligible(public_url)
+    f_group = get_credential_group("feishu_app")
+    f_event = get_credential_group("feishu_event")
+    f_event_dual_ready = bool(
+        f_event.ready
+        and str(f_event.values.get("DALTON_FEISHU_ENCRYPT_KEY") or "").strip()
+        and str(f_event.values.get("DALTON_FEISHU_VERIFICATION_TOKEN") or "").strip()
+    )
+    g_base_ready = bool(g_group.ready and g_uri_ok and enc_ok)
+    f_base_ready = bool(f_group.ready and bool(public_url) and enc_ok)
+
+    return {
+        "google": {
+            "credentials_ready": bool(g_group.ready),
+            "source": g_group.source,
+            "redirect_uri_eligible": bool(g_uri_ok),
+            "redirect_uri_reason": g_uri_reason,
+            "encryption_configured": enc_ok,
+            "langsmith_tracing_enabled": langsmith_tracing_on,
+            "ready": g_base_ready,
+            "services": {
+                "calendar": {
+                    "ready": bool(g_base_ready and not langsmith_tracing_on),
+                    "langsmith_tracing_enabled": langsmith_tracing_on,
+                },
+                "mail": {
+                    "ready": g_base_ready,
+                    "langsmith_tracing_enabled": False,
+                },
+            },
+        },
+        "feishu": {
+            "credentials_ready": bool(f_group.ready),
+            "source": f_group.source,
+            "event_credentials_ready": f_event_dual_ready,
+            "public_url_configured": bool(public_url),
+            "encryption_configured": enc_ok,
+            "langsmith_tracing_enabled": langsmith_tracing_on,
+            "ready": f_base_ready,
+            "services": {
+                "calendar": {
+                    "ready": bool(f_base_ready and not langsmith_tracing_on),
+                    "langsmith_tracing_enabled": langsmith_tracing_on,
+                },
+                "mail": {
+                    "ready": f_base_ready,
+                    "langsmith_tracing_enabled": False,
+                },
+            },
+        },
+    }
+
+
 def capabilities_fingerprint(
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
-    """Return a deterministic 16-char hex digest of the enabled capability set."""
+    """Return a deterministic 16-char hex digest of enabled capabilities and connector provider readiness (§6)."""
     active = effective_capabilities() if capabilities is None else capabilities
-    canonical = ",".join(sorted(cap.value for cap in active))
+    canonical_caps = ",".join(sorted(cap.value for cap in active))
+    providers = get_connector_providers_summary()
+    canonical_providers = ",".join(
+        f"{name}:{int(bool(info.get('ready')))}:{int(bool(info.get('event_credentials_ready', False)))}:{int(bool(info.get('langsmith_tracing_enabled', False)))}"
+        for name, info in sorted(providers.items())
+    )
+    canonical = f"{canonical_caps}|connectors={canonical_providers}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def get_capabilities_payload() -> dict[str, Any]:
     """Build the read-only ``GET /api/v1/dalton/capabilities`` response payload."""
     from src.config.env import GINLIX_DATA_ENABLED
-    from src.dalton.settings import get_brand_name
+    from src.dalton.settings import get_brand_name, is_artifact_publishing_enabled
 
     profile = resolve_profile()
     caps = effective_capabilities(profile=profile)
     brand_name = get_brand_name()
+    connector_providers = get_connector_providers_summary()
     return {
         "profile": profile.value,
         "capabilities": sorted(cap.value for cap in caps),
+        "connector_providers": connector_providers,
         "fingerprint": capabilities_fingerprint(caps),
         "brand_name": brand_name,
         "brand": {
@@ -530,7 +730,122 @@ def get_capabilities_payload() -> dict[str, Any]:
         },
         "ticker_logos": bool(GINLIX_DATA_ENABLED),
         "market_enabled": True,
+        # File and chart comments share the publishing switch; the UI hides them when off.
+        "artifact_comments": bool(is_artifact_publishing_enabled()),
     }
+
+
+def require_personal_integration_capability(
+    provider: str | None,
+    service: str | None,
+    *,
+    mode: str = "connect",
+    has_existing_records: bool = False,
+    allow_feishu_event_configured: bool = False,
+) -> CapabilityId | None:
+    """Enforce per-service personal integration capability & runtime readiness (§6 item 1).
+
+    - ``mode == "connect"``: requires the exact single ``CapabilityId`` for
+      ``(provider, service)`` to be enabled (404 if disabled) AND runtime
+      credentials / public origin / encryption to be ready (503
+      ``personal_integrations_not_ready`` with explicit admin-configuration
+      guidance when not ready).
+    - ``mode == "manage"``: requires Dalton enabled (404 otherwise); always
+      allows access when any personal integration capability is enabled, when
+      ``has_existing_records`` is True (so users can disconnect/retry revokes
+      even after an admin disables a capability), or when
+      ``allow_feishu_event_configured`` is True and ``feishu_event`` credentials
+      are ready.
+    """
+    from fastapi import HTTPException
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
+
+    active = effective_capabilities()
+    if mode == "manage":
+        if any(cap in active for cap in PERSONAL_INTEGRATION_CAPABILITIES):
+            return (
+                personal_integration_capability(provider, service)
+                if provider and service
+                else None
+            )
+        if has_existing_records:
+            return (
+                personal_integration_capability(provider, service)
+                if provider and service
+                else None
+            )
+        if allow_feishu_event_configured:
+            providers = get_connector_providers_summary()
+            if providers["feishu"]["event_credentials_ready"]:
+                return None
+        raise HTTPException(
+            status_code=404,
+            detail="Personal integration capabilities are not enabled",
+        )
+
+    if mode != "connect":
+        raise ValueError(f"Unsupported mode for require_personal_integration_capability: {mode!r}")
+
+    if not provider or not service:
+        raise HTTPException(status_code=400, detail="Provider and service are required")
+
+    cap = personal_integration_capability(provider, service)
+    if cap is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unsupported personal integration '{provider}/{service}'",
+        )
+    if cap not in active:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Capability '{cap.value}' is not enabled",
+        )
+
+    norm_provider = str(provider).strip().lower()
+    norm_service = str(service).strip().lower()
+    summary = get_connector_providers_summary().get(norm_provider)
+    if not is_connector_service_ready(summary, norm_service):
+        if (
+            norm_service == "calendar"
+            and summary
+            and summary.get("langsmith_tracing_enabled")
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "personal_integrations_not_ready",
+                    "reason": "langsmith_tracing_enabled",
+                    "message": "当前部署开启了调用追踪，个人日历不可用。",
+                    "provider": norm_provider,
+                    "service": norm_service,
+                    "missing": ["langsmith_tracing_disabled"],
+                },
+            )
+        missing: list[str] = []
+        if not summary or not summary.get("credentials_ready"):
+            missing.append("oauth_credentials")
+        if norm_provider == "google" and (not summary or not summary.get("redirect_uri_eligible")):
+            missing.append(
+                f"redirect_uri:{(summary or {}).get('redirect_uri_reason') or 'https_required'}"
+            )
+        if norm_provider == "feishu" and (not summary or not summary.get("public_url_configured")):
+            missing.append("public_app_url")
+        if not summary or not summary.get("encryption_configured"):
+            missing.append("encryption_key")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "personal_integrations_not_ready",
+                "message": "管理员尚未完成该个人集成的 OAuth 凭据或加密环境配置，请先在「部署设置 → 集成凭据」配置后再连接。",
+                "provider": norm_provider,
+                "service": norm_service,
+                "missing": missing,
+            },
+        )
+    return cap
 
 
 def require_capability(*caps: CapabilityId) -> None:
@@ -785,6 +1100,232 @@ BATCH3_CONNECTOR_BUNDLED_PLUGINS: frozenset[str] = frozenset(
     }
 )
 
+# Batch 3 legacy bridge routes migrated to split connectors / `dalton-research-host`
+# once `is_batch3_connectors_enabled()` is True (§6.4b (1) #3).
+BATCH3_CUTOVER_BRIDGE_ROUTES: frozenset[str] = frozenset(
+    {
+        "sec",
+        "fred",
+        "treasury",
+        "company-wiki",
+        "guidepoint",
+        "sales-notes",
+        "sales-mail",
+        "tmtb",
+        "funda-ai",
+        "all",
+    }
+)
+
+BATCH3_CUTOVER_INGEST_TARGETS: frozenset[str] = frozenset(
+    {
+        "wiki",
+        "sales-notes",
+    }
+)
+
+# Profile, capability, and cutover control keys that MUST reside exclusively in
+# the shared repository `.env` (never in host service credential files).
+CAPABILITY_CONTROL_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "APP_ENV",
+        "DALTON_PROFILE",
+        "DALTON_HOST_PLATFORM",
+        "DALTON_ENABLED",
+        "DALTON_RESEARCH_HOST_URL",
+        "DALTON_RESEARCH_HOST_BASE_URL",
+    }
+)
+
+
+def is_capability_control_env_key(key: str | None) -> bool:
+    """Return True if ``key`` controls deployment profile, capabilities, or cutover state."""
+    cleaned = str(key or "").strip()
+    if not cleaned:
+        return False
+    return cleaned in CAPABILITY_CONTROL_ENV_KEYS or cleaned.startswith("DALTON_CAP_")
+
+
+def load_deployment_capability_env(
+    *,
+    repo_env_file: Path | str | None = None,
+    service_env_file: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    allowed_service_keys: Collection[str] | None = None,
+    loaded_files: list[Path] | None = None,
+) -> dict[str, str]:
+    """Merge deployment capability and host service environment in one canonical order.
+
+    Precedence (highest to lowest, §6.4b (1) #1):
+      1. Explicit process environment variables (``environ`` or ``os.environ``).
+      2. Shared repository root ``.env`` via ``src.dalton.config_env.load_shared_dotenv``
+         (supports ``DALTON_REPO_ENV_FILE`` / ``DALTON_DOTENV_PATH`` and ``PYTHON_DOTENV_DISABLED``).
+      3. Optional host-side private service credential file (e.g.
+         ``~/.config/dalton/research-host.env`` or ``~/.config/dalton/researchdata-bridge.env``).
+         Profile, capability, and cutover control keys (``is_capability_control_env_key``)
+         are ALWAYS ignored from ``service_env_file`` with a warning so services can never
+         diverge from the shared repository ``.env``.
+    """
+    from src.dalton.config_env import load_shared_dotenv, parse_and_resolve_dotenv
+
+    merged: dict[str, str] = dict(os.environ if environ is None else environ)
+    shared_loaded = load_shared_dotenv(repo_env_file, environ=merged)
+    if shared_loaded is not None and loaded_files is not None:
+        loaded_files.append(shared_loaded)
+
+    svc_raw = str(service_env_file).strip() if service_env_file is not None else ""
+    if svc_raw:
+        svc_path = Path(svc_raw).expanduser()
+        if svc_path.is_file():
+            resolved_svc = svc_path.resolve()
+            parsed_svc = parse_and_resolve_dotenv(
+                resolved_svc,
+                base_env=merged,
+                override=False,
+            )
+            allowed_set = (
+                frozenset(str(k).strip() for k in allowed_service_keys if str(k).strip())
+                if allowed_service_keys is not None
+                else None
+            )
+            for raw_k, val in parsed_svc.items():
+                key = str(raw_k or "").strip()
+                if not key:
+                    continue
+                if is_capability_control_env_key(key):
+                    logger.warning(
+                        "Ignoring capability/profile/cutover control key %r in service env file %s "
+                        "(control keys must be defined only in shared repository .env)",
+                        key,
+                        resolved_svc,
+                    )
+                    continue
+                if allowed_set is not None and key not in allowed_set:
+                    logger.warning(
+                        "Ignoring non-allowlisted key %r in service env file %s",
+                        key,
+                        resolved_svc,
+                    )
+                    continue
+                merged.setdefault(key, val)
+            if loaded_files is not None:
+                loaded_files.append(resolved_svc)
+
+    return merged
+
+
+def find_capability_env_conflicts(
+    *,
+    repo_env_file: Path | str | None = None,
+    service_env_file: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    extra_sources: Mapping[str, Mapping[str, str]] | None = None,
+    expected_bridge_env_file: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Detect profile/capability/cutover env overrides and host routing conflicts (§6.4b (1) #1).
+
+    Checks:
+      1. Any capability/profile/cutover control key placed in ``service_env_file``.
+      2. Process env (``environ``) or ``extra_sources`` (e.g. ``launchctl getenv``,
+         loaded ``.plist`` ``EnvironmentVariables``, running host processes) overriding
+         control keys relative to ``repo_env_file``.
+      3. ``DALTON_BRIDGE_ENV_FILE`` resolving to an unexpected path (while allowing the
+         canonical resolved ``~/.config/dalton/researchdata-bridge.env`` path).
+      4. ``DALTON_GUIDEPOINT_MCP_URL`` injected in ``extra_sources`` or overriding
+         ``service_env_file``.
+    """
+    from src.dalton.config_env import parse_and_resolve_dotenv, resolve_shared_dotenv_path
+
+    conflicts: list[dict[str, Any]] = []
+    proc_env: Mapping[str, str] = os.environ if environ is None else environ
+
+    repo_vals: dict[str, str] = {}
+    resolved_repo = resolve_shared_dotenv_path(repo_env_file, environ=proc_env)
+    if resolved_repo is not None and resolved_repo.is_file():
+        repo_vals = parse_and_resolve_dotenv(resolved_repo, base_env={}, override=True)
+
+    svc_vals: dict[str, str] = {}
+    resolved_svc: Path | None = None
+    if service_env_file is not None and str(service_env_file).strip():
+        cand_svc = Path(service_env_file).expanduser()
+        if cand_svc.is_file():
+            resolved_svc = cand_svc.resolve()
+            svc_vals = parse_and_resolve_dotenv(resolved_svc, base_env={}, override=True)
+            for key, val in sorted(svc_vals.items()):
+                if is_capability_control_env_key(key):
+                    conflicts.append(
+                        {
+                            "source": f"service_env:{resolved_svc}",
+                            "key": key,
+                            "value": val,
+                            "repo_value": repo_vals.get(key),
+                            "reason": "control_key_in_service_env",
+                        }
+                    )
+
+    expected_bridge_path = (
+        Path(expected_bridge_env_file).expanduser().resolve()
+        if expected_bridge_env_file is not None and str(expected_bridge_env_file).strip()
+        else (Path.home() / ".config" / "dalton" / "researchdata-bridge.env").resolve()
+    )
+
+    def _scan_mapping(source_name: str, mapping: Mapping[str, str], *, is_external: bool) -> None:
+        for key, raw_val in sorted(mapping.items()):
+            val = str(raw_val or "").strip()
+            if is_capability_control_env_key(key):
+                repo_val = repo_vals.get(key)
+                if repo_val is not None and val != str(repo_val).strip():
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "repo_value": str(repo_val).strip(),
+                            "reason": "control_key_override",
+                        }
+                    )
+                elif repo_val is None and val and is_external:
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "repo_value": None,
+                            "reason": "control_key_injected",
+                        }
+                    )
+            elif key == "DALTON_BRIDGE_ENV_FILE" and val:
+                actual_path = Path(val).expanduser().resolve()
+                if actual_path != expected_bridge_path:
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": str(actual_path),
+                            "expected_value": str(expected_bridge_path),
+                            "reason": "unexpected_bridge_env_file_path",
+                        }
+                    )
+            elif key == "DALTON_GUIDEPOINT_MCP_URL" and val:
+                svc_gp = str(svc_vals.get("DALTON_GUIDEPOINT_MCP_URL") or "").strip()
+                if is_external or (svc_gp and val != svc_gp):
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "service_value": svc_gp or None,
+                            "reason": "guidepoint_url_env_override",
+                        }
+                    )
+
+    _scan_mapping("process_env", proc_env, is_external=False)
+    if extra_sources:
+        for src_name, src_map in extra_sources.items():
+            _scan_mapping(str(src_name), src_map, is_external=True)
+
+    return conflicts
+
 
 def is_batch3_connectors_enabled(
     *,
@@ -1001,6 +1542,42 @@ def is_bridge_route_enabled(
     return True
 
 
+def is_bridge_route_migrated_to_connector(
+    route_id: str | None,
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff legacy bridge MCP ``route_id`` has cut over to Batch 3 connectors (§6.4b (1) #3)."""
+    cleaned = str(route_id or "").strip().lower()
+    if cleaned not in BATCH3_CUTOVER_BRIDGE_ROUTES:
+        return False
+    return is_batch3_connectors_enabled(profile=profile, environ=environ)
+
+
+def is_bridge_ingest_migrated_to_connector(
+    target: str | None,
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff legacy bridge ingest endpoint ``target`` has cut over to ``research-host`` (§6.4b (1) #3)."""
+    cleaned = str(target or "").strip().lower().strip("/")
+    alias_map = {
+        "wiki": "wiki",
+        "wiki/ingest": "wiki",
+        "company-wiki": "wiki",
+        "company_wiki": "wiki",
+        "sales-notes": "sales-notes",
+        "sales_notes": "sales-notes",
+        "sales-notes/ingest": "sales-notes",
+    }
+    normalized = alias_map.get(cleaned, cleaned)
+    if normalized not in BATCH3_CUTOVER_INGEST_TARGETS:
+        return False
+    return is_batch3_connectors_enabled(profile=profile, environ=environ)
+
+
 # ---------------------------------------------------------------------------
 # Declarative registries for anti-leakage gate tests (§3.4 #1)
 # ---------------------------------------------------------------------------
@@ -1017,12 +1594,16 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
         "dalton-team-model-catalog-follow": CORE_CAPABILITY,
         "dalton-startup-watchlist-reconcile": CORE_CAPABILITY,
+        "dalton-personal-purge-resume": CORE_CAPABILITY,
+        "dalton-integration-revoke-retry": CORE_CAPABILITY,
+        "dalton-integration-health-sweep": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services
         "warm-brokerage-marks": CORE_CAPABILITY,
         "heap-settle": CORE_CAPABILITY,
         "PlatformSecretSweeper": CORE_CAPABILITY,
+        "ToolsetSweeper": CORE_CAPABILITY,
         "HookOutboxDrainer": CORE_CAPABILITY,
         "RecoveryScanner": CORE_CAPABILITY,
         "restart_drain": CORE_CAPABILITY,
@@ -1042,6 +1623,8 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "SetupSettings": CORE_CAPABILITY,
         # Prod Audit 2 Batch 1: per-worker Redis diagnostics flush + PG leader sampler
         "RedisDiagnosticsService": CORE_CAPABILITY,
+        # Durable failure-notice receipt sweeper (self-gates on is_failure_notice_enabled)
+        "FailureNoticeSweeper": CORE_CAPABILITY,
     }
 )
 
@@ -1057,6 +1640,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         # --- router.py ---
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_maintenance_admission_status_endpoint"): CORE_CAPABILITY,
+        ("router.py", "probe_maintenance_admission_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_browser_memory_diagnostics_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_admin_redis_diagnostics_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_native_models_status_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
@@ -1238,6 +1823,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
+        ("channels_router.py", "internal_failure_notice_plan_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         # --- automation_notifications_router.py ---
         ("automation_notifications_router.py", "internal_automation_notification_plan_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         # --- data_task_notifications_router.py ---
@@ -1264,6 +1850,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("transcriptions.py", "get_transcription_result_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "get_transcription_raw_result_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "retry_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
+        ("transcriptions.py", "resubmit_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "cancel_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
         # --- oauth_native.py ---
         ("oauth_native.py", "muse_device_initiate"): CapabilityId.NATIVE_OAUTH_SYNC,
@@ -1305,6 +1892,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("research_host/app.py", "healthz"): CORE_CAPABILITY,
         ("research_host/app.py", "get_drain"): CORE_CAPABILITY,
         ("research_host/app.py", "set_drain"): CORE_CAPABILITY,
+        ("research_host/app.py", "acquire_connector_lock"): CORE_CAPABILITY,
         ("research_host/app.py", "get_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
         ("research_host/app.py", "set_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
         ("research_host/app.py", "mcp_endpoint"): INTERNAL_RESEARCH_CAPABILITIES,
@@ -1312,6 +1900,23 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.COMPANY_WIKI,
             CapabilityId.SALES_NOTES,
         ),
+        # --- deployment_credentials/router.py (shared Core & Everflow admin settings) ---
+        ("deployment_credentials/router.py", "get_deployment_settings_endpoint"): CORE_CAPABILITY,
+        ("deployment_credentials/router.py", "put_deployment_settings_endpoint"): CORE_CAPABILITY,
+        ("deployment_credentials/router.py", "test_deployment_settings_endpoint"): CORE_CAPABILITY,
+        # --- integrations_router.py (per-service single-capability gating in handlers, §6 item 1) ---
+        ("integrations_router.py", "list_personal_integrations_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "authorize_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "oauth_callback_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "confirm_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "update_personal_integration_preferences_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "disconnect_personal_integration_service_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "disconnect_personal_integration_provider_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "retry_personal_integration_revoke_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "feishu_integration_events_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "feishu_integration_internal_events_endpoint"): CORE_CAPABILITY,
+        # --- tracker_calendar_router.py (Everflow earnings tracker gate, §5.3, §6 item 2) ---
+        ("tracker_calendar_router.py", "tracker_calendar_mcp_endpoint"): CapabilityId.FUND_AUTOMATIONS,
     }
 )
 

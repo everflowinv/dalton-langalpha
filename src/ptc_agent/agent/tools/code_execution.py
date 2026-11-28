@@ -283,6 +283,10 @@ def _bound_caller_identity(config: Any, fallback_thread_id: str) -> Any:
 
         cfg = dict((config or {}).get("configurable") or {})
         run_origin = "automation" if cfg.get("turn_origin_automation_id") else None
+        # DALTON-HOOK(sandbox-caller-identity): include run_id, automation id, and execution id in signed caller token
+        run_id = cfg.get("run_id") or cfg.get("response_id")
+        turn_origin_automation_id = cfg.get("turn_origin_automation_id")
+        automation_execution_id = cfg.get("automation_execution_id")
         raw_deadline = cfg.get("turn_deadline")
         raw_limit = cfg.get("turn_time_limit")
         exp: int | None = None
@@ -304,6 +308,9 @@ def _bound_caller_identity(config: Any, fallback_thread_id: str) -> Any:
             cfg.get("workspace_id"),
             cfg.get("thread_id") or fallback_thread_id,
             run_origin=run_origin,
+            run_id=run_id,
+            turn_origin_automation_id=turn_origin_automation_id,
+            automation_execution_id=automation_execution_id,
             exp=exp,
         )
     except Exception:

@@ -6259,6 +6259,112 @@ describe("Feishu card envelope constants parity with Python", () => {
     );
     expect(() => assertFeishuCardWithinEnvelope(sentCard)).not.toThrow();
   });
+
+  it("registers auth.user_access_token.revoked_v4 and forwards revocation events to Dalton backend", async () => {
+    const { FeishuChannelAdapter } = await import(
+      "../src/channels/feishu/monitor.js"
+    );
+    const { client } = createFakeLarkClient();
+    const registeredHandlers: Record<string, (data: unknown) => Promise<void>> = {};
+    const forwarded: Array<Record<string, unknown>> = [];
+
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_gw_rev_test",
+      appSecret: "sec_gw_rev_test",
+      botOpenId: "ou_test_bot_open_id",
+      client,
+      wsClientFactory: () => ({
+        start: async () => undefined,
+        close: () => undefined,
+        getConnectionStatus: () => ({ state: "connected" }),
+      }),
+      eventDispatcherFactory: () =>
+        ({
+          register: (map: Record<string, (data: unknown) => Promise<void>>) => {
+            Object.assign(registeredHandlers, map);
+          },
+        }) as unknown as import("@larksuiteoapi/node-sdk").EventDispatcher,
+    });
+
+    adapter.setBackendClient({
+      forwardFeishuRevokedEvent: async (payload: Record<string, unknown>) => {
+        forwarded.push(payload);
+        return { status: "purged", event_id: "evt_ws_1", purge_ids: ["p1"] };
+      },
+    } as unknown as import("../src/backend-client.js").BackendClient);
+
+    await adapter.start();
+    try {
+      expect(typeof registeredHandlers["auth.user_access_token.revoked_v4"]).toBe(
+        "function",
+      );
+      await registeredHandlers["auth.user_access_token.revoked_v4"]!({
+        event_id: "evt_ws_1",
+        open_id: "ou_user_rev",
+        revoke_reason: "Revoked by user action.",
+        create_time: String(Date.now()),
+      });
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({
+        app_id: "cli_gw_rev_test",
+        event_type: "auth.user_access_token.revoked_v4",
+        event_id: "evt_ws_1",
+        open_id: "ou_user_rev",
+        revoke_reason: "Revoked by user action.",
+      });
+    } finally {
+      await adapter.stop();
+    }
+  });
+
+  it("exposes active Feishu App ID and reports it on gateway lease acquire and heartbeat", async () => {
+    const { GatewayLeaseManager } = await import("../src/gateway-lease.js");
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_active_running_gw",
+      appSecret: "sec_active_gw",
+    });
+    expect(adapter.getActiveAppId()).toBe("cli_active_running_gw");
+
+    const acquireCalls: Array<Record<string, unknown>> = [];
+    const heartbeatCalls: Array<Record<string, unknown>> = [];
+    const leaseMgr = new GatewayLeaseManager({
+      backend: {
+        acquireGatewayLease: async (req) => {
+          acquireCalls.push(req as Record<string, unknown>);
+          return {
+            granted: true,
+            epoch: 3,
+            expires_at: new Date(Date.now() + 45_000).toISOString(),
+          };
+        },
+        heartbeatGatewayLease: async (req) => {
+          heartbeatCalls.push(req as Record<string, unknown>);
+          return {
+            ok: true,
+            epoch: 3,
+            expires_at: new Date(Date.now() + 45_000).toISOString(),
+          };
+        },
+        releaseGatewayLease: async () => ({ ok: true, released: true }),
+      },
+      feishuAppId: adapter.getActiveAppId(),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      await leaseMgr.acquireUntilGranted();
+      await leaseMgr.runHeartbeatOnce();
+      expect(acquireCalls).toHaveLength(1);
+      expect(acquireCalls[0]).toMatchObject({
+        feishu_app_id: "cli_active_running_gw",
+      });
+      expect(heartbeatCalls).toHaveLength(1);
+      expect(heartbeatCalls[0]).toMatchObject({
+        feishu_app_id: "cli_active_running_gw",
+      });
+    } finally {
+      await leaseMgr.stopAndRelease();
+    }
+  });
 });
 
 describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {

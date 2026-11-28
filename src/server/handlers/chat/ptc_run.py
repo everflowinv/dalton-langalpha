@@ -32,6 +32,7 @@ from src.server.services.shared_workspaces.member_context import (
 )
 from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.forks.carry import ForkTurnStart
+from src.server.services.forks.start import ThreadStart
 from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
@@ -126,7 +127,7 @@ from src.server.services.runs.admission import (
     begin_run,
     dedup_retransmit_or_raise,
 )
-from src.server.services.artifacts.comments import CommentSendScope
+from src.server.services.artifacts.comments import CommentSendScope, stamp_send
 from src.server.services.turn_runtime import TurnRoute
 
 from .admission_gate import agent_steer_of, steer_allowed, wait_or_steer
@@ -1046,6 +1047,7 @@ async def astream_ptc_workflow(
             workspace_owner_id=workspace_owner_id,
             acting_for=workspace_id,
             member_context=member_context,
+            fork=prior_thread.fork,
         )
         project = inputs.project
         # One relay session per directly bound server, held for the run.
@@ -1148,7 +1150,9 @@ async def astream_ptc_workflow(
                 # A port, not a value: the switch can flip mid-turn from any
                 # worker, so the agent re-reads the row on every call.
                 subagent_switch=partial(read_thread_subagents_allowed, thread_id),
-                window_coverage=partial(runs_held, thread_id),
+                window_coverage=partial(
+                    runs_held, thread_id, start=ThreadStart.of(prior_thread.fork)
+                ),
                 cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
                 reached_computers=reached_computers,
             )
@@ -1200,6 +1204,16 @@ async def astream_ptc_workflow(
             sandbox_id = getattr(session.sandbox, "sandbox_id", None)
 
         messages = normalize_request_messages(request)
+        # DALTON-HOOK(cos-verbatim-forward): capture pre-injection raw user text and attachment filenames before context reminders
+        from src.dalton.cos_verbatim import capture_turn_verbatim_request
+
+        turn_verbatim_request = capture_turn_verbatim_request(
+            request=request,
+            raw_messages=messages,
+            turn_attachments=turn_attachments,
+            from_server=from_server,
+            is_checkpoint_replay=is_checkpoint_replay,
+        )
 
         # =====================================================================
         # Skill Context Resolution (body injection happens in SkillsMiddleware)
@@ -1312,6 +1326,8 @@ async def astream_ptc_workflow(
 
         if inline_target is not None and written_by is not None:
             written_by.stamp(inline_target)
+        if inline_target is not None:
+            stamp_send(inline_target, request.artifact_comments)
 
         # =====================================================================
         # Save user request to system thread directory (non-critical)
@@ -1344,6 +1360,34 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
+        # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payloads read during HITL validation (fallback to checkpointer only when absent)
+        approved_dispatch_payloads: dict[str, Any] | None = None
+        if request.hitl_response:
+            from src.dalton.cos_verbatim import (
+                COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY,
+                COS_HITL_RESUME_CONFIG_KEY,
+                load_approved_dispatch_payloads,
+            )
+
+            preloaded_payloads = getattr(request, "approved_dispatch_payloads", None)
+            if preloaded_payloads is not None:
+                approved_dispatch_payloads = preloaded_payloads
+            else:
+                approved_dispatch_payloads = await load_approved_dispatch_payloads(
+                    getattr(ptc_graph, "checkpointer", None),
+                    thread_id,
+                    checkpoint_id=request.checkpoint_id or base_checkpoint_id,
+                    hitl_response=request.hitl_response,
+                )
+        # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag for LangSmith suppression on historical private threads
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        thread_is_personal_private = await is_thread_personal_private(
+            thread_id, meta=prior_thread
+        )
+
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
             **(extra_configurable or {}),
@@ -1351,10 +1395,25 @@ async def astream_ptc_workflow(
             "workspace_owner_id": workspace_owner_id,
             "origin_channel": origin_channel,
             **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
+            **(
+                {"has_personal_integration_data": True}
+                if thread_is_personal_private
+                else {}
+            ),
             # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag
             "agent_role": route.role,
+            # DALTON-HOOK(cos-verbatim-forward): forward pre-injection raw user request (None when turn has no user text) and approved HITL dispatch payloads
+            "cos_turn_verbatim_request": turn_verbatim_request,
+            **(
+                {
+                    COS_HITL_RESUME_CONFIG_KEY: True,
+                    COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY: approved_dispatch_payloads,
+                }
+                if request.hitl_response
+                else {}
+            ),
             **(
                 {"colleague_outbound_blocked": True}
                 if _is_colleague_sharing_auth_enabled()
@@ -1380,6 +1439,7 @@ async def astream_ptc_workflow(
             extra_configurable=extra_configurable,
             base_checkpoint_id=base_checkpoint_id,
             from_server=from_server,
+            unwatched=turn_context.unwatched,  # DALTON-HOOK(personal-integrations)
         )
         # Propagate run_id to LangGraph via the top-level config key; it
         # lands on ExecutionInfo.run_id and CheckpointMetadata.run_id so

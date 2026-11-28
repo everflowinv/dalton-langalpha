@@ -106,6 +106,7 @@ def _make_doc(**overrides: Any) -> SharedDocumentRecord:
 def _make_artifact(**overrides: Any) -> Artifact:
     defaults: dict[str, Any] = dict(
         artifact_id="71000000-0000-4000-8000-000000000101",
+        kind="file",
         code="mdcode123456",
         workspace_id=WS_ID,
         path="notes/q4-memo.md",

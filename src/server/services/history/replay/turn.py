@@ -46,12 +46,16 @@ class Inputs:
     open_runs: dict[Any, str]
     # DALTON-HOOK(chat-large-upload): failed steers grouped by turn_index for replay
     failed_steers_by_turn: dict[Any, list[dict[str, Any]]] = field(default_factory=dict)
+    # DALTON-HOOK(personal-integrations): persisted first-touch privacy notice event for its owning turn
+    personal_first_touch_event: dict[str, Any] | None = None
 
     @classmethod
     def of(cls, rows: ThreadRows) -> Inputs:
         queries_by_turn = group_queries(rows.queries)
         turn_indexes = sorted(ti for ti in queries_by_turn if ti is not None)
         failed_by_turn = group_failed_steers(rows.failed_steers, turn_indexes)
+        raw_ft = (rows.thread or {}).get("personal_first_touch_event")
+        ft_event = dict(raw_ft) if isinstance(raw_ft, dict) else None
         return cls(
             thread_id=rows.thread_id,
             turn_indexes=turn_indexes,
@@ -62,6 +66,7 @@ class Inputs:
             run_facts=replay_facts.RunFacts.of(rows.run_facts),
             open_runs=rows.open_runs,
             failed_steers_by_turn=failed_by_turn,
+            personal_first_touch_event=ft_event,
         )
 
     def response_id(self, turn_index: Any) -> str | None:
@@ -183,6 +188,17 @@ def project_turn(
         items._failed_steer_item(thread_id, failed)
         for failed in inputs.failed_steers_by_turn.get(turn_index, ())
     )
+    # DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice once on its owning turn
+    if (
+        isinstance(inputs.personal_first_touch_event, dict)
+        and inputs.personal_first_touch_event.get("turn_index") == turn_index
+        and inputs.personal_first_touch_event.get("message")
+    ):
+        turn_items.append(
+            items._personal_integration_notice_item(
+                thread_id, inputs.personal_first_touch_event
+            )
+        )
     # The row's terminal error and a user stop's close, after the legacy
     # facts so each can defer to the copy they placed: an archived error
     # frame takes the row's kind instead of gaining a twin.

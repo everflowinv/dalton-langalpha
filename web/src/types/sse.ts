@@ -547,6 +547,13 @@ export interface ActionRequest {
   duplicate_check_unavailable?: boolean;
   // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
   confirm_token?: string;
+  // DALTON-HOOK(personal-integrations): personal integration L1/L2 write & Google MCP elicitation fields.
+  approval_id?: string;
+  payload_sha256?: string;
+  requires_second_confirm?: boolean;
+  risk_level?: string;
+  input_requests?: Record<string, unknown>;
+  web_approval_url?: string;
   // DALTON-HOOK(cos-settings-tools): target computer snapshot fields on create_workspace and archive_workspace action requests.
   computer_id?: string | null;
   computer_name?: string | null;

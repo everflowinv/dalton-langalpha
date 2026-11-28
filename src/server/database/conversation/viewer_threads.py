@@ -93,6 +93,8 @@ def viewer_threads(user: str) -> str:
     )
     return f"""(
         SELECT {cols}, ct.created_by, ct.workspace_shared_at,
+               -- DALTON-HOOK(personal-integrations): project personal-integration privacy flag for viewer filters
+               COALESCE(ct.has_personal_integration_data, FALSE) AS has_personal_integration_data,
                CASE WHEN w.user_id = {user} THEN ct.thread_index END AS thread_index,
                CASE WHEN w.user_id = {user} THEN ct.is_pinned
                     ELSE COALESCE(sr.is_pinned, FALSE) END AS is_pinned,
@@ -216,9 +218,10 @@ async def threads_with_shared(
     reach = f"""
         FROM {viewer_threads("%(user)s")} t
         WHERE (t.owner_id = %(user)s OR t.workspace_id = ANY(%(shared)s::uuid[]))
+          AND (COALESCE(t.user_id, t.owner_id) = %(user)s OR NOT COALESCE(t.has_personal_integration_data, FALSE))
           AND t.workspace_status != 'deleted'
           AND t.archived_at IS NULL{_platform(params, platform_prefix)}
-    """
+    """  # DALTON-HOOK(personal-integrations)
     return await _page(
         f"SELECT COUNT(*) AS total {reach}",
         f"""

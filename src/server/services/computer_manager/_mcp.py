@@ -39,7 +39,11 @@ from src.server.services.computer_manager._types import (
     MachineTarget,
     WorkspaceToolView,
 )
-from src.server.services.user_skills.reconcile import reconcile_workspace_skills
+from src.server.services.user_skills.reconcile import (
+    SkillSaved,
+    reconcile_workspace_skills,
+    save_workspace_skill,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -69,7 +73,10 @@ class McpSecretsMixin:
         if not user_id:
             return None, {}, ""
         secrets, fingerprint = await get_user_vault_snapshot(user_id)
-        return user_id, secrets, fingerprint
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys from sandbox vault sync
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+        return user_id, strip_sandbox_excluded_vault_secrets(secrets) or {}, fingerprint
 
     async def _settle_vault(
         self,
@@ -94,13 +101,18 @@ class McpSecretsMixin:
             get_user_vault_fingerprint,
             get_user_vault_snapshot,
         )
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys during vault settle
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
 
+        secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
         if not published:
             await publish_vault_secrets(sandbox, secrets)
         for _ in range(_VAULT_SETTLE_ATTEMPTS):
             if await get_user_vault_fingerprint(user_id) == fingerprint:
                 return secrets
             secrets, fingerprint = await get_user_vault_snapshot(user_id)
+            # DALTON-HOOK(deployment-credentials): strip dedicated Feishu keys on settle re-read
+            secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
             await publish_vault_secrets(sandbox, secrets)
         logger.warning(
             f"[vault] still changing after {_VAULT_SETTLE_ATTEMPTS} republishes; "
@@ -193,6 +205,10 @@ class McpSecretsMixin:
         from src.server.database.user_vault_secrets import get_user_vault_snapshot
 
         secrets, fingerprint = await get_user_vault_snapshot(user_id)
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys from sandbox vault push
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+        secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
         reached = 0
         for computer_id, sandbox in sandboxes.items():
             try:
@@ -814,6 +830,30 @@ class McpSecretsMixin:
         await self._reconcile_skills(
             workspace_id, owner_id, session.sandbox, source=source
         )
+
+    async def save_skill(
+        self, workspace_id: str, user_id: str, sandbox: Any, name: str
+    ) -> SkillSaved:
+        """Save one skill folder on request, under the folder hold every pass
+        writes through, so a rename cannot move the folder beneath it."""
+        try:
+            async with self._held_workspace_folder(workspace_id) as dir_name:
+                if not dir_name:
+                    return SkillSaved(
+                        False, reason="this workspace has no folder on the computer yet"
+                    )
+                return await save_workspace_skill(
+                    sandbox,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    name=name,
+                    project=ProjectContext(workspace_id, dir_name),
+                )
+        except WorkspaceFolderMoving:
+            return SkillSaved(
+                False,
+                reason="this workspace's folder is being moved; run it again in a moment",
+            )
 
     async def proactively_apply_mcp_config(
         self, workspace_id: str, user_id: str | None = None

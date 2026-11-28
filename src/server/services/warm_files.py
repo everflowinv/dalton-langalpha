@@ -6,7 +6,7 @@ the file routes do, without depending on a route module.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.server.services.computer_manager import MachineTarget
@@ -49,6 +49,19 @@ async def db_fallback_bytes(
     if extension_mime == "application/octet-stream" and file_record.get("mime_type"):
         return content, file_record["mime_type"]
     return content, extension_mime
+
+
+# DALTON-HOOK(workspace-file-streaming): cross-process DB/shared-state sandbox online check
+def is_sandbox_online(workspace: Mapping[str, Any]) -> bool:
+    """Return True when the persisted workspace/computer state says the sandbox is online.
+
+    Uses cross-process DB state (never process-local ``WorkspaceManager`` memory)
+    so a worker without a cached session still treats a running sandbox as online.
+    """
+    status = str(
+        workspace.get("computer_status") or workspace.get("status") or ""
+    ).strip().lower()
+    return status in ("running", "stopping")
 
 
 def warm_sandbox(workspace: dict[str, Any], workspace_id: str) -> Any | None:

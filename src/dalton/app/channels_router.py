@@ -11,6 +11,7 @@ import logging
 import os
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
+from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -177,12 +178,14 @@ def _reject_nested_company_user_ids(*containers: dict[str, Any] | None) -> None:
 class GatewayLeaseAcquireRequest(BaseModel):
     instance_id: str = Field(min_length=1, max_length=255)
     ttl_seconds: int = Field(default=45, ge=5, le=300)
+    feishu_app_id: str | None = Field(default=None, max_length=255)
 
 
 class GatewayLeaseHeartbeatRequest(BaseModel):
     instance_id: str = Field(min_length=1, max_length=255)
     epoch: int = Field(ge=1)
     ttl_seconds: int = Field(default=45, ge=5, le=300)
+    feishu_app_id: str | None = Field(default=None, max_length=255)
 
 
 class GatewayLeaseReleaseRequest(BaseModel):
@@ -372,6 +375,16 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     reclaim_stale_source_attempt_id: str | None = None
     retry_dedup_by_target: bool = False
     payload_digest: str | None = None
+    claim_token: str | None = None
+
+
+class FailureNoticePlanRequest(BaseModel):
+    """Strict request identifying ``target_receipt_id`` and ``claim_token``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_receipt_id: UUID = Field(...)
+    claim_token: UUID = Field(...)
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -667,10 +680,23 @@ async def internal_gateway_lease_acquire_endpoint(
     body: GatewayLeaseAcquireRequest,
 ) -> dict[str, Any]:
     """Acquire or renew the single-instance gateway lease."""
-    return await wx_db.acquire_gateway_lease(
+    res = await wx_db.acquire_gateway_lease(
         instance_id=body.instance_id,
         ttl_seconds=body.ttl_seconds,
     )
+    if res.get("granted") and body.feishu_app_id is not None:
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.upsert_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=int(res["epoch"]),
+                feishu_app_id=body.feishu_app_id,
+                expires_at=res["expires_at"],
+            )
+        except Exception:
+            logger.debug("Could not persist channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 @channels_router.post(
@@ -682,13 +708,26 @@ async def internal_gateway_lease_heartbeat_endpoint(
 ) -> Any:
     """Extend an active gateway lease; returns HTTP 409 `stale_gateway_epoch` if lost."""
     try:
-        return await wx_db.heartbeat_gateway_lease(
+        res = await wx_db.heartbeat_gateway_lease(
             instance_id=body.instance_id,
             epoch=body.epoch,
             ttl_seconds=body.ttl_seconds,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
+    if res.get("ok") and body.feishu_app_id is not None:
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.upsert_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=int(res["epoch"]),
+                feishu_app_id=body.feishu_app_id,
+                expires_at=res["expires_at"],
+            )
+        except Exception:
+            logger.debug("Could not update channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 @channels_router.post(
@@ -699,10 +738,21 @@ async def internal_gateway_lease_release_endpoint(
     body: GatewayLeaseReleaseRequest,
 ) -> dict[str, Any]:
     """Voluntarily release the gateway lease on clean shutdown."""
-    return await wx_db.release_gateway_lease(
+    res = await wx_db.release_gateway_lease(
         instance_id=body.instance_id,
         epoch=body.epoch,
     )
+    if res.get("released"):
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.clear_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=body.epoch,
+            )
+        except Exception:
+            logger.debug("Could not clear channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -1535,11 +1585,28 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             reclaim_stale_source_attempt_id=body.reclaim_stale_source_attempt_id,
             retry_dedup_by_target=body.retry_dedup_by_target,
             payload_digest=body.payload_digest,
+            claim_token=body.claim_token,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/failure-notices/plan",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_failure_notice_plan_endpoint(
+    body: FailureNoticePlanRequest,
+) -> dict[str, Any]:
+    """Authorize ``(target_receipt_id, claim_token)`` and return the saved failure notice plan."""
+    from src.dalton.database.failure_notice_claims import authorize_failure_notice_plan
+
+    return await authorize_failure_notice_plan(
+        target_receipt_id=str(body.target_receipt_id),
+        claim_token=str(body.claim_token),
+    )
 
 
 @channels_router.post(

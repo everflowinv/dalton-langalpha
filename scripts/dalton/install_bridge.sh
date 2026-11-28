@@ -32,9 +32,11 @@ if [[ -n "${RESEARCH_RUNTIME_MODE}" && "${RESEARCH_RUNTIME_MODE}" != "auto" && "
     exit 2
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 ENV_FILE="${DALTON_BRIDGE_ENV_FILE:-${HOME}/.config/dalton/researchdata-bridge.env}"
 REPO_ENV="${DALTON_REPO_ENV_FILE:-${REPO_ROOT}/.env}"
+OWNERSHIP_FILE="${DALTON_GUIDEPOINT_OWNERSHIP_FILE:-${REPO_ROOT}/var/dalton/cutover-snapshots/research-host/handoff-journal.json}"
 PLIST_TEMPLATE="${DALTON_PLIST_TEMPLATE:-${REPO_ROOT}/scripts/dalton/launchd/com.dalton.researchdata-bridge.plist.template}"
 LAUNCH_AGENTS_DIR="${DALTON_LAUNCH_AGENTS_DIR:-${HOME}/Library/LaunchAgents}"
 PLIST_DEST="${LAUNCH_AGENTS_DIR}/com.dalton.researchdata-bridge.plist"
@@ -53,7 +55,14 @@ LAUNCHCTL_CMD="${LAUNCHCTL_BIN:-launchctl}"
 CURL_CMD="${CURL_BIN:-curl}"
 HEALTH_RETRIES="${DALTON_BRIDGE_HEALTH_RETRIES:-20}"
 HEALTH_SLEEP_S="${DALTON_BRIDGE_HEALTH_SLEEP_S:-0.5}"
-HELPER_PY="${REPO_ROOT}/scripts/dalton/bridge_subprocess_env.py"
+HELPER_PY="${SCRIPT_DIR}/bridge_subprocess_env.py"
+
+# Fail before writing any env files when repository venv Python is missing.
+REPO_VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+if [[ ! -x "${REPO_VENV_PYTHON}" ]]; then
+    echo "[install_bridge] ERROR: repository virtualenv Python not found or not executable: ${REPO_VENV_PYTHON} (run 'uv sync --frozen' first)" >&2
+    exit 1
+fi
 
 EFFECTIVE_PORT="$("${HELPER_PYTHON}" "${HELPER_PY}" merge-bridge-env \
     --bridge-env "${ENV_FILE}" \
@@ -66,11 +75,14 @@ EFFECTIVE_PORT="$("${HELPER_PYTHON}" "${HELPER_PY}" merge-bridge-env \
     --research-runtime "${RESEARCH_RUNTIME_MODE}" \
     --print-port-only)"
 
+mkdir -p "${LOGS_DIR}"
 "${HELPER_PYTHON}" "${HELPER_PY}" render-plist \
     --template "${PLIST_TEMPLATE}" \
     --dest "${PLIST_DEST}" \
     --bridge-env "${ENV_FILE}" \
     --repo-root "${REPO_ROOT}" \
+    --repo-env "${REPO_ENV}" \
+    --ownership-file "${OWNERSHIP_FILE}" \
     --home "${HOME}" \
     --logs-dir "${LOGS_DIR}" \
     --research-runtime "${RESEARCH_RUNTIME_MODE}" >/dev/null

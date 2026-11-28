@@ -12,6 +12,7 @@
 import i18n from '@/i18n';
 import { isOnline } from '@/lib/network';
 import type { AssistantMessage, ProvenanceRecord } from '@/types/chat';
+import type { ForkDividerEvent } from '@/types/api';
 import { replayThreadHistory } from '../../utils/api';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
@@ -23,7 +24,8 @@ import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
 import { applyCallUsage } from '../tokenUsage';
 // DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
 import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
-import { handleCliQueue, handlePlanBilled } from '../stream/mainEventHandlers';
+// DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+import { handleCliQueue, handlePersonalIntegrationNotice, handlePlanBilled } from '../stream/mainEventHandlers';
 import { eventOrder } from '../eventOrder';
 import {
   handleHistoryUserMessage,
@@ -179,6 +181,8 @@ export async function loadConversationHistory(
     let minReplayedTurnIndex: number | null = null;
     // The page header, when the replay was paged (null when it named no turn).
     let page: HistoryPageInfo | null | undefined;
+    // Where a fork's borrowed turns end, when this page holds that point.
+    let forkDivider = null as ForkDividerEvent | null;
 
     // Run ids of the turns this replay rendered (the server stamps run_id on
     // a user_message only once its run is terminal — a live run's stub
@@ -252,6 +256,13 @@ export async function loadConversationHistory(
         page = typeof event.first_turn_index === 'number'
           ? { firstTurnIndex: event.first_turn_index, hasMore: event.has_more === true }
           : null;
+        return;
+      }
+
+      // A fork's borrowed turns end here, and its own begin. The list draws
+      // the line from the turn numbers, so it is page data, not a row.
+      if (eventType === 'fork_divider') {
+        forkDivider = _rawEvent as unknown as ForkDividerEvent;
         return;
       }
 
@@ -345,6 +356,20 @@ export async function loadConversationHistory(
         const msgId = activeReplyId();
         if (!isSubagent && msgId) {
           handleCliQueue({ assistantMessageId: msgId, event, order: eventOrder(event, nextCount), setMessages: setMessagesForHandlers });
+        }
+        return;
+      }
+
+      // DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+      if (eventType === 'personal_integration_notice') {
+        const msgId = activeReplyId();
+        if (!isSubagent && msgId) {
+          handlePersonalIntegrationNotice({
+            assistantMessageId: msgId,
+            event,
+            order: eventOrder(event, nextCount),
+            setMessages: setMessagesForHandlers,
+          });
         }
         return;
       }
@@ -884,7 +909,10 @@ export async function loadConversationHistory(
 
     // Replay settled (a 404 counts: brand-new thread, zero turns) — record
     // the watermark the reactivation staleness check compares against.
-    rt.lastRenderedTurnIndexRef.current = maxReplayedTurnIndex;
+    // A fork's next send opens its first own turn, whatever of its borrowed
+    // turns the replay showed, so the turn before it counts as rendered.
+    rt.lastRenderedTurnIndexRef.current = Math.max(maxReplayedTurnIndex, forkDivider ? forkDivider.turn_base - 1 : -1);
+    rt.setForkDivider(forkDivider);
     rt.replayedRunIdsRef.current = replayedRunIds;
 
     // An attach that opened while the replay was in flight already stands for

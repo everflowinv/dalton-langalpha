@@ -45,6 +45,13 @@ from src.server.services.egress import reachability as egress_reachability
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _install_restore_reset_sql(work_dir: Path) -> None:
+    src = REPO_ROOT / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst = work_dir / "scripts/dalton/sql/personal_integrations_restore_reset.sql"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+
+
 def _clear_storage_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for prefix in ("DALTON_CHAT_UPLOAD_STORAGE_", "DALTON_ASR_STORAGE_"):
         for suffix in (
@@ -835,6 +842,12 @@ class TestSandboxNetworkAndInitScript:
             encoding="utf-8",
         )
         env_tokens_copy.chmod(0o644)
+        compose_env_copy = script_dir / "_compose_env.sh"
+        compose_env_copy.write_text(
+            (REPO_ROOT / "scripts/standalone/_compose_env.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        compose_env_copy.chmod(0o644)
         (install_dir / ".env.core.example").write_text(
             (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -2199,12 +2212,15 @@ class TestSandboxNetworkAndInitScript:
             elif env_u_lock.exists():
                 env_u_lock.unlink()
 
-        # backup.sh identifies restore-created buckets by tag or .dalton-restore.json (never suffix regex)
+        # backup.sh delegates to consistent_backup.py, which identifies restore-created buckets
+        # by tag or .dalton-restore.json (never suffix regex)
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
+        cb_text = (REPO_ROOT / "scripts/standalone/consistent_backup.py").read_text(encoding="utf-8")
         assert "restore_bucket_re" not in backup_text
+        assert "restore_bucket_re" not in cb_text
         is_restore_match = _re.search(
             r"(def is_restore_created_bucket\(.*?\n    return False\n)",
-            backup_text,
+            cb_text,
             flags=_re.DOTALL,
         )
         assert is_restore_match is not None
@@ -2506,6 +2522,7 @@ class TestSandboxNetworkAndInitScript:
         def _make_work(name: str, env_text: str, *, include_agent_yaml: bool = True) -> Path:
             w = tmp_path / name
             w.mkdir(parents=True, exist_ok=True)
+            _install_restore_reset_sql(w)
             (w / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
             (w / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
             if include_agent_yaml:
@@ -2835,6 +2852,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_mid = tmp_path / "work-mid-fail"
         w_mid.mkdir()
+        _install_restore_reset_sql(w_mid)
         (w_mid / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mid / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mid / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -3368,9 +3386,11 @@ class TestSandboxNetworkAndInitScript:
         sc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sc)
 
-        # Item 1 & Item 2: backup.sh uses `pg_restore -f - --data-only` and no `printf/echo ... | grep -q`
+        # Item 1 & Item 2: backup.sh delegates full-consumer reconciliation to consistent_backup.py
+        # (removing the legacy duplicate verify-backup-refs check) and has no `printf/echo ... | grep -q`
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
-        assert "pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads" in backup_text
+        assert "scripts/standalone/consistent_backup.py compose-backup" in backup_text
+        assert "verify-backup-refs" not in backup_text
         for script_name in ("backup.sh", "restore.sh", "upgrade.sh"):
             src_text = (REPO_ROOT / "scripts/standalone" / script_name).read_text(encoding="utf-8")
             assert not _re.search(r"\b(?:printf|echo)\b[^\n|]*\|\s*grep\s+-[^\s]*q", src_text), (
@@ -3418,10 +3438,13 @@ class TestSandboxNetworkAndInitScript:
         )
         assert sc.compare_backup_with_target(target_same_path_upper_host, backup_manifest_archive, None) == []
 
-        # Also verify backup.sh embedded `_norm_ep` matches the same case-sensitive path rule
-        m_ep = _re.search(r"(def _norm_ep\(url: str\) -> str:.*?    return raw\n)", backup_text, flags=_re.DOTALL)
-        assert m_ep is not None, "Could not locate _norm_ep in backup.sh"
-        ep_ns: dict[str, Any] = {}
+        # Also verify standalone consistent_backup `_norm_ep` matches the same case-sensitive path rule
+        from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
+
+        cb_text = (REPO_ROOT / "scripts/standalone/consistent_backup.py").read_text(encoding="utf-8")
+        m_ep = _re.search(r"(def _norm_ep\(url: str\) -> str:.*?    return raw\n)", cb_text, flags=_re.DOTALL)
+        assert m_ep is not None, "Could not locate _norm_ep in consistent_backup.py"
+        ep_ns: dict[str, Any] = {"urlsplit": _urlsplit, "urlunsplit": _urlunsplit}
         exec(m_ep.group(1), ep_ns)
         assert ep_ns["_norm_ep"]("https://S3.Example.Test/Archive") == "https://s3.example.test/Archive"
         assert ep_ns["_norm_ep"]("https://s3.example.test/archive") == "https://s3.example.test/archive"
@@ -3494,6 +3517,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_ov = tmp_path / "r9-work-ov"
         w_ov.mkdir()
+        _install_restore_reset_sql(w_ov)
         (w_ov / "docker-compose.yml").write_text(
             "services:\n  backend:\n    env_file: .env\n", encoding="utf-8"
         )
@@ -3708,6 +3732,7 @@ class TestSandboxNetworkAndInitScript:
         proj_multi_db = f"r9-multi-db-{os.getpid()}"
         w_mdb = tmp_path / "r9-work-mdb"
         w_mdb.mkdir()
+        _install_restore_reset_sql(w_mdb)
         (w_mdb / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mdb / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_mdb / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4137,6 +4162,7 @@ class TestSandboxNetworkAndInitScript:
         bak_post = _make_r11_backup("r11-bak-post", proj_post, new_env_post)
         w_post = tmp_path / "r11-work-post"
         w_post.mkdir()
+        _install_restore_reset_sql(w_post)
         (w_post / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_post / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_post / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4212,6 +4238,7 @@ class TestSandboxNetworkAndInitScript:
         bak_ok = _make_r11_backup("r11-bak-ok", proj_ok, new_env_ok)
         w_ok = tmp_path / "r11-work-ok"
         w_ok.mkdir()
+        _install_restore_reset_sql(w_ok)
         (w_ok / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_ok / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_ok / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4295,6 +4322,7 @@ class TestSandboxNetworkAndInitScript:
         )
         w_keep = tmp_path / "r11-work-keep"
         w_keep.mkdir()
+        _install_restore_reset_sql(w_keep)
         (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4567,6 +4595,7 @@ class TestSandboxNetworkAndInitScript:
         bak_term = _make_r12_backup("r12-bak-term", proj_term, new_term_env)
         w_term = tmp_path / "r12-work-term"
         w_term.mkdir()
+        _install_restore_reset_sql(w_term)
         (w_term / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_term / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_term / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -4830,6 +4859,7 @@ class TestSandboxNetworkAndInitScript:
         bak_keep = _make_r13_backup("r13-bak-keep", proj_keep, orig_keep_env + "EXTRA=from-backup\n")
         w_keep = tmp_path / "r13-work-keep"
         w_keep.mkdir()
+        _install_restore_reset_sql(w_keep)
         (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -5025,6 +5055,7 @@ class TestSandboxNetworkAndInitScript:
         bak_unr = _make_r13_backup("r13-bak-unreadable", proj_unr, new_unr_env)
         w_unr = tmp_path / "r13-work-unreadable"
         w_unr.mkdir()
+        _install_restore_reset_sql(w_unr)
         (w_unr / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
         (w_unr / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
         (w_unr / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
@@ -5511,6 +5542,7 @@ class TestSandboxNetworkAndInitScript:
                 work_r = case_dir / "work"
                 bak_r = case_dir / "backup"
                 (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                _install_restore_reset_sql(work_r)
                 bak_r.mkdir()
                 (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
                 (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
@@ -5712,7 +5744,13 @@ class TestSandboxNetworkAndInitScript:
             text = caddy_path.read_text(encoding="utf-8")
             for m in re.finditer(r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}", text):
                 caddy_vars.add(m.group(1))
-        assert caddy_vars == {"DOMAIN", "DALTON_TLS_MODE", "DALTON_EDGE_HTTPS_PORT"}
+        assert caddy_vars == {
+            "DOMAIN",
+            "DALTON_TLS_MODE",
+            "DALTON_EDGE_HTTPS_PORT",
+            "STORAGE_BUCKET_NAME",
+            "STORAGE_KEY_PREFIX",
+        }
 
         # --- Case 1: Merged compose edge env never contains backend secrets across all overlays ---
         for combo in (
@@ -5949,6 +5987,7 @@ class TestSandboxNetworkAndInitScript:
                     work_r = case_dir / "work"
                     bak_r = case_dir / "backup"
                     (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                    _install_restore_reset_sql(work_r)
                     bak_r.mkdir()
                     (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
                     (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")

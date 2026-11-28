@@ -229,6 +229,8 @@ async def dispatch(
     preapproved: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    # DALTON-HOOK(cos-verbatim-forward): accept caller state to attach latest user verbatim request.
+    state: dict | None = None,
 ) -> Command:
     """Start ``question`` as a background turn of a workspace's own agent.
 
@@ -242,6 +244,12 @@ async def dispatch(
     runs at where the model has no such level.
     """
     import aiohttp
+
+    # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payload by tool_call_id on resume, else attach verbatim user request.
+    from src.dalton.cos_verbatim import resolve_dispatch_question
+    question = resolve_dispatch_question(
+        question, state, config=config, tool_call_id=tool_call_id
+    )
 
     model = (model or "").strip() or None
 
@@ -349,6 +357,23 @@ async def dispatch(
                 tool_call_id,
             )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    # DALTON-HOOK(personal-integrations): gate delegate_to_analyst when source thread holds personal integration data
+    from src.dalton.services.personal_integration_guard import (
+        check_personal_thread_dispatch_allowed,
+    )
+
+    dispatch_ok, dispatch_err = await check_personal_thread_dispatch_allowed(
+        source_thread_id=configurable.get("thread_id"),
+        caller_user_id=user_id,
+        target_workspace_id=workspace_id,
+        target_thread_id=thread_id if is_continuation else None,
+    )
+    if not dispatch_ok:
+        return error_command(
+            dispatch_err
+            or "当前对话包含个人日历/邮箱私密数据，不支持转派到其他工作区或线程；请直接在当前私密对话中继续处理。",
+            tool_call_id,
+        )
     if workspace is not None and (away := await _unreachable_computer(workspace_id)):
         # Its files are on that computer, so its analyst cannot run anywhere
         # else; refused before the card, so nothing is approved and dropped.
@@ -378,6 +403,14 @@ async def dispatch(
 
         if not approved:
             return decline_handoff_command(response, tool_call_id)
+
+        # DALTON-HOOK(cos-verbatim-forward): require approval-bound payload on HITL resume; stop with retryable error if missing.
+        from src.dalton.cos_verbatim import resolve_approved_dispatch_question
+        question, payload_err = resolve_approved_dispatch_question(
+            question, config=config, tool_call_id=tool_call_id
+        )
+        if payload_err is not None:
+            return error_command(payload_err, tool_call_id)
 
         # The card's report-back switch, when the user moved it. A resume
         # that names no overrides keeps what the call asked for.

@@ -1,7 +1,12 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { useCallback, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useLocation, useNavigate } from 'react-router';
+import React, { useCallback, useContext, useState } from 'react';
+import {
+  QueryClient,
+  QueryClientContext,
+  useQuery,
+  type QueryClient as QueryClientType,
+} from '@tanstack/react-query';
+import { UNSAFE_LocationContext, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ChevronRight, Folder, Lock, Send } from 'lucide-react';
 import { api } from '@/api/client';
@@ -17,7 +22,17 @@ import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
 import { shortMonthDay } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
+import { cachedHomeRow, workspaceDetailQuery } from '@/pages/ChatAgent/utils/workspaceQueries';
 import { cn } from '@/lib/utils';
+
+const FALLBACK_QUERY_CLIENT: QueryClientType = new QueryClient({
+  defaultOptions: {
+    queries: {
+      enabled: false,
+      retry: false,
+    },
+  },
+});
 
 export type TeamAccessMode = 'owner' | 'rw' | 'ro';
 
@@ -63,20 +78,26 @@ export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
 }
 
 export function useTeamWorkspaces(enabled = true) {
+  const contextClient = useContext(QueryClientContext);
+  const queryClient = contextClient ?? FALLBACK_QUERY_CLIENT;
   const identity = useCallerIdentity({ enabled });
   const { hasCapability } = useCapabilities({ enabled });
-  return useQuery({
-    queryKey: queryKeys.workspaces.team(),
-    queryFn: fetchTeamWorkspaces,
-    enabled:
-      enabled &&
-      !identity.isPlatform &&
-      (isDaltonAuth || identity.isMultiUserAuth) &&
-      identity.isInternal &&
-      hasCapability('colleague_sharing'),
-    staleTime: 60_000,
-    retry: false,
-  });
+  return useQuery(
+    {
+      queryKey: queryKeys.workspaces.team(),
+      queryFn: fetchTeamWorkspaces,
+      enabled:
+        enabled &&
+        Boolean(contextClient) &&
+        !identity.isPlatform &&
+        (isDaltonAuth || identity.isMultiUserAuth) &&
+        identity.isInternal &&
+        hasCapability('colleague_sharing'),
+      staleTime: 60_000,
+      retry: false,
+    },
+    queryClient,
+  );
 }
 
 export interface TeamReadOnlyState {
@@ -104,12 +125,27 @@ export function useTeamReadOnly(
     colleague_dispatch_enabled?: boolean | null;
   } | null,
 ): TeamReadOnlyState {
-  const location = useLocation();
-  const queryClient = useQueryClient();
+  const locationCtx = useContext(UNSAFE_LocationContext);
+  const location = locationCtx?.location ?? null;
+  const contextClient = useContext(QueryClientContext);
+  const queryClient = contextClient ?? FALLBACK_QUERY_CLIENT;
   const teamAccessActive = Boolean(workspaceId) && isDaltonAuth;
   const identity = useCallerIdentity({ enabled: teamAccessActive });
   const { user: currentUser } = useUser({ enabled: teamAccessActive });
   const { data: teamData } = useTeamWorkspaces(teamAccessActive);
+  // DALTON-HOOK(team-sharing): subscribe to workspace detail when callers omit workspaceRecord
+  // so an empty detail cache resolves ownership instead of staying stuck in fail-closed read-only.
+  const cachedHome = contextClient ? cachedHomeRow(queryClient, workspaceId) ?? null : null;
+  const shouldFetchDetail =
+    teamAccessActive && Boolean(contextClient) && !workspaceRecord && !cachedHome?.user_id;
+  const { data: queriedWorkspaceRecord } = useQuery(
+    {
+      ...workspaceDetailQuery(workspaceId ?? ''),
+      enabled: shouldFetchDetail,
+      retry: false,
+    },
+    queryClient,
+  );
   const callerTier = identity.isPlatform
     ? null
     : identity.status === 'ready'
@@ -130,7 +166,20 @@ export function useTeamReadOnly(
     };
   }
 
-  const navState = (location.state ?? null) as {
+  const resolvedWorkspaceRecord =
+    workspaceRecord ??
+    queriedWorkspaceRecord ??
+    cachedHome ??
+    (contextClient
+      ? queryClient.getQueryData<{
+          user_id?: string | null;
+          name?: string | null;
+          effective_web_access?: string | null;
+          colleague_dispatch_enabled?: boolean | null;
+        }>(queryKeys.workspaces.detail(workspaceId)) ?? null
+      : null);
+
+  const navState = (location?.state ?? null) as {
     isTeamReadOnly?: boolean;
     teamAccess?: 'rw' | 'ro';
     teamOwnerName?: string;
@@ -141,13 +190,13 @@ export function useTeamReadOnly(
     queryKeys.dalton.sharing(workspaceId),
   );
   const colleagueDispatchEnabled = Boolean(
-    workspaceRecord?.colleague_dispatch_enabled ??
+    resolvedWorkspaceRecord?.colleague_dispatch_enabled ??
       sharingData?.colleague_dispatch_enabled ??
       teamData?.colleague_dispatch_enabled ??
       false,
   );
 
-  const effectiveAccess = workspaceRecord?.effective_web_access ?? null;
+  const effectiveAccess = resolvedWorkspaceRecord?.effective_web_access ?? null;
   const isThreadOnly = effectiveAccess === 'thread_only';
   // DALTON-HOOK(colleague-access): the workspace record's effective access is computed by the
   // server for this caller; cached team lists and route state grant write access only to a caller
@@ -190,7 +239,7 @@ export function useTeamReadOnly(
     }
   }
 
-  const wsOwnerId = workspaceRecord?.user_id ?? null;
+  const wsOwnerId = resolvedWorkspaceRecord?.user_id ?? null;
   const currentUserId = currentUser?.user_id ?? null;
   if (wsOwnerId && currentUserId && wsOwnerId !== currentUserId) {
     const matchedMember = members.find((m) => m.user_id === wsOwnerId);

@@ -58,7 +58,6 @@ import { THREAD_ID, WORKSPACE_ID, chatInput, chatState, mountChatView, resetChat
 import ChatView from '../ChatView';
 import { MAX_FILES } from '@/components/ui/chat-input.helpers';
 import type { ComposerSend, ReadyAttachment } from '@/components/ui/chat-input.types';
-import { chartSelectionStore } from '@/pages/MarketView/stores/chartSelectionStore';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 
 type OnSend = (send: ComposerSend) => boolean | void;
@@ -102,7 +101,6 @@ beforeAll(() => {
 
 beforeEach(() => {
   resetChatState();
-  chartSelectionStore.clearAll();
   mocks.getThread.mockReset();
   mocks.getWorkspace.mockReset();
   mocks.toast.mockReset();
@@ -111,50 +109,8 @@ beforeEach(() => {
   mocks.getThread.mockResolvedValue({ thread_id: THREAD_ID, subagents_allowed: false });
 });
 
+// DALTON-HOOK(chat-attachment-count): panel chart selection crops left with upstream #874; widget screenshots still count.
 describe('ChatView: screenshots count toward MAX_FILES (10)', () => {
-  it('blocks sending 10 files plus a panel chart screenshot with toast and keeps selection intact', async () => {
-    mountChatView(ChatView);
-    await waitFor(() => expect(chatInput.props?.onSend).toBeTypeOf('function'));
-
-    mocks.attachmentCount = MAX_FILES + 1;
-    let selId = '';
-    act(() => {
-      selId = chartSelectionStore.beginDraft({
-        symbol: 'NVDA',
-        timeframe: '1day',
-        selectionType: 'region',
-        timeStart: '2026-01-01T00:00:00Z',
-        timeEnd: '2026-01-10T00:00:00Z',
-        priceLow: 100,
-        priceHigh: 120,
-        bars: [],
-        barsTruncated: false,
-        croppedImage: 'data:image/jpeg;base64,AAAA',
-      });
-      chartSelectionStore.confirm(selId, 'breakout');
-    });
-
-    await waitFor(() => expect(chatInput.props?.externalAttachmentCount).toBe(1));
-    expect(mocks.toast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        variant: 'destructive',
-        title: `chat.attachmentsTooMany:${MAX_FILES}`,
-      }),
-    );
-
-    mocks.toast.mockReset();
-    const sent = sendWith(makeFiles(MAX_FILES));
-    expect(sent).toBe(false);
-    expect(chatState.handleSendMessage).not.toHaveBeenCalled();
-    expect(chartSelectionStore.getConfirmedFor('NVDA', '1day')).toHaveLength(1);
-    expect(mocks.toast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        variant: 'destructive',
-        title: `chat.attachmentsTooMany:${MAX_FILES}`,
-      }),
-    );
-  });
-
   it('blocks sending 10 files plus an image-bearing widget snapshot', async () => {
     mountChatView(ChatView);
     await waitFor(() => expect(chatInput.props?.onSend).toBeTypeOf('function'));
@@ -179,35 +135,5 @@ describe('ChatView: screenshots count toward MAX_FILES (10)', () => {
         title: `chat.attachmentsTooMany:${MAX_FILES}`,
       }),
     );
-  });
-
-  it('allows sending 9 files plus 1 chart screenshot (total 10)', async () => {
-    mountChatView(ChatView);
-    await waitFor(() => expect(chatInput.props?.onSend).toBeTypeOf('function'));
-
-    act(() => {
-      const selId = chartSelectionStore.beginDraft({
-        symbol: 'NVDA',
-        timeframe: '1day',
-        selectionType: 'region',
-        timeStart: '2026-01-01T00:00:00Z',
-        timeEnd: '2026-01-10T00:00:00Z',
-        priceLow: 100,
-        priceHigh: 120,
-        bars: [],
-        barsTruncated: false,
-        croppedImage: 'data:image/jpeg;base64,CCCC',
-      });
-      chartSelectionStore.confirm(selId, 'support');
-    });
-
-    await waitFor(() => expect(chatInput.props?.externalAttachmentCount).toBe(1));
-    sendWith(makeFiles(MAX_FILES - 1));
-    expect(chatState.handleSendMessage).toHaveBeenCalledTimes(1);
-    const contexts = chatState.handleSendMessage.mock.calls[0][1] as Array<Record<string, unknown>>;
-    const imageOrFileContexts = contexts.filter(
-      (c) => c.type === 'image' || c.type === 'pdf' || c.type === 'file' || c.type === 'chat_upload',
-    );
-    expect(imageOrFileContexts).toHaveLength(MAX_FILES);
   });
 });

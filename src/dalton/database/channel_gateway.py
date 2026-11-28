@@ -1091,7 +1091,12 @@ async def lookup_bot_topic(
 
 
 BT2_TERMINAL_FAILURE_CODES: frozenset[str] = frozenset(
-    {"not_allowed", "max_attempts_exceeded", "skipped_platform_disabled"}
+    {
+        "not_allowed",
+        "max_attempts_exceeded",
+        "skipped_platform_disabled",
+        "personal_integration_private_only",
+    }
 )
 BT2_MAX_DELIVERY_ATTEMPTS: int = 8
 BT2_SOURCE_OR_PARENT_LEASE_SECONDS: int = 180
@@ -4875,6 +4880,41 @@ async def _bind_identity_in_tx(
                 platform_tenant_key,
             ),
         )
+        if platform == "feishu":
+            # Record binding-owned Feishu App ID (from active gateway runtime or get_credential_group)
+            # inside a savepoint so pre-d064 schemas stay compatible.
+            try:
+                from src.dalton.database import user_integrations as ui_db
+                from src.dalton.deployment_credentials.catalog import FEISHU_APP_ID_KEY
+                from src.dalton.deployment_credentials.snapshot import get_credential_group
+
+                eff_app_id: str | None = None
+                has_live_gw, live_app_id = await ui_db.get_active_channel_gateway_feishu_app_id(
+                    conn=cur.connection
+                )
+                if has_live_gw and live_app_id:
+                    eff_app_id = live_app_id
+                else:
+                    fg = get_credential_group("feishu_app")
+                    if fg.ready:
+                        eff_app_id = str(fg.values.get(FEISHU_APP_ID_KEY) or "").strip() or None
+                if eff_app_id:
+                    await cur.execute("SAVEPOINT sp_dalton_feishu_app_id")
+                    try:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_identities
+                            SET feishu_app_id = %s
+                            WHERE user_id = %s AND platform = 'feishu'
+                            """,
+                            (eff_app_id, user_id),
+                        )
+                        await cur.execute("RELEASE SAVEPOINT sp_dalton_feishu_app_id")
+                    except Exception:
+                        await cur.execute("ROLLBACK TO SAVEPOINT sp_dalton_feishu_app_id")
+                        await cur.execute("RELEASE SAVEPOINT sp_dalton_feishu_app_id")
+            except Exception:
+                pass
 
     # Advance any existing session_generations rows for (platform, user_id)
     await cur.execute(
@@ -10718,7 +10758,12 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                 if not is_dm:
                     pinned_dm_recipient = None
 
-                async def _persist_bt2_terminal_denied(code: str = "not_allowed") -> dict[str, Any]:
+                async def _persist_bt2_terminal_denied(
+                    code: str = "not_allowed",
+                    *,
+                    message: str = BT2_DENIED_ERROR_MESSAGE,
+                    has_personal_integration_data: bool = False,
+                ) -> dict[str, Any]:
                     failed_fs = [
                         {
                             "workspace_id": m.get("workspace_id") or "",
@@ -10775,7 +10820,7 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                             resolved_target_address,
                             Jsonb(failed_fs),
                             code,
-                            BT2_DENIED_ERROR_MESSAGE,
+                            message,
                             resolved_scope,
                             resolved_gen,
                             resolved_activity_origin,
@@ -10801,12 +10846,56 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                         locked_bg_runs=locked_bg_runs,
                         error_code=code,
                     )
-                    return {
+                    denied_res: dict[str, Any] = {
                         "claim_status": "denied",
                         "status": "failed",
                         "code": code,
-                        "message": BT2_DENIED_ERROR_MESSAGE,
+                        "message": message,
                     }
+                    if has_personal_integration_data:
+                        denied_res["has_personal_integration_data"] = True
+                    return denied_res
+
+                # Personal-integration privacy gate (shared with normal I-6 delivery):
+                # BT2 parent and item attachment resends for private threads may ONLY go
+                # to the thread owner's verified 1:1 DM (never back to a group chat or another user).
+                resolved_privacy_thread_id = resolved_tid
+                if not resolved_privacy_thread_id and source_row and source_row.get("thread_id"):
+                    resolved_privacy_thread_id = normalize_uuid(source_row.get("thread_id"))
+                if not resolved_privacy_thread_id and parent_row and parent_row.get("thread_id"):
+                    resolved_privacy_thread_id = normalize_uuid(parent_row.get("thread_id"))
+                if not resolved_privacy_thread_id and resolved_exec_id:
+                    await cur.execute(
+                        """
+                        SELECT conversation_thread_id::text AS thread_id
+                        FROM automation_executions
+                        WHERE automation_execution_id = %s::uuid
+                        LIMIT 1
+                        """,
+                        (resolved_exec_id,),
+                    )
+                    bt2_exec_row = await cur.fetchone()
+                    if bt2_exec_row and bt2_exec_row.get("thread_id"):
+                        resolved_privacy_thread_id = normalize_uuid(bt2_exec_row.get("thread_id"))
+
+                bt2_priv_thread = False
+                if resolved_privacy_thread_id:
+                    bt2_priv_thread, bt2_priv_owner = await _read_thread_personal_privacy_in_tx(
+                        cur, resolved_privacy_thread_id
+                    )
+                    if bt2_priv_thread:
+                        if bt2_priv_owner and str(resolved_user_id or "").strip() != bt2_priv_owner:
+                            return await _persist_bt2_terminal_denied(
+                                "personal_integration_private_only",
+                                message="该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
+                                has_personal_integration_data=True,
+                            )
+                        if not is_dm:
+                            return await _persist_bt2_terminal_denied(
+                                "personal_integration_private_only",
+                                message="该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                                has_personal_integration_data=True,
+                            )
 
                 # Intentional scope limit (§3.5(2)): production-disabled platforms (e.g. Discord) background DM
                 # without original DM inbound recipient immediately settle as terminal not_allowed.
@@ -10838,6 +10927,24 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                 )
                 if not live_ok:
                     return await _persist_bt2_terminal_denied(live_code or "not_allowed")
+
+                if (
+                    bt2_priv_thread
+                    and not _is_dm_address(resolved_platform, resolved_target_address)
+                    and (
+                        not resolved_recip
+                        or resolved_target_address
+                        not in (
+                            f"{resolved_platform}:{resolved_recip}",
+                            f"{resolved_platform}:user:{resolved_recip}",
+                        )
+                    )
+                ):
+                    return await _persist_bt2_terminal_denied(
+                        "personal_integration_private_only",
+                        message="该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                        has_personal_integration_data=True,
+                    )
 
                 if is_dm and resolved_platform == "feishu" and not pinned_dm_recipient and resolved_recip:
                     pinned_dm_recipient = resolved_recip
@@ -10987,6 +11094,32 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                 }
 
 
+async def _read_thread_personal_privacy_in_tx(
+    cur: Any,
+    thread_id: str | None,
+) -> tuple[bool, str | None]:
+    """Return ``(has_personal_integration_data, owner_user_id)`` for ``thread_id`` inside an open cursor."""
+    norm = normalize_uuid(thread_id) if thread_id else None
+    if not norm:
+        return False, None
+    await cur.execute(
+        """
+        SELECT COALESCE(t.has_personal_integration_data, FALSE) AS has_personal_integration_data,
+               COALESCE(t.user_id, w.user_id) AS owner_user_id
+        FROM conversation_threads t
+        LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
+        WHERE t.conversation_thread_id = %s::uuid
+        LIMIT 1
+        """,
+        (norm,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False, None
+    owner = str(row.get("owner_user_id") or "").strip() or None
+    return bool(row.get("has_personal_integration_data")), owner
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -11011,6 +11144,7 @@ async def authorize_and_claim_delivery(
     reclaim_stale_source_attempt_id: str | None = None,
     retry_dedup_by_target: bool = False,
     payload_digest: str | None = None,
+    claim_token: str | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -11053,11 +11187,27 @@ async def authorize_and_claim_delivery(
             require_gateway_epoch=require_gateway_epoch,
             conn=conn,
         )
+    if cleaned_kind == "failure_notice":
+        from src.dalton.database.failure_notice_claims import (
+            authorize_and_claim_failure_notice,
+        )
+
+        return await authorize_and_claim_failure_notice(
+            delivery_key=cleaned_key,
+            claim_token=claim_token,
+            run_id=run_id,
+            target=target,
+            has_non_empty_text=has_non_empty_text,
+            total_chunks=total_chunks,
+            gateway_epoch=gateway_epoch,
+            require_gateway_epoch=require_gateway_epoch,
+            conn=conn,
+        )
     cleaned_uid = str(user_id or "").strip() or None
     cleaned_platform = str(platform or "").strip().lower() or None
     cleaned_target = str(target).strip() if target is not None and str(target).strip() else None
     cleaned_inbound_mid = str(inbound_message_id or "").strip() or None
-    eff_exec_id = normalize_uuid(automation_execution_id or execution_id)
+    eff_exec_id = _normalize_automation_run_uuid(automation_execution_id or execution_id)
     norm_tid = normalize_uuid(thread_id)
     cleaned_rid = str(run_id or "").strip() or None
     eff_source_scope = str(source_scope_key or "").strip() or None
@@ -11573,6 +11723,8 @@ async def authorize_and_claim_delivery(
                 verified_source_row: dict[str, Any] | None = None
                 resolved_auth_mode: str = "current_conversation"
                 resolved_verified_ws_id: str | None = None
+                resolved_privacy_thread_id: str | None = norm_tid
+                forced_personal_redirect_notice = False
 
                 # Scenario A1: Direct notice replying to an inbound event
                 if cleaned_kind == "notice" and cleaned_inbound_mid and cleaned_platform:
@@ -11811,6 +11963,9 @@ async def authorize_and_claim_delivery(
                             "message": "Automation run belongs to another user.",
                         }
                     resolved_user_id = owner_uid
+                    auto_tid = normalize_uuid(auto_row.get("thread_id")) or norm_tid
+                    if auto_tid:
+                        resolved_privacy_thread_id = auto_tid
                     targets_list = list(auto_row.get("targets") or [])
                     matched_target: dict[str, Any] | None = None
                     for t_item in targets_list:
@@ -11826,6 +11981,31 @@ async def authorize_and_claim_delivery(
                             ).startswith(f"{cleaned_platform}:"):
                                 matched_target = t_item
                                 break
+
+                    # Allow redirecting a personal-integration thread's group/channel target
+                    # to the automation owner's verified 1:1 DM on the same platform.
+                    if matched_target is None and cleaned_target and ":" in cleaned_target:
+                        dm_plat = cleaned_target.split(":", 1)[0].strip().lower()
+                        if _is_dm_address(dm_plat, cleaned_target):
+                            has_plat_target = any(
+                                isinstance(t_item, dict)
+                                and t_item.get("ok") is True
+                                and str(t_item.get("address") or "")
+                                .strip()
+                                .lower()
+                                .startswith(f"{dm_plat}:")
+                                for t_item in targets_list
+                            )
+                            if has_plat_target:
+                                auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                                    cur, resolved_privacy_thread_id
+                                )
+                                if auto_is_priv:
+                                    matched_target = {
+                                        "entry": cleaned_target,
+                                        "address": f"{dm_plat}:@me",
+                                        "ok": True,
+                                    }
 
                     if not matched_target or matched_target.get("ok") is not True:
                         return {
@@ -12004,6 +12184,23 @@ async def authorize_and_claim_delivery(
                     verified_source_row = dict(source_row)
                     resolved_platform = str(source_row["platform"]).lower()
                     resolved_target_address = str(source_row["target_address"])
+                    a2_tid = normalize_uuid(source_row.get("thread_id")) or norm_tid
+                    if a2_tid:
+                        resolved_privacy_thread_id = a2_tid
+                    # Allow fallback / retry deliveries for a personal-integration thread
+                    # to redirect from a non-DM source conversation to the owner's verified 1:1 DM.
+                    if (
+                        cleaned_kind == "fallback"
+                        and cleaned_key.endswith(":personal_dm")
+                        and cleaned_target
+                        and _is_dm_address(resolved_platform, cleaned_target)
+                        and resolved_privacy_thread_id
+                    ):
+                        a2_is_priv, a2_owner = await _read_thread_personal_privacy_in_tx(
+                            cur, resolved_privacy_thread_id
+                        )
+                        if a2_is_priv and (not a2_owner or a2_owner == resolved_user_id):
+                            resolved_target_address = f"{resolved_platform}:@me"
                     resolved_thread_scope_key = (
                         str(source_row["thread_scope_key"])
                         if source_row.get("thread_scope_key")
@@ -12589,6 +12786,55 @@ async def authorize_and_claim_delivery(
                 if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
                     reject_company_system_auth(resolved_user_id)
                 require_channel_platform_capability(resolved_platform)
+
+                # Personal integration egress guard (backend enforcement):
+                # Once a thread carries personal integration data, actual replies,
+                # automation summaries, fallbacks, and retries may ONLY go to the
+                # owner's verified 1:1 DM. Non-DM targets only permit the sanitized
+                # redirect notice (`:personal_redirect_notice`) with forced safe text.
+                if (
+                    not resolved_privacy_thread_id
+                    and isinstance(verified_source_row, dict)
+                    and verified_source_row.get("thread_id")
+                ):
+                    resolved_privacy_thread_id = normalize_uuid(
+                        verified_source_row.get("thread_id")
+                    )
+                if resolved_privacy_thread_id:
+                    (
+                        priv_thread,
+                        priv_owner,
+                    ) = await _read_thread_personal_privacy_in_tx(
+                        cur, resolved_privacy_thread_id
+                    )
+                    if priv_thread:
+                        if priv_owner and str(resolved_user_id or "").strip() != priv_owner:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "personal_integration_private_only",
+                                "has_personal_integration_data": True,
+                                "message": "该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
+                            }
+                        if not _is_dm_address(
+                            str(resolved_platform or ""),
+                            str(resolved_target_address or ""),
+                        ):
+                            if cleaned_key.endswith(
+                                ":personal_redirect_notice"
+                            ) and cleaned_kind in ("automation", "fallback", "notice"):
+                                forced_personal_redirect_notice = True
+                            else:
+                                return {
+                                    "claim_status": "denied",
+                                    "status": "failed",
+                                    "code": "personal_integration_private_only",
+                                    "has_personal_integration_data": True,
+                                    "redirect_dm_address": f"{resolved_platform}:@me"
+                                    if resolved_platform
+                                    else None,
+                                    "message": "该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                                }
 
                 cleaned_payload_digest = (
                     str(payload_digest).strip()
@@ -13701,6 +13947,13 @@ async def authorize_and_claim_delivery(
                     resp_claim["weixin_bot_id"] = resolved_wx_bot_id
                     resp_claim["weixin_bot_generation"] = resolved_wx_bot_gen
                     resp_claim["weixin_context_token_version"] = weixin_ctx_token_version
+                if forced_personal_redirect_notice:
+                    from src.dalton.services.personal_integration_guard import (
+                        PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                    )
+
+                    resp_claim["personal_private_redirect_notice"] = True
+                    resp_claim["forced_text"] = PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
                 return resp_claim
 
 
@@ -18295,8 +18548,16 @@ async def _recover_channel_state_once(
                     auto_row["chart_snapshots"] = auto_snaps
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
-                    from src.dalton.settings import is_strict_deliverable_text_enabled
+                    from src.dalton.settings import (
+                        is_failure_notice_enabled,
+                        is_strict_deliverable_text_enabled,
+                    )
                     auto_row["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
+                    auto_row["failure_notice_enabled"] = is_failure_notice_enabled()
+                    auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                        cur, eff_tid
+                    )
+                    auto_row["has_personal_integration_data"] = bool(auto_is_priv)
 
                 (
                     bt2_link_recoveries,
@@ -18307,11 +18568,15 @@ async def _recover_channel_state_once(
                     cur, enabled_platforms=enabled_platforms
                 )
 
-                from src.dalton.settings import is_strict_deliverable_text_enabled
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
 
                 return {
                     "mode": "startup",
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+                    "failure_notice_enabled": is_failure_notice_enabled(),
                     "inbound_events": _json_safe_rows(inbound_events),
                     "background_runs": _json_safe_rows(background_runs),
                     "thread_watches": _json_safe_rows(thread_watches),
@@ -18373,6 +18638,20 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_automation_run_uuid(raw_id: str | None) -> str | None:
+    """Normalize an automation delivery execution ID (UUID or ``<uuid>.<n>``)."""
+    if not raw_id:
+        return None
+    norm = normalize_uuid(raw_id)
+    if norm:
+        return norm
+    text = str(raw_id).strip()
+    base, sep, suffix = text.rpartition(".")
+    if sep and suffix.isdigit() and int(suffix) >= 2:
+        return normalize_uuid(base)
+    return None
+
+
 async def register_automation_run(
     *,
     execution_id: str,
@@ -18384,7 +18663,7 @@ async def register_automation_run(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-8 (1): Idempotently register automation run and resolve `entries` into `targets`."""
-    norm_exec_id = normalize_uuid(execution_id)
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
     if not norm_exec_id:
         raise HTTPException(status_code=400, detail="Valid execution_id UUID is required")
     cleaned_uid = str(user_id or "").strip()
@@ -18400,14 +18679,66 @@ async def register_automation_run(
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT targets FROM dalton_channel_automation_runs
+                    SELECT user_id, workspace_id, thread_id, automation_name,
+                           entries, status, targets
+                    FROM dalton_channel_automation_runs
                     WHERE execution_id = %s
+                    FOR UPDATE
                     """,
                     (norm_exec_id,),
                 )
                 existing = await cur.fetchone()
+                incoming_entries = [
+                    str(raw_entry or "").strip()
+                    for raw_entry in (entries or [])
+                    if str(raw_entry or "").strip()
+                ]
+                update_existing_unstarted = False
                 if existing:
-                    return {"targets": list(existing.get("targets") or [])}
+                    existing_status = str(existing.get("status") or "")
+                    existing_targets = list(existing.get("targets") or [])
+                    existing_entries = [
+                        str(e or "").strip()
+                        for e in (existing.get("entries") or [])
+                        if str(e or "").strip()
+                    ]
+                    existing_ws = (
+                        str(existing["workspace_id"])
+                        if existing.get("workspace_id")
+                        else None
+                    )
+                    any_reached = any(
+                        isinstance(t, dict)
+                        and (t.get("reached") is True or bool(t.get("via")))
+                        for t in existing_targets
+                    )
+                    has_default_entry = any(":" not in e for e in incoming_entries)
+                    can_re_resolve = (
+                        existing_status == "registered"
+                        and not any_reached
+                        and str(existing.get("user_id") or "") == cleaned_uid
+                    )
+                    if not can_re_resolve or (
+                        existing_entries == incoming_entries
+                        and existing_ws == norm_ws_id
+                        and not has_default_entry
+                    ):
+                        if (
+                            can_re_resolve
+                            and norm_tid is not None
+                            and not existing.get("thread_id")
+                        ):
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_automation_runs
+                                SET thread_id = %s, updated_at = NOW()
+                                WHERE execution_id = %s
+                                  AND status = 'registered'
+                                """,
+                                (norm_tid, norm_exec_id),
+                            )
+                        return {"targets": existing_targets}
+                    update_existing_unstarted = True
 
                 await cur.execute(
                     """
@@ -18533,6 +18864,33 @@ async def register_automation_run(
                         }
                     )
 
+                if update_existing_unstarted:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_automation_runs
+                        SET workspace_id = %s,
+                            thread_id = COALESCE(%s, thread_id),
+                            automation_name = %s,
+                            entries = %s,
+                            targets = %s,
+                            updated_at = NOW()
+                        WHERE execution_id = %s
+                          AND status = 'registered'
+                        RETURNING targets
+                        """,
+                        (
+                            norm_ws_id,
+                            norm_tid,
+                            str(automation_name or ""),
+                            Jsonb(list(entries or [])),
+                            Jsonb(targets),
+                            norm_exec_id,
+                        ),
+                    )
+                    ins = await cur.fetchone()
+                    if ins:
+                        return {"targets": list(ins.get("targets") or [])}
+
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_automation_runs (
@@ -18561,7 +18919,47 @@ async def register_automation_run(
                         (norm_exec_id,),
                     )
                     ins = await cur.fetchone()
-                return {"targets": list((ins or {}).get("targets") or [])}
+                reg_is_priv, _ = await _read_thread_personal_privacy_in_tx(cur, norm_tid)
+                return {
+                    "targets": list((ins or {}).get("targets") or []),
+                    "has_personal_integration_data": bool(reg_is_priv),
+                }
+
+
+async def revoke_unstarted_automation_run(
+    execution_id: str,
+    *,
+    user_id: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Delete an unstarted ``dalton_channel_automation_runs`` registration.
+
+    Only deletes rows still in ``status = 'registered'`` with zero reached/sent
+    targets so cleared delivery recipients can never receive a later finish post.
+    """
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
+    if not norm_exec_id:
+        return False
+    cleaned_uid = str(user_id or "").strip() or None
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM dalton_channel_automation_runs
+                    WHERE execution_id = %s
+                      AND status = 'registered'
+                      AND (%s::varchar IS NULL OR user_id = %s)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(COALESCE(targets, '[]'::jsonb)) AS t
+                          WHERE (t->>'reached') = 'true'
+                             OR NULLIF(t->>'via', '') IS NOT NULL
+                      )
+                    """,
+                    (norm_exec_id, cleaned_uid, cleaned_uid),
+                )
+                return bool(cur.rowcount)
 
 
 async def _resolve_verified_automation_run_id(
@@ -18657,7 +19055,7 @@ async def finish_automation_run(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-8 (2): Claim/update or finalize `dalton_channel_automation_runs` for `/finish` (§1.2.7)."""
-    norm_exec_id = normalize_uuid(execution_id)
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
     if not norm_exec_id:
         raise HTTPException(status_code=404, detail="Unknown execution_id")
     norm_tid = normalize_uuid(thread_id) if thread_id else None
@@ -18922,6 +19320,22 @@ async def finish_automation_run(
                 eff_thread_str = (
                     str(updated["thread_id"]) if updated.get("thread_id") else None
                 )
+                if not eff_thread_str:
+                    await cur.execute(
+                        """
+                        SELECT conversation_thread_id::text AS thread_id
+                        FROM automation_executions
+                        WHERE automation_execution_id = %s::uuid
+                        LIMIT 1
+                        """,
+                        (norm_exec_id,),
+                    )
+                    ae_row = await cur.fetchone()
+                    if ae_row and ae_row.get("thread_id"):
+                        eff_thread_str = str(ae_row["thread_id"])
+                auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                    cur, eff_thread_str
+                )
                 auto_chart_snapshots: list[dict[str, Any]] = []
                 auto_outbound_blocked: bool | None = None
                 if eff_thread_str and verified_run_id:
@@ -18949,7 +19363,10 @@ async def finish_automation_run(
                             norm_exec_id,
                             exc_info=True,
                         )
-                from src.dalton.settings import is_strict_deliverable_text_enabled
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
 
                 return {
                     "execution_id": norm_exec_id,
@@ -18974,6 +19391,8 @@ async def finish_automation_run(
                     "final_text": updated.get("final_text"),
                     "targets": enriched_targets,
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+                    "failure_notice_enabled": is_failure_notice_enabled(),
+                    "has_personal_integration_data": bool(auto_is_priv),
                 }
 
 

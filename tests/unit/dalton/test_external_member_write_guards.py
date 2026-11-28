@@ -82,6 +82,7 @@ def _make_artifact(**overrides: Any) -> Artifact:
         "workspace_id": WS_ID,
         "path": "report.html",
         "shared_at": None,
+        "kind": "file",
         "keep_updated": False,
         "kept_at": None,
         "latest_seq": 1,
@@ -145,6 +146,7 @@ def _make_comment(**overrides: Any) -> Comment:
     base: dict[str, Any] = {
         "comment_id": COMMENT_ID,
         "artifact_id": ARTIFACT_ID,
+        "kind": "file",
         "number": 1,
         "path": "report.html",
         "file_sha256": None,

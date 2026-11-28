@@ -833,6 +833,9 @@ async def post_notification_turn(
                             f"by itself; not waiting"
                         )
                         return "refused", None
+                    # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress defers via maintenance_gate for all callers
+                    from src.dalton.maintenance_gate import raise_if_maintenance_http_response
+                    await raise_if_maintenance_http_response(resp, workspace_id=body.get("workspace_id") if isinstance(body, dict) else None)
                     if (
                         resp.status == 409
                         or resp.status >= 500
@@ -854,6 +857,9 @@ async def post_notification_turn(
                         )
                         return "drop", None
             except Exception as e:
+                # DALTON-HOOK(maintenance-gate): let maintenance pause escape the HTTP retry catch to defer outbox job
+                from src.dalton.maintenance_gate import reraise_if_maintenance_paused
+                reraise_if_maintenance_paused(e)
                 logger.warning(
                     f"{log_prefix} HTTP error POSTing to thread {thread_id}: {e}"
                 )

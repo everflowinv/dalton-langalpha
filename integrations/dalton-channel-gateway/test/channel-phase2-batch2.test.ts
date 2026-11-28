@@ -4115,10 +4115,11 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
       final_text: "",
     };
 
-    // Attempt 1: chart sent + I-7 writes `sent`, then I-8 mark_finished fails transiently.
-    await expect(
-      routes.handleFinishAutomationRun("user-alice", execId, reqBody),
-    ).rejects.toThrow(/I-8 transient 503/);
+    // Attempt 1: chart sent + I-7 writes `sent`, then I-8 mark_finished fails transiently
+    // -> returns retryable 503 and queues pending finalization while keeping DB in `finishing`.
+    const res1 = await routes.handleFinishAutomationRun("user-alice", execId, reqBody);
+    expect(res1.status).toBe(503);
+    expect(res1.data.retryable).toBe(true);
     expect(deliveryStates.get(chartsKey)).toBe("sent");
     expect(dbStatus).toBe("finishing");
     expect(feishu.sentCards).toHaveLength(1);

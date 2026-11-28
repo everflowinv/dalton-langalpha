@@ -4,7 +4,7 @@ import logging
 import math
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -41,6 +41,89 @@ EXECUTION_TIMEOUT_MIN_SECONDS = 3 * 3600
 _TIMEOUT_JSONB_FIELDS = ("metadata", "trigger_config")
 _POSITIVE_INT_STR_RE = re.compile(r"^[0-9]+(?:\.0+)?$")
 UNSET_RUN_ID = object()
+# DALTON-HOOK(automation-capacity-retry): sentinel and SQL guards for claim-token & capacity-deadline fencing
+UNSET_CLAIM_TOKEN = object()
+_CAPACITY_WAIT_REASON = "capacity_limit"
+_CAPACITY_DEADLINE_E_SQL = (
+    "COALESCE("
+    "(e.delivery->'capacity_retry'->>'deadline_at')::timestamptz, "
+    "(e.delivery->'capacity_retry'->>'first_parked_at')::timestamptz + INTERVAL '15 minutes', "
+    "e.created_at + INTERVAL '15 minutes'"
+    ")"
+)
+_CAPACITY_CLEAR_CLAIM_SET_SQL = (
+    "wait_reason = CASE WHEN e.wait_reason = 'capacity_limit' THEN NULL ELSE e.wait_reason END, "
+    "delivery = CASE "
+    "WHEN e.delivery ? 'capacity_retry' THEN "
+    "jsonb_set(e.delivery, '{capacity_retry}', (e.delivery->'capacity_retry') - 'claim_token' - 'dispatch_lease_until', true) "
+    "ELSE e.delivery END"
+)
+
+
+def _capacity_begin_predicate(claim_token: Optional[str]) -> tuple[str, tuple[Any, ...]]:
+    """SQL predicate fencing pending -> running on capacity claim_token and 15m deadline."""
+    if claim_token is not None:
+        return (
+            "AND e.wait_reason IS NOT DISTINCT FROM 'capacity_limit' "
+            "AND e.delivery->'capacity_retry'->>'claim_token' = %s "
+            f"AND {_CAPACITY_DEADLINE_E_SQL} > NOW()",
+            (claim_token,),
+        )
+    return (
+        "AND NOT ("
+        "e.wait_reason IS NOT DISTINCT FROM 'capacity_limit' "
+        "AND ("
+        "NULLIF(e.delivery->'capacity_retry'->>'claim_token', '') IS NOT NULL "
+        f"OR {_CAPACITY_DEADLINE_E_SQL} <= NOW()"
+        ")"
+        ")",
+        (),
+    )
+
+
+def _ensure_utc_dt(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_utc_dt(raw: Any) -> Optional[datetime]:
+    if isinstance(raw, datetime):
+        return _ensure_utc_dt(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return _ensure_utc_dt(datetime.fromisoformat(raw.strip()))
+    except ValueError:
+        return None
+
+
+def _is_capacity_deadline_expired(
+    prior: Mapping[str, Any], *, max_wait_seconds: float = 900.0
+) -> bool:
+    """Re-verify capacity deadline expiry under FOR UPDATE using Postgres db_now."""
+    raw_now = prior.get("db_now")
+    db_now = _ensure_utc_dt(raw_now) if isinstance(raw_now, datetime) else datetime.now(timezone.utc)
+    delivery_obj = prior.get("delivery")
+    cap_meta = (
+        delivery_obj.get("capacity_retry")
+        if isinstance(delivery_obj, Mapping)
+        else None
+    )
+    deadline: Optional[datetime] = None
+    if isinstance(cap_meta, Mapping):
+        deadline = _parse_iso_utc_dt(cap_meta.get("deadline_at"))
+        if deadline is None:
+            first_parked = _parse_iso_utc_dt(cap_meta.get("first_parked_at"))
+            if first_parked is not None:
+                deadline = first_parked + timedelta(seconds=max_wait_seconds)
+    if deadline is None:
+        created_at = _parse_iso_utc_dt(prior.get("created_at"))
+        if created_at is not None:
+            deadline = created_at + timedelta(seconds=max_wait_seconds)
+    if deadline is None:
+        return False
+    return db_now >= deadline
 
 
 def _parse_positive_int_seconds(raw: Any) -> Optional[float]:
@@ -284,12 +367,14 @@ async def begin_execution_if_not_deleted(
     execution_id: str,
     *,
     started_at: datetime,
+    claim_token: Optional[str] = None,  # DALTON-HOOK(automation-capacity-retry)
 ) -> Optional[Dict[str, Any]]:
     """Move a pending execution to running only while its automation is live.
 
     DALTON-HOOK(company-automations): a soft-deleted automation does not start.
     DALTON-HOOK(coverage-units): serialize execution entry against unit handoff with FOR SHARE on unit row,
     require active status and lead match, and stamp coverage_unit_id/coverage_unit_version.
+    DALTON-HOOK(automation-capacity-retry): fence capacity retries on claim_token and deadline_at.
     The shared ``transition_execution`` helper is left unchanged.
     """
     from src.dalton.autonomy.classification import (
@@ -299,14 +384,17 @@ async def begin_execution_if_not_deleted(
     )
     from src.dalton.settings import is_coverage_units_enabled
 
+    cap_pred, cap_params = _capacity_begin_predicate(claim_token)
+
     async with get_db_connection() as conn:
         if not is_coverage_units_enabled():
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    """
+                    f"""
                     UPDATE automation_executions e
                     SET status = 'running',
                         started_at = %s,
+                        {_CAPACITY_CLEAR_CLAIM_SET_SQL},
                         llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE a.llm_model END,
                         reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE a.reasoning_effort END,
                         llm_model_system_only = CASE
@@ -319,11 +407,12 @@ async def begin_execution_if_not_deleted(
                       AND e.status = 'pending'
                       AND a.automation_id = e.automation_id
                       AND a.deleted_at IS NULL
+                      {cap_pred}
                     RETURNING e.conversation_thread_id, e.conversation_response_id,
                               e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
                               e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken
                     """,  # DALTON-HOOK(cos-settings-tools)
-                    (started_at, execution_id),
+                    (started_at, execution_id, *cap_params),
                 )
                 row = await cur.fetchone()
                 return dict(row) if row else None
@@ -353,6 +442,7 @@ async def begin_execution_if_not_deleted(
                                 UPDATE automation_executions e
                                 SET status = 'running',
                                     started_at = %s,
+                                    {_CAPACITY_CLEAR_CLAIM_SET_SQL},
                                     llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE a.llm_model END,
                                     reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE a.reasoning_effort END,
                                     llm_model_system_only = CASE
@@ -366,12 +456,13 @@ async def begin_execution_if_not_deleted(
                                   AND a.automation_id = e.automation_id
                                   AND a.deleted_at IS NULL
                                   AND NOT ({managed_base_pred})
+                                  {cap_pred}
                                 RETURNING e.conversation_thread_id, e.conversation_response_id,
                                           e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
                                           e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                                           NULL::text AS coverage_unit_id, NULL::timestamptz AS coverage_unit_version
                                 """,  # DALTON-HOOK(cos-settings-tools)
-                                (started_at, execution_id),
+                                (started_at, execution_id, *cap_params),
                             )
                             fast_row = await cur.fetchone()
                             if fast_row is not None:
@@ -397,8 +488,9 @@ async def begin_execution_if_not_deleted(
                             WHERE e.automation_execution_id = %s
                               AND e.status = 'pending'
                               AND a.deleted_at IS NULL
+                              {cap_pred}
                             """,
-                            (execution_id,),
+                            (execution_id, *cap_params),
                         )
                         ws_probe = await cur.fetchone()
                         if ws_probe is None:
@@ -519,6 +611,7 @@ async def begin_execution_if_not_deleted(
                                 WHERE e.automation_execution_id = %s
                                   AND e.status = 'pending'
                                   AND a.deleted_at IS NULL
+                                  {cap_pred}
                                 FOR UPDATE OF e
                             ),
                             skipped AS (
@@ -548,6 +641,7 @@ async def begin_execution_if_not_deleted(
                                 UPDATE automation_executions e
                                 SET status = 'running',
                                     started_at = %s,
+                                    {_CAPACITY_CLEAR_CLAIM_SET_SQL},
                                     coverage_unit_id = t.stamp_unit_id,
                                     coverage_unit_version = t.stamp_unit_version,
                                     -- DALTON-HOOK(cos-settings-tools): lazily snapshot rolling-upgrade rows (snapshot_taken=FALSE) and freeze
@@ -576,7 +670,7 @@ async def begin_execution_if_not_deleted(
                             FROM target t
                             WHERE t.ws_changed
                             """,  # DALTON-HOOK(cos-settings-tools)
-                            (probe_ws_id, execution_id, started_at, started_at),
+                            (probe_ws_id, execution_id, *cap_params, started_at, started_at),
                         )
                         row = await cur.fetchone()
                         if row and row.get("ws_changed"):
@@ -708,6 +802,12 @@ async def settle_execution(
     expected_run_id: Any = UNSET_RUN_ID,
     check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
     parked: bool = False,
+    # DALTON-HOOK(automation-capacity-retry): in-lock capacity guards & capacity-pending skip
+    expected_wait_reason: Optional[str] = None,
+    expected_claim_token: Any = UNSET_CLAIM_TOKEN,
+    require_capacity_expired: bool = False,
+    capacity_max_wait_seconds: float = 900.0,
+    allow_capacity_pending: bool = False,
     in_transaction: Optional[Callable[[Any, Dict[str, Any]], Awaitable[Any]]] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
@@ -748,16 +848,49 @@ async def settle_execution(
                 if parked:
                     quiet += f" AND {_PARKED.format(e='automation_executions')}"
                 await cur.execute(f"""
-                    SELECT status, created_at, delivery,
+                    SELECT status, wait_reason, created_at, delivery,
                            conversation_thread_id, conversation_response_id,
-                           coverage_unit_id, coverage_unit_version
+                           coverage_unit_id, coverage_unit_version,
+                           NOW() AS db_now
                     FROM automation_executions
                     WHERE automation_execution_id = %s::uuid AND automation_id = %s::uuid
                       {quiet}
                     FOR UPDATE
                 """, tuple(params))
                 prior = await cur.fetchone()
-                if prior is None or prior["status"] not in from_statuses:
+                if prior is None:
+                    return None
+                # DALTON-HOOK(automation-capacity-retry): allow skipping capacity-held pending and re-check wait_reason/claim_token/deadline under FOR UPDATE
+                status_ok = prior["status"] in from_statuses or (
+                    allow_capacity_pending
+                    and prior["status"] == "pending"
+                    and prior.get("wait_reason") == _CAPACITY_WAIT_REASON
+                )
+                if not status_ok:
+                    return None
+                if (
+                    expected_wait_reason is not None
+                    and prior.get("wait_reason") != expected_wait_reason
+                ):
+                    return None
+                if expected_claim_token is not UNSET_CLAIM_TOKEN:
+                    delivery_obj = prior.get("delivery")
+                    cap_meta = (
+                        delivery_obj.get("capacity_retry")
+                        if isinstance(delivery_obj, Mapping)
+                        else None
+                    )
+                    actual_token = (
+                        str(cap_meta.get("claim_token"))
+                        if isinstance(cap_meta, Mapping) and cap_meta.get("claim_token")
+                        else None
+                    )
+                    exp_token = str(expected_claim_token) if expected_claim_token else None
+                    if actual_token != exp_token:
+                        return None
+                if require_capacity_expired and not _is_capacity_deadline_expired(
+                    prior, max_wait_seconds=capacity_max_wait_seconds
+                ):
                     return None
 
                 # DALTON-HOOK(automation-continuation-identity): CAS on linked run and re-read state under FOR UPDATE
@@ -899,23 +1032,47 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
         async with conn.cursor() as cur:
             if stamp is not None:
                 # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
+                # DALTON-HOOK(dalton-notify): preserve pending_settlement marker across delivery re-stamps
+                # DALTON-HOOK(automation-capacity-retry): preserve capacity_retry and delivery_meta state across delivery re-stamps
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback'
+                          AND (delivery ? 'pending_settlement' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta') THEN
+                            %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback') || (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('pending_settlement', 'capacity_retry', 'delivery_meta')
+                            )
                         WHEN delivery ? 'subscription_fallback' THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'pending_settlement' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
+                            %s::jsonb || (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('pending_settlement', 'capacity_retry', 'delivery_meta')
+                            )
                         ELSE %s::jsonb
                     END
                     WHERE automation_execution_id = %s
                       AND status IN {UNSETTLED_STATUSES}
-                """, (Json(stamp), Json(stamp), execution_id))
+                """, (Json(stamp), Json(stamp), Json(stamp), Json(stamp), execution_id))
             else:
                 # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
+                # DALTON-HOOK(dalton-notify): keep pending_settlement marker when clearing delivery targets
+                # DALTON-HOOK(automation-capacity-retry): keep capacity_retry and delivery_meta state even when clearing delivery targets
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' THEN
-                            jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'subscription_fallback'
+                          OR delivery ? 'pending_settlement'
+                          OR delivery ? 'capacity_retry'
+                          OR delivery ? 'delivery_meta' THEN
+                            (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('subscription_fallback', 'pending_settlement', 'capacity_retry', 'delivery_meta')
+                            )
                         ELSE NULL
                     END
                     WHERE automation_execution_id = %s
@@ -1225,6 +1382,8 @@ async def has_earlier_waiting_execution(
                   ON me.automation_execution_id = %s
                 WHERE w.automation_id = %s AND w.status = 'waiting'
                   AND NOT {_PARKED.format(e="w")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked rows are not in the thread_busy line
+                  AND NOT {_CAPACITY_PARKED.format(e="w")}
                   AND (w.created_at, w.automation_execution_id)
                       < (me.created_at, me.automation_execution_id)
                 LIMIT 1
@@ -1273,6 +1432,8 @@ async def touch_execution(execution_id: str) -> None:
                 WHERE automation_execution_id = %s
                   AND status IN {UNSETTLED_STATUSES}
                   AND NOT {_PARKED.format(e="automation_executions")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked heartbeats are maintained by the capacity sweep
+                  AND NOT {_CAPACITY_PARKED.format(e="automation_executions")}
             """, (execution_id,))
 
 
@@ -1352,6 +1513,8 @@ async def list_abandoned_executions(
                     ON t.conversation_thread_id = e.conversation_thread_id
                 WHERE e.status IN {UNSETTLED_STATUSES}
                   AND NOT {_PARKED.format(e="e")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked rows are expired/released by sweep_capacity_parked
+                  AND NOT {_CAPACITY_PARKED.format(e="e")}
                   AND NOT EXISTS (
                       SELECT 1 FROM conversation_responses r
                       WHERE (
@@ -1641,6 +1804,11 @@ async def take_over_execution_run(
 _PARKED = (
     "({e}.status = 'waiting'"
     " AND {e}.wait_reason IS NOT DISTINCT FROM 'computer_unreachable')"
+)
+# DALTON-HOOK(automation-capacity-retry): capacity-backoff waits (and leased pending re-dispatches) are owned by the capacity sweep
+_CAPACITY_PARKED = (
+    "({e}.status IN ('waiting', 'pending')"
+    " AND {e}.wait_reason IS NOT DISTINCT FROM 'capacity_limit')"
 )
 
 # A firing of the same automation came after ``e``, whatever became of it: it

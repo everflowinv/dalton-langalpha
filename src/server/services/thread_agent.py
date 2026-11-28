@@ -21,12 +21,14 @@ if TYPE_CHECKING:
     from ptc_agent.agent.claude_code.launcher import Launcher
     from ptc_agent.agent.middleware.member_context import MemberContext
     from ptc_agent.agent.roles import AgentRole
+    from ptc_agent.agent.transcript import BorrowedFiles
     from ptc_agent.config.agent import Admitted, AgentConfig
     from ptc_agent.core.claude_code_clis import CliQueue
     from ptc_agent.core.project_context import ProjectContext
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from src.server.services.computer_manager._types import WorkspaceToolView
     from src.server.services.egress.direct_tools import DirectMCPBinding
+    from src.server.services.forks.model import ForkLineage
     from src.server.services.livefs.history_files import ThreadHistory
     from src.server.services.turn_runtime import TurnRoute
 
@@ -143,6 +145,9 @@ class AgentInputs:
     #: The thread's own transcript, for the file tools of a turn in a thread
     #: its sender keeps private in a shared workspace (``ThreadHistory``).
     thread_history: ThreadHistory | None = None
+    #: A snapshot fork's turns before its own, whose files its transcript
+    #: pointers name in the chats it was forked from (``ThreadStart``).
+    transcript_borrowed: tuple[BorrowedFiles, ...] = ()
     #: In a shared workspace, the member whose own context the turn carries
     #: (``shared_workspaces_member_context``); None for a call between
     #: turns and for every other turn.
@@ -163,13 +168,16 @@ class AgentInputs:
         workspace_owner_id: str | None = None,
         acting_for: str | None = None,
         member_context: MemberContext | None = None,
+        fork: ForkLineage | None = None,
     ) -> AgentInputs:
         """``workspace_id`` is the one whose folder the turn runs in;
         ``acting_for`` the thread's, when that is another (Home's turn in its
-        stand-in)."""
+        stand-in). ``fork`` is the thread's lineage, which the caller read
+        with its row."""
         from dataclasses import replace
 
         from src.server.services.egress.direct_tools import direct_tools_for_turn
+        from src.server.services.forks.start import ThreadStart
         from src.server.services.livefs.history_files import private_thread_history
         from src.server.services.trading_rule import with_trading_rule
         from src.server.services.workspace_layout import resolve_project_context
@@ -198,6 +206,22 @@ class AgentInputs:
         from src.dalton.watchlist.privacy import is_thread_shared
 
         thread_is_shared = True if identity.shared else await is_thread_shared(thread_id)
+        borrowed = ThreadStart.of(fork).borrowed
+        # DALTON-HOOK(personal-integrations): personal-integration threads are excluded from the shared computer mount, so request creator-verified ThreadHistory only for shared workspaces or personal-integration threads
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        needs_private_history = bool(
+            thread_id
+            and (
+                identity.shared
+                or (
+                    bool(identity.sender)
+                    and await is_thread_personal_private(thread_id)
+                )
+            )
+        )
         return cls(
             identity=identity,
             # DALTON-HOOK(colleague-dispatch): store workspace owner identity
@@ -219,10 +243,12 @@ class AgentInputs:
                     project.dir_name if project is not None else None,
                     thread_id,
                     identity.sender,
+                    tuple(files.thread_id for files in borrowed),
                 )
-                if identity.shared and thread_id
+                if needs_private_history
                 else None
             ),
+            transcript_borrowed=borrowed,
             member_context=member_context,
             thread_is_shared=thread_is_shared,
         )
@@ -247,6 +273,7 @@ class AgentInputs:
             "role": self.role,
             "claude_code_launcher": self.claude_code_launcher,
             "thread_history": self.thread_history,
+            "transcript_borrowed": self.transcript_borrowed,
             "member_context": self.member_context,
         }
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to graph build

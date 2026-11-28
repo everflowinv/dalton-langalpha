@@ -172,6 +172,7 @@ resolve_runtime_context
 
 GUIDEPOINT_ENV_PATH="${GUIDEPOINT_ENV_FILE:-${DATA_ROOT}/config/guidepoint_mcp.env}"
 GUIDEPOINT_TOKENS_PATH="${GUIDEPOINT_TOKENS_FILE:-${DATA_ROOT}/config/guidepoint_mcp_tokens.json}"
+GUIDEPOINT_OWNERSHIP_PATH="${DALTON_GUIDEPOINT_OWNERSHIP_FILE:-${REPO_ROOT}/var/dalton/cutover-snapshots/research-host/handoff-journal.json}"
 WATCHDOG_STATE_FILE="${ALPHAENGINE_WATCHDOG_STATE_FILE:-${DATA_ROOT}/state/alphaengine-desktop-watchdog.json}"
 ALPHAENGINE_DOWNLOADS_DIR="${DATA_ROOT}/temp/alphaengine-mcp-downloads"
 
@@ -252,53 +253,27 @@ render_plist_template() {
   local dest_path="$2"
   local helper_py
   helper_py="$(resolve_helper_python)"
-  local tmp_path="${dest_path}.tmp.$$"
-  TMP_ARTIFACTS+=("${tmp_path}")
-  if ! "${helper_py}" - "${template_path}" "${tmp_path}" \
-    "${REPO_ROOT}" "${HOME}" "${LOGS_DIR}" "${RUNTIME_ENV_KEY}" "${RUNTIME_ENV_VAL}" \
-    "${NODE_BIN}" "${PYTHON_BIN}" "${GUIDEPOINT_ENV_PATH}" "${GUIDEPOINT_TOKENS_PATH}" <<'PY'
-import sys
-from xml.sax.saxutils import escape
-
-(
-    tpl_path,
-    out_path,
-    repo,
-    home,
-    log_dir,
-    rt_key,
-    rt_val,
-    node_bin,
-    py_bin,
-    gp_env,
-    gp_tokens,
-) = sys.argv[1:12]
-
-with open(tpl_path, "r", encoding="utf-8") as f:
-    text = f.read()
-
-replacements = {
-    "__REPO__": escape(repo),
-    "__HOME__": escape(home),
-    "__LOG_DIR__": escape(log_dir),
-    "__RUNTIME_ENV_KEY__": escape(rt_key),
-    "__RUNTIME_ENV_VAL__": escape(rt_val),
-    "__NODE_BIN__": escape(node_bin),
-    "__PYTHON_BIN__": escape(py_bin),
-    "__GUIDEPOINT_ENV_FILE__": escape(gp_env),
-    "__GUIDEPOINT_TOKENS_FILE__": escape(gp_tokens),
-}
-for k, v in replacements.items():
-    text = text.replace(k, v)
-
-with open(out_path, "w", encoding="utf-8") as f:
-    f.write(text)
-PY
+  local bse_py="${SCRIPT_DIR}/../bridge_subprocess_env.py"
+  if [[ ! -f "${bse_py}" ]]; then
+    bse_py="${REPO_ROOT}/scripts/dalton/bridge_subprocess_env.py"
+  fi
+  if ! PYTHONDONTWRITEBYTECODE=1 "${helper_py}" -B "${bse_py}" render-host-service-plist \
+    --template "${template_path}" \
+    --dest "${dest_path}" \
+    --repo-root "${REPO_ROOT}" \
+    --home "${HOME}" \
+    --logs-dir "${LOGS_DIR}" \
+    --runtime-env-key "${RUNTIME_ENV_KEY}" \
+    --runtime-env-val "${RUNTIME_ENV_VAL}" \
+    --node-bin "${NODE_BIN}" \
+    --python-bin "${PYTHON_BIN}" \
+    --guidepoint-env "${GUIDEPOINT_ENV_PATH}" \
+    --tokens-file "${GUIDEPOINT_TOKENS_PATH}" \
+    --ownership-file "${GUIDEPOINT_OWNERSHIP_PATH}" >/dev/null
   then
     echo "[error] rendering ${template_path} failed" >&2
     return 1
   fi
-  chmod 0644 "${tmp_path}" && mv -f "${tmp_path}" "${dest_path}" || return 1
 }
 
 resolve_watchdog_state_file_for_plist() {

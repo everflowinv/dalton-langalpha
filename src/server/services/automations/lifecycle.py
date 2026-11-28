@@ -1964,7 +1964,16 @@ async def skip_execution(
         return None
     # settle raises nothing once the row is written, so True is the skip
     # having happened; False needs a read to tell missing from moved on.
-    if not await settle(current, execution_id, Outcome.SKIPPED, skip_reason="user"):
+    # DALTON-HOOK(automation-capacity-retry): allow skipping capacity-held pending, release pre-START claimed signals, and reset thread status atomically on manual skip
+    if not await settle(
+        current,
+        execution_id,
+        Outcome.SKIPPED,
+        skip_reason="user",
+        allow_capacity_pending=True,
+        release_pre_start_signals=True,
+        reset_prestart_thread_status=True,
+    ):
         if await exec_db.get_execution_status(
             execution_id, automation_id=automation_id
         ) is None:

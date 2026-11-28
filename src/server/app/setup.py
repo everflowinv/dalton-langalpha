@@ -173,6 +173,8 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Copies what Home's stand-in wrote into Home once Home's computer is
     # back; a per-user advisory lock and a guarded watermark dedup it.
     ("HomeHandbackSweeper", "src.server.services.home_handback"),
+    # DALTON-HOOK(deployment-credentials): scrub legacy dedicated Feishu keys from running sandboxes' vault files.
+    ("SandboxFeishuVaultScrubber", "src.dalton.deployment_credentials.sandbox_scrub"),
 )
 
 
@@ -583,6 +585,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
+        # Tool-table sweep: converges running computers whose tools are behind
+        # the server's table, which always-on computers' warm sessions would
+        # otherwise never reach. Needs the ComputerManager, as above.
+        try:
+            from src.server.services.toolset_sweep import ToolsetSweeper
+
+            ToolsetSweeper.get_instance().start()
+        except Exception as e:
+            logger.warning(f"Failed to start ToolsetSweeper: {e}")
+
         # Initialize PTC Agent checkpointer for state persistence
         from src.server.utils.checkpointer import (
             get_checkpointer,
@@ -789,6 +801,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # diagnostics must never block startup
         logger.warning(f"Failed to start RedisDiagnosticsService: {e}")
 
+    # DALTON-HOOK(dalton-notify): start periodic durable failure-notice sweeper (PG SKIP LOCKED across workers)
+    try:
+        from src.dalton.notify.failure_receipts import FailureNoticeSweeper
+
+        FailureNoticeSweeper.get_instance().start()
+    except Exception as e:
+        logger.warning(f"Failed to start FailureNoticeSweeper: {e}")
+
     # Start MarketDataFeed (shared upstream WS to ginlix-data)
     try:
         from src.server.services.market_data_feed import (
@@ -989,6 +1009,12 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-watchlist-reconcile",
         )
 
+    # DALTON-HOOK(personal-integrations): start personal integration purge-resume, revoke-retry, and 12h health-sweep loops
+    from src.dalton.services.integration_background import run_integration_health_sweep_loop, run_integration_revoke_retry_loop, run_personal_purge_resume_loop
+    _dalton_personal_purge_resume_task = asyncio.create_task(run_personal_purge_resume_loop(), name="dalton-personal-purge-resume") if is_dalton_enabled() else None
+    _dalton_integration_revoke_retry_task = asyncio.create_task(run_integration_revoke_retry_loop(), name="dalton-integration-revoke-retry") if is_dalton_enabled() else None
+    _dalton_integration_health_sweep_task = asyncio.create_task(run_integration_health_sweep_loop(), name="dalton-integration-health-sweep") if is_dalton_enabled() else None
+
     # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
     from src.dalton.services.transcriptions import (
         is_transcription_reconciliation_enabled,
@@ -1084,6 +1110,10 @@ async def lifespan(app: FastAPI):
         _dalton_watchlist_reconcile_startup_task.cancel()
         await asyncio.gather(_dalton_watchlist_reconcile_startup_task, return_exceptions=True)
         _dalton_watchlist_reconcile_startup_task = None
+    # DALTON-HOOK(personal-integrations): cancel personal integration background tasks on shutdown
+    for _t in (_dalton_personal_purge_resume_task, _dalton_integration_revoke_retry_task, _dalton_integration_health_sweep_task):
+        if _t is not None: _t.cancel()
+    await asyncio.gather(*[t for t in (_dalton_personal_purge_resume_task, _dalton_integration_revoke_retry_task, _dalton_integration_health_sweep_task) if t is not None], return_exceptions=True)
     # DALTON-HOOK(transcriptions-reconcile): cancel periodic ASR reconciliation task on shutdown
     if _dalton_transcription_reconcile_task is not None:
         _dalton_transcription_reconcile_task.cancel()
@@ -1141,6 +1171,13 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Error stopping PlatformSecretSweeper: {e}")
 
     try:
+        from src.server.services.toolset_sweep import ToolsetSweeper
+
+        await ToolsetSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error stopping ToolsetSweeper: {e}")
+
+    try:
         from src.server.services.egress.relay import close_relay_client
 
         await close_relay_client()
@@ -1169,6 +1206,14 @@ async def lifespan(app: FastAPI):
             await _background_singleton(name, module).stop()
         except Exception as e:
             logger.warning(f"Error stopping {name}: {e}")
+
+    # DALTON-HOOK(dalton-notify): stop periodic durable failure-notice sweeper
+    try:
+        from src.dalton.notify.failure_receipts import FailureNoticeSweeper
+
+        await FailureNoticeSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error stopping FailureNoticeSweeper: {e}")
 
     # DALTON-HOOK(redis-write-diag): stop per-worker Redis diagnostics & release PG leader lock
     try:

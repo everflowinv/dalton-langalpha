@@ -6,8 +6,10 @@ arbitrary command, URL, credential input, network listener or shell expansion.
 """
 import json
 import base64
+import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import data_gateway
@@ -87,14 +89,26 @@ def call_tool(name, args):
         reg = data_gateway.catalog()
         return {"ok": True, **reg, "routes": [r for r in reg['routes']
                 if not args.get('category') or r['category'] == args['category']]}
+    req_timeout = float(args.get('timeout', 180))
+    raw_deadline_ms = os.environ.get('DALTON_REQUEST_DEADLINE_EPOCH_MS', '').strip()
+    eff_timeout_s = req_timeout
+    if raw_deadline_ms:
+        try:
+            deadline_rem_s = max(0.1, (int(raw_deadline_ms) / 1000.0) - time.time())
+            eff_timeout_s = min(req_timeout, deadline_rem_s)
+        except ValueError:
+            eff_timeout_s = req_timeout
     command = [sys.executable, str(ROOT/'scripts/data_gateway.py'), args.get('mode', 'fetch'), args['route']]
-    for key in STRING_FIELDS + ('limit', 'timeout'):
+    for key in STRING_FIELDS + ('limit',):
         if key in args:
             # --key=value keeps a query starting with '-' a value, never an option.
             command.append('--' + key.replace('_', '-') + '=' + str(args[key]))
+    if 'timeout' in args or raw_deadline_ms:
+        cli_timeout = max(1, min(600, int(math.ceil(eff_timeout_s))))
+        command.append('--timeout=' + str(cli_timeout))
     if 'params' in args:
         command.append('--params-json=' + json.dumps(args['params'], ensure_ascii=False))
-    result = data_gateway.execute(command, args.get('timeout', 180) + 10)
+    result = data_gateway.execute(command, eff_timeout_s)
     if 'data' in result:
         return result['data']
     return result

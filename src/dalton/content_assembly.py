@@ -6,6 +6,7 @@ validation so malformed or unclosed markers fail loudly with the file path:
   ``<!-- DALTON_CAP:<expr> -->...<!-- /DALTON_CAP -->``
   ``<!-- DALTON_CAP:<expr> -->...<!-- DALTON_CAP_ELSE -->...<!-- /DALTON_CAP -->``
 - JavaScript (`.js`):
+  ``/* DALTON_INCLUDE:_shared/<file>.js */`` (inlined recursively before capability pruning, confined to ``workflows/_shared/`` with cycle detection)
   ``/* DALTON_CAP:<expr> */.../* /DALTON_CAP */``
   ``/* DALTON_CAP:<expr> */.../* DALTON_CAP_ELSE */.../* /DALTON_CAP */``
 - JSON (`.json`): keeps valid JSON on disk; applies structured capability pruning for
@@ -58,16 +59,41 @@ _JS_TOKEN_RE = re.compile(
     r"/\*\s*(?P<kind>/DALTON_CAP|DALTON_CAP_ELSE|DALTON_CAP:(?P<expr>.*?))\s*\*/",
     re.DOTALL,
 )
+_JS_INCLUDE_RE = re.compile(
+    r"/\*\s*DALTON_INCLUDE:(?P<target>.*?)\s*\*/",
+    re.DOTALL,
+)
 
 # Detect stray/malformed marker prefixes that failed to match a valid token
 # (e.g., missing closing `-->` / `*/`, or wrong spacing/casing).
 _STRAY_MARKER_RE = re.compile(r"(?:/?DALTON_CAP(?:_ELSE|:)?)", re.IGNORECASE)
+_STRAY_INCLUDE_RE = re.compile(r"DALTON_INCLUDE", re.IGNORECASE)
+
+_DEFAULT_WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "workflows"
+
+# Strip developer-only DALTON hook HTML comments from assembled markdown so they never reach the model.
+_DALTON_HOOK_HTML_COMMENT_RE = re.compile(
+    r"<!--\s*DALTON-" r"HOOK\([^)]*\)[\s\S]*?-->\n?"
+)
 
 _ASSEMBLED_TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {".md", ".mdx", ".txt", ".js", ".json", ".yaml", ".yml"}
 )
 
-_VALID_CAPABILITY_VALUES: str = ", ".join(sorted(c.value for c in CapabilityId))
+
+def _is_artifact_comments_enabled() -> bool:
+    from src.dalton.settings import is_artifact_publishing_enabled
+
+    return bool(is_artifact_publishing_enabled())
+
+
+_RUNTIME_SWITCH_EVALUATORS: dict[str, Any] = {
+    "artifact_comments": _is_artifact_comments_enabled,
+}
+
+_VALID_CAPABILITY_VALUES: str = ", ".join(
+    sorted([*(c.value for c in CapabilityId), *_RUNTIME_SWITCH_EVALUATORS.keys()])
+)
 
 
 def _format_loc(path: Path | str | None, text: str | None = None, pos: int | None = None) -> str:
@@ -123,14 +149,17 @@ def evaluate_capability_expr(
                 raise ContentAssemblyError(
                     f"{loc}: invalid DALTON_CAP expression {expr!r} (misplaced '!')"
                 )
-            try:
-                cap = CapabilityId(cap_name)
-            except ValueError as exc:
-                raise ContentAssemblyError(
-                    f"{loc}: unknown capability {cap_name!r} in DALTON_CAP expression {expr!r} "
-                    f"(valid: {_VALID_CAPABILITY_VALUES})"
-                ) from exc
-            present = cap in active_caps
+            if cap_name in _RUNTIME_SWITCH_EVALUATORS:
+                present = bool(_RUNTIME_SWITCH_EVALUATORS[cap_name]())
+            else:
+                try:
+                    cap = CapabilityId(cap_name)
+                except ValueError as exc:
+                    raise ContentAssemblyError(
+                        f"{loc}: unknown capability {cap_name!r} in DALTON_CAP expression {expr!r} "
+                        f"(valid: {_VALID_CAPABILITY_VALUES})"
+                    ) from exc
+                present = cap in active_caps
             if negate:
                 present = not present
             if not present:
@@ -249,6 +278,167 @@ _PROPRIETARY_RESEARCH_CAPS: tuple[CapabilityId, ...] = (
 )
 
 
+_LANGALPHA_DOC_DRIVE_BULLET_RE = re.compile(
+    r"^- \*\*The Drive\*\*,[^\n]*\.agents/skills/langalpha-doc/references/drive\.md`\.\n?",
+    re.MULTILINE,
+)
+_LANGALPHA_DOC_BROKERAGES_SECTION_RE = re.compile(
+    r"\n## Brokerages\n.*?(?=\n## )",
+    re.DOTALL,
+)
+
+
+def _assemble_langalpha_doc_markdown(text: str, path_str: str) -> str:
+    """Prune Dalton-disabled feature guidance from ``langalpha-doc`` skill pages at assembly time."""
+    if "langalpha-doc/" not in path_str:
+        return text
+
+    from src.config.features import system_flag
+    from src.dalton.settings import is_computer_cli_tokens_enabled, is_dalton_enabled
+
+    dalton_on = is_dalton_enabled()
+    trading_enabled = not dalton_on
+    cli_tokens_enabled = (not dalton_on) or is_computer_cli_tokens_enabled()
+    drive_enabled = bool(system_flag("drive").enabled)
+    scratchpad_enabled = bool(system_flag("scratchpad").enabled)
+
+    out = text
+    if path_str.endswith("langalpha-doc/SKILL.md"):
+        if not trading_enabled:
+            out = out.replace(
+                "MCP servers, brokerages or plugins",
+                "MCP servers or plugins",
+            )
+            out = out.replace(
+                "MCP server, brokerage connection or plugin",
+                "MCP server or plugin",
+            )
+        if not drive_enabled:
+            out = _LANGALPHA_DOC_DRIVE_BULLET_RE.sub("", out)
+        return out
+
+    if path_str.endswith("langalpha-doc/references/skills.md"):
+        if not cli_tokens_enabled:
+            out = out.replace(
+                "Two steps add a skill: put its folder at `.agents/skills/<name>/`, "
+                "then run `la skills save <name>`. The folder comes one of three ways:",
+                "Put the skill folder at `.agents/skills/<name>/`. "
+                "The folder comes one of three ways:",
+            )
+            out = out.replace(
+                "removed by the next save, the command's included.",
+                "removed by the next save.",
+            )
+            out = out.replace(
+                "- Run `la skills save <name>` after you add a skill and after every change "
+                "to one, `npx skills update` included, once for each skill. It prints "
+                "`Saved <name>`, `<name> is already saved as it stands`, or "
+                "`Not saved: <reason>` with a non-zero exit; fix what the reason names "
+                "and run it again.\n",
+                "",
+            )
+            out = out.replace(
+                "- Saves also run without the command: when a turn completes, when the "
+                "computer next starts, and when the user changes this workspace's skills. "
+                "Such a save refuses a folder without a message, so the command is how "
+                "you know a skill was saved.",
+                "- Saves run automatically when a turn completes, when the computer next "
+                "starts, and when the user changes this workspace's skills. Such a save "
+                "refuses a folder without a message, so check the rules above before finishing.",
+            )
+        return out
+
+    if path_str.endswith("langalpha-doc/references/plugins.md"):
+        if not trading_enabled:
+            out = out.replace(
+                "# MCP Servers, Brokerages, Secrets and Plugins",
+                "# MCP Servers, Secrets and Plugins",
+            )
+            out = out.replace(
+                "Packages, Brokerages, Connectors, Skills and Secrets",
+                "Packages, Connectors, Skills and Secrets",
+            )
+            out = out.replace(
+                ", tool settings or order approvals.",
+                " or tool settings.",
+            )
+            out = _LANGALPHA_DOC_BROKERAGES_SECTION_RE.sub("", out)
+        return out
+
+    if path_str.endswith("langalpha-doc/references/drive.md"):
+        if not drive_enabled:
+            # Keep only the Dalton admin-enablement intro; omit operational Drive & `la drive` CLI sections.
+            if "\n## What it is\n" in out:
+                out = out.split("\n## What it is\n", 1)[0].rstrip() + "\n"
+            return out
+        if not cli_tokens_enabled:
+            out = out.replace(
+                "| A machine the user brought | yes | refused; use `la drive` |",
+                "| A machine the user brought | yes | refused |",
+            )
+            out = out.replace(
+                '- The same on any computer: `la drive put task/model.xlsx models/model.xlsx`, '
+                'or a folder: `la drive put task/data datasets/q3` sends every file under it. '
+                '`la drive` takes paths as they sit inside `personal/`. Add `--note "why"` to '
+                "record the reason in the file's history. If `put` is interrupted, run the same "
+                "command again; it continues from what the Drive already holds.\n",
+                "",
+            )
+            out = out.replace(
+                " `la drive usage` shows what the Drive counts against its allowance. "
+                "Only the user clears earlier versions: `la drive history clear` is refused from a computer.",
+                " Only the user clears earlier versions.",
+            )
+            out = out.replace(
+                " Where Bash does not reach the Drive, copy it out with "
+                "`la drive get models/model.xlsx -o task/model.xlsx`; run it again "
+                "to continue an interrupted download.",
+                "",
+            )
+            out = out.replace(
+                " `la drive history <path>` says what a file keeps.",
+                "",
+            )
+            out = out.replace(
+                "- `la drive history <path>` lists a file's versions; "
+                "`la drive restore <path> --rev N` makes an older one current, as a new version.\n",
+                "",
+            )
+            out = out.replace(
+                "Use `mv` and `rm` where Bash reaches the Drive, else "
+                "`la drive mv <from> <to>` and `la drive rm <path>`.",
+                "Use `mv` and `rm` where Bash reaches the Drive.",
+            )
+            out = out.replace(
+                ": `la drive trash` lists it and `la drive trash restore <id>` puts an item back",
+                "",
+            )
+        return out
+
+    if path_str.endswith("langalpha-doc/references/files.md"):
+        if not scratchpad_enabled:
+            out = out.replace(
+                ".agents/scratchpad/<thread>/        a thread's temporary files and "
+                "checkpoint notes; deleted when the thread is archived\n",
+                "",
+            )
+            out = out.replace(
+                "(`threads/`, `transcripts/`, `large_tool_results/`, `scratchpad/`)",
+                "(`threads/`, `transcripts/`, `large_tool_results/`)",
+            )
+        return out
+
+    if path_str.endswith("langalpha-doc/references/history.md"):
+        if not scratchpad_enabled:
+            out = out.replace(
+                "`.agents/large_tool_results/`, `.agents/scratchpad/` and `.agents/tmp/`",
+                "`.agents/large_tool_results/` and `.agents/tmp/`",
+            )
+        return out
+
+    return out
+
+
 def assemble_markdown_text(
     text: str,
     *,
@@ -258,6 +448,10 @@ def assemble_markdown_text(
     """Assemble Markdown/text content with ``<!-- DALTON_CAP:... -->`` blocks."""
     active_caps = effective_capabilities() if capabilities is None else capabilities
     out = _assemble_stacked(text, _HTML_TOKEN_RE, active_caps, path=path)
+    if "<!--" in out:
+        out = _DALTON_HOOK_HTML_COMMENT_RE.sub("", out)
+    if path is not None:
+        out = _assemble_langalpha_doc_markdown(out, Path(path).as_posix())
     if not any(cap in active_caps for cap in _PROPRIETARY_RESEARCH_CAPS):
         if "、内部研究库与卖方增量" in out:
             out = out.replace("、内部研究库与卖方增量", "、公开市场新闻与卖方动态")
@@ -274,15 +468,116 @@ def assemble_markdown_text(
     return out
 
 
+def _resolve_workflows_root(path: Path | str | None) -> Path:
+    """Resolve the ``workflows/`` root directory for JS ``DALTON_INCLUDE`` targets."""
+    if path is not None:
+        p = Path(path)
+        candidates = (p.resolve(),) if p.is_absolute() or p.exists() else (p,)
+        for cand in candidates:
+            for parent in cand.parents:
+                if (parent / "_shared").is_dir() or parent.name == "workflows":
+                    return parent
+    return _DEFAULT_WORKFLOWS_DIR
+
+
+def _check_stray_include(
+    chunk: str, chunk_start: int, full_text: str, path: Path | str | None
+) -> None:
+    m = _STRAY_INCLUDE_RE.search(chunk)
+    if m is not None:
+        loc = _format_loc(path, full_text, chunk_start + m.start())
+        snippet = chunk[max(0, m.start() - 8) : min(len(chunk), m.end() + 24)].strip()
+        raise ContentAssemblyError(
+            f"{loc}: malformed or unclosed DALTON_INCLUDE marker near {snippet!r}"
+        )
+
+
+def _expand_js_includes(
+    text: str,
+    *,
+    path: Path | str | None = None,
+    workflows_root: Path | None = None,
+    _stack: tuple[Path, ...] = (),
+) -> str:
+    """Recursively inline ``/* DALTON_INCLUDE:_shared/*.js */`` fragments before capability pruning."""
+    if "DALTON_INCLUDE" not in text and "dalton_include" not in text.lower():
+        return text
+
+    wf_root = (workflows_root or _resolve_workflows_root(path)).resolve()
+    shared_root = (wf_root / "_shared").resolve()
+    current_stack = _stack
+    if not current_stack and path is not None:
+        p = Path(path)
+        if p.exists():
+            current_stack = (p.resolve(),)
+
+    out_parts: list[str] = []
+    cursor = 0
+    for match in _JS_INCLUDE_RE.finditer(text):
+        start, end = match.span()
+        between = text[cursor:start]
+        if between:
+            _check_stray_include(between, cursor, text, path)
+            out_parts.append(between)
+
+        loc = _format_loc(path, text, start)
+        target = (match.group("target") or "").strip()
+        if (
+            not target
+            or "\\" in target
+            or "\x00" in target
+            or target.startswith("/")
+            or ".." in Path(target).parts
+            or not target.startswith("_shared/")
+            or not target.endswith(".js")
+        ):
+            raise ContentAssemblyError(
+                f"{loc}: invalid DALTON_INCLUDE target {target!r} "
+                "(must be a relative path under _shared/*.js)"
+            )
+        inc_path = (wf_root / target).resolve()
+        if not inc_path.is_relative_to(shared_root) or inc_path.suffix.lower() != ".js":
+            raise ContentAssemblyError(
+                f"{loc}: DALTON_INCLUDE target escapes workflows/_shared/: {target!r}"
+            )
+        if not inc_path.is_file():
+            raise ContentAssemblyError(
+                f"{loc}: DALTON_INCLUDE target not found: {target!r} ({inc_path})"
+            )
+        if inc_path in current_stack:
+            chain = " -> ".join(p.name for p in (*current_stack, inc_path))
+            raise ContentAssemblyError(
+                f"{loc}: circular DALTON_INCLUDE detected ({chain})"
+            )
+
+        raw_inc = inc_path.read_text(encoding="utf-8")
+        expanded_inc = _expand_js_includes(
+            raw_inc,
+            path=inc_path,
+            workflows_root=wf_root,
+            _stack=(*current_stack, inc_path),
+        )
+        out_parts.append(expanded_inc)
+        cursor = end
+
+    tail = text[cursor:]
+    if tail:
+        _check_stray_include(tail, cursor, text, path)
+        out_parts.append(tail)
+
+    return "".join(out_parts)
+
+
 def assemble_js_text(
     text: str,
     *,
     path: Path | str | None = None,
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
-    """Assemble JavaScript workflow content with ``/* DALTON_CAP:... */`` blocks."""
+    """Assemble JavaScript workflow content: expand ``DALTON_INCLUDE`` then prune ``DALTON_CAP``."""
     active_caps = effective_capabilities() if capabilities is None else capabilities
-    return _assemble_stacked(text, _JS_TOKEN_RE, active_caps, path=path)
+    expanded = _expand_js_includes(text, path=path)
+    return _assemble_stacked(expanded, _JS_TOKEN_RE, active_caps, path=path)
 
 
 def assemble_json_text(

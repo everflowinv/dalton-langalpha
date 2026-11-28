@@ -180,16 +180,16 @@ async def turns_to_index(
     return sources, read_at
 
 
-async def write_turns(
-    thread_id: str, rows: Sequence[IndexedTurn], *, read_at: datetime | None
-) -> int:
+async def write_turns(thread_id: str, rows: Sequence[IndexedTurn], *, read_at: datetime | None, expected_purge_gen: int | None = None) -> int:  # DALTON-HOOK(personal-integrations)
     """Write each turn's row from its response, read at ``read_at``, unless
     the response is no longer the turn's current one or the row holds a read
     as new. Returns the rows written or changed."""
     thread_id = normalize_uuid(thread_id)
     if thread_id is None or not rows or read_at is None:
         return 0
-    async with pool.get_db_connection() as conn:
+    async with pool.get_db_connection() as conn, conn.transaction():  # DALTON-HOOK(personal-integrations)
+        from src.dalton.services.purge_fence import check_writeback_fence_tx
+        if not await check_writeback_fence_tx(conn, thread_id, expected_purge_gen, label="search_write_turns"): return 0
         async with conn.cursor() as cur:
             await cur.execute(
                 f"""

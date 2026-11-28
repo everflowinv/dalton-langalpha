@@ -269,4 +269,82 @@ describe('Settings sections & search capability gating', () => {
       expect(settingSearchText(notifyEntry!, tZh, ctx).toLowerCase()).not.toContain('微信');
     }
   });
+
+  // DALTON-HOOK(personal-integrations): verify Integrations section & search visibility for single personal capability or historical connections
+  it('shows Integrations section and personal integrations search entry on single personal capability or historical connections', () => {
+    // Core with all personal & channel capabilities off and no historical connections -> hidden
+    expect(sectionShown('integrations', coreAdminCtx)).toBe(false);
+    expect(
+      searchableSettings(false, coreAdminCtx).some((e) => e.anchor === 'dalton-personal-integrations'),
+    ).toBe(false);
+
+    // Core with single google_calendar capability enabled -> visible
+    const gcalOnlyCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      capabilities: new Set<CapabilityId>(['company_wiki', 'google_calendar']),
+    };
+    expect(sectionShown('integrations', gcalOnlyCtx)).toBe(true);
+    expect(
+      searchableSettings(false, gcalOnlyCtx).some((e) => e.anchor === 'dalton-personal-integrations'),
+    ).toBe(true);
+
+    // Core with all capabilities off but historical personal connections present -> visible for disconnect/cleanup
+    const historicalCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      hasPersonalIntegrations: true,
+    };
+    expect(sectionShown('integrations', historicalCtx)).toBe(true);
+    expect(
+      searchableSettings(false, historicalCtx).some(
+        (e) => e.anchor === 'dalton-personal-integrations',
+      ),
+    ).toBe(true);
+  });
+
+  it('gates deploymentCredentials by admin tier in multi-user mode, allows OSS static view, and keeps Core search neutral', () => {
+    // Multi-user admin sees deploymentCredentials
+    expect(sectionShown('deploymentCredentials', coreAdminCtx)).toBe(true);
+
+    // Multi-user non-admin (internal / external / null) cannot see deploymentCredentials
+    for (const tier of ['internal', 'external', null] as const) {
+      const nonAdminCtx: DaltonSettingVisibilityContext = {
+        ...coreAdminCtx,
+        callerTier: tier,
+        isSingleUserOss: false,
+      };
+      expect(sectionShown('deploymentCredentials', nonAdminCtx)).toBe(false);
+      const anchors = new Set(searchableSettings(false, nonAdminCtx).map((e) => e.anchor));
+      expect(anchors.has('dalton-deployment-credentials')).toBe(false);
+    }
+
+    // Passwordless OSS single-user mode allows opening the static guidance view even with null callerTier
+    const ossCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      callerTier: null,
+      isSingleUserOss: true,
+    };
+    expect(sectionShown('deploymentCredentials', ossCtx)).toBe(true);
+
+    // Core default search text for dalton-deployment-credentials omits proprietary channel terms
+    const coreEntries = searchableSettings(false, coreAdminCtx);
+    const credEntry = coreEntries.find((e) => e.anchor === 'dalton-deployment-credentials');
+    expect(credEntry).toBeDefined();
+    const coreCredText = settingSearchText(credEntry!, tZh, coreAdminCtx).toLowerCase();
+    expect(coreCredText).toContain('google');
+    expect(coreCredText).toContain('集成凭据');
+    for (const forbidden of ['飞书', 'feishu', '微信', 'weixin', 'wechat', 'discord', 'everflow']) {
+      expect(coreCredText).not.toContain(forbidden);
+    }
+
+    // Enabling channel_feishu dynamically appends Feishu search tokens without Discord/WeChat
+    const feishuCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      capabilities: new Set<CapabilityId>(['company_wiki', 'channel_feishu']),
+    };
+    const feishuCredText = settingSearchText(credEntry!, tZh, feishuCtx).toLowerCase();
+    expect(feishuCredText).toContain('飞书');
+    expect(feishuCredText).toContain('feishu');
+    expect(feishuCredText).not.toContain('discord');
+    expect(feishuCredText).not.toContain('微信');
+  });
 });

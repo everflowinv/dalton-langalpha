@@ -260,7 +260,13 @@ async def execute_wakeup(job: dict) -> None:
     if isinstance(ids, list) and ids:
         wake.riders = await riders_db.wakeup_jobs([str(i) for i in ids])
 
-    exit_ = await _deliver(wake)
+    try:
+        exit_ = await _deliver(wake)
+    except Exception as exc:
+        # DALTON-HOOK(maintenance-gate): release gathered wakeup riders when maintenance pauses delivery
+        from src.dalton.maintenance_gate import release_riders_if_maintenance_paused
+        await release_riders_if_maintenance_paused(exc, lambda: _release_riders(wake))
+        raise
     if exit_ == "release":
         await _release_riders(wake)
     elif exit_ == "parked" and wake.riders:
@@ -385,9 +391,10 @@ async def _deliver(wake: _Wake) -> _Exit:
     # Out of retries: this claim is the one more look a held job's release
     # bought it, or the last of its backoff, so a refusal holds it again
     # rather than starting another round.
+    # DALTON-HOOK(maintenance-gate): count maintenance reschedules out of wakeup retry budget via effective_attempts()
     spent = not plan_held and (
         bool(wake.payload.get("exhausted"))
-        or attempts - int(wake.payload.get("waited") or 0) >= MAX_ATTEMPTS
+        or outbox_db.effective_attempts(attempts, wake.payload) >= MAX_ATTEMPTS
     )
 
     for _ in range(_MAX_ROUNDS):
@@ -431,6 +438,13 @@ async def _deliver(wake: _Wake) -> _Exit:
             "wakeup": {"v": 1, "notices": notices},
             "request_key": request_key(job_id),
         }
+
+        # DALTON-HOOK(maintenance-gate): hold wakeup delivery for retry while maintenance admission is paused
+        from src.dalton.maintenance_gate import enforce_maintenance_admission_for_wakeup
+
+        await enforce_maintenance_admission_for_wakeup(
+            str(thread["workspace_id"]), release_riders=lambda: _release_riders(wake)
+        )
 
         outcome, run_id = await post_notification_turn(
             thread_id=thread_id,

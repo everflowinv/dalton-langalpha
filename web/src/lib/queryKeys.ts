@@ -126,9 +126,13 @@ export const queryKeys = {
     // tab may have asked by another spelling of it.
     pathsIn:     (wsId: string) => [...queryKeys.artifacts.allByPath, wsId],
     byPath:      (wsId: string, path: string) => [...queryKeys.artifacts.pathsIn(wsId), path],
+    // A chart's record, among its workspace's reads so its events reach it. An
+    // object, so no file's path can spell the same key.
+    byChart:     (wsId: string, chart: string) => [...queryKeys.artifacts.pathsIn(wsId), { chart }],
     // The owner's get-or-create of a file's record. Beside the reads by path,
     // not under them, so an event that reads those again never makes one.
     ensured:     (wsId: string, path: string) => [...queryKeys.artifacts.all, 'ensured', wsId, path],
+    ensuredChart: (wsId: string, chart: string) => [...queryKeys.artifacts.all, 'ensured', wsId, { chart }],
     allDetails:  ['artifacts', 'detail'],
     detail:      (artifactId: string) => [...queryKeys.artifacts.allDetails, artifactId],
     versions:    (artifactId: string) => [...queryKeys.artifacts.all, 'versions', artifactId],
@@ -233,6 +237,11 @@ export const queryKeys = {
     recentAll:   () => [...queryKeys.threads.all, 'recent'],
     recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
+    // How many forks borrow the thread's history, read when its delete dialog opens.
+    forkCount:   (threadId: string) => [...queryKeys.threads.all, 'fork-count', threadId],
+    // The mutation that makes a fork, which the button, the sidebar's pending
+    // row and every other fork button read while it runs.
+    fork:        () => [...queryKeys.threads.all, 'fork'],
     // The search across every thread (the command palette). Under the prefix,
     // so a rename, archive or delete rereads the results already on screen.
     searchAll:   () => [...queryKeys.threads.all, 'search'],
@@ -339,6 +348,8 @@ export const queryKeys = {
   chartLayers: {
     all:      ['chartLayers'],
     bySymbol: (workspaceId: string, symbol: string) => [...queryKeys.chartLayers.all, workspaceId, symbol],
+    // Held by a chart whose workspace is not known yet; never fetched.
+    none:     () => [...queryKeys.chartLayers.all, ''],
   },
   // The brokerage connectors this build ships. Deliberately its own family
   // rather than a child of `mcp`: it is static and user-independent, so the
@@ -495,10 +506,12 @@ export const queryKeys = {
     marketBrief: () => [...queryKeys.insights.all, 'market-brief'],
   },
   // DALTON-HOOK(query-keys): Dalton native-model sync, budget, and coverage board query keys
-  // DALTON-HOOK(standalone-core): runtime capabilities query key
+    // DALTON-HOOK(standalone-core): runtime capabilities query key
+    // DALTON-HOOK(deployment-credentials): deployment-level integration credentials query key
   dalton: {
     all:             ['dalton'],
     capabilities:    () => [...queryKeys.dalton.all, 'capabilities'],
+    deploymentSettings: () => [...queryKeys.dalton.all, 'deployment-settings'],
     nativeModelsStatus: () => [...queryKeys.dalton.all, 'native-models', 'status'],
     providersStatus: () => [...queryKeys.dalton.all, 'providers', 'status'],
     modelsAvailable: () => [...queryKeys.dalton.all, 'models', 'available'],
@@ -572,6 +585,8 @@ export const queryKeys = {
       symbolsKey,
     ],
     watchlistTierPolicies: () => [...queryKeys.dalton.all, 'watchlist', 'tier-policies'],
+    // DALTON-HOOK(personal-integrations): personal calendar & mail OAuth connections and active purges
+    personalIntegrations: () => [...queryKeys.dalton.all, 'personal-integrations'],
   },
   // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, shared documents, and company members
   daltonMonitors: {

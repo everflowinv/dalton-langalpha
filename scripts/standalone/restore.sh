@@ -740,8 +740,22 @@ if (( ${#STALE_ENV_TMPS[@]} > 0 )); then
   rm -f "${STALE_ENV_TMPS[@]}"
 fi
 
-# External PostgreSQL guard using strictly the candidate .env file
-CFG_DB_HOST="$(read_env_file_var "$CANDIDATE_ENV" "DB_HOST" "postgres")"
+# Unified PostgreSQL configuration guard using strictly CANDIDATE_ENV via stdlib resolver
+# (same DB_* > DATABASE_URL rule and conflict check as backend and backup).
+if ! RESTORE_PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config \
+    --env-file "$CANDIDATE_ENV" \
+    --default-host postgres \
+    --check-conflict \
+    --caller restore)"; then
+  exit 1
+fi
+RESTORE_PG_LINES="$(printf '%s' "$RESTORE_PG_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "user", "password", "dbname"):
+    print(d.get(k, ""))
+')"
+CFG_DB_HOST="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '1p')"
 if [[ "$CFG_DB_HOST" != "postgres" ]]; then
   err "External PostgreSQL detected (DB_HOST='${CFG_DB_HOST}'; expected Compose-managed 'postgres')."
   err "restore.sh only manages the Compose-managed PostgreSQL container. For external databases, restore directly with pg_restore."
@@ -761,9 +775,11 @@ validate_db_identifiers() {
 }
 
 # Read all target configuration strictly from CANDIDATE_ENV (never shell environment)
-CFG_DB_USER="$(read_env_file_var "$CANDIDATE_ENV" "DB_USER" "postgres")"
-CFG_DB_PASSWORD="$(read_env_file_var "$CANDIDATE_ENV" "DB_PASSWORD" "postgres")"
-CFG_DB_NAME="$(read_env_file_var "$CANDIDATE_ENV" "DB_NAME" "postgres")"
+CFG_DB_USER="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '2p')"
+CFG_DB_PASSWORD="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '3p')"
+CFG_DB_NAME="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '4p')"
+CFG_DB_USER="${CFG_DB_USER:-postgres}"
+CFG_DB_NAME="${CFG_DB_NAME:-postgres}"
 CFG_DOMAIN="$(read_env_file_var "$CANDIDATE_ENV" "DOMAIN" "localhost")"
 CFG_TLS_MODE="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_TLS_MODE" "loopback")"
 CFG_EDGE_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_PORT" "8088")"
@@ -825,6 +841,7 @@ for key in (
     "DB_USER",
     "DB_PASSWORD",
     "DB_NAME",
+    "DATABASE_URL",
     "DALTON_RESEARCH_HOST_TOKEN",
     "DALTON_RESEARCH_ADMIN_TOKEN",
 ):
@@ -932,6 +949,35 @@ if [[ "$COMPOSE_CFG_RC" -ne 0 ]]; then
   exit 1
 fi
 
+# Re-resolve effective backend PostgreSQL config after Compose interpolation so backup,
+# backend, and restore agree on one exact DB target and reject any DB_* vs DATABASE_URL conflict.
+if ! RESTORE_COMPOSE_PG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config \
+    --env-file "$ENV_FILE" \
+    --compose-config-json "$COMPOSE_CFG_TMP" \
+    --service backend \
+    --default-host postgres \
+    --check-conflict \
+    --caller restore)"; then
+  exit 1
+fi
+RESTORE_COMPOSE_PG_LINES="$(printf '%s' "$RESTORE_COMPOSE_PG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "user", "password", "dbname"):
+    print(d.get(k, ""))
+')"
+CFG_DB_HOST="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '1p')"
+if [[ "$CFG_DB_HOST" != "postgres" && "$CFG_DB_HOST" != "127.0.0.1" && "$CFG_DB_HOST" != "localhost" ]]; then
+  err "External PostgreSQL detected in effective backend Compose config (host='${CFG_DB_HOST}'; expected Compose-managed 'postgres')."
+  exit 1
+fi
+CFG_DB_USER="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '2p')"
+CFG_DB_PASSWORD="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '3p')"
+CFG_DB_NAME="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '4p')"
+CFG_DB_USER="${CFG_DB_USER:-postgres}"
+CFG_DB_NAME="${CFG_DB_NAME:-postgres}"
+validate_db_identifiers "$CFG_DB_USER" "$CFG_DB_NAME"
+
 STORAGE_CHECK_ARGS=(
   python3 "${SCRIPT_DIR}/storage_config.py" check-env
   --compose-config-json "$COMPOSE_CFG_TMP"
@@ -981,6 +1027,11 @@ fi
 # Step 3: Verify entire target PostgreSQL instance and object storage are empty
 # and validate postgres.dump before writing any data.
 info "3/7 Verifying target instance is empty and validating postgres.dump..."
+PERSONAL_INTEGRATIONS_RESET_SQL="${WORK_DIR}/scripts/dalton/sql/personal_integrations_restore_reset.sql"
+if [[ ! -f "$PERSONAL_INTEGRATIONS_RESET_SQL" || ! -r "$PERSONAL_INTEGRATIONS_RESET_SQL" || ! -s "$PERSONAL_INTEGRATIONS_RESET_SQL" ]]; then
+  err "Required personal-integration restore reset SQL is missing, unreadable, or empty: ${PERSONAL_INTEGRATIONS_RESET_SQL}"
+  exit 1
+fi
 if ! service_is_running postgres; then
   compose_cmd up -d postgres
 fi
@@ -1124,9 +1175,13 @@ if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
   MINIO_PREFLIGHT_PY='
 from __future__ import annotations
 import os, sys, time
+from pathlib import Path
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+
+sys.path.insert(0, str(Path("/app")))
+from scripts.standalone.storage_config import configured_minio_init_buckets
 
 def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     for key in (primary, *fallbacks):
@@ -1136,7 +1191,7 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "DALTON_ASR_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
-minio_init_bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "DALTON_ASR_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", "S3_BUCKET_NAME", default="chat-uploads")
+allowed_init_buckets = set(configured_minio_init_buckets(os.environ))
 access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "DALTON_ASR_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID")
 secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY")
 region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "DALTON_ASR_STORAGE_REGION", "STORAGE_REGION", "S3_REGION", default="us-east-1")
@@ -1175,7 +1230,7 @@ if resp is None:
     sys.exit(1)
 
 existing_buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
-unexpected_buckets = [b for b in existing_buckets if b != minio_init_bucket]
+unexpected_buckets = [b for b in existing_buckets if b not in allowed_init_buckets]
 non_empty: list[tuple[str, int]] = []
 for bucket in existing_buckets:
     count = 0
@@ -1270,9 +1325,13 @@ expected_objects = [
     item for item in (manifest.get("objects") or [])
     if item.get("key") != RESTORE_MARKER_KEY
 ]
-manifest_by_pair: dict[tuple[str, str], dict[str, object]] = {
-    (str(item["bucket"]), str(item["key"])): item for item in expected_objects
-}
+manifest_by_pair: dict[tuple[str, str], dict[str, object]] = {}
+for item in expected_objects:
+    pair = (str(item["bucket"]), str(item["key"]).lstrip("/"))
+    if pair in manifest_by_pair:
+        print(f"ERROR: Manifest contains duplicate object {pair!r}", file=sys.stderr)
+        sys.exit(1)
+    manifest_by_pair[pair] = item
 
 source_buckets: set[str] = set(manifest.get("buckets") or [])
 for item in expected_objects:
@@ -1401,7 +1460,13 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as tf:
         if bucket not in source_buckets:
             print(f"ERROR: Archive contains object for undeclared bucket {bucket!r}", file=sys.stderr)
             sys.exit(1)
-        meta = manifest_by_pair.get((bucket, key)) or {}
+        if (bucket, key) not in manifest_by_pair:
+            print(f"ERROR: Archive contains undeclared object {(bucket, key)!r} not present in manifest", file=sys.stderr)
+            sys.exit(1)
+        if (bucket, key) in uploaded_pairs:
+            print(f"ERROR: Archive contains duplicate object {(bucket, key)!r}", file=sys.stderr)
+            sys.exit(1)
+        meta = manifest_by_pair[(bucket, key)]
         content_type = (
             str(meta.get("content_type") or "").strip()
             or str((member.pax_headers or {}).get("DALTON.content_type") or "").strip()
@@ -1410,8 +1475,35 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as tf:
         upload_streaming(bucket, key, fp, member.size, content_type)
         uploaded_pairs.add((bucket, key))
 
-if len(uploaded_pairs) != len(expected_objects):
-    print(f"ERROR: Restored {len(uploaded_pairs)} objects, expected {len(expected_objects)}", file=sys.stderr)
+expected_pairs = set(manifest_by_pair.keys())
+if uploaded_pairs != expected_pairs:
+    missing_up = sorted(expected_pairs - uploaded_pairs)[:10]
+    extra_up = sorted(uploaded_pairs - expected_pairs)[:10]
+    print(
+        f"ERROR: Restored key set mismatch: uploaded={len(uploaded_pairs)}, expected={len(expected_pairs)} "
+        f"(missing_sample={missing_up}, extra_sample={extra_up})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# Post-import bucket listing check: actual key set across all restored buckets must match manifest exactly.
+actual_pairs: set[tuple[str, str]] = set()
+for b in sorted(source_buckets):
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=b):
+        for entry in page.get("Contents") or []:
+            k = str(entry.get("Key") or "")
+            if k and k != RESTORE_MARKER_KEY:
+                actual_pairs.add((b, k))
+
+if actual_pairs != expected_pairs:
+    missing_live = sorted(expected_pairs - actual_pairs)[:10]
+    extra_live = sorted(actual_pairs - expected_pairs)[:10]
+    print(
+        f"ERROR: Post-import object key set mismatch against manifest: "
+        f"actual={len(actual_pairs)}, expected={len(expected_pairs)} "
+        f"(missing_sample={missing_live}, extra_sample={extra_live})",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # Read-back verification: size, SHA-256, and ContentType
@@ -1511,6 +1603,73 @@ ok "Database '${CFG_DB_NAME}' restored."
 info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
+
+# Clear & restore terminal `asr-jobs` volume BEFORE post-restore convergence and BEFORE
+# starting backend or transcription services, so pre-restore directories can never be
+# auto-resumed by `recover_incomplete_jobs`.
+RESTORE_HAS_TRANSCRIPTION=0
+RESTORE_ASR_VOLUME="${COMPOSE_PROJECT}_dalton-asr-jobs"
+if compose_cmd --profile transcription config --services 2>/dev/null | grep -qx "transcription"; then
+  RESTORE_HAS_TRANSCRIPTION=1
+  RESTORE_ASR_CFG_JSON="$(compose_cmd --profile transcription config --format json 2>/dev/null || true)"
+  if [[ -n "$RESTORE_ASR_CFG_JSON" ]]; then
+    RESOLVED_RESTORE_ASR_VOL="$(printf '%s' "$RESTORE_ASR_CFG_JSON" | python3 -c '
+import json, sys
+cfg = json.load(sys.stdin)
+vol = (cfg.get("volumes") or {}).get("dalton-asr-jobs") or {}
+print(str(vol.get("name") or ""))
+' 2>/dev/null || true)"
+    if [[ -n "$RESOLVED_RESTORE_ASR_VOL" ]]; then
+      RESTORE_ASR_VOLUME="$RESOLVED_RESTORE_ASR_VOL"
+    fi
+  fi
+  if [[ -f "${BACKUP_DIR}/asr-jobs.tar.gz" ]]; then
+    info "Restoring terminal ASR jobs archive into /var/lib/dalton/asr_jobs..."
+    if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
+        -c 'set -e; mkdir -p /var/lib/dalton/asr_jobs; find /var/lib/dalton/asr_jobs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; if [ -n "$(ls -A /var/lib/dalton/asr_jobs)" ]; then echo "ERROR: /var/lib/dalton/asr_jobs is not empty after clearing" >&2; exit 1; fi; tar -xzf - -C /var/lib/dalton/asr_jobs' \
+        < "${BACKUP_DIR}/asr-jobs.tar.gz"; then
+      err "Failed to clear and extract terminal ASR jobs from ${BACKUP_DIR}/asr-jobs.tar.gz; refusing to start services."
+      exit 1
+    fi
+    ok "Terminal ASR jobs archive restored into /var/lib/dalton/asr_jobs."
+  else
+    info "Clearing /var/lib/dalton/asr_jobs volume (no asr-jobs.tar.gz in backup)..."
+    if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
+        -c 'set -e; mkdir -p /var/lib/dalton/asr_jobs; find /var/lib/dalton/asr_jobs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; if [ -n "$(ls -A /var/lib/dalton/asr_jobs)" ]; then echo "ERROR: /var/lib/dalton/asr_jobs is not empty after clearing" >&2; exit 1; fi'; then
+      err "Failed to clear /var/lib/dalton/asr_jobs volume before service start; refusing to start services."
+      exit 1
+    fi
+    ok "Cleared /var/lib/dalton/asr_jobs volume."
+  fi
+elif [[ -f "${BACKUP_DIR}/asr-jobs.tar.gz" ]]; then
+  err "Backup includes asr-jobs.tar.gz, but transcription service is not defined in Compose; refusing to start services."
+  exit 1
+fi
+
+# Converge restored inflight uploads and non-terminal transcription jobs BEFORE verification
+# and BEFORE starting services (`compose up -d`). Failure aborts restore immediately.
+info "Running post-restore inflight state convergence (reconcile-restored-inflight-states)..."
+RECONCILE_RUN_ARGS=(run --rm -T --no-deps)
+RECONCILE_CLI_ARGS=(reconcile-restored-inflight-states)
+if [[ "$RESTORE_HAS_TRANSCRIPTION" -eq 1 ]]; then
+  RECONCILE_RUN_ARGS+=(-v "${RESTORE_ASR_VOLUME}:/var/lib/dalton/asr_jobs")
+  RECONCILE_CLI_ARGS+=(--asr-jobs-dir /var/lib/dalton/asr_jobs)
+fi
+if [[ "$SKIP_MINIO" -eq 1 || "$STORAGE_ANY_CONFIGURED" -eq 0 ]]; then
+  RECONCILE_CLI_ARGS+=(--skip-object-check)
+fi
+if ! compose_cmd "${RECONCILE_RUN_ARGS[@]}" backend \
+    uv run --no-sync python scripts/standalone/consistent_backup.py "${RECONCILE_CLI_ARGS[@]}"; then
+  err "Post-restore inflight state convergence failed; refusing to run compose up -d."
+  exit 1
+fi
+ok "Post-restore inflight states converged."
+
+info "Clearing restored personal-integration tokens and transient OAuth state..."
+compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+  psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 \
+  < "$PERSONAL_INTEGRATIONS_RESET_SQL"
+ok "Restored personal-integration tokens cleared (existing connections marked needs_reauth)."
 
 # Verify every completed DB-referenced object exists in object storage; skip in-progress
 # 'uploading' records (incomplete at backup time) and report how many were skipped.

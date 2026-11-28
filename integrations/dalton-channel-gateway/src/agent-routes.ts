@@ -1,7 +1,8 @@
-import type {
-  BackendClient,
-  ChartSnapshotItem,
-  I4StateResponse,
+import {
+  BackendHttpError,
+  type BackendClient,
+  type ChartSnapshotItem,
+  type I4StateResponse,
 } from "./backend-client.js";
 import { canViewPlatformChat, type ChannelAdapter } from "./channels/adapter.js";
 import { AUTOMATION_EMPTY_AFTER_TOOLS_SUMMARY } from "./shared/deliverable-text.js";
@@ -14,6 +15,16 @@ import {
   type PendingChartDeliveryReceipt,
 } from "./chart-snapshots.js";
 import { DeliveryService } from "./delivery-service.js";
+import type { DataTaskNotificationResponse } from "./data-task-notification-types.js";
+import type {
+  DataTaskNotificationService,
+  ExecutionStateTracker,
+} from "./data-task-notifications.js";
+import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "./gateway-lease.js";
+import { createSequentialQueue, type SequentialQueue } from "./shared/keyed-queue.js";
 import {
   type AgentAutomationOutputPutRequest,
   type AgentAutomationOutputPutResponse,
@@ -44,11 +55,61 @@ import {
   personalChannelBindingsUrl,
 } from "./commands.js";
 
+export const PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE =
+  "本次结果含个人日历内容，已发送到你的私聊";
+
+function isDmTargetAddress(address: string | null | undefined): boolean {
+  const cleaned = (address ?? "").trim().toLowerCase();
+  return cleaned.endsWith(":@me");
+}
+
+function platformFromAddress(address: string | null | undefined): ChannelPlatform | null {
+  const prefix = (address ?? "").split(":", 1)[0]?.trim().toLowerCase() ?? "";
+  if (prefix === "feishu" || prefix === "discord" || prefix === "weixin") {
+    return prefix;
+  }
+  if (prefix === "wechat") {
+    return "weixin";
+  }
+  return null;
+}
+
+export interface PendingAutomationFinalizeRecord {
+  executionId: string;
+  userId: string;
+  status: AgentAutomationRunFinishRequest["status"];
+  threadId: string | null;
+  finalText: string | null;
+  targets: AutomationRunTargetRecord[];
+  attempts: number;
+}
+
+const MAX_PENDING_FINALIZE_RETRIES = 3;
+const PENDING_FINALIZE_RETRY_DELAYS_MS = [1_500, 5_000, 15_000] as const;
+
+function isTransientFinishBackendError(err: unknown): boolean {
+  if (isLeaseSafetyMarginPauseError(err) || isStaleGatewayEpochError(err)) {
+    return false;
+  }
+  if (err instanceof BackendHttpError) {
+    return (
+      err.status === 0 ||
+      err.status === 408 ||
+      err.status === 429 ||
+      err.status >= 500
+    );
+  }
+  return true;
+}
+
 export class AgentRoutesHandler {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly deliveryService: DeliveryService;
+  private readonly dataTaskNotifications?: DataTaskNotificationService;
+  private readonly failureNoticeQueue: SequentialQueue;
   private readonly webBaseUrl: string;
+  private disposed = false;
 
   /**
    * Process-local set of `execution_id`s currently executing `/finish` (§1.2.7).
@@ -66,16 +127,151 @@ export class AgentRoutesHandler {
     PendingChartDeliveryReceipt
   >();
 
+  /**
+   * Process-local pending I-8 `mark_finished=true` writes that failed transiently
+   * after target delivery, retained so background recovery or subsequent retries
+   * can finish sealing the run instead of leaving it stuck in `finishing`.
+   */
+  readonly pendingFinalizations = new Map<string, PendingAutomationFinalizeRecord>();
+  private readonly pendingFinalizeTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+
   constructor(options: {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
     deliveryService: DeliveryService;
+    dataTaskNotifications?: DataTaskNotificationService;
     webBaseUrl: string;
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
     this.deliveryService = options.deliveryService;
+    this.dataTaskNotifications = options.dataTaskNotifications;
+    this.failureNoticeQueue = createSequentialQueue({ taskTimeoutMs: 180_000 });
     this.webBaseUrl = options.webBaseUrl.replace(/\/+$/, "");
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    for (const timer of this.pendingFinalizeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFinalizeTimers.clear();
+  }
+
+  private clearPendingFinalization(executionId: string): void {
+    this.pendingFinalizations.delete(executionId);
+    const timer = this.pendingFinalizeTimers.get(executionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingFinalizeTimers.delete(executionId);
+    }
+  }
+
+  private recordPendingFinalization(
+    record: Omit<PendingAutomationFinalizeRecord, "attempts">,
+    scheduleAutoRetry = true,
+  ): void {
+    const prev = this.pendingFinalizations.get(record.executionId);
+    const next: PendingAutomationFinalizeRecord = {
+      ...record,
+      attempts: (prev?.attempts ?? 0) + 1,
+    };
+    this.pendingFinalizations.set(record.executionId, next);
+    if (!scheduleAutoRetry || this.disposed) {
+      return;
+    }
+    if (next.attempts > MAX_PENDING_FINALIZE_RETRIES) {
+      return;
+    }
+    const existingTimer = this.pendingFinalizeTimers.get(record.executionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    const delayIdx = Math.min(
+      Math.max(0, next.attempts - 1),
+      PENDING_FINALIZE_RETRY_DELAYS_MS.length - 1,
+    );
+    const delayMs = PENDING_FINALIZE_RETRY_DELAYS_MS[delayIdx]!;
+    const timer = setTimeout(() => {
+      this.pendingFinalizeTimers.delete(record.executionId);
+      if (this.disposed) return;
+      void this.retryPendingFinalization(record.executionId).catch(() => {
+        // Entry stays in pendingFinalizations for subsequent recovery attempts.
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.pendingFinalizeTimers.set(record.executionId, timer);
+  }
+
+  /**
+   * Recovery entry point for an unfinished I-8 `mark_finished=true` write.
+   * Returns true if the run is now finalized (or no longer exists), false if still pending.
+   */
+  async retryPendingFinalization(executionId: string): Promise<boolean> {
+    const rec = this.pendingFinalizations.get(executionId);
+    if (!rec) {
+      return true;
+    }
+    if (this.activeFinishExecutors.has(executionId)) {
+      return false;
+    }
+    this.activeFinishExecutors.add(executionId);
+    try {
+      const finalized = await this.backend.finishAutomationRun(
+        rec.executionId,
+        {
+          status: rec.status,
+          thread_id: rec.threadId,
+          final_text: rec.finalText,
+          targets: rec.targets,
+          mark_finished: true,
+        },
+        rec.userId,
+      );
+      if (
+        finalized.status === 404 ||
+        (finalized.status === 200 && finalized.data?.status === "finished")
+      ) {
+        this.clearPendingFinalization(executionId);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      if (isTransientFinishBackendError(err)) {
+        this.recordPendingFinalization(
+          {
+            executionId: rec.executionId,
+            userId: rec.userId,
+            status: rec.status,
+            threadId: rec.threadId,
+            finalText: rec.finalText,
+            targets: rec.targets,
+          },
+          true,
+        );
+        return false;
+      }
+      throw err;
+    } finally {
+      this.activeFinishExecutors.delete(executionId);
+    }
+  }
+
+  async flushPendingFinalizations(): Promise<number> {
+    let settled = 0;
+    for (const executionId of [...this.pendingFinalizations.keys()]) {
+      try {
+        if (await this.retryPendingFinalization(executionId)) {
+          settled += 1;
+        }
+      } catch {
+        // Keep iterating remaining pending entries.
+      }
+    }
+    return settled;
   }
 
   // -------------------------------------------------------------------------
@@ -740,6 +936,19 @@ export class AgentRoutesHandler {
     return { status: 200, data: { targets: res.targets } };
   }
 
+  private canonicalAutomationExecutionId(rawExecutionId: string): string {
+    const trimmed = String(rawExecutionId || "").trim();
+    const dot = trimmed.lastIndexOf(".");
+    if (dot > 0) {
+      const base = trimmed.slice(0, dot);
+      const suffix = trimmed.slice(dot + 1);
+      if (/^\d+$/.test(suffix) && Number(suffix) >= 2 && /^[0-9a-fA-F-]{36}$/.test(base)) {
+        return base.toLowerCase();
+      }
+    }
+    return trimmed;
+  }
+
   async handleFinishAutomationRun(
     userId: string,
     executionId: string,
@@ -752,21 +961,40 @@ export class AgentRoutesHandler {
       retryable?: boolean;
     };
   }> {
+    const lockExecutionId = this.canonicalAutomationExecutionId(executionId);
     // Shape B check: if another caller in this gateway process is already finishing `executionId`,
     // never enter execution or write `finished`; return a retryable response while in flight
     // (or Shape C if the first caller already transitioned the row to `finished`).
-    if (this.activeFinishExecutors.has(executionId)) {
-      const current = await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: body.status,
-          thread_id: body.thread_id ?? null,
-          run_id: body.run_id ?? null,
-          final_text: body.final_text ?? null,
-          mark_finished: false,
-        },
-        userId,
-      );
+    if (
+      this.activeFinishExecutors.has(lockExecutionId) ||
+      this.activeFinishExecutors.has(executionId)
+    ) {
+      let current: Awaited<ReturnType<BackendClient["finishAutomationRun"]>>;
+      try {
+        current = await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: body.status,
+            thread_id: body.thread_id ?? null,
+            run_id: body.run_id ?? null,
+            final_text: body.final_text ?? null,
+            mark_finished: false,
+          },
+          userId,
+        );
+      } catch (err) {
+        if (isTransientFinishBackendError(err)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Backend temporarily unavailable while checking automation run finish; retry finish to settle.",
+              retryable: true,
+            },
+          };
+        }
+        throw err;
+      }
       if (current.status === 404 || !current.data) {
         return { status: 404, data: { detail: "Unknown execution_id" } };
       }
@@ -833,21 +1061,38 @@ export class AgentRoutesHandler {
     // BW2: Acquire in-process execution ownership synchronously BEFORE the first `await`
     // (I-8 `finishAutomationRun`) so two concurrent `/finish` calls cannot both pass the
     // active check before I-8 returns.
-    this.activeFinishExecutors.add(executionId);
+    const heldLockIds = new Set<string>([lockExecutionId]);
+    this.activeFinishExecutors.add(lockExecutionId);
     try {
-      const claimed = await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: body.status,
-          thread_id: body.thread_id ?? null,
-          run_id: body.run_id ?? null,
-          final_text: body.final_text ?? null,
-          mark_finished: false,
-        },
-        userId,
-      );
+      let claimed: Awaited<ReturnType<BackendClient["finishAutomationRun"]>>;
+      try {
+        claimed = await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: body.status,
+            thread_id: body.thread_id ?? null,
+            run_id: body.run_id ?? null,
+            final_text: body.final_text ?? null,
+            mark_finished: false,
+          },
+          userId,
+        );
+      } catch (err) {
+        if (isTransientFinishBackendError(err)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Backend temporarily unavailable while claiming automation run finish; retry finish to settle.",
+              retryable: true,
+            },
+          };
+        }
+        throw err;
+      }
 
       if (claimed.status === 404 || !claimed.data) {
+        this.clearPendingFinalization(executionId);
         return { status: 404, data: { detail: "Unknown execution_id" } };
       }
 
@@ -856,6 +1101,7 @@ export class AgentRoutesHandler {
         claimed.data.status === "finished" &&
         claimed.data.previous_status === "finished"
       ) {
+        this.clearPendingFinalization(executionId);
         const finishedRows: AgentAutomationRunFinishTargetRow[] = (
           claimed.data.targets ?? []
         ).map((t) => ({
@@ -869,15 +1115,46 @@ export class AgentRoutesHandler {
         return { status: 200, data: { targets: finishedRows } };
       }
 
+      // Unify delivery dedup key with startup recovery by always using the canonical
+      // execution_id returned by the backend (never a `<uuid>.2` retry alias).
+      const resolvedExecutionId =
+        claimed.data.execution_id?.trim() || lockExecutionId;
+      if (!heldLockIds.has(resolvedExecutionId)) {
+        if (this.activeFinishExecutors.has(resolvedExecutionId)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Another finish request is already delivering this automation run; retry finish to settle.",
+              retryable: true,
+              targets: (claimed.data.targets ?? []).map((t) => ({
+                entry: t.entry,
+                address: t.address ?? null,
+                name: t.name ?? null,
+                reached: Boolean(t.reached),
+                via: t.via ?? null,
+                error: t.ok === false ? (t.message ?? "Target was not resolved at start.") : (t.error ?? null),
+              })),
+            },
+          };
+        }
+        heldLockIds.add(resolvedExecutionId);
+        this.activeFinishExecutors.add(resolvedExecutionId);
+      }
+
       // Shape A: execute finish deliveries and finalize in DB
       const detailed = await this.executeAutomationRunFinishDetailed(
         {
-          executionId,
+          executionId: resolvedExecutionId,
           userId: claimed.data.user_id || userId,
           threadId: claimed.data.thread_id ?? body.thread_id ?? null,
           runId: claimed.data.run_id ?? null,
           initialSnapshots: claimed.data.chart_snapshots,
           outboundBlocked: claimed.data.outbound_blocked,
+          hasPersonalIntegrationData: Boolean(
+            claimed.data.has_personal_integration_data ||
+              body.has_personal_integration_data,
+          ),
           automationName: claimed.data.automation_name,
           finishStatus:
             (body.status ??
@@ -885,18 +1162,30 @@ export class AgentRoutesHandler {
               "completed") as AgentAutomationRunFinishRequest["status"],
           finalText: body.final_text ?? claimed.data.final_text ?? null,
           strictDeliverableTextEnabled: claimed.data.strict_deliverable_text_enabled,
+          failureNoticeEnabled: claimed.data.failure_notice_enabled === true,
+          forceSealNoticeFailure: body.final_attempt === true,
+          isRecovery: false,
           targets: claimed.data.targets ?? [],
         },
         { callerHoldsExecutionLock: true },
       );
 
-      if (detailed.replayPending || detailed.chartsInFlight) {
+      if (
+        detailed.replayPending ||
+        detailed.chartsInFlight ||
+        detailed.noticeRetryable ||
+        detailed.finalizeRetryable
+      ) {
         return {
           status: 503,
           data: {
-            detail: detailed.chartsInFlight
-              ? "Automation charts or widgets are still being delivered; retry finish to settle."
-              : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            detail: detailed.finalizeRetryable
+              ? "Finalizing automation run state encountered a transient error; retry finish to settle."
+              : detailed.noticeRetryable
+                ? "Automation status notice delivery encountered a transient error; retry finish to settle."
+                : detailed.chartsInFlight
+                  ? "Automation charts or widgets are still being delivered; retry finish to settle."
+                  : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
             retryable: true,
             targets: detailed.targets,
           },
@@ -905,7 +1194,9 @@ export class AgentRoutesHandler {
 
       return { status: 200, data: { targets: detailed.targets } };
     } finally {
-      this.activeFinishExecutors.delete(executionId);
+      for (const id of heldLockIds) {
+        this.activeFinishExecutors.delete(id);
+      }
     }
   }
 
@@ -920,13 +1211,17 @@ export class AgentRoutesHandler {
     runId?: string | null;
     initialSnapshots?: ChartSnapshotItem[];
     outboundBlocked?: boolean;
+    hasPersonalIntegrationData?: boolean;
     automationName: string;
     finishStatus: AgentAutomationRunFinishRequest["status"];
     finalText: string | null;
     strictDeliverableTextEnabled?: boolean;
+    failureNoticeEnabled?: boolean;
+    recoveryRetryDelayMs?: number;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
-    if (this.activeFinishExecutors.has(params.executionId)) {
+    const canonicalId = this.canonicalAutomationExecutionId(params.executionId);
+    if (this.activeFinishExecutors.has(canonicalId)) {
       return params.targets.map((t) => ({
         entry: t.entry,
         address: t.address ?? null,
@@ -936,7 +1231,39 @@ export class AgentRoutesHandler {
         error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
       }));
     }
-    const detailed = await this.executeAutomationRunFinishDetailed(params);
+    let detailed = await this.executeAutomationRunFinishDetailed({
+      ...params,
+      executionId: canonicalId,
+      failureNoticeEnabled: params.failureNoticeEnabled === true,
+      isRecovery: true,
+      forceSealNoticeFailure: false,
+    });
+    if (detailed.noticeRetryable && !detailed.replayPending && !detailed.chartsInFlight) {
+      const delayMs =
+        typeof params.recoveryRetryDelayMs === "number" && params.recoveryRetryDelayMs >= 0
+          ? params.recoveryRetryDelayMs
+          : 500;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      detailed = await this.executeAutomationRunFinishDetailed({
+        ...params,
+        executionId: canonicalId,
+        failureNoticeEnabled: params.failureNoticeEnabled === true,
+        isRecovery: true,
+        forceSealNoticeFailure: true,
+      });
+    }
+    if (detailed.finalizeRetryable) {
+      const delayMs =
+        typeof params.recoveryRetryDelayMs === "number" && params.recoveryRetryDelayMs >= 0
+          ? params.recoveryRetryDelayMs
+          : 500;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      await this.retryPendingFinalization(canonicalId);
+    }
     return detailed.targets;
   }
 
@@ -948,10 +1275,14 @@ export class AgentRoutesHandler {
       runId?: string | null;
       initialSnapshots?: ChartSnapshotItem[];
       outboundBlocked?: boolean;
+      hasPersonalIntegrationData?: boolean;
       automationName: string;
       finishStatus: AgentAutomationRunFinishRequest["status"];
       finalText: string | null;
       strictDeliverableTextEnabled?: boolean;
+      failureNoticeEnabled?: boolean;
+      forceSealNoticeFailure?: boolean;
+      isRecovery?: boolean;
       targets: AutomationRunTargetRecord[];
     },
     opts?: { callerHoldsExecutionLock?: boolean },
@@ -959,6 +1290,8 @@ export class AgentRoutesHandler {
     targets: AgentAutomationRunFinishTargetRow[];
     replayPending: boolean;
     chartsInFlight: boolean;
+    noticeRetryable: boolean;
+    finalizeRetryable: boolean;
     replayRetryable: boolean;
     replayHttpStatus: number | null;
   }> {
@@ -1065,6 +1398,8 @@ export class AgentRoutesHandler {
           autoWidgets.length > 0);
 
       let chartsInFlight = false;
+      let noticeRetryable = false;
+      let finalizeRetryable = false;
 
       const deliverAutomationChartsForTarget = async (
         t: AutomationRunTargetRecord,
@@ -1108,6 +1443,106 @@ export class AgentRoutesHandler {
         );
       };
 
+      const hasPersonalIntegrationData = Boolean(params.hasPersonalIntegrationData);
+      const dmRedirectOutcomeByPlatform = new Map<
+        string,
+        { ok: boolean; error: string | null }
+      >();
+
+      const redirectPersonalTargetToDmAndNotifyGroup = async (
+        t: AutomationRunTargetRecord,
+      ): Promise<AutomationRunTargetRecord> => {
+        const plat = platformFromAddress(t.address);
+        if (!plat || !t.address) {
+          return {
+            ...t,
+            reached: false,
+            via: null,
+            error: "Cannot redirect personal calendar result: unsupported target platform.",
+          };
+        }
+        const dmAddress = `${plat}:@me`;
+        let dmOutcome = dmRedirectOutcomeByPlatform.get(plat);
+        if (!dmOutcome) {
+          let dmOk = false;
+          let dmErr: string | null = null;
+          if (truncatedFinalText.length > 0) {
+            const dmRes = await this.deliveryService.executeDelivery({
+              deliveryKey: `automation:${executionId}:${plat}:personal_dm`,
+              kind: "automation",
+              userId,
+              threadId,
+              executionId,
+              target: dmAddress,
+              text: truncatedFinalText,
+            });
+            dmOk = dmRes.status === "sent" || dmRes.status === "partial";
+            if (!dmOk) {
+              dmErr =
+                dmRes.message ||
+                "Failed to deliver personal calendar result to verified 1:1 DM.";
+            } else {
+              await deliverAutomationChartsForTarget({
+                ...t,
+                entry: `${plat}:personal_dm`,
+                address: dmAddress,
+              });
+            }
+          } else {
+            const chartsOk = await deliverAutomationChartsForTarget({
+              ...t,
+              entry: `${plat}:personal_dm`,
+              address: dmAddress,
+            });
+            dmOk = chartsOk;
+            if (!dmOk) {
+              dmErr = "Automation completed without deliverable personal content.";
+            }
+          }
+          dmOutcome = { ok: dmOk, error: dmErr };
+          dmRedirectOutcomeByPlatform.set(plat, dmOutcome);
+        }
+
+        if (!dmOutcome.ok) {
+          return {
+            ...t,
+            reached: false,
+            via: null,
+            error:
+              dmOutcome.error ||
+              "Failed to deliver personal calendar result to verified 1:1 DM.",
+          };
+        }
+
+        // Send ONLY the sanitized redirect notice to the group/channel (zero calendar text, zero charts/files).
+        const noticeRes = await this.deliveryService.executeDelivery({
+          deliveryKey: `automation:${executionId}:${t.entry}:personal_redirect_notice`,
+          kind: "automation",
+          userId,
+          threadId,
+          executionId,
+          target: t.address,
+          text: PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+        });
+        if (noticeRes.status === "sent" || noticeRes.status === "partial") {
+          return {
+            ...t,
+            address: noticeRes.address ?? t.address,
+            reached: true,
+            via: "fallback",
+            error: null,
+          };
+        }
+        return {
+          ...t,
+          reached: false,
+          via: null,
+          error:
+            noticeRes.message ||
+            "Personal calendar result sent to DM, but group redirect notice failed.",
+        };
+      };
+
       for (const t of targets) {
         if (!t.ok || !t.address) {
           results.push({
@@ -1120,6 +1555,12 @@ export class AgentRoutesHandler {
         }
 
         if (finishStatus === "completed") {
+          const targetIsGroup = !isDmTargetAddress(t.address);
+          if (hasPersonalIntegrationData && targetIsGroup) {
+            results.push(await redirectPersonalTargetToDmAndNotifyGroup(t));
+            continue;
+          }
+
           if (t.agent_sent) {
             await deliverAutomationChartsForTarget(t);
             results.push({
@@ -1141,6 +1582,14 @@ export class AgentRoutesHandler {
               target: t.address,
               text: truncatedFinalText,
             });
+
+            if (
+              deliveryRes.code === "personal_integration_private_only" &&
+              targetIsGroup
+            ) {
+              results.push(await redirectPersonalTargetToDmAndNotifyGroup(t));
+              continue;
+            }
 
             if (
               deliveryRes.status === "sent" ||
@@ -1245,6 +1694,20 @@ export class AgentRoutesHandler {
             error: null,
           });
         } else {
+          const isUnknownOrInFlight =
+            noticeRes.status === "unknown" || noticeRes.code === "in_flight";
+          const isRetryableCode =
+            noticeRes.code === "unavailable" || noticeRes.code === "rate_limited";
+          // Only return 503 / defer sealing when failure_notice_enabled is ON, retries remain,
+          // and startup recovery is not observing an already-unknown/in_flight delivery key
+          // (which will never resend on the same key and must seal).
+          const isTransientNoticeFailure =
+            params.failureNoticeEnabled === true &&
+            params.forceSealNoticeFailure !== true &&
+            (isRetryableCode || (!params.isRecovery && isUnknownOrInFlight));
+          if (isTransientNoticeFailure) {
+            noticeRetryable = true;
+          }
           results.push({
             ...t,
             reached: false,
@@ -1254,26 +1717,47 @@ export class AgentRoutesHandler {
         }
       }
 
-      if (!replayTargetMissing && !chartsInFlight) {
-        const finalized = await this.backend.finishAutomationRun(
-          executionId,
-          {
-            status: finishStatus,
-            thread_id: threadId,
-            final_text: finalText,
-            targets: results,
-            mark_finished: true,
-          },
-          userId,
-        );
-        // If backend DB refused to mark finished (e.g. concurrent finisher still has
-        // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
-        if (
-          finalized.status === 200 &&
-          finalized.data &&
-          finalized.data.status !== "finished"
-        ) {
-          chartsInFlight = true;
+      if (!replayTargetMissing && !chartsInFlight && !noticeRetryable) {
+        try {
+          const finalized = await this.backend.finishAutomationRun(
+            executionId,
+            {
+              status: finishStatus,
+              thread_id: threadId,
+              final_text: finalText,
+              targets: results,
+              mark_finished: true,
+            },
+            userId,
+          );
+          // If backend DB refused to mark finished (e.g. concurrent finisher still has
+          // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
+          if (
+            finalized.status === 200 &&
+            finalized.data &&
+            finalized.data.status !== "finished"
+          ) {
+            chartsInFlight = true;
+          } else {
+            this.clearPendingFinalization(executionId);
+          }
+        } catch (err) {
+          if (isTransientFinishBackendError(err)) {
+            finalizeRetryable = true;
+            this.recordPendingFinalization(
+              {
+                executionId,
+                userId,
+                status: finishStatus,
+                threadId,
+                finalText,
+                targets: results,
+              },
+              !params.isRecovery,
+            );
+          } else {
+            throw err;
+          }
         }
       }
 
@@ -1288,6 +1772,8 @@ export class AgentRoutesHandler {
         })),
         replayPending: replayTargetMissing,
         chartsInFlight,
+        noticeRetryable,
+        finalizeRetryable,
         replayRetryable,
         replayHttpStatus,
       };
@@ -1295,6 +1781,173 @@ export class AgentRoutesHandler {
       if (acquiredHere) {
         this.activeFinishExecutors.delete(executionId);
       }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §3.3 POST /internal/failure-notices (leased claim_token delivery)
+  // -------------------------------------------------------------------------
+  async handleFailureNotice(rawBody: unknown): Promise<{
+    status: number;
+    data: DataTaskNotificationResponse;
+  }> {
+    const UUID_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const ALLOWED_KEYS = new Set(["target_receipt_id", "claim_token"]);
+    const isPlainObj = (val: unknown): val is Record<string, unknown> =>
+      typeof val === "object" && val !== null && !Array.isArray(val);
+    const failedBody = (
+      receiptId: string,
+      code: string,
+      message: string,
+      status: DataTaskNotificationResponse["status"] = "failed",
+    ): DataTaskNotificationResponse => ({
+      ok: false,
+      status,
+      code,
+      message,
+      run_id: receiptId,
+      target: "",
+      platform: null,
+      items_total: 0,
+      items_sent: 0,
+      items: [],
+    });
+
+    if (!isPlainObj(rawBody)) {
+      return {
+        status: 400,
+        data: failedBody("", "invalid_request", "Request body must be a JSON object."),
+      };
+    }
+    const extraKeys = Object.keys(rawBody).filter((k) => !ALLOWED_KEYS.has(k));
+    if (extraKeys.length > 0) {
+      return {
+        status: 400,
+        data: failedBody(
+          typeof rawBody.target_receipt_id === "string" ? rawBody.target_receipt_id : "",
+          "invalid_request",
+          `Forbidden caller fields in failure notice request: ${extraKeys.join(", ")}`,
+        ),
+      };
+    }
+    const receiptId =
+      typeof rawBody.target_receipt_id === "string"
+        ? rawBody.target_receipt_id.trim().toLowerCase()
+        : "";
+    const claimToken =
+      typeof rawBody.claim_token === "string"
+        ? rawBody.claim_token.trim().toLowerCase()
+        : "";
+    if (!receiptId || !UUID_RE.test(receiptId) || !claimToken || !UUID_RE.test(claimToken)) {
+      return {
+        status: 400,
+        data: failedBody(
+          receiptId,
+          "invalid_request",
+          "target_receipt_id and claim_token must both be valid UUIDs.",
+        ),
+      };
+    }
+    if (!this.dataTaskNotifications) {
+      return {
+        status: 503,
+        data: failedBody(
+          receiptId,
+          "unavailable",
+          "Failure notice delivery loop is not configured on this gateway.",
+        ),
+      };
+    }
+
+    const tracker: ExecutionStateTracker = {
+      claimedAnyItem: false,
+      resolvedPlatform: null,
+      itemsTotal: 0,
+      itemsSent: 0,
+      outcomes: [],
+    };
+    let captured:
+      | { status: number; data: DataTaskNotificationResponse }
+      | undefined;
+
+    try {
+      const queueOutcome = await this.failureNoticeQueue.enqueue(
+        receiptId,
+        async () => {
+          if (typeof this.backend.authorizeFailureNoticePlan !== "function") {
+            throw new Error(
+              "BackendClient does not implement authorizeFailureNoticePlan",
+            );
+          }
+          const rawPlan = await this.backend.authorizeFailureNoticePlan({
+            target_receipt_id: receiptId,
+            claim_token: claimToken,
+          });
+          const requested =
+            isPlainObj(rawPlan) && typeof rawPlan.requested_target === "string"
+              ? rawPlan.requested_target
+              : "";
+          captured = await this.dataTaskNotifications!.deliverAuthorizedPlan(
+            receiptId,
+            requested,
+            tracker,
+            {
+              rawPlan,
+              claimKind: "failure_notice",
+              claimToken,
+              liveCheckPurpose: "failure_notice",
+            },
+          );
+        },
+      );
+      if (queueOutcome === "completed" && captured !== undefined) {
+        return captured;
+      }
+      const uncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: uncertain ? "unknown" : "failed",
+          code: uncertain ? "delivery_uncertain" : "unavailable",
+          message: uncertain
+            ? "Failure notice timed out after claiming delivery; state is uncertain."
+            : "Failure notice timed out before claiming any item.",
+          run_id: receiptId,
+          target: "",
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      const uncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : uncertain
+            ? "Backend communication failed after claiming delivery; state is uncertain."
+            : "Backend communication failed before claiming delivery.";
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: uncertain ? "unknown" : "failed",
+          code: uncertain ? "delivery_uncertain" : "unavailable",
+          message,
+          run_id: receiptId,
+          target: "",
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
     }
   }
 

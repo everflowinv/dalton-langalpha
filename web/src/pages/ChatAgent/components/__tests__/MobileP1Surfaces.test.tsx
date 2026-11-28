@@ -249,6 +249,7 @@ describe('Mobile P1 surfaces: PaletteField, GeneralPanel /help, FileHeaderAction
     } as unknown as import('../viewers/html/comments/useCommentUi').CommentUi;
 
     const baseRecord = {
+      kind: 'file' as const,
       artifact_id: 'art-entry',
       code: 'ent',
       url: '/a/ent',
@@ -341,6 +342,7 @@ describe('Mobile P1 surfaces: PaletteField, GeneralPanel /help, FileHeaderAction
 
   it('ArtifactVersionPicker preserves full accessible names (live vs snapshot) and status markers on mobile while keeping desktop unchanged', () => {
     const baseRecord = {
+      kind: 'file' as const,
       artifact_id: 'art-1',
       code: 'abc',
       url: '/a/abc',

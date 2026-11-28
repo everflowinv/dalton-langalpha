@@ -108,6 +108,11 @@ async def check_command_server(
     """
     extra = dict(extra_secrets or {})
     refs = _vault_refs(server)
+    # DALTON-HOOK(deployment-credentials): refuse stdio MCP checks referencing server-only Feishu Vault keys
+    from src.dalton.deployment_credentials.sandbox_scrub import sandbox_excluded_vault_ref_reason
+
+    if blocked_reason := sandbox_excluded_vault_ref_reason(refs):
+        return CheckFailure(server.name, "command_failed", blocked_reason)
     stored_names = [n for n in refs if n not in extra]
     stored = (
         await get_user_secrets_decrypted(user_id, stored_names) if stored_names else {}

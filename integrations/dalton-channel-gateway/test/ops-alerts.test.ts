@@ -725,7 +725,7 @@ describe("ops-alerts monitor_publish_failed", () => {
       }),
     );
 
-    const sender = vi.fn(async () => ({ messageId: "om_mon_1" }));
+    const sender = vi.fn(async (_target: string, _text: string) => ({ messageId: "om_mon_1" }));
     const longDetail = "x".repeat(700);
     const resDefault = await handleOpsAlert({
       body: {

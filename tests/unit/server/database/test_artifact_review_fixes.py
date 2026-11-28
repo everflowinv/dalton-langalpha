@@ -41,6 +41,7 @@ def _sql(mock_cursor) -> list[str]:
 def _row(**overrides) -> dict:
     row = {
         "artifact_id": _A,
+        "kind": "file",
         "code": "c0de",
         "workspace_id": _W,
         "path": "r.html",
@@ -89,7 +90,7 @@ async def test_require_destination_checks_the_thread_owner_not_the_workspaces(
 
     with pytest.raises(routing.DestinationUnavailable):
         await routing.require_destination(
-            mock_cursor, user_id=_U, workspace_id=_W, thread_id=_T, caller=_U
+            mock_cursor, user_id=_U, artifact_id=_A, thread_id=_T, caller=_U
         )
 
     (sql,) = _sql(mock_cursor)

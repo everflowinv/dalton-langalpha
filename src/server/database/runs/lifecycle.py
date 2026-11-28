@@ -244,18 +244,24 @@ async def _lifecycle_connection(conn=None):
 
 
 async def allocate_turn_index(conn, thread_id: str) -> int:
-    """Next turn = MAX+1 across queries ∪ responses (gap-robust, unlike COUNT)."""
+    """Next turn = MAX+1 across queries ∪ responses (gap-robust, unlike COUNT).
+
+    A fork made from a snapshot holds no rows for the turns it borrows, so its
+    numbering starts at its lineage's ``borrow.turn_base``, continuing its source's."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT GREATEST(
                 COALESCE((SELECT MAX(turn_index) FROM conversation_queries
-                          WHERE conversation_thread_id = %s), -1),
+                          WHERE conversation_thread_id = %s), -1) + 1,
                 COALESCE((SELECT MAX(turn_index) FROM conversation_responses
-                          WHERE conversation_thread_id = %s), -1)
-            ) + 1 AS next_turn
+                          WHERE conversation_thread_id = %s), -1) + 1,
+                COALESCE((SELECT (metadata->'fork'->'borrow'->>'turn_base')::int
+                          FROM conversation_threads
+                          WHERE conversation_thread_id = %s), 0)
+            ) AS next_turn
             """,
-            (thread_id, thread_id),
+            (thread_id, thread_id, thread_id),
         )
         row = await cur.fetchone()
         return row["next_turn"]
@@ -450,6 +456,11 @@ async def start_run(
                 )
                 if locked_tail_turn and not isinstance(metadata, dict):
                     metadata = {**(metadata or {}), "tail_turn_no_new_work": True}
+
+                # DALTON-HOOK(personal-integrations): refuse run start inside START txn while personal data purge is active
+                from src.dalton.services.purge_fence import assert_thread_not_purging_tx
+
+                await assert_thread_not_purging_tx(conn, thread_id)
 
                 # Fast-path dedup probe. The unique index below is the
                 # race-safe backstop; this just avoids burning a turn_index

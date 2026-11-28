@@ -100,6 +100,11 @@ async def after_secret_change(
     if value_changed:
         await _invalidate_mcp(user_id, [secret_name])
     await _push_secrets(user_id)
+    # DALTON-HOOK(deployment-credentials): refresh deployment settings when dedicated Feishu Vault keys change
+    if value_changed:
+        from src.dalton.deployment_credentials.hooks import on_vault_secrets_changed
+
+        await on_vault_secrets_changed([secret_name])
 
 
 async def after_secrets_changed(user_id: str, secret_names: Iterable[str]) -> None:
@@ -118,6 +123,10 @@ async def after_secrets_changed(user_id: str, secret_names: Iterable[str]) -> No
         return
     await _invalidate_mcp(user_id, names)
     await _push_secrets(user_id)
+    # DALTON-HOOK(deployment-credentials): refresh deployment settings when dedicated Feishu Vault keys change
+    from src.dalton.deployment_credentials.hooks import on_vault_secrets_changed
+
+    await on_vault_secrets_changed(names)
 
 
 async def _push_secrets(user_id: str) -> None:

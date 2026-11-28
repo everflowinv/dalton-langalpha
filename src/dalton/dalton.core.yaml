@@ -70,6 +70,7 @@ channels:
   bt2_link_recovery_enabled: true
 
 workspace_files:
+  public_bucket_urls: false
   write_inline_only: false
   exclude_dir_names: []
   exclude_rel_dirs: []

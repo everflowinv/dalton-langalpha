@@ -15,7 +15,12 @@ from typing import Any, NamedTuple  # DALTON-HOOK(cos-settings-tools)
 from fastapi import HTTPException
 
 from src.server.database.conversation import threads_read
-from src.server.services.history.branch import branch_turns, stale_fork_detail
+from src.server.services.forks.model import BorrowedTurn, Borrowing
+from src.server.services.history.branch import (
+    branch_turns,
+    borrowing_of,
+    stale_fork_detail,
+)
 from src.server.utils.checkpoint_helpers import (
     FORK_ROOT_CHECKPOINT_ID,
     build_checkpoint_config,
@@ -34,7 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 async def get_thread_turns(
-    thread_id: str, branch_tip_checkpoint_id: str | None = None
+    thread_id: str,
+    branch_tip_checkpoint_id: str | None = None,
+    *,
+    borrow: Borrowing | None = None,
 ) -> ThreadTurnsResponse:
     """Turn boundaries on the thread's current branch, for edit/regenerate.
 
@@ -45,8 +53,10 @@ async def get_thread_turns(
     with no persisted turn to name is left out. Turns past the last boundary
     share one last entry at the tip, or at the empty fork root on a thread
     with no checkpoint, which is also where the first turn's edit forks.
+    ``borrow`` is the thread's standing as a snapshot fork, read with the tip
+    (``borrowing_of``).
     """
-    listing = await branch_turns(thread_id, branch_tip_checkpoint_id)
+    listing = await branch_turns(thread_id, branch_tip_checkpoint_id, borrow=borrow)
     return ThreadTurnsResponse(
         thread_id=thread_id,
         turns=listing.turns,
@@ -90,7 +100,7 @@ async def resolve_fork_turn(
     """
     branch = await threads_read.get_thread_branch_read(thread_id)
     branch_tip, horizon = branch.checkpoint_id, branch.run_horizon
-    listing = await branch_turns(thread_id, branch_tip)
+    listing = await branch_turns(thread_id, branch_tip, borrow=borrowing_of(branch))
     turns = listing.turns
     if (
         regenerate
@@ -131,20 +141,35 @@ async def first_turn_dropped(thread_id: str, checkpoint_id: str) -> int | None:
     """
     from src.server.utils.checkpoint_helpers import checkpoint_on_branch
 
-    tip = (await threads_read.get_thread_branch_read(thread_id)).checkpoint_id
+    branch = await threads_read.get_thread_branch_read(thread_id)
+    tip, borrow = branch.checkpoint_id, borrowing_of(branch)
     if tip is None:
         return 0
     if checkpoint_id == tip or await checkpoint_on_branch(thread_id, tip, checkpoint_id):
         return None
-    if not await checkpoint_on_branch(thread_id, checkpoint_id, tip):
+    on_branch = await checkpoint_on_branch(thread_id, checkpoint_id, tip)
+    if borrow is not None and (
+        checkpoint_id == FORK_ROOT_CHECKPOINT_ID
+        or (not on_branch and not await _holds(thread_id, checkpoint_id))
+    ):
+        # A snapshot fork's state is the checkpoint it holds: one it does not
+        # hold loads as empty state, which would drop the borrowed turns too.
+        # One it holds off the branch is a view of its own turns gone stale.
+        raise BorrowedTurn()
+    if not on_branch:
         return 0
-    dropped = 0
+    dropped = borrow.turn_base if borrow is not None else 0
     # Checkpoint ids are uuid6, ordered by time, the fork root first.
-    for turn in (await branch_turns(thread_id, tip)).turns:
+    for turn in (await branch_turns(thread_id, tip, borrow=borrow)).turns:
         start = turn.edit_checkpoint_id
         if start is not None and start <= checkpoint_id:
             dropped = max(dropped, turn.turn_index)
     return dropped
+
+
+async def _holds(thread_id: str, checkpoint_id: str) -> bool:
+    config = build_checkpoint_config(thread_id, checkpoint_id)
+    return await get_checkpointer().aget_tuple(config) is not None
 
 
 async def first_turn_replaced(thread_id: str, request: ChatRequest) -> int | None:
@@ -287,6 +312,13 @@ WEB_CONFIRM_ACTION_TYPES: frozenset[str] = frozenset(
         "watchlist_set_tier",
         "watchlist_remove",
         "watchlist_tier_policy",
+        # DALTON-HOOK(personal-integrations): personal calendar/mail write & Google MCP elicitation confirmations
+        "dalton_google_mcp_elicitation",
+        "dalton_calendar_create_event",
+        "dalton_calendar_update_event",
+        "dalton_calendar_delete_event",
+        "dalton_mail_create_draft",
+        "dalton_mail_send",
     }
 )
 
@@ -537,9 +569,37 @@ async def _verify_web_confirm_resume(
         # An explicit decline on an expired or pre-upgrade card settles as
         # rejected rather than being rewritten to approve + scope_changed, so
         # live display and history replay agree.
+        action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
+        # DALTON-HOOK(personal-integrations): verify personal integration write & Google MCP elicitation resumes
+        if action_req.get("type") in {
+            "dalton_google_mcp_elicitation",
+            "dalton_calendar_create_event",
+            "dalton_calendar_update_event",
+            "dalton_calendar_delete_event",
+            "dalton_mail_create_draft",
+            "dalton_mail_send",
+        }:
+            from src.dalton.services.personal_integration_approval import (
+                verify_personal_integration_interrupt_resume,
+            )
+
+            ok = await verify_personal_integration_interrupt_resume(
+                thread_id=thread_id,
+                action_req=action_req,
+                answer=answers[iid],
+                principal=principal,
+                raw_request=raw_request,
+            )
+            if not ok:
+                if rewritten is None:
+                    rewritten = dict(answers)
+                rewritten[iid] = HITLResponse(
+                    decisions=[HITLDecision(type="approve")],
+                    scope_changed=True,
+                )
+            continue
         if _is_reject_answer(answers[iid]):
             continue
-        action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
         if action_req.get("type") == "dalton_report_delivery_set":
             # DALTON-HOOK(report-delivery): delegate AD5 session & confirm_token verification to src.dalton
             from src.dalton.services.report_delivery import (
@@ -614,7 +674,11 @@ async def settle_resume_request(
     if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
     # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # DALTON-HOOK(cos-verbatim-forward): reuse newest checkpoint read here to carry approval-bound ptc_agent payloads into ptc_run
+    approved_dispatch_payloads: dict[str, dict[str, Any]] | None = None
     if request.hitl_response and newest is not None:
+        from src.dalton.cos_verbatim import extract_approved_dispatch_payloads_from_checkpoint
+
         pending_records = interrupt_records(getattr(newest, "pending_writes", None))
         pending_by_id = {
             str(rec["id"]): rec
@@ -641,15 +705,26 @@ async def settle_resume_request(
                 raw_request=raw_request,
                 thread_meta=thread_meta,
             )
+        approved_dispatch_payloads = extract_approved_dispatch_payloads_from_checkpoint(
+            newest,
+            hitl_response=rewritten_hitl if rewritten_hitl is not None else request.hitl_response,
+        )
         if rewritten_hitl is not None:
             return request.model_copy(
                 update={
                     "resume_run_horizon": branch.run_horizon,
                     "hitl_response": rewritten_hitl,
+                    "approved_dispatch_payloads": approved_dispatch_payloads,
                 }
             )
     # --- DALTON-HOOK(cos-settings-tools): end ---
-    return request.model_copy(update={"resume_run_horizon": branch.run_horizon})
+    return request.model_copy(
+        update={
+            "resume_run_horizon": branch.run_horizon,
+            # DALTON-HOOK(cos-verbatim-forward): stamp verified payloads (or None when newest was absent)
+            "approved_dispatch_payloads": approved_dispatch_payloads,
+        }
+    )
 
 
 async def resolve_checkpoint_resume_run_id(

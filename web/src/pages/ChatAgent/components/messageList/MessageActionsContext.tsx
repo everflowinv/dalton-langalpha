@@ -17,17 +17,25 @@ import React from 'react';
 import type { FeedbackResult, SubagentInfo } from './types';
 import type { ThumbDownFollowUp, ThumbDownFollowUpOutcome } from '../../hooks/useChatFeedback';
 import type { PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
+import type { ToolApprovalDecisionExtra } from '../../session/interrupts/answerBoard'; // DALTON-HOOK(personal-integrations)
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import type { ChartTabSpec } from '../filePanel/types';
-import type { ArtifactCommentRef } from '../artifactComments/artifactCommentReply';
+import type { ArtifactCommentOpeners } from '../artifactComments/artifactCommentReply';
 import type { EditDraftStore } from '../../hooks/utils/editDrafts';
-import type { ThreadForkCut } from '@/types/api';
 
 export interface MessageActions {
-  onOpenSubagentTask?: (info: SubagentInfo) => void;
+  /** Opens a task's transcript. `ownerThreadId` names the thread that holds
+   *  the task's runs when it is not this one: a task in a turn a fork
+   *  borrowed, which opens there. */
+  onOpenSubagentTask?: (info: SubagentInfo, ownerThreadId?: string) => void;
   /** Opens the thread that handed a turn to this one, where the thread's own
    *  back button goes. Only the host knows how that button gets there. */
   onOpenDispatcher?: (threadId: string) => void;
+  /** Leaves this view for another thread, or one of its tasks, as the view's
+   *  other exits do: a fork's original, from the divider. The workspace
+   *  rides along when the caller knows it. Absent where the view cannot
+   *  leave (a shared chat), which shows no link. */
+  onOpenThread?: (threadId: string, state: { workspaceId?: string }, taskId?: string) => void;
   onOpenFile?: OpenFileHandler;
   /** Brings a turn's deliverables deck into view as it unfolds. The deck owns
    *  no scroll container and must not grab one: the host's scroll controller
@@ -52,9 +60,10 @@ export interface MessageActions {
   onOpenSources?: (messageId: string) => void;
   /** Opens a live chart for a symbol beside the chat; absent where there is no panel to land in. */
   onOpenChart?: (spec: ChartTabSpec) => void;
-  /** Opens a file beside the chat on one of its comments; absent where there
-   *  is no panel to land in (a shared chat). */
-  onOpenArtifactComment?: (comment: ArtifactCommentRef) => void;
+  /** Opens a file or a chart beside the chat on one of its comments, by its
+   *  kind; a kind with no place to land in is left out (a shared chat has
+   *  none, the market page only its chart). */
+  onOpenArtifactComment?: ArtifactCommentOpeners;
   /** Opens a tool call's result by id; the host reads the live record. */
   onToolCallDetailClick?: (toolCallId: string) => void;
   onAnswerQuestion?: (answer: string, questionId: string, interruptId: string) => void;
@@ -76,20 +85,22 @@ export interface MessageActions {
    *  sits, so it says rather than the hook looking it up. */
   /** `attemptId` rides along for a call the order gate keyed: the resume names
    *  it rather than trusting the slot, so a batch cannot misassign a verdict. */
-  onApproveToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string) => void;
-  onRejectToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string) => void;
+  // DALTON-HOOK(personal-integrations): allow passing L2 receipt & Google elicitation responses
+  onApproveToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string, extra?: ToolApprovalDecisionExtra) => void;
+  onRejectToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string, extra?: ToolApprovalDecisionExtra) => void;
   onEditMessage?: (messageId: string, content: string) => void;
   /** The session's open edit boxes, which outlive the bubbles a reload
    *  remounts. Without it a bubble keeps its own while it lives. */
   editDrafts?: EditDraftStore;
   onRegenerate?: (messageId: string) => void;
   onRetry?: () => void;
-  /** Copies the thread up to a turn into a new chat and opens it there. Unlike
-   *  edit and regenerate it changes nothing in this thread, so reading the
-   *  thread is enough to offer it. Resolves once the request has settled, so
-   *  the button can hold itself disabled meanwhile; refusals are the host's
-   *  to show. Absent where no new chat can be made (a shared or subagent view). */
-  onForkFromTurn?: (turnIndex: number, cut: ThreadForkCut) => Promise<void>;
+  /** Makes a new chat that carries on from this one through a turn, and opens
+   *  it. Unlike edit and regenerate it changes nothing in this thread, so
+   *  reading the thread is enough to offer it. It runs as the fork mutation
+   *  (`useForkThread`), which the button reads its spinner from; refusals
+   *  are the host's to show. Absent where no new chat can be made (a shared
+   *  or subagent view). */
+  onForkFromTurn?: (turnIndex: number) => void;
   /** Feedback is addressed by BACKEND TURN, not by bubble — a steering
    *  continuation rates the turn it continues. MessageList supplies the index. */
   onThumbUp?: (turnIndex: number) => Promise<FeedbackResult | null>;

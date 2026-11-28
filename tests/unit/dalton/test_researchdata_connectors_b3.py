@@ -23,6 +23,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -50,10 +51,7 @@ from src.dalton.provenance.declared_sources import expand_declared_sources
 from src.dalton.research_host.app import ResearchHostConfig, ResearchHostRuntime, create_app
 from src.dalton.research_host.auth import verify_caller_token
 from src.dalton.research_host.connector_registry import ConnectorRegistry
-from src.dalton.research_host.federated import (
-    FederatedResearchConnector,
-    LegacyBridgeAlphaEngineProxy,
-)
+from src.dalton.research_host.federated import FederatedResearchConnector
 from src.dalton.research_host.wiki_store import CompanyWikiConnector, OpenWikiStore
 from src.dalton.sandbox_caller_identity import sign_caller_token
 from src.dalton.tools import build_dalton_tools
@@ -61,6 +59,59 @@ from src.dalton.tools import ingest_tools as ingest_tools_mod
 from src.dalton.tools import wiki_tools as wiki_tools_mod
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _snapshot_working_tree_repo(tmp_path: Path) -> Path:
+    """Return REPO_ROOT if clean, else a temp git repo snapshotting HEAD + working-tree changes."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if not status.strip():
+        return REPO_ROOT
+
+    snap = tmp_path / "working-tree-repo"
+    snap.mkdir()
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", "HEAD"],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+    )
+    try:
+        subprocess.run(["tar", "-xf", "-", "-C", str(snap)], stdin=archive.stdout, check=True)
+    finally:
+        if archive.stdout is not None:
+            archive.stdout.close()
+        assert archive.wait() == 0
+
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        rel = line[3:].strip().strip('"')
+        if " -> " in rel:
+            old_rel, rel = rel.split(" -> ", 1)
+            old_dst = snap / old_rel
+            if old_dst.exists() or old_dst.is_symlink():
+                old_dst.unlink()
+        src = REPO_ROOT / rel
+        dst = snap / rel
+        if "D" in xy and not src.exists():
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    subprocess.run(["git", "init", "-q"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(snap), check=True)
+    subprocess.run(["git", "add", "-A", "-f"], cwd=str(snap), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "working-tree-snapshot"], cwd=str(snap), check=True)
+    return snap
 
 
 def _load_module_from_path(name: str, path: Path) -> Any:
@@ -504,7 +555,7 @@ async def test_research_host_credential_isolation_and_wiki_ingest_idempotency(
         data_root=tmp_path / "wiki_root",
         mcp_token="host-sandbox-token-aaa",
         admin_token="admin-backend-token-bbb",
-        bridge_admin_token="hmac-caller-secret-ccc",
+        extra_caller_admin_secrets=("hmac-caller-secret-ccc",),
         profile=DeploymentProfile.CORE,
     )
     def _wiki_only_caps() -> frozenset[CapabilityId]:
@@ -790,41 +841,41 @@ async def test_sales_notes_tmtb_partition_isolation_funda_and_guidepoint_lock(
         with open(lock_path, "a+", encoding="utf-8") as fh:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def _gp_handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get("authorization") == "Bearer gp-access-live"
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "structuredContent": {
+                            "data": [{"id": "gp-1", "transcript_name": "Cloud Expert Call", "date": "2026-08-09"}]
+                        }
+                    },
+                },
+            )
+
+        orig_client = httpx.AsyncClient
+
+        def _gp_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            kwargs["transport"] = httpx.MockTransport(_gp_handler)
+            return orig_client(*args, **kwargs)
+
+        gp_conn = gp_mod.GuidepointConnector(
+            token_manager=tm,
+            http_client_factory=create_autospec(httpx.AsyncClient, side_effect=_gp_client_factory),
+        )
+        gp_out = await gp_conn.call_tool(
+            "search_library",
+            {"query": "NVDA cloud"},
+            active_caps=frozenset({CapabilityId.GUIDEPOINT}),
+        )
+        assert gp_out["ok"] is True
+        assert gp_out["data"]["structuredContent"]["data"][0]["id"] == "gp-1"
     finally:
         tm.release_owner_lock()
-
-    def _gp_handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("authorization") == "Bearer gp-access-live"
-        return httpx.Response(
-            200,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "structuredContent": {
-                        "data": [{"id": "gp-1", "transcript_name": "Cloud Expert Call", "date": "2026-08-09"}]
-                    }
-                },
-            },
-        )
-
-    orig_client = httpx.AsyncClient
-
-    def _gp_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        kwargs["transport"] = httpx.MockTransport(_gp_handler)
-        return orig_client(*args, **kwargs)
-
-    gp_conn = gp_mod.GuidepointConnector(
-        token_manager=tm,
-        http_client_factory=create_autospec(httpx.AsyncClient, side_effect=_gp_client_factory),
-    )
-    gp_out = await gp_conn.call_tool(
-        "search_library",
-        {"query": "NVDA cloud"},
-        active_caps=frozenset({CapabilityId.GUIDEPOINT}),
-    )
-    assert gp_out["ok"] is True
-    assert gp_out["data"]["structuredContent"]["data"][0]["id"] == "gp-1"
 
 
 @pytest.mark.asyncio
@@ -869,9 +920,21 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
     registry = ConnectorRegistry()
     registry.register_connector(CompanyWikiConnector(wiki_store))
     registry.register_federated_source("company-wiki", CapabilityId.COMPANY_WIKI, search_fn=_wiki_search)
-    registry.register_federated_source("sales-notes", CapabilityId.SALES_NOTES, search_fn=_sn_search)
-    registry.register_federated_source("tmtb", CapabilityId.TMTB, search_fn=_tm_search)
-    registry.register_prefix_reader("mail", CapabilityId.SALES_NOTES, _sn_read)
+    registry.register_federated_source(
+        "sales-notes",
+        CapabilityId.SALES_NOTES,
+        search_fn=_sn_search,
+        allowed_params=frozenset({"sender", "layer", "search_mode", "media"}),
+        prefixes=("mail", "digest"),
+    )
+    registry.register_federated_source(
+        "tmtb",
+        CapabilityId.TMTB,
+        search_fn=_tm_search,
+        allowed_params=frozenset({"sender", "search_mode", "media"}),
+        prefixes=("tmtb",),
+    )
+    registry.register_prefix_reader("mail", CapabilityId.SALES_NOTES, _sn_read, source_id="sales-notes")
 
     async def _slow_gp(
         q: str, s: str | None, e: str | None, l: int, p: dict[str, Any], _c: str
@@ -880,7 +943,14 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
         await asyncio.sleep(0.5)
         return {"ok": True, "results": []}
 
-    registry.register_federated_source("guidepoint", CapabilityId.GUIDEPOINT, search_fn=_slow_gp)
+    registry.register_federated_source(
+        "guidepoint",
+        CapabilityId.GUIDEPOINT,
+        search_fn=_slow_gp,
+        top_level_block=True,
+        fuse_local=False,
+        provenance_identity="expert",
+    )
 
     def _ae_handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "http://127.0.0.1:8960/mcp"
@@ -905,16 +975,25 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
         kwargs["transport"] = httpx.MockTransport(_ae_handler)
         return orig_async_client(*args, **kwargs)
 
+    runtime_dir = str(REPO_ROOT / "scripts" / "dalton" / "research_runtime")
+    if runtime_dir not in sys.path:
+        sys.path.insert(0, runtime_dir)
+    from host_connectors.bridge_alphaengine_proxy import (
+        LegacyBridgeAlphaEngineProxy,
+        register_alphaengine_bridge_proxy,
+    )
+
     ae_proxy = LegacyBridgeAlphaEngineProxy(
         bridge_mcp_url="http://127.0.0.1:8960/mcp",
         client_factory=create_autospec(httpx.AsyncClient, side_effect=_ae_client_factory),
     )
+    register_alphaengine_bridge_proxy(registry, bridge_mcp_url="", proxy=ae_proxy)
+    registry.register_federated_alias("sales_mail", ("sales-notes", "tmtb"))
 
     fed = FederatedResearchConnector(
         registry,
         wiki_store,
         fanout_grace_s=0.05,
-        alphaengine_proxy=ae_proxy,
     )
 
     active = frozenset(
@@ -2296,8 +2375,21 @@ async def test_federated_dynamic_tools_list_param_filtering_and_nonblocking_sqli
         return await asyncio.to_thread(_blocking_slow_sqlite, p)
 
     reg = ConnectorRegistry()
-    reg.register_federated_source("company-wiki", CapabilityId.COMPANY_WIKI, search_fn=_fast_wiki_leg)
-    reg.register_federated_source("sales-notes", CapabilityId.SALES_NOTES, search_fn=_slow_sales_leg)
+    reg.register_federated_source(
+        "company-wiki",
+        CapabilityId.COMPANY_WIKI,
+        search_fn=_fast_wiki_leg,
+        allowed_params=frozenset({"company", "sector", "tag", "search_mode", "no_decay", "media", "indexed_since"}),
+        prefixes=("wiki",),
+    )
+    reg.register_federated_source(
+        "sales-notes",
+        CapabilityId.SALES_NOTES,
+        search_fn=_slow_sales_leg,
+        allowed_params=frozenset({"sender", "layer", "search_mode", "media"}),
+        prefixes=("mail", "digest"),
+    )
+    reg.register_federated_alias("sales_mail", ("sales-notes", "tmtb"))
     fed = FederatedResearchConnector(reg, wiki_store, fanout_grace_s=0.05)
 
     # With sales-notes enabled, `sales_mail` IS advertised
@@ -3020,14 +3112,15 @@ async def test_r7_wiki_pause_writes_shared_dotenv_interpolation_host_allowlist_a
     # 4. Item #4: package_release.sh excludes docs-site/src/content/docs/everflow/
     pkg_src = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
     assert '"docs-site/src/content/docs/everflow"' in pkg_src
-    # Run package_release.sh against current repo HEAD (using working-tree script) to verify exported dir
+    # Run package_release.sh against current repo working tree (or HEAD when clean) to verify exported dir
+    source_repo = _snapshot_working_tree_repo(tmp_path)
     pkg_out = tmp_path / "core_release_export"
     pkg_res = subprocess.run(
         [
             "bash",
             str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
             "--repo",
-            str(REPO_ROOT),
+            str(source_repo),
             "--ref",
             "HEAD",
             "--output",
@@ -3339,13 +3432,14 @@ async def test_r8_wiki_pause_lease_owner_ttl_dotenv_disabled_feishu_pkg_and_sec_
         assert r_unblocked.status_code == 200 and r_unblocked.json()["ok"] is True
 
     # 2. r8 #3: Core release package excludes deliver-to-feishu.mdx & everflow/ AND b3_skills_prompts_ui check passes
+    source_repo = _snapshot_working_tree_repo(tmp_path)
     pkg_out = tmp_path / "core_release_r8"
     pkg_res = subprocess.run(
         [
             "bash",
             str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
             "--repo",
-            str(REPO_ROOT),
+            str(source_repo),
             "--ref",
             "HEAD",
             "--output",

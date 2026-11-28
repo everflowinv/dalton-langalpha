@@ -154,6 +154,10 @@ async def _read_vault_digest(sandbox: "PTCSandbox") -> str | None:
 
 def _vault_is_behind(vault_secrets: Mapping[str, str] | None, on_disk: str | None) -> bool:
     """Whether the root vault file holds other content than ``vault_secrets``."""
+    # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys from sandbox vault digest
+    from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+    vault_secrets = strip_sandbox_excluded_vault_secrets(vault_secrets)
     if vault_secrets is None:
         return False
     # No file rather than an empty one, so vault.list_names() is [].
@@ -175,6 +179,10 @@ async def _publish_changed_vault(
     ``None`` is a caller with nothing to say about the vault. ``on_disk`` is
     :func:`_read_vault_digest`'s answer.
     """
+    # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys before writing sandbox disk
+    from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+    vault_secrets = strip_sandbox_excluded_vault_secrets(vault_secrets)
     if not _vault_is_behind(vault_secrets, on_disk):
         return False
     assert vault_secrets is not None

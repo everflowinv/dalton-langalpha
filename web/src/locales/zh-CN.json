@@ -264,8 +264,13 @@
     "threadTurns": "轮次",
     "threadNeedsInput": "等待您的输入",
     "threadUnseen": "已完成，尚未查看",
+    "draft": "草稿",
+    "draftPrefix": "草稿：",
+    "draftWaiting": "有未发送的草稿",
     "workspaceUnread": "有尚未查看的会话",
     "untitledThread": "未命名",
+    "forkPreparing": "复制中…",
+    "forkPreparingHint": "正在把对话复制到新会话，较长的对话需要一点时间。",
     "onComputer": "位于 {{name}} · {{kind}}",
     "noConversations": "暂无会话",
     "workspaceFallback": "工作区",
@@ -999,6 +1004,7 @@
     "failedLoadThreads": "加载对话失败，请刷新页面。",
     "invalidThread": "无效对话，请重试。",
     "failedDeleteThread": "删除对话失败，请重试。",
+    "forkCountNote_other": "这个对话有 {{count}} 个分叉。删除后它们仍可继续使用，但不再显示分叉之前的对话内容。",
     "failedRenameThread": "重命名对话失败，请重试。",
     "viewAll": "查看全部",
     "shared": "已分享",
@@ -1125,7 +1131,9 @@
         "labelQuote": "{{label}} · “{{quote}}”",
         "quote": "“{{quote}}”",
         "open": "在文件中查看",
-        "openLabel": "在文件中查看评论 {{number}}"
+        "openLabel": "在文件中查看评论 {{number}}",
+        "open_chart": "在图表上查看",
+        "openLabel_chart": "在图表上查看评论 {{number}}"
       },
       "reply": {
         "replied_other": "已回复 {{title}} 上的评论 <nums/>",
@@ -1134,7 +1142,8 @@
         "unread": "未读",
         "showMore": "展开",
         "showLess": "收起",
-        "readRest": "在文件中阅读完整回复"
+        "readRest": "在文件中阅读完整回复",
+        "readRest_chart": "在图表上阅读完整回复"
       },
       "deck": {
         "queuedCount_other": "{{count}} 条待发送评论",
@@ -1145,6 +1154,7 @@
         "addToTurn": "加入本轮",
         "addToTurnTitle": "发送到正在进行的这一轮，你写的内容作为它们的备注",
         "showInFile": "在文件中查看",
+        "showInFile_chart": "在图表上查看",
         "keepOne": "保留为笔记：留在文件上，不发送",
         "keepOneLabel": "将评论 {{number}} 保留为笔记",
         "more": "还有 {{rest}} 条",
@@ -1161,6 +1171,21 @@
     "forkedFromDeleted": "分叉自已删除的对话",
     "forkFailed": "没能从这里开启新对话，请重试。",
     "forkTitle": "{{title}}（分叉）",
+    "forkDivider": {
+      "shown": "分叉自 {{title}}",
+      "shownUntitled": "分叉自另一个对话",
+      "changed": "分叉自 {{title}}（原对话已改动）",
+      "changedUntitled": "分叉自另一个对话（原对话已改动）",
+      "deleted": "分叉自已删除的对话",
+      "unavailable": "分叉自你无法打开的对话",
+      "open": "打开",
+      "hint": {
+        "shown": "以上消息来自原对话，无法在这里编辑、重新生成、评价或分叉。",
+        "changed": "原对话在分叉后有改动，以上只显示改动之前的消息，且无法在这里编辑、重新生成、评价或分叉。",
+        "deleted": "原对话已删除，其中的消息不再显示。",
+        "unavailable": "你无法打开原对话，因此不显示其中的消息。"
+      }
+    },
     "reconnecting": "重新连接中…",
     "offlineHistoryLoad": "网络已断开，无法刷新此对话。恢复连接后会自动同步。",
     "jumpToLatest": {
@@ -1237,6 +1262,7 @@
     "worker": "工作者",
     "agentNotFound": "未找到 Agent",
     "stoppedChip": "已停止",
+    "computerLostChip": "已停止：计算机已离线",
     "workingFor": "工作中 {{duration}}",
     "workedFor": "已工作 {{duration}}",
     "worked": "工作过程",
@@ -1340,7 +1366,7 @@
       "regenerate": "重新生成回复",
       "retry": "重试",
       "forkFromHere": "从这里分叉",
-      "editInNewChat": "在新对话中编辑"
+      "forking": "正在创建分叉…"
     },
     "turnFiles": {
       "open": "打开",

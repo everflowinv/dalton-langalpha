@@ -164,19 +164,19 @@ Everflow 生产（`scripts/dalton/ops/prod/{backup.sh,local_backup_set.py,offsit
 flowchart LR
     LOCK["1. 核验挂载与空间 + 持两把 GC 会话咨询锁"] --> SNAP["2. REPEATABLE READ 导出快照，待 pg_dump 导入且 storage_refs 枚举完引用与转写 ID 后 COMMIT"]
     SNAP --> LIST["3. list_object_versions 按两类规则选定清单 VersionId + 仅打包快照终态 asr_jobs 与台账"]
-    LIST --> FETCH["4. 完成 pg_dump 并按清单拉取对象计算 archived_sha256，释放咨询锁"]
+    LIST --> FETCH["4. 完成 pg_dump 后释放咨询锁（非版本化桶先完成拉取），再按 VersionId 拉取版本化对象计算 archived_sha256"]
     FETCH --> VERIFY["5. storage_refs.py 全消费者对账"]
     VERIFY --> PUB["6. 本机与异地校验通过后成套原子发布"]
 ```
 
 1. **备份期间照常写入的一致性切面步骤**：
-   - **第 1 步（持 GC 会话咨询锁）**：打开专用 PostgreSQL 控制连接，执行 `SET idle_in_transaction_session_timeout = 0;` 并获取会话级咨询锁 `SELECT pg_advisory_lock(hashtextextended('workspace_file_blobs:gc', 0)), pg_advisory_lock(hashtextextended('provenance_gc_sweep', 0));`（对齐 `src/server/database/workspace_file_blobs.py:111, 551` 与 `src/server/database/provenance_bodies.py:46, 349`），**保持到第 4 步对象拉取结束**。
+   - **第 1 步（持 GC 会话咨询锁）**：打开专用 PostgreSQL 控制连接，执行 `SET idle_in_transaction_session_timeout = 0;` 并获取会话级咨询锁 `SELECT pg_advisory_lock(hashtextextended('workspace_file_blobs:gc', 0)), pg_advisory_lock(hashtextextended('provenance_gc_sweep', 0));`（对齐 `src/server/database/workspace_file_blobs.py:111, 551` 与 `src/server/database/provenance_bodies.py:46, 349`），**保持到第 4 步 `pg_dump` 结束（未开启版本控制的外部桶同时保持到对象拉取结束）**。
    - **第 2 步（导出数据库快照并枚举引用）**：在同一控制连接开启 `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT pg_export_snapshot();` 取得 `snapshot_id`。该只读事务保持打开，直到 `pg_dump -Fc --snapshot="<snapshot_id>"` 完成快照导入、且 `storage_refs.py` 在同一快照里枚举完引用键集合与转写终态作业 ID 列表之后才执行 `COMMIT`（会话咨询锁继续保持）。
    - **第 3 步（列版本按两类规则取键 + 按快照终态打包转写目录）**：
      - 对各活跃桶执行 `list_object_versions`，清单键集合等于「**列版本时仍存在的键 ∪ 快照仍引用的键**」，按两类取键：① 当前版本是普通对象的键，取当前 `VersionId`；② 当前版本是删除标记、但第 2 步快照里仍有引用的键，取删除标记之前最近的一个版本；其余键（当前是删除标记且快照不再引用）跳过不入清单。快照引用的任一键在桶内找不到任何版本时，本次备份不发布并以非零码退出；
      - 内置 MinIO 一律开启版本控制（开启前存量对象的 `VersionId` 为 `"null"`，拉取时原样传入 `"null"`）。核心安装可接入未开启版本控制的外部桶，备份照常运行并打 `WARNING`（列举与拉取省略 `VersionId`；缺对象或对账失败时不发布并退出非零）；
      - 按第 2 步同一快照查出的终态（`succeeded`/`failed`/`cancelled`/`indeterminate`，定义见 `src/dalton/database/transcriptions.py:26-41`）ASR（Automatic Speech Recognition，自动语音识别）作业 ID 列表，只打包这些终态作业在 `<DALTON_ASR_JOBS_DIR>/<job_id>/` 下的目录及顶层 `asr_usage.jsonl`（排除 `*.lock`、`*.tmp` 与临时切片目录），生成 `asr-jobs-<backup_set_id>.tar.gz` 并记录大小与 SHA-256（Everflow 生产路径见 `scripts/dalton/launchd/com.dalton.transcription.plist.template:56-59`、`src/dalton/transcription_service/app.py:63-65`；核心安装为 `dalton-asr-jobs` 卷，`docker-compose.core.yml:265, 270, 412`）。
-   - **第 4 步（拉取对象与对账）**：等待 `pg_dump` 结束，按清单固定的 `VersionId` 拉取对象计算 `archived_sha256`（Everflow 写入外置盘镜像池 `backups/minio-mirror/objects/`，核心安装写入 `minio-objects.tar.gz`），拉取结束后释放两把会话咨询锁，运行 `storage_refs.py` 完成全消费者对账。
+   - **第 4 步（拉取对象与对账）**：等待 `pg_dump` 结束（未开启版本控制的外部桶同时在持锁期内完成对象拉取），随后释放两把会话咨询锁；已开启版本控制的桶在释放咨询锁之后按清单固定的 `VersionId` 拉取对象并计算 `archived_sha256`（按 `VersionId` 读取指定版本，后续删除只写入新删除标记，对象历史版本在非当前版本 30 天保留期内保持可读，同时避免长时间持锁；Everflow 写入外置盘镜像池 `backups/minio-mirror/objects/`，核心安装写入 `minio-objects.tar.gz`），完成后运行 `storage_refs.py` 完成全消费者对账。
 
 2. **全仓对象写入入口、键形态与可变性登记表**：
    > **硬性规则**：新增对象存储写入统一采用内容寻址或一次性随机标识的**不可变键**，先上传对象、后提交数据库记录；确需引入可变键时，先登记入下表并明确备份恢复语义。

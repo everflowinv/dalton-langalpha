@@ -311,6 +311,15 @@ async def start_task_run(
                 # DALTON-HOOK(colleague-dispatch): subagent belongs to an already-admitted parent run; skip colleague access re-check
                 await lock_run_workspace(conn, thread_id, check_colleague_access=False)
 
+                # DALTON-HOOK(maintenance-gate): acquire shared PG advisory lock and enforce maintenance gate before subagent_runs insert
+                from src.dalton.maintenance_gate import (
+                    enforce_maintenance_admission_for_subagent_in_txn,
+                )
+
+                await enforce_maintenance_admission_for_subagent_in_txn(
+                    conn, thread_id=thread_id
+                )
+
                 # Fast-path dedup probe for checkpoint re-execution; the
                 # partial unique index below is the race-safe backstop.
                 if parent_run_id and launch_tool_call_id:

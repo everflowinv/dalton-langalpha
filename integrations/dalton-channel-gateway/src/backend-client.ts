@@ -446,7 +446,8 @@ export interface I6AuthorizeAndClaimRequest {
     | "automation"
     | "notice"
     | "data_task"
-    | "automation_notify";
+    | "automation_notify"
+    | "failure_notice";
   user_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
@@ -462,6 +463,7 @@ export interface I6AuthorizeAndClaimRequest {
   activity_origin?: DeliveryActivityOrigin | null;
   retry_dedup_by_target?: boolean;
   payload_digest?: string | null;
+  claim_token?: string | null;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -533,6 +535,10 @@ export interface I6AuthorizeAndClaimResponse {
   topic_initiator_platform_user_id?: string | null;
   topic_canonical_scope_key?: string | null;
   dm_recipient_platform_user_id?: string | null;
+  has_personal_integration_data?: boolean;
+  personal_private_redirect_notice?: boolean;
+  forced_text?: string | null;
+  redirect_dm_address?: string | null;
   prior_run_files?: Array<{
     workspace_id?: string | null;
     path: string;
@@ -886,6 +892,7 @@ export interface RecoverAutomationRunRow {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   entries: string[];
   status: "registered" | "finishing" | "finished";
@@ -899,11 +906,13 @@ export interface RecoverAutomationRunRow {
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
 }
 
 export interface I7RecoverResponse {
   mode: "startup" | "watch_reconnect";
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
   inbound_events?: RecoverInboundEventRow[];
   background_runs: RecoverBackgroundRunRow[];
   thread_watches: RecoverThreadWatchRow[];
@@ -942,11 +951,13 @@ export interface I8AutomationRunFinishResponse {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   finish_status: string | null;
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +967,7 @@ export interface I8AutomationRunFinishResponse {
 export interface GatewayLeaseAcquireRequest {
   instance_id: string;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseAcquireResponse {
@@ -969,6 +981,7 @@ export interface GatewayLeaseHeartbeatRequest {
   instance_id: string;
   epoch: number;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseHeartbeatResponse {
@@ -1177,6 +1190,7 @@ export interface ThreadMessageDispatchPayload {
   external_thread_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
   steer_only?: boolean;
   hitl_response?: Record<string, { decisions: Array<Record<string, unknown>> }>;
@@ -1193,6 +1207,7 @@ export interface ThreadRetryPayload {
   checkpoint_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
 }
 
@@ -1649,6 +1664,18 @@ export interface BackendClient {
 
   authorizeAutomationNotificationPlan?(req: {
     delivery_id: string;
+  }): Promise<DataTaskAuthorizePlanResponse>;
+
+  forwardFeishuRevokedEvent?(payload: Record<string, unknown>): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }>;
+
+  authorizeFailureNoticePlan?(req: {
+    target_receipt_id: string;
+    claim_token: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
 
   downloadDataTaskRunArtifact?(
@@ -2161,7 +2188,11 @@ export class HttpBackendClient implements BackendClient {
     );
     const includeGatewayEpoch =
       inferredPlatform === "weixin" || inferredPlatform === null;
-    if (req.kind === "data_task" || req.kind === "automation_notify") {
+    if (
+      req.kind === "data_task" ||
+      req.kind === "automation_notify" ||
+      req.kind === "failure_notice"
+    ) {
       const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
         "POST",
         "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
@@ -2227,7 +2258,8 @@ export class HttpBackendClient implements BackendClient {
     if (
       typeof req.delivery_key === "string" &&
       (req.delivery_key.startsWith("data_task:") ||
-        req.delivery_key.startsWith("automation_notify:"))
+        req.delivery_key.startsWith("automation_notify:") ||
+        req.delivery_key.startsWith("failure_notice:"))
     ) {
       const { data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
         "POST",
@@ -2995,6 +3027,33 @@ export class HttpBackendClient implements BackendClient {
     return data;
   }
 
+  async forwardFeishuRevokedEvent(
+    payload: Record<string, unknown>,
+  ): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }> {
+    const { status, data } = await this.jsonRequest<{
+      status: string;
+      event_id?: string | null;
+      reason?: string | null;
+      purge_ids?: string[];
+    }>("POST", "/api/v1/dalton/integrations/internal/feishu/events", {
+      body: payload,
+      timeoutMs: 15_000,
+    });
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `forwardFeishuRevokedEvent failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
   async verifyDmDeliveryRecipient(
     deliveryKey: string,
     deliveryAttempt?: number,
@@ -3255,6 +3314,28 @@ export class HttpBackendClient implements BackendClient {
         cache: "no-store",
         strictJson: true,
         operationLabel: "authorizeAutomationNotificationPlan",
+      },
+    );
+    return data;
+  }
+
+  async authorizeFailureNoticePlan(req: {
+    target_receipt_id: string;
+    claim_token: string;
+  }): Promise<DataTaskAuthorizePlanResponse> {
+    const { data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/failure-notices/plan",
+      {
+        body: {
+          target_receipt_id: req.target_receipt_id,
+          claim_token: req.claim_token,
+        },
+        timeoutMs: 15_000,
+        redirect: "error",
+        cache: "no-store",
+        strictJson: true,
+        operationLabel: "authorizeFailureNoticePlan",
       },
     );
     return data;
