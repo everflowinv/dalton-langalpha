@@ -60,6 +60,7 @@ class _InMemoryDeferralStore:
         self._outbox_idem: set[str] = set()
         self.advisory_locks: list[int] = []
         self.reschedule_queries: list[tuple[str, Any]] = []
+        self.responses: list[dict[str, Any]] = []
 
     @asynccontextmanager
     async def transaction(self):
@@ -92,6 +93,15 @@ class _InMemoryCursor:
             key = str(params[0])
             row = self._store.rows.get(key)
             self._result = dict(row) if row is not None else None
+        elif norm.startswith("SELECT 1 FROM CONVERSATION_RESPONSES"):
+            tid, req_key, failed_id = str(params[0]), str(params[1]), str(params[2])
+            matched = any(
+                str(r.get("conversation_thread_id") or "") == tid
+                and str(r.get("request_key") or "") == req_key
+                and str(r.get("retry_of_run_id") or "") == failed_id
+                for r in self._store.responses
+            )
+            self._result = (1,) if matched else None
         elif norm.startswith("INSERT INTO DALTON_WAKEUP_QUOTA_DEFERRALS"):
             key = str(params[0])
             existing = self._store.rows.get(key)
@@ -175,8 +185,17 @@ class _InMemoryCursor:
                     row["status"] = "settled"
                 elif "'EXHAUSTED_FAILED'" in norm:
                     row["status"] = "exhausted_failed"
-                    row["last_reason"] = "wakeup_quota_deadline_exceeded"
+                    if "'UNATTENDED_QUOTA_FALLBACK_DISABLED'" in norm:
+                        row["last_reason"] = "unattended_quota_fallback_disabled"
+                    else:
+                        row["last_reason"] = "wakeup_quota_deadline_exceeded"
                 self.rowcount = 1
+                if "RETURNING" in norm:
+                    self._result = {
+                        "wakeup_id": row.get("wakeup_id"),
+                        "owner_user_id": row.get("owner_user_id"),
+                        "defer_count": row.get("defer_count", 0),
+                    }
         elif norm.startswith("UPDATE HOOK_OUTBOX"):
             self._store.reschedule_queries.append((sql, params))
             self.rowcount = 1
@@ -364,7 +383,6 @@ async def test_same_wakeup_4th_pre_dispatch_cooldown_terminates_without_keyerror
 ) -> None:
     """Real chain across delivery._deliver -> post_notification_turn -> automation_thread_model -> ledger."""
     monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
 
     store = _InMemoryDeferralStore()
     root_job_id = str(uuid4())
@@ -792,6 +810,7 @@ async def test_mid_turn_exhaustion_executor_finalize_enqueues_resume_and_replays
 async def test_execute_wakeup_quota_resume_deadline_recheck_and_fenced_reschedule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
     store = _InMemoryDeferralStore()
     root_job_id = str(uuid4())
     thread_id = str(uuid4())
@@ -1046,3 +1065,362 @@ def test_register_wakeup_executors_registers_resume_hook(monkeypatch: pytest.Mon
     assert "wakeup" in registered
     assert uf.WAKEUP_QUOTA_RESUME_HOOK in registered
     assert registered[uf.WAKEUP_QUOTA_RESUME_HOOK] is uf.execute_wakeup_quota_resume
+
+
+# ---------------------------------------------------------------------------
+# 6. Codex #7, #8, #9: own-run recognition, 24h deadline before HTTP retries &
+#    DB fail-closed & pre-held normal wakeup recovery, and switch-off settlement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_wakeup_quota_resume_recognizes_own_dispatched_run_without_settling_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #7: Re-claiming unacked job after /retry created its own run must NOT mark deferral settled."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    store = _InMemoryDeferralStore()
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    failed_run_id = str(uuid4())
+    own_retry_run_id = str(uuid4())
+    ws_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    req_key = uf.deterministic_wakeup_resume_request_key(root_job_id, 1)
+
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
+
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    store.rows[root_job_id] = {
+        "root_job_id": root_job_id,
+        "wakeup_id": "wake-own",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": now - timedelta(hours=1),
+        "deadline_at": now + timedelta(hours=23),
+        "defer_count": 1,
+        "last_step_key": f"mid:{failed_run_id}",
+        "seen_step_keys": [f"mid:{failed_run_id}"],
+        "status": "deferred",
+    }
+
+    job = {
+        "hook_outbox_id": str(uuid4()),
+        "conversation_thread_id": thread_id,
+        "run_id": failed_run_id,
+        "attempts": 2,
+        "payload": {
+            "root_job_id": root_job_id,
+            "wakeup_id": "wake-own",
+            "owner_user_id": "owner-1",
+            "workspace_id": ws_id,
+            "failed_run_id": failed_run_id,
+            "defer_count": 1,
+            "request_key": req_key,
+        },
+    }
+
+    orig_post = notify_turn.post_notification_turn
+    orig_get_latest = tl_db.get_latest_attempt
+    post_mock = create_autospec(orig_post, instance=False)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+
+    # Case A: latest attempt IS our own dispatched retry run -> ack old job ONLY, keep deferral 'deferred'!
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_get_latest,
+            instance=False,
+            return_value={
+                "conversation_response_id": own_retry_run_id,
+                "status": "in_progress",
+                "request_key": req_key,
+                "retry_of_run_id": failed_run_id,
+            },
+        ),
+    )
+    await uf.execute_wakeup_quota_resume(job)
+    assert post_mock.await_count == 0
+    assert store.rows[root_job_id]["status"] == "deferred"
+
+    # Case B: our own retry run already finished & another retry R3 is now latest, while R2 is in history ->
+    # STILL recognizes own dispatched run via (request_key, retry_of_run_id) and keeps deferral 'deferred'!
+    store.responses.append(
+        {
+            "conversation_response_id": own_retry_run_id,
+            "conversation_thread_id": thread_id,
+            "request_key": req_key,
+            "retry_of_run_id": failed_run_id,
+        }
+    )
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_get_latest,
+            instance=False,
+            return_value={
+                "conversation_response_id": str(uuid4()),
+                "status": "in_progress",
+                "request_key": str(uuid4()),
+                "retry_of_run_id": own_retry_run_id,
+            },
+        ),
+    )
+    await uf.execute_wakeup_quota_resume(job)
+    assert post_mock.await_count == 0
+    assert store.rows[root_job_id]["status"] == "deferred"
+
+    # Case C: genuinely foreign user turn (no matching (request_key, retry_of_run_id)) -> marks 'settled'
+    store.responses.clear()
+    await uf.execute_wakeup_quota_resume(job)
+    assert store.rows[root_job_id]["status"] == "settled"
+
+
+@pytest.mark.asyncio
+async def test_wakeup_24h_deadline_checked_before_http_retries_db_error_fails_closed_and_pre_held_recovery_checks_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #8:
+    (a) DB error during deadline check fails closed (raises, never dispatches).
+    (b) Crossing 24h deadline between internal HTTP retries is caught by still_due before next POST.
+    (c) Pre-dispatch held normal wakeup recovering past 24h when model IS now available STILL checks
+        the ledger in automation_thread_model and refuses with dalton_wakeup_quota_exhausted (400)
+        (or 503 on DB error).
+    """
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    store = _InMemoryDeferralStore()
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    failed_run_id = str(uuid4())
+    ws_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    # (a) DB failure during _check_and_enforce_resume_deadline raises and NEVER dispatches
+    @asynccontextmanager
+    async def _broken_conn(conn: Any = None):
+        raise RuntimeError("pg connection lost")
+        yield  # pragma: no cover
+
+    orig_post = notify_turn.post_notification_turn
+    monkeypatch.setattr(uf, "get_db_connection", _broken_conn)
+    post_mock = create_autospec(orig_post, instance=False)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+    with pytest.raises(RuntimeError, match="pg connection lost"):
+        await uf.execute_wakeup_quota_resume(
+            {
+                "hook_outbox_id": str(uuid4()),
+                "conversation_thread_id": thread_id,
+                "run_id": failed_run_id,
+                "attempts": 1,
+                "payload": {
+                    "root_job_id": root_job_id,
+                    "wakeup_id": "wake-db-err",
+                    "owner_user_id": "owner-1",
+                    "workspace_id": ws_id,
+                    "failed_run_id": failed_run_id,
+                    "defer_count": 1,
+                },
+            }
+        )
+    assert post_mock.await_count == 0
+
+    # (b) Crossing 24h deadline before an internal HTTP retry stops via still_due
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
+
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(
+        uf,
+        "_maybe_enqueue_failure_notice_in_tx",
+        create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False, return_value=True),
+    )
+    store.rows[root_job_id] = {
+        "root_job_id": root_job_id,
+        "wakeup_id": "wake-mid-retry",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": now - timedelta(hours=23),
+        "deadline_at": now + timedelta(hours=1),
+        "defer_count": 1,
+        "last_step_key": f"mid:{failed_run_id}",
+        "seen_step_keys": [f"mid:{failed_run_id}"],
+        "status": "deferred",
+    }
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            tl_db.get_latest_attempt,
+            instance=False,
+            return_value={"conversation_response_id": failed_run_id, "status": "error", "metadata": {"workspace_id": ws_id}},
+        ),
+    )
+
+    still_due_results: list[bool] = []
+
+    async def _sim_retry_crosses_deadline(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        still_due_cb = kwargs["still_due"]
+        assert still_due_cb is not None
+        # First attempt before deadline -> due
+        still_due_results.append(await still_due_cb())
+        # Deadline expires before the next HTTP retry!
+        store.rows[root_job_id]["deadline_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        still_due_results.append(await still_due_cb())
+        return "superseded", None
+
+    monkeypatch.setattr(
+        notify_turn,
+        "post_notification_turn",
+        create_autospec(orig_post, instance=False, side_effect=_sim_retry_crosses_deadline),
+    )
+    await uf.execute_wakeup_quota_resume(
+        {
+            "hook_outbox_id": str(uuid4()),
+            "conversation_thread_id": thread_id,
+            "run_id": failed_run_id,
+            "attempts": 1,
+            "payload": {
+                "root_job_id": root_job_id,
+                "wakeup_id": "wake-mid-retry",
+                "owner_user_id": "owner-1",
+                "workspace_id": ws_id,
+                "failed_run_id": failed_run_id,
+                "defer_count": 1,
+            },
+        }
+    )
+    assert still_due_results == [True, False]
+    assert store.rows[root_job_id]["status"] == "exhausted_failed"
+
+    # (c) Pre-dispatch held normal wakeup recovering past 24h when model IS now available
+    #     STILL checks ledger in automation_thread_model and refuses (never dispatches!)
+    root_pre = str(uuid4())
+    store.rows[root_pre] = {
+        "root_job_id": root_pre,
+        "wakeup_id": "wake-pre-expired",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": now - timedelta(hours=25),
+        "deadline_at": now - timedelta(hours=1),
+        "defer_count": 1,
+        "last_step_key": f"pre:{root_pre}:1",
+        "seen_step_keys": [f"pre:{root_pre}:1"],
+        "status": "deferred",
+    }
+    monkeypatch.setattr(
+        auto_tm_mod,
+        "_resolve_automation_notification_context",
+        create_autospec(
+            auto_tm_mod._resolve_automation_notification_context,
+            instance=False,
+            return_value=(None, None, None, False, False, None),
+        ),
+    )
+    # Primary model is AVAILABLE now!
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(
+            uf.inspect_subscription_availability,
+            instance=False,
+            return_value=uf.SubscriptionAvailability(available=True, model_name="claude-opus-5-5-oauth"),
+        ),
+    )
+    resolve_never = create_autospec(lambda m: None, instance=False)
+    req_wake = SimpleNamespace(
+        query_type="wakeup",
+        platform=None,
+        hitl_response=None,
+        wakeup={"v": 1, "root_job_id": root_pre, "wakeup_id": "wake-pre-expired", "notices": []},
+    )
+    with pytest.raises(HTTPException) as exp_exc:
+        await auto_tm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id="owner-1",
+            thread_id=thread_id,
+            request=req_wake,
+            requested_model="claude-opus-5-5-oauth",
+            held_model=None,
+            from_service=True,
+            resolve=resolve_never,
+        )
+    assert exp_exc.value.status_code == 400
+    assert exp_exc.value.detail["type"] == uf.DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE
+    assert store.rows[root_pre]["status"] == "exhausted_failed"
+    assert resolve_never.call_count == 0
+
+    # And DB failure on admission returns 503 (never dispatches!)
+    monkeypatch.setattr(uf, "get_db_connection", _broken_conn)
+    with pytest.raises(HTTPException) as db_exc:
+        await auto_tm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id="owner-1",
+            thread_id=thread_id,
+            request=req_wake,
+            requested_model="claude-opus-5-5-oauth",
+            held_model=None,
+            from_service=True,
+            resolve=resolve_never,
+        )
+    assert db_exc.value.status_code == 503
+    assert resolve_never.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_wakeup_quota_resume_switch_off_settles_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #9: Main switch OFF settles already-queued wakeup_quota_resume as failed without dispatching."""
+    monkeypatch.delenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", raising=False)
+    store = _InMemoryDeferralStore()
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    failed_run_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
+
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    notice_mock = create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False, return_value=True)
+    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", notice_mock)
+    store.rows[root_job_id] = {
+        "root_job_id": root_job_id,
+        "wakeup_id": "wake-switch-off",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": now - timedelta(minutes=10),
+        "deadline_at": now + timedelta(hours=23),
+        "defer_count": 1,
+        "last_step_key": f"mid:{failed_run_id}",
+        "seen_step_keys": [f"mid:{failed_run_id}"],
+        "status": "deferred",
+    }
+
+    post_mock = create_autospec(notify_turn.post_notification_turn, instance=False)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+
+    await uf.execute_wakeup_quota_resume(
+        {
+            "hook_outbox_id": str(uuid4()),
+            "conversation_thread_id": thread_id,
+            "run_id": failed_run_id,
+            "attempts": 1,
+            "payload": {
+                "root_job_id": root_job_id,
+                "wakeup_id": "wake-switch-off",
+                "owner_user_id": "owner-1",
+                "workspace_id": str(uuid4()),
+                "failed_run_id": failed_run_id,
+                "defer_count": 1,
+            },
+        }
+    )
+    assert post_mock.await_count == 0
+    assert store.rows[root_job_id]["status"] == "exhausted_failed"
+    assert store.rows[root_job_id]["last_reason"] == "unattended_quota_fallback_disabled"
+    assert notice_mock.await_count == 1

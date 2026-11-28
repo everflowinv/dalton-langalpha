@@ -396,6 +396,35 @@ async def resolve_live_route_fingerprint(
     )
 
 
+async def load_resume_source_snapshot(
+    target: ResumeVerifyTarget | None = None,
+    *,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Load the persisted ``effective_catalog_snapshot`` for a resume target run, if any."""
+    eff_target = target if target is not None else get_active_resume_verify_target()
+    if eff_target is None:
+        return None
+    row: dict[str, Any] | None = (
+        dict(eff_target.run_row) if isinstance(eff_target.run_row, Mapping) else None
+    )
+    if row is None and eff_target.run_id:
+        row = await _fetch_persisted_run_row(
+            eff_target.run_id,
+            thread_id=eff_target.thread_id,
+            conn=conn,
+        )
+    if not isinstance(row, Mapping):
+        return None
+    meta = row.get("metadata")
+    if not isinstance(meta, Mapping):
+        return None
+    snap = meta.get("effective_catalog_snapshot")
+    if isinstance(snap, Mapping) and snap.get("schema") == TURN_SNAPSHOT_SCHEMA:
+        return copy.deepcopy(dict(snap))
+    return None
+
+
 def extract_snapshot_route_fingerprint(
     snapshot: Mapping[str, Any] | None,
     model_key: str,

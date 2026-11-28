@@ -212,7 +212,6 @@ async def internal_llm_complete(
                 task_fallbacks=ordered_pool,
                 primary_model=requested_model,
                 allowed_pool=allowed_models,
-                allow_cash=False,
                 skip_cooldown_keys=skip_keys,
                 user_id=primary_admin_id,
                 ignore_custom_models=True,
@@ -236,7 +235,7 @@ async def internal_llm_complete(
         slot="background",
         purpose=payload.purpose,
         timeout_s=payload.timeout_s,
-        ignore_custom_models=True,
+        **({"ignore_custom_models": True} if unattended_on else {}),
     )
 
     if not result.ok and unattended_on:
@@ -257,7 +256,6 @@ async def internal_llm_complete(
                 task_fallbacks=ordered_pool,
                 primary_model=active_model,
                 allowed_pool=allowed_models,
-                allow_cash=False,
                 skip_cooldown_keys=skip_keys,
                 user_id=primary_admin_id,
                 ignore_custom_models=True,
@@ -289,8 +287,10 @@ async def internal_llm_complete(
                         cand_model,
                     )
                     break
+                if not is_complete_result_quota_or_auth_trigger(cand_res):
+                    break
 
-            if not result.ok:
+            if not result.ok and is_complete_result_quota_or_auth_trigger(result):
                 # Best-effort Item 3 call-site (no-op when Item 3 is absent/disabled)
                 try:
                     async with get_db_connection() as conn:

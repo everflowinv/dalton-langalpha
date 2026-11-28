@@ -2238,20 +2238,3 @@ def is_unattended_quota_fallback_enabled() -> bool:
         default=False,
     )
 
-
-def allow_cash_fallback_on_unattended() -> bool:
-    """Switch allowing unattended quota fallback to spill into cash-billed models (default ``False``).
-
-    When ``False`` (default), unattended fallback is strictly confined to ``$0``
-    OAuth subscription models. When ``True``, cash fallback is gated atomically
-    through ``acquire_cash_lease_tx``. Reads
-    ``DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED`` -> YAML
-    ``autonomy.allow_cash_fallback_on_unattended`` -> ``False``.
-    """
-    return _parse_bool_env_or_section_yaml(
-        "DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED",
-        "autonomy",
-        "allow_cash_fallback_on_unattended",
-        default=False,
-    )
-

@@ -237,9 +237,9 @@ async def resolve_with_subscription_fallback(
 
     Uses the user's saved ``prefs['fallback_models']`` when present (an explicit
     empty list ``[]`` disables fallback when ``unattended_gate`` is False). When
-    ``unattended_gate`` is True, candidate selection and cash admission go through
+    ``unattended_gate`` is True, candidate selection and live admission go through
     the unified unattended fallback chain and ``acquire_fallback_candidate_live``
-    (enforcing ``allow_cash_fallback_on_unattended()`` and ``acquire_cash_lease_tx``).
+    (strictly confined to ``$0`` OAuth subscription candidates).
 
     Raises *exc_to_raise* if no fallback candidate can serve the turn.
     """
@@ -388,11 +388,6 @@ async def resolve_with_subscription_fallback(
                 continue
 
         if admission is not None:
-            if admission.lease_verdict is not None:
-                try:
-                    setattr(config, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
-                except Exception:
-                    pass
             if admission.route is not None:
                 try:
                     setattr(config, "_dalton_active_fallback_route", route_fingerprint_to_dict(admission.route))
@@ -537,11 +532,6 @@ async def resolve_automation_turn_llm_config(
                         cfg = await _resolve(cand)
                     except Exception:
                         continue
-                    if admission.lease_verdict is not None:
-                        try:
-                            setattr(cfg, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
-                        except Exception:
-                            pass
                     if admission.route is not None:
                         try:
                             setattr(cfg, "_dalton_active_fallback_route", route_fingerprint_to_dict(admission.route))

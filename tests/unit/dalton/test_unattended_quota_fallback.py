@@ -44,6 +44,7 @@ from fastapi import HTTPException
 from langchain_core.messages import AIMessage
 
 from src.config.models import ModelsPolicy, OwnModelAccessPolicy, PolicyLayer
+from src.dalton import settings as dalton_settings_mod
 from src.dalton.budget import port as budget_port
 from src.dalton.llm import assist as assist_mod
 from src.dalton.llm import complete as complete_mod
@@ -55,25 +56,18 @@ from src.dalton.services.team_model_catalog.constants import TURN_SNAPSHOT_SCHEM
 from src.dalton.services.team_model_catalog.snapshot import (
     RouteFingerprint,
     bind_catalog_snapshot,
+    resume_verify_scope,
     verify_candidate_route_against_snapshot,
     verify_resume_route,
 )
-from src.dalton.settings import (
-    allow_cash_fallback_on_unattended,
-    is_unattended_quota_fallback_enabled,
-)
+from src.dalton.settings import is_unattended_quota_fallback_enabled
 from src.llms.provider_errors import ProviderRefusal
-from ptc_agent.agent.middleware.credit_gate import (
-    CreditGateState,
-    CreditLease,
-    LeaseVerdict,
-    current_credit_gate,
-)
 from src.ptc_agent.agent.middleware.model_resilience import (
     ModelResilienceMiddleware,
     _RemoteQuotaExhaustedError,
     quota_redis_key,
 )
+from ptc_agent.config.agent import CredentialSource
 from src.server.database import oauth_tokens as oauth_tokens_db
 from src.server.handlers.chat.error_handling import classify_error
 from src.server.services.llm import clients as llm_clients
@@ -195,14 +189,11 @@ class _FakeConn:
 
 def test_unattended_switches_default_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", raising=False)
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
     assert is_unattended_quota_fallback_enabled() is False
-    assert allow_cash_fallback_on_unattended() is False
+    assert not any(name.startswith("allow_cash_") for name in dir(dalton_settings_mod))
 
     monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
-    monkeypatch.setenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", "true")
     assert is_unattended_quota_fallback_enabled() is True
-    assert allow_cash_fallback_on_unattended() is True
 
 
 def test_d062_migration_single_head_no_src_imports_and_sql() -> None:
@@ -259,7 +250,6 @@ async def test_public_entrypoints_import_and_execute_with_switch_on(
 ) -> None:
     """Exercise every public entrypoint of unattended_fallback with switch ON (real resolve_turn_tuning)."""
     monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
 
     # 1. Context binding & source classification
     ctx = uf.UnattendedTurnContext(
@@ -276,7 +266,9 @@ async def test_public_entrypoints_import_and_execute_with_switch_on(
     # 2. resolve_unattended_fallback_clients exercises REAL src.llms.preferences.resolve_turn_tuning
     fake_client = _FakeModel("gpt-6.2-sol-oauth", billing_type="oauth", provider="codex-oauth")
     resolve_client_mock = create_autospec(llm_clients.resolve_model_client, instance=False)
-    resolve_client_mock.return_value = SimpleNamespace(client=fake_client)
+    resolve_client_mock.return_value = SimpleNamespace(
+        client=fake_client, credential_source=CredentialSource.OAUTH
+    )
     monkeypatch.setattr(llm_clients, "resolve_model_client", resolve_client_mock)
     monkeypatch.setattr(
         uf,
@@ -469,7 +461,6 @@ async def test_inspect_subscription_availability_oauth_reauth_and_redis_key_pari
 def test_resolve_unattended_fallback_chain_disable_and_cash_filter_fall_through_to_profile_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
     billing_map = {
         "claude-opus-5-5-oauth": ("oauth", "anthropic-oauth"),
         "gpt-6.2-sol-oauth": ("oauth", "codex-oauth"),
@@ -506,14 +497,6 @@ def test_resolve_unattended_fallback_chain_disable_and_cash_filter_fall_through_
     )
     assert chain_cash_only_personal == ["gpt-6.2-sol-oauth", "gemini-4-neon-high-oauth"]
 
-    # When cash switch is ON, cash model is included ahead of profile tail
-    chain_cash_on = uf.resolve_unattended_fallback_chain(
-        user_prefs={"fallback_models": ["deepseek-flash"]},
-        primary_model="claude-opus-5-5-oauth",
-        allow_cash=True,
-    )
-    assert chain_cash_on == ["deepseek-flash", "gpt-6.2-sol-oauth", "gemini-4-neon-high-oauth"]
-
 
 # ---------------------------------------------------------------------------
 # 6. Pre-dispatch cooldown -> subscription pool fallback (real chain)
@@ -526,7 +509,6 @@ async def test_pre_dispatch_cooldown_switches_to_subscription_pool_candidate(
 ) -> None:
     """Real chain: resolve_turn_config_with_automation_inheritance probes cooldown -> picks $0 fallback."""
     monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
     now = datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc)
 
     pref_mock = create_autospec(user_models.get_model_preference, instance=False)
@@ -635,43 +617,28 @@ async def test_pre_dispatch_cooldown_switches_to_subscription_pool_candidate(
 
 
 # ---------------------------------------------------------------------------
-# 7. Unified cash admission across legacy auth-failure, pre-dispatch & runtime
+# 7. $0 OAuth-only admission: blocks cash everywhere & closes disconnected-OAuth bypasses
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_legacy_auth_failure_blocks_cash_when_off_and_uses_acquire_cash_lease_when_on(
+async def test_unattended_blocks_cash_and_disconnected_oauth_does_not_leak_to_cash_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """resolve_with_subscription_fallback with unattended_gate=True never picks cash when OFF,
-    and routes through acquire_cash_lease_tx (binding LeaseVerdict) when ON."""
+    """With cash fallback removed:
+    - resolve_with_subscription_fallback(..., unattended_gate=True) always rejects cash candidates;
+    - inspect_subscription_availability detects disconnected OAuth as auth_unavailable;
+    - automation_thread_model never falls through to resolve(None) (account cash default) on disconnected OAuth;
+    - assist_json never leaks into cash deepseek-flash even via _is_safe_to_fallback when switch is ON.
+    """
     monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
     monkeypatch.setattr(uf, "get_profile_default_fallback_chain", lambda: [])
     monkeypatch.setattr(
         uf,
         "_classify_candidate_billing",
-        lambda model_name, prefs=None, ignore_custom_models=False: ("cash", "deepseek"),
-    )
-    monkeypatch.setattr(
-        uf,
-        "resolve_live_route_fingerprint",
-        create_autospec(
-            uf.resolve_live_route_fingerprint,
-            instance=False,
-            return_value=RouteFingerprint(
-                model_key="deepseek-flash",
-                provider="deepseek",
-                model_id="deepseek-chat",
-                billing="cash",
-            ),
+        lambda model_name, prefs=None, ignore_custom_models=False: (
+            ("oauth", "codex-oauth") if model_name.endswith("-oauth") else ("cash", "deepseek")
         ),
-    )
-    from src.server.services import account as account_mod
-
-    monkeypatch.setattr(
-        account_mod,
-        "require_policy",
-        create_autospec(account_mod.require_policy, instance=False, return_value=ALLOW_ALL),
     )
     monkeypatch.setattr(
         auto_fb_mod,
@@ -684,8 +651,7 @@ async def test_legacy_auth_failure_blocks_cash_when_off_and_uses_acquire_cash_le
     async def _resolve_cand(model_name: str) -> Any:
         return SimpleNamespace(llm=SimpleNamespace(name=model_name), llm_client=_FakeModel(model_name, "cash"))
 
-    # Cash switch OFF -> raises original exception, never picks deepseek-flash
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
+    # 1) Legacy auth failure with unattended_gate=True unconditionally rejects cash candidate
     with pytest.raises(HTTPException) as exc_info:
         await auto_fb_mod.resolve_with_subscription_fallback(
             user_id="user-1",
@@ -698,40 +664,118 @@ async def test_legacy_auth_failure_blocks_cash_when_off_and_uses_acquire_cash_le
             model_resolves_fn=lambda prefs, name: True,
             unattended_gate=True,
             payer_user_id="user-1",
-            run_id="run-cash-auth-1",
+            run_id="run-no-cash-1",
         )
     assert exc_info.value is orig_exc
 
-    # Cash switch ON -> MUST call acquire_cash_lease with real payer & run_id & bind verdict
-    monkeypatch.setenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", "1")
-    lease_mock = create_autospec(uf.acquire_cash_lease, instance=False)
-    lease_mock.return_value = LeaseVerdict(granted=True, ceiling_credits=250.0, ttl_seconds=300.0, generation=2)
-    monkeypatch.setattr(uf, "acquire_cash_lease", lease_mock)
-
-    cfg, rec = await auto_fb_mod.resolve_with_subscription_fallback(
-        user_id="user-1",
-        prefs={"fallback_models": ["deepseek-flash"]},
-        original_model="claude-opus-5-5-oauth",
-        failed_provider="anthropic-oauth",
-        reason="oauth_reauth_required",
-        resolve_candidate=_resolve_cand,
-        exc_to_raise=orig_exc,
-        model_resolves_fn=lambda prefs, name: True,
-        unattended_gate=True,
-        payer_user_id="user-1",
-        run_id="run-cash-auth-1",
+    # 2) inspect_subscription_availability detects disconnected OAuth row (None) as auth_unavailable
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda model_name, prefs=None, ignore_custom_models=False: ("anthropic-oauth", "anthropic-oauth", model_name, False),
     )
-    assert cfg.llm.name == "deepseek-flash"
-    assert rec["fallback_model"] == "deepseek-flash"
-    assert lease_mock.await_count == 1
-    assert lease_mock.await_args.kwargs["user_id"] == "user-1"
-    assert lease_mock.await_args.kwargs["run_ref"] == "run-cash-auth-1"
-    assert getattr(cfg, "_dalton_pre_cash_lease_verdict").ceiling_credits == 250.0
+    disconnected_conn = create_autospec(oauth_tokens_db.get_oauth_connection, instance=False, return_value=None)
+    monkeypatch.setattr(oauth_tokens_db, "get_oauth_connection", disconnected_conn)
+    avail_disc = await uf.inspect_subscription_availability("user-1", "claude-opus-5-5-oauth")
+    assert avail_disc.available is False
+    assert avail_disc.kind == "auth_unavailable"
+    assert avail_disc.refusal_code == "oauth_required"
+
+    # 3) Normal server notification (fallback_eligible=False) with disconnected subscription
+    #    MUST NOT fall back to resolve(None) (account cash default)
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(
+            user_models.get_model_preference,
+            instance=False,
+            return_value={"default_model": "deepseek-flash", "fallback_models": []},
+        ),
+    )
+    monkeypatch.setattr(
+        auto_tm_mod,
+        "_resolve_automation_notification_context",
+        create_autospec(
+            auto_tm_mod._resolve_automation_notification_context,
+            instance=False,
+            return_value=(None, None, None, False, False, None),
+        ),
+    )
+    resolve_calls: list[str | None] = []
+
+    async def _resolve_disconnected(model_name: str | None) -> Any:
+        resolve_calls.append(model_name)
+        if model_name is None:
+            return SimpleNamespace(llm=SimpleNamespace(name="deepseek-flash"))
+        raise HTTPException(
+            status_code=400,
+            detail={"type": "oauth_required", "provider": "anthropic-oauth"},
+        )
+
+    req_sys = SimpleNamespace(query_type="system", platform=None, hitl_response=None)
+    with pytest.raises(HTTPException) as disc_exc:
+        await auto_tm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id="user-1",
+            thread_id="thread-disc",
+            request=req_sys,
+            requested_model=None,
+            held_model="claude-opus-5-5-oauth",
+            from_service=True,
+            resolve=_resolve_disconnected,
+        )
+    assert disc_exc.value.detail["type"] == "oauth_required"
+    assert None not in resolve_calls
+
+    # 4) assist_json with switch ON and subscription primary failing on safe-to-fallback (http_401)
+    #    MUST NOT spill onto cash fallback deepseek-flash
+    monkeypatch.setattr(
+        assist_mod,
+        "resolve_assist_model",
+        create_autospec(assist_mod.resolve_assist_model, instance=False, return_value="claude-opus-5-5-oauth"),
+    )
+    monkeypatch.setattr(
+        assist_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(assist_mod.resolve_assist_fallback_models, instance=False, return_value=["deepseek-flash"]),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "resolve_model_billing_and_provider",
+        lambda model_key: ("oauth", "anthropic-oauth") if model_key.endswith("-oauth") else ("cash", "deepseek"),
+    )
+    assist_calls: list[str] = []
+    assist_complete = create_autospec(complete_mod.dalton_complete, instance=False)
+
+    async def _assist_side_effect(*args: Any, **kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        m = str(kwargs["request_model"])
+        assist_calls.append(m)
+        return complete_mod.DaltonCompleteResult(
+            ok=False,
+            status="failed",
+            model=m,
+            error="HTTP 401 unauthorized",
+            error_kind="http_401",
+            quota_or_auth_trigger=True,
+        )
+
+    assist_complete.side_effect = _assist_side_effect
+    monkeypatch.setattr(assist_mod, "dalton_complete", assist_complete)
+
+    res_assist = await assist_mod.assist_json(
+        task="test.no_cash_leak",
+        instructions="return json",
+        payload={"x": 1},
+        schema={"type": "object", "properties": {"answer": {"type": "string"}}},
+        user_id="user-1",
+    )
+    assert res_assist.ok is False
+    assert assist_calls == ["claude-opus-5-5-oauth"]
 
 
 # ---------------------------------------------------------------------------
-# 8. ModelResilienceMiddleware: transient 502 stays on primary; quota 429 switches,
-#    binds CreditLease, and persists active_fallback_route
+# 8. ModelResilienceMiddleware: transient 502 / plain 429 stays on primary;
+#    subsequent switch re-checks immediately preceding failure; terminal quota
+#    switches to $0 OAuth fallback & persists active_fallback_route
 # ---------------------------------------------------------------------------
 
 
@@ -740,34 +784,33 @@ async def test_resilience_transient_502_stays_on_primary_quota_429_switches_and_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     primary = _FakeModel("claude-opus-5-5-oauth", billing_type="oauth")
-    fallback = _FakeModel("deepseek-flash", billing_type="cash", provider="deepseek")
+    fallback = _FakeModel("gpt-6.2-sol-oauth", billing_type="oauth", provider="codex-oauth")
     uf.stamp_quota_or_auth_only(
         fallback,
-        candidate_name="deepseek-flash",
+        candidate_name="gpt-6.2-sol-oauth",
         subject_user_id="user-1",
         payer_user_id="user-1",
         run_id="run-resil-1",
-        allow_cash=True,
     )
 
     route_fp = RouteFingerprint(
-        model_key="deepseek-flash",
-        provider="deepseek",
-        model_id="deepseek-chat",
-        bound_base_url="https://api.deepseek.com",
-        key_fingerprint=None,
-        billing="cash",
+        model_key="gpt-6.2-sol-oauth",
+        provider="codex-oauth",
+        model_id="gpt-6.2-sol",
+        bound_base_url="https://api.openai.com/v1",
+        key_fingerprint="fp-codex",
+        billing="subscription",
     )
     snap = {
         "schema": TURN_SNAPSHOT_SCHEMA,
         "models": {
-            "deepseek-flash": {
-                "model_key": "deepseek-flash",
-                "provider": "deepseek",
-                "model_id": "deepseek-chat",
-                "billing": "cash",
-                "bound_base_url": "https://api.deepseek.com",
-                "key_fingerprint": None,
+            "gpt-6.2-sol-oauth": {
+                "model_key": "gpt-6.2-sol-oauth",
+                "provider": "codex-oauth",
+                "model_id": "gpt-6.2-sol",
+                "billing": "subscription",
+                "bound_base_url": "https://api.openai.com/v1",
+                "key_fingerprint": "fp-codex",
             }
         },
         "variants": {},
@@ -778,6 +821,17 @@ async def test_resilience_transient_502_stays_on_primary_quota_429_switches_and_
         "resolve_live_route_fingerprint",
         create_autospec(uf.resolve_live_route_fingerprint, instance=False, return_value=route_fp),
     )
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(
+            uf.inspect_subscription_availability,
+            instance=False,
+            return_value=uf.SubscriptionAvailability(
+                available=True, provider="codex-oauth", model_name="gpt-6.2-sol-oauth"
+            ),
+        ),
+    )
     from src.server.services import account as account_mod
 
     monkeypatch.setattr(
@@ -785,16 +839,18 @@ async def test_resilience_transient_502_stays_on_primary_quota_429_switches_and_
         "require_policy",
         create_autospec(account_mod.require_policy, instance=False, return_value=ALLOW_ALL),
     )
-    lease_mock = create_autospec(uf.acquire_cash_lease, instance=False)
-    lease_mock.return_value = LeaseVerdict(granted=True, ceiling_credits=500.0, ttl_seconds=300.0, generation=3)
-    monkeypatch.setattr(uf, "acquire_cash_lease", lease_mock)
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, instance=False, return_value={}),
+    )
     persist_mock = create_autospec(uf.persist_active_fallback_route, instance=False, return_value=True)
     monkeypatch.setattr(uf, "persist_active_fallback_route", persist_mock)
 
     mw = ModelResilienceMiddleware(
         primary_name="claude-opus-5-5-oauth",
         primary_client=primary,
-        fallbacks=[("deepseek-flash", fallback)],
+        fallbacks=[("gpt-6.2-sol-oauth", fallback)],
         max_retries=1,
         initial_delay=0.0,
         jitter=False,
@@ -812,11 +868,10 @@ async def test_resilience_transient_502_stays_on_primary_quota_429_switches_and_
     with pytest.raises(RuntimeError, match="502"):
         await mw.awrap_model_call(_FakeRequest(primary), _handler_502)
     assert all(m == "claude-opus-5-5-oauth" for m in seen_models_502)
-    assert lease_mock.await_count == 0
     assert persist_mock.await_count == 0
 
     # Case B: Terminal quota 429 switches through real acquire_fallback_candidate_live ->
-    # binds CreditLease verdict AND persists active_fallback_route!
+    # persists active_fallback_route!
     seen_models_429: list[str] = []
 
     async def _handler_429(req: Any) -> Any:
@@ -829,28 +884,446 @@ async def test_resilience_transient_502_stays_on_primary_quota_429_switches_and_
             )
         return _FakeResponse("fallback-answer")
 
-    lease = CreditLease(
-        port=SimpleNamespace(),
-        recorded_as="user-1",
-        run_ref="run-resil-1",
-        is_byok=False,
-        sender="user-1",
-    )
-    gate_state = CreditGateState(run_ref="run-resil-1", kind="run", port=SimpleNamespace(), lease=lease)
-    token = current_credit_gate.set(gate_state)
-    try:
-        with bind_catalog_snapshot(snap):
-            resp = await mw.awrap_model_call(_FakeRequest(primary), _handler_429)
-    finally:
-        current_credit_gate.reset(token)
+    with bind_catalog_snapshot(snap):
+        resp = await mw.awrap_model_call(_FakeRequest(primary), _handler_429)
 
     assert resp.result[0].content == "fallback-answer"
-    assert seen_models_429 == ["claude-opus-5-5-oauth", "deepseek-flash"]
-    assert lease_mock.await_count == 1
-    assert lease.ceiling_credits == 500.0
-    assert lease.grant_generation == 3
+    assert seen_models_429 == ["claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"]
     assert persist_mock.await_count == 1
     assert persist_mock.await_args.args == ("run-resil-1", route_fp)
+
+
+@pytest.mark.asyncio
+async def test_resilience_subsequent_switch_stops_on_502_and_plain_429_long_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #5:
+    (a) Primary skipped on terminal quota cooldown -> fb1 fails with 502 -> MUST NOT switch to fb2.
+    (b) Primary fails with plain 429 + long Retry-After (benched as rate_limited) -> MUST NOT switch.
+    (c) Redis cooldown record with refusal.reason=='rate_limited' is NOT treated as quota_cooldown.
+    """
+    primary = _FakeModel("claude-opus-5-5-oauth", billing_type="oauth")
+    fb1 = _FakeModel("gpt-6.2-sol-oauth", billing_type="oauth", provider="codex-oauth")
+    fb2 = _FakeModel("gemini-4-neon-high-oauth", billing_type="oauth", provider="antigravity-oauth")
+    for name, client in (("gpt-6.2-sol-oauth", fb1), ("gemini-4-neon-high-oauth", fb2)):
+        uf.stamp_quota_or_auth_only(
+            client, candidate_name=name, subject_user_id="user-1", run_id="run-sub-1"
+        )
+
+    monkeypatch.setattr(
+        uf,
+        "acquire_fallback_candidate_live",
+        create_autospec(
+            uf.acquire_fallback_candidate_live,
+            instance=False,
+            return_value=uf.FallbackAdmissionResult(admitted=True, model_name="ok", billing="oauth"),
+        ),
+    )
+
+    # (a) Primary already benched on terminal plan_limit -> fb1 runs and fails with 502 -> fb2 MUST NOT run
+    mw = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[("gpt-6.2-sol-oauth", fb1), ("gemini-4-neon-high-oauth", fb2)],
+        max_retries=0,
+        initial_delay=0.0,
+        jitter=False,
+    )
+    mw._remember_quota_exhausted_local(
+        mw._quota_scope_key("claude-opus-5-5-oauth", primary),
+        3600.0,
+        _RemoteQuotaExhaustedError("plan_limit", 429, provider_refusal=ProviderRefusal("plan_limit")),
+    )
+    seen_a: list[str] = []
+
+    async def _handler_fb1_502(req: Any) -> Any:
+        seen_a.append(req.model.model)
+        err = RuntimeError("Upstream 502 Bad Gateway")
+        err.status_code = 502  # type: ignore[attr-defined]
+        raise err
+
+    with pytest.raises(Exception):
+        await mw.awrap_model_call(_FakeRequest(primary), _handler_fb1_502)
+    assert seen_a == ["gpt-6.2-sol-oauth"]
+
+    # (b) Plain 429 with long Retry-After (benched locally as rate_limited) MUST NOT switch to fb1
+    mw_plain = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[("gpt-6.2-sol-oauth", fb1)],
+        max_retries=0,
+        initial_delay=0.0,
+        jitter=False,
+    )
+    seen_b: list[str] = []
+
+    async def _handler_plain_429(req: Any) -> Any:
+        seen_b.append(req.model.model)
+        err = RuntimeError("Too Many Requests")
+        err.status_code = 429  # type: ignore[attr-defined]
+        err.response = SimpleNamespace(status_code=429, headers={"Retry-After": "600"})  # type: ignore[attr-defined]
+        raise err
+
+    with pytest.raises(RuntimeError, match="Too Many Requests"):
+        await mw_plain.awrap_model_call(_FakeRequest(primary), _handler_plain_429)
+    assert seen_b == ["claude-opus-5-5-oauth"]
+    # Second call sees primary skipped on rate_limited bench -> STILL must not switch to quota_or_auth_only fb1
+    seen_b.clear()
+    with pytest.raises(Exception):
+        await mw_plain.awrap_model_call(_FakeRequest(primary), _handler_plain_429)
+    assert seen_b == []
+
+    # (c) Plain 429 rate_limited record in Redis is NOT terminal subscription quota cooldown
+    now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda model_name, prefs=None, ignore_custom_models=False: (
+            "codex-oauth",
+            "codex-oauth",
+            model_name,
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_connection",
+        create_autospec(
+            oauth_tokens_db.get_oauth_connection,
+            instance=False,
+            return_value={"account_id": "acct-1", "email": "a@b.com", "needs_reauth_at": None},
+        ),
+    )
+
+    class _RateLimitedCache:
+        async def get(self, key: str) -> Any:
+            return {
+                "expires_at": (now + timedelta(minutes=10)).timestamp(),
+                "refusal": {"reason": "rate_limited", "until": (now + timedelta(minutes=10)).isoformat()},
+            }
+
+    from src.utils.cache import redis_cache
+
+    monkeypatch.setattr(redis_cache, "get_cache_client", lambda: _RateLimitedCache())
+    avail_rl = await uf.inspect_subscription_availability("u1", "gpt-6.2-sol-oauth", now=now)
+    assert avail_rl.available is True
+
+
+@pytest.mark.asyncio
+async def test_resume_runtime_fallbacks_verified_against_original_snapshot_and_disable_fallback_honored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #4 & #10:
+    - During resume, runtime fallbacks are verified against the ORIGINAL snapshot BEFORE build,
+      dropping mutated/unrecorded candidates and carrying the original snapshot onto config & clients.
+    - When disable_fallback: true and config.llm.fallback carries personal models from select_model,
+      resolve_unattended_fallback_clients ignores config.llm.fallback and personal models.
+    """
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    monkeypatch.setattr(
+        uf,
+        "_classify_candidate_billing",
+        lambda model_name, prefs=None, ignore_custom_models=False: ("oauth", "oauth"),
+    )
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda model_name, prefs=None, ignore_custom_models=False: (
+            f"prov-{model_name}",
+            f"prov-{model_name}",
+            model_name,
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        uf,
+        "get_profile_default_fallback_chain",
+        lambda: ["fb-mutated", "fb-intact", "fb-unrecorded"],
+    )
+
+    orig_snap = {
+        "schema": TURN_SNAPSHOT_SCHEMA,
+        "catalog_revision": 7,
+        "models": {
+            "claude-opus-5-5-oauth": {
+                "model_key": "claude-opus-5-5-oauth",
+                "provider": "anthropic-oauth",
+                "model_id": "claude-opus-5-5",
+                "billing": "subscription",
+            },
+            "fb-mutated": {
+                "model_key": "fb-mutated",
+                "provider": "team-a",
+                "model_id": "m-mut",
+                "billing": "subscription",
+                "bound_base_url": "https://orig.example.com/v1",
+                "key_fingerprint": "fp-orig",
+            },
+            "fb-intact": {
+                "model_key": "fb-intact",
+                "provider": "team-b",
+                "model_id": "m-ok",
+                "billing": "subscription",
+                "bound_base_url": "https://intact.example.com/v1",
+                "key_fingerprint": "fp-intact",
+            },
+        },
+        "variants": {},
+    }
+    orig_run_row = {
+        "conversation_response_id": "run-orig-1",
+        "metadata": {
+            "llm_model": "claude-opus-5-5-oauth",
+            "effective_catalog_snapshot": orig_snap,
+        },
+    }
+
+    live_routes = {
+        "fb-mutated": RouteFingerprint(
+            model_key="fb-mutated",
+            provider="team-a",
+            model_id="m-mut",
+            bound_base_url="https://hijacked.example.com/v1",
+            key_fingerprint="fp-rotated",
+            billing="subscription",
+        ),
+        "fb-intact": RouteFingerprint(
+            model_key="fb-intact",
+            provider="team-b",
+            model_id="m-ok",
+            bound_base_url="https://intact.example.com/v1",
+            key_fingerprint="fp-intact",
+            billing="subscription",
+        ),
+        "fb-unrecorded": RouteFingerprint(
+            model_key="fb-unrecorded",
+            provider="team-c",
+            model_id="m-new",
+            bound_base_url="https://new.example.com/v1",
+            key_fingerprint="fp-new",
+            billing="subscription",
+        ),
+    }
+
+    async def _fake_resolve_route(
+        model_key: str,
+        *,
+        user_id: str | None = None,
+        model_pref: Any = None,
+        ignore_custom_models: bool = False,
+        conn: Any = None,
+    ) -> RouteFingerprint:
+        return live_routes[model_key]
+
+    monkeypatch.setattr(uf, "resolve_live_route_fingerprint", _fake_resolve_route)
+
+    built_names: list[str] = []
+
+    async def _fake_resolve_client(user_id: str, model_name: str, **kwargs: Any) -> Any:
+        built_names.append(model_name)
+        assert kwargs.get("allow_platform_fallback") is False
+        return SimpleNamespace(
+            client=_FakeModel(model_name, billing_type="oauth", provider=f"prov-{model_name}"),
+            credential_source=CredentialSource.OAUTH,
+        )
+
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_model_client",
+        create_autospec(llm_clients.resolve_model_client, instance=False, side_effect=_fake_resolve_client),
+    )
+
+    # Personal list was copied into config.llm.fallback by select_model, but disable_fallback=True!
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(name="claude-opus-5-5-oauth", fallback=["personal-only-oauth"]),
+        fallback_llm_clients=[],
+        fallback_llm_names=[],
+        prompt_guidance=None,
+        compaction=SimpleNamespace(profile=None),
+    )
+    ctx = uf.UnattendedTurnContext(
+        is_unattended=True,
+        subject_user_id="user-1",
+        payer_user_id="user-1",
+        source_kind="wakeup",
+        run_id="run-resumed-2",
+    )
+    with resume_verify_scope("run-orig-1", run_row=orig_run_row), uf.bind_unattended_turn_context(ctx):
+        handled = await uf.resolve_unattended_fallback_clients(
+            cfg,
+            "user-1",
+            {"disable_fallback": True, "fallback_models": ["personal-only-oauth"]},
+            {},
+            is_byok=True,
+            cache_key="k",
+            policy=ALLOW_ALL,
+        )
+
+    assert handled is True
+    assert "personal-only-oauth" not in built_names
+    assert "fb-mutated" not in built_names
+    assert "fb-unrecorded" not in built_names
+    assert built_names == ["fb-intact"]
+    assert cfg.fallback_llm_names == ["fb-intact"]
+    assert getattr(cfg, "_dalton_resume_catalog_snapshot") == orig_snap
+    meta = uf.get_unattended_fallback_meta(cfg.fallback_llm_clients[0])
+    assert meta is not None and meta.get("catalog_snapshot") == orig_snap
+
+    # Even if a fresh outer snapshot were later bound, runtime switch still verifies against
+    # the ORIGINAL snapshot carried on the client and rejects a post-start mutation!
+    live_routes["fb-intact"] = RouteFingerprint(
+        model_key="fb-intact",
+        provider="team-b",
+        model_id="m-ok",
+        bound_base_url="https://mutated-later.example.com/v1",
+        key_fingerprint="fp-intact",
+        billing="subscription",
+    )
+    mutated_new_snap = {
+        "schema": TURN_SNAPSHOT_SCHEMA,
+        "models": {
+            "fb-intact": {
+                "model_key": "fb-intact",
+                "provider": "team-b",
+                "model_id": "m-ok",
+                "billing": "subscription",
+                "bound_base_url": "https://mutated-later.example.com/v1",
+                "key_fingerprint": "fp-intact",
+            }
+        },
+        "variants": {},
+    }
+    from src.server.services import account as account_mod
+
+    monkeypatch.setattr(
+        account_mod,
+        "require_policy",
+        create_autospec(account_mod.require_policy, instance=False, return_value=ALLOW_ALL),
+    )
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, instance=False, return_value={}),
+    )
+    with bind_catalog_snapshot(mutated_new_snap):
+        ok_switch = await uf.verify_middleware_fallback_switch(
+            candidate_name="fb-intact",
+            candidate_client=cfg.fallback_llm_clients[0],
+            last_exc=_RemoteQuotaExhaustedError("plan_limit", 429, provider_refusal=ProviderRefusal("plan_limit")),
+            primary_quota_skipped=False,
+        )
+    assert ok_switch is False
+
+
+@pytest.mark.asyncio
+async def test_resilience_multi_candidate_exhaustion_passes_all_refusals_and_picks_earliest_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #6: Primary resets in 24h while fallback resets in 1h -> settlement gets both & picks +1h."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+    reset_24h = now + timedelta(hours=24)
+    reset_1h = now + timedelta(hours=1)
+
+    primary = _FakeModel("claude-opus-5-5-oauth", billing_type="oauth")
+    fb = _FakeModel("gpt-6.2-sol-oauth", billing_type="oauth", provider="codex-oauth")
+    uf.stamp_quota_or_auth_only(fb, candidate_name="gpt-6.2-sol-oauth", subject_user_id="user-1", run_id="run-mc-1")
+
+    monkeypatch.setattr(
+        uf,
+        "acquire_fallback_candidate_live",
+        create_autospec(
+            uf.acquire_fallback_candidate_live,
+            instance=False,
+            return_value=uf.FallbackAdmissionResult(admitted=True, model_name="gpt-6.2-sol-oauth", billing="oauth"),
+        ),
+    )
+
+    mw = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[("gpt-6.2-sol-oauth", fb)],
+        max_retries=0,
+        initial_delay=0.0,
+        jitter=False,
+    )
+
+    async def _both_exhausted(req: Any) -> Any:
+        if req.model.model == "claude-opus-5-5-oauth":
+            raise _RemoteQuotaExhaustedError(
+                "Plan limit 24h",
+                429,
+                expires_at=reset_24h.timestamp(),
+                provider_refusal=ProviderRefusal("plan_limit", until=reset_24h),
+            )
+        raise _RemoteQuotaExhaustedError(
+            "Plan limit 1h",
+            429,
+            expires_at=reset_1h.timestamp(),
+            provider_refusal=ProviderRefusal("plan_limit", until=reset_1h),
+        )
+
+    caught: BaseException | None = None
+    try:
+        await mw.awrap_model_call(_FakeRequest(primary), _both_exhausted)
+    except Exception as exc:
+        caught = exc
+
+    assert caught is not None
+    payload = uf.extract_mid_turn_quota_failure_payload(caught, model_name="claude-opus-5-5-oauth")
+    assert payload is not None
+    assert len(payload["candidates"]) == 2
+    assert {c["model_name"] for c in payload["candidates"]} == {
+        "claude-opus-5-5-oauth",
+        "gpt-6.2-sol-oauth",
+    }
+
+    # Verify maybe_record_wakeup_mid_turn_resume_in_tx passes BOTH candidates and picks earliest (+1h)!
+    captured_avails: list[uf.SubscriptionAvailability] = []
+    rec_mock = create_autospec(uf.record_wakeup_mid_turn_quota_exhaustion_tx, instance=False)
+
+    async def _capture_rec(conn: Any, **kwargs: Any) -> uf.WakeupDeferDecision:
+        captured_avails.extend(kwargs["availabilities"])
+        pure_auth, earliest, held_known, _, _ = uf._select_earliest_cooldown(
+            kwargs["availabilities"], now=now
+        )
+        assert pure_auth is False
+        assert held_known is True
+        return uf.WakeupDeferDecision(
+            action="defer",
+            root_job_id=kwargs["root_job_id"],
+            defer_count=1,
+            effective_reset_at=earliest,
+            scheduled_wake_at=(earliest + timedelta(minutes=1)) if earliest else None,
+        )
+
+    rec_mock.side_effect = _capture_rec
+    monkeypatch.setattr(uf, "record_wakeup_mid_turn_quota_exhaustion_tx", rec_mock)
+
+    decision = await uf.maybe_record_wakeup_mid_turn_resume_in_tx(
+        None,
+        run_row={
+            "turn_index": 1,
+            "metadata": {
+                "dalton_wakeup_quota_ctx": {
+                    "root_job_id": str(uuid4()),
+                    "wakeup_id": "wake-multi",
+                    "owner_user_id": "user-1",
+                    "workspace_id": "ws-1",
+                    "first_due_at": now.isoformat(),
+                    "llm_model": "claude-opus-5-5-oauth",
+                }
+            },
+        },
+        thread_id=str(uuid4()),
+        run_id=str(uuid4()),
+        newest_checkpoint_id="ckpt-1",
+        quota_failure=payload,
+    )
+    assert decision is not None
+    assert decision.action == "defer"
+    assert len(captured_avails) == 2
+    assert decision.effective_reset_at == reset_1h
 
 
 # ---------------------------------------------------------------------------
@@ -966,8 +1439,7 @@ async def test_live_admission_enforces_real_policy_refuses_and_snapshot_route(
     assert res_payer_mismatch.admitted is False
     assert res_payer_mismatch.reason == "payer_subject_mismatch"
 
-    # 5) Cash model rejected when allow_cash_fallback_on_unattended is False
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
+    # 5) Cash model is unconditionally rejected (unattended fallback is $0 OAuth-only)
     cash_route_fn = create_autospec(
         uf.resolve_live_route_fingerprint,
         instance=False,
@@ -1167,9 +1639,8 @@ def test_classify_error_off_and_interactive_preserve_retryable_while_unattended_
         provider_refusal=ProviderRefusal("plan_limit"),
     )
 
-    # Contrast 1: BOTH switches OFF -> terminal 429 stays recoverable (identical to upstream!)
+    # Contrast 1: Main switch OFF -> terminal 429 stays recoverable (identical to upstream!)
     monkeypatch.delenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", raising=False)
-    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
     res_off_default = classify_error(remote_429)
     assert res_off_default["is_recoverable"] is True
     assert res_off_default["error_type"] == "api_error"
@@ -1306,6 +1777,75 @@ async def test_internal_llm_complete_system_only_and_structured_trigger_only(
         ("admin-1", "claude-opus-5-5-oauth", True),
         ("admin-1", "gpt-6.2-sol-oauth", True),
     ]
+
+    # Case C (Codex #5): When fallback cand1 fails with transient 502 (non-quota/auth),
+    # stop immediately without continuing to cand2!
+    monkeypatch.setattr(
+        router_mod,
+        "get_allowed_host_oauth_models",
+        lambda: frozenset({"claude-opus-5-5-oauth", "gpt-6.2-sol-oauth", "gemini-4-neon-high-oauth"}),
+    )
+    fake_mc_3 = SimpleNamespace(
+        get_model_config=lambda m: {"provider": "oauth", "model_id": m}
+        if m in ("claude-opus-5-5-oauth", "gpt-6.2-sol-oauth", "gemini-4-neon-high-oauth")
+        else None
+    )
+    monkeypatch.setattr(LLMFactory, "get_model_config", lambda: fake_mc_3)
+    stop_calls: list[str] = []
+    stop_complete = create_autospec(complete_mod.dalton_complete, instance=False)
+
+    async def _stop_on_502(*args: Any, **kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        m = str(kwargs["model"])
+        stop_calls.append(m)
+        if m == "claude-opus-5-5-oauth":
+            return complete_mod.DaltonCompleteResult(
+                ok=False,
+                status="failed",
+                model=m,
+                error="plan limit reached",
+                error_kind="http_429",
+                refusal_reason="plan_limit",
+                quota_or_auth_trigger=True,
+            )
+        return complete_mod.DaltonCompleteResult(
+            ok=False,
+            status="failed",
+            model=m,
+            error="HTTP 502 Bad Gateway",
+            error_kind="http_502",
+            quota_or_auth_trigger=False,
+        )
+
+    stop_complete.side_effect = _stop_on_502
+    monkeypatch.setattr(router_mod, "dalton_complete", stop_complete)
+
+    resp_stop = await router_mod.internal_llm_complete(req)
+    assert resp_stop.ok is False
+    # Ordered pool after claude-opus-5-5-oauth is ["gemini-4-neon-high-oauth", "gpt-6.2-sol-oauth"];
+    # failing on the first fallback with 502 must stop before trying the second fallback!
+    assert len(stop_calls) == 2
+    assert stop_calls[0] == "claude-opus-5-5-oauth"
+
+    # Case D (Codex #9): Main switch OFF -> exact existing behavior (no ignore_custom_models=True forced!)
+    monkeypatch.delenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", raising=False)
+    off_calls: list[dict[str, Any]] = []
+    off_complete = create_autospec(complete_mod.dalton_complete, instance=False)
+
+    async def _off_side_effect(*args: Any, **kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        off_calls.append(dict(kwargs))
+        return complete_mod.DaltonCompleteResult(
+            ok=True,
+            status="done",
+            text="custom-ok",
+            model=str(kwargs["model"]),
+        )
+
+    off_complete.side_effect = _off_side_effect
+    monkeypatch.setattr(router_mod, "dalton_complete", off_complete)
+    resp_off = await router_mod.internal_llm_complete(req)
+    assert resp_off.ok is True
+    assert len(off_calls) == 1
+    assert "ignore_custom_models" not in off_calls[0]
 
 
 # ---------------------------------------------------------------------------

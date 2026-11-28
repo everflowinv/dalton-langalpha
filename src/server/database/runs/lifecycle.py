@@ -603,6 +603,44 @@ async def start_run(
                 # DALTON-HOOK(team-model-catalog): persist turn-scoped effective_catalog_snapshot
                 # (including pricing, modalities, reasoning, fixed route, bound_base_url & key_fingerprint)
                 run_metadata = dict(metadata or {})
+                # DALTON-HOOK(quota-exhaustion): preserve original run's effective_catalog_snapshot across unattended retries instead of rebuilding from live catalog
+                if "effective_catalog_snapshot" not in run_metadata and retry_of_run_id:
+                    try:
+                        from src.dalton.services.team_model_catalog.constants import (
+                            TURN_SNAPSHOT_SCHEMA,
+                        )
+                        from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+                        if is_unattended_quota_fallback_enabled():
+                            async with conn.cursor(row_factory=dict_row) as cur:
+                                await cur.execute(
+                                    """
+                                    SELECT metadata->'effective_catalog_snapshot' AS snap
+                                    FROM conversation_responses
+                                    WHERE conversation_response_id = %s::uuid
+                                    """,
+                                    (str(retry_of_run_id),),
+                                )
+                                _src_snap_row = await cur.fetchone()
+                            _src_snap = (
+                                _src_snap_row.get("snap")
+                                if isinstance(_src_snap_row, dict)
+                                else None
+                            )
+                            if (
+                                isinstance(_src_snap, dict)
+                                and _src_snap.get("schema") == TURN_SNAPSHOT_SCHEMA
+                                and isinstance(_src_snap.get("models"), dict)
+                                and _src_snap.get("models")
+                            ):
+                                run_metadata["effective_catalog_snapshot"] = dict(_src_snap)
+                                if _src_snap.get("catalog_revision") is not None:
+                                    run_metadata["catalog_revision"] = _src_snap["catalog_revision"]
+                    except Exception as _retry_snap_exc:
+                        logger.debug(
+                            "[turn_lifecycle] retry source catalog snapshot lookup skipped: %s",
+                            _retry_snap_exc,
+                        )
                 if "effective_catalog_snapshot" not in run_metadata:
                     try:
                         from src.dalton.services.team_model_catalog.snapshot import (

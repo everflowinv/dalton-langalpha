@@ -422,10 +422,7 @@ async def assist_json(
         from src.dalton.llm.unattended_fallback import (
             is_complete_result_quota_or_auth_trigger,
         )
-        from src.dalton.settings import (
-            allow_cash_fallback_on_unattended,
-            is_unattended_quota_fallback_enabled,
-        )
+        from src.dalton.settings import is_unattended_quota_fallback_enabled
 
         unattended_assist_fallback = is_unattended_quota_fallback_enabled()
 
@@ -460,9 +457,8 @@ async def assist_json(
                 if (
                     unattended_assist_fallback
                     and not own_chain
-                    and not _is_safe_to_fallback(comp)
+                    and _is_subscription(primary_model)
                     and not _is_subscription(fb_cand)
-                    and not allow_cash_fallback_on_unattended()
                 ):
                     continue
                 if _past_deadline():

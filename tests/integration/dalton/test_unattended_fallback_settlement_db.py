@@ -1,21 +1,25 @@
 """Real PostgreSQL & dual-worker integration tests for Prod Audit 2 §2 (unattended quota fallback).
 
+Reuses the directory conftest's ``dalton_schema`` (which depends on ``test_db_pool`` and
+applies upstream Alembic migrations first, then Dalton migrations to ``head``) and
+``test_db_uri``.
+
 Exercises real production call paths against a real PostgreSQL ``*_test`` database:
-1. Concurrent regular cash call (``LocalBudgetPort.acquire``) vs unattended cash fallback
-   (going through real ``acquire_fallback_candidate_live`` -> ``acquire_cash_lease_tx``) for a
-   default-budget user with NO ``dalton_budget_config`` row and headroom for exactly one ``$0.25``
-   lease -> serialized by ``acquire_budget_advisory_lock``, strictly 1 granted, 1 denied, zero overdraft.
+1. Concurrent regular cash call (``LocalBudgetPort.acquire``) vs ``acquire_cash_lease``
+   (pure budget-port concurrency serialization under ``acquire_budget_advisory_lock``) ->
+   strictly 1 granted, 1 denied, zero overdraft.
 2. Cross-worker wakeup mid-turn exhaustion & checkpoint resume via REAL ``LocalRunExecutor._finalize_run``
    -> ``RunCoordinator.finalize_run`` -> ``lifecycle.finalize_run`` atomic transaction (writing
    ``status='error'``, ``dalton_wakeup_quota_deferrals``, and ``hook_outbox('wakeup_quota_resume')``) ->
    Worker 2 claiming ``wakeup_quota_resume`` -> ``RetryRequest`` validation -> real LangGraph
    ``StateGraph`` + ``MemorySaver`` checkpoint replay asserting step-1 tool executes STRICTLY ONCE.
-3. Concurrent first-row deferral creation serialized by ``pg_advisory_xact_lock`` + persisted
+3. Own dispatched resume run recognition by deterministic ``request_key`` + ``retry_of_run_id``
+   against real ``conversation_responses`` (never marking ``dalton_wakeup_quota_deferrals`` settled),
+   24h deadline enforcement via ``check_wakeup_deferral_admission_deadline``, and switch-off settlement.
+4. Concurrent first-row deferral creation serialized by ``pg_advisory_xact_lock`` + persisted
    ``seen_step_keys`` idempotency + 4th cooldown termination.
-4. Resume route mutation injection (``bound_base_url`` / ``key_fingerprint``) + Alembic d062 <-> d061
+5. Resume route mutation injection (``bound_base_url`` / ``key_fingerprint``) + Alembic d062 <-> d061
    round-trip against real PG.
-
-Skipped automatically when ``DALTON_TEST_PG_DSN`` is unset (run by Lead against a ``*_test`` DB).
 """
 
 from __future__ import annotations
@@ -24,7 +28,6 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict
@@ -33,6 +36,7 @@ from uuid import UUID, uuid4
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from fastapi import HTTPException
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 import psycopg
@@ -51,35 +55,14 @@ from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhauste
 from src.server.database import pool as db_pool_mod
 from src.server.database.runs import lifecycle as tl_db
 from src.server.models.workflow import RetryRequest
-from src.server.services.policy import ALLOW_ALL
 from src.server.services.report_back import notify_turn
 from src.server.services.runs import finalization as finalization_mod
 from src.server.services.runs.coordinator import RunCoordinator, RunHandle
 from src.server.services.runs.executor import LocalRunExecution, LocalRunExecutor, LocalRunStatus
-from tests.integration.dalton._db_guard import extract_effective_test_db_name
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-PG_DSN = os.getenv("DALTON_TEST_PG_DSN", "").strip()
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not PG_DSN,
-        reason="DALTON_TEST_PG_DSN is not set; skipping real PostgreSQL §2 unattended fallback tests",
-    ),
-]
-
-
-@pytest.fixture(scope="session", autouse=True)
-def dalton_schema():
-    """Override directory conftest autouse fixture; managed explicitly via ``migrated_fallback_dsn``."""
-    yield
-
-
-@pytest.fixture(autouse=True)
-def cleanup_dalton_tables():
-    """Override directory conftest autouse fixture so no DB connection runs when DALTON_TEST_PG_DSN is unset."""
-    yield
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
 def _to_sa_url(dsn: str) -> str:
@@ -95,26 +78,18 @@ def _to_sa_url(dsn: str) -> str:
 def _dalton_alembic_cfg(dsn: str) -> AlembicConfig:
     cfg = AlembicConfig(str(REPO_ROOT / "src" / "dalton" / "alembic.ini"))
     cfg.set_main_option("script_location", str(REPO_ROOT / "src" / "dalton" / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", _to_sa_url(dsn))
+    cfg.set_main_option("sqlalchemy.url", _to_sa_url(dsn).replace("%", "%%"))
     return cfg
 
 
-@pytest.fixture(scope="session")
-def migrated_fallback_dsn() -> str:
-    db_name = extract_effective_test_db_name(PG_DSN)
-    assert db_name.endswith("_test"), f"Refusing to run against non-test DB {db_name!r}"
-    alembic_command.upgrade(_dalton_alembic_cfg(PG_DSN), "head")
-    return PG_DSN
-
-
 @pytest.fixture
-def bound_pg_pool(migrated_fallback_dsn: str, monkeypatch: pytest.MonkeyPatch):
+def bound_pg_pool(dalton_schema, test_db_uri: str, monkeypatch: pytest.MonkeyPatch) -> str:
     @asynccontextmanager
     async def _conn_ctx(conn=None):
         if conn is not None:
             yield conn
             return
-        aconn = await psycopg.AsyncConnection.connect(migrated_fallback_dsn)
+        aconn = await psycopg.AsyncConnection.connect(test_db_uri)
         try:
             yield aconn
         finally:
@@ -124,21 +99,17 @@ def bound_pg_pool(migrated_fallback_dsn: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(budget_port, "get_db_connection", _conn_ctx)
     monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
     monkeypatch.setattr(tl_db.pool, "get_db_connection", _conn_ctx)
-    return migrated_fallback_dsn
+    return test_db_uri
 
 
-@pytest.mark.asyncio
-async def test_db_concurrent_regular_cash_vs_live_fallback_admission_default_budget_user(
+async def test_db_concurrent_budget_port_vs_acquire_cash_lease_default_budget_user(
     bound_pg_pool: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two concurrent workers racing the last $0.25 through LocalBudgetPort vs acquire_fallback_candidate_live."""
-    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
-    monkeypatch.setenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", "1")
-
+    """Two concurrent workers racing the last $0.25 through LocalBudgetPort vs acquire_cash_lease."""
     user_id = f"u-race-{uuid4().hex[:10]}"
     run_regular = str(uuid4())
-    run_fallback = str(uuid4())
+    run_second = str(uuid4())
 
     fake_budget_cfg = SimpleNamespace(
         default_daily_cap_usd=0.25,
@@ -150,23 +121,9 @@ async def test_db_concurrent_regular_cash_vs_live_fallback_admission_default_bud
     )
     fake_settings = SimpleNamespace(budget=fake_budget_cfg)
     monkeypatch.setattr(budget_port, "get_dalton_settings", lambda: fake_settings)
-    monkeypatch.setattr(uf, "get_dalton_settings", lambda: fake_settings)
     from src.dalton.budget import service as budget_service
 
     monkeypatch.setattr(budget_service, "get_dalton_settings", lambda: fake_settings)
-
-    cash_route_fn = create_autospec(
-        uf.resolve_live_route_fingerprint,
-        instance=False,
-        return_value=RouteFingerprint(
-            model_key="deepseek-flash",
-            provider="deepseek",
-            model_id="deepseek-chat",
-            bound_base_url="https://api.deepseek.com",
-            key_fingerprint=None,
-            billing="cash",
-        ),
-    )
 
     try:
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
@@ -182,23 +139,18 @@ async def test_db_concurrent_regular_cash_vs_live_fallback_admission_default_bud
                 spent_credits=0.0,
             )
 
-        async def _worker_fallback():
-            return await uf.acquire_fallback_candidate_live(
-                subject_user_id=user_id,
-                payer_user_id=user_id,
-                candidate_model="deepseek-flash",
-                run_id=run_fallback,
-                call_id="deepseek-flash:step-1",
-                allow_cash=True,
+        async def _worker_cash_lease():
+            return await budget_port.acquire_cash_lease(
+                user_id=user_id,
+                run_ref=run_second,
+                call_id="cash-race:step-1",
                 min_floor_usd=Decimal("0.25"),
-                policy=ALLOW_ALL,
-                resolve_route_fn=cash_route_fn,
             )
 
-        v_reg, res_fb = await asyncio.gather(_worker_regular(), _worker_fallback())
-        assert v_reg is not None and res_fb is not None
-        granted_count = int(bool(v_reg.granted)) + int(bool(res_fb.admitted))
-        assert granted_count == 1, f"Expected strictly 1 winner, got regular={v_reg}, fallback={res_fb}"
+        v_reg, v_second = await asyncio.gather(_worker_regular(), _worker_cash_lease())
+        assert v_reg is not None and v_second is not None
+        granted_count = int(bool(v_reg.granted)) + int(bool(v_second.granted))
+        assert granted_count == 1, f"Expected strictly 1 winner, got regular={v_reg}, second={v_second}"
 
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -220,7 +172,6 @@ async def test_db_concurrent_regular_cash_vs_live_fallback_admission_default_bud
                     await cur.execute("DELETE FROM dalton_budget_reservations WHERE user_id = %s", (user_id,))
 
 
-@pytest.mark.asyncio
 async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1_tool_once(
     bound_pg_pool: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -326,7 +277,6 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
         saved_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
         ckpt_id = saved_state.config["configurable"]["checkpoint_id"]
 
-        # Wire RunCoordinator._newest_checkpoint to return the real checkpoint owned by failed_run_id
         coord = RunCoordinator.get_instance()
         monkeypatch.setattr(
             coord,
@@ -344,7 +294,6 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
             create_autospec(finalization_mod._delivered_steering_inputs, instance=False, return_value=[]),
         )
 
-        # Run REAL LocalRunExecutor._finalize_run -> REAL RunCoordinator.finalize_run -> REAL lifecycle.finalize_run
         executor = LocalRunExecutor.__new__(LocalRunExecutor)
         executor.task_lock = asyncio.Lock()
         executor.executions = {}
@@ -395,7 +344,6 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
 
         await executor._finalize_run(thread_id, failed_run_id, kind="failed", error=str(caught_exc), exc=caught_exc)
 
-        # Verify atomic PG commit: conversation_responses.status == 'error' AND hook_outbox has 1 wakeup_quota_resume
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
@@ -418,32 +366,61 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
         assert outbox_job["hook_type"] == "wakeup_quota_resume"
         assert outbox_job["payload"]["resume_checkpoint_id"] == ckpt_id
 
-        # Worker 2 reads the real DB outbox row and runs execute_wakeup_quota_resume ->
-        # real RetryRequest validation -> resumes real LangGraph checkpoint!
         resumed_answer: dict[str, Any] = {}
+        resumed_run_id = str(uuid4())
 
         async def _dispatch_retry(*args: Any, **kwargs: Any) -> tuple[str, str | None]:
             parsed = RetryRequest.model_validate(kwargs["body"])
             UUID(str(parsed.request_key))
             assert parsed.workspace_id == workspace_id
             assert parsed.checkpoint_id == ckpt_id
+            # Insert the dispatched retry run row into real PG to also verify own-run recognition on re-claim
+            async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO conversation_responses (
+                                conversation_response_id, conversation_thread_id,
+                                turn_index, attempt_no, status, retry_of_run_id, request_key, user_id
+                            )
+                            VALUES (%s::uuid, %s::uuid, 1, 2, 'in_progress', %s::uuid, %s, %s)
+                            """,
+                            (
+                                resumed_run_id,
+                                thread_id,
+                                failed_run_id,
+                                str(parsed.request_key),
+                                owner_user_id,
+                            ),
+                        )
             quota_flag["exhausted"] = False
             out = await graph.ainvoke(
                 None,
                 config={"configurable": {"thread_id": thread_id, "checkpoint_id": parsed.checkpoint_id}},
             )
             resumed_answer.update(out)
-            return "dispatched", str(uuid4())
+            return "dispatched", resumed_run_id
 
-        monkeypatch.setattr(
-            notify_turn,
-            "post_notification_turn",
-            create_autospec(notify_turn.post_notification_turn, instance=False, side_effect=_dispatch_retry),
-        )
+        post_mock = create_autospec(notify_turn.post_notification_turn, instance=False, side_effect=_dispatch_retry)
+        monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
         await uf.execute_wakeup_quota_resume(dict(outbox_job))
 
         assert resumed_answer.get("answer") == "db-resumed-ok"
         assert tool_side_effect_runs == ["step1-tool-executed"]
+
+        # Re-claiming the unacked outbox job recognizes resumed_run_id via (request_key, retry_of_run_id)
+        # and leaves dalton_wakeup_quota_deferrals.status == 'deferred' (Codex #7)!
+        await uf.execute_wakeup_quota_resume(dict(outbox_job))
+        assert post_mock.await_count == 1
+        async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT status FROM dalton_wakeup_quota_deferrals WHERE root_job_id = %s::uuid",
+                    (root_job_id,),
+                )
+                d_row = await cur.fetchone()
+        assert d_row is not None and d_row["status"] == "deferred"
     finally:
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.transaction():
@@ -457,8 +434,8 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
                         (thread_id,),
                     )
                     await cur.execute(
-                        "DELETE FROM conversation_responses WHERE conversation_response_id = %s::uuid",
-                        (failed_run_id,),
+                        "DELETE FROM conversation_responses WHERE conversation_thread_id = %s::uuid",
+                        (thread_id,),
                     )
                     await cur.execute(
                         "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
@@ -470,12 +447,14 @@ async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1
                     )
 
 
-@pytest.mark.asyncio
-async def test_db_concurrent_first_deferral_serialized_and_4th_terminates(
+async def test_db_concurrent_first_deferral_serialized_and_4th_terminates_and_deadline_enforced(
     bound_pg_pool: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two concurrent workers racing on a brand-new root_job_id serialize cleanly under advisory lock."""
+    """Two concurrent workers racing on a brand-new root_job_id serialize cleanly under advisory lock;
+    admission deadline check enforces 24h cap against real PG."""
     root_job_id = str(uuid4())
+    root_expired = str(uuid4())
     thread_id = str(uuid4())
     owner_user_id = f"u-conc-{uuid4().hex[:10]}"
     t0 = datetime.now(timezone.utc)
@@ -550,17 +529,47 @@ async def test_db_concurrent_first_deferral_serialized_and_4th_terminates(
         )
         assert d4.action == "exhausted_failed"
         assert d4.defer_count == 3
+
+        # Pre-dispatch held wakeup crossing 24h deadline is rejected by check_wakeup_deferral_admission_deadline
+        past_t0 = t0 - timedelta(hours=25)
+        await uf.evaluate_and_record_wakeup_deferral(
+            root_job_id=root_expired,
+            wakeup_id="wake-exp",
+            thread_id=thread_id,
+            owner_user_id=owner_user_id,
+            step_key=f"pre:{root_expired}:1",
+            availabilities=[
+                uf.SubscriptionAvailability(
+                    available=False,
+                    kind="quota_cooldown",
+                    refusal_code="plan_limit",
+                    reset_at=past_t0 + timedelta(hours=1),
+                    model_name="claude-opus-5-5-oauth",
+                )
+            ],
+            first_due_at=past_t0,
+            now=past_t0,
+        )
+        with pytest.raises(HTTPException) as exp_exc:
+            await uf.check_wakeup_deferral_admission_deadline(
+                root_job_id=root_expired,
+                wakeup_id="wake-exp",
+                thread_id=thread_id,
+                owner_user_id=owner_user_id,
+                now=t0,
+            )
+        assert exp_exc.value.status_code == 400
+        assert exp_exc.value.detail["type"] == uf.DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE
     finally:
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.transaction():
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "DELETE FROM dalton_wakeup_quota_deferrals WHERE root_job_id = %s::uuid",
-                        (root_job_id,),
+                        "DELETE FROM dalton_wakeup_quota_deferrals WHERE root_job_id IN (%s::uuid, %s::uuid)",
+                        (root_job_id, root_expired),
                     )
 
 
-@pytest.mark.asyncio
 async def test_db_resume_route_mutation_skips_mutated_candidate(
     bound_pg_pool: str,
 ) -> None:

@@ -1309,6 +1309,7 @@ async def resolve_turn_config_with_automation_inheritance(
         acquire_fallback_candidate_live,
         bind_unattended_turn_context,
         build_wakeup_cooldown_http_exception,
+        check_wakeup_deferral_admission_deadline,
         classify_unattended_source_kind,
         evaluate_and_record_wakeup_deferral,
         format_unattended_quota_notice,
@@ -1371,6 +1372,31 @@ async def resolve_turn_config_with_automation_inheritance(
         )
         else held_model
     )
+
+    # Pre-dispatch wakeup deferral deadline check (runs BEFORE model availability so
+    # previously held wakeups and checkpoint resumes cannot bypass the 24h deadline
+    # when a model becomes available again or across internal HTTP retries).
+    if unattended_quota_on and getattr(request, "query_type", None) == "wakeup":
+        _admit_wake = getattr(request, "wakeup", None)
+        if isinstance(_admit_wake, Mapping):
+            _admit_root = str(
+                _admit_wake.get("root_job_id") or _admit_wake.get("job_id") or ""
+            ).strip()
+            if _admit_root:
+                _admit_notices = _admit_wake.get("notices") or []
+                _admit_wid = str(_admit_wake.get("wakeup_id") or "").strip()
+                if not _admit_wid and isinstance(_admit_notices, list) and _admit_notices:
+                    _first_n = _admit_notices[0]
+                    if isinstance(_first_n, Mapping):
+                        _admit_wid = str(
+                            _first_n.get("wakeup_id") or _first_n.get("id") or ""
+                        ).strip()
+                await check_wakeup_deferral_admission_deadline(
+                    root_job_id=_admit_root,
+                    wakeup_id=_admit_wid or _admit_root,
+                    thread_id=thread_id,
+                    owner_user_id=user_id,
+                )
 
     # Pre-dispatch structured cooldown & wakeup shared-deferral gate when enabled.
     if unattended_quota_on and flagged_subscription is None:
@@ -1441,11 +1467,6 @@ async def resolve_turn_config_with_automation_inheritance(
                         cfg = await _effective_resolve(cand)
                     except Exception:
                         continue
-                    if admission.lease_verdict is not None:
-                        try:
-                            setattr(cfg, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
-                        except Exception:
-                            pass
                     if admission.route is not None:
                         try:
                             setattr(
@@ -1569,10 +1590,23 @@ async def resolve_turn_config_with_automation_inheritance(
             on_fallback(record)
         return cfg
 
+    effective_fallback_eligible = fallback_eligible or unattended_quota_on
+
+    def _is_sub_unavailable_for_turn(exc: HTTPException) -> bool:
+        if is_subscription_unavailable_error(exc):
+            return True
+        if (
+            unattended_quota_on
+            and isinstance(exc.detail, dict)
+            and exc.detail.get("type") == "oauth_required"
+        ):
+            return True
+        return False
+
     if flagged_subscription is not None:
         subscription, error_code = flagged_subscription
         flagged_exc = build_flagged_subscription_error(subscription, error_code)
-        if not fallback_eligible:
+        if not effective_fallback_eligible:
             raise flagged_exc
         sub_name = getattr(subscription, "account_name", None) or getattr(
             subscription, "id", None
@@ -1601,7 +1635,7 @@ async def resolve_turn_config_with_automation_inheritance(
             and not effective_held_model
         ):
             raise _automation_model_unreadable()
-        if not fallback_eligible:
+        if not effective_fallback_eligible:
             return await thread_model.resolve_turn_config(
                 user_id,
                 thread_id,
@@ -1621,7 +1655,7 @@ async def resolve_turn_config_with_automation_inheritance(
                     resolve=_tracked_resolve,
                 )
             except HTTPException as exc:
-                if not is_subscription_unavailable_error(exc):
+                if not _is_sub_unavailable_for_turn(exc):
                     raise
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_model = (
@@ -1643,12 +1677,12 @@ async def resolve_turn_config_with_automation_inheritance(
                 thread_id,
                 named=inherited_model,
                 held=effective_held_model,
-                fall_back=False if fallback_eligible else from_service,
+                fall_back=False if effective_fallback_eligible else from_service,
                 resolve=_tracked_resolve,
             )
     except HTTPException as exc:
-        if is_subscription_unavailable_error(exc):
-            if fallback_eligible:
+        if _is_sub_unavailable_for_turn(exc):
+            if effective_fallback_eligible:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_model = (
                     (captured_model[-1] if captured_model else None)
