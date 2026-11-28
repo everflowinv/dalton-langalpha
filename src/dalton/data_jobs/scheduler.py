@@ -1728,8 +1728,37 @@ async def finalize_task_run(
                     cf_row = await cur.fetchone()
                     if cf_row is not None:
                         consecutive_failures = int(_extract_field(cf_row, "consecutive_failures", 0))
+
+                    # Durable failure-notice receipt / recovery-epoch update in the same terminal tx
+                    from src.dalton.notify.failure_receipts import (
+                        bump_failure_notice_recovery_epoch_in_tx,
+                        enqueue_failure_notice_in_tx,
+                    )
+
+                    if terminal_status == "succeeded":
+                        await bump_failure_notice_recovery_epoch_in_tx(
+                            conn,
+                            subject_kind="data_task",
+                            source_key=claimed.job_key,
+                        )
+                    else:
+                        await enqueue_failure_notice_in_tx(
+                            conn,
+                            subject_kind="data_task",
+                            subject_id=str(claimed.run_id),
+                            source_key=claimed.job_key,
+                            failure_reason=evaluation.failure_reason or terminal_status,
+                            title=f"数据任务失败：{claimed.job_key}",
+                            detail=evaluation.failure_reason,
+                            metadata={"job_key": claimed.job_key},
+                        )
     except _TerminalRollback:
         return False, None
+
+    if not claimed.is_trial and terminal_status != "succeeded":
+        from src.dalton.notify.failure_receipts import wake_failure_notice_dispatcher
+
+        wake_failure_notice_dispatcher()
 
     try:
         freeze_task_run_artifacts(

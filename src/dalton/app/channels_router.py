@@ -372,6 +372,16 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     reclaim_stale_source_attempt_id: str | None = None
     retry_dedup_by_target: bool = False
     payload_digest: str | None = None
+    claim_token: str | None = None
+
+
+class FailureNoticePlanRequest(BaseModel):
+    """Strict request identifying ``target_receipt_id`` and ``claim_token``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_receipt_id: UUID = Field(...)
+    claim_token: UUID = Field(...)
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -1535,11 +1545,28 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             reclaim_stale_source_attempt_id=body.reclaim_stale_source_attempt_id,
             retry_dedup_by_target=body.retry_dedup_by_target,
             payload_digest=body.payload_digest,
+            claim_token=body.claim_token,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/failure-notices/plan",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_failure_notice_plan_endpoint(
+    body: FailureNoticePlanRequest,
+) -> dict[str, Any]:
+    """Authorize ``(target_receipt_id, claim_token)`` and return the saved failure notice plan."""
+    from src.dalton.database.failure_notice_claims import authorize_failure_notice_plan
+
+    return await authorize_failure_notice_plan(
+        target_receipt_id=str(body.target_receipt_id),
+        claim_token=str(body.claim_token),
+    )
 
 
 @channels_router.post(

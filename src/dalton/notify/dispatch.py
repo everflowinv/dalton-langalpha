@@ -102,6 +102,26 @@ async def sync_terminal_undelivered_execution(
     from src.server.database import automation_executions as exec_db
 
     try:
+        # Guard entry: never touch delivery_result or result_excerpt on non-completed executions
+        async with get_db_connection(conn) as owned:
+            async with owned.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT status
+                    FROM automation_executions
+                    WHERE automation_execution_id = %s::uuid
+                    """,
+                    (exec_id,),
+                )
+                exec_row = await cur.fetchone()
+        exec_status = (
+            str(exec_row.get("status") or "").strip().lower()
+            if isinstance(exec_row, Mapping)
+            else ""
+        )
+        if exec_status != "completed":
+            return False
+
         loaded_rows: list[Mapping[str, Any]]
         if rows is not None:
             loaded_rows = [r for r in rows if isinstance(r, Mapping)]
@@ -190,6 +210,7 @@ async def sync_terminal_undelivered_execution(
                         ELSE result_excerpt || E'\n\n' || %s
                     END
                     WHERE automation_execution_id = %s::uuid
+                      AND status = 'completed'
                     """,
                     (excerpt_note, excerpt_note, exec_id),
                 )
@@ -5651,6 +5672,16 @@ async def retry_failed_notify_deliveries(
             limit=limit,
             uncertain_codes=uncertain_codes_list,
         )
+        from src.dalton.settings import is_failure_notice_enabled
+
+        if is_failure_notice_enabled() and time.monotonic() - started_at < max_duration_s:
+            from src.dalton.notify.failure_receipts import process_due_failure_notices
+
+            fn_stats = await process_due_failure_notices(
+                limit=limit,
+                max_duration_s=max(1.0, max_duration_s - (time.monotonic() - started_at)),
+            )
+            sent_count += int(fn_stats.get("sent") or 0)
     except Exception as scan_exc:
         logger.warning(
             "[DALTON_NOTIFY] Retry scan failed: error_type=%s",

@@ -11011,6 +11011,7 @@ async def authorize_and_claim_delivery(
     reclaim_stale_source_attempt_id: str | None = None,
     retry_dedup_by_target: bool = False,
     payload_digest: str | None = None,
+    claim_token: str | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -11045,6 +11046,22 @@ async def authorize_and_claim_delivery(
 
         return await authorize_and_claim_automation_notify_delivery(
             delivery_key=cleaned_key,
+            run_id=run_id,
+            target=target,
+            has_non_empty_text=has_non_empty_text,
+            total_chunks=total_chunks,
+            gateway_epoch=gateway_epoch,
+            require_gateway_epoch=require_gateway_epoch,
+            conn=conn,
+        )
+    if cleaned_kind == "failure_notice":
+        from src.dalton.database.failure_notice_claims import (
+            authorize_and_claim_failure_notice,
+        )
+
+        return await authorize_and_claim_failure_notice(
+            delivery_key=cleaned_key,
+            claim_token=claim_token,
             run_id=run_id,
             target=target,
             has_non_empty_text=has_non_empty_text,

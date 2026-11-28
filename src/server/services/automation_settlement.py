@@ -198,10 +198,21 @@ async def settle(
 
     async def leave_finish(conn: Any, settled: Dict[str, Any]) -> None:
         nonlocal finish_left
+        settled_tid, settled_rid, settled_delivery = _settled_as(
+            settled, execution_id, thread_id, run_id, delivery
+        )
         finish_left = await _leave_finish(
             conn, policy, automation, execution_id,
-            *_settled_as(settled, execution_id, thread_id, run_id, delivery),
+            settled_tid, settled_rid, settled_delivery,
             settled, final_text,
+        )
+        # DALTON-HOOK(dalton-notify): enqueue durable failure notice or bump recovery epoch inside settle tx
+        from src.dalton.notify.failure_receipts import on_automation_settle_in_tx
+
+        await on_automation_settle_in_tx(
+            conn, automation=automation, execution_id=execution_id, outcome_status=policy.status,
+            failure_reason=policy.failure_reason, error=error, delivery=settled_delivery,
+            thread_id=settled_tid, workspace_id=workspace_id,
         )
         # DALTON-HOOK(automation-subscription-fallback): release signals only when executor's synchronous pre-START path settles 'failed'
         if release_pre_start_signals and policy.status == "failed":
@@ -392,6 +403,11 @@ async def _after_settling(
             coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
             coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
         )
+    # DALTON-HOOK(dalton-notify): wake failure-notice dispatcher after failed settle commits
+    if not deleted and policy.status == "failed":
+        from src.dalton.notify.failure_receipts import wake_failure_notice_dispatcher
+
+        wake_failure_notice_dispatcher()
     if row["settled_from"] == "waiting" and thread_id:
         await publish_automation_wait(
             user_id=automation["user_id"],
