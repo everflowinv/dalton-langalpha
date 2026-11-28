@@ -174,6 +174,18 @@ export STANDALONE_WORK_DIR="$WORK_DIR"
 export STANDALONE_ARTIFACTS_DIR="$ARTIFACTS_DIR"
 export STANDALONE_COMPOSE_FILES="${BASE_COMPOSE}:${CORE_COMPOSE}:${CI_COMPOSE_FILE}"
 
+# Private 0600 sidecar file (outside ARTIFACTS_DIR) where check scripts record
+# runtime-generated credentials (access tokens, WS tickets, invite tokens,
+# refresh cookies, passwords) so the post-run secret scan covers them too.
+_OWN_RUNTIME_SECRETS_FILE=0
+if [[ -z "${STANDALONE_RUNTIME_SECRETS_FILE:-}" ]]; then
+  STANDALONE_RUNTIME_SECRETS_FILE="$(mktemp "${TMPDIR:-/tmp}/dalton-runtime-secrets.XXXXXX")"
+  chmod 600 "$STANDALONE_RUNTIME_SECRETS_FILE"
+  export STANDALONE_RUNTIME_SECRETS_FILE
+  _OWN_RUNTIME_SECRETS_FILE=1
+  trap 'rm -f "$STANDALONE_RUNTIME_SECRETS_FILE"' EXIT
+fi
+
 echo "[run_checks] Using isolated Compose project '${PROJECT_NAME}' (sandbox network: '${SANDBOX_DOCKER_NETWORK}')"
 
 compose_run() {
@@ -210,6 +222,17 @@ verify_backend_auth_mode() {
     return 1
   fi
   echo "[run_checks] Verified backend active DALTON_AUTH_MODE=${actual_mode}"
+  if [[ "$expected_mode" == "oss" ]]; then
+    local owner_secret_set
+    owner_secret_set="$(compose_run exec -T backend uv run --no-sync python -c \
+      "import os; print('1' if os.environ.get('LANGALPHA_OWNER_SECRET', '').strip() else '0')" \
+      | tr -d '\r\n' | tail -n 1)"
+    if [[ "$owner_secret_set" != "1" ]]; then
+      echo "ERROR: Backend container missing LANGALPHA_OWNER_SECRET for auth=oss" >&2
+      return 1
+    fi
+    echo "[run_checks] Verified backend has LANGALPHA_OWNER_SECRET configured (value redacted)"
+  fi
 }
 
 OVERALL_RC=0
@@ -232,6 +255,20 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
     export DALTON_ALLOW_DEV_OSS_AUTH=1
     export DALTON_AUTH_COOKIE_SECURE=""
     export CI_GINLIX_DATA_URL=""
+    unset LANGALPHA_OWNER_SECRET || true
+    # Generate a random LANGALPHA_OWNER_SECRET into .env (mode 0600, never printed)
+    # so oss-group checks authenticate through Caddy edge via X-LangAlpha-Owner.
+    "$PYTHON_BIN" - "$CHECKS_DIR" "${WORK_DIR}/.env" <<'PY'
+from pathlib import Path
+import sys
+
+checks_dir, env_path = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(checks_dir))
+import _lib
+
+_lib.ensure_oss_owner_secret(env_path)
+PY
+    echo "[run_checks] Configured random LANGALPHA_OWNER_SECRET in .env for auth=oss (value not printed)."
   else
     export DALTON_ALLOW_DEV_OSS_AUTH=""
     export DALTON_AUTH_COOKIE_SECURE="false"
@@ -269,10 +306,12 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
 
   IFS=$'\t' read -r -a check_scripts <<< "$scripts_rest"
   group_rc=0
+  check_output_log="${ARTIFACTS_DIR}/check-output-${auth_mode}.txt"
+  : > "$check_output_log"
   for script in "${check_scripts[@]}"; do
     [[ -z "$script" ]] && continue
     echo "[run_checks] Running $(basename "$script") (auth=${auth_mode})..."
-    if ! "$PYTHON_BIN" "$script"; then
+    if ! "$PYTHON_BIN" "$script" 2>&1 | tee -a "$check_output_log"; then
       echo "ERROR: Check failed: $script (auth=${auth_mode})" >&2
       group_rc=1
       break
@@ -292,16 +331,26 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
   fi
 done <<< "$GROUP_MANIFEST"
 
-# Fail if any collected log/report artifact contains a secret from .env.
-if ! "$PYTHON_BIN" - "$CHECKS_DIR" "$ARTIFACTS_DIR" "${WORK_DIR}/.env" <<'PY'
+# Fail if any collected log/report/check-output artifact contains a secret from
+# .env (including Research Host & owner tokens) or runtime-generated credentials.
+if ! "$PYTHON_BIN" - "$CHECKS_DIR" "$ARTIFACTS_DIR" "${WORK_DIR}/.env" "$STANDALONE_RUNTIME_SECRETS_FILE" <<'PY'
 from pathlib import Path
 import sys
 
-checks_dir, artifacts_dir, env_path = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+checks_dir, artifacts_dir, env_path, rt_path = (
+    Path(sys.argv[1]),
+    Path(sys.argv[2]),
+    Path(sys.argv[3]),
+    Path(sys.argv[4]),
+)
 sys.path.insert(0, str(checks_dir))
 import _lib
 
-leaks = _lib.scan_artifacts_for_secrets(artifacts_dir, env_path)
+leaks = _lib.scan_artifacts_for_secrets(
+    artifacts_dir,
+    env_path,
+    runtime_secrets_path=rt_path,
+)
 if leaks:
     print("ERROR: Secret leak detected in collected artifacts:", file=sys.stderr)
     for hit in leaks:

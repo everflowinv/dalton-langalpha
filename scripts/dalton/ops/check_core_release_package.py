@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import fnmatch
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from typing import Iterable
 
@@ -129,6 +130,81 @@ EXPORT_MIGRATED_TARGETS: tuple[str, ...] = (
 
 _SKIP_DIR_NAMES = frozenset({"__pycache__", ".git", "node_modules", ".venv"})
 
+# Single source of truth for test-only path exemptions, active ONLY when `--include-ci`
+# is explicitly passed (CI test tarballs). Customer release packages NEVER use this list.
+#
+# Exemptions skip ONLY regular-file content scans; member paths, symlinks and their
+# targets, `.dalton.yaml` checks, and forbidden-subpath checks always run.
+#
+# Rationale:
+# - `tests/standalone/**`: standalone verification harness itself embeds forbidden-term
+#   regexes (e.g. `b3_skills_prompts_ui.py`) and scanner self-test fixtures
+#   (`test_check_framework.py`) that cannot be rewritten without breaking the checks.
+# - `web/e2e/**`, `**/__tests__/**`, and `*.test.ts` / `*.test.tsx` / `*.spec.js`
+#   strictly under `web/src/**` or `web/e2e/**`: frontend test suites kept only in
+#   `--include-ci` test tarballs (customer releases strip `web/e2e` and `**/__tests__`,
+#   and never pass `--include-ci`).
+#
+# Production code paths are NEVER exempted.
+CI_TEST_EXEMPT_PATH_PATTERNS: tuple[str, ...] = (
+    "tests/standalone/**",
+    "web/e2e/**",
+    "**/__tests__/**",
+    "web/src/**/*.test.ts",
+    "web/src/**/*.test.tsx",
+    "web/src/**/*.spec.js",
+    "web/e2e/**/*.test.ts",
+    "web/e2e/**/*.test.tsx",
+    "web/e2e/**/*.spec.js",
+)
+
+
+def _posix_rel_parts(rel_posix: str) -> tuple[str, ...]:
+    """Split a POSIX relative path into components, stripping only leading ``./`` segments.
+
+    Hidden directory names (e.g. ``.tests``, ``.web``) are preserved verbatim.
+    Absolute paths and parent-traversal segments (``..``) never match.
+    """
+    trimmed = rel_posix
+    while trimmed.startswith("./"):
+        trimmed = trimmed[2:]
+    if not trimmed or trimmed.startswith("/"):
+        return ()
+    parts = tuple(part for part in PurePosixPath(trimmed).parts if part not in ("", "."))
+    if not parts or ".." in parts:
+        return ()
+    return parts
+
+
+def _matches_ci_test_pattern(rel_posix: str, pattern: str) -> bool:
+    parts = _posix_rel_parts(rel_posix)
+    if not parts:
+        return False
+    if pattern.startswith("**/") and pattern.endswith("/**"):
+        segment = pattern[3:-3]
+        return segment in parts[:-1]
+    if "/**/" in pattern:
+        prefix_str, file_glob = pattern.split("/**/", 1)
+        prefix_parts = tuple(p for p in PurePosixPath(prefix_str).parts if p not in ("", "."))
+        if not prefix_parts or "/" in file_glob:
+            return False
+        return (
+            len(parts) > len(prefix_parts)
+            and parts[: len(prefix_parts)] == prefix_parts
+            and fnmatch.fnmatchcase(parts[-1], file_glob)
+        )
+    if pattern.endswith("/**"):
+        prefix_parts = tuple(p for p in PurePosixPath(pattern[:-3]).parts if p not in ("", "."))
+        return len(parts) > len(prefix_parts) and parts[: len(prefix_parts)] == prefix_parts
+    return False
+
+
+def is_ci_test_exempt_path(rel_posix: str) -> bool:
+    return any(_matches_ci_test_pattern(rel_posix, pat) for pat in CI_TEST_EXEMPT_PATH_PATTERNS)
+
+
+_is_ci_test_exempt_path = is_ci_test_exempt_path
+
 
 @dataclass
 class CheckReport:
@@ -182,10 +258,15 @@ def _scan_files_for_terms(
     base_root: Path,
     files: Iterable[Path],
     terms: tuple[str, ...],
+    *,
+    exempt_ci_test_paths: bool = False,
 ) -> list[dict[str, object]]:
     lowered_terms = [(term, term.casefold()) for term in terms]
     hits: list[dict[str, object]] = []
     for path in files:
+        rel = path.relative_to(base_root).as_posix()
+        if exempt_ci_test_paths and _is_ci_test_exempt_path(rel):
+            continue
         if path.suffix.lower() in _BINARY_SUFFIXES:
             continue
         try:
@@ -195,7 +276,6 @@ def _scan_files_for_terms(
         if b"\x00" in raw[:8192]:
             continue
         text = raw.decode("utf-8", errors="replace")
-        rel = str(path.relative_to(base_root))
         for lineno, line in enumerate(text.splitlines(), 1):
             line_cf = line.casefold()
             for orig_term, needle in lowered_terms:
@@ -214,6 +294,8 @@ def _scan_files_for_terms(
 def _scan_export_for_forbidden_regex(
     base_root: Path,
     patterns: tuple[tuple[str, re.Pattern[str]], ...],
+    *,
+    exempt_ci_test_paths: bool = False,
 ) -> list[dict[str, object]]:
     hits: list[dict[str, object]] = []
     for p in sorted(base_root.rglob("*")):
@@ -238,8 +320,31 @@ def _scan_export_for_forbidden_regex(
                             "snippet": link_target[:160],
                         }
                     )
+            if link_target.endswith(".dalton.yaml") or link_target.endswith(
+                "everflow_defaults.yaml"
+            ):
+                hits.append(
+                    {
+                        "kind": "symlink",
+                        "path": rel,
+                        "line": 0,
+                        "rule": "everflow_overlay_symlink",
+                        "snippet": link_target[:160],
+                    }
+                )
             continue
         if not p.is_file():
+            for rule_name, pattern in patterns:
+                if pattern.search(rel):
+                    hits.append(
+                        {
+                            "kind": "path",
+                            "path": rel,
+                            "line": 0,
+                            "rule": rule_name,
+                            "snippet": rel[:160],
+                        }
+                    )
             continue
         for rule_name, pattern in patterns:
             if pattern.search(rel):
@@ -252,6 +357,8 @@ def _scan_export_for_forbidden_regex(
                         "snippet": rel[:160],
                     }
                 )
+        if exempt_ci_test_paths and _is_ci_test_exempt_path(rel):
+            continue
         if p.suffix.lower() in _BINARY_SUFFIXES:
             continue
         try:
@@ -292,6 +399,7 @@ def check_core_release_package(
     *,
     repo_root: Path | None = None,
     export_dir: Path | None = None,
+    include_ci: bool = False,
 ) -> CheckReport:
     """Run all Standalone Core release isolation and zero-leak checks."""
     report = CheckReport()
@@ -328,10 +436,12 @@ def check_core_release_package(
             resolved_export,
             _iter_text_files(resolved_export, None),
             WHOLE_PACKAGE_FORBIDDEN_COMMERCIAL_TERMS,
+            exempt_ci_test_paths=include_ci,
         )
         report.whole_export_forbidden_regex_hits = _scan_export_for_forbidden_regex(
             resolved_export,
             WHOLE_PACKAGE_FORBIDDEN_REGEX_PATTERNS,
+            exempt_ci_test_paths=include_ci,
         )
 
     return report
@@ -341,6 +451,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Out-of-package Standalone Core release verification gate")
     parser.add_argument("--repo-root", default=None, help="Repository root to check migrated public source dirs")
     parser.add_argument("--export-dir", default=None, help="Exported Standalone Core directory to check")
+    parser.add_argument(
+        "--include-ci",
+        action="store_true",
+        help="Exempt CI test-only paths from whole-export leak scans (for --include-ci test tarballs only)",
+    )
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
     parser.add_argument("--report-only", action="store_true", help="Print report and always exit 0")
     args = parser.parse_args(argv)
@@ -350,12 +465,18 @@ def main(argv: list[str] | None = None) -> int:
     if repo_root is None and export_dir is None:
         repo_root = Path(__file__).resolve().parents[3]
 
-    report = check_core_release_package(repo_root=repo_root, export_dir=export_dir)
+    report = check_core_release_package(
+        repo_root=repo_root,
+        export_dir=export_dir,
+        include_ci=args.include_ci,
+    )
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:
         print("=== Standalone Core Release Scan Report ===")
         print(f"status: {'PASS' if report.ok else 'FAIL'}")
+        if args.include_ci:
+            print(f"ci_test_exempt_paths: {', '.join(CI_TEST_EXEMPT_PATH_PATTERNS)}")
         print(f"scanned_terms: {', '.join(PROPRIETARY_SCAN_TERMS)}")
         print(
             "scanned_forbidden_regex_rules: "

@@ -101,6 +101,8 @@ jobs:
             export BUILD_GIT_SHA
             export BUILD_GIT_DIRTY="false"
             cleanup_customer_stack() {
+              docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps -a || true
+              docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env logs --tail=200 backend migrate || true
               docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v --remove-orphans || true
             }
             trap cleanup_customer_stack EXIT
@@ -118,8 +120,7 @@ jobs:
               up -d
             for i in $(seq 1 60); do
               if docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1 \
-                && curl -sf http://127.0.0.1:8088/api/v1/dalton/capabilities >/dev/null 2>&1; then
-                echo "[customer-smoke] Customer release tarball built and passed health check."
+                && curl -sf http://127.0.0.1:8088/api/v1/dalton/bootstrap/status >/dev/null 2>&1; then
                 break
               fi
               if [[ "$i" -eq 60 ]]; then
@@ -129,6 +130,89 @@ jobs:
               fi
               sleep 2
             done
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import secrets
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          base = "http://127.0.0.1:8088"
+
+          def req(method: str, path: str, *, headers=None, body=None):
+              hdrs = dict(headers or {})
+              data = None
+              if body is not None:
+                  data = json.dumps(body).encode("utf-8")
+                  hdrs["Content-Type"] = "application/json"
+              r = Request(f"{base}{path}", data=data, headers=hdrs, method=method)
+              try:
+                  with urlopen(r, timeout=20) as resp:
+                      return resp.status, json.loads(resp.read().decode("utf-8"))
+              except HTTPError as err:
+                  raw = err.read().decode("utf-8", errors="replace")
+                  return err.code, raw
+
+          def read_env_key(env_path: Path, target: str) -> str:
+              for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  if line.startswith("export "):
+                      line = line[len("export "):].strip()
+                  if "=" not in line:
+                      continue
+                  k, v = line.split("=", 1)
+                  if k.strip() != target:
+                      continue
+                  val = v.strip()
+                  if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                      val = val[1:-1]
+                  return val
+              return ""
+
+          # 1. Confirm unauthenticated /dalton/capabilities is rejected (401)
+          unauth_status, _ = req("GET", "/api/v1/dalton/capabilities")
+          assert unauth_status == 401, f"Expected 401 for unauthenticated /dalton/capabilities, got {unauth_status}"
+
+          # 2. Confirm fresh install requires first-admin bootstrap
+          boot_status, boot_info = req("GET", "/api/v1/dalton/bootstrap/status")
+          assert boot_status == 200 and isinstance(boot_info, dict) and boot_info.get("needs_bootstrap") is True, (
+              f"Expected needs_bootstrap=true, got {boot_status} {boot_info!r}"
+          )
+
+          # 3. Bootstrap first admin through the normal local-auth onboarding flow
+          bootstrap_token = read_env_key(Path(".env"), "BOOTSTRAP_SETUP_TOKEN")
+          assert bootstrap_token, "BOOTSTRAP_SETUP_TOKEN missing from .env"
+          admin_status, admin_body = req(
+              "POST",
+              "/api/v1/dalton/bootstrap/admin",
+              body={
+                  "bootstrap_token": bootstrap_token,
+                  "email": f"smoke-admin-{secrets.token_hex(4)}@core.local",
+                  "username": "smoke_admin",
+                  "name": "Smoke Admin",
+                  "password": f"SmokeAdmin!{secrets.token_hex(8)}",
+              },
+          )
+          assert admin_status == 201 and isinstance(admin_body, dict), (
+              f"First-admin bootstrap failed: HTTP {admin_status}"
+          )
+          access_token = str(admin_body.get("access_token") or "")
+          assert access_token, "Bootstrap response missing access_token"
+
+          # 4. Read /dalton/capabilities with the authenticated Bearer session
+          cap_status, cap_body = req(
+              "GET",
+              "/api/v1/dalton/capabilities",
+              headers={"Authorization": f"Bearer {access_token}"},
+          )
+          assert cap_status == 200 and isinstance(cap_body, dict), (
+              f"Authenticated /dalton/capabilities failed: HTTP {cap_status}"
+          )
+          assert cap_body.get("profile") == "core", f"Expected profile='core', got {cap_body.get('profile')!r}"
+          print("[customer-smoke] Customer release tarball built and passed authenticated capabilities check.")
+          PY
           )
 
       - name: Package, verify, and extract CI test tarball (with CI harness)
@@ -141,6 +225,7 @@ jobs:
             --tar /tmp/dalton-core-ci-test.tar.gz
           python3 scripts/standalone/verify_release_tarball.py \
             --expected-top-dir "${EXPECTED_TOP_DIR}" \
+            --include-ci \
             /tmp/dalton-core-ci-test.tar.gz
           mkdir -p /tmp/dalton-core-dist
           tar -xzf /tmp/dalton-core-ci-test.tar.gz --strip-components=1 -C /tmp/dalton-core-dist
