@@ -2319,6 +2319,172 @@ def _cmd_preflight_disk_space(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class KnownMissingObject:
+    """One referenced object registered as already missing in a backup-set or object manifest."""
+
+    bucket: str
+    key: str
+    consumer: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "bucket": self.bucket,
+            "key": self.key,
+            "consumer": self.consumer,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class RestoredRefsVerifyReport:
+    """Result of verifying restored objects against DB/snapshot references and registered known missing items."""
+
+    ok: bool
+    checked_count: int
+    present_count: int
+    known_missing: tuple[KnownMissingObject, ...] = ()
+    unexpected_missing: tuple[KnownMissingObject, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "checked_count": self.checked_count,
+            "present_count": self.present_count,
+            "known_missing_count": len(self.known_missing),
+            "unexpected_missing_count": len(self.unexpected_missing),
+            "known_missing": [item.to_dict() for item in self.known_missing],
+            "unexpected_missing": [item.to_dict() for item in self.unexpected_missing],
+        }
+
+
+def load_known_missing_objects(
+    manifest_or_set: Mapping[str, Any] | Path,
+) -> tuple[KnownMissingObject, ...]:
+    """Load registered ``missing_referenced_objects`` from a backup-set or object manifest."""
+    if isinstance(manifest_or_set, Path):
+        data = json.loads(manifest_or_set.read_text(encoding="utf-8"))
+    else:
+        data = manifest_or_set
+    if not isinstance(data, Mapping):
+        return ()
+    raw_items = data.get("missing_referenced_objects")
+    if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes)):
+        return ()
+    out: list[KnownMissingObject] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_items:
+        if not isinstance(item, Mapping):
+            continue
+        bucket = str(item.get("bucket") or "").strip()
+        key = str(item.get("key") or "").strip().lstrip("/")
+        consumer = str(item.get("consumer") or "").strip()
+        if not bucket or not key:
+            continue
+        triple = (bucket, key, consumer)
+        if triple in seen:
+            continue
+        seen.add(triple)
+        out.append(KnownMissingObject(bucket=bucket, key=key, consumer=consumer))
+    return tuple(out)
+
+
+def verify_restored_references(
+    referenced_objects: Sequence[Mapping[str, Any] | tuple[str, str] | tuple[str, str, str]],
+    present_objects: Iterable[Mapping[str, Any] | tuple[str, str]],
+    *,
+    known_missing_objects: Sequence[Mapping[str, Any] | KnownMissingObject | tuple[str, str]] = (),
+    manifest_or_set: Mapping[str, Any] | Path | None = None,
+    log_fn: Callable[[str], None] | None = None,
+) -> RestoredRefsVerifyReport:
+    """Verify restored bucket objects against referenced keys, treating manifest-registered missing items as known missing.
+
+    - Registered items in ``known_missing_objects`` (or loaded from ``manifest_or_set``) are
+      reported in ``known_missing`` and via ``log_fn``, and do NOT fail verification (``ok=True``).
+    - Any unregistered missing object is reported in ``unexpected_missing`` and fails verification
+      (``ok=False``).
+    """
+    present_pairs: set[tuple[str, str]] = set()
+    for item in present_objects:
+        if isinstance(item, Mapping):
+            b = str(item.get("bucket") or "").strip()
+            k = str(item.get("key") or "").strip().lstrip("/")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            b = str(item[0] or "").strip()
+            k = str(item[1] or "").strip().lstrip("/")
+        else:
+            continue
+        if b and k:
+            present_pairs.add((b, k))
+
+    known_pairs: dict[tuple[str, str], str] = {}
+    if manifest_or_set is not None:
+        for km in load_known_missing_objects(manifest_or_set):
+            known_pairs[(km.bucket, km.key)] = km.consumer
+    for item in known_missing_objects:
+        if isinstance(item, KnownMissingObject):
+            b, k, c = item.bucket.strip(), item.key.strip().lstrip("/"), item.consumer.strip()
+        elif isinstance(item, Mapping):
+            b = str(item.get("bucket") or "").strip()
+            k = str(item.get("key") or "").strip().lstrip("/")
+            c = str(item.get("consumer") or "").strip()
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            b = str(item[0] or "").strip()
+            k = str(item[1] or "").strip().lstrip("/")
+            c = str(item[2] or "").strip() if len(item) >= 3 else ""
+        else:
+            continue
+        if b and k:
+            known_pairs.setdefault((b, k), c)
+
+    present_count = 0
+    checked_count = 0
+    known_missing_hits: list[KnownMissingObject] = []
+    unexpected_missing_hits: list[KnownMissingObject] = []
+
+    for ref in referenced_objects:
+        if isinstance(ref, Mapping):
+            b = str(ref.get("bucket") or "").strip()
+            k = str(ref.get("key") or "").strip().lstrip("/")
+            c = str(ref.get("consumer") or "").strip()
+        elif isinstance(ref, (tuple, list)) and len(ref) >= 2:
+            b = str(ref[0] or "").strip()
+            k = str(ref[1] or "").strip().lstrip("/")
+            c = str(ref[2] or "").strip() if len(ref) >= 3 else ""
+        else:
+            continue
+        if not b or not k:
+            continue
+        checked_count += 1
+        if (b, k) in present_pairs:
+            present_count += 1
+        elif (b, k) in known_pairs:
+            known_missing_hits.append(
+                KnownMissingObject(bucket=b, key=k, consumer=c or known_pairs[(b, k)])
+            )
+        else:
+            unexpected_missing_hits.append(KnownMissingObject(bucket=b, key=k, consumer=c))
+
+    if known_missing_hits and log_fn is not None:
+        sample = ", ".join(f"{x.bucket}/{x.key}" for x in known_missing_hits[:10])
+        suffix = (
+            f" (+{len(known_missing_hits) - 10} more)"
+            if len(known_missing_hits) > 10
+            else ""
+        )
+        log_fn(
+            f"KNOWN_MISSING_OBJECTS count={len(known_missing_hits)} "
+            f"(registered in backup manifest, not treated as restore failure): {sample}{suffix}"
+        )
+
+    return RestoredRefsVerifyReport(
+        ok=len(unexpected_missing_hits) == 0,
+        checked_count=checked_count,
+        present_count=present_count,
+        known_missing=tuple(known_missing_hits),
+        unexpected_missing=tuple(unexpected_missing_hits),
+    )
+
+
 def _cmd_reconcile_restored_inflight_states(args: argparse.Namespace) -> int:
     repo_root = Path(__file__).resolve().parents[3]
     if str(repo_root) not in sys.path:
@@ -2333,6 +2499,44 @@ def _cmd_reconcile_restored_inflight_states(args: argparse.Namespace) -> int:
     if args.restored_before:
         sub_argv.extend(["--restored-before", args.restored_before])
     return consistent_backup.main(sub_argv)
+
+
+def _cmd_verify_restored_refs(args: argparse.Namespace) -> int:
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from src.dalton import storage_refs
+
+    manifest_path = str(args.manifest or "").strip()
+    backup_set_path = str(args.backup_set or "").strip()
+    if not manifest_path and backup_set_path:
+        set_data = json.loads(Path(backup_set_path).read_text(encoding="utf-8"))
+        if isinstance(set_data, dict):
+            manifest_path = str(set_data.get("manifest_path") or "").strip()
+    if not manifest_path:
+        print("verify-restored-refs requires --manifest or --backup-set with manifest_path", file=sys.stderr)
+        return 2
+
+    sub_argv = ["reconcile", "--manifest", manifest_path]
+    if backup_set_path:
+        sub_argv.extend(["--backup-set", backup_set_path])
+    if args.refs_json:
+        sub_argv.extend(["--refs-json", args.refs_json])
+    if args.asr_archive:
+        sub_argv.extend(["--asr-archive", args.asr_archive])
+    if args.asr_dir:
+        sub_argv.extend(["--asr-dir", args.asr_dir])
+    if args.source_asr_dir:
+        sub_argv.extend(["--source-asr-dir", args.source_asr_dir])
+    if args.main_bucket:
+        sub_argv.extend(["--main-bucket", args.main_bucket])
+    if args.main_prefix:
+        sub_argv.extend(["--main-prefix", args.main_prefix])
+    if args.aux_bucket:
+        sub_argv.extend(["--aux-bucket", args.aux_bucket])
+    if args.aux_prefix:
+        sub_argv.extend(["--aux-prefix", args.aux_prefix])
+    return int(storage_refs.main(sub_argv))
 
 
 def _cmd_latest_pg_dump(args: argparse.Namespace) -> int:
@@ -2596,6 +2800,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_rri.add_argument("--asr-jobs-dir", default="")
     p_rri.add_argument("--restored-before", default="")
     p_rri.set_defaults(func=_cmd_reconcile_restored_inflight_states)
+
+    p_vrr = sub.add_parser("verify-restored-refs")
+    p_vrr.add_argument("--manifest", default="")
+    p_vrr.add_argument("--backup-set", default="")
+    p_vrr.add_argument("--refs-json", default="")
+    p_vrr.add_argument("--asr-archive", default="")
+    p_vrr.add_argument("--asr-dir", default="")
+    p_vrr.add_argument("--source-asr-dir", default="")
+    p_vrr.add_argument("--main-bucket", default="")
+    p_vrr.add_argument("--main-prefix", default="")
+    p_vrr.add_argument("--aux-bucket", default="")
+    p_vrr.add_argument("--aux-prefix", default="")
+    p_vrr.set_defaults(func=_cmd_verify_restored_refs)
 
     p_pg = sub.add_parser("latest-pg-dump")
     p_pg.add_argument("--pg-dir", required=True)

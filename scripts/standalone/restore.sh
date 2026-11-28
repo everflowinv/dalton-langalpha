@@ -1704,9 +1704,43 @@ if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
     ")"
   fi
   if [[ -n "$DB_OBJ_REFS" ]]; then
+    KNOWN_MISSING_JSON="[]"
+    if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
+      KNOWN_MISSING_JSON="$(python3 - "$MINIO_MANIFEST_TMP" "${BACKUP_DIR}/manifest.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+out = []
+seen = set()
+for raw_path in sys.argv[1:]:
+    p = Path(raw_path)
+    if not p.is_file():
+        continue
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    items = data.get("missing_referenced_objects")
+    if not isinstance(items, list):
+        continue
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        b = str(item.get("bucket") or "").strip()
+        k = str(item.get("key") or "").strip().lstrip("/")
+        c = str(item.get("consumer") or "").strip()
+        if b and k and (b, k) not in seen:
+            seen.add((b, k))
+            out.append({"bucket": b, "key": k, "consumer": c})
+print(json.dumps(out, ensure_ascii=False))
+PY
+)"
+    fi
     MISSING_CHECK_PY='
 from __future__ import annotations
-import os, sys
+import json, os, sys
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -1719,6 +1753,17 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 skipped_uploading = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
+known_missing_raw = sys.argv[2] if len(sys.argv) > 2 else "[]"
+known_missing_pairs: set[tuple[str, str]] = set()
+try:
+    for km in json.loads(known_missing_raw or "[]"):
+        if isinstance(km, dict):
+            kb = str(km.get("bucket") or "").strip()
+            kk = str(km.get("key") or "").strip().lstrip("/")
+            if kb and kk:
+                known_missing_pairs.add((kb, kk))
+except Exception:
+    pass
 
 dedicated_ok = all(
     (os.getenv(k) or "").strip()
@@ -1761,6 +1806,7 @@ client = boto3.client(
 )
 
 missing: list[str] = []
+known_missing_hits: list[str] = []
 checked = 0
 for line in sys.stdin:
     line = line.strip()
@@ -1777,7 +1823,20 @@ for line in sys.stdin:
     try:
         client.head_object(Bucket=bucket, Key=full_key)
     except ClientError:
-        missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+        if (bucket, full_key) in known_missing_pairs:
+            known_missing_hits.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+        else:
+            missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+
+if known_missing_hits:
+    print(
+        f"[restore] WARN: {len(known_missing_hits)}/{checked} DB-referenced object(s) are registered as known missing in backup manifest (not treated as restore failure):",
+        file=sys.stderr,
+    )
+    for item in known_missing_hits[:10]:
+        print(f"[restore] WARN:   known missing: {item}", file=sys.stderr)
+    if len(known_missing_hits) > 10:
+        print(f"[restore] WARN:   ... (+{len(known_missing_hits) - 10} more)", file=sys.stderr)
 
 if missing:
     print(f"[restore] ERROR: {len(missing)}/{checked} DB-referenced object(s) missing from object storage:", file=sys.stderr)
@@ -1790,12 +1849,12 @@ if missing:
     sys.exit(1)
 else:
     print(
-        f"[restore] OK: All {checked} completed DB-referenced object(s) present in MinIO bucket {bucket!r} "
-        f"(skipped {skipped_uploading} in-progress \x27uploading\x27 record(s))."
+        f"[restore] OK: All {checked - len(known_missing_hits)}/{checked} present DB-referenced object(s) verified in MinIO bucket {bucket!r} "
+        f"(known_missing={len(known_missing_hits)}, skipped {skipped_uploading} in-progress \x27uploading\x27 record(s))."
     )
 '
     printf '%s\n' "$DB_OBJ_REFS" | compose_cmd run --rm -T --no-deps backend \
-      uv run --no-sync python -c "$MISSING_CHECK_PY" "$SKIPPED_UPLOADING_COUNT"
+      uv run --no-sync python -c "$MISSING_CHECK_PY" "$SKIPPED_UPLOADING_COUNT" "$KNOWN_MISSING_JSON"
   else
     ok "No active completed DB object references to verify (skipped ${SKIPPED_UPLOADING_COUNT} in-progress 'uploading' record(s))."
   fi

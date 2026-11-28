@@ -2572,6 +2572,7 @@ class ReconcileReport:
     errors: tuple[ReconcileIssue, ...] = ()
     warnings: tuple[ReconcileIssue, ...] = ()
     skipped_pending: dict[str, int] = field(default_factory=dict)
+    known_missing: tuple[ReconcileIssue, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2580,9 +2581,11 @@ class ReconcileReport:
             "checked_asr_jobs": self.checked_asr_jobs,
             "error_count": len(self.errors),
             "warning_count": len(self.warnings),
+            "known_missing_count": len(self.known_missing),
             "skipped_pending": dict(self.skipped_pending),
             "errors": [e.to_dict() for e in self.errors],
             "warnings": [w.to_dict() for w in self.warnings],
+            "known_missing": [k.to_dict() for k in self.known_missing],
         }
 
 
@@ -3531,6 +3534,29 @@ def _load_tar_members_bytes(tar_path: Path) -> dict[str, bytes]:
     return members
 
 
+def _index_known_missing_objects(
+    known_missing_objects: Sequence[Any] | None,
+) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    if not known_missing_objects:
+        return out
+    for item in known_missing_objects:
+        bucket = ""
+        key = ""
+        if isinstance(item, Mapping):
+            bucket = str(item.get("bucket") or "").strip()
+            key = str(item.get("key") or "").strip().lstrip("/")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            bucket = str(item[0] or "").strip()
+            key = str(item[1] or "").strip().lstrip("/")
+        elif hasattr(item, "bucket") and hasattr(item, "key"):
+            bucket = str(getattr(item, "bucket") or "").strip()
+            key = str(getattr(item, "key") or "").strip().lstrip("/")
+        if bucket and key:
+            out.add((bucket, key))
+    return out
+
+
 def reconcile_inventory_against_manifest(
     inventory: SnapshotRefInventory,
     manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
@@ -3540,6 +3566,7 @@ def reconcile_inventory_against_manifest(
     asr_jobs_dir: Path | None = None,
     source_asr_jobs_dir: Path | None = None,
     require_raw_response_job_ids: set[str] | frozenset[str] | None = None,
+    known_missing_objects: Sequence[Any] | None = None,
     target_logger: logging.Logger | None = None,
 ) -> ReconcileReport:
     """Reconcile all snapshot consumer references against the archived object manifest & ASR jobs archive.
@@ -3550,11 +3577,16 @@ def reconcile_inventory_against_manifest(
     - ``provenance_result_bodies`` checks existence only; size mismatch logs WARNING and passes.
     - ``succeeded`` ASR jobs check ``<job_id>/state.json`` (status='succeeded'), ``result.json``,
       and ``raw_response.json`` whenever the job writes it.
+    - Objects registered in ``known_missing_objects`` (already absent at backup snapshot time
+      and tolerated under threshold on non-main buckets) are recorded as ``known_missing_object``
+      warnings rather than reconciliation errors.
     """
     log = target_logger or logger
     index, duplicate_pairs = _index_manifest_objects_with_duplicates(manifest_objects)
+    known_missing_set = _index_known_missing_objects(known_missing_objects)
     errors: list[ReconcileIssue] = []
     warnings: list[ReconcileIssue] = []
+    known_missing_issues: list[ReconcileIssue] = []
     checked_refs = 0
 
     for dup_bucket, dup_key in duplicate_pairs:
@@ -3599,6 +3631,20 @@ def reconcile_inventory_against_manifest(
         full_key = _apply_bucket_prefix(ref.object_key, key_prefix)
         entry = index.get((bucket_name, full_key))
         if entry is None:
+            if (bucket_name, full_key) in known_missing_set:
+                km_issue = ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="known_missing_object",
+                    row_id=ref.row_id,
+                    object_key=f"{bucket_name}/{full_key}",
+                    detail=(
+                        "Referenced object was missing at backup snapshot time "
+                        "(registered in manifest missing_referenced_objects)"
+                    ),
+                )
+                warnings.append(km_issue)
+                known_missing_issues.append(km_issue)
+                continue
             errors.append(
                 ReconcileIssue(
                     consumer=ref.consumer,
@@ -3825,6 +3871,7 @@ def reconcile_inventory_against_manifest(
         errors=tuple(errors),
         warnings=tuple(warnings),
         skipped_pending=dict(inventory.skipped_pending),
+        known_missing=tuple(known_missing_issues),
     )
 
 
@@ -4031,6 +4078,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Override aux bucket key prefix.",
     )
+    reconcile_p.add_argument(
+        "--backup-set",
+        default="",
+        help="Optional backup-set JSON file carrying registered missing_referenced_objects.",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "check":
@@ -4089,6 +4141,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.aux_bucket:
                 targets["asr"] = (args.aux_bucket, args.aux_prefix.strip("/"))
                 targets["chat_upload"] = (args.aux_bucket, args.aux_prefix.strip("/"))
+            known_missing_entries: list[Any] = []
+            if isinstance(manifest_data, dict):
+                raw_km = manifest_data.get("missing_referenced_objects")
+                if isinstance(raw_km, list):
+                    known_missing_entries.extend(raw_km)
+            if args.backup_set:
+                set_data = json.loads(Path(args.backup_set).read_text(encoding="utf-8"))
+                if isinstance(set_data, dict):
+                    raw_set_km = set_data.get("missing_referenced_objects")
+                    if isinstance(raw_set_km, list):
+                        known_missing_entries.extend(raw_set_km)
             report = reconcile_inventory_against_manifest(
                 inventory,
                 objects,
@@ -4096,6 +4159,7 @@ def main(argv: list[str] | None = None) -> int:
                 asr_jobs_archive=Path(args.asr_archive) if args.asr_archive else None,
                 asr_jobs_dir=Path(args.asr_dir) if args.asr_dir else None,
                 source_asr_jobs_dir=Path(args.source_asr_dir) if args.source_asr_dir else None,
+                known_missing_objects=known_missing_entries,
             )
             print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
             return EXIT_CLEAN if report.ok else EXIT_REFERENCES_FOUND

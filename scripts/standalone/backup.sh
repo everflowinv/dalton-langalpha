@@ -2302,6 +2302,10 @@ import json, sys
 with open(minio_manifest_path, encoding="utf-8") as mfh:
     minio_meta = json.load(mfh)
 
+missing_refs = minio_meta.get("missing_referenced_objects")
+if not isinstance(missing_refs, list):
+    missing_refs = []
+
 manifest = {
     "schema_version": 2,
     "created_at_utc": ts,
@@ -2325,6 +2329,8 @@ manifest = {
         "object_count": int(minio_objects),
         "total_bytes": int(minio_bytes),
     },
+    "missing_referenced_objects": missing_refs,
+    "missing_referenced_count": len(missing_refs),
     "asr_jobs": (
         {
             "file": "asr-jobs.tar.gz",

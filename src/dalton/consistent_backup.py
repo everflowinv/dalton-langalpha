@@ -67,6 +67,10 @@ DEFAULT_SNAPSHOT_IMPORT_TIMEOUT_S = 120.0
 DEFAULT_PG_DUMP_TIMEOUT_S = 7200.0
 DEFAULT_LOCK_PHASE_TIMEOUT_S = 7200.0
 DEFAULT_MIRROR_TIMEOUT_S = 14400.0
+DEFAULT_MAX_MISSING_REFERENCED_OBJECTS = 50
+MISSING_REFERENCED_OBJECTS_ENV = "DALTON_BACKUP_MAX_MISSING_REFS"
+STRICT_MAIN_BUCKET_NAME = "dalton-main"
+MISSING_REFERENCED_OBJECTS_ALERT_CODE = "MISSING_REFERENCED_OBJECTS"
 STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 
 RESTORED_INFLIGHT_ERROR_MESSAGE = "恢复后请重新提交"
@@ -113,14 +117,24 @@ class MissingBucketConfigError(ConsistentBackupError):
 class MissingReferencedObjectsError(ConsistentBackupError):
     """Raised when one or more snapshot-referenced keys have no recoverable version in the bucket."""
 
-    def __init__(self, bucket: str, missing_keys: Sequence[str]) -> None:
+    def __init__(
+        self,
+        bucket: str,
+        missing_keys: Sequence[str],
+        *,
+        threshold: int | None = None,
+    ) -> None:
         self.bucket = bucket
         self.missing_keys = tuple(sorted(set(missing_keys)))
+        self.threshold = threshold
         sample = ", ".join(self.missing_keys[:10])
         suffix = f" (+{len(self.missing_keys) - 10} more)" if len(self.missing_keys) > 10 else ""
+        thresh_note = (
+            f" (exceeds tolerance threshold {threshold})" if threshold is not None else ""
+        )
         super().__init__(
-            f"Bucket {bucket!r} is missing {len(self.missing_keys)} snapshot-referenced object(s): "
-            f"{sample}{suffix}"
+            f"Bucket {bucket!r} is missing {len(self.missing_keys)} snapshot-referenced object(s)"
+            f"{thresh_note}: {sample}{suffix}"
         )
 
 
@@ -133,6 +147,56 @@ class BackupReconciliationError(ConsistentBackupError):
         super().__init__(
             f"Backup reconciliation failed with {len(report.errors)} error(s): {first}"
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class MissingReferencedObject:
+    """One snapshot-referenced object that had no recoverable version in its bucket."""
+
+    bucket: str
+    key: str
+    consumer: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "bucket": self.bucket,
+            "key": self.key,
+            "consumer": self.consumer,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> MissingReferencedObject:
+        return cls(
+            bucket=str(data.get("bucket") or "").strip(),
+            key=str(data.get("key") or "").strip().lstrip("/"),
+            consumer=str(data.get("consumer") or "").strip(),
+        )
+
+
+def format_missing_referenced_summary(
+    missing_objects: Sequence[MissingReferencedObject],
+    *,
+    max_sample: int = 10,
+) -> str:
+    """Format a concise one-line summary with total count and the first ``max_sample`` missing keys."""
+    seen: list[tuple[str, str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for item in missing_objects:
+        pair = (item.bucket, item.key)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        seen.append((item.bucket, item.key, item.consumer))
+    total = len(seen)
+    sample_items = seen[: max(1, int(max_sample))]
+    sample = ", ".join(
+        f"{b}/{k}" + (f" [{c}]" if c else "") for b, k, c in sample_items
+    )
+    suffix = f" (+{total - len(sample_items)} more)" if total > len(sample_items) else ""
+    return (
+        f"Tolerated {total} missing snapshot-referenced object(s) "
+        f"(recorded in backup manifest): {sample}{suffix}"
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,6 +220,7 @@ class VersionSelectionResult:
     selected: tuple[SelectedObjectVersion, ...]
     skipped_pre_snapshot_deleted: int = 0
     warning: str | None = None
+    missing_keys: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,6 +314,7 @@ class ConsistentBackupResult:
     asr_archive: AsrArchiveSummary | None
     reconcile_report: ReconcileReport
     warnings: tuple[str, ...] = ()
+    missing_referenced_objects: tuple[MissingReferencedObject, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +332,18 @@ def _env_float(env: Mapping[str, str] | None, key: str, default: float) -> float
     except ValueError:
         return default
     return val if val > 0 else default
+
+
+def _env_nonneg_int(env: Mapping[str, str] | None, key: str, default: int) -> int:
+    em = os.environ if env is None else env
+    raw = (em.get(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= 0 else default
 
 
 def _remaining_or_raise(deadline: float, phase: str) -> float:
@@ -912,6 +990,7 @@ def select_bucket_object_versions(
     delete_markers: Sequence[Mapping[str, Any]],
     snapshot_referenced_keys: Iterable[str],
     versioning_enabled: bool = True,
+    allow_missing: bool = False,
     target_logger: logging.Logger | None = None,
 ) -> VersionSelectionResult:
     """Apply the §3.1 Step 3 two-rule version selection over ``bucket``.
@@ -922,9 +1001,11 @@ def select_bucket_object_versions(
       the DB snapshot -> take the most recent non-delete-marker version before that DeleteMarker.
     - All other deleted keys (current is DeleteMarker AND not referenced by snapshot) are skipped.
     - Any snapshot-referenced key with no non-delete-marker version raises
-      :class:`MissingReferencedObjectsError`.
+      :class:`MissingReferencedObjectsError` unless ``allow_missing=True``, in which case
+      the missing keys are returned in :attr:`VersionSelectionResult.missing_keys`.
     - When ``versioning_enabled=False``, emits a ``WARNING`` and selects current objects
-      without ``VersionId``, still failing on any missing snapshot-referenced key.
+      without ``VersionId``, still failing on any missing snapshot-referenced key unless
+      ``allow_missing=True``.
     """
     log = target_logger or logger
     snap_keys = {str(k).strip().lstrip("/") for k in snapshot_referenced_keys if str(k).strip()}
@@ -943,8 +1024,8 @@ def select_bucket_object_versions(
             # Prefer IsLatest if present, else overwrite/keep newest
             if key not in by_key or item.get("IsLatest"):
                 by_key[key] = item
-        missing = [k for k in snap_keys if k not in by_key]
-        if missing:
+        missing = sorted(k for k in snap_keys if k not in by_key)
+        if missing and not allow_missing:
             raise MissingReferencedObjectsError(bucket, missing)
         selected = tuple(
             SelectedObjectVersion(
@@ -961,6 +1042,7 @@ def select_bucket_object_versions(
             selected=selected,
             skipped_pre_snapshot_deleted=0,
             warning=warn_msg,
+            missing_keys=tuple(missing),
         )
 
     versions_by_key: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
@@ -1054,14 +1136,16 @@ def select_bucket_object_versions(
             else:
                 missing_keys.append(key)
 
-    if missing_keys:
-        raise MissingReferencedObjectsError(bucket, missing_keys)
+    sorted_missing = tuple(sorted(set(missing_keys)))
+    if sorted_missing and not allow_missing:
+        raise MissingReferencedObjectsError(bucket, sorted_missing)
 
     return VersionSelectionResult(
         bucket=bucket,
         versioning_enabled=True,
         selected=tuple(selected_list),
         skipped_pre_snapshot_deleted=skipped_deleted,
+        missing_keys=sorted_missing,
     )
 
 
@@ -1506,9 +1590,22 @@ class TarGzObjectSink:
         self._tmp_tar = tar_path.with_name(f".{tar_path.name}.tmp.{os.getpid()}")
         self._tf = tarfile.open(self._tmp_tar, "w:gz", format=tarfile.PAX_FORMAT)
         self._manifest_extra = dict(manifest_extra or {})
+        self._missing_referenced_objects: list[dict[str, str]] = []
         self.records: list[ArchivedObjectRecord] = []
         self._seen_pairs: set[tuple[str, str]] = set()
         self._closed = False
+
+    def set_missing_referenced_objects(
+        self,
+        items: Sequence[MissingReferencedObject | Mapping[str, Any]],
+    ) -> None:
+        normalized: list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, MissingReferencedObject):
+                normalized.append(item.to_dict())
+            elif isinstance(item, Mapping):
+                normalized.append(MissingReferencedObject.from_dict(item).to_dict())
+        self._missing_referenced_objects = normalized
 
     def archive_object(
         self,
@@ -1580,9 +1677,15 @@ class TarGzObjectSink:
         self.records.append(rec)
         return rec
 
-    def finalize(self) -> tuple[ArchivedObjectRecord, ...]:
+    def finalize(
+        self,
+        *,
+        missing_referenced_objects: Sequence[MissingReferencedObject | Mapping[str, Any]] | None = None,
+    ) -> tuple[ArchivedObjectRecord, ...]:
         if self._closed:
             return tuple(self.records)
+        if missing_referenced_objects is not None:
+            self.set_missing_referenced_objects(missing_referenced_objects)
         seen: set[tuple[str, str]] = set()
         for rec in self.records:
             pair = (str(rec.bucket), str(rec.key).lstrip("/"))
@@ -1598,9 +1701,18 @@ class TarGzObjectSink:
             "object_count": len(self.records),
             "total_bytes": sum(r.size for r in self.records),
             "objects": [r.to_dict() for r in self.records],
+            "missing_referenced_objects": list(self._missing_referenced_objects),
+            "missing_referenced_count": len(self._missing_referenced_objects),
         }
         for k, v in self._manifest_extra.items():
-            if k not in ("version", "objects", "object_count", "total_bytes"):
+            if k not in (
+                "version",
+                "objects",
+                "object_count",
+                "total_bytes",
+                "missing_referenced_objects",
+                "missing_referenced_count",
+            ):
                 manifest_payload[k] = v
         if "buckets" in self._manifest_extra:
             manifest_payload["buckets"] = list(self._manifest_extra["buckets"])
@@ -1901,11 +2013,14 @@ async def run_consistent_backup(
     pg_dump_timeout_s: float | None = None,
     mirror_timeout_s: float | None = None,
     snapshot_import_timeout_s: float | None = None,
+    max_missing_referenced_objects: int | None = None,
     env: Mapping[str, str] | None = None,
     after_snapshot_commit_hook: Callable[[str, SnapshotRefInventory], Any] | None = None,
     wait_pg_dump_imported_fn: Callable[[Any], Any] | None = None,
     wait_pg_dump_finished_fn: Callable[[Any], Any] | None = None,
     terminate_pg_dump_fn: Callable[[Any], Any] | None = None,
+    alert_fn: Callable[[str, str], Any] | None = None,
+    target_logger: logging.Logger | None = None,
 ) -> ConsistentBackupResult:
     """Execute the full §3.1 Steps 1-4 consistent backup protocol with hard deadlines.
 
@@ -1918,11 +2033,18 @@ async def run_consistent_backup(
       ``pg_dump`` imports the snapshot and ``enumerate_snapshot_refs`` finishes.
     - Enumerates ALL DB references independently of ``bucket_specs`` and fails loudly if
       the DB contains references for a bucket role without configured storage.
+    - Tolerates up to ``max_missing_referenced_objects`` (default 50, configurable via
+      ``DALTON_BACKUP_MAX_MISSING_REFS``) missing snapshot-referenced objects on non-main
+      buckets, recording them in ``result.missing_referenced_objects`` and reporting once
+      to logger + ``alert_fn``. Any missing object on the main bucket (``role='main'`` or
+      ``dalton-main``) or exceeding the threshold still fails with
+      :class:`MissingReferencedObjectsError`.
     - Releases both GC advisory locks before full-bucket versioned mirroring (or keeps
       them through unversioned bucket downloads, still capped by ``lock_phase_timeout_s``).
     - On timeout or error: terminates ``pg_dump`` & ASR archiver, rolls back any open snapshot
       txn, releases both GC advisory locks (or closes the control session), and propagates.
     """
+    log = target_logger or logger
     eff_lock_timeout = (
         float(lock_phase_timeout_s)
         if lock_phase_timeout_s is not None
@@ -1942,6 +2064,15 @@ async def run_consistent_backup(
         float(snapshot_import_timeout_s)
         if snapshot_import_timeout_s is not None
         else _env_float(env, "DALTON_BACKUP_SNAPSHOT_IMPORT_TIMEOUT_S", DEFAULT_SNAPSHOT_IMPORT_TIMEOUT_S)
+    )
+    eff_max_missing = (
+        max(0, int(max_missing_referenced_objects))
+        if max_missing_referenced_objects is not None
+        else _env_nonneg_int(
+            env,
+            MISSING_REFERENCED_OBJECTS_ENV,
+            DEFAULT_MAX_MISSING_REFERENCED_OBJECTS,
+        )
     )
 
     locks_held = False
@@ -2011,6 +2142,7 @@ async def run_consistent_backup(
         SnapshotRefInventory,
         dict[str, tuple[str, str]],
         list[tuple[BucketArchiveSpec, VersionSelectionResult]],
+        tuple[MissingReferencedObject, ...],
         AsrArchiveSummary | None,
     ]:
         nonlocal locks_held, snapshot_open, dump_handle, dump_finished, asr_proc, watchdog
@@ -2172,16 +2304,82 @@ async def run_consistent_backup(
                 )
                 dms = []
 
+            is_strict_main_bucket = (
+                "main" in spec.roles or spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
+            )
             sel = select_bucket_object_versions(
                 bucket=spec.bucket,
                 versions=vers,
                 delete_markers=dms,
                 snapshot_referenced_keys=snap_keys_for_bucket,
                 versioning_enabled=ver_enabled,
+                allow_missing=(not is_strict_main_bucket and eff_max_missing > 0),
+                target_logger=log,
             )
             if sel.warning:
                 warnings.append(sel.warning)
             selections.append((spec, sel))
+
+        # Collect tolerated missing referenced objects across non-main buckets and enforce
+        # strict failure rules: never tolerate main-bucket missing objects or > eff_max_missing.
+        consumers_by_bucket_key: dict[tuple[str, str], set[str]] = {}
+        main_role_pairs: set[tuple[str, str]] = set()
+        for ref in inventory.references:
+            target = bucket_targets.get(ref.bucket_role)
+            if target is None or not target[0] or not ref.object_key:
+                continue
+            b_name, k_prefix = target
+            full_k = _apply_bucket_prefix(ref.object_key, k_prefix)
+            consumers_by_bucket_key.setdefault((b_name, full_k), set()).add(ref.consumer)
+            if ref.bucket_role == "main" or b_name == STRICT_MAIN_BUCKET_NAME:
+                main_role_pairs.add((b_name, full_k))
+
+        missing_pairs_by_bucket: dict[str, set[str]] = {}
+        for spec, sel in selections:
+            for mkey in sel.missing_keys:
+                clean_k = str(mkey).strip().lstrip("/")
+                if not clean_k:
+                    continue
+                if (spec.bucket, clean_k) in main_role_pairs or (
+                    spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
+                ):
+                    raise MissingReferencedObjectsError(spec.bucket, [clean_k])
+                missing_pairs_by_bucket.setdefault(spec.bucket, set()).add(clean_k)
+
+        total_unique_missing = sum(len(keys) for keys in missing_pairs_by_bucket.values())
+        if total_unique_missing > eff_max_missing:
+            if len(missing_pairs_by_bucket) == 1:
+                only_bucket, only_keys = next(iter(missing_pairs_by_bucket.items()))
+                raise MissingReferencedObjectsError(
+                    only_bucket,
+                    sorted(only_keys),
+                    threshold=eff_max_missing,
+                )
+            combined_buckets = ",".join(sorted(missing_pairs_by_bucket))
+            combined_keys = [
+                f"{b}/{k}"
+                for b in sorted(missing_pairs_by_bucket)
+                for k in sorted(missing_pairs_by_bucket[b])
+            ]
+            raise MissingReferencedObjectsError(
+                combined_buckets,
+                combined_keys,
+                threshold=eff_max_missing,
+            )
+
+        missing_records_list: list[MissingReferencedObject] = []
+        for b_name in sorted(missing_pairs_by_bucket):
+            for mkey in sorted(missing_pairs_by_bucket[b_name]):
+                consumers = sorted(consumers_by_bucket_key.get((b_name, mkey)) or ("unknown",))
+                for consumer in consumers:
+                    missing_records_list.append(
+                        MissingReferencedObject(
+                            bucket=b_name,
+                            key=mkey,
+                            consumer=consumer,
+                        )
+                    )
+        missing_records = tuple(missing_records_list)
 
         # Deduplicate across overlapping specs (e.g. shared bucket with empty main prefix
         # and non-empty chat_upload prefix) by (endpoint, bucket, full_key) before archiving.
@@ -2242,12 +2440,19 @@ async def run_consistent_backup(
         watchdog.set_phase("release_gc_advisory_locks")
         await _release_locks_now(strict=True, deadline=lock_deadline)
         watchdog.disarm()
-        return snapshot_id, inventory, bucket_targets, selections, asr_summary
+        return snapshot_id, inventory, bucket_targets, selections, missing_records, asr_summary
 
     try:
         lock_task = asyncio.create_task(_run_lock_phase())
         try:
-            snapshot_id, inventory, bucket_targets, selections, asr_summary = await lock_task
+            (
+                snapshot_id,
+                inventory,
+                bucket_targets,
+                selections,
+                missing_records,
+                asr_summary,
+            ) = await lock_task
         except asyncio.CancelledError as exc:
             if watchdog is not None and watchdog.timed_out:
                 raise BackupTimeoutError(
@@ -2268,6 +2473,8 @@ async def run_consistent_backup(
                     deadline=mirror_deadline,
                 )
 
+        if isinstance(object_sink, TarGzObjectSink):
+            object_sink.set_missing_referenced_objects(missing_records)
         manifest_records = object_sink.finalize()
     except BaseException as exc:
         # Close DB session FIRST without waiting for ROLLBACK or pg_advisory_unlock so
@@ -2304,9 +2511,23 @@ async def run_consistent_backup(
         bucket_targets=bucket_targets,
         asr_jobs_archive=asr_summary.archive_path if asr_summary is not None else None,
         source_asr_jobs_dir=asr_jobs_dir,
+        known_missing_objects=missing_records,
+        target_logger=log,
     )
     if not reconcile_report.ok:
         raise BackupReconciliationError(reconcile_report)
+
+    if missing_records:
+        missing_summary = format_missing_referenced_summary(missing_records, max_sample=10)
+        log.warning("%s", missing_summary)
+        warnings.append(missing_summary)
+        if alert_fn is not None:
+            try:
+                alert_res = alert_fn(MISSING_REFERENCED_OBJECTS_ALERT_CODE, missing_summary)
+                if asyncio.iscoroutine(alert_res):
+                    await alert_res
+            except Exception as exc:
+                log.warning("Failed emitting missing-referenced-objects alert: %s", exc)
 
     return ConsistentBackupResult(
         snapshot_id=snapshot_id,
@@ -2316,6 +2537,7 @@ async def run_consistent_backup(
         asr_archive=asr_summary,
         reconcile_report=reconcile_report,
         warnings=tuple(warnings),
+        missing_referenced_objects=missing_records,
     )
 
 
@@ -2403,8 +2625,30 @@ def restore_objects_from_manifest(
     *,
     sha_index: Mapping[str, Callable[[], bytes]],
     s3_clients_by_bucket: Mapping[str, Any],
+    known_missing_objects: Sequence[Mapping[str, Any] | MissingReferencedObject] | None = None,
+    target_logger: logging.Logger | None = None,
 ) -> dict[str, set[str]]:
-    """Restore ONLY the keys listed in the target-day authoritative manifest and assert exact key equality."""
+    """Restore ONLY the keys listed in the target-day authoritative manifest and assert exact key equality.
+
+    Any entries in ``known_missing_objects`` (registered as absent at backup snapshot time)
+    are reported once as known missing and are not expected in the restored buckets.
+    """
+    log = target_logger or logger
+    if known_missing_objects:
+        normalized_missing = tuple(
+            item
+            if isinstance(item, MissingReferencedObject)
+            else MissingReferencedObject.from_dict(item)
+            for item in known_missing_objects
+            if isinstance(item, (MissingReferencedObject, Mapping))
+        )
+        if normalized_missing:
+            log.warning(
+                "Restore skipping %d known missing referenced object(s) registered in manifest: %s",
+                len(normalized_missing),
+                format_missing_referenced_summary(normalized_missing, max_sample=10),
+            )
+
     expected_by_bucket: dict[str, set[str]] = {}
     for entry in manifest_objects:
         bucket = str(entry["bucket"])
