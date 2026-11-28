@@ -254,6 +254,23 @@ async function _mSafeAgent(prompt, opts) {
   }
 }
 
+function _mServerBoundRunContext(ctx) {
+  const a = typeof args === 'object' && args !== null ? args : null
+  const runId =
+    (ctx && typeof ctx.boundRunId === 'string' && ctx.boundRunId.trim()) ||
+    (a && typeof a.__run_id === 'string' && a.__run_id.trim()) ||
+    null
+  const runDir =
+    (ctx && typeof ctx.boundRunDir === 'string' && ctx.boundRunDir.trim()) ||
+    (a && typeof a.__run_dir === 'string' && a.__run_dir.trim()) ||
+    null
+  const resumedFrom =
+    (ctx && typeof ctx.boundResumedFrom === 'string' && ctx.boundResumedFrom.trim()) ||
+    (a && typeof a.__resumed_from === 'string' && a.__resumed_from.trim()) ||
+    null
+  return { runId, runDir, resumedFrom }
+}
+
 function _mProgressReadCmd(progressPath) {
   return `python3 -c "import json,os; p='${progressPath}'; print(json.load(open(p)).get('run_id','') if os.path.exists(p) else '')"`
 }
@@ -312,12 +329,18 @@ async function _mProbeCandidateOnDisk(
   expectedRunId = null,
   requireReceipt = true,
   progressPath = null,
-  dispatchLabel = null
+  dispatchLabel = null,
+  boundRunDir = null,
+  boundResumedFrom = null,
+  transitionReceiptPath = null
 ) {
   const norm = _mNormPath(candidatePath, W)
   const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
   const progNorm = _mNormPath(progressPath, W) || ''
   const dispLbl = typeof dispatchLabel === 'string' ? dispatchLabel.trim() : ''
+  const runDirNorm = _mNormPath(boundRunDir, W) || ''
+  const resumedFromNorm = _mNormPath(boundResumedFrom, W) || ''
+  const trRcptNorm = _mNormPath(transitionReceiptPath, W) || ''
   if (!norm) {
     return {
       verified: true,
@@ -349,6 +372,9 @@ async function _mProbeCandidateOnDisk(
     `want_rid = sys.argv[2].strip() if len(sys.argv) > 2 else ''`,
     `prog_arg = sys.argv[3].strip() if len(sys.argv) > 3 else ''`,
     `disp_lbl = sys.argv[4].strip() if len(sys.argv) > 4 else ''`,
+    `run_dir_arg = sys.argv[5].strip() if len(sys.argv) > 5 else ''`,
+    `resumed_from_arg = sys.argv[6].strip() if len(sys.argv) > 6 else ''`,
+    `tr_rcpt_arg = sys.argv[7].strip() if len(sys.argv) > 7 else ''`,
     `ex = p.is_file()`,
     `ok, _msg = model_readable.check_workbook_readable(p) if ex else (False, 'missing')`,
     `sha = model_fingerprint.file_sha256(p) if ok else None`,
@@ -356,16 +382,26 @@ async function _mProbeCandidateOnDisk(
     `receipt_rid = None`,
     `if want_rid:`,
     `    allowed_rids = {want_rid}`,
-    `    if prog_arg and disp_lbl:`,
+    `    if disp_lbl and (run_dir_arg or prog_arg):`,
     `        try:`,
-    `            pp = pathlib.Path(prog_arg)`,
-    `            prog = json.loads(pp.read_text(encoding='utf-8')) if pp.is_file() else None`,
-    `            rfrom = str(prog.get('resumed_from') or '').strip() if isinstance(prog, dict) else ''`,
-    `            prog_rid = str(prog.get('run_id') or '').strip() if isinstance(prog, dict) else ''`,
-    `            if rfrom and (not prog_rid or prog_rid == want_rid):`,
-    `                ws_root = pathlib.Path('.').resolve()`,
-    `                run_dir_raw = str(prog.get('run_dir') or '').strip()`,
-    `                this_dir = pathlib.Path(run_dir_raw) if run_dir_raw else (pathlib.Path(rfrom).parent / want_rid)`,
+    `            ws_root = pathlib.Path('.').resolve()`,
+    `            rfrom = ''`,
+    `            this_dir = None`,
+    `            if run_dir_arg:`,
+    `                this_dir = pathlib.Path(run_dir_arg)`,
+    `                rfrom = resumed_from_arg`,
+    `            elif prog_arg:`,
+    `                pp = pathlib.Path(prog_arg)`,
+    `                prog = json.loads(pp.read_text(encoding='utf-8')) if pp.is_file() else None`,
+    `                prog_rid = str(prog.get('run_id') or '').strip() if isinstance(prog, dict) else ''`,
+    `                if isinstance(prog, dict) and (not prog_rid or prog_rid == want_rid):`,
+    `                    rfrom = str(prog.get('resumed_from') or '').strip()`,
+    `                    run_dir_raw = str(prog.get('run_dir') or '').strip()`,
+    `                    if run_dir_raw:`,
+    `                        this_dir = pathlib.Path(run_dir_raw)`,
+    `                    elif rfrom:`,
+    `                        this_dir = pathlib.Path(rfrom).parent / want_rid`,
+    `            if rfrom and this_dir is not None:`,
     `                safe_lbl = re.sub(r'[^0-9A-Za-z_\\u4e00-\\u9fff.-]+', '_', disp_lbl)[:80] or 'dispatch'`,
     `                jf = this_dir / 'journal' / f'{safe_lbl}.json'`,
     `                was_replayed = False`,
@@ -432,14 +468,53 @@ async function _mProbeCandidateOnDisk(
     `                r_abs = rd.get('candidate_abs_path') if isinstance(rd, dict) else None`,
     `                r_rel = str(rd.get('candidate_path') or '').lstrip('./') if isinstance(rd, dict) else ''`,
     `                path_ok = (r_rel == sys.argv[1].lstrip('./')) or (isinstance(r_abs, str) and pathlib.Path(r_abs).resolve() == p.resolve())`,
-    `                run_matched = bool(receipt_rid in allowed_rids and r_sha == sha.lower() and path_ok)`,
+    `                sha_ok = (r_sha == sha.lower())`,
+    `                if not sha_ok and r_sha:`,
+    `                    pt = rd.get('pending_transition') if isinstance(rd, dict) else None`,
+    `                    if isinstance(pt, dict) and str(pt.get('pre_model_sha256') or '').strip().lower() == r_sha and str(pt.get('post_model_sha256') or '').strip().lower() == sha.lower():`,
+    `                        sha_ok = True`,
+    `                if not sha_ok and r_sha:`,
+    `                    ws_root_tr = pathlib.Path('.').resolve()`,
+    `                    tr_paths = []`,
+    `                    if tr_rcpt_arg:`,
+    `                        tr_paths.append(pathlib.Path(tr_rcpt_arg))`,
+    `                    pt = rd.get('pending_transition') if isinstance(rd, dict) else None`,
+    `                    if isinstance(pt, dict) and isinstance(pt.get('transition_receipt_path'), str) and pt['transition_receipt_path'].strip():`,
+    `                        tr_paths.append(pathlib.Path(pt['transition_receipt_path'].strip()))`,
+    `                    for trp in tr_paths:`,
+    `                        if sha_ok:`,
+    `                            break`,
+    `                        try:`,
+    `                            if not trp.is_file() or not trp.resolve().is_relative_to(ws_root_tr):`,
+    `                                continue`,
+    `                            tr_doc = json.loads(trp.read_text(encoding='utf-8'))`,
+    `                            if not isinstance(tr_doc, dict):`,
+    `                                continue`,
+    `                            rec_name = str(tr_doc.get('model_name') or '').strip()`,
+    `                            if rec_name and rec_name != p.name:`,
+    `                                continue`,
+    `                            raw_trs = tr_doc.get('transitions')`,
+    `                            trs = [t for t in raw_trs if isinstance(t, dict)] if isinstance(raw_trs, list) else []`,
+    `                            if not trs and tr_doc.get('pre_snapshot_model_sha256') and tr_doc.get('post_snapshot_model_sha256'):`,
+    `                                trs = [{'pre_model_sha256': tr_doc.get('pre_snapshot_model_sha256'), 'post_model_sha256': tr_doc.get('post_snapshot_model_sha256')}]`,
+    `                            frontier = {r_sha}`,
+    `                            for t in trs:`,
+    `                                pre_m = str(t.get('pre_model_sha256') or '').strip().lower()`,
+    `                                post_m = str(t.get('post_model_sha256') or '').strip().lower()`,
+    `                                if pre_m and pre_m in frontier and post_m:`,
+    `                                    frontier.add(post_m)`,
+    `                            if sha.lower() in frontier:`,
+    `                                sha_ok = True`,
+    `                        except Exception:`,
+    `                            continue`,
+    `                run_matched = bool(receipt_rid in allowed_rids and sha_ok and path_ok)`,
     `            except Exception:`,
     `                run_matched = False`,
     `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'readable': bool(ok), 'model_sha256': sha, 'run_matched': run_matched, 'receipt_run_id': receipt_rid}))`,
   ].join('\n')
   const prompt = [
     `只读核验候选模型 ${norm} 是否已落盘、可读${wantRunId ? `且由本轮（run_id=${wantRunId}，或经日志复用的续跑链）发布` : ''}（不修改任何文件）。`,
-    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" "${progNorm}" "${dispLbl}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${norm}" "${wantRunId}" "${progNorm}" "${dispLbl}" "${runDirNorm}" "${resumedFromNorm}" "${trRcptNorm}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、readable、model_sha256、run_matched、receipt_run_id 字段原样回传。`,
   ].join('\n')
   const probeOpts = {
     agentType: 'dalton-evidence',
@@ -730,7 +805,8 @@ async function writeFallbackLedger(ctx) {
   const candidatePath = _mNormPath(ctx.candidatePath, W)
   const baselinePath = _mNormPath(ctx.baselinePath, W)
   const failedStages = Array.isArray(ctx.failedStages) && ctx.failedStages.length ? ctx.failedStages.slice() : ['check']
-  const runId = ctx.runId && String(ctx.runId).trim() ? String(ctx.runId).trim() : null
+  const serverRun = _mServerBoundRunContext(ctx)
+  const runId = serverRun.runId || (ctx.runId && String(ctx.runId).trim() ? String(ctx.runId).trim() : null)
   const fixRounds = typeof ctx.fixRounds === 'number' ? ctx.fixRounds : null
   const reason = ctx.reason || '检查、复算或笔记子任务超时或返回空'
   const phaseTitle = ctx.phaseLabel || '写入降级账本'
@@ -883,9 +959,11 @@ async function runModelingPipeline(ctx) {
     return emitPhases ? title : (ctx.phaseLabel || title)
   }
 
+  const serverRun = _mServerBoundRunContext(ctx)
   const dumpDir = `${R}/model_dump`
   const fpPath = `${dumpDir}/${T}-fingerprint.json`
   const coordMapPath = `${dumpDir}/coord_map.json`
+  const transitionReceiptPath = `${dumpDir}/consensus-snapshot-receipt.json`
   const ledgerPath = `${dumpDir}/model-verification.json`
   const checkMdPath = `${dumpDir}/model-check.md`
   const reviewPackPath = `${dumpDir}/model-review-pack.md`
@@ -957,8 +1035,11 @@ async function runModelingPipeline(ctx) {
     }
   }
 
-  // 独立非重放读取本轮 run_id：避免续跑时复用旧 run_id（§3.2 & journal.py）
-  let runId = await _mReadLiveRunId(progressPath, p1)
+  // 优先直接使用服务端绑定的 run_id（不从共享 .progress.json 读取）；仅无服务端绑定时回退读取
+  let runId = serverRun.runId || (ctx.runId && String(ctx.runId).trim()) || null
+  if (!runId) {
+    runId = await _mReadLiveRunId(progressPath, p1)
+  }
 
   // -------------------------------------------------------------------------
   // 阶段 2a：先绑定本轮输出路径，再受控原地建模并确认可读候选模型落盘
@@ -990,7 +1071,9 @@ async function runModelingPipeline(ctx) {
     : ''
   const editSourcePath = baselinePath || '.agents/skills/dalton-model/assets/default_model_template.xlsx'
   const stage2aOutArg = ` --out "${plannedCandPath}"`
-  const editRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
+  const editRunIdArg = serverRun.runId
+    ? ` --run-id "${serverRun.runId}"`
+    : (progressPath ? ` --progress-path "${progressPath}"` : '')
   const stage2aPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/SKILL.md、.agents/skills/dalton-model/references/forecast-rules.md、.agents/skills/dalton-model/references/rollforward.md 与 .agents/skills/dalton-model/references/format-spec.md${modelSpecPath ? `，以及 ${modelSpecPath}` : ''}。`,
     `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}；本轮绑定输出路径：${plannedCandPath}。`,
@@ -1017,7 +1100,10 @@ async function runModelingPipeline(ctx) {
     runId,
     true,
     progressPath,
-    stage2a ? '模型构建与落盘' : null
+    stage2a ? '模型构建与落盘' : null,
+    serverRun.runDir,
+    serverRun.resumedFrom,
+    transitionReceiptPath
   )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     candidatePath = plannedCandPath
@@ -1245,7 +1331,10 @@ async function runModelingPipeline(ctx) {
               runId,
               true,
               progressPath,
-              `模型修改 ${fixRounds}`
+              `模型修改 ${fixRounds}`,
+              serverRun.runDir,
+              serverRun.resumedFrom,
+              transitionReceiptPath
             )
           : null
       const fixVerified = Boolean(
@@ -1410,7 +1499,8 @@ async function reviseModelForReport(ctx) {
   const reviewFeedback = ctx.reviewFeedback
   const extraSyncPaths = Array.isArray(ctx.extraSyncPaths) ? ctx.extraSyncPaths.filter(Boolean) : []
   const phaseLabel = ctx.phaseLabel || '修订'
-  let runId = ctx.runId && String(ctx.runId).trim() ? String(ctx.runId).trim() : null
+  const serverRun = _mServerBoundRunContext(ctx)
+  let runId = serverRun.runId || (ctx.runId && String(ctx.runId).trim() ? String(ctx.runId).trim() : null)
   if (!runId) {
     runId = await _mReadLiveRunId(progressPath, phaseLabel)
   }
@@ -1429,6 +1519,7 @@ async function reviseModelForReport(ctx) {
   const consensusJsonPath = `${dumpDir}/consensus-diff.json`
   const remPath = `${dumpDir}/remaining-issues.md`
   const coordMapPath = `${dumpDir}/coord_map.json`
+  const transitionReceiptPath = `${dumpDir}/consensus-snapshot-receipt.json`
   const revFpPath = `${dumpDir}/${T}-rev-fingerprint.json`
 
   const thresholdArg = consensusThresholds
@@ -1522,7 +1613,9 @@ async function reviseModelForReport(ctx) {
     )
   }
   const revOutArg = ` --out "${plannedNextPath}"`
-  const revRunIdArg = progressPath ? ` --progress-path "${progressPath}"` : ''
+  const revRunIdArg = serverRun.runId
+    ? ` --run-id "${serverRun.runId}"`
+    : (progressPath ? ` --progress-path "${progressPath}"` : '')
 
   // -------------------------------------------------------------------------
   // 派发 1：仅重提指纹 + 改模落盘（按预绑路径独立实测可读性与哈希后，再分别派发差异刷新与报告同步）
@@ -1557,7 +1650,10 @@ async function reviseModelForReport(ctx) {
     runId,
     true,
     progressPath,
-    editRes ? '模型联动修订' : null
+    editRes ? '模型联动修订' : null,
+    serverRun.runDir,
+    serverRun.resumedFrom,
+    transitionReceiptPath
   )
   if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     nextPath = plannedNextPath

@@ -776,27 +776,70 @@ def write_consensus_snapshot(
                 pre_coord_map_sha256=pre_cm_sha,
                 post_coord_map_sha256=post_cm_sha,
             )
-        os.replace(editing_copy, mpath)
-        # Keep existing publish receipt SHA aligned across legitimate write-snapshot
-        # transitions while preserving the original publishing run_id.
+        # Stage transition record on publish receipt BEFORE replacing mpath so
+        # any crash or write error between model swap and receipt commit leaves
+        # a verifiable, retryable transition record (and never silently swallows
+        # receipt commit failures).
         pub_rcpt = model_edit.publish_receipt_path(mpath)
+        committed_rcpt_doc: dict[str, Any] | None = None
         if pub_rcpt.is_file():
-            try:
-                rcpt_doc = json.loads(pub_rcpt.read_text(encoding="utf-8"))
-                if (
-                    isinstance(rcpt_doc, dict)
-                    and str(rcpt_doc.get("candidate_sha256") or "").strip().lower()
-                    == pre_model_sha.lower()
-                ):
-                    rcpt_doc["candidate_sha256"] = new_sha.lower()
-                    tmp_rcpt = pub_rcpt.with_name(f".{pub_rcpt.name}.{os.getpid()}.tmp")
-                    tmp_rcpt.write_text(
-                        json.dumps(rcpt_doc, indent=2, ensure_ascii=False) + "\n",
+            rcpt_doc = json.loads(pub_rcpt.read_text(encoding="utf-8"))
+            if isinstance(rcpt_doc, dict):
+                rcpt_sha = str(rcpt_doc.get("candidate_sha256") or "").strip().lower()
+                prior_pt = rcpt_doc.get("pending_transition")
+                prior_pt_matches = (
+                    isinstance(prior_pt, dict)
+                    and str(prior_pt.get("pre_model_sha256") or "").strip().lower() == rcpt_sha
+                    and str(prior_pt.get("post_model_sha256") or "").strip().lower() == pre_model_sha.lower()
+                )
+                if rcpt_sha == pre_model_sha.lower() or prior_pt_matches:
+                    staged_rcpt_doc = dict(rcpt_doc)
+                    prev_trs = staged_rcpt_doc.get("transitions")
+                    rcpt_trs = list(prev_trs) if isinstance(prev_trs, list) else []
+                    if prior_pt_matches:
+                        prior_tr_item = {
+                            "op": str(prior_pt.get("op") or "write_snapshot"),
+                            "pre_model_sha256": rcpt_sha,
+                            "post_model_sha256": pre_model_sha.lower(),
+                        }
+                        if not rcpt_trs or rcpt_trs[-1] != prior_tr_item:
+                            rcpt_trs.append(prior_tr_item)
+                        staged_rcpt_doc["candidate_sha256"] = pre_model_sha.lower()
+                        staged_rcpt_doc["transitions"] = rcpt_trs
+                    staged_rcpt_doc["pending_transition"] = {
+                        "op": "write_snapshot",
+                        "pre_model_sha256": pre_model_sha.lower(),
+                        "post_model_sha256": new_sha.lower(),
+                        "transition_receipt_path": str(receipt_path) if receipt_path is not None else None,
+                    }
+                    tmp_pre_rcpt = pub_rcpt.with_name(f".{pub_rcpt.name}.{os.getpid()}.pre.tmp")
+                    tmp_pre_rcpt.write_text(
+                        json.dumps(staged_rcpt_doc, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8",
                     )
-                    os.replace(tmp_rcpt, pub_rcpt)
-            except Exception:
-                pass
+                    os.replace(tmp_pre_rcpt, pub_rcpt)
+
+                    committed_rcpt_doc = dict(staged_rcpt_doc)
+                    committed_rcpt_doc["candidate_sha256"] = new_sha.lower()
+                    committed_rcpt_doc.pop("pending_transition", None)
+                    tr_item = {
+                        "op": "write_snapshot",
+                        "pre_model_sha256": pre_model_sha.lower(),
+                        "post_model_sha256": new_sha.lower(),
+                    }
+                    final_trs = list(rcpt_trs)
+                    if not final_trs or final_trs[-1] != tr_item:
+                        final_trs.append(tr_item)
+                    committed_rcpt_doc["transitions"] = final_trs
+
+        os.replace(editing_copy, mpath)
+        if committed_rcpt_doc is not None:
+            tmp_rcpt = pub_rcpt.with_name(f".{pub_rcpt.name}.{os.getpid()}.tmp")
+            tmp_rcpt.write_text(
+                json.dumps(committed_rcpt_doc, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp_rcpt, pub_rcpt)
         if cp_obj is not None and new_cm_text is not None:
             tmp_cm = cp_obj.with_name(f".{cp_obj.name}.{os.getpid()}.tmp")
             tmp_cm.write_text(new_cm_text, encoding="utf-8")

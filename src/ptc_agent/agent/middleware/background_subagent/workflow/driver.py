@@ -60,16 +60,20 @@ from src.dalton.workflows.journal import (
     digest_paths,
     engine_safe,
     missing_declared_artifacts,
-    prompt_digest,
 )
 # DALTON-HOOK(modeling-lock): per-workspace modeling lock helpers owned by
-# Dalton; driver enforces acquisition for direct callers and releases on exit.
+# Dalton; driver enforces acquisition for direct callers, runs short-lease
+# heartbeat, binds server run context, and confirms writer exit before release.
 from src.dalton.workflows.modeling_lock import (
     ModelingLockBusy,
+    ModelingLockHeartbeat,
     acquire_modeling_lock,
+    bind_script_run_context,
+    confirm_modeling_writers_exited,
     modeling_lock_ttl,
     needs_modeling_lock,
     release_modeling_lock,
+    resolve_workflow_progress_path,
 )
 
 logger = structlog.get_logger(__name__)
@@ -278,18 +282,61 @@ class WorkflowDriver:
             run_id=self.wf_task_id,
             workflow=spec.meta.name,
             journal_source=spec.journal_source,
-            progress_path=spec.progress_path,
+            # DALTON-HOOK(modeling-lock): isolate non-modeled earnings-deep-update
+            # progress files from concurrent modeled runs.
+            progress_path=resolve_workflow_progress_path(
+                spec.meta.name, spec.script_args, spec.progress_path
+            ),
         )
-        # DALTON-HOOK(modeling-lock): track lock ownership and avoid
-        # overwriting the active holder's progress marker on lock refusal.
+        # DALTON-HOOK(modeling-lock): track lock ownership, lease heartbeat,
+        # cancelled writer tasks, and avoid clobbering holder progress on refusal.
         self._modeling_lock_held = bool(spec.modeling_lock_held)
+        self._modeling_lock_heartbeat: ModelingLockHeartbeat | None = None
+        self._cancelled_child_tasks: list[BackgroundTask] = []
+        self._children_cancelled = False
         self._skip_progress_on_finalize = False
 
+    def _start_modeling_lock_heartbeat(self) -> None:
+        # DALTON-HOOK(modeling-lock): renew the short modeling lock lease while running.
+        if not self._modeling_lock_held or self._modeling_lock_heartbeat is not None:
+            return
+        self._modeling_lock_heartbeat = ModelingLockHeartbeat(
+            self.spec.backend,
+            registry=self.spec.registry,
+            run_id=self.wf_task_id,
+            workflow=self.spec.meta.name,
+            workspace_id=(self.spec.base_configurable or {}).get("workspace_id"),
+            ttl_seconds=modeling_lock_ttl(self.spec.caps),
+        )
+        self._modeling_lock_heartbeat.start()
+
+    async def _stop_modeling_lock_heartbeat(self) -> None:
+        # DALTON-HOOK(modeling-lock): stop lease renewal before exit or release.
+        hb = self._modeling_lock_heartbeat
+        self._modeling_lock_heartbeat = None
+        if hb is not None:
+            await hb.stop()
+
     async def _release_modeling_lock(self) -> None:
-        # DALTON-HOOK(modeling-lock): idempotent release of this run's lock.
+        # DALTON-HOOK(modeling-lock): idempotent release of this run's lock
+        # after stopping heartbeat and confirming modeling writer exit.
+        await self._stop_modeling_lock_heartbeat()
         if not self._modeling_lock_held:
             return
         self._modeling_lock_held = False
+        writers_exited = await confirm_modeling_writers_exited(
+            registry=self.spec.registry,
+            owner_task_id=self.wf_task_id,
+            extra_tasks=list(self._cancelled_child_tasks),
+            backend=self.spec.backend,
+            check_sandbox_processes=self._children_cancelled,
+        )
+        if not writers_exited:
+            logger.warning(
+                "Modeling writer exit unconfirmed; keeping short-lease lock until expiry",
+                wf_task_id=self.wf_task_id,
+            )
+            return
         await release_modeling_lock(
             self.spec.backend,
             registry=self.spec.registry,
@@ -347,10 +394,19 @@ class WorkflowDriver:
                 if lock_busy_error is not None:
                     terminal = _Terminal(error=lock_busy_error)
                 else:
+                    # DALTON-HOOK(modeling-lock): start lease heartbeat and pass
+                    # server-bound run identity to the workflow script.
+                    self._start_modeling_lock_heartbeat()
+                    script_args = bind_script_run_context(
+                        self.spec.script_args,
+                        run_id=self.wf_task_id,
+                        run_dir=self.base_rel,
+                        resumed_from=self.spec.journal_source,
+                    )
                     async with asyncio.timeout(caps.run_timeout):
                         outcome = await run_workflow_script(
                             self.spec.script,
-                            self.spec.script_args,
+                            script_args,
                             host=self,
                             limits=WorkflowLimits(
                                 memory_limit_mb=caps.memory_limit_mb,
@@ -389,9 +445,9 @@ class WorkflowDriver:
                 return terminal.summary
             raise WorkflowRunError(await self._fail(terminal.error))
         finally:
-            # DALTON-HOOK(modeling-lock): safety net release if an exception
-            # escaped before _finalize ran.
-            if self._modeling_lock_held:
+            # DALTON-HOOK(modeling-lock): safety net heartbeat stop & release if
+            # an exception escaped before _finalize ran.
+            if self._modeling_lock_held or self._modeling_lock_heartbeat is not None:
                 await self._shielded(self._release_modeling_lock())
 
     async def _shielded(self, cleanup: Coroutine[Any, Any, Any]) -> Any:
@@ -681,7 +737,7 @@ class WorkflowDriver:
                 "seq": seq,
                 "label": label,
                 "phase": phase,
-                "prompt_sha256": prompt_digest(rec["prompt"]),
+                "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                 "status": "pending",
                 "recorded_at": time.time(),
             }
@@ -819,7 +875,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": "partial",
                     "result": engine_safe(result_value),
                     "result_kind": "parsed" if schema is not None else "text",
@@ -842,7 +898,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": "ok",
                     "result": result_value,
                     "result_kind": "parsed" if schema is not None else "text",
@@ -865,7 +921,7 @@ class WorkflowDriver:
                     "seq": seq,
                     "label": label,
                     "phase": phase,
-                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "prompt_sha256": self._journal.prompt_hash(rec["prompt"]),
                     "status": run.status,
                     "error": run.to_record()["error"],
                     "recorded_at": time.time(),
@@ -1020,9 +1076,19 @@ class WorkflowDriver:
 
     async def _cancel_children(self, *, reason: str) -> int:
         self._stopping = True
+        # DALTON-HOOK(modeling-lock): snapshot in-flight child tasks before
+        # _emit_child_cancelled clears _inflight so release confirms they exited.
+        if self._inflight:
+            self._children_cancelled = True
+            for rec in self._inflight.values():
+                task = rec.get("task")
+                if task is not None:
+                    self._cancelled_child_tasks.append(task)
         cancelled = await self.spec.registry.cancel_owner_children(
             self.wf_task_id, reason=reason
         )
+        if cancelled > 0:
+            self._children_cancelled = True
         # Their own coroutines unwind after this run's terminal frame is already
         # snapshotted, so the last word on each child has to be said here.
         for seq in sorted(self._inflight):

@@ -11752,7 +11752,11 @@ async def test_p0b_r8_2_workspace_modeling_lock_excludes_concurrent_launches_and
         async def _admit(task: Any, **_kw: Any) -> str:
             return ""
 
+        async def _abort(task: Any, _err: BaseException) -> None:
+            task.mark_cancelled("aborted before spawn")
+
         mw.admit_task_run.side_effect = _admit
+        mw._abort_admitted_run.side_effect = _abort
         dispatcher = create_autospec(SubagentDispatcher, instance=True)
         dispatcher.middleware = mw
         dispatcher.registry = mw.registry
@@ -11995,3 +11999,1378 @@ async def test_p0b_r8_2_workspace_modeling_lock_excludes_concurrent_launches_and
     )
     lock_still_held = json.loads((ws / MODELING_LOCK_PATH).read_text(encoding="utf-8"))
     assert lock_still_held["status"] == "locked" and lock_still_held["run_id"] == recovered_holder_id
+
+
+@pytest.mark.asyncio
+async def test_p0b_r9_1_modeling_uses_server_bound_run_id_and_isolates_deep_update_progress(
+    tmp_path: Path,
+) -> None:
+    """R9 #1 (Codex P1):
+    1) Modeled vs non-modeled ``earnings-deep-update`` runs in the same workspace,
+       release_date, and quarter run in parallel using separate progress files
+       (``.progress.json`` vs ``.progress.no-model.json``);
+    2) Modeling stages receive server-bound ``run_id``, ``run_dir``, and ``resumed_from``
+       directly (never dispatching ``读取运行ID`` or reading shared ``.progress.json``);
+    3) Even if ``.progress.json`` is overwritten with another run's id mid-run, both a
+       fresh modeled run and a resumed modeled run running alongside a non-modeled run
+       stamp the server-bound ``run_id``, pass the real disk probe, and pass verify_done."""
+    import asyncio
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+    from src.config.models import WorkflowOrchestrationConfig
+
+    ws = tmp_path / "ws_r9_parallel_deep"
+    ws.mkdir(parents=True, exist_ok=True)
+    r_rel = "research/2026-11-27-deep-FY26Q3"
+    dump_rel = f"{r_rel}/model_dump"
+    base_rel = "model/PDD-model-v01.xlsx"
+    cand_rel = "model/PDD-model-v02.xlsx"
+    fp_rel = f"{dump_rel}/PDD-fingerprint.json"
+    cm_rel = f"{dump_rel}/coord_map.json"
+    cons_rel = "data/consensus/2026-11-27_1000.json"
+    draft_rel = "drafts/2026-11-27-deep-FY26Q3.md"
+    shared_prog_rel = f"{r_rel}/.progress.json"
+    nomodel_prog_rel = f"{r_rel}/.progress.no-model.json"
+
+    base_p = ws / base_rel
+    base_p.parent.mkdir(parents=True, exist_ok=True)
+    base_sha = _write_simple_valid_model(base_p)
+    cand_p = ws / cand_rel
+    cm_p = ws / cm_rel
+    cons_p = ws / cons_rel
+    cons_p.parent.mkdir(parents=True, exist_ok=True)
+    cons_p.write_text(
+        json.dumps(
+            {
+                "ticker": "PDD",
+                "as_of_date": "2026-11-27",
+                "source_type": "Market Consensus",
+                "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 1100.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    skills_dst = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    skills_dst.parent.mkdir(parents=True, exist_ok=True)
+    if not skills_dst.exists():
+        skills_dst.symlink_to(REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts")
+
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    async def _aglob(pattern: str, _root: str = ".") -> list[str]:
+        return sorted(str(p.relative_to(ws)) for p in ws.glob(pattern))
+
+    async def _aexec(cmd: str) -> Any:
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        return _NS(exit_code=proc.returncode, output=proc.stdout)
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+    backend.aglob_paths.side_effect = _aglob
+    backend.aexecute.side_effect = _aexec
+
+    def _run_real_probe(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, prompt
+        cmd = m.group(1).replace("python3 ", f"{sys.executable} ")
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return json.loads(proc.stdout.strip())
+
+    wf_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "earnings-deep-update" / "workflow.js")
+    wf_meta = compile_check(wf_script)
+
+    def _touch_text(rel: str, body: str = "content\n" * 15) -> str:
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def _make_deep_driver(
+        *,
+        run_id_str: str,
+        short_tid: str,
+        model_path_arg: str | None,
+        handler: Any,
+        journal_source: str | None = None,
+    ) -> tuple[WorkflowDriver, list[str]]:
+        dispatched: list[str] = []
+        reg = BackgroundTaskRegistry()
+
+        class _Disp:
+            subagent_types = frozenset({"general-purpose", "dalton-evidence", "dalton-reviewer"})
+
+            async def dispatch(
+                self,
+                *,
+                subagent_type: str,
+                description: str,
+                prompt: str,
+                run_id: str | None = None,
+                owner_task_id: str | None = None,
+                base_configurable: dict[str, Any] | None = None,
+                time_limit: float | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                dispatched.append(description)
+                t = await reg.register(
+                    tool_call_id=f"{run_id_str}-{len(dispatched)}",
+                    description=description,
+                    prompt=prompt[:200],
+                    subagent_type=subagent_type,
+                    run_id=run_id,
+                    owner_task_id=owner_task_id,
+                )
+                t.per_call_records = []
+
+                async def _work() -> str:
+                    res = await handler(description, prompt)
+                    if isinstance(res, Exception):
+                        t.terminal_status = "error"
+                        raise res
+                    t.terminal_status = "completed"
+                    return json.dumps(res, ensure_ascii=False)
+
+                t.asyncio_task = asyncio.create_task(_work())
+                return t
+
+        rt = _NS(
+            task_id=run_id_str,
+            display_id=run_id_str,
+            task_run_id=None,
+            spawned_run_id=run_id_str,
+            terminal_status=None,
+            stop_at=None,
+            keep_straggler=lambda _w: None,
+        )
+        params = {
+            "ticker": "PDD",
+            "company": "PDD Holdings",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-11-27",
+            "model_path": model_path_arg,
+            "progress_path": shared_prog_rel,
+        }
+        spec = WorkflowRunSpec(
+            run_task=rt,
+            registry=reg,
+            dispatcher=_Disp(),
+            backend=backend,
+            thread_id=f"thr-{short_tid}",
+            short_thread_id=short_tid,
+            script=wf_script,
+            script_args=params,
+            meta=wf_meta,
+            source="prebuilt",
+            base_configurable={"workspace_id": "ws-r9-1"},
+            caps=WorkflowOrchestrationConfig(
+                enabled=True,
+                max_dispatches_per_run=40,
+                max_concurrent_children=4,
+                child_timeout=30.0,
+                run_timeout=60.0,
+                memory_limit_mb=64,
+                cpu_budget_s=15.0,
+            ),
+            journal_source=journal_source,
+            progress_path=shared_prog_rel,
+        )
+        return WorkflowDriver(spec), dispatched
+
+    # Case A: Modeled and non-modeled earnings-deep-update run CONCURRENTLY in the same
+    # workspace, release_date, and quarter, both passing shared_prog_rel!
+    nomodel_started = asyncio.Event()
+    modeled_done_prep = asyncio.Event()
+    modeled_prompts: dict[str, str] = {}
+    probes_a: list[dict[str, Any]] = []
+
+    def _review_pass() -> dict[str, Any]:
+        return {
+            "verdict": "pass",
+            "summary": "ok",
+            "must_fix": [],
+            "items": [{"check": i, "result": "pass", "reason": "ok", "lines": "1"} for i in range(1, 10)],
+        }
+
+    def _evidence_reply(prompt: str) -> dict[str, Any]:
+        paths = [ln[2:].strip() for ln in prompt.splitlines() if ln.startswith("- ")]
+        out = []
+        for rel in paths:
+            p = ws / rel
+            if not p.is_file():
+                _touch_text(rel)
+            out.append(f"{rel}|{hashlib.sha256(p.read_bytes()).hexdigest()}")
+        return {"files": out}
+
+    async def _h_nomodel(lbl: str, prompt: str) -> Any:
+        if lbl == "八节点评":
+            nomodel_started.set()
+            await modeled_done_prep.wait()
+            sha = _touch_text(draft_rel, "# Deep draft\n" * 20)
+            return {"files": [draft_rel], "summary": "draft", "sha256": sha}
+        if lbl in ("语言审查 1", "语言审查 2"):
+            _touch_text(f"{draft_rel}.language.json", '{"rounds": [1, 2]}')
+            sha = hashlib.sha256((ws / draft_rel).read_bytes()).hexdigest()
+            return {"files": [draft_rel, f"{draft_rel}.language.json"], "summary": "lang", "sha256": sha}
+        if lbl == "校准与对账":
+            for rel in (f"{r_rel}/reconcile.md", f"{r_rel}/reconcile.json", f"{r_rel}/thesis-calibration.md", f"{r_rel}/management-delta.md"):
+                _touch_text(rel, '{"wrong":0,"partial":0}' if rel.endswith(".json") else "# note\n" * 15)
+            sha = hashlib.sha256((ws / draft_rel).read_bytes()).hexdigest()
+            return {"files": [draft_rel, f"{r_rel}/reconcile.md"], "summary": "calib", "sha256": sha}
+        if lbl == "审稿":
+            return _review_pass()
+        if lbl == "笔记语言审查":
+            for rel in (f"{r_rel}/reconcile.md", f"{r_rel}/thesis-calibration.md", f"{r_rel}/management-delta.md"):
+                _touch_text(f"{rel}.language.json", '{"rounds": [1, 2]}')
+            return {"files": [f"{r_rel}/reconcile.md.language.json"], "summary": "notes"}
+        if lbl == "知识层修订草案":
+            _touch_text(f"{r_rel}/knowledge-revision.json", '{"thesis": {}}')
+            return {"files": [f"{r_rel}/knowledge-revision.json"], "summary": "kp"}
+        if lbl == "产物核验":
+            return _evidence_reply(prompt)
+        raise AssertionError(f"nomodel unexpected: {lbl}")
+
+    async def _h_modeled_a(lbl: str, prompt: str) -> Any:
+        modeled_prompts[lbl] = prompt
+        if lbl == "读取运行ID":
+            raise AssertionError("Server-bound modeling run must NOT dispatch 读取运行ID")
+        if lbl == "八节点评":
+            sha = _touch_text(draft_rel, "# Deep draft\n" * 20)
+            return {"files": [draft_rel], "summary": "draft", "sha256": sha}
+        if lbl == "建模准备":
+            await nomodel_started.wait()
+            fp_obj = mfp.build_fingerprint(base_p, ticker="PDD")
+            (ws / fp_rel).parent.mkdir(parents=True, exist_ok=True)
+            (ws / fp_rel).write_text(json.dumps(fp_obj, indent=2), encoding="utf-8")
+            _touch_text(f"{r_rel}/mapping.md", "# mapping\n" * 15)
+            modeled_done_prep.set()
+            return {
+                "files": [fp_rel, f"{r_rel}/mapping.md"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": base_rel,
+                "baseline_sha256": base_sha,
+                "fingerprint_path": fp_rel,
+                "consensus_path": cons_rel,
+                "planned_output_path": cand_rel,
+                "baseline_health_warning": None,
+            }
+        if lbl == "模型构建与落盘":
+            # Verify prompt binds server run_id directly (NOT --progress-path)
+            assert '--run-id "run-r9-model-A"' in prompt
+            assert "--progress-path" not in prompt
+            # Even if shared .progress.json is corrupted by an external writer right now,
+            # model_edit uses explicit --run-id and ignores .progress.json!
+            (ws / shared_prog_rel).write_text(
+                json.dumps({"run_id": "run-corrupted-other", "workflow": "earnings-deep-update"}),
+                encoding="utf-8",
+            )
+            ed = medit.apply_edit_plan(
+                baseline_path=base_p,
+                ticker="PDD",
+                plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1180}]},
+                output_path=cand_p,
+                workspace_dir=ws,
+                fingerprint=json.loads((ws / fp_rel).read_text(encoding="utf-8")),
+                coord_map_out=cm_p,
+                skip_recalc=True,
+                mode="update",
+                run_id="run-r9-model-A",
+            )
+            return {
+                "files": [cand_rel, cm_rel],
+                "summary": "v02 built",
+                "candidate_path": cand_rel,
+                "model_sha256": ed["candidate_sha256"],
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            probes_a.append(out)
+            return out
+        if lbl == "一致预期对照":
+            assert mcons.main(["write-snapshot", "--model", str(cand_p), "--consensus", str(cons_p), "--coord-map", str(cm_p)]) == 0
+            assert mcons.main(["diff", "--model", str(cand_p), "--ticker", "PDD", "--research-dir", str(ws / r_rel), "--consensus", str(cons_p)]) == 0
+            return {
+                "files": [cand_rel, cm_rel, f"{dump_rel}/consensus-diff.md", f"{dump_rel}/consensus-diff.json"],
+                "summary": "cons ok",
+                "candidate_path": cand_rel,
+                "model_sha256": mfp.file_sha256(cand_p),
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if lbl == "模型本轮范围检查":
+            assert '--run-id "run-r9-model-A"' in prompt
+            chk_res = mchk.write_check_and_ledger(
+                workspace_dir=ws,
+                ticker="PDD",
+                research_dir=ws / r_rel,
+                candidate_path=cand_p,
+                baseline_path=base_p,
+                fingerprint_path=ws / fp_rel,
+                coord_map_path=cm_p,
+                run_id="run-r9-model-A",
+                workflow="earnings-deep-update",
+                mode="update",
+            )
+            files = [f"{dump_rel}/model-check.md", f"{dump_rel}/model-verification.json"]
+            if chk_res.get("remaining_issues_path"):
+                files.append(f"{dump_rel}/remaining-issues.md")
+            return {
+                "files": files,
+                "summary": "chk",
+                "readable": chk_res["readable"],
+                "final_status": chk_res["final_status"],
+                "model_sha256": chk_res["candidate_sha256"],
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{dump_rel}/remaining-issues.md" if chk_res.get("remaining_issues_path") else None,
+            }
+        if lbl == "模型变动拆解":
+            _touch_text(f"{r_rel}/model-delta.md", "# model delta\n" * 15)
+            return {"files": [f"{r_rel}/model-delta.md"], "summary": "delta"}
+        if lbl in ("语言审查 1", "语言审查 2"):
+            _touch_text(f"{draft_rel}.language.json", '{"rounds": [1, 2]}')
+            sha = hashlib.sha256((ws / draft_rel).read_bytes()).hexdigest()
+            return {"files": [draft_rel, f"{draft_rel}.language.json"], "summary": "lang", "sha256": sha}
+        if lbl == "校准与对账":
+            for rel in (f"{r_rel}/reconcile.md", f"{r_rel}/reconcile.json", f"{r_rel}/thesis-calibration.md", f"{r_rel}/management-delta.md"):
+                _touch_text(rel, '{"wrong":0,"partial":0}' if rel.endswith(".json") else "# note\n" * 15)
+            sha = hashlib.sha256((ws / draft_rel).read_bytes()).hexdigest()
+            return {"files": [draft_rel, f"{r_rel}/reconcile.md"], "summary": "calib", "sha256": sha}
+        if lbl == "审稿":
+            return _review_pass()
+        if lbl == "笔记语言审查":
+            for rel in (f"{r_rel}/reconcile.md", f"{r_rel}/thesis-calibration.md", f"{r_rel}/management-delta.md", f"{r_rel}/mapping.md", f"{r_rel}/model-delta.md"):
+                _touch_text(f"{rel}.language.json", '{"rounds": [1, 2]}')
+            return {"files": [f"{r_rel}/mapping.md.language.json"], "summary": "notes"}
+        if lbl == "知识层修订草案":
+            _touch_text(f"{r_rel}/knowledge-revision.json", '{"thesis": {}}')
+            return {"files": [f"{r_rel}/knowledge-revision.json"], "summary": "kp"}
+        if lbl == "产物核验":
+            return _evidence_reply(prompt)
+        raise AssertionError(f"modeled unexpected: {lbl}")
+
+    drv_model_a, disp_model_a = _make_deep_driver(
+        run_id_str="run-r9-model-A",
+        short_tid="aaaa1111",
+        model_path_arg=base_rel,
+        handler=_h_modeled_a,
+    )
+    drv_nomodel_b, _ = _make_deep_driver(
+        run_id_str="run-r9-nomodel-B",
+        short_tid="bbbb2222",
+        model_path_arg=None,
+        handler=_h_nomodel,
+    )
+
+    assert drv_model_a._journal.progress_path == shared_prog_rel
+    assert drv_nomodel_b._journal.progress_path == nomodel_prog_rel
+
+    await asyncio.gather(drv_model_a.run(), drv_nomodel_b.run())
+
+    assert "读取运行ID" not in disp_model_a
+    assert len(probes_a) == 1 and probes_a[0]["run_matched"] is True
+    assert probes_a[0]["receipt_run_id"] == "run-r9-model-A"
+    prog_model_doc = json.loads((ws / shared_prog_rel).read_text(encoding="utf-8"))
+    prog_nomodel_doc = json.loads((ws / nomodel_prog_rel).read_text(encoding="utf-8"))
+    assert prog_model_doc["run_id"] == "run-r9-model-A" and prog_model_doc["status"] == "completed"
+    assert prog_nomodel_doc["run_id"] == "run-r9-nomodel-B" and prog_nomodel_doc["status"] == "completed"
+    vd_a = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        expected_run_id="run-r9-model-A",
+        expected_workflow="earnings-deep-update",
+    )
+    assert vd_a["ok"] is True, vd_a["errors"]
+
+    # Case B: Resumed modeled run in parallel with a non-modeled run while .progress.json
+    # holds a completely wrong run_id -> server-bound run_dir & resumed_from still replay
+    # Stage 2a and validate ancestor receipt without reading .progress.json!
+    probes_b: list[dict[str, Any]] = []
+    nomodel_started_2 = asyncio.Event()
+    modeled_done_probe_2 = asyncio.Event()
+
+    async def _h_nomodel_2(lbl: str, prompt: str) -> Any:
+        if lbl == "八节点评":
+            nomodel_started_2.set()
+            await modeled_done_probe_2.wait()
+        return await _h_nomodel(lbl, prompt)
+
+    async def _h_modeled_resume(lbl: str, prompt: str) -> Any:
+        if lbl in ("读取运行ID", "模型构建与落盘"):
+            raise AssertionError(f"Resumed modeled run must not dispatch {lbl}")
+        if lbl == "核验候选落盘":
+            await nomodel_started_2.wait()
+            # Overwrite shared .progress.json with wrong run_id right before probe!
+            (ws / shared_prog_rel).write_text(
+                json.dumps({"run_id": "run-wrong-clobbered", "resumed_from": None}),
+                encoding="utf-8",
+            )
+            out = _run_real_probe(prompt)
+            probes_b.append(out)
+            modeled_done_probe_2.set()
+            return out
+        if lbl == "模型本轮范围检查":
+            assert '--run-id "run-r9-model-A2"' in prompt
+            chk_res = mchk.write_check_and_ledger(
+                workspace_dir=ws,
+                ticker="PDD",
+                research_dir=ws / r_rel,
+                candidate_path=cand_p,
+                baseline_path=base_p,
+                fingerprint_path=ws / fp_rel,
+                coord_map_path=cm_p,
+                run_id="run-r9-model-A2",
+                workflow="earnings-deep-update",
+                mode="update",
+            )
+            files = [f"{dump_rel}/model-check.md", f"{dump_rel}/model-verification.json"]
+            if chk_res.get("remaining_issues_path"):
+                files.append(f"{dump_rel}/remaining-issues.md")
+            return {
+                "files": files,
+                "summary": "chk2",
+                "readable": chk_res["readable"],
+                "final_status": chk_res["final_status"],
+                "model_sha256": chk_res["candidate_sha256"],
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{dump_rel}/remaining-issues.md" if chk_res.get("remaining_issues_path") else None,
+            }
+        return await _h_modeled_a(lbl, prompt)
+
+    drv_model_res, disp_model_res = _make_deep_driver(
+        run_id_str="run-r9-model-A2",
+        short_tid="aaaa1111",
+        model_path_arg=base_rel,
+        handler=_h_modeled_resume,
+        journal_source=".agents/threads/aaaa1111/workflows/run-r9-model-A",
+    )
+    drv_nomodel_2, _ = _make_deep_driver(
+        run_id_str="run-r9-nomodel-B2",
+        short_tid="bbbb2222",
+        model_path_arg=None,
+        handler=_h_nomodel_2,
+    )
+    await asyncio.gather(drv_model_res.run(), drv_nomodel_2.run())
+
+    assert "模型构建与落盘" not in disp_model_res
+    assert "读取运行ID" not in disp_model_res
+    assert len(probes_b) == 1 and probes_b[0]["run_matched"] is True
+    assert probes_b[0]["receipt_run_id"] == "run-r9-model-A"
+    vd_b = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        expected_run_id="run-r9-model-A2",
+        expected_workflow="earnings-deep-update",
+    )
+    assert vd_b["ok"] is True, vd_b["errors"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r9_2_short_lease_heartbeat_startup_cancel_and_delayed_stop_lock_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #2 (Codex P1 ×2):
+    1) Lock uses a short lease (default 10 min, NOT 4h31m) and renews via heartbeat while running;
+    2) Cancelling during startup while saving ``workflow.js`` or ``args.json`` (before driver
+       takeover) releases the modeling lock cleanly so subsequent launches are not blocked;
+    3) When stopping a modeling run is delayed (in-process writer slow to unwind OR sandbox
+       writer process still alive), the driver does NOT release the lock prematurely: a new
+       modeling entry is refused while the lease holds, and succeeds once the short lease expires."""
+    import asyncio
+    import time
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import BackgroundSubagentMiddleware
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import PrebuiltWorkflowRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.workflows import modeling_lock as mlock
+
+    # 1. Short lease even with large run_timeout (4h30m)
+    long_caps = WorkflowOrchestrationConfig(run_timeout=16200.0)
+    assert mlock.modeling_lock_ttl(long_caps) == mlock.DEFAULT_MODELING_LOCK_TTL_SECONDS == 600.0
+
+    ws = tmp_path / "ws_r9_lock_lifecycle"
+    ws.mkdir(parents=True, exist_ok=True)
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    cancel_on_artifact: dict[str, str | None] = {"target": None}
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        target = cancel_on_artifact["target"]
+        if target and path.endswith(f"/{target}"):
+            raise asyncio.CancelledError("cancelled while saving startup artifact")
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+
+    # 2. Startup cancel while saving workflow.js and args.json releases lock!
+    cm_js = "export const meta = { name: 'company-model', description: 'cm' }\nreturn { ok: true }\n"
+    prebuilt = create_autospec(PrebuiltWorkflowRegistry, instance=True)
+    prebuilt.get.side_effect = {"company-model": cm_js}.get
+    prebuilt.names.side_effect = lambda: ["company-model"]
+
+    captured_specs: list[WorkflowRunSpec] = []
+    monkeypatch.setattr(
+        wf_tool_mod,
+        "WorkflowDriver",
+        lambda spec: (captured_specs.append(spec), create_autospec(WorkflowDriver, instance=True))[1],
+    )
+
+    async def _noop_spawn(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", _noop_spawn)
+    monkeypatch.setattr(
+        "src.config.settings.get_workflow_orchestration_config",
+        lambda: WorkflowOrchestrationConfig(),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.as_of.resolve_launch_as_of",
+        lambda _b, _n, p, _j: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.subject_kind.resolve_launch_subject_kind",
+        lambda _n, p, _c: asyncio.sleep(0, result=p),
+    )
+    monkeypatch.setattr(
+        "src.dalton.workflows.company_routing.resolve_launch_company_routing",
+        lambda *_a, **_kw: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        wf_tool_mod,
+        "get_config",
+        lambda: {"metadata": {"run_id": "turn-r9"}, "configurable": {"user_id": "u-1", "workspace_id": "ws-r9-2"}},
+    )
+
+    def _make_tool(thread_id: str, short_id: str) -> Any:
+        mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+        mw.registry = BackgroundTaskRegistry()
+        mw.checkpointer = object()
+
+        async def _admit(task: Any, **_kw: Any) -> str:
+            return ""
+
+        async def _abort(task: Any, _err: BaseException) -> None:
+            task.mark_cancelled("aborted before spawn")
+
+        mw.admit_task_run.side_effect = _admit
+        mw._abort_admitted_run.side_effect = _abort
+        dispatcher = create_autospec(SubagentDispatcher, instance=True)
+        dispatcher.middleware = mw
+        dispatcher.registry = mw.registry
+        dispatcher.subagent_types = ["general-purpose"]
+        return wf_tool_mod.create_run_workflow_tool(
+            dispatcher=dispatcher,
+            backend=backend,
+            thread_id=thread_id,
+            short_thread_id=short_id,
+            store=None,
+            user_id="u-1",
+            prebuilt_workflows=prebuilt,
+        )
+
+    tool = _make_tool("thr-startup-cancel", "stca1111")
+    for artifact_name in ("workflow.js", "args.json"):
+        cancel_on_artifact["target"] = artifact_name
+        with pytest.raises(asyncio.CancelledError):
+            await tool.coroutine(
+                workflow="company-model",
+                params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+                tool_call_id=f"call-cancel-{artifact_name}",
+            )
+        lock_doc = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+        assert lock_doc["status"] == "released", f"lock leaked when cancelled saving {artifact_name}"
+
+    # Subsequent launch succeeds immediately after startup cancel!
+    cancel_on_artifact["target"] = None
+    ok_reply = await tool.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-after-startup-cancel",
+    )
+    assert mlock.MODELING_LOCK_BUSY_MESSAGE not in str(ok_reply)
+    assert await mlock.release_modeling_lock(
+        backend,
+        run_id=captured_specs[-1].run_task.task_id,
+        workflow="company-model",
+        workspace_id="ws-r9-2",
+    )
+
+    # 3. Heartbeat renews lease while driver is running!
+    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_TTL_SECONDS", 0.35)
+    monkeypatch.setattr(mlock, "DEFAULT_MODELING_LOCK_HEARTBEAT_SECONDS", 0.06)
+    monkeypatch.setattr(mlock, "DEFAULT_WRITER_EXIT_TIMEOUT_SECONDS", 0.06)
+
+    cm_wait_js = (
+        "export const meta = { name: 'company-model', description: 'cm' }\n"
+        "await agent('write workbook', { label: '模型构建与落盘' })\n"
+        "return { ok: true }\n"
+    )
+    cm_wait_meta = compile_check(cm_wait_js)
+
+    hb_entered = asyncio.Event()
+    hb_release = asyncio.Event()
+
+    def _make_driver_with_child(
+        run_id_str: str,
+        *,
+        on_entered: asyncio.Event,
+        slow_unwind_event: asyncio.Event | None = None,
+        finish_event: asyncio.Event | None = None,
+    ) -> tuple[WorkflowDriver, BackgroundTaskRegistry]:
+        reg = BackgroundTaskRegistry()
+
+        class _Disp:
+            subagent_types = frozenset({"general-purpose"})
+
+            async def dispatch(
+                self,
+                *,
+                subagent_type: str,
+                description: str,
+                prompt: str,
+                run_id: str | None = None,
+                owner_task_id: str | None = None,
+                base_configurable: dict[str, Any] | None = None,
+                time_limit: float | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                t = await reg.register(
+                    tool_call_id=f"{run_id_str}-child",
+                    description=description,
+                    prompt=prompt,
+                    subagent_type=subagent_type,
+                    run_id=run_id,
+                    owner_task_id=owner_task_id,
+                )
+                t.per_call_records = []
+
+                async def _work() -> str:
+                    on_entered.set()
+                    try:
+                        if finish_event is not None:
+                            await finish_event.wait()
+                        else:
+                            await asyncio.sleep(30.0)
+                    except asyncio.CancelledError:
+                        if slow_unwind_event is not None:
+                            # Simulate a delayed stop where the underlying writer is still unwinding!
+                            await asyncio.shield(slow_unwind_event.wait())
+                        raise
+                    t.terminal_status = "completed"
+                    return "ok"
+
+                t.asyncio_task = asyncio.create_task(_work())
+                return t
+
+        rt = _NS(
+            task_id=run_id_str,
+            display_id=run_id_str,
+            task_run_id=None,
+            spawned_run_id=run_id_str,
+            terminal_status=None,
+            stop_at=None,
+            keep_straggler=lambda _w: None,
+        )
+        drv = WorkflowDriver(
+            WorkflowRunSpec(
+                run_task=rt,
+                registry=reg,
+                dispatcher=_Disp(),
+                backend=backend,
+                thread_id=f"thr-{run_id_str}",
+                short_thread_id=run_id_str[:8],
+                script=cm_wait_js,
+                script_args={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+                meta=cm_wait_meta,
+                source="prebuilt",
+                base_configurable={"workspace_id": "ws-r9-2"},
+                caps=WorkflowOrchestrationConfig(enabled=True, child_timeout=10.0, run_timeout=30.0),
+            )
+        )
+        return drv, reg
+
+    drv_hb, _ = _make_driver_with_child("run-r9-hb", on_entered=hb_entered, finish_event=hb_release)
+    hb_task = asyncio.create_task(drv_hb.run())
+    await hb_entered.wait()
+    initial_lock = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    await asyncio.sleep(0.18)
+    renewed_lock = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert renewed_lock["status"] == "locked" and renewed_lock["run_id"] == "run-r9-hb"
+    assert renewed_lock.get("renewed_at") is not None
+    assert renewed_lock["expires_at"] > initial_lock["expires_at"]
+    hb_release.set()
+    await hb_task
+    assert json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))["status"] == "released"
+
+    # 4a. Delayed stop (in-process writer slow to unwind): cancel driver -> lock NOT released ->
+    #     new entry REFUSED while lease holds -> succeeds once short lease expires!
+    slow_entered = asyncio.Event()
+    allow_unwind = asyncio.Event()
+    drv_slow, _ = _make_driver_with_child(
+        "run-r9-slow-stop",
+        on_entered=slow_entered,
+        slow_unwind_event=allow_unwind,
+    )
+    slow_task = asyncio.create_task(drv_slow.run())
+    await slow_entered.wait()
+    slow_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await slow_task
+
+    # Driver finished cancelling, but writer unwind timed out -> lock MUST remain held!
+    lock_held_after_cancel = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert lock_held_after_cancel["status"] == "locked"
+    assert lock_held_after_cancel["run_id"] == "run-r9-slow-stop"
+
+    # New modeling entry is REFUSED while lease has not expired!
+    refused_during_delay = await tool.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-during-delayed-stop",
+    )
+    assert mlock.MODELING_LOCK_BUSY_MESSAGE in str(refused_during_delay)
+
+    # Wait for the short lease to expire -> heartbeat was stopped, so new entry now SUCCEEDS!
+    wait_for_expiry = max(lock_held_after_cancel["expires_at"] - time.time() + 0.05, 0.05)
+    await asyncio.sleep(wait_for_expiry)
+    allow_unwind.set()
+
+    ok_after_short_lease = await tool.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-after-short-lease-expiry",
+    )
+    assert mlock.MODELING_LOCK_BUSY_MESSAGE not in str(ok_after_short_lease)
+    assert await mlock.release_modeling_lock(
+        backend,
+        run_id=captured_specs[-1].run_task.task_id,
+        workflow="company-model",
+        workspace_id="ws-r9-2",
+    )
+
+    # 4b. Delayed sandbox process stop: asyncio child unwinds immediately, but sandbox
+    #     probe still reports __MODEL_WRITER_ALIVE__ -> lock stays held until lease expires!
+    async def _probe_still_alive(_cmd: str) -> Any:
+        return _NS(exit_code=0, output=mlock._MODEL_WRITER_ALIVE_SENTINEL)
+
+    backend.aexecute.side_effect = _probe_still_alive
+    sbx_entered = asyncio.Event()
+    drv_sbx, _ = _make_driver_with_child("run-r9-sbx-alive", on_entered=sbx_entered)
+    sbx_task = asyncio.create_task(drv_sbx.run())
+    await sbx_entered.wait()
+    sbx_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sbx_task
+
+    sbx_lock = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert sbx_lock["status"] == "locked" and sbx_lock["run_id"] == "run-r9-sbx-alive"
+    refused_sbx = await tool.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-during-sbx-alive",
+    )
+    assert mlock.MODELING_LOCK_BUSY_MESSAGE in str(refused_sbx)
+    await asyncio.sleep(max(sbx_lock["expires_at"] - time.time() + 0.05, 0.05))
+    ok_sbx_after_expiry = await tool.coroutine(
+        workflow="company-model",
+        params={"ticker": "PDD", "workspace_dir": ".", "as_of": "2026-11-27"},
+        tool_call_id="call-after-sbx-expiry",
+    )
+    assert mlock.MODELING_LOCK_BUSY_MESSAGE not in str(ok_sbx_after_expiry)
+
+
+@pytest.mark.asyncio
+async def test_p0b_r9_3_modeling_lock_advisory_fail_rules_and_run_id_holder_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #3 (Grok 中 & 疑似):
+    1) When the DB inter-process advisory lock cannot be obtained (connection error or pool
+       exhaustion), ``release_modeling_lock`` and ``renew_modeling_lock`` do NOT write the
+       lock file unlocked (leaving the short lease to expire);
+    2) When importing ``get_db_connection`` fails on the acquire side, ``acquire_modeling_lock``
+       fails closed with ``ModelingLockBusy`` instead of falling back to an unlocked write;
+    3) ``release_modeling_lock`` respects ``expires_at`` and refuses to overwrite an expired lock;
+    4) Same ``tool_call_id`` with a DIFFERENT ``run_id`` is rejected as another holder; only
+       an identical ``run_id`` counts as the same holder."""
+    import builtins
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from src.dalton.workflows import modeling_lock as mlock
+    from src.server.database import pool as db_pool
+
+    ws = tmp_path / "ws_r9_lock_rules"
+    ws.mkdir(parents=True, exist_ok=True)
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+    writes: list[str] = []
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        writes.append(path)
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+
+    # 1. Same tool_call_id with DIFFERENT run_id must be REJECTED; same run_id refreshes!
+    now_clock = {"t": 1000.0}
+    await mlock.acquire_modeling_lock(
+        backend,
+        run_id="run-owner-1",
+        workflow="company-model",
+        tool_call_id="shared-call-1",
+        workspace_id="ws-r9-3",
+        ttl_seconds=600.0,
+        now_fn=lambda: now_clock["t"],
+    )
+    with pytest.raises(mlock.ModelingLockBusy):
+        await mlock.acquire_modeling_lock(
+            backend,
+            run_id="run-intruder-2",
+            workflow="company-model",
+            tool_call_id="shared-call-1",
+            workspace_id="ws-r9-3",
+            ttl_seconds=600.0,
+            now_fn=lambda: now_clock["t"] + 10.0,
+        )
+    lock_doc = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert lock_doc["run_id"] == "run-owner-1"
+
+    # Same run_id is accepted as the same holder
+    refreshed = await mlock.acquire_modeling_lock(
+        backend,
+        run_id="run-owner-1",
+        workflow="company-model",
+        tool_call_id="shared-call-1",
+        workspace_id="ws-r9-3",
+        ttl_seconds=600.0,
+        now_fn=lambda: now_clock["t"] + 20.0,
+    )
+    assert refreshed["run_id"] == "run-owner-1" and refreshed["expires_at"] == 1620.0
+
+    # 2. Release refuses to write after expires_at has passed
+    writes.clear()
+    assert (
+        await mlock.release_modeling_lock(
+            backend,
+            run_id="run-owner-1",
+            workflow="company-model",
+            workspace_id="ws-r9-3",
+            now_fn=lambda: 1620.0,
+        )
+        is False
+    )
+    assert writes == []
+
+    # 3. With active run_ledger (multi-worker mode): DB advisory lock failure during
+    #    release / renew MUST NOT write the lock file unlocked!
+    ledger_reg = _NS(run_ledger=object())
+
+    @asynccontextmanager
+    async def _broken_db_conn():
+        raise ConnectionError("pg pool exhausted")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(db_pool, "get_db_connection", _broken_db_conn)
+    writes.clear()
+    assert (
+        await mlock.release_modeling_lock(
+            backend,
+            registry=ledger_reg,
+            run_id="run-owner-1",
+            workflow="company-model",
+            workspace_id="ws-r9-3",
+            now_fn=lambda: 1050.0,
+        )
+        is False
+    )
+    assert (
+        await mlock.renew_modeling_lock(
+            backend,
+            registry=ledger_reg,
+            run_id="run-owner-1",
+            workflow="company-model",
+            workspace_id="ws-r9-3",
+            now_fn=lambda: 1050.0,
+        )
+        is False
+    )
+    assert writes == [], "release/renew must never write lock file when advisory lock is unavailable"
+    still_locked = json.loads((ws / mlock.MODELING_LOCK_PATH).read_text(encoding="utf-8"))
+    assert still_locked["status"] == "locked" and still_locked["run_id"] == "run-owner-1"
+
+    # 4. Import failure of get_db_connection on acquire MUST fail closed with ModelingLockBusy!
+    real_import = builtins.__import__
+
+    def _fail_pool_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "src.server.database.pool":
+            raise ImportError("simulated pool import failure")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fail_pool_import)
+    writes.clear()
+    with pytest.raises(mlock.ModelingLockBusy):
+        await mlock.acquire_modeling_lock(
+            backend,
+            registry=ledger_reg,
+            run_id="run-import-fail",
+            workflow="company-model",
+            workspace_id="ws-r9-3",
+            now_fn=lambda: 2000.0,
+        )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_p0b_r9_4_snapshot_receipt_crash_between_writes_and_resume_chain_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #4 (Codex P1 + Grok 低):
+    1) ``write-snapshot`` stages a durable transition record BEFORE replacing the workbook
+       and does NOT swallow exceptions if committing the publish receipt fails;
+    2) Interrupting between ``os.replace(editing_copy, mpath)`` and ``os.replace(tmp_rcpt, pub_rcpt)``
+       leaves the workbook on disk with the new SHA while ``pub_rcpt`` still carries the pre-snapshot
+       SHA + retryable ``pending_transition`` (and ``consensus-snapshot-receipt.json`` records the
+       transition);
+    3) Resuming after that crash replays Stage 2a and verifies the publish receipt via the recorded
+       transition (both WITH and WITHOUT ``pending_transition``), retrying ``write-snapshot`` cleanly
+       commits the receipt, and external tampering outside the transition chain is still rejected."""
+    import asyncio
+    import os as _os
+    from types import SimpleNamespace as _NS
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
+        WorkflowDriver,
+        WorkflowRunSpec,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+    from src.config.models import WorkflowOrchestrationConfig
+
+    ws = tmp_path / "ws_r9_snapshot_crash"
+    ws.mkdir(parents=True, exist_ok=True)
+    r_rel = "research/2026-11-27-model-PDD"
+    dump_rel = f"{r_rel}/model_dump"
+    base_rel = "model/PDD-model-v01.xlsx"
+    cand_rel = "model/PDD-model-v02.xlsx"
+    fp_rel = f"{dump_rel}/PDD-fingerprint.json"
+    cm_rel = f"{dump_rel}/coord_map.json"
+    cons_rel = "data/consensus/2026-11-27_1000.json"
+
+    base_p = ws / base_rel
+    base_p.parent.mkdir(parents=True, exist_ok=True)
+    base_sha = _write_simple_valid_model(base_p)
+    cand_p = ws / cand_rel
+    cm_p = ws / cm_rel
+    cons_p = ws / cons_rel
+    cons_p.parent.mkdir(parents=True, exist_ok=True)
+    cons_p.write_text(
+        json.dumps(
+            {
+                "ticker": "PDD",
+                "as_of_date": "2026-11-27",
+                "source_type": "Market Consensus",
+                "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 1125.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    skills_dst = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    skills_dst.parent.mkdir(parents=True, exist_ok=True)
+    if not skills_dst.exists():
+        skills_dst.symlink_to(REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts")
+
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    async def _aread(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        p = ws / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return True
+
+    async def _aglob(pattern: str, _root: str = ".") -> list[str]:
+        return sorted(str(p.relative_to(ws)) for p in ws.glob(pattern))
+
+    async def _aexec(cmd: str) -> Any:
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        return _NS(exit_code=proc.returncode, output=proc.stdout)
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+    backend.aglob_paths.side_effect = _aglob
+    backend.aexecute.side_effect = _aexec
+
+    def _run_real_probe(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, prompt
+        cmd = m.group(1).replace("python3 ", f"{sys.executable} ")
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return json.loads(proc.stdout.strip())
+
+    wf_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+    wf_meta = compile_check(wf_script)
+
+    def _make_driver(
+        run_id_str: str,
+        handler: Any,
+        *,
+        journal_source: str | None = None,
+    ) -> tuple[WorkflowDriver, list[str]]:
+        dispatched: list[str] = []
+        reg = BackgroundTaskRegistry()
+
+        class _Disp:
+            subagent_types = frozenset({"general-purpose", "dalton-evidence"})
+
+            async def dispatch(
+                self,
+                *,
+                subagent_type: str,
+                description: str,
+                prompt: str,
+                run_id: str | None = None,
+                owner_task_id: str | None = None,
+                base_configurable: dict[str, Any] | None = None,
+                time_limit: float | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                dispatched.append(description)
+                t = await reg.register(
+                    tool_call_id=f"{run_id_str}-{len(dispatched)}",
+                    description=description,
+                    prompt=prompt[:200],
+                    subagent_type=subagent_type,
+                    run_id=run_id,
+                    owner_task_id=owner_task_id,
+                )
+                t.per_call_records = []
+
+                async def _work() -> str:
+                    res = handler(description, prompt)
+                    if isinstance(res, Exception):
+                        t.terminal_status = "error"
+                        raise res
+                    t.terminal_status = "completed"
+                    return json.dumps(res, ensure_ascii=False)
+
+                t.asyncio_task = asyncio.create_task(_work())
+                return t
+
+        rt = _NS(
+            task_id=run_id_str,
+            display_id=run_id_str,
+            task_run_id=None,
+            spawned_run_id=run_id_str,
+            terminal_status=None,
+            stop_at=None,
+            keep_straggler=lambda _w: None,
+        )
+        params = {
+            "ticker": "PDD",
+            "company": "PDD Holdings",
+            "workspace_dir": ".",
+            "as_of": "2026-11-27",
+            "mode": "update",
+            "model_path": base_rel,
+            "progress_path": f"{r_rel}/.progress.json",
+        }
+        return (
+            WorkflowDriver(
+                WorkflowRunSpec(
+                    run_task=rt,
+                    registry=reg,
+                    dispatcher=_Disp(),
+                    backend=backend,
+                    thread_id="thr-r9-snap",
+                    short_thread_id="9999aaaa",
+                    script=wf_script,
+                    script_args=params,
+                    meta=wf_meta,
+                    source="prebuilt",
+                    base_configurable={"workspace_id": "ws-r9-4"},
+                    caps=WorkflowOrchestrationConfig(enabled=True, child_timeout=30.0, run_timeout=60.0),
+                    journal_source=journal_source,
+                    progress_path=f"{r_rel}/.progress.json",
+                )
+            ),
+            dispatched,
+        )
+
+    pre_snap_sha_holder: dict[str, str] = {}
+    post_snap_sha_holder: dict[str, str] = {}
+    real_replace = _os.replace
+    pub_rcpt_p = medit.publish_receipt_path(cand_p)
+
+    # Run 1: Stage 2a publishes v02, then Stage 2b's write-snapshot crashes RIGHT BETWEEN
+    # os.replace(editing_copy, cand_p) and os.replace(tmp_rcpt, pub_rcpt_p)!
+    def _h_r1(lbl: str, prompt: str) -> Any:
+        if lbl == "建模准备":
+            fp_obj = mfp.build_fingerprint(base_p, ticker="PDD")
+            (ws / fp_rel).parent.mkdir(parents=True, exist_ok=True)
+            (ws / fp_rel).write_text(json.dumps(fp_obj, indent=2), encoding="utf-8")
+            return {
+                "files": [fp_rel],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": base_rel,
+                "baseline_sha256": base_sha,
+                "fingerprint_path": fp_rel,
+                "consensus_path": cons_rel,
+                "planned_output_path": cand_rel,
+                "baseline_health_warning": None,
+            }
+        if lbl == "模型构建与落盘":
+            ed = medit.apply_edit_plan(
+                baseline_path=base_p,
+                ticker="PDD",
+                plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1160}]},
+                output_path=cand_p,
+                workspace_dir=ws,
+                fingerprint=json.loads((ws / fp_rel).read_text(encoding="utf-8")),
+                coord_map_out=cm_p,
+                skip_recalc=True,
+                mode="update",
+                run_id="run-r9-snap1",
+            )
+            pre_snap_sha_holder["sha"] = ed["candidate_sha256"]
+            return {
+                "files": [cand_rel, cm_rel],
+                "summary": "v02 built",
+                "candidate_path": cand_rel,
+                "model_sha256": ed["candidate_sha256"],
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            return _run_real_probe(prompt)
+        if lbl == "一致预期对照":
+            def _crash_on_final_rcpt_commit(src: Any, dst: Any) -> None:
+                if Path(dst).resolve() == pub_rcpt_p.resolve() and not str(src).endswith(".pre.tmp"):
+                    raise OSError("simulated crash between workbook replace and receipt commit")
+                real_replace(src, dst)
+
+            with monkeypatch.context() as mp:
+                mp.setattr(mcons.os, "replace", _crash_on_final_rcpt_commit)
+                with pytest.raises(OSError, match="simulated crash between workbook replace and receipt commit"):
+                    mcons.main(["write-snapshot", "--model", str(cand_p), "--consensus", str(cons_p), "--coord-map", str(cm_p)])
+            post_snap_sha_holder["sha"] = mfp.file_sha256(cand_p)
+            return RuntimeError("interrupted after partial snapshot commit")
+        if lbl in ("模型本轮范围检查", "写入降级账本"):
+            return RuntimeError("interrupted")
+        raise AssertionError(lbl)
+
+    d1, _ = _make_driver("run-r9-snap1", _h_r1)
+    await d1.run()
+
+    pre_sha = pre_snap_sha_holder["sha"]
+    post_sha = post_snap_sha_holder["sha"]
+    assert post_sha != pre_sha
+    rcpt_after_crash = json.loads(pub_rcpt_p.read_text(encoding="utf-8"))
+    assert rcpt_after_crash["run_id"] == "run-r9-snap1"
+    assert rcpt_after_crash["candidate_sha256"] == pre_sha
+    assert rcpt_after_crash["pending_transition"]["pre_model_sha256"] == pre_sha
+    assert rcpt_after_crash["pending_transition"]["post_model_sha256"] == post_sha
+
+    # Subcase A: Also verify resume probe works even when pub_rcpt has ONLY old pre_sha
+    # (no pending_transition), purely via consensus-snapshot-receipt.json transition chain!
+    rcpt_without_pt = dict(rcpt_after_crash)
+    rcpt_without_pt.pop("pending_transition", None)
+    pub_rcpt_p.write_text(json.dumps(rcpt_without_pt, indent=2), encoding="utf-8")
+
+    probes_no_pt: list[dict[str, Any]] = []
+
+    def _h_probe_only(lbl: str, prompt: str) -> Any:
+        if lbl == "模型构建与落盘":
+            raise AssertionError("Must replay Stage 2a via consensus-snapshot-receipt.json")
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            probes_no_pt.append(out)
+            return out
+        return RuntimeError("stop after probe")
+
+    d_no_pt, disp_no_pt = _make_driver(
+        "run-r9-snap-nopt",
+        _h_probe_only,
+        journal_source=".agents/threads/9999aaaa/workflows/run-r9-snap1",
+    )
+    await d_no_pt.run()
+    assert "模型构建与落盘" not in disp_no_pt
+    assert len(probes_no_pt) == 1
+    assert probes_no_pt[0]["run_matched"] is True and probes_no_pt[0]["model_sha256"] == post_sha
+
+    # Restore pending_transition to test full resume + retryable write-snapshot commit + delivery!
+    pub_rcpt_p.write_text(json.dumps(rcpt_after_crash, indent=2), encoding="utf-8")
+    probes_r2: list[dict[str, Any]] = []
+
+    def _h_r2(lbl: str, prompt: str) -> Any:
+        if lbl == "模型构建与落盘":
+            raise AssertionError("Run 2 must replay Stage 2a")
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            probes_r2.append(out)
+            return out
+        if lbl == "一致预期对照":
+            # Retry write-snapshot with normal os.replace -> commits receipt and clears pending_transition!
+            assert mcons.main(["write-snapshot", "--model", str(cand_p), "--consensus", str(cons_p), "--coord-map", str(cm_p)]) == 0
+            assert mcons.main(["diff", "--model", str(cand_p), "--ticker", "PDD", "--research-dir", str(ws / r_rel), "--consensus", str(cons_p)]) == 0
+            return {
+                "files": [cand_rel, cm_rel, f"{dump_rel}/consensus-diff.md", f"{dump_rel}/consensus-diff.json"],
+                "summary": "cons retried ok",
+                "candidate_path": cand_rel,
+                "model_sha256": mfp.file_sha256(cand_p),
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if lbl == "模型本轮范围检查":
+            chk_res = mchk.write_check_and_ledger(
+                workspace_dir=ws,
+                ticker="PDD",
+                research_dir=ws / r_rel,
+                candidate_path=cand_p,
+                baseline_path=base_p,
+                fingerprint_path=ws / fp_rel,
+                coord_map_path=cm_p,
+                run_id="run-r9-snap2",
+                workflow="company-model",
+                mode="update",
+            )
+            files = [f"{dump_rel}/model-check.md", f"{dump_rel}/model-verification.json"]
+            if chk_res.get("remaining_issues_path"):
+                files.append(f"{dump_rel}/remaining-issues.md")
+            return {
+                "files": files,
+                "summary": "checked",
+                "readable": chk_res["readable"],
+                "final_status": chk_res["final_status"],
+                "model_sha256": chk_res["candidate_sha256"],
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{dump_rel}/remaining-issues.md" if chk_res.get("remaining_issues_path") else None,
+            }
+        raise AssertionError(lbl)
+
+    d2, disp_r2 = _make_driver(
+        "run-r9-snap2",
+        _h_r2,
+        journal_source=".agents/threads/9999aaaa/workflows/run-r9-snap1",
+    )
+    await d2.run()
+    assert "模型构建与落盘" not in disp_r2
+    assert len(probes_r2) == 1 and probes_r2[0]["run_matched"] is True
+    rcpt_committed = json.loads(pub_rcpt_p.read_text(encoding="utf-8"))
+    assert rcpt_committed["run_id"] == "run-r9-snap1"
+    assert rcpt_committed["candidate_sha256"] == mfp.file_sha256(cand_p)
+    assert "pending_transition" not in rcpt_committed
+    res2 = json.loads((ws / ".agents/threads/9999aaaa/workflows/run-r9-snap2/result.json").read_text(encoding="utf-8"))
+    assert res2["ok"] is True and res2["candidate_path"] == cand_rel
+    vd2 = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        expected_run_id="run-r9-snap2",
+        expected_workflow="company-model",
+    )
+    assert vd2["ok"] is True, vd2["errors"]
+
+    # Subcase B: Tampering with cand_p outside the recorded transition chain is STILL rejected!
+    wb_tamper = openpyxl.load_workbook(cand_p)
+    wb_tamper["Model - PDD"]["E2"] = 999999
+    wb_tamper.save(cand_p)
+    wb_tamper.close()
+    tamper_probes: list[dict[str, Any]] = []
+
+    def _h_tamper(lbl: str, prompt: str) -> Any:
+        if lbl == "模型构建与落盘":
+            return {
+                "files": [cand_rel, cm_rel],
+                "summary": "claimed ok",
+                "candidate_path": cand_rel,
+                "model_sha256": mfp.file_sha256(cand_p),
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            tamper_probes.append(out)
+            return out
+        raise AssertionError(f"Tampered workbook must stop before {lbl}")
+
+    d_tamper, _ = _make_driver(
+        "run-r9-tamper",
+        _h_tamper,
+        journal_source=".agents/threads/9999aaaa/workflows/run-r9-snap1",
+    )
+    await d_tamper.run()
+    assert len(tamper_probes) == 1 and tamper_probes[0]["run_matched"] is False
+    res_tamper = json.loads((ws / ".agents/threads/9999aaaa/workflows/run-r9-tamper/result.json").read_text(encoding="utf-8"))
+    assert res_tamper["ok"] is False and res_tamper["status"] == "failed_unusable"

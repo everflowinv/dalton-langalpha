@@ -230,6 +230,15 @@ def prompt_digest(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
+def canonical_prompt_digest(prompt: str, run_id: str | None = None) -> str:
+    """Hash ``prompt`` while normalizing this run's server-bound ``--run-id``
+    flag so resumed runs match prior modeling dispatches across run_ids."""
+    if isinstance(run_id, str) and run_id.strip():
+        rid = run_id.strip()
+        prompt = prompt.replace(f'--run-id "{rid}"', '--run-id "{{RUN_ID}}"')
+    return prompt_digest(prompt)
+
+
 async def _probe_declared_paths(backend: Any, paths: list[str]) -> dict[str, str]:
     """Each declared path's existence verdict: ``ok`` (exists, non-empty),
     ``missing``, ``empty``, or ``unknown`` — never guessed.
@@ -377,6 +386,10 @@ class WorkflowJournal:
     def journal_file(self, label: str) -> str:
         safe = JOURNAL_NAME_SAFE.sub("_", label)[:80] or "dispatch"
         return f"{self.base_rel}/{JOURNAL_DIR}/{safe}.json"
+
+    def prompt_hash(self, prompt: str) -> str:
+        """Stable prompt digest for journal recording & resume matching."""
+        return canonical_prompt_digest(prompt, self.run_id)
 
     async def append(self, entry: dict[str, Any]) -> None:
         """Append one dispatch record to its label's journal file, best-effort.
@@ -594,9 +607,10 @@ class WorkflowJournal:
         since forces the dispatch again rather than resurrecting stale work.
         """
         index = await self._load_resume_index()
+        expected_digests = {self.prompt_hash(prompt), prompt_digest(prompt)}
         for entry in index.get(label) or []:
             if (
-                entry.get("prompt_sha256") != prompt_digest(prompt)
+                entry.get("prompt_sha256") not in expected_digests
                 or entry.get("status") != "ok"
                 or entry.get("replayable") is not True
             ):
