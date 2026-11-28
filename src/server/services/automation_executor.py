@@ -1010,6 +1010,13 @@ class AutomationExecutor:
 
         while True:
             automation = firing.automation
+            # DALTON-HOOK(maintenance-gate): block automation turn execution during maintenance window
+            from src.dalton.maintenance_gate import enforce_maintenance_admission
+
+            enforce_maintenance_admission(
+                workspace_id=str(automation.get("workspace_id") or "") or None,
+                context="automation_run_turn",
+            )
             user_id = automation["user_id"]
             recorded_as = carried_recorded_as(automation)
             instruction = automation["instruction"]

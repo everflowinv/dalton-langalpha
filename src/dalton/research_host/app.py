@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
-import json
 import logging
 import os
 import sys
@@ -12,7 +12,6 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +34,6 @@ from src.dalton.research_host.connector_registry import (
 from src.dalton.research_host.federated import (
     DEFAULT_FANOUT_GRACE_S,
     FederatedResearchConnector,
-    LegacyBridgeAlphaEngineProxy,
 )
 from src.dalton.research_host.mcp_protocol import (
     jsonrpc_error,
@@ -49,6 +47,7 @@ logger = logging.getLogger("dalton-research-host")
 
 DEFAULT_RESEARCH_HOST: str = "127.0.0.1"
 DEFAULT_RESEARCH_PORT: int = 8951
+DEFAULT_DATA_ROOT: str = "/var/lib/dalton/wiki"
 DEFAULT_WIKI_PAUSE_TTL_S: float = 300.0
 MIN_WIKI_PAUSE_TTL_S: float = 0.05
 MAX_WIKI_PAUSE_TTL_S: float = 3600.0
@@ -58,6 +57,31 @@ def _parse_extra_modules(raw: str | None) -> list[str]:
     if not raw or not raw.strip():
         return []
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _resolve_extra_default_data_root(
+    extra_modules: list[str],
+    extra_python_paths: list[str],
+    environ: Mapping[str, str],
+) -> str:
+    """Allow an optional host extension module to supply a deployment-specific default data root."""
+    if not extra_modules:
+        return ""
+    for p in extra_python_paths:
+        if p and p not in sys.path:
+            sys.path.insert(0, p)
+    for mod_name in extra_modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:
+            logger.debug("Skipping default data root lookup for %s: %s", mod_name, exc)
+            continue
+        resolver = getattr(mod, "resolve_default_data_root", None)
+        if callable(resolver):
+            candidate = str(resolver(environ) or "").strip()
+            if candidate:
+                return candidate
+    return ""
 
 
 @dataclass
@@ -70,15 +94,14 @@ class ResearchHostConfig:
     port: int = DEFAULT_RESEARCH_PORT
     mcp_token: str = ""
     admin_token: str = ""
-    bridge_admin_token: str = ""
-    legacy_bridge_mcp_url: str = ""
-    legacy_bridge_token: str = ""
+    extra_caller_admin_secrets: tuple[str, ...] = ()
     usage_file: Path | None = None
     wiki_audit_file: Path | None = None
     fanout_grace_s: float = DEFAULT_FANOUT_GRACE_S
     extra_modules: list[str] = field(default_factory=list)
     extra_python_paths: list[str] = field(default_factory=list)
     profile: DeploymentProfile | None = None
+    environ: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ResearchHostConfig:
@@ -87,12 +110,11 @@ class ResearchHostConfig:
             app_env=env.get("APP_ENV", "") if environ is not None else None,
             dalton_profile=env.get("DALTON_PROFILE", "") if environ is not None else None,
         )
-        default_data = (
-            "/var/lib/dalton/wiki"
-            if active_profile is DeploymentProfile.CORE
-            else str(Path.home() / "Library" / "Application Support" / "Everflow" / "research")
-        )
-        raw_home = str(env.get("DALTON_RESEARCH_HOME") or env.get("DALTON_WIKI_DATA_DIR") or default_data).strip()
+        extra_modules = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_MODULES"))
+        extra_paths = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"))
+        raw_home = str(env.get("DALTON_RESEARCH_HOME") or env.get("DALTON_WIKI_DATA_DIR") or "").strip()
+        if not raw_home:
+            raw_home = _resolve_extra_default_data_root(extra_modules, extra_paths, env) or DEFAULT_DATA_ROOT
         raw_code = str(env.get("DALTON_RESEARCH_CODE") or "").strip()
         host = str(env.get("DALTON_RESEARCH_HOST_BIND") or DEFAULT_RESEARCH_HOST).strip() or DEFAULT_RESEARCH_HOST
         try:
@@ -101,17 +123,11 @@ class ResearchHostConfig:
             port = DEFAULT_RESEARCH_PORT
         mcp_token = str(env.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
         admin_token = str(env.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
-        bridge_admin_token = str(env.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
-        legacy_bridge_mcp_url = str(env.get("DALTON_LEGACY_BRIDGE_MCP_URL") or "").strip()
-        legacy_bridge_token = str(env.get("DALTON_BRIDGE_TOKEN") or "").strip()
-        raw_usage = str(env.get("DALTON_ALPHAENGINE_USAGE_FILE") or "").strip()
         raw_audit = str(env.get("DALTON_WIKI_INGEST_AUDIT_FILE") or "").strip()
         try:
             grace_s = float(env.get("DALTON_RESEARCH_FANOUT_GRACE_S") or DEFAULT_FANOUT_GRACE_S)
         except ValueError:
             grace_s = DEFAULT_FANOUT_GRACE_S
-        extra_modules = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_MODULES"))
-        extra_paths = _parse_extra_modules(env.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"))
         return cls(
             data_root=Path(raw_home).expanduser().resolve(),
             code_root=Path(raw_code).expanduser().resolve() if raw_code else None,
@@ -119,34 +135,14 @@ class ResearchHostConfig:
             port=port,
             mcp_token=mcp_token,
             admin_token=admin_token,
-            bridge_admin_token=bridge_admin_token,
-            legacy_bridge_mcp_url=legacy_bridge_mcp_url,
-            legacy_bridge_token=legacy_bridge_token,
-            usage_file=Path(raw_usage).expanduser().resolve() if raw_usage else None,
+            usage_file=None,
             wiki_audit_file=Path(raw_audit).expanduser().resolve() if raw_audit else None,
             fanout_grace_s=max(0.05, grace_s),
             extra_modules=extra_modules,
             extra_python_paths=extra_paths,
             profile=active_profile,
+            environ=dict(env),
         )
-
-
-def _read_usage_today(usage_file: Path | None) -> dict[str, Any]:
-    if usage_file is None or not usage_file.is_file():
-        return {"configured": usage_file is not None, "today_reads": 0}
-    try:
-        data = json.loads(usage_file.read_text(encoding="utf-8"))
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if isinstance(data, dict):
-            if isinstance(data.get("days"), dict) and today_str in data["days"]:
-                entry = data["days"][today_str]
-                reads = int(entry.get("reads", 0)) if isinstance(entry, dict) else int(entry or 0)
-                return {"configured": True, "today_reads": reads, "date": today_str}
-            if data.get("date") == today_str:
-                return {"configured": True, "today_reads": int(data.get("reads", 0)), "date": today_str}
-        return {"configured": True, "today_reads": 0, "date": today_str}
-    except Exception as exc:
-        return {"configured": True, "error": type(exc).__name__}
 
 
 class ResearchHostRuntime:
@@ -157,7 +153,6 @@ class ResearchHostRuntime:
         config: ResearchHostConfig,
         *,
         capabilities_provider: Any = None,
-        alphaengine_proxy: LegacyBridgeAlphaEngineProxy | None = None,
     ) -> None:
         if config.mcp_token and config.admin_token and config.mcp_token == config.admin_token:
             raise ValueError(
@@ -226,10 +221,22 @@ class ResearchHostRuntime:
             CapabilityId.COMPANY_WIKI,
             search_fn=_wiki_search_leg,
             list_fn=_wiki_list_leg,
+            allowed_params=frozenset(
+                {"company", "sector", "tag", "search_mode", "no_decay", "media", "indexed_since"}
+            ),
+            prefixes=("wiki",),
+            top_level_block=False,
+            fuse_local=True,
+            provenance_identity="internal_note",
         )
-        self.registry.register_prefix_reader("wiki", CapabilityId.COMPANY_WIKI, _wiki_read)
+        self.registry.register_prefix_reader(
+            "wiki",
+            CapabilityId.COMPANY_WIKI,
+            _wiki_read,
+            source_id="company-wiki",
+        )
 
-        # Load optional host-side commercial connector modules (excluded from Core release)
+        # Load optional host-side connector extension modules (excluded from Core release)
         for p in config.extra_python_paths:
             if p and p not in sys.path:
                 sys.path.insert(0, p)
@@ -241,19 +248,10 @@ class ResearchHostRuntime:
                 active_caps=self.current_capabilities(),
             )
 
-        # Batch 3: AlphaEngine leg in `all` forwards to legacy bridge when configured
-        eff_ae_proxy = alphaengine_proxy
-        if eff_ae_proxy is None and config.legacy_bridge_mcp_url:
-            eff_ae_proxy = LegacyBridgeAlphaEngineProxy(
-                bridge_mcp_url=config.legacy_bridge_mcp_url,
-                bridge_token=config.legacy_bridge_token,
-            )
-
         self.federated_connector = FederatedResearchConnector(
             self.registry,
             self.wiki_store,
             fanout_grace_s=config.fanout_grace_s,
-            alphaengine_proxy=eff_ae_proxy,
         )
         self.registry.register_connector(self.federated_connector)
 
@@ -307,7 +305,15 @@ class ResearchHostRuntime:
 
     def _caller_admin_secrets(self) -> tuple[str, ...]:
         return tuple(
-            s for s in (self.config.admin_token, self.config.bridge_admin_token) if s
+            dict.fromkeys(
+                s
+                for s in (
+                    self.config.admin_token,
+                    *self.config.extra_caller_admin_secrets,
+                    *self.registry.caller_admin_secrets,
+                )
+                if s
+            )
         )
 
     def _connector_enabled(self, route_id: str, active_caps: frozenset[CapabilityId]) -> bool:
@@ -340,8 +346,12 @@ class ResearchHostRuntime:
         }
         if self.loaded_extra_modules:
             payload["extra_modules"] = list(self.loaded_extra_modules)
-        if CapabilityId.ALPHAENGINE in active:
-            payload["alphaengine_usage"] = _read_usage_today(self.config.usage_file)
+        for field_name, (req_cap, provider) in sorted(self.registry.health_fields.items()):
+            if req_cap is not None and req_cap not in active:
+                continue
+            val = provider(active)
+            if val is not None:
+                payload[field_name] = val
         return payload
 
     async def shutdown(self) -> None:
@@ -359,14 +369,12 @@ def create_app(
     *,
     runtime: ResearchHostRuntime | None = None,
     capabilities_provider: Any = None,
-    alphaengine_proxy: LegacyBridgeAlphaEngineProxy | None = None,
 ) -> FastAPI:
     """Create the FastAPI application for ``dalton-research-host``."""
     cfg = config or ResearchHostConfig.from_env()
     rt = runtime or ResearchHostRuntime(
         cfg,
         capabilities_provider=capabilities_provider,
-        alphaengine_proxy=alphaengine_proxy,
     )
 
     @asynccontextmanager
@@ -420,6 +428,68 @@ def create_app(
             status_code=200,
             content={"ok": True, "draining": rt.draining, "in_flight": rt.in_flight},
         )
+
+    @app.post("/admin/{connector_id}/acquire-lock")
+    async def acquire_connector_lock(connector_id: str, request: Request) -> JSONResponse:
+        err = _require_admin_token(request)
+        if err is not None:
+            return err
+        entry = rt.registry.lock_handoff_handlers.get(connector_id)
+        if entry is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "ok": False,
+                    "status": "not_found",
+                    "error_code": "lock_handoff_not_registered",
+                    "error": f"No lock handoff handler registered for connector '{connector_id}'.",
+                },
+            )
+        req_cap, acquire_fn = entry
+        if req_cap is not None and req_cap not in rt.current_capabilities():
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "ok": False,
+                    "status": "capability_disabled",
+                    "error_code": "capability_disabled",
+                    "error": f"Capability '{req_cap.value}' is disabled.",
+                },
+            )
+        try:
+            raw_body = await request.body()
+            body = await request.json() if raw_body else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "status": "bad_request", "error": "JSON object required"},
+            )
+        try:
+            if inspect.iscoroutinefunction(acquire_fn):
+                result = await acquire_fn(body)
+            else:
+                result = await asyncio.to_thread(acquire_fn, body)
+                if inspect.isawaitable(result):
+                    result = await result
+        except Exception as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "status": "lock_acquire_failed",
+                    "error_code": "lock_acquire_failed",
+                    "error": str(exc) or type(exc).__name__,
+                },
+            )
+        if isinstance(result, tuple) and len(result) == 2:
+            status_code, payload = result
+            return JSONResponse(status_code=int(status_code), content=dict(payload))
+        if isinstance(result, dict):
+            code = int(result.pop("http_status", 200))
+            return JSONResponse(status_code=code, content=result)
+        return JSONResponse(status_code=200, content={"ok": True, "connector_id": connector_id})
 
     @app.get("/admin/wiki/pause-writes")
     async def get_wiki_pause_writes(request: Request) -> JSONResponse:
@@ -649,7 +719,11 @@ def create_app(
                 arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
                 caller = resolve_caller_identity(request, admin_secrets=rt._caller_admin_secrets())
                 fwd_headers: dict[str, str] = {}
-                for hdr in ("x-dalton-caller-token", "x-dalton-caller-scope"):
+                for hdr in (
+                    "x-dalton-caller-token",
+                    "x-dalton-caller-scope",
+                    "x-dalton-request-timeout-ms",
+                ):
                     val = request.headers.get(hdr, "").strip()
                     if val:
                         fwd_headers[hdr] = val
@@ -664,9 +738,17 @@ def create_app(
                 finally:
                     CURRENT_CALLER_HEADERS.reset(ctx_tok)
                 http_override = payload.pop("http_status", None) if isinstance(payload, dict) else None
-                if http_override == 403 or (isinstance(payload, dict) and payload.get("error_code") == "capability_disabled"):
+                if http_override in (403, 503) or (
+                    isinstance(payload, dict)
+                    and payload.get("error_code") in ("capability_disabled", "lock_not_acquired")
+                ):
+                    code = (
+                        int(http_override)
+                        if isinstance(http_override, int) and http_override in (403, 503)
+                        else (503 if isinstance(payload, dict) and payload.get("error_code") == "lock_not_acquired" else 403)
+                    )
                     return JSONResponse(
-                        status_code=403,
+                        status_code=code,
                         content=jsonrpc_result(req_id, mcp_tool_result(payload, is_error=True)),
                     )
                 return JSONResponse(

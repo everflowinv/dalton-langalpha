@@ -39,7 +39,330 @@ SOURCES = ('company-wiki', 'sales-notes', 'tmtb', 'funda-ai')
 KEY_SQL = "COALESCE(NULLIF(message_id,''),NULLIF(email_id,''),'row:' || id)"
 
 
-def validate_request(route, operation, query=None, document=None, params=None):
+_DOTENV_DISABLED_VALUES = frozenset({"1", "true", "t", "yes", "y"})
+
+
+def _parse_dotenv_stdlib(path: Path, base_env: dict[str, str]) -> dict[str, str]:
+    """Pure-stdlib .env reader used only when python-dotenv is absent; never mutates os.environ."""
+    resolved: dict[str, str] = {}
+    var_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, raw_val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = raw_val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            quote = val[0]
+            val = val[1:-1]
+            if quote == "'":
+                resolved[key] = val
+                continue
+        else:
+            val = re.sub(r"\s+#.*$", "", val).strip()
+        lookup = {**resolved, **base_env}
+        resolved[key] = var_re.sub(lambda m: lookup.get(m.group(1), ""), val)
+    return resolved
+
+
+_YAML_SIMPLE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _strip_yaml_inline_comment(value: str) -> str:
+    """Strip an unquoted YAML `# ...` comment (at index 0 or following whitespace)."""
+    in_single = False
+    in_double = False
+    for idx, ch in enumerate(value):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single and (idx == 0 or value[idx - 1] != "\\"):
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if idx == 0 or value[idx - 1] in (" ", "\t"):
+                return value[:idx].strip()
+    return value.strip()
+
+
+def _unquote_yaml_simple_key(raw_key: str) -> str:
+    key = raw_key.strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
+        key = key[1:-1].strip()
+    if not _YAML_SIMPLE_KEY_RE.fullmatch(key):
+        raise ValueError(f"Unparseable YAML key without PyYAML: {raw_key!r}")
+    return key.lower()
+
+
+def _parse_yaml_strict_bool(raw_val: str) -> bool:
+    norm = _strip_yaml_inline_comment(raw_val).lower()
+    if norm == "true":
+        return True
+    if norm == "false":
+        return False
+    raise ValueError(f"Unparseable YAML boolean without PyYAML: {raw_val!r}")
+
+
+def _parse_yaml_flow_capabilities(flow_text: str) -> dict[str, bool]:
+    """Strictly parse a single-line YAML flow mapping like `{sales_notes: false}`; raise on anything ambiguous."""
+    stripped = flow_text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        raise ValueError(f"Unsupported capabilities flow syntax without PyYAML: {flow_text!r}")
+    inner = stripped[1:-1].strip()
+    if not inner:
+        return {}
+    if any(ch in inner for ch in ("{", "}", "[", "]", "&", "*", "!", "\n")):
+        raise ValueError(f"Complex capabilities flow syntax requires PyYAML: {flow_text!r}")
+    out: dict[str, bool] = {}
+    for raw_entry in inner.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if entry.count(":") != 1:
+            raise ValueError(f"Unparseable capabilities flow entry without PyYAML: {entry!r}")
+        raw_k, raw_v = entry.split(":", 1)
+        out[_unquote_yaml_simple_key(raw_k)] = _parse_yaml_strict_bool(raw_v)
+    return out
+
+
+def _read_yaml_top_and_capabilities_fallback(text: str) -> tuple[bool | None, dict[str, bool]]:
+    """Fail-closed stdlib YAML subset parser used only when PyYAML is absent.
+
+    Handles top-level `enabled:` and `capabilities:` (block mapping with optional trailing
+    comments or single-line flow mapping `{k: bool}`). Any syntax that cannot be reliably
+    parsed raises `ValueError` so host-direct callers fail closed (`[]`) rather than
+    falling back to Everflow defaults.
+    """
+    enabled_val: bool | None = None
+    caps_out: dict[str, bool] = {}
+    in_caps = False
+    seen_caps = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading_ws = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+        if "\t" in leading_ws:
+            raise ValueError("Tab indentation in YAML requires PyYAML")
+        indent = len(leading_ws)
+        if indent == 0:
+            in_caps = False
+            if stripped in ("---", "..."):
+                continue
+            if stripped.startswith(("{", "[", "?", "<<:", "&", "*", "!")):
+                raise ValueError(f"Unsupported top-level YAML construct without PyYAML: {stripped!r}")
+            if ":" not in stripped:
+                continue
+            raw_k, raw_rest = stripped.split(":", 1)
+            key_clean = raw_k.strip()
+            if len(key_clean) >= 2 and key_clean[0] == key_clean[-1] and key_clean[0] in ("'", '"'):
+                key_clean = key_clean[1:-1].strip()
+            key_lower = key_clean.lower()
+            if key_lower == "enabled":
+                enabled_val = _parse_yaml_strict_bool(raw_rest)
+            elif key_lower == "capabilities":
+                if seen_caps:
+                    raise ValueError("Duplicate capabilities key in YAML requires PyYAML")
+                seen_caps = True
+                rest_clean = _strip_yaml_inline_comment(raw_rest)
+                if not rest_clean:
+                    in_caps = True
+                elif rest_clean.lower() in ("null", "~"):
+                    in_caps = False
+                elif rest_clean.startswith("{"):
+                    caps_out.update(_parse_yaml_flow_capabilities(rest_clean))
+                    in_caps = False
+                else:
+                    raise ValueError(
+                        f"Unsupported capabilities value without PyYAML: {raw_rest!r}"
+                    )
+        elif in_caps:
+            line_clean = _strip_yaml_inline_comment(stripped)
+            if not line_clean:
+                continue
+            if ":" not in line_clean or line_clean.startswith(("-", "<<:", "&", "*", "!", "{", "[")):
+                raise ValueError(
+                    f"Unsupported capabilities block entry without PyYAML: {stripped!r}"
+                )
+            raw_k, raw_v = line_clean.split(":", 1)
+            caps_out[_unquote_yaml_simple_key(raw_k)] = _parse_yaml_strict_bool(raw_v)
+    return enabled_val, caps_out
+
+
+def _read_yaml_top_and_capabilities(path: Path) -> tuple[bool | None, dict[str, bool]]:
+    """Read optional top-level `enabled:` and `capabilities:` booleans without importing src.config."""
+    if not path.is_file():
+        return None, {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return _read_yaml_top_and_capabilities_fallback(text)
+
+    data = yaml.safe_load(text)
+    if data is None:
+        return None, {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected YAML mapping in {path}")
+    raw_enabled = data.get("enabled")
+    if raw_enabled is not None and not isinstance(raw_enabled, bool):
+        raise ValueError(f"Invalid non-boolean 'enabled' in {path}")
+    enabled = raw_enabled if isinstance(raw_enabled, bool) else None
+    caps_raw = data.get("capabilities")
+    if caps_raw is not None and not isinstance(caps_raw, dict):
+        raise ValueError(f"Invalid non-mapping 'capabilities' in {path}")
+    caps: dict[str, bool] = {}
+    if isinstance(caps_raw, dict):
+        for k, v in caps_raw.items():
+            if not isinstance(k, str) or not isinstance(v, bool):
+                raise ValueError(f"Invalid capability entry {k!r}={v!r} in {path}")
+            caps[k.strip().lower()] = v
+    return enabled, caps
+
+
+def _resolve_host_direct_library_sources() -> list[str]:
+    """Resolve deployment-enabled local library source names for host-direct calls.
+
+    Reads only profile & capability control keys from process env, deployment `.env`,
+    and `dalton.yaml` / `dalton.core.yaml` using `src.dalton.profile` and
+    `src.dalton.capabilities` (never importing `src.config` / `src.dalton.settings`
+    and never mutating `os.environ`). Fails closed (`[]`) if deployment config
+    cannot be resolved.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+        if not (
+            (repo_root / "src" / "dalton" / "profile.py").is_file()
+            and (repo_root / "src" / "dalton" / "capabilities.py").is_file()
+        ):
+            return []
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        from src.dalton.capabilities import (
+            CAPABILITY_SPECS,
+            CapabilityId,
+            _parse_explicit_cap_env,
+            is_capability_control_env_key,
+        )
+        from src.dalton.profile import DeploymentProfile, resolve_profile
+
+        proc_env = dict(os.environ)
+        cap_env: dict[str, str] = {
+            k: v for k, v in proc_env.items() if is_capability_control_env_key(k)
+        }
+
+        dotenv_disabled_raw = proc_env.get("PYTHON_DOTENV_DISABLED")
+        dotenv_disabled = (
+            dotenv_disabled_raw is not None
+            and str(dotenv_disabled_raw).strip().casefold() in _DOTENV_DISABLED_VALUES
+        )
+        if not dotenv_disabled:
+            explicit_dotenv = (
+                str(proc_env.get("DALTON_DOTENV_PATH") or "").strip()
+                or str(proc_env.get("DALTON_REPO_ENV_FILE") or "").strip()
+            )
+            env_path: Path | None = None
+            if explicit_dotenv:
+                cand = Path(explicit_dotenv).expanduser()
+                if not cand.is_file():
+                    return []
+                env_path = cand.resolve()
+            else:
+                repo_dotenv = repo_root / ".env"
+                if repo_dotenv.is_file():
+                    env_path = repo_dotenv.resolve()
+            if env_path is not None:
+                try:
+                    from src.dalton.config_env import parse_and_resolve_dotenv
+
+                    parsed_dotenv = parse_and_resolve_dotenv(
+                        env_path, base_env=proc_env, override=False
+                    )
+                except ImportError:
+                    parsed_dotenv = _parse_dotenv_stdlib(env_path, proc_env)
+                for k, v in parsed_dotenv.items():
+                    if is_capability_control_env_key(k) and k not in cap_env:
+                        cap_env[k] = v
+
+        active_profile = resolve_profile(
+            app_env=cap_env.get("APP_ENV", ""),
+            dalton_profile=cap_env.get("DALTON_PROFILE", ""),
+        )
+
+        yaml_enabled, yaml_caps = _read_yaml_top_and_capabilities(
+            repo_root / "src" / "dalton" / "dalton.yaml"
+        )
+        if active_profile is DeploymentProfile.CORE:
+            core_enabled, core_caps = _read_yaml_top_and_capabilities(
+                repo_root / "src" / "dalton" / "dalton.core.yaml"
+            )
+            if core_enabled is not None:
+                yaml_enabled = core_enabled
+            yaml_caps.update(core_caps)
+
+        if "DALTON_ENABLED" in cap_env:
+            dalton_on = cap_env["DALTON_ENABLED"].strip().lower() in ("1", "true", "yes")
+        else:
+            dalton_on = True if yaml_enabled is None else bool(yaml_enabled)
+        if not dalton_on:
+            return []
+
+        source_caps = (
+            ("company-wiki", CapabilityId.COMPANY_WIKI),
+            ("sales-notes", CapabilityId.SALES_NOTES),
+            ("tmtb", CapabilityId.TMTB),
+            ("funda-ai", CapabilityId.FUNDA_AI),
+        )
+        enabled: list[str] = []
+        for source_name, cap_id in source_caps:
+            spec = CAPABILITY_SPECS[cap_id]
+            explicit = _parse_explicit_cap_env(spec.env_var, cap_env.get(spec.env_var))
+            if explicit is not None:
+                is_on = explicit
+            elif cap_id.value in yaml_caps:
+                is_on = bool(yaml_caps[cap_id.value])
+            else:
+                is_on = (
+                    spec.core_default
+                    if active_profile is DeploymentProfile.CORE
+                    else spec.everflow_default
+                )
+            if is_on:
+                enabled.append(source_name)
+        return enabled
+    except Exception:
+        return []
+
+
+def _enabled_library_sources(allowed_sources=None):
+    """Resolve enabled local library sources from explicit allowlist, bridge env, or deployment config.
+
+    When called through the bridge (`DALTON_ENABLED_LIBRARY_SOURCES` or `--allowed-sources`),
+    uses only the supplied source names and never reads deployment files or imports `src.*`.
+    When called host-directly without an allowlist, resolves source names once from deployment
+    profile/capabilities without loading `.env` into `os.environ`, failing closed (`[]`) if
+    deployment config cannot be resolved.
+    """
+    if allowed_sources is not None:
+        if isinstance(allowed_sources, str):
+            allowed = {part.strip() for part in allowed_sources.split(",") if part.strip()}
+        else:
+            allowed = {str(s).strip() for s in allowed_sources if str(s).strip()}
+        return [s for s in SOURCES if s in allowed]
+    raw_env = os.environ.get("DALTON_ENABLED_LIBRARY_SOURCES")
+    if raw_env is not None:
+        allowed = {part.strip() for part in raw_env.split(",") if part.strip()}
+        return [s for s in SOURCES if s in allowed]
+    return _resolve_host_direct_library_sources()
+
+
+def validate_request(route, operation, query=None, document=None, params=None, allowed_sources=None):
     p = dict(params or {})
     allowed = {'company', 'sector', 'tag', 'sender', 'layer', 'sources',
                'search_mode', 'no_decay', 'offset', 'max_chars', 'media', 'indexed_since'}
@@ -65,9 +388,25 @@ def validate_request(route, operation, query=None, document=None, params=None):
         raise ValueError('layer 须为 raw、digest 或 all')
     if 'sender' in p and p.get('layer','raw') != 'raw':
         raise ValueError('sender 筛选仅用于原文层')
-    sources = p.get('sources', list(SOURCES)) if route == 'all' else [route]
-    if not isinstance(sources, list) or not sources or any(s not in SOURCES for s in sources):
-        raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+    enabled_sources = _enabled_library_sources(allowed_sources)
+    if route == 'all':
+        if 'sources' in p:
+            sources = p['sources']
+            if not isinstance(sources, list) or not sources or any(s not in SOURCES for s in sources):
+                raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+            disabled = [s for s in sources if s not in enabled_sources]
+            if disabled:
+                raise ValueError('capability_disabled: 已禁用来源 ' + ', '.join(disabled))
+        else:
+            sources = list(enabled_sources)
+            if not sources:
+                raise ValueError('capability_disabled: 所有本地资料来源均已禁用')
+    else:
+        if route not in SOURCES:
+            raise ValueError('sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai')
+        if route not in enabled_sources:
+            raise ValueError(f"capability_disabled: 来源 '{route}' 已禁用")
+        sources = [route]
     if 'sources' in p and route != 'all':
         raise ValueError('sources 仅用于 all')
     if operation not in ('search', 'read', 'list', 'topic'):
@@ -376,11 +715,12 @@ class Library:
         warnings=[]; results=[]
         with readonly(self.mail_db) as conn:
             if op=='read':return self.mail_read(conn,source,document,p)
-            import numpy as np
             terms=words(query or '')
             vec=None
+            np=None
             if op=='search' and p.get('search_mode')!='keyword':
                 try:
+                    import numpy as np
                     vec=np.asarray(self.embed(source,query),dtype=np.float32)
                     norm=np.linalg.norm(vec)
                     if not norm or not np.isfinite(norm):raise ValueError('invalid query vector')
@@ -444,8 +784,8 @@ class Library:
         return {'ok':True,'status':source_status(results,warnings),'results':results[:limit],
                 'warnings':warnings,'coverage':{'scope':'local_index_in_requested_window','layers':coverage}}
 
-    def run(self, route, op, query=None, document=None, start=None, end=None, limit=3, params=None):
-        p,sources=validate_request(route,op,query,document,params)
+    def run(self, route, op, query=None, document=None, start=None, end=None, limit=3, params=None, allowed_sources=None):
+        p,sources=validate_request(route,op,query,document,params,allowed_sources=allowed_sources)
         if op=='read' and (start or end):raise ValueError('read 不接受日期筛选')
         if op=='read' and document.startswith('image:'):
             if p.get('offset') or p.get('max_chars'):raise ValueError('图片读取不使用正文分页参数')
@@ -531,6 +871,7 @@ def main():
     for k in ('query','document','start','end'):parser.add_argument('--'+k)
     parser.add_argument('--limit',type=int,default=3)
     parser.add_argument('--params-json',default='{}')
+    parser.add_argument('--allowed-sources',default=None)
     args=parser.parse_args()
     try:
         if not 1<=args.limit<=100:raise ValueError('limit 须在 1–100')
@@ -539,7 +880,7 @@ def main():
         if args.start and args.end and args.start>args.end:raise ValueError('起止日期倒置')
         params=json.loads(args.params_json)
         if not isinstance(params,dict):raise ValueError('params 须为对象')
-        result=Library().run(args.route,args.operation,args.query,args.document,args.start,args.end,args.limit,params)
+        result=Library().run(args.route,args.operation,args.query,args.document,args.start,args.end,args.limit,params,allowed_sources=args.allowed_sources)
     except (ValueError,OSError) as exc:
         result={'ok':False,'status':'error','error':str(exc),'hint':'核对 catalog 和内部资料参数；未执行写入。'}
     print(json.dumps(result,ensure_ascii=False))

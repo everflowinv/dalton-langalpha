@@ -371,6 +371,10 @@ class TestInitAndComposeSingleBuild:
             (REPO_ROOT / "scripts" / "standalone" / "env_tokens.sh").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+        (inst / "scripts" / "standalone" / "_compose_env.sh").write_text(
+            (REPO_ROOT / "scripts" / "standalone" / "_compose_env.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
         (inst / ".env.core.example").write_text(
             (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8"),
             encoding="utf-8",

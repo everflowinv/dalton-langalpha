@@ -201,6 +201,13 @@ COMMAND_PIPELINE = ReportPipeline(
 async def execute_command_report_back(job: dict) -> None:
     """Execute one ``command_report_back`` outbox job (``run_report_back``),
     as ``execute_task_report_back`` does a task's."""
+    # DALTON-HOOK(maintenance-gate): defer command report-back wake turns during maintenance window
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
+
+    await enforce_maintenance_admission_for_thread(
+        thread_id=str(job.get("conversation_thread_id") or "") or None,
+        context="command_report_back",
+    )
     await run_report_back(job, COMMAND_PIPELINE)
 
 

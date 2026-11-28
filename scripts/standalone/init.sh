@@ -30,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=scripts/standalone/env_tokens.sh
 source "${SCRIPT_DIR}/env_tokens.sh"
+# shellcheck source=scripts/standalone/_compose_env.sh
+source "${SCRIPT_DIR}/_compose_env.sh"
 ENV_FILE="${REPO_ROOT}/.env"
 ENV_EXAMPLE="${REPO_ROOT}/.env.core.example"
 DEFAULT_CORE_INTERNAL_SUBNET="172.31.250.0/24"
@@ -875,13 +877,7 @@ gen_hex_secret() {
 }
 
 sanitize_project_name() {
-  local raw="$1"
-  local cleaned
-  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
-  if [[ -z "$cleaned" ]]; then
-    cleaned="dalton-core"
-  fi
-  printf '%s' "$cleaned"
+  standalone_sanitize_project_name "$1"
 }
 
 print_tls_notice() {
@@ -1193,16 +1189,8 @@ main() {
       effective_bind="$cur_bind"
     fi
   fi
-  if [[ "$domain" == *:* || "$effective_bind" == *:* ]]; then
-    tls_overlay_file="deploy/standalone/docker-compose.tls.ipv6.yml"
-  else
-    tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
-  fi
-  if [[ "$tls_mode" == "loopback" ]]; then
-    compose_file="docker-compose.yml:docker-compose.core.yml"
-  else
-    compose_file="docker-compose.yml:docker-compose.core.yml:${tls_overlay_file}"
-  fi
+  tls_overlay_file="$(standalone_resolve_tls_overlay_file "$domain" "$effective_bind")"
+  compose_file="$(standalone_build_compose_file_value "$tls_mode" "$domain" "$effective_bind")"
 
   if [[ "$domain_class" == "loopback" ]] || is_ip_address "$domain"; then
     invite_domain="team.dalton.local"

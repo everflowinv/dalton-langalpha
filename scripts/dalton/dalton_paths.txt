@@ -498,6 +498,7 @@ scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy_run.sh
 scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template
 scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template
 scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template
+scripts/dalton/launchd/com.dalton.research-host.plist.template
 scripts/dalton/ops/host_services_switch.sh
 scripts/dalton/ops/ops-alerts.json.example
 tests/unit/dalton/test_guidepoint_cli.py

@@ -3,24 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 import os
+import sys
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
 import uvicorn
 
-from src.dalton.config_env import load_shared_dotenv, parse_and_resolve_dotenv
+from src.dalton.capabilities import load_deployment_capability_env
+from src.dalton.config_env import parse_and_resolve_dotenv
 from src.dalton.research_host.app import ResearchHostConfig, create_app
 
 logger = logging.getLogger("dalton-research-host")
 
 # Strict allowlist for optional host-specific env files (`--env-file` /
 # `DALTON_RESEARCH_HOST_ENV_FILE`). Only connection, token, path, and host-runtime
-# keys are accepted; any profile or capability-affecting key (e.g. `APP_ENV`,
-# `DALTON_PROFILE`, `DALTON_CAP_*`, `CHANNEL_GATEWAY_URL`, `DALTON_TRANSCRIPTION_ENABLED`,
-# `DALTON_RESEARCHDATA_URL`, `DALTON_BRIDGE_URL`, etc.) is ignored with a warning so
-# research-host capabilities can never diverge from the backend's shared `.env`.
+# keys are accepted; any profile or capability-affecting key is ignored with a warning
+# so research-host capabilities can never diverge from the backend's shared `.env`.
+# Extra connector modules loaded via `DALTON_RESEARCH_HOST_EXTRA_MODULES` may declare
+# additional credential/runtime keys via `EXTRA_HOST_ENV_KEYS`.
 ALLOWED_HOST_ENV_KEYS: frozenset[str] = frozenset(
     {
         "DALTON_RESEARCH_HOME",
@@ -30,20 +33,50 @@ ALLOWED_HOST_ENV_KEYS: frozenset[str] = frozenset(
         "DALTON_RESEARCH_HOST_PORT",
         "DALTON_RESEARCH_HOST_TOKEN",
         "DALTON_RESEARCH_ADMIN_TOKEN",
-        "DALTON_BRIDGE_ADMIN_TOKEN",
-        "DALTON_LEGACY_BRIDGE_MCP_URL",
-        "DALTON_BRIDGE_TOKEN",
-        "DALTON_ALPHAENGINE_USAGE_FILE",
         "DALTON_WIKI_INGEST_AUDIT_FILE",
         "DALTON_RESEARCH_FANOUT_GRACE_S",
         "DALTON_RESEARCH_HOST_EXTRA_MODULES",
         "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH",
-        "GUIDEPOINT_CLIENT_ID",
-        "GUIDEPOINT_CLIENT_SECRET",
-        "GUIDEPOINT_TOKENS_FILE",
-        "DALTON_GUIDEPOINT_TOKENS_FILE",
+        "DALTON_HOST_OWNERSHIP_FILE",
     }
 )
+
+
+def _discover_extra_module_env_keys(
+    env: Mapping[str, str],
+    host_env_file: str | None = None,
+) -> frozenset[str]:
+    extra_mods_raw = str(env.get("DALTON_RESEARCH_HOST_EXTRA_MODULES") or "").strip()
+    extra_paths_raw = str(env.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH") or "").strip()
+    if host_env_file and (not extra_mods_raw or not extra_paths_raw):
+        host_path = Path(host_env_file).expanduser()
+        if host_path.is_file():
+            parsed = parse_and_resolve_dotenv(host_path.resolve(), base_env=env, override=False)
+            if not extra_mods_raw:
+                extra_mods_raw = str(parsed.get("DALTON_RESEARCH_HOST_EXTRA_MODULES") or "").strip()
+            if not extra_paths_raw:
+                extra_paths_raw = str(parsed.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH") or "").strip()
+    if not extra_mods_raw:
+        return frozenset()
+    for raw_p in extra_paths_raw.split(","):
+        p = raw_p.strip()
+        if p and p not in sys.path:
+            sys.path.insert(0, p)
+    discovered: set[str] = set()
+    for raw_m in extra_mods_raw.split(","):
+        mod_name = raw_m.strip()
+        if not mod_name:
+            continue
+        try:
+            mod = importlib.import_module(mod_name)
+            keys = getattr(mod, "EXTRA_HOST_ENV_KEYS", None)
+            if keys:
+                for k in keys:
+                    if isinstance(k, str) and k.strip():
+                        discovered.add(k.strip())
+        except Exception as exc:
+            logger.debug("Skipping EXTRA_HOST_ENV_KEYS discovery for %s: %s", mod_name, exc)
+    return frozenset(discovered)
 
 
 def _is_allowed_host_env_key(key: str) -> bool:
@@ -56,48 +89,20 @@ def load_shared_and_host_env(
     repo_env_file: str | None = None,
     environ: MutableMapping[str, str] | None = None,
 ) -> list[Path]:
-    """Load shared backend `.env` via ``src.dalton.config_env.load_shared_dotenv`` and optional host env file.
-
-    Precedence (highest to lowest):
-      1. Explicit process environment variables.
-      2. Shared backend repo `.env` parsed via ``src.dalton.config_env.load_shared_dotenv``,
-         guaranteeing identical profile, interpolation, and capability resolution between
-         backend and research-host.
-      3. Optional host-specific env file (``--env-file`` / ``DALTON_RESEARCH_HOST_ENV_FILE``)
-         restricted to ``ALLOWED_HOST_ENV_KEYS`` ONLY — any other key is ignored with a warning
-         so it can never alter capability evaluation.
-    """
+    """Load shared backend `.env` and optional host env file via `load_deployment_capability_env`."""
     target_env: MutableMapping[str, str] = os.environ if environ is None else environ
     loaded: list[Path] = []
-
-    shared_loaded = load_shared_dotenv(repo_env_file, environ=target_env)
-    if shared_loaded is not None:
-        loaded.append(shared_loaded)
-
-    host_raw = (env_file or target_env.get("DALTON_RESEARCH_HOST_ENV_FILE", "").strip())
-    if host_raw:
-        host_path = Path(host_raw).expanduser()
-        if host_path.is_file():
-            resolved_host = host_path.resolve()
-            parsed_host = parse_and_resolve_dotenv(
-                resolved_host,
-                base_env=target_env,
-                override=False,
-            )
-            for k, v in parsed_host.items():
-                if not k:
-                    continue
-                if not _is_allowed_host_env_key(k):
-                    logger.warning(
-                        "Ignoring non-allowlisted key %r in research-host env file %s "
-                        "(only connection/token/path keys are permitted in host env files)",
-                        k,
-                        resolved_host,
-                    )
-                    continue
-                target_env.setdefault(k, v)
-            loaded.append(resolved_host)
-
+    host_raw = env_file or target_env.get("DALTON_RESEARCH_HOST_ENV_FILE", "").strip()
+    extra_keys = _discover_extra_module_env_keys(target_env, host_raw or None)
+    merged = load_deployment_capability_env(
+        repo_env_file=repo_env_file,
+        service_env_file=host_raw or None,
+        environ=target_env,
+        allowed_service_keys=ALLOWED_HOST_ENV_KEYS | extra_keys,
+        loaded_files=loaded,
+    )
+    for k, v in merged.items():
+        target_env.setdefault(k, v)
     return loaded
 
 

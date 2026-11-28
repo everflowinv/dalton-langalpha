@@ -347,6 +347,9 @@ class TestSourceIdentityRoutes:
         assert cnhk_decl[0]["identity"] == "filing" and cnhk_decl[0]["url"] == "https://hkexnews.hk/1.pdf"
 
 
+_REAL_KILL_PROCESS_GROUP = rb._kill_process_group
+
+
 def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.ResearchDataBridge:
     monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
     monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "0")
@@ -371,6 +374,7 @@ def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.Research
     monkeypatch.setenv("DALTON_LAST30DAYS_PYTHON", str(dummy_py))
     monkeypatch.setenv("DALTON_LAST30DAYS_SCRIPT", str(dummy_l30))
     monkeypatch.setenv("DALTON_XREACH_BIN", str(dummy_xreach))
+    monkeypatch.setattr(rb, "_kill_process_group", create_autospec(_REAL_KILL_PROCESS_GROUP))
     cfg = rb.BridgeConfig()
     return rb.ResearchDataBridge(cfg)
 
@@ -380,9 +384,12 @@ def _make_subprocess_double(
 ) -> Any:
     """Create a `create_autospec(asyncio.create_subprocess_exec)` double."""
     exec_mock = create_autospec(asyncio.create_subprocess_exec)
+    next_pid = [424200]
 
     async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
         proc = create_autospec(asyncio.subprocess.Process, instance=True)
+        next_pid[0] += 1
+        proc.pid = next_pid[0]
         proc.returncode = 0
 
         async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -886,6 +893,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
 
         async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
             proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.pid = 424242
             proc.returncode = None
 
             async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -909,7 +917,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
             await task
 
         assert len(spawned_procs) == 1
-        spawned_procs[0].kill.assert_called_once()
+        rb._kill_process_group.assert_called_once_with(424242)
         spawned_procs[0].wait.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -919,11 +927,14 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
         bridge = _make_bridge(tmp_path, monkeypatch)
         gp_blocked = asyncio.Event()
         procs_by_route: dict[str, asyncio.subprocess.Process] = {}
+        next_pid = [424300]
 
         exec_mock = create_autospec(asyncio.create_subprocess_exec)
 
         async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
             proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            next_pid[0] += 1
+            proc.pid = next_pid[0]
             proc.returncode = 0
 
             async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -969,7 +980,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
         assert body["source_status"]["guidepoint"]["status"] == "canceled"
         assert [d["document_id"] for d in body["_declared_sources"]] == ["alphaengine:99001122"]
 
-        procs_by_route["guidepoint"].kill.assert_called_once()
+        rb._kill_process_group.assert_any_call(procs_by_route["guidepoint"].pid)
         procs_by_route["guidepoint"].wait.assert_awaited_once()
 
     @pytest.mark.asyncio

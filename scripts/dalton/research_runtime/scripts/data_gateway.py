@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+import http.client
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timezone
@@ -83,6 +84,54 @@ def _resolve_research_host_token() -> str:
         os.environ.get("DALTON_RESEARCH_HOST_TOKEN", "").strip()
         or _read_bridge_env_fallback("DALTON_RESEARCH_HOST_TOKEN")
     )
+
+
+def _is_bridge_internal_call() -> bool:
+    return os.environ.get("DALTON_BRIDGE_INTERNAL_CALL", "").strip() == "1"
+
+
+def _is_ops_controlled_probe() -> bool:
+    return os.environ.get("DALTON_OPS_CONTROLLED_PROBE", "").strip() == "1"
+
+
+def _is_host_direct_paused() -> bool:
+    """Return True when external host-direct Guidepoint calls are paused for maintenance (§6.4b (1) #2)."""
+    if _is_bridge_internal_call() or _is_ops_controlled_probe():
+        return False
+    env_flag = (
+        os.environ.get("DALTON_HOST_DIRECT_PAUSED", "").strip()
+        or _read_bridge_env_fallback("DALTON_HOST_DIRECT_PAUSED").strip()
+    )
+    if env_flag.lower() in ("1", "true", "yes", "on"):
+        return True
+    gate_override = os.environ.get("DALTON_MAINTENANCE_ADMISSION_FILE", "").strip()
+    if gate_override:
+        gate_path = Path(gate_override).expanduser()
+    else:
+        gate_path = Path(__file__).resolve().parents[4] / "var" / "dalton" / "maintenance-admission.json"
+    if gate_path.exists():
+        try:
+            data = json.loads(gate_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return True
+            if bool(data.get("pause_host_direct", False)):
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _effective_timeout_s(requested_timeout: float) -> float:
+    """Compute remaining timeout bounded by shared `DALTON_REQUEST_DEADLINE_EPOCH_MS` if present."""
+    eff = max(0.1, float(requested_timeout))
+    raw_ms = os.environ.get("DALTON_REQUEST_DEADLINE_EPOCH_MS", "").strip()
+    if raw_ms:
+        try:
+            rem = (int(raw_ms) / 1000.0) - time.time()
+            eff = min(eff, max(0.1, rem))
+        except ValueError:
+            pass
+    return max(0.1, eff)
 LIBRARY_SOURCES = {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all"}
 CN_HK_SINGLE_DAY_DEFAULT_MAX_PAGES = 5
 CN_HK_MAX_PAGES_LIMIT = 20
@@ -171,19 +220,58 @@ def build_command(route, args):
     if args.vintage and rid != "fred":
         raise ValueError("--vintage 只支持 FRED/ALFRED")
     if rid in LIBRARY_SOURCES or rid == "sales-mail":
-        from research_library import validate_request
+        from research_library import _enabled_library_sources, validate_request
         params = json.loads(args.params_json or "{}")
         if not isinstance(params, dict):
             raise ValueError("params-json 须为对象")
-        target = ("sales-notes" if operation == "read" else "all") if rid == "sales-mail" else rid
-        if rid == "sales-mail" and operation == "search":
-            params={"sources":["sales-notes","tmtb"],"layer":"all","media":"text",**params}
-        validate_request(target, operation, args.query, args.document, params)
+        allowed_sources = getattr(args, "allowed_sources", None)
+        if allowed_sources is None and os.environ.get("DALTON_ENABLED_LIBRARY_SOURCES") is None:
+            # Host-direct invocation: resolve deployment allowlist once (source names only,
+            # without loading shared .env into process/child env) and pass only names.
+            enabled_sources = _enabled_library_sources(None)
+            allowed_sources = ",".join(enabled_sources)
+        else:
+            enabled_sources = _enabled_library_sources(allowed_sources)
+        target = "all" if rid == "sales-mail" else rid
+        if rid == "sales-mail":
+            sm_valid = ("sales-notes", "tmtb")
+            if "sources" in params:
+                raw_sm = params["sources"]
+                if (
+                    not isinstance(raw_sm, list)
+                    or not raw_sm
+                    or any(not isinstance(s, str) or s.strip() not in sm_valid for s in raw_sm)
+                ):
+                    raise ValueError("sales-mail 的 sources 仅支持 sales-notes、tmtb")
+                eff_sources = list(dict.fromkeys(s.strip() for s in raw_sm))
+                params = {**params, "sources": eff_sources}
+            elif operation in ("search", "list"):
+                eff_sources = [s for s in sm_valid if s in enabled_sources] or list(sm_valid)
+                params = {**params, "sources": eff_sources}
+            elif operation == "read":
+                doc_str = str(args.document or "").strip()
+                prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                if prefix == "tmtb":
+                    eff_sources = ["tmtb"]
+                elif prefix in ("mail", "digest"):
+                    eff_sources = ["sales-notes"]
+                elif prefix == "image":
+                    eff_sources = [s for s in sm_valid if s in enabled_sources] or list(sm_valid)
+                else:
+                    eff_sources = list(sm_valid)
+                params = {**params, "sources": eff_sources}
+            if operation in ("search", "list"):
+                eff_sources = params["sources"]
+                default_layer = "all" if "sales-notes" in eff_sources else "raw"
+                params = {"layer": default_layer, "media": "text", **params}
+        validate_request(target, operation, args.query, args.document, params, allowed_sources=allowed_sources)
         if operation == "read" and (args.start or args.end):
             raise ValueError("read 不接受日期筛选")
         cmd = ["bash", str(ROOT / "scripts/research_library.sh"), target,
                "--operation=" + operation, "--limit=" + str(args.limit),
                "--params-json=" + json.dumps(params, ensure_ascii=False)]
+        if allowed_sources is not None:
+            cmd.append("--allowed-sources=" + str(allowed_sources))
         for field in ("query", "document", "start", "end"):
             if getattr(args, field, None):
                 cmd.append("--" + field + "=" + getattr(args, field))
@@ -386,22 +474,34 @@ def native_request(route, args, execute_request=False):
     result = {"operation": operation, "parameters": params}
     if not execute_request:
         return result
+    if rid == "guidepoint" and _is_host_direct_paused():
+        return {
+            "ok": False,
+            "status": "maintenance_host_direct_paused",
+            "error_code": "maintenance_host_direct_paused",
+            "error": "External host-direct Guidepoint calls are paused during maintenance.",
+            **result,
+        }
+    eff_timeout_s = _effective_timeout_s(args.timeout)
     target_url = _resolve_guidepoint_mcp_url() if rid == "guidepoint" else NATIVE_SOURCES[rid]
     req_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        "X-Dalton-Request-Timeout-Ms": str(max(100, int(eff_timeout_s * 1000))),
     }
+    rpc_params_args = dict(params)
     if rid == "guidepoint":
+        rpc_params_args["timeout"] = max(1, int(eff_timeout_s)) if eff_timeout_s >= 1.0 else eff_timeout_s
         host_token = _resolve_research_host_token()
         if host_token:
             req_headers["Authorization"] = f"Bearer {host_token}"
     request = urllib.request.Request(target_url, data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": operation, "arguments": params},
+        "params": {"name": operation, "arguments": rpc_params_args},
     }).encode(), headers=req_headers)
     try:
         # Local services must not be sent through an outbound HTTP proxy.
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=args.timeout) as response:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=eff_timeout_s) as response:
             raw = response.read().decode()
         message = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
             [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")][-1])
@@ -410,7 +510,7 @@ def native_request(route, args, execute_request=False):
         payload = message["result"]
         ok = not payload.get("isError", False)
         return {"ok": ok, "status": "ok" if ok else "error", "data": payload, **result}
-    except (OSError, ValueError, KeyError, IndexError) as exc:
+    except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException) as exc:
         return {"ok": False, "status": "error", "error": type(exc).__name__,
                 "hint": "检查原有本地 MCP 服务及登录状态；本入口未切换数据源。", **result}
 
@@ -585,18 +685,39 @@ def fetch_transcripts(reg, args, fallback_cmd):
 
 
 def execute(cmd, timeout):
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
+    eff_timeout = _effective_timeout_s(timeout)
+    internal_call = _is_bridge_internal_call()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=not internal_call,
+    )
     try:
-        out, err = proc.communicate(timeout=timeout)
+        out, err = proc.communicate(timeout=eff_timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+        if internal_call:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             proc.communicate()
-        return {"ok": False, "status": "timeout", "error": f"超过 {timeout} 秒，已停止取数进程组", "hint": "缩小窗口或按底层 skill 的 self-test 排查。"}
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+        return {"ok": False, "status": "timeout", "error": f"超过 {eff_timeout:.1f} 秒，已停止取数进程组", "hint": "缩小窗口或按底层 skill 的 self-test 排查。"}
     try:
         payload = json.loads(out)
     except json.JSONDecodeError:
@@ -669,6 +790,7 @@ def main(argv=None):
                 a.add_argument("--" + field, type=date_arg)
             a.add_argument("--limit", type=int, default=3)
             a.add_argument("--timeout", type=int, default=180)
+            a.add_argument("--allowed-sources", default=None)
     try:
         args = p.parse_args(argv)
     except _ArgumentError as exc:

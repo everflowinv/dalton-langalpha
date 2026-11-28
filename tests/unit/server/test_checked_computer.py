@@ -3,10 +3,11 @@ the approval gate checked it to run on: a workspace moved off that computer
 in between refuses the run instead of running it where nobody checked."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import pytest
 
+from src.dalton import maintenance_gate
 from src.server.app.threads import messaging
 from src.server.database.workspace import WorkspaceMovingError, refuse_moved_off
 from src.server.handlers.chat.steering import steer_payload
@@ -73,7 +74,11 @@ async def test_a_workspace_moved_off_the_checked_computer_refuses_the_run():
 @pytest.mark.asyncio
 async def test_start_holds_only_a_stamped_turn_to_its_computer():
     refuse = AsyncMock()
-    with patch("src.server.database.workspace.refuse_moved_off", refuse):
+    gate_mock = create_autospec(maintenance_gate.enforce_maintenance_admission_in_txn)
+    with (
+        patch("src.dalton.maintenance_gate.enforce_maintenance_admission_in_txn", gate_mock),
+        patch("src.server.database.workspace.refuse_moved_off", refuse),
+    ):
         await admission._start_checks(_say(), object(), thread_id=THREAD, run_id="r")
         await admission._start_checks(
             _say(checked_computer_id=CHECKED), "conn", thread_id=THREAD, run_id="r"
@@ -94,7 +99,11 @@ async def test_a_home_turn_in_the_stand_in_is_held_to_the_stand_ins_computer():
     async def mark(conn):
         order.append("mark")
 
-    with patch("src.server.database.workspace.refuse_moved_off", refuse):
+    gate_mock = create_autospec(maintenance_gate.enforce_maintenance_admission_in_txn)
+    with (
+        patch("src.dalton.maintenance_gate.enforce_maintenance_admission_in_txn", gate_mock),
+        patch("src.server.database.workspace.refuse_moved_off", refuse),
+    ):
         await admission._start_checks(
             _say(checked_computer_id=CHECKED),
             "conn",

@@ -225,7 +225,8 @@
       "skill": "skills/market-digest/SKILL.md",
       "operations": [
         "search",
-        "read"
+        "read",
+        "list"
       ],
       "tool": null,
       "rules": [

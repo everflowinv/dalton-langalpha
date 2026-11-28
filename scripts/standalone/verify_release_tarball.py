@@ -34,21 +34,47 @@ FORBIDDEN_PAX_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# Everflow/proprietary subpaths that must never ship inside a Standalone Core archive.
+# Everflow-only subpaths that must never ship inside a Standalone Core archive.
 FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
     ("plugins", "dalton_data"),
     ("plugins", "dalton", "skills", "dalton-richard-coverage-weekly"),
     ("plugins", "dalton", "skills", "dalton-ai-app-weekly-monitor"),
-    ("scripts", "dalton", "researchdata_bridge.py"),
-    ("scripts", "dalton", "research_runtime"),
-    ("scripts", "dalton", "ops"),
-    ("scripts", "dalton", "data_assets", "skills"),
-    ("scripts", "dalton", "data_assets", "everflow_only.txt"),
     ("src", "dalton", "data_jobs", "everflow_defaults.yaml"),
     ("web", ".env.dalton"),
 )
 
-# Post-package content gate matching package_release.sh (zero proprietary leaks).
+# `scripts/dalton/` is default-deny: only these paths ship in Core (they must
+# match the release allowlist in package_release.sh). Everything else under it
+# (the research runtime, ops and launchd scripts, data_assets/skills, Everflow-only
+# bridges) is rejected without having to enumerate every private file.
+CORE_SCRIPTS_DALTON_PREFIX: tuple[str, ...] = ("scripts", "dalton")
+CORE_SCRIPTS_DALTON_ALLOWED: frozenset[str] = frozenset(
+    {
+        "Dockerfile.dalton",
+        "Dockerfile.postgres",
+        "docker_entrypoint_dalton.sh",
+        "configure_minio.sh",
+        "log_redaction.py",
+        "seed_openclaw_data.sh",
+        "data_assets/scripts",
+        "data_assets/everflow_only.txt",
+    }
+)
+CORE_SCRIPTS_DALTON_ALLOWED_DIRS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("data_assets", "scripts"),
+    }
+)
+_CORE_SCRIPTS_DALTON_ALLOWED_PARTS: frozenset[tuple[str, ...]] = frozenset(
+    tuple(entry.split("/")) for entry in CORE_SCRIPTS_DALTON_ALLOWED
+)
+_CORE_SCRIPTS_DALTON_PARENT_DIRS: frozenset[tuple[str, ...]] = frozenset(
+    parts[:i]
+    for parts in _CORE_SCRIPTS_DALTON_ALLOWED_PARTS
+    for i in range(1, len(parts))
+)
+
+# Post-package content gate matching out-of-package checker (zero proprietary leaks).
 FORBIDDEN_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("everflow_company_domain", re.compile(r"everflowinv", re.IGNORECASE)),
     ("personal_home_path", re.compile(r"/Users/richardlu", re.IGNORECASE)),
@@ -95,6 +121,17 @@ def _matches_forbidden_subpath(rel_parts: tuple[str, ...]) -> tuple[str, ...] | 
     for forbidden in FORBIDDEN_RELEASE_SUBPATHS:
         if len(rel_parts) >= len(forbidden) and rel_parts[: len(forbidden)] == forbidden:
             return forbidden
+    prefix_len = len(CORE_SCRIPTS_DALTON_PREFIX)
+    if len(rel_parts) > prefix_len and rel_parts[:prefix_len] == CORE_SCRIPTS_DALTON_PREFIX:
+        sub = rel_parts[prefix_len:]
+        if sub in _CORE_SCRIPTS_DALTON_ALLOWED_PARTS or sub in _CORE_SCRIPTS_DALTON_PARENT_DIRS:
+            return None
+        for allowed_dir in CORE_SCRIPTS_DALTON_ALLOWED_DIRS:
+            if len(sub) > len(allowed_dir) and sub[: len(allowed_dir)] == allowed_dir:
+                return None
+        if len(sub) >= 2 and sub[:1] in _CORE_SCRIPTS_DALTON_PARENT_DIRS:
+            return rel_parts[: prefix_len + 2]
+        return rel_parts[: prefix_len + 1]
     return None
 
 
@@ -150,9 +187,17 @@ def inspect_tarball(
                 else parts
             )
             matched_forbidden = _matches_forbidden_subpath(rel_parts)
+            if (
+                matched_forbidden is None
+                and not member.isdir()
+                and len(rel_parts) > len(CORE_SCRIPTS_DALTON_PREFIX)
+                and rel_parts[: len(CORE_SCRIPTS_DALTON_PREFIX)] == CORE_SCRIPTS_DALTON_PREFIX
+                and rel_parts[len(CORE_SCRIPTS_DALTON_PREFIX) :] in _CORE_SCRIPTS_DALTON_PARENT_DIRS
+            ):
+                matched_forbidden = rel_parts
             if matched_forbidden is not None:
                 violations.append(
-                    f"forbidden Everflow/proprietary member in core archive: {member.name} "
+                    f"forbidden Everflow-only member in core archive: {member.name} "
                     f"(matched {'/'.join(matched_forbidden)})"
                 )
             elif parts and parts[-1].endswith(".dalton.yaml"):

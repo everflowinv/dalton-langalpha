@@ -8,7 +8,6 @@ import http.client
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import stat
 import subprocess
@@ -54,8 +53,8 @@ def _run_search_result(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) 
         json=True,
     )
     out = io.StringIO()
-    monkeypatch.setattr(gp, "mcp_session", lambda: ({}, None))
-    monkeypatch.setattr(gp, "rpc", lambda *_a, **_kw: ({"result": result}, None))
+    monkeypatch.setattr(gp, "mcp_session", create_autospec(gp.mcp_session, return_value=({}, None)))
+    monkeypatch.setattr(gp, "rpc", create_autospec(gp.rpc, return_value=({"result": result}, None)))
     with contextlib.redirect_stdout(out):
         status = gp.cmd_search(args)
     return status, json.loads(out.getvalue())
@@ -163,6 +162,13 @@ def test_guidepoint_proxy_atomic_save_0600_and_refresh_with_autospec(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import socket
+    import urllib.request
+
+    lock_mod = _load_module(
+        "test_guidepoint_lock_refresh",
+        REPO_ROOT / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py",
+    )
     proxy_mod = _load_module("test_guidepoint_proxy_refresh", RESEARCH_SCRIPTS / "guidepoint_mcp_proxy.py")
     token_file = tmp_path / "cfg" / "guidepoint_mcp_tokens.json"
     token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -177,12 +183,21 @@ def test_guidepoint_proxy_atomic_save_0600_and_refresh_with_autospec(
         ),
         encoding="utf-8",
     )
+    ownership_file = tmp_path / "handoff-journal.json"
+    lock_mod.set_target_owner(lock_mod.OWNER_LEGACY_PROXY, ownership_file=ownership_file)
 
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(ownership_file))
     monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
     monkeypatch.setenv("GUIDEPOINT_CLIENT_ID", "cid_synth")
     monkeypatch.setenv("GUIDEPOINT_CLIENT_SECRET", "csec_synth")
 
-    def _fake_urlopen(_req: Any, timeout: int = 30) -> Any:
+    def _fake_urlopen(
+        url: Any,
+        data: Any = None,
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+        *,
+        context: Any = None,
+    ) -> Any:
         assert timeout == 30
         resp = create_autospec(http.client.HTTPResponse, instance=True)
         resp.__enter__.return_value = resp
@@ -196,19 +211,27 @@ def test_guidepoint_proxy_atomic_save_0600_and_refresh_with_autospec(
         ).encode("utf-8")
         return resp
 
-    monkeypatch.setattr(proxy_mod.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(
+        proxy_mod.urllib.request,
+        "urlopen",
+        create_autospec(urllib.request.urlopen, side_effect=_fake_urlopen),
+    )
 
-    proxy_mod.load_tokens()
-    tok = proxy_mod.ensure_fresh_token()
-    assert tok == "fresh_tok_2"
+    proxy_mod.initialize_runtime(ownership_file=ownership_file, token_store=token_file)
+    try:
+        tok = proxy_mod.ensure_fresh_token()
+        assert tok == "fresh_tok_2"
 
-    mode = stat.S_IMODE(token_file.stat().st_mode)
-    assert mode == 0o600
-    saved = json.loads(token_file.read_text(encoding="utf-8"))
-    assert saved["access_token"] == "fresh_tok_2"
-    assert saved["refresh_token"] == "ref_tok_1"
-    # No leftover temporary files
-    assert [p.name for p in token_file.parent.iterdir()] == ["guidepoint_mcp_tokens.json"]
+        mode = stat.S_IMODE(token_file.stat().st_mode)
+        assert mode == 0o600
+        saved = json.loads(token_file.read_text(encoding="utf-8"))
+        assert saved["access_token"] == "fresh_tok_2"
+        assert saved["refresh_token"] == "ref_tok_1"
+        # No leftover temporary files (only token file and owner lock file)
+        assert not [p.name for p in token_file.parent.iterdir() if p.name.endswith(".tmp")]
+        assert "guidepoint_mcp_tokens.json" in [p.name for p in token_file.parent.iterdir()]
+    finally:
+        proxy_mod.release_owner_lock()
 
 
 def test_guidepoint_proxy_run_sh_resolves_env_and_python_override(tmp_path: Path) -> None:

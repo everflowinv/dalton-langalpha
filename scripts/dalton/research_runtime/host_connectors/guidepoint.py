@@ -1,143 +1,60 @@
-"""Commercial Guidepoint connector with single-process exclusive token refresh lock (§2.2, §6.4)."""
+"""Commercial Guidepoint connector with persistent ownership lock & shared deadline (§6.4b)."""
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from src.dalton.capabilities import CapabilityId
+from src.dalton.research_host.auth import CURRENT_CALLER_HEADERS
+
+_RUNTIME_DIR = str(Path(__file__).resolve().parent.parent)
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
+from guidepoint_lock import (  # noqa: E402
+    GuidepointOwnerLock,
+    GuidepointStandbyError,
+    GuidepointTokenLockBusyError,
+    OWNER_RESEARCH_HOST,
+    read_target_owner,
+    resolve_guidepoint_lock_file,
+    resolve_guidepoint_tokens_file,
+    resolve_ownership_file,
+)
 
 logger = logging.getLogger("dalton-research-host.guidepoint")
-
-
-class GuidepointTokenLockBusyError(RuntimeError):
-    """Raised when `.guidepoint.owner.lock` is already held by another owner process."""
-
-
-def resolve_guidepoint_tokens_file(
-    *,
-    data_root: Path | str | None = None,
-    environ: Mapping[str, str] | None = None,
-) -> Path:
-    """Resolve the canonical Guidepoint OAuth token JSON path."""
-    env = os.environ if environ is None else environ
-    explicit = str(env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    if data_root is not None:
-        base = Path(data_root).expanduser().resolve()
-    else:
-        raw_home = str(env.get("DALTON_RESEARCH_HOME") or "").strip()
-        if raw_home:
-            base = Path(raw_home).expanduser().resolve()
-        else:
-            base = (Path.home() / "Library" / "Application Support" / "Everflow" / "research").resolve()
-    return base / "config" / "guidepoint_mcp_tokens.json"
-
-
-def resolve_guidepoint_lock_file(token_file: Path | str) -> Path:
-    """Return the shared `.guidepoint.owner.lock` path alongside `token_file`."""
-    return Path(token_file).expanduser().resolve().parent / ".guidepoint.owner.lock"
-
-
-class GuidepointOwnerLock:
-    """Process-scoped exclusive `fcntl.flock` guard for `guidepoint_mcp_tokens.json`."""
-
-    def __init__(self, token_file: Path | str, *, service_name: str = "guidepoint") -> None:
-        self.token_file = Path(token_file).expanduser().resolve()
-        self.lock_file = resolve_guidepoint_lock_file(self.token_file)
-        self.service_name = service_name
-        self._lock_fd: int | None = None
-
-    @property
-    def held(self) -> bool:
-        return self._lock_fd is not None
-
-    def acquire(self, *, timeout_s: float = 2.0) -> None:
-        if self._lock_fd is not None:
-            return
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT, 0o600)
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
-        acquired = False
-        try:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise GuidepointTokenLockBusyError(
-                            f"Guidepoint token owner lock busy: {self.lock_file}"
-                        ) from None
-                    time.sleep(0.05)
-            meta = {
-                "pid": os.getpid(),
-                "service": self.service_name,
-                "token_file": str(self.token_file),
-                "started_at": datetime.now(timezone.utc).isoformat(),
-            }
-            payload = (json.dumps(meta) + "\n").encode("utf-8")
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, payload)
-            os.fsync(fd)
-            self._lock_fd = fd
-        except BaseException:
-            if acquired:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise
-
-    def release(self) -> None:
-        fd = self._lock_fd
-        self._lock_fd = None
-        if fd is None:
-            return
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 GUIDEPOINT_UPSTREAM_URL = "https://clapi.guidepoint.io/mcp-server/v1/mcp"
 GUIDEPOINT_TOKEN_URL = "https://auth0.guidepoint.com/oauth/token"
 REFRESH_SKEW_SECONDS = 60.0
+DEFAULT_UPSTREAM_TIMEOUT_S = 60.0
 
 __all__ = [
     "GuidepointConnector",
     "GuidepointOwnerLock",
+    "GuidepointStandbyError",
     "GuidepointTokenLockBusyError",
     "GuidepointTokenManager",
+    "OWNER_RESEARCH_HOST",
     "resolve_guidepoint_lock_file",
     "resolve_guidepoint_tokens_file",
+    "resolve_ownership_file",
 ]
 
 
 class GuidepointTokenManager:
-    """Exclusive owner of `guidepoint_mcp_tokens.json` with a single `asyncio.Lock` + flock."""
+    """Exclusive owner of `guidepoint_mcp_tokens.json` with startup ownership awareness."""
 
     def __init__(
         self,
@@ -146,9 +63,17 @@ class GuidepointTokenManager:
         client_id: str = "",
         client_secret: str = "",
         token_url: str = GUIDEPOINT_TOKEN_URL,
+        ownership_file: Path | str | None = None,
+        service_owner_id: str = OWNER_RESEARCH_HOST,
         http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
     ) -> None:
         self.token_file = Path(token_file).expanduser().resolve()
+        self.ownership_file = (
+            resolve_ownership_file(ownership_file=ownership_file)
+            if ownership_file is not None
+            else None
+        )
+        self.service_owner_id = str(service_owner_id or OWNER_RESEARCH_HOST).strip()
         self._owner_lock = GuidepointOwnerLock(self.token_file, service_name="dalton-research-host")
         self.lock_file = self._owner_lock.lock_file
         self.client_id = str(client_id or "").strip()
@@ -157,16 +82,89 @@ class GuidepointTokenManager:
         self._http_client_factory = http_client_factory or httpx.AsyncClient
         self._async_lock = asyncio.Lock()
         self._tokens: dict[str, Any] = {}
+        self._standby: bool = True
 
     @property
     def lock_held(self) -> bool:
         return self._owner_lock.held
 
+    @property
+    def standby(self) -> bool:
+        return self._standby
+
+    def current_target_owner(self) -> str:
+        return read_target_owner(ownership_file=self.ownership_file)
+
+    def initialize_from_ownership(self, *, timeout_s: float = 2.0) -> bool:
+        """Read `handoff-journal.json` FIRST; acquire lock & load tokens only when target_owner matches.
+
+        When `target_owner` differs, enters standby (`_standby = True`, `lock_held = False`)
+        without touching `.guidepoint.owner.lock` or reading `guidepoint_mcp_tokens.json`.
+        """
+        target_owner = self.current_target_owner()
+        if target_owner != self.service_owner_id:
+            self._standby = True
+            logger.info(
+                "GuidepointTokenManager starting in standby (target_owner=%s != %s)",
+                target_owner,
+                self.service_owner_id,
+            )
+            return False
+        self.acquire_owner_lock(timeout_s=timeout_s)
+        if self.token_file.is_file():
+            self._load_tokens_unlocked()
+        self._standby = False
+        return True
+
     def acquire_owner_lock(self, *, timeout_s: float = 2.0) -> None:
         """Acquire exclusive flock before reading, refreshing, or writing `guidepoint_mcp_tokens.json`."""
         self._owner_lock.acquire(timeout_s=timeout_s)
+        self._standby = False
+
+    def acquire_lock_for_handoff(self, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        """Admin handoff hook for `POST /admin/guidepoint/acquire-lock` (§6.4b (3) step 4)."""
+        target_owner = self.current_target_owner()
+        if target_owner != self.service_owner_id:
+            return 409, {
+                "ok": False,
+                "status": "ownership_mismatch",
+                "error_code": "target_owner_mismatch",
+                "error": (
+                    f"Cannot acquire Guidepoint lock while target_owner={target_owner!r} "
+                    f"(expected {self.service_owner_id!r})."
+                ),
+                "target_owner": target_owner,
+                "owner_lock_held": self.lock_held,
+                "standby": self._standby,
+            }
+        raw_timeout = (body or {}).get("timeout_s", 5.0)
+        try:
+            timeout_s = max(0.1, min(30.0, float(raw_timeout)))
+        except (TypeError, ValueError):
+            timeout_s = 5.0
+        previously_held = self.lock_held
+        if not previously_held:
+            self._owner_lock.acquire(timeout_s=timeout_s)
+        try:
+            self._tokens = {}
+            self._load_tokens_unlocked()
+        except Exception:
+            if not previously_held:
+                self._owner_lock.release()
+                self._standby = True
+            raise
+        self._standby = False
+        return 200, {
+            "ok": True,
+            "status": "lock_acquired",
+            "target_owner": target_owner,
+            "owner_lock_held": self.lock_held,
+            "standby": self._standby,
+            "token_file_exists": self.token_file.is_file(),
+        }
 
     def release_owner_lock(self) -> None:
+        self._standby = True
         self._owner_lock.release()
 
     def _load_tokens_unlocked(self) -> dict[str, Any]:
@@ -202,11 +200,37 @@ class GuidepointTokenManager:
                     pass
             raise
 
-    async def ensure_fresh_token(self, *, now: float | None = None) -> str:
-        """Return a valid access token, refreshing serially under `self._async_lock` when near expiry."""
-        async with self._async_lock:
-            if not self.lock_held:
-                self.acquire_owner_lock()
+    async def ensure_fresh_token(
+        self,
+        *,
+        now: float | None = None,
+        timeout_s: float | None = None,
+        deadline_mono: float | None = None,
+    ) -> str:
+        """Return a valid access token; immediately fail closed with `GuidepointStandbyError` if standby."""
+        if self._standby or not self.lock_held:
+            raise GuidepointStandbyError("lock_not_acquired")
+        eff_deadline: float | None
+        if deadline_mono is not None:
+            eff_deadline = float(deadline_mono)
+        elif timeout_s is not None:
+            eff_deadline = time.monotonic() + max(0.01, float(timeout_s))
+        else:
+            eff_deadline = None
+
+        if eff_deadline is not None:
+            rem_lock = eff_deadline - time.monotonic()
+            if rem_lock <= 0.0:
+                raise asyncio.TimeoutError("Guidepoint request deadline exceeded before token lock")
+            await asyncio.wait_for(self._async_lock.acquire(), timeout=rem_lock)
+        else:
+            await self._async_lock.acquire()
+
+        try:
+            if self._standby or not self.lock_held:
+                raise GuidepointStandbyError("lock_not_acquired")
+            if eff_deadline is not None and (eff_deadline - time.monotonic()) <= 0.0:
+                raise asyncio.TimeoutError("Guidepoint request deadline exceeded waiting for token lock")
             if not self._tokens:
                 self._load_tokens_unlocked()
             now_ts = time.time() if now is None else float(now)
@@ -218,16 +242,26 @@ class GuidepointTokenManager:
             if not self.client_id or not self.client_secret:
                 raise RuntimeError("GUIDEPOINT_CLIENT_ID and GUIDEPOINT_CLIENT_SECRET are required to refresh tokens")
 
-            async with self._http_client_factory(timeout=30.0, trust_env=False) as client:
-                resp = await client.post(
-                    self.token_url,
-                    data={
-                        "grant_type": "refresh_token",
-                        "client_id": self.client_id,
-                        "client_secret": self.client_secret,
-                        "refresh_token": str(self._tokens["refresh_token"]),
-                    },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+            if eff_deadline is not None:
+                rem_refresh = eff_deadline - time.monotonic()
+                if rem_refresh <= 0.0:
+                    raise asyncio.TimeoutError("Guidepoint request deadline exceeded before token refresh")
+                refresh_timeout = max(0.01, min(30.0, rem_refresh))
+            else:
+                refresh_timeout = 30.0
+            async with self._http_client_factory(timeout=refresh_timeout, trust_env=False) as client:
+                resp = await asyncio.wait_for(
+                    client.post(
+                        self.token_url,
+                        data={
+                            "grant_type": "refresh_token",
+                            "client_id": self.client_id,
+                            "client_secret": self.client_secret,
+                            "refresh_token": str(self._tokens["refresh_token"]),
+                        },
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    ),
+                    timeout=refresh_timeout,
                 )
             resp.raise_for_status()
             refreshed = resp.json()
@@ -238,12 +272,36 @@ class GuidepointTokenManager:
             self._tokens.update(refreshed)
             self._save_tokens_atomic_unlocked(self._tokens)
             return str(self._tokens["access_token"])
+        finally:
+            self._async_lock.release()
 
     def health(self) -> dict[str, Any]:
         return {
             "owner_lock_held": self.lock_held,
+            "standby": self._standby,
+            "target_owner": self.current_target_owner(),
             "token_file_exists": self.token_file.is_file(),
         }
+
+
+def _resolve_request_timeout_s(arguments: dict[str, Any]) -> float:
+    """Resolve shared request timeout from `X-Dalton-Request-Timeout-Ms` header and `arguments.timeout`."""
+    candidates: list[float] = []
+    hdrs = CURRENT_CALLER_HEADERS.get() or {}
+    raw_hdr_ms = str(hdrs.get("x-dalton-request-timeout-ms") or "").strip()
+    if raw_hdr_ms:
+        try:
+            hdr_s = float(raw_hdr_ms) / 1000.0
+            if hdr_s > 0:
+                candidates.append(hdr_s)
+        except ValueError:
+            pass
+    raw_arg = arguments.get("timeout")
+    if isinstance(raw_arg, (int, float)) and not isinstance(raw_arg, bool) and float(raw_arg) > 0:
+        candidates.append(float(raw_arg))
+    if not candidates:
+        return DEFAULT_UPSTREAM_TIMEOUT_S
+    return max(0.1, min(candidates))
 
 
 def _normalize_guidepoint_args(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -306,6 +364,7 @@ class GuidepointConnector:
         self.token_manager = token_manager
         self.upstream_url = upstream_url
         self._http_client_factory = http_client_factory or httpx.AsyncClient
+        self._session_id: str | None = None
 
     def list_tools(self) -> list[dict[str, Any]]:
         return [
@@ -320,6 +379,7 @@ class GuidepointConnector:
                         "start": {"type": "string", "description": "Start UTC date YYYY-MM-DD"},
                         "end": {"type": "string", "description": "End UTC date YYYY-MM-DD"},
                         "limit": {"type": "integer", "default": 3, "minimum": 1, "maximum": 30},
+                        "timeout": {"type": "integer", "minimum": 1, "maximum": 600},
                         "params": {
                             "type": "object",
                             "description": "Optional start_date, end_date, size (1-30), keywords (1-10), recency_bias (1-100)",
@@ -335,8 +395,12 @@ class GuidepointConnector:
         gp_args: dict[str, Any],
         *,
         caller_key: str = "anonymous",
+        timeout_s: float = DEFAULT_UPSTREAM_TIMEOUT_S,
     ) -> dict[str, Any]:
-        access_token = await self.token_manager.ensure_fresh_token()
+        deadline_mono = time.monotonic() + max(0.1, float(timeout_s))
+        access_token = await self.token_manager.ensure_fresh_token(
+            deadline_mono=deadline_mono
+        )
         rpc_body = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -348,11 +412,54 @@ class GuidepointConnector:
             "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {access_token}",
         }
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
         if caller_key and caller_key != "anonymous":
             headers["X-Dalton-Caller-Key"] = caller_key
-        logger.debug("guidepoint.search_library caller=%s size=%s", caller_key, gp_args.get("size"))
-        async with self._http_client_factory(timeout=60.0, trust_env=False) as client:
-            resp = await client.post(self.upstream_url, json=rpc_body, headers=headers)
+        rem_s = deadline_mono - time.monotonic()
+        if rem_s <= 0.0:
+            raise asyncio.TimeoutError("Guidepoint deadline exceeded after token refresh")
+        logger.debug("guidepoint.search_library caller=%s size=%s timeout=%.2fs", caller_key, gp_args.get("size"), rem_s)
+        async with self._http_client_factory(timeout=max(0.01, rem_s), trust_env=False) as client:
+            resp = await asyncio.wait_for(
+                client.post(self.upstream_url, json=rpc_body, headers=headers),
+                timeout=max(0.01, rem_s),
+            )
+            if resp.headers.get("mcp-session-id"):
+                self._session_id = resp.headers["mcp-session-id"].strip()
+            # Streamable HTTP fallback: if upstream rejects missing/stale session (400/404), run initialize once
+            if resp.status_code in (400, 404) and (deadline_mono - time.monotonic()) > 0.2:
+                init_rem = deadline_mono - time.monotonic()
+                if init_rem <= 0.0:
+                    raise asyncio.TimeoutError("Guidepoint deadline exceeded before session initialize")
+                init_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-session-id"}
+                init_resp = await asyncio.wait_for(
+                    client.post(
+                        self.upstream_url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 0,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "clientInfo": {"name": "dalton-research-host", "version": "1.0"},
+                            },
+                        },
+                        headers=init_headers,
+                    ),
+                    timeout=max(0.01, init_rem),
+                )
+                if init_resp.status_code == 200 and init_resp.headers.get("mcp-session-id"):
+                    self._session_id = init_resp.headers["mcp-session-id"].strip()
+                    headers["Mcp-Session-Id"] = self._session_id
+                    call_rem = deadline_mono - time.monotonic()
+                    if call_rem <= 0.0:
+                        raise asyncio.TimeoutError("Guidepoint deadline exceeded after session initialize")
+                    resp = await asyncio.wait_for(
+                        client.post(self.upstream_url, json=rpc_body, headers=headers),
+                        timeout=max(0.01, call_rem),
+                    )
         resp.raise_for_status()
         raw_text = resp.text
         if raw_text.lstrip().startswith("{"):
@@ -434,8 +541,24 @@ class GuidepointConnector:
             }
         if tool_name not in ("search_library", "search", "query"):
             return {"ok": False, "status": "error", "error": f"Unknown guidepoint tool: {tool_name}"}
+        eff_timeout_s = _resolve_request_timeout_s(arguments)
         try:
             gp_args = _normalize_guidepoint_args(arguments)
-            return await self.search_raw(gp_args, caller_key=caller_key)
+            return await self.search_raw(gp_args, caller_key=caller_key, timeout_s=eff_timeout_s)
+        except GuidepointStandbyError:
+            return {
+                "ok": False,
+                "status": "standby",
+                "error_code": "lock_not_acquired",
+                "http_status": 503,
+                "error": "Guidepoint connector is in standby (lock_not_acquired).",
+            }
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            return {
+                "ok": False,
+                "status": "timeout",
+                "error_code": "upstream_timeout",
+                "error": f"Guidepoint upstream timed out after {eff_timeout_s:.1f}s.",
+            }
         except Exception as exc:
             return {"ok": False, "status": "error", "error": str(exc)}

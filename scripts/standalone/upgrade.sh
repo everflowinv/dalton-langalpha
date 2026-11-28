@@ -28,6 +28,8 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/standalone/env_tokens.sh
 source "${SCRIPT_DIR}/env_tokens.sh"
+# shellcheck source=scripts/standalone/_compose_env.sh
+source "${SCRIPT_DIR}/_compose_env.sh"
 WORK_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RELEASE_TAR=""
 RELEASE_DIR=""
@@ -189,25 +191,15 @@ fmt_cmd() {
 }
 
 validate_project_name() {
-  local name="$1"
-  local source_label="${2:---project-name}"
-  local LC_ALL=C
-  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-    err "Invalid ${source_label} '${name}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase ASCII letters, digits, hyphens, underscores; must start with a letter or digit)."
-    exit 2
-  fi
+  standalone_validate_project_name "$@"
 }
 
 normalize_env_project_name() {
-  local raw="$1"
-  printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+  standalone_normalize_env_project_name "$@"
 }
 
 sanitize_project_name() {
-  local raw="$1"
-  local cleaned
-  cleaned="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
-  printf '%s' "${cleaned:-dalton-core}"
+  standalone_sanitize_project_name "$@"
 }
 
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
@@ -252,44 +244,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 read_env_file_var() {
-  local env_path="$1" key="$2" default_val="${3:-}"
-  if [[ ! -f "$env_path" ]]; then
-    printf '%s' "$default_val"
-    return 0
-  fi
-  local val
-  val="$(python3 - "$env_path" "$key" <<'PY'
-import re, sys
-
-env_path, target_key = sys.argv[1], sys.argv[2]
-line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
-found = None
-with open(env_path, encoding="utf-8") as fh:
-    for raw in fh:
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        m = line_re.match(raw.rstrip("\r\n"))
-        if not m or m.group(1) != target_key:
-            continue
-        val = m.group(3).strip()
-        if val and val[0] in ("'", '"'):
-            # Quoted value, possibly followed by an inline comment: keep what is
-            # inside the quotes, as Compose does.
-            end = val.find(val[0], 1)
-            val = val[1:end] if end > 0 else val[1:]
-        elif val:
-            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
-        found = val
-if found is not None:
-    sys.stdout.write(found)
-PY
-)"
-  if [[ -n "$val" ]]; then
-    printf '%s' "$val"
-  else
-    printf '%s' "$default_val"
-  fi
+  standalone_read_env_file_var "$@"
 }
 
 # Read deployment settings strictly from .env (never shell environment).
@@ -301,19 +256,10 @@ if [[ "$DB_HOST" != "postgres" ]]; then
 fi
 
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
-  PROJECT_NAME="$PROJECT_NAME_ARG"
+  standalone_load_compose_env "$WORK_DIR" "$ENV_FILE" "$PROJECT_NAME_ARG" "$COMPOSE_FILES_RAW"
 else
-  RAW_ENV_PROJECT="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-  if [[ -n "$RAW_ENV_PROJECT" ]]; then
-    PROJECT_NAME="$(normalize_env_project_name "$RAW_ENV_PROJECT")"
-    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
-  else
-    PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
-    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
-  fi
+  standalone_load_compose_env "$WORK_DIR" "$ENV_FILE" "" "$COMPOSE_FILES_RAW"
 fi
-DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
-TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
 
 if [[ -z "$BACKUP_OUTPUT_DIR" ]]; then
   BACKUP_OUTPUT_DIR="${WORK_DIR}/backups"
@@ -323,37 +269,6 @@ if [[ ! -d "$BACKUP_OUTPUT_DIR" ]]; then
   chmod 700 "$BACKUP_OUTPUT_DIR"
 fi
 BACKUP_OUTPUT_DIR="$(cd "$BACKUP_OUTPUT_DIR" && pwd)"
-
-if [[ -z "$COMPOSE_FILES_RAW" ]]; then
-  env_compose_file="$(read_env_file_var "$ENV_FILE" "COMPOSE_FILE" "")"
-  if [[ -n "$env_compose_file" ]]; then
-    COMPOSE_FILES_RAW="$env_compose_file"
-  elif [[ "$TLS_MODE" != "loopback" && "$DOMAIN" == *:* && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml" ]]; then
-    COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml"
-  elif [[ "$TLS_MODE" != "loopback" && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.yml" ]]; then
-    COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.yml"
-  else
-    COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml"
-  fi
-fi
-
-IFS=':' read -r -a COMPOSE_FILES_ARR <<< "$COMPOSE_FILES_RAW"
-COMPOSE_FILE_ARGS=()
-NORMALIZED_COMPOSE_FILES=()
-for cf in "${COMPOSE_FILES_ARR[@]}"; do
-  [[ -z "$cf" ]] && continue
-  if [[ "$cf" != /* ]]; then
-    cf="${WORK_DIR}/${cf}"
-  fi
-  if [[ ! -f "$cf" ]]; then
-    err "Compose file not found: ${cf}"
-    exit 1
-  fi
-  COMPOSE_FILE_ARGS+=(-f "$cf")
-  NORMALIZED_COMPOSE_FILES+=("$cf")
-done
-COMPOSE_FILES_JOINED="$(IFS=':'; echo "${NORMALIZED_COMPOSE_FILES[*]}")"
-COMPOSE_PRINT_ARGS=(-p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE")
 
 # Unset .env keys, compose-interpolated keys, and COMPOSE_*/DB_* variables so
 # shell exports never shadow .env (ensuring migrate and psql share the same DB_NAME).

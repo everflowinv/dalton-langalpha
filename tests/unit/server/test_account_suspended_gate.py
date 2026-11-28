@@ -193,6 +193,9 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/internal/llm/complete"),
     ("POST", "/api/v1/dalton/internal/model-availability/check"),
     ("PUT", "/api/v1/dalton/channels/internal/settings"),
+    # DALTON-HOOK(maintenance-gate): host-side maintenance probes authenticated by X-Service-Token.
+    ("GET", "/api/v1/dalton/maintenance/admission"),
+    ("POST", "/api/v1/dalton/maintenance/admission/probe"),
 }
 
 
