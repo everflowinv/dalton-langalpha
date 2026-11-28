@@ -13,6 +13,7 @@ import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(mobile
 import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
+import { usePageTabLeaveGuard } from '@/components/PageTabs/usePageTabLeaveGuard';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): gate Dalton-only turn-pick & effort rollback behavior to Dalton builds
@@ -72,7 +73,11 @@ import './FilePanel.css';
 import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-input';
 import { MAX_FILES } from '../../../components/ui/chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
-import { attachmentSendParts, countContextAttachments, widgetSnapshotsToContexts } from '../utils/fileUpload';
+import { attachmentSendParts, countContextAttachments } from '../utils/fileUpload'; // DALTON-HOOK(chat-attachment-count)
+import { snapshotSendParts } from '../utils/widgetPrompt';
+import { newThreadCarry } from './chatView/newThreadCarry';
+import { hostSendParts } from './chatView/hostSendParts';
+import { useWidgetPromptActions } from './chatView/useWidgetPromptActions';
 import MessageList, { LiveMessageList, normalizeSubagentText } from './MessageList';
 import { MessageActionsProvider } from './messageList/MessageActionsContext';
 import { UserBubble } from './messageList/UserBubble';
@@ -82,6 +87,10 @@ import { WorkflowRunContext } from './WorkflowRunContext';
 import WorkflowRunDetail from './WorkflowRunDetail';
 import { WORKFLOW_TASK_TYPE } from '../session/subagents/workflowRunState';
 import { deriveSubagentStatus, isTerminalStatus } from '../session/subagents/subagentStatus';
+import { threadPath } from '../utils/chatRoutes';
+import { ChatBreadcrumb } from './chatView/ChatBreadcrumb';
+import { SidebarReveal } from '@/components/Sidebar/SidebarReveal';
+import { useChatTrail } from './chatView/useChatTrail';
 import Markdown from './Markdown';
 import ChatMinimap from './ChatMinimap';
 import { DispatchStatusProvider } from '../hooks/usePTCDispatchStatus';
@@ -962,6 +971,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, [isCompacting, isLoading, handleStop, stableStopCompaction]);
 
   const panelChart = usePanelChart(chatInputRef);
+  const pageSendParts = useStableHandler((marketWatch: boolean | null | undefined, present: Record<string, unknown>[]) =>
+    hostSendParts(!!marketWatch && marketWatchEnabled, present, panelChart.viewsForSend()));
 
   // Wrapper: converts ChatInput's send into handleSendMessage(message,
   // additionalContext, attachmentMeta), the send itself the draft it gives back.
@@ -981,26 +992,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       }
     }
 
-    // Watch toggle activates the market-watch skill (re-sent every turn while
-    // on, as MarketView's sends carry the chart-annotation skill). Dedup against a manually-typed
-    // /market-watch pill added by the loop above (SkillsMiddleware also dedups
-    // the body, but this keeps the context list clean).
-    if (modelOptions.marketWatch && marketWatchEnabled && !contexts.some((c) => c.type === 'skills' && c.name === 'market-watch')) {
-      contexts.push({
-        type: 'skills',
-        name: 'market-watch',
-        instruction: 'Market watch mode is on for this message. If the central tickers are not yet registered, register them with watch_market.',
-      });
-    }
+    const host = pageSendParts(modelOptions.marketWatch, contexts);
+    contexts.push(...host.contexts);
 
     // Widget context snapshots from the deck rail. Each snapshot becomes one
     // `{type:"widget"}` item plus an optional sibling `{type:"image"}` item
     // (the existing MultimodalContext channel handles vision-vs-text-only
     // routing). The same snapshots are also forwarded to handleSendMessage so
     // the user message renders chip cards inline below its bubble.
-    if (modelOptions.widgetSnapshots && modelOptions.widgetSnapshots.length > 0) {
-      contexts.push(...widgetSnapshotsToContexts(modelOptions.widgetSnapshots));
-    }
+    contexts.push(...snapshotSendParts(modelOptions.widgetSnapshots).contexts);
 
     // DALTON-HOOK(chat-attachment-count): guard total attachments (files + widget screenshots)
     // before a doomed request is dispatched.
@@ -1012,30 +1012,38 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       return false;
     }
 
-    // What each chart in the panel shows.
-    const chartViews = panelChart.viewsForSend();
-
     const additionalContext = contexts.length > 0 ? contexts : null;
     const attachmentMeta = meta.length > 0 ? meta : null;
     // The queued comments, on files and charts, go with every send, the text as their note.
     const artifactComments = takeQueuedComments(message);
     // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
-    return stableSendMessage(
-      message,
-      additionalContext,
-      attachmentMeta,
-      composerSendOptions({
-        ...modelOptions,
-        ...(artifactComments ? { artifactComments } : {}),
-        ...(chartViews.length > 0 ? { chartViews } : {}),
-        // DALTON-HOOK(composer-drafts): the box as the person wrote it — a
-        // send the server refuses while the transcript is out of view goes
-        // back to the composer whole (attachments, mentions and commands too)
-        // instead of leaving a failed reply nobody reads.
-        draft: send,
-      }),
-    );
-  }, [marketWatchEnabled, stableSendMessage, panelChart, takeQueuedComments, composerSendOptions, t]);
+    return stableSendMessage(message, additionalContext, attachmentMeta, composerSendOptions({
+      ...modelOptions,
+      ...(artifactComments ? { artifactComments } : {}),
+      ...host.options,
+      draft: send,
+    }));
+  }, [pageSendParts, stableSendMessage, takeQueuedComments, composerSendOptions, t]);
+
+  // A widget's send goes out as the box's would; its new thread opens in this
+  // workspace (Home's, in the Chief of Staff) as a new chat's composer opens one.
+  const widgetPrompts = useWidgetPromptActions({
+    chatInputRef,
+    send: (text, parts) => {
+      const composer = readComposerOptions();
+      const host = pageSendParts(composer?.marketWatch, parts.contexts);
+      const contexts = [...host.contexts, ...parts.contexts];
+      stableSendMessage(text, contexts.length > 0 ? contexts : null, null, composerSendOptions({ ...composer, ...parts.options, ...host.options }));
+    },
+    openThread: (text, parts, carry) => {
+      const host = pageSendParts(readComposerOptions()?.marketWatch, parts.contexts);
+      const contexts = [...host.contexts, ...parts.contexts];
+      // Through the file panel's unsaved-draft check, as every exit to another thread.
+      leaveToThread('__default__', { workspaceId, initialMessage: text,
+        ...(contexts.length > 0 ? { additionalContext: contexts } : {}), ...parts.options, ...host.options, ...carry } satisfies LocationState);
+    },
+    readCarry: () => newThreadCarry(readComposerOptions(), threadSubagents, threadTuning.tuning),
+  });
 
   const planReader = useLatestRef(usePlanReader());
 
@@ -1263,7 +1271,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // file's foot while it does (chatView/useChatCover).
   const { dockOpen, dock: composerDock, panelInnerRef, onSheetLanded } = useChatCover({
     isMobile, filePanel: rightPanelType === 'file', panelExpanded, panelWidth: rightPanelWidth, threadId: panelThreadId,
-    mainAgent: activeAgentId === 'main', queuedComments: commentDeck.comments, reads: coverReads,
+    mainAgent: activeAgentId === 'main', queuedComments: commentDeck.comments, running: isLoading, waiting: !!pendingInterrupt, reads: coverReads,
   });
   const deckComposer = useDeckComposer(chatInputRef);
   const openArtifactComment = useMemo(
@@ -1414,7 +1422,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // id opens one of the thread's tasks there.
   const goToThread = useCallback((targetThreadId: string, navState: LocationState, taskId?: string) => {
     intentionalExitRef.current = true;
-    navigate(taskId ? `/chat/t/${targetThreadId}/${taskId}` : `/chat/t/${targetThreadId}`, { state: navState });
+    navigate(threadPath(targetThreadId, taskId), { state: navState });
   }, [navigate]);
   const leaveToThread = useCallback((targetThreadId: string, navState: LocationState, taskId?: string) => {
     leaveFiles(() => goToThread(targetThreadId, navState, taskId));
@@ -1435,6 +1443,32 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
     );
   }, [leaveToThread, fromThreadId, fromWorkspaceId]);
+
+  // The header's trail: the workspace, the thread once it has a name, and the
+  // subagent or workflow open in it, a workflow's own step under its run. The
+  // back button takes one step up it. Leaving for the workspace asks the file
+  // panel first, as leaving for another thread does, and marks itself only
+  // once the user goes.
+  const exitToWorkspace = useCallback(() => {
+    leaveFiles(() => {
+      intentionalExitRef.current = true;
+      onBack();
+    });
+  }, [leaveFiles, onBack]);
+  // The tabs leave through the file panel too, while this view is on screen.
+  usePageTabLeaveGuard(isActive ? leaveFiles : null);
+  const { crumbs, up } = useChatTrail({
+    threadId: currentThreadId,
+    workspaceName,
+    isActive,
+    activeAgentId,
+    activeAgent,
+    agentRows: sidebarAgentRows,
+    onSelectAgent: handleSelectAgent,
+    fromThreadId,
+    onOpenDispatcher: openDispatcher,
+    onExit: exitToWorkspace,
+  });
 
   // "Fork from here": a new chat carrying on from this thread through a
   // reply, opened while this view is still the one in front. A view kept
@@ -1509,13 +1543,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onThumbUp: handleThumbUp,
     onThumbDown: handleThumbDown,
     onThumbDownFollowUp: handleThumbDownFollowUp,
-    onWidgetSendPrompt: stableSendMessage,
+    widgetPrompts,
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
     onForkFromTurn: handleForkFromTurn,
     editDrafts,
-    onSendMessage: handleSendMessage,
     chatInputRef,
     // DALTON-HOOK(workspace-sharing-settings): withhold mutation/interactive callbacks for colleagues
     // DALTON-HOOK(colleague-dispatch): also withhold mutation/interactive callbacks on foreign-owned threads
@@ -1864,22 +1897,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         {/* DALTON-HOOK(mobile-web): tighten horizontal padding/gaps on phones while keeping adjacent 44px tap-targets non-overlapping */}
         <div data-chrome="drag" data-handoff="header" className={cn('flex items-center justify-between py-2 border-b min-w-0 shrink-0', isMobile ? 'px-2 gap-2' : 'px-4')} style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
           <div className={cn('flex items-center min-w-0', isMobile ? 'gap-2 flex-1' : 'gap-4 shrink')}>
+            <SidebarReveal titlebar />
             {/* DALTON-HOOK(mobile-web): 12px gap between 32px Back & Drawer buttons keeps their 44px tap-targets edge-to-edge without overlap */}
             <div className={cn('flex items-center shrink-0', isMobile && 'gap-3')}>
               <button
-                onClick={() => {
-                  if (activeAgentId !== 'main') {
-                    // Workflow-owned children step up to their run's view;
-                    // everything else returns to the main chat.
-                    handleSelectAgent(activeAgent?.ownerTaskId ?? 'main');
-                  } else if (state?.fromThreadId) {
-                    // Back to the thread that dispatched this PTC thread.
-                    openDispatcher(state.fromThreadId);
-                  } else {
-                    intentionalExitRef.current = true;
-                    onBack();
-                  }
-                }}
+                onClick={up}
                 className={cn('rounded-md transition-colors shrink-0', isMobile ? 'p-1.5 tap-target' : 'p-2')}
                 style={{ color: 'var(--color-text-primary)' }}
                 title={
@@ -1907,7 +1929,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 </button>
               )}
             </div>
-            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate min-w-0" style={{ color: 'var(--color-text-primary)' }}>
+            <h1 className="min-w-0 title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate" style={{ color: 'var(--color-text-primary)' }}>
               {/* The bar's tap is a pointer's shortcut, and a bar holding buttons
                   cannot be one. The title is the same action as a real control,
                   named by the words on it, with what it does as its description. */}
@@ -1915,7 +1937,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 <button type="button" className="block max-w-full truncate text-left" title={t('chat.scrollToTop')} onClick={scrollThreadToTop}>
                   {workspaceName || t('thread.workspace')}
                 </button>
-              ) : (workspaceName || t('thread.workspace'))}
+              ) : <ChatBreadcrumb crumbs={crumbs} />}
             </h1>
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
             {/* DALTON-HOOK(mobile-web): move TeamReadOnlyBanner below top bar on mobile */}

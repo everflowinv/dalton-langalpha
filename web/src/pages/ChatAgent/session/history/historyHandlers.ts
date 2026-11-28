@@ -23,6 +23,7 @@ import { wakeTurnOpener } from '../wakeupEvents';
 import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
 // DALTON-HOOK(chat-large-upload): normalize persisted attachment metadata on replayed turns
 import { normalizeAttachments } from '../../hooks/utils/messageHelpers';
+import { widgetSegmentId } from '../stream/widgetIds';
 
 
 /** Shape of an SSE history event. */
@@ -1010,7 +1011,7 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
   }
 
   const { html, title } = payload;
-  const segmentId = `widget-${artifactId}`;
+  const segmentId = widgetSegmentId(artifactId);
   const currentOrder = eventId != null ? eventId : ++pairState.contentOrderCounter;
 
   setMessages((prev: MessageRecord[]) => {
@@ -1036,6 +1037,10 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
       };
       if (payload.data) {
         widgetEntry.data = payload.data;
+      }
+      // DALTON-HOOK(channel-deep-links): preserve ShowWidget's persistent widget_id for unified storage & deep-link identity
+      if (typeof payload.widget_id === 'string' && payload.widget_id.trim()) {
+        widgetEntry.widget_id = payload.widget_id.trim();
       }
       // DALTON-HOOK(share-redaction): preserve redacted placeholder flag from strict shared replays
       if (payload.redacted === true) {

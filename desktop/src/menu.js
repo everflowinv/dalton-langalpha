@@ -22,6 +22,7 @@ function buildMenu({
   onRevealStackLogs = null,
   onOpenAccount,
   onCheckForUpdates,
+  updateChannel = null,
   onReload,
   onBack,
   onForward,
@@ -71,6 +72,19 @@ function buildMenu({
 
   const settingsItem = command('Settings…', 'open-settings', 'CmdOrCtrl+,')
   const updatesItem = { label: 'Check for Updates…', click: (_item, win) => onCheckForUpdates(win) }
+  // `updateChannel` is `{ current, onPick }` where the install can move between
+  // stable and nightly (updater.canPickChannel), and null where it cannot.
+  const channelItems = updateChannel
+    ? [{
+      label: 'Update Channel',
+      submenu: [['Stable', 'stable'], ['Nightly', 'nightly']].map(([label, name]) => ({
+        label,
+        type: 'radio',
+        checked: updateChannel.current === name,
+        click: (_item, win) => updateChannel.onPick(name, win),
+      })),
+    }]
+    : []
   // The picker is the OSS edition's only server setting, and a user who moved
   // their stack has no other way back to a working window. A build that carries
   // its own stack switches between that and a server here too.
@@ -86,6 +100,7 @@ function buildMenu({
       { type: 'separator' },
       settingsItem,
       updatesItem,
+      ...channelItems,
       { type: 'separator' },
       accountItem,
       ...stackLogsItems,
@@ -113,6 +128,7 @@ function buildMenu({
         { type: 'separator' },
         settingsItem,
         updatesItem,
+        ...channelItems,
         accountItem,
         ...stackLogsItems,
         { type: 'separator' },
@@ -126,7 +142,10 @@ function buildMenu({
   const viewMenu = {
     label: 'View',
     submenu: [
-      command('Toggle Sidebar', 'toggle-sidebar', isMac ? 'Ctrl+Cmd+S' : 'Ctrl+Shift+S'),
+      // The page answers Cmd+B itself and takes the key, so a shell keeps it
+      // out of the menu's hands while that build is loaded; the menu answers
+      // only for a build that leaves the key alone.
+      command('Toggle Sidebar', 'toggle-sidebar', 'CmdOrCtrl+B'),
       { type: 'separator' },
       // Not `role: 'reload'`: on the outage page that reloads the local error
       // file, which is the one moment someone actually reaches for ⌘R.

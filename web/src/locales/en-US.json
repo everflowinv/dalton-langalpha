@@ -220,10 +220,10 @@
     "newChat": "New chat",
     "workspaces": "Workspaces",
     "workspaceGallery": "Workspace gallery",
-    "collapse": "Collapse sidebar",
+    "collapse": "Hide sidebar",
     "back": "Back",
     "forward": "Forward",
-    "expand": "Expand sidebar",
+    "expand": "Show sidebar",
     "resize": "Resize sidebar",
     "plugins": "Plugins",
     "orders": "Orders",
@@ -1343,6 +1343,8 @@
     "errorLinkViewUsage": "View usage",
     "errorLinkReconnect": "Reconnect",
     "errorLinkAddApiKey": "Add an API key",
+    "errorLinkChooseModel": "Choose a model",
+    "modelRequired": "Choose a model to chat with. You have no default model yet.",
     "errorUpstreamHeadlineModel": "{{model}} returned an error",
     "errorUpstreamHeadlineModelStatus": "{{model}} returned an error ({{status}})",
     "errorAttemptedModels": "Also tried:",
@@ -2120,7 +2122,12 @@
     "attachmentTooLarge": "{{name}} exceeds the {{max}} MB limit and was not attached.",
     "attachmentsTotalTooLarge": "{{name}} was not attached: attachments in one message cannot exceed {{max}} MB in total.",
     "attachmentsTooMany": "Not attached: attachments in one message cannot exceed {{max}} in total (including screenshots).",
-    "steerTemporaryRetry": "Temporary failure — please retry."
+    "steerTemporaryRetry": "Temporary failure — please retry.",
+    "dockMinimize": "Minimize composer",
+    "dockRestore": "Message",
+    "dockWorking": "Working",
+    "dockPillHint": "Click to open, drag to move",
+    "dockWaiting": "Waiting for you"
   },
   "context": {
     "quote": {
@@ -4910,5 +4917,12 @@
         "street_estimate": "Consensus Estimate"
       }
     }
+  },
+  "pageTabs": {
+    "label": "Open pages",
+    "newTab": "New tab",
+    "close": "Close {{title}}",
+    "untitled": "LangAlpha",
+    "full": "{{count}} tabs are open. Close one to open another."
   }
 }

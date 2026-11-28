@@ -481,4 +481,40 @@ describe('handleHistoryHtmlWidget (history)', () => {
     const processes = msg.htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string> }>;
     expect(processes[segmentId].data).toEqual({ 'data.csv': 'a,b\n1,2' });
   });
+
+  it('preserves identical segmentId and persistent widget_id across live push and checkpoint replay', () => {
+    const callId = 'call_widget_42';
+    const persistentId = 'widget_deadbeef';
+    const payload = { html: '<p>interactive</p>', title: 'Interactive', widget_id: persistentId };
+
+    const refs = makeStreamRefs();
+    const liveMessages = applySetMessages([makeAssistantMessage(assistantMessageId)], (setMessages) => {
+      handleHtmlWidget({
+        assistantMessageId,
+        artifactType: 'html_widget',
+        artifactId: callId,
+        payload,
+        refs,
+        setMessages,
+      });
+    });
+
+    const pairState = makePairState();
+    const replayMessages = applySetMessages([makeAssistantMessage(assistantMessageId)], (setMessages) => {
+      handleHistoryHtmlWidget({
+        assistantMessageId,
+        artifactType: 'html_widget',
+        artifactId: callId,
+        payload,
+        pairState,
+        setMessages,
+      });
+    });
+
+    const segmentId = `widget-${callId}`;
+    const liveProc = (liveMessages[0].htmlWidgetProcesses as Record<string, { widget_id?: string }>)[segmentId];
+    const replayProc = (replayMessages[0].htmlWidgetProcesses as Record<string, { widget_id?: string }>)[segmentId];
+    expect(liveProc.widget_id).toBe(persistentId);
+    expect(replayProc.widget_id).toBe(persistentId);
+  });
 });

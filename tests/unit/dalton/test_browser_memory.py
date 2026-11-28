@@ -895,9 +895,11 @@ async def test_explicit_pid_registration_without_private_playwright_attrs(
             pss_kb=225 * 1024,
         )
 
-        # Ensure `pdf_render._playwright_cm` and `_browser` have no `_connection`
-        monkeypatch.setattr(pdf_render_mod, "_playwright_cm", object())
-        monkeypatch.setattr(pdf_render_mod, "_browser", object())
+        # Ensure `headless_browser._playwright` and `_browser` have no `_connection`
+        from src.server.services import headless_browser as headless_browser_mod
+
+        monkeypatch.setattr(headless_browser_mod, "_playwright", object())
+        monkeypatch.setattr(headless_browser_mod, "_browser", object())
 
         snap = read_live_concurrency()
         assert snap.pdf_driver_pid == 300
@@ -916,8 +918,8 @@ async def test_explicit_pid_registration_without_private_playwright_attrs(
         assert sample.crawler.mb == 250.0
         assert sample.other.pids == (100,)
 
-        # Resetting the PDF browser clears registered PDF root PIDs
-        await pdf_render_mod._reset_browser()
+        # Resetting the headless browser clears registered PDF root PIDs
+        await headless_browser_mod._reset_browser()
         assert get_registered_pdf_render_pids() == set()
 
         # Direct registration + track_crawler_session lifecycle cleanup

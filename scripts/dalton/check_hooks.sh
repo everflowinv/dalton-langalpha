@@ -613,6 +613,10 @@ ALLOWED_HOOKS=(
   # switch_thread_model atomic effort clear, conditional CAS guards for background auto-saves,
   # mobile MarketView effort clear, queued-send live effort read, preferences cross-tab broadcast).
   "model-picker-races"
+  # sync14b: user decisions — widget SSR off by default,
+  # and ordinary Drive files retain long history instead of 7-day single-step undo.
+  "widget-ssr-off"
+  "drive-long-history"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -720,10 +720,15 @@ async def test_comments_and_binding_external_guards(
         "mark_comment_read",
         create_autospec(artifacts_db.mark_comment_read, return_value=(comment, True)),
     )
+    from src.server.database.artifacts.comments import DeletedComment
+
     monkeypatch.setattr(
         artifacts_db,
         "delete_comment",
-        create_autospec(artifacts_db.delete_comment, return_value=(True, None)),
+        create_autospec(
+            artifacts_db.delete_comment,
+            return_value=DeletedComment(thread_id=None, workspace_id=WS_ID, pictures=()),
+        ),
     )
     monkeypatch.setattr(
         artifact_comments_app,

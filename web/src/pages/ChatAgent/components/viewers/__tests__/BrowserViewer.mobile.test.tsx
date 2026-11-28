@@ -75,13 +75,16 @@ async function mountHeld(coarse: boolean, box = { width: 400, height: 300 }) {
     state: 'running',
     url: 'http://9224.preview.localhost/b/t',
   }));
-  render(<BrowserViewer view={view} />);
+  render(<BrowserViewer view={view} computerName="Test Computer" />);
   await act(async () => {
     stopWatching = view.watch({
       ask,
       control: async () => true,
+      fit: async () => ({ size: null, kept: false }),
+      close: async () => null,
       navigate: async () => null,
       local: false,
+      computer: 'c-1',
     });
   });
   await act(async () => {

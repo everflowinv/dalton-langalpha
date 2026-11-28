@@ -28,14 +28,14 @@ describe('InlineWidget export actions', () => {
   });
 
   it('offers every export by default', () => {
-    render(<InlineWidget html="<p>x</p>" title="Chart" />);
+    render(<InlineWidget html="<p>x</p>" title="Chart" base={null} />);
     expect(typeof barProps!.onFullscreen).toBe('function');
     expect(typeof barProps!.onDownload).toBe('function');
     expect(typeof barProps!.onExportPdf).toBe('function');
   });
 
   it('offers only fullscreen and the HTML download on a share that allows downloads', () => {
-    render(<InlineWidget html="<p>x</p>" title="Chart" exports="download" />);
+    render(<InlineWidget html="<p>x</p>" title="Chart" base={null} exports="download" />);
     expect(typeof barProps!.onFullscreen).toBe('function');
     expect(typeof barProps!.onDownload).toBe('function');
     expect(barProps!.onOpenInNewTab).toBeUndefined();
@@ -43,7 +43,7 @@ describe('InlineWidget export actions', () => {
   });
 
   it('offers only fullscreen on a share without downloads', () => {
-    render(<InlineWidget html="<p>x</p>" title="Chart" exports="none" />);
+    render(<InlineWidget html="<p>x</p>" title="Chart" base={null} exports="none" />);
     expect(typeof barProps!.onFullscreen).toBe('function');
     expect(barProps!.onOpenInNewTab).toBeUndefined();
     expect(barProps!.onDownload).toBeUndefined();

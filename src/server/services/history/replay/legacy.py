@@ -279,6 +279,9 @@ def apply(
     upgraded = _upgrade_widgets(turn_items, stored_widgets)
     for k, idx in upgraded.items():
         index["widget", k] = idx
+        stored_id = stored_widgets[k][0]
+        if stored_id is not None and ("artifact", stored_id) not in index:
+            index["artifact", stored_id] = idx
 
     results = merge.get("results") or {}
     if results:
@@ -356,17 +359,27 @@ def apply(
     return merged
 
 
+def _widget_payload_id(data: dict[str, Any]) -> str | None:
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    widget_id = payload.get("widget_id")
+    return widget_id if isinstance(widget_id, str) and widget_id else None
+
+
 def _upgrade_widgets(
     turn_items: list[dict[str, Any]], stored_widgets: list[list[Any]]
 ) -> dict[int, int]:
     """Give each projected widget its stored payload; the position of each
     payload taken.
 
-    A payload goes to the projected widget it names. One that named none
-    (the projection did not emit its widget when the facts were resolved)
-    takes the first widget no payload names between the widgets its stored
-    neighbours took: both streams order widgets by tool execution, and the
-    live artifact id is random.
+    A payload goes to the projected widget it names — matching either the
+    projected ``artifact_id`` (tool call id) or, for archives recorded before
+    widget artifacts switched to call ids, ``payload.widget_id`` (while
+    preserving the projected call id). One that named none (the projection did
+    not emit its widget when the facts were resolved) takes the first widget no
+    payload names between the widgets its stored neighbours took: both streams
+    order widgets by tool execution, and the live artifact id is random.
     """
     projected = [
         idx
@@ -378,14 +391,33 @@ def _upgrade_widgets(
         for k, (artifact_id, _data) in enumerate(stored_widgets)
         if artifact_id is not None
     }
+    by_widget_id: dict[str, int] = {}
+    for k, (artifact_id, data) in enumerate(stored_widgets):
+        if artifact_id is None or not isinstance(data, dict):
+            continue
+        wid = _widget_payload_id(data)
+        if wid is not None and wid not in by_widget_id:
+            by_widget_id[wid] = k
     taken: dict[int, int] = {}  # stored payload -> projected position
+    keep_projected_id: set[int] = set()
     unnamed: list[int] = []
     for idx in projected:
-        k = named.get(turn_items[idx]["data"].get("artifact_id"))
+        data = turn_items[idx]["data"]
+        k = named.get(data.get("artifact_id"))
+        matched_by_widget_id = False
+        if k is None:
+            wid = _widget_payload_id(data)
+            if wid is not None:
+                k = named.get(wid)
+                if k is None:
+                    k = by_widget_id.get(wid)
+                matched_by_widget_id = k is not None
         if k is None:
             unnamed.append(idx)
         elif k not in taken:
             taken[k] = idx
+            if matched_by_widget_id:
+                keep_projected_id.add(k)
     for k, (artifact_id, _data) in enumerate(stored_widgets):
         if artifact_id is not None:
             continue
@@ -396,5 +428,9 @@ def _upgrade_widgets(
             unnamed.remove(idx)
             taken[k] = idx
     for k, idx in taken.items():
-        turn_items[idx]["data"] = dict(stored_widgets[k][1])
+        projected_id = turn_items[idx]["data"].get("artifact_id")
+        upgraded = dict(stored_widgets[k][1])
+        if k in keep_projected_id and projected_id is not None:
+            upgraded["artifact_id"] = projected_id
+        turn_items[idx]["data"] = upgraded
     return taken

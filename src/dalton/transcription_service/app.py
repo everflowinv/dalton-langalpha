@@ -394,6 +394,11 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # uvloop spawns ffprobe/ffmpeg without close_fds; mark listening sockets
+        # non-inheritable before startup can resume transcription jobs.
+        from src.server.utils.child_fds import keep_descriptors_from_children
+
+        keep_descriptors_from_children()
         rt.startup()
         try:
             yield

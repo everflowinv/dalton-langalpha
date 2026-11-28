@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useEffectEvent, useCallback, useMemo } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router';
+import { NavigationType, useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Info } from 'lucide-react';
@@ -18,7 +18,8 @@ import MarketChatPanel from './components/MarketChatPanel';
 import { QuoteList } from './components/quoteList/QuoteList';
 import { QuoteListDrawer } from './components/quoteList/QuoteListDrawer';
 import { INTERVALS } from './utils/chartConstants';
-import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRoute';
+import { MARKET_VIEW_ROUTE_PARAMS } from './utils/marketRoute';
+import { useEditSearchParams } from '@/hooks/useEditSearchParams';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 // DALTON-HOOK(model-picker-races): clear local standard reasoning effort when mobile FAB switches to an Antigravity variant
@@ -54,11 +55,13 @@ import { chartIdFor, chartKeyParts, chartParts, normalizeTimeframe } from '@/lib
 import { getShowLayersRequest, subscribeLayerView, type ShowLayersRequest } from './stores/layerViewStore';
 import { buildMarketSendContexts } from './utils/marketSend';
 import { useCommentUi } from '../ChatAgent/components/viewers/html/comments/useCommentUi';
-import ConfirmDialog from '../Dashboard/components/ConfirmDialog';
 import { ArtifactCommentSendContext } from '../ChatAgent/components/artifactComments/sendContext';
 import type { ChatCommentSends } from '../ChatAgent/components/artifactComments/useChatCommentSends';
 import type { ArtifactCommentRef } from '../ChatAgent/components/artifactComments/artifactCommentReply';
 import { layerAskContext } from './utils/layerAsk';
+import { draftKeys } from '@/lib/composerDrafts';
+import { SidebarReveal } from '@/components/Sidebar/SidebarReveal';
+import { usePageTabTitle } from '@/components/PageTabs/usePageTabTitle';
 
 // Stable identity for the pre-data render, so the reconcile effect's
 // `workspaces` dependency doesn't change on every render before the fetch
@@ -105,6 +108,7 @@ function MarketViewInner() {
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const editSearchParams = useEditSearchParams();
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const { prices: wsPrices, connectionStatus: wsStatus, dataLevel: wsDataLevel, subscribe: wsSubscribe, unsubscribe: wsUnsubscribe } = useMarketDataWSContext();
@@ -116,6 +120,11 @@ function MarketViewInner() {
   // DALTON-HOOK(watchlist): restore consumed ws/returnTo from history entry state & detect watchlist route
   const [openingRoute] = useState(() => daltonWatchlist.readDaltonOpeningMarketRoute(searchParams, location.state));
   const showWatchlistView = daltonWatchlist.shouldShowDaltonWatchlist(searchParams);
+  const navigationType = useNavigationType();
+  // The symbol/workspace/scope the address last named, which the page has already followed.
+  const urlSymbol = useRef(openingRoute.symbol ? displaySpelling(openingRoute.symbol) : null);
+  const urlWorkspaceRef = useRef<string | null>(openingRoute.workspaceId);
+  const urlScopeRef = useRef<ComposerScope | null>(openingRoute.scope);
   // Every way in (link, saved pref, search, sidebar, chip) lands on the display
   // spelling, so a `600519.SS` link, its header, pref and chart keys all read
   // `600519.SH` from the first render.
@@ -123,6 +132,7 @@ function MarketViewInner() {
     () => displaySpelling(openingRoute.symbol || loadPref('symbol', 'GOOGL')) || 'GOOGL',
   );
   const [selectedStockDisplay, setSelectedStockDisplay] = useState<SymbolDisplayOverride | null>(null);
+  usePageTabTitle(showWatchlistView ? null : selectedStock); // DALTON-HOOK(watchlist)
   const wsHasData = wsPrices.has(selectedStock);
   const streamsLive = wsStatus === 'connected' && wsHasData;
 
@@ -159,10 +169,6 @@ function MarketViewInner() {
   const isMobile = useIsMobile();
   const [chatSends, setChatSends] = useState<Pick<ChatCommentSends, 'sender' | 'sends'> | null>(null);
   const commentUi = useCommentUi(null, chatSends?.sends);
-  const chartComments = useMemo(
-    () => ({ ui: commentUi, tabId: CHART_COMMENTS_TAB, active: true }),
-    [commentUi],
-  );
   const [chartImage, setChartImage] = useState<string | null>(null);       // base64 data URL
   const [chartImageDesc, setChartImageDesc] = useState<string | null>(null); // text description for LLM
   const [showOverview, setShowOverview] = useState<boolean>(false);
@@ -170,13 +176,8 @@ function MarketViewInner() {
   const [chatExpanded, setChatExpanded] = useState(false);
 
   const [prefillMessage, setPrefillMessage] = useState<string>('');
-  // The composer's scope, stored under its old pref name and values so a
-  // saved pick still reads: 'fast' is the Chief of Staff, 'ptc' the selected
-  // workspace.
-  const [scope, setScope] = useState<ComposerScope>(() => {
-    if (openingRoute.scope) return openingRoute.scope;
-    return loadPref<string>('mode', 'fast') === 'ptc' ? 'workspace' : 'all';
-  });
+  // DALTON-HOOK(watchlist): tab URL is the sole source of truth — absent ws/scope opens Home
+  const [scope, setScope] = useState<ComposerScope>(() => openingRoute.scope ?? 'all');
   // Workspaces for the selector. The shared query, not a local
   // fetch — a rename elsewhere invalidates this key, and a copy in local state
   // would keep showing the old name until the page remounts. The list is
@@ -284,28 +285,28 @@ function MarketViewInner() {
     [scope, homeWorkspace, workspaces, selectedWorkspaceId],
   );
 
-  // A comment being written on the chart belongs to this workspace's chart,
-  // and goes when the chart moves to another, so a move that takes the chart
-  // elsewhere then waits on the writer's answer: from the picker or a link
-  // followed while the page is open. The toolbar's pick of a workspace sets
-  // the workspace and then the side in one press, so both land in the one
-  // move held here.
-  const [heldMove, setHeldMove] = useState<ScopeMove | null>(null);
-  const applyMove = useCallback((move: Partial<ScopeMove>) => {
+  // The toolbar's pick of a workspace sets the workspace and then the side in
+  // one press, and a link may name both: either way they land as one move.
+  const moveScope = useCallback((move: Partial<ScopeMove>) => {
     if (move.workspaceId !== undefined) selectWorkspace(move.workspaceId);
     if (move.scope) setScope(move.scope);
   }, [selectWorkspace]);
-  const writingOnChart = commentUi.writing(CHART_COMMENTS_TAB);
-  const homeWorkspaceId = homeWorkspace?.workspace_id ?? null;
-  const moveScope = useCallback((move: Partial<ScopeMove>) => {
-    const next = { scope, workspaceId: selectedWorkspaceId, ...move };
-    const chartTo = next.scope === 'all' ? homeWorkspaceId : next.workspaceId;
-    if (!writingOnChart || chartTo === activeWorkspaceId) applyMove(move);
-    else setHeldMove((prev) => ({ ...(prev ?? { scope, workspaceId: selectedWorkspaceId }), ...move }));
-  }, [writingOnChart, applyMove, scope, selectedWorkspaceId, homeWorkspaceId, activeWorkspaceId]);
-  const pickScope = useCallback((next: ComposerScope) => moveScope({ scope: next }), [moveScope]);
+  const pickScope = useCallback((next: ComposerScope) => {
+    moveScope({ scope: next });
+    if (next === 'all') {
+      editSearchParams((params) => { params.delete('ws'); }, { replace: true });
+    } else if (selectedWorkspaceId) {
+      // DALTON-HOOK(watchlist): do not overwrite a ?ws= already written by pickWorkspace in the same tick
+      editSearchParams((params) => {
+        if (!params.get('ws')) params.set('ws', selectedWorkspaceId);
+      }, { replace: true });
+    }
+  }, [moveScope, editSearchParams, selectedWorkspaceId]);
   // Picking a workspace is picking its side too, as the toolbar does next.
-  const pickWorkspace = useCallback((id: string) => moveScope({ workspaceId: id, scope: 'workspace' }), [moveScope]);
+  const pickWorkspace = useCallback((id: string) => {
+    moveScope({ workspaceId: id, scope: 'workspace' });
+    editSearchParams((params) => { params.set('ws', id); }, { replace: true });
+  }, [moveScope, editSearchParams]);
   const moveFromRoute = useEffectEvent(moveScope);
 
   // Switch the chart to a given instance: for a request to show layers below,
@@ -324,8 +325,15 @@ function MarketViewInner() {
       setSelectedInterval((cur) => (cur === tf ? cur : tf));
     }
     // DALTON-HOOK(watchlist): push chart URL when jumping from watchlist list view so Back returns to /market
-    daltonWatchlist.navigateDaltonChartJump(navigate, sym, timeframe ? normalizeTimeframe(timeframe) : undefined, showWatchlistView, location.state);
-  }, [selectedStock, navigate, showWatchlistView, location.state]);
+    daltonWatchlist.navigateDaltonChartJump(
+      navigate,
+      sym,
+      timeframe ? normalizeTimeframe(timeframe) : undefined,
+      showWatchlistView,
+      location.state,
+      searchParams,
+    );
+  }, [selectedStock, navigate, showWatchlistView, location.state, searchParams]);
 
   // A request to show layers made while the page is open (the agent publishing
   // from the chat panel, a card's chip) brings the chart to their instance when
@@ -353,17 +361,24 @@ function MarketViewInner() {
     setChatExpanded(true);
   } : null);
 
-  // A line in the chat beside naming a comment on a chart in this workspace
-  // brings that chart up and the comment forward on it.
+  // A comment on a chart of this workspace comes forward on it, the chart
+  // moved to its ticker and timeframe first.
   const { requestFocus } = commentUi;
-  const focusSerial = useRef(0);
-  const openChartComment = useCallback((comment: ArtifactCommentRef) => {
-    const chart = chartParts(comment.path);
-    if (comment.kind !== 'chart' || !chart || comment.workspaceId !== activeWorkspaceId) return;
+  const showChartComment = useCallback((path: string, commentId: string) => {
+    const chart = chartParts(path);
+    if (!chart) return;
     handleJumpToChart(chart.symbol, chart.timeframe);
-    focusSerial.current += 1;
-    requestFocus({ kind: 'chart', path: comment.path, commentId: comment.commentId, key: focusSerial.current });
-  }, [activeWorkspaceId, handleJumpToChart, requestFocus]);
+    requestFocus({ kind: 'chart', path, commentId });
+  }, [handleJumpToChart, requestFocus]);
+  // As a line in the chat beside naming one does.
+  const openChartComment = useCallback((comment: ArtifactCommentRef) => {
+    if (comment.kind === 'chart' && comment.workspaceId === activeWorkspaceId) showChartComment(comment.path, comment.commentId);
+  }, [activeWorkspaceId, showChartComment]);
+  // And a row in the chart's list for one on another of its timeframes.
+  const chartComments = useMemo(
+    () => ({ ui: commentUi, tabId: CHART_COMMENTS_TAB, active: true, openComment: showChartComment }),
+    [commentUi, showChartComment],
+  );
 
   // Chat return path — captured from URL (or history entry state in Dalton) when navigating from chat DetailPanel
   const [chatReturnPath, setChatReturnPath] = useState<string | null>(() => openingRoute.returnTo);
@@ -375,14 +390,27 @@ function MarketViewInner() {
   // already seeded from the same route, so this re-applies identical values;
   // it earns its keep for a link followed while the page is already mounted.
   useEffect(() => {
-    const route = readMarketViewRoute(searchParams);
-    if (route.symbol) {
-      const symbol = displaySpelling(route.symbol);
-      if (symbol && symbol !== selectedStock) {
-        setSelectedStock(symbol);
-        setSelectedStockDisplay(null);
-        setChartMeta(null);
-      }
+    const route = daltonWatchlist.readDaltonOpeningMarketRoute(searchParams, location.state);
+    // The ticker stays in the address, so the page at an address is one
+    // ticker: a page tab, a reload or a copied link comes back to it. A new
+    // symbol in the address is followed when a link, a tab or Back brought it;
+    // otherwise the address is made to name the ticker on screen, replacing its
+    // entry. That write is told from a link by the replace: while it is on its
+    // way the address still names the ticker the page left, and followed then
+    // it would switch the page back.
+    const symbol = route.symbol ? displaySpelling(route.symbol) : null;
+    let follow = false;
+    if (symbol && symbol !== urlSymbol.current) {
+      urlSymbol.current = symbol;
+      follow = navigationType !== NavigationType.Replace && symbol !== selectedStock;
+    }
+    if (follow && symbol) {
+      setSelectedStock(symbol);
+      setSelectedStockDisplay(null);
+      setChartMeta(null);
+    } else if (!showWatchlistView && symbol !== selectedStock) {
+      // DALTON-HOOK(watchlist): do not stamp ?symbol= onto /market while showing the watchlist view
+      editSearchParams((params) => params.set('symbol', selectedStock), { replace: true });
     }
     // Land on the timeframe the expanded card was drawn for, so its layers
     // (keyed by symbol:timeframe) show immediately. Validate against the chart's
@@ -391,26 +419,28 @@ function MarketViewInner() {
     if (route.timeframe && INTERVALS.some((i) => i.key === route.timeframe)) {
       setSelectedInterval(route.timeframe);
     }
-    // Workspace and scope as one move, which waits on a comment being
-    // written on the chart as the picker's does.
-    if (route.workspaceId || route.scope) {
-      moveFromRoute({
-        ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
-        ...(route.scope ? { scope: route.scope } : {}),
-      });
+    // Workspace and scope as one move, as the picker makes it. Kept in the tab
+    // URL so switching between two MarketView tabs restores each tab's workspace
+    // (absent `ws` / `scope` means Home).
+    // DALTON-HOOK(watchlist): mount and tab navigation follow the tab URL alone without backfilling ?ws= from prefs
+    if (route.workspaceId !== urlWorkspaceRef.current || route.scope !== urlScopeRef.current) {
+      urlWorkspaceRef.current = route.workspaceId;
+      urlScopeRef.current = route.scope;
+      if (navigationType !== NavigationType.Replace) {
+        moveFromRoute({
+          ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}),
+          scope: route.scope ?? 'all',
+        });
+      }
     }
-    if (route.returnTo) {
-      setChatReturnPath(route.returnTo);
-    }
+    setChatReturnPath(route.returnTo);
     // A comment a phone opened from the chat comes forward on the chart the
     // route lands on, as one the Market chat names does.
     const commentChart = route.commentId ? chartIdFor(route.symbol, route.timeframe) : null;
-    if (route.commentId && commentChart) {
-      focusSerial.current += 1;
-      requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId, key: focusSerial.current });
-    }
-    // `thread` stays for MarketChatPanel, which consumes it itself.
-    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL & persist consumed `ws`/`returnTo` in history state
+    if (route.commentId && commentChart) requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId });
+    // `thread`, `symbol`, `ws`, `returnTo` (and Dalton `tf`) stay in the URL so
+    // switching between MarketView tabs restores each tab's workspace & return path.
+    // DALTON-HOOK(watchlist): keep `symbol`, `ws`, `returnTo` (and `tf` in Dalton) in URL
     const consumed = MARKET_VIEW_ROUTE_PARAMS.filter(
       (key) => daltonWatchlist.shouldConsumeMarketRouteParam(key) && searchParams.has(key),
     );
@@ -422,7 +452,7 @@ function MarketViewInner() {
         return next;
       }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, setSearchParams, selectWorkspace, location.state, requestFocus]);
+  }, [searchParams, selectedStock, showWatchlistView, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);
@@ -468,6 +498,17 @@ function MarketViewInner() {
     source: { wsStatus, wsHasData, wsDataLevel, chartFreshness },
     detail: 'full',
   });
+  // The reveal leads the chart's toolbar, the page's top row; memoized as
+  // `legend.toolbarLead` is, so the chart's memo holds.
+  const toolbarLead = useMemo(
+    () => (
+      <div className="flex items-center gap-2 min-w-0">
+        <SidebarReveal titlebar />
+        {legend.toolbarLead}
+      </div>
+    ),
+    [legend.toolbarLead],
+  );
   const toggleOverview = useCallback(() => setShowOverview((v) => !v), []);
 
 
@@ -715,8 +756,8 @@ function MarketViewInner() {
       </h1>
       {/* DALTON-HOOK(watchlist): render full personal watchlist at `/market` when no `?symbol=` is present */}
       {showWatchlistView ? daltonWatchlist.renderDaltonWatchlistWorkspace({
-        scope, onScopeChange: setScope, activeWorkspaceId, workspaces: selectableWorkspaces,
-        selectedWorkspaceId, workspacePending, onWorkspaceChange: selectWorkspace,
+        scope, onScopeChange: pickScope, activeWorkspaceId, workspaces: selectableWorkspaces,
+        selectedWorkspaceId, workspacePending, onWorkspaceChange: pickWorkspace,
         chatPanelWidth, onDragStart: handleDragStart, onJumpToChart: handleJumpToChart,
       }) : isMobile ? (
         <div className="market-mobile-layout">
@@ -915,11 +956,12 @@ function MarketViewInner() {
                   comments={chartComments}
                   toolbarLead={
                     backToWatchlistButton ? (
-                      <div className="inline-flex items-center">
+                      <div className="inline-flex items-center gap-1 min-w-0">
+                        <SidebarReveal titlebar />
                         {backToWatchlistButton}
                         {legend.toolbarLead}
                       </div>
-                    ) : legend.toolbarLead
+                    ) : toolbarLead
                   }
                   toolbarLeadKey={legend.toolbarLeadKey}
                   measureToolbarLead={legend.measureToolbarLead}
@@ -962,15 +1004,6 @@ function MarketViewInner() {
           </div>
         </>
       )}
-      <ConfirmDialog
-        open={heldMove !== null}
-        title={t('pageViewer:comments.discardConfirm')}
-        message={t('pageViewer:comments.discardOnSwitch')}
-        confirmLabel={t('pageViewer:comments.discard')}
-        cancelLabel={t('pageViewer:comments.keepWriting')}
-        onConfirm={() => { if (heldMove) applyMove(heldMove); }}
-        onOpenChange={(open) => { if (!open) setHeldMove(null); }}
-      />
     </div>
   );
 }

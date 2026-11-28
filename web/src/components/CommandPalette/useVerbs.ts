@@ -1,6 +1,7 @@
 import { useLocation, useNavigate, type NavigateFunction } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useOpenInNewTab } from '@/components/PageTabs/useOpenInNewTab';
 import { useChatRoute } from '@/components/Sidebar/useChatRoute';
 import { toast } from '@/components/ui/use-toast';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
@@ -17,7 +18,6 @@ import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { copyText } from '@/lib/clipboard';
 // DALTON-HOOK(global-search): Dalton document hit navigation types and memo directory path
 import type { GlobalSearchDocumentItem } from '@/lib/dalton/searchApi';
-import { isDesktopShell } from '@/lib/desktop';
 import { relativeTime } from '@/lib/format';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { MEMO_USER_DIR } from '@/pages/ChatAgent/utils/agentPaths.generated';
@@ -279,6 +279,7 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
   const names = useNames();
   const newWork = usePlace();
   const newThread = useNewThread(newWork.workspaceId);
+  const openInNewTab = useOpenInNewTab();
 
   return {
     ...names,
@@ -318,7 +319,7 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
         () => toast({ title: t('common.copied') }),
         () => toast({ variant: 'destructive', title: t('palette.copyFailed') }),
       ),
-    openInNewTab: isDesktopShell() ? null : (path) => void window.open(path, '_blank', 'noopener'),
+    openInNewTab,
     renameThread: (thread, title) => void renameThreadRow(queryClient, thread.workspaceId, thread.threadId, title, thread.savedTitle, t),
     pinThread: (thread, pinned) =>
       void pinThreadRow(queryClient, thread.workspaceId, thread.threadId, pinned).then((ok) =>

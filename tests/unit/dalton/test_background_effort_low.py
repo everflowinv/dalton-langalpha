@@ -34,7 +34,10 @@ async def test_background_call_that_names_its_model_is_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_primary_slot_is_unchanged():
+async def test_primary_slot_is_unchanged(monkeypatch: pytest.MonkeyPatch):
+    # Upstream #888 refuses the deployment default in standalone mode when no
+    # credential serves it; provide a key so the primary slot resolves.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-system")
     assert await _effort_passed("primary") is None
 
 

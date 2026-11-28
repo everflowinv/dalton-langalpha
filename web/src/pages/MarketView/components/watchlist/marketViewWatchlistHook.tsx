@@ -7,6 +7,7 @@ import React from 'react';
 import type { NavigateFunction, SetURLSearchParams } from 'react-router';
 import { ArrowLeft } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
+import { displaySpelling } from '@/lib/bars';
 import { buildMarketViewUrl, readMarketViewRoute, type MarketViewRouteParams } from '../../utils/marketRoute';
 import { WatchlistWorkspace, type WatchlistWorkspaceProps } from './WatchlistWorkspace';
 
@@ -21,8 +22,8 @@ export function shouldShowDaltonWatchlist(searchParams: URLSearchParams): boolea
 }
 
 export function shouldConsumeMarketRouteParam(key: string): boolean {
-  if (key === 'thread') return false;
-  if (isDaltonBuild && (key === 'symbol' || key === 'tf')) return false;
+  if (key === 'thread' || key === 'symbol' || key === 'ws' || key === 'returnTo') return false;
+  if (isDaltonBuild && key === 'tf') return false;
   return true;
 }
 
@@ -94,8 +95,16 @@ export function navigateDaltonChartJump(
   timeframe: string | undefined,
   fromWatchlistView: boolean,
   locationState?: unknown,
+  currentSearchParams?: URLSearchParams,
 ): void {
   if (!isDaltonBuild) return;
+  const currentRoute = currentSearchParams
+    ? readMarketViewRoute(currentSearchParams)
+    : null;
+  const sameSymbol =
+    !fromWatchlistView &&
+    Boolean(currentRoute?.symbol) &&
+    displaySpelling(currentRoute!.symbol!) === displaySpelling(symbol);
   const nextState = fromWatchlistView
     ? {
         ...(locationState && typeof locationState === 'object'
@@ -108,6 +117,9 @@ export function navigateDaltonChartJump(
     buildMarketViewUrl({
       symbol,
       ...(timeframe ? { timeframe } : {}),
+      ...(currentRoute?.workspaceId ? { workspaceId: currentRoute.workspaceId } : {}),
+      ...(sameSymbol && currentRoute?.threadId ? { threadId: currentRoute.threadId } : {}),
+      ...(currentRoute?.returnTo ? { returnTo: currentRoute.returnTo } : {}),
     }),
     {
       replace: !fromWatchlistView,

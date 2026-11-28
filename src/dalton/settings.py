@@ -259,6 +259,17 @@ class DaltonProblemReportsConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonWidgetRenderConfig(BaseModel):
+    """Master flag for #893's ShowWidget server-side headless Chromium render check.
+
+    Off (the default in both Everflow and Core): ShowWidget skips the backend
+    Chromium render/screenshot check while keeping frontend streaming and widget
+    thread communication active.
+    """
+
+    enabled: bool = False
+
+
 class DaltonCoverageUnitsConfig(BaseModel):
     """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
 
@@ -430,6 +441,9 @@ class DaltonConfig(BaseModel):
     )
     problem_reports: DaltonProblemReportsConfig = Field(
         default_factory=DaltonProblemReportsConfig
+    )
+    widget_render: DaltonWidgetRenderConfig = Field(
+        default_factory=DaltonWidgetRenderConfig
     )
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
@@ -639,6 +653,14 @@ def is_problem_reports_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().problem_reports.enabled
+
+
+def is_widget_ssr_enabled() -> bool:
+    """Whether #893's ShowWidget server-side Chromium render check is enabled (default False)."""
+    env_flag = os.getenv("DALTON_WIDGET_SSR_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().widget_render.enabled
 
 
 def is_coverage_units_enabled() -> bool:

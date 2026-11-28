@@ -89,7 +89,7 @@ class OwedResume:
             cause = (
                 "because the connection to the computer running it was lost"
                 if self.computer_lost
-                else "by a routine deployment before it finished"
+                else "by a restart before it finished"
             )
             lines.append(
                 f"Your previous turn was paused {cause}. Continue where you left "
@@ -105,7 +105,7 @@ class OwedResume:
         if self.computer_lost:
             cause = "The lost connection also paused" if also else "A lost connection to the computer paused"
         else:
-            cause = "The deployment also paused" if also else "A routine deployment paused"
+            cause = "The restart also paused" if also else "A restart paused"
         lines = [f"{cause} these background subagents before they finished:"]
         for task in self.tasks:
             description = " ".join((task.description or "").split())

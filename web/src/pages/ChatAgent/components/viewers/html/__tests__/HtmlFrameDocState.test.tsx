@@ -85,6 +85,7 @@ vi.mock('../../../artifactComments/useCommentDestinations', () => ({
     choices: [],
     canBind: false,
     targetFor: hoisted.targetFor,
+    nameOf: () => 'Main',
   }),
 }));
 

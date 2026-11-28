@@ -620,6 +620,42 @@ def test_a_widget_takes_the_payload_that_names_it():
     assert [i["data"]["artifact_id"] for i in out] == ["s0", "s1"]
 
 
+def test_a_legacy_widget_indexed_by_widget_id_merges_once_and_keeps_call_id():
+    """Old archives indexed widgets by ``widget_id`` before projections switched
+    to ``tool_call_id``. Replaying merges the archived payload into the
+    projected call-id widget without emitting a duplicate, preserves the
+    projected call id, and keeps signal anchors aimed at the legacy id intact."""
+    projected = [
+        _widget("tc-call-1", widget_id="w_abc123", title="DCF"),
+        _row("message_chunk", agent="main", id="m1", content_type="text", content="done"),
+    ]
+    archived_data = {
+        "artifact_type": "html_widget",
+        "artifact_id": "w_abc123",
+        "payload": {"widget_id": "w_abc123", "title": "DCF", "data": {"rows": [1, 2]}},
+    }
+    merge = {
+        "widgets": [["w_abc123", archived_data]],
+        "anchors": [["artifact", "w_abc123"]],
+        "signals": [
+            {"widget": 0},
+            {"event": "provenance", "data": {"agent": "main", "tag": "after-w"}, "at": 0},
+        ],
+    }
+
+    out = legacy.apply(projected, merge)
+
+    widget_rows = [i for i in out if i["event"] == "artifact"]
+    assert len(widget_rows) == 1
+    assert widget_rows[0]["data"]["artifact_id"] == "tc-call-1"
+    assert widget_rows[0]["data"]["payload"]["widget_id"] == "w_abc123"
+    assert widget_rows[0]["data"]["payload"]["data"] == {"rows": [1, 2]}
+    # Legacy anchor on ("artifact", "w_abc123") still places the signal right after the widget.
+    assert [i["event"] for i in out] == ["artifact", "provenance", "message_chunk"]
+    # Stored archive entry itself is not mutated.
+    assert archived_data["artifact_id"] == "w_abc123"
+
+
 def test_an_unnamed_payload_pairs_in_order_or_is_placed():
     """One the projection did not emit then pairs with a widget no payload
     names; one whose widget the projection dropped is placed where it

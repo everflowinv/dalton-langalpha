@@ -1,5 +1,6 @@
 import React from 'react';
 import { render, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, useLocation } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -66,10 +67,13 @@ describe('ChatView channel deep links (?chart=&layer= and ?widget=)', () => {
     expect(parseChartDeepLinkParam('   ')).toBeNull();
 
     const onOpenChart = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { getByTestId } = render(
-      <MemoryRouter initialEntries={['/chat/t/thread-1?chart=NVDA%3A1day&layer=layer-1&keep=1']}>
-        <ChannelDeepLinksHost workspaceId="ws-1" onOpenChart={onOpenChart} />
-      </MemoryRouter>,
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/chat/t/thread-1?chart=NVDA%3A1day&layer=layer-1&keep=1']}>
+          <ChannelDeepLinksHost workspaceId="ws-1" onOpenChart={onOpenChart} />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     await waitFor(() => {
@@ -97,10 +101,13 @@ describe('ChatView channel deep links (?chart=&layer= and ?widget=)', () => {
     const clearTimeoutSpy = vi.spyOn(window, 'clearTimeout');
 
     try {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const { container, getByTestId } = render(
-        <MemoryRouter initialEntries={['/chat/t/thread-1?widget=widget_abc123']}>
-          <ChannelDeepLinksHost workspaceId="ws-1" onOpenChart={onOpenChart} />
-        </MemoryRouter>,
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={['/chat/t/thread-1?widget=widget_abc123']}>
+            <ChannelDeepLinksHost workspaceId="ws-1" onOpenChart={onOpenChart} />
+          </MemoryRouter>
+        </QueryClientProvider>,
       );
 
       await waitFor(() => {

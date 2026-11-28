@@ -18,6 +18,8 @@ from pathlib import Path
 
 import uvicorn
 
+from src.dalton.uvicorn_runtime import configure_uv_threadpool_size, default_uvicorn_loop
+
 from .app import TranscriptionServiceConfig, create_app
 
 logger = logging.getLogger("dalton-transcription")
@@ -71,12 +73,14 @@ def main() -> None:
         cfg.disabled,
         cfg.worker_mode,
     )
+    configure_uv_threadpool_size()
     uvicorn.run(
         create_app(config=cfg),
         host=cfg.host,
         port=cfg.port,
         workers=1,
         log_level="info",
+        loop=default_uvicorn_loop(),
     )
 
 

@@ -22,6 +22,7 @@ import type { OpenFileHandler } from '../../utils/fileLocation';
 import type { ChartTabSpec } from '../filePanel/types';
 import type { ArtifactCommentOpeners } from '../artifactComments/artifactCommentReply';
 import type { EditDraftStore } from '../../hooks/utils/editDrafts';
+import type { WidgetPrompts } from '../../utils/widgetPrompt';
 
 export interface MessageActions {
   /** Opens a task's transcript. `ownerThreadId` names the thread that holds
@@ -107,7 +108,10 @@ export interface MessageActions {
   onThumbDown?: (turnIndex: number, issueCategories: string[], comment: string | null, consentHumanReview: boolean) => Promise<FeedbackResult | null>;
   /** Add to a sent thumbs-down's report, or withdraw it. */
   onThumbDownFollowUp?: (turnIndex: number, action: ThumbDownFollowUp) => Promise<ThumbDownFollowUpOutcome>;
-  onWidgetSendPrompt?: (text: string) => void;
+  /** What a ShowWidget widget's prompt calls do here, one identity-stable
+   *  object (`useWidgetPromptActions`). A call left out does nothing: a shared
+   *  view answers none. */
+  widgetPrompts?: WidgetPrompts;
   /** DALTON-HOOK(shared-widgets): which of an inline widget's export actions
    *  the surface offers. Absent means all of them (the owner's view). A shared
    *  view offers no new tab or PDF, which run the widget outside its sandbox

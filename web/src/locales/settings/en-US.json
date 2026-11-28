@@ -52,6 +52,10 @@
         "title": "Dashboard",
         "description": "What your dashboard shows."
       },
+      "layout": {
+        "title": "Layout",
+        "description": "How the app's window is arranged."
+      },
       "other": {
         "title": "More",
         "description": "More features you can try."
@@ -130,7 +134,7 @@
   "ownContext": "Use my preferences and memory in shared workspaces",
   "ownContextDesc": "On your own messages in a shared workspace, the agent follows your answer preferences and can read your memory. In a conversation shared with the workspace, its answers are visible to the workspace's members.",
   "resetPreferences": "Reset preferences",
-  "resetConfirmMsg": "This will clear all your preferences: risk tolerance, investment style, agent settings, your default models and other model settings (custom models and providers, quick-access models, per-model settings), and your dashboard layout. Conversations keep the models they use. You can set everything up again anytime in Settings or via the agent. Are you sure?",
+  "resetConfirmMsg": "This will clear your risk tolerance, investment style, agent settings and dashboard layout. Your models, model settings and API keys stay as they are. You can set everything up again anytime in Settings or via the agent. Are you sure?",
   "resetting": "Resetting...",
   "completeProfile": "Set up your investing profile",
   "completeProfileDesc": "A few questions so the agent's research fits how you invest.",
@@ -366,7 +370,7 @@
   "nameDesc": "Shown in the account menu.",
   "logoutDesc": "You'll need to sign in again to use {{brand}}.",
   "investingAnswers": "Your answers",
-  "resetPreferencesDesc": "Clears your investing answers, default models and other model settings. Conversations keep the models they use.",
+  "resetPreferencesDesc": "Clears your investing answers and agent settings. Your models and API keys stay as they are.",
   "regionGroup": "Language and region",
   "localeDesc": "The language {{brand}} is shown in.",
   "timezoneDesc": "Dates and times are shown in this timezone.",
@@ -462,6 +466,11 @@
     "notifyAutomationDesc": "When an automation finishes a run.",
     "notifyStarted": "Show when a background run starts",
     "notifyStartedDesc": "A silent notice as a price alert or automation begins, replaced by its result. A wakeup tells you only when it found something.",
+    "badge": "App icon badge",
+    "badgeDesc": "For threads with a new reply or waiting on you.",
+    "badgeCount": "Number",
+    "badgeDot": "Dot",
+    "badgeOff": "Off",
     "menubarGroup": "Menu bar",
     "menubarIcon": "Show icon in the menu bar",
     "menubarIconDesc": "Markets, your portfolio and the agent's activity, a click away.",
@@ -480,6 +489,8 @@
     "menubarStyleRotate": "Rotate",
     "menubarStyleSide": "Side by side",
     "rotateEvery": "Rotate every",
+    "menubarLogo": "Show the LangAlpha logo",
+    "menubarLogoDesc": "Off leaves only your items. With none to show, the logo stays so there is something to click.",
     "rotateSeconds_one": "Every {{count}}s",
     "rotateSeconds_other": "Every {{count}}s",
     "menubarShow": "Show",
@@ -521,6 +532,9 @@
     "openAtLoginWindowDesc": "Open {{brand}} when you sign in to this computer. With the icon on, it starts in the background instead.",
     "keepRunning": "Keep running in the tray when closed",
     "keepRunningDesc": "Closing the window leaves notifications and the tray icon running.",
+    "updatesGroup": "Updates",
+    "automaticUpdates": "Install updates automatically",
+    "automaticUpdatesDesc": "New versions download in the background and install the next time you quit. Off, the sidebar offers each one and waits for you to download it.",
     "unavailable": "The desktop app did not answer. Restart it and try again."
   },
   "computers": {

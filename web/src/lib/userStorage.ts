@@ -17,7 +17,8 @@ import { LOCAL_USER_ID, hasAuthEnv } from '../config/localUser';
  */
 export interface UserStorage {
   getItem(key: string): string | null;
-  setItem(key: string, value: string): void;
+  /** False when the value was not kept: nobody signed in, or the store refused it (blocked, full). */
+  setItem(key: string, value: string): boolean;
   removeItem(key: string): void;
   /** Removes the current user's keys under `prefix`, and any unscoped ones. */
   removeByPrefix(prefix: string): void;
@@ -47,8 +48,8 @@ export function subscribeStorageUser(listener: () => void): () => void {
  * client, a platform build without its Supabase env included.
  */
 function currentUser(): string | null {
-  // DALTON-HOOK(dalton-auth): scope storage by signed-in user when Dalton auth is enabled
-  return (isPlatformMode || isDaltonAuth) && hasAuthEnv ? platformUser : LOCAL_USER_ID;
+  // DALTON-HOOK(dalton-auth): scope storage by signed-in user for both Supabase auth and local auth (which has no Supabase env)
+  return (isPlatformMode && hasAuthEnv) || isDaltonAuth ? platformUser : LOCAL_USER_ID;
 }
 
 /**
@@ -95,9 +96,11 @@ function userScoped(store: () => Storage): UserStorage {
     },
     setItem(key, value) {
       const user = currentUser();
-      if (!user) return;
+      if (!user) return false;
       // As above: a refused write leaves the legacy key the only copy.
-      if (write(scoped(user, key), value)) remove(key);
+      if (!write(scoped(user, key), value)) return false;
+      remove(key);
+      return true;
     },
     removeItem(key) {
       const user = currentUser();
@@ -121,6 +124,12 @@ function userScoped(store: () => Storage): UserStorage {
 }
 
 export const userLocalStorage = userScoped(() => localStorage);
+
+/** Reads `userId`'s key from localStorage whoever is signed in now: for a
+ *  clean-up that checks what it removes. */
+export function getUserLocalItem(userId: string, key: string): string | null {
+  try { return localStorage.getItem(scoped(userId, key)); } catch { return null; }
+}
 
 /** Removes `userId`'s key from localStorage whoever is signed in now: for a
  *  clean-up that runs once they have signed out. */

@@ -44,13 +44,12 @@ function sources(overrides: Partial<MessageActionSources> = {}): MessageActionSo
     onThumbDown: async () => null,
     // DALTON-HOOK(external-share-guard): follow-up is part of the action sources; this gate still only checks Publish
     onThumbDownFollowUp: async () => ({ status: 'ok' as const }),
-    onWidgetSendPrompt: noop,
+    widgetPrompts: {},
     onEditMessage: noop,
     onRegenerate: noop,
     onRetry: noop,
     onForkFromTurn: async () => {},
     editDrafts: createEditDraftStore(() => 'th-publish-gate'),
-    onSendMessage: noop,
     chatInputRef: { current: null },
     ...overrides,
   };

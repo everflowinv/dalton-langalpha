@@ -1,5 +1,5 @@
 import { registerAuthReset } from '@/lib/authResets';
-import type { PendingToolCallChunk } from '@/types/chat';
+import type { PendingToolCallChunk, WidgetDraft } from '@/types/chat';
 import type { ChartKey } from '@/lib/bars/chartId';
 import type { ChartLayersCard } from '../chartLayerGrouping';
 import { buildRenderBlocks, groupSegments, HIDDEN_TOOL_CALL_NAMES, type NotificationRenderBlock, type RenderBlock } from './buildRenderBlocks';
@@ -18,6 +18,7 @@ export interface ContentInput {
   reasoningProcesses: Record<string, Record<string, unknown>>;
   toolCallProcesses: Record<string, ToolCallProcessRecord>;
   pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
+  widgetDrafts?: Record<string, WidgetDraft>;
   isStreaming?: boolean;
   isSubagentView?: boolean;
   /** See `buildRenderBlocks`; the current time when omitted. */
@@ -289,6 +290,7 @@ interface CacheEntry {
   reasoning: unknown;
   tools: unknown;
   pending: unknown;
+  drafts: unknown;
   streaming: boolean;
   root: string | null | undefined;
   carded: ReadonlySet<ChartKey> | undefined;
@@ -322,6 +324,7 @@ export function projectMessageContent(
     && hit.reasoning === message.reasoningProcesses
     && hit.tools === message.toolCallProcesses
     && hit.pending === message.pendingToolCallChunks
+    && hit.drafts === message.widgetDrafts
     && hit.streaming === (message.isStreaming === true)
     && (hit.projection.nextExpiry === null || hit.projection.nextExpiry > Date.now())) return hit.projection;
   const segments = message.contentSegments as ContentSegmentRecord[] | undefined;
@@ -333,6 +336,7 @@ export function projectMessageContent(
     reasoningProcesses: (message.reasoningProcesses ?? EMPTY_OBJ) as ContentInput['reasoningProcesses'],
     toolCallProcesses: (message.toolCallProcesses ?? EMPTY_OBJ) as ContentInput['toolCallProcesses'],
     pendingToolCallChunks: (message.pendingToolCallChunks ?? EMPTY_OBJ) as ContentInput['pendingToolCallChunks'],
+    widgetDrafts: (message.widgetDrafts ?? EMPTY_OBJ) as ContentInput['widgetDrafts'],
     isStreaming: message.isStreaming === true,
     isSubagentView,
     root,
@@ -349,6 +353,7 @@ export function projectMessageContent(
     reasoning: message.reasoningProcesses,
     tools: message.toolCallProcesses,
     pending: message.pendingToolCallChunks,
+    drafts: message.widgetDrafts,
     streaming: message.isStreaming === true,
     root,
     carded: cardedCharts,
