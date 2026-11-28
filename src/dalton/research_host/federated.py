@@ -500,13 +500,17 @@ class FederatedResearchConnector:
         extra_blocks: list[dict[str, Any]] = []
         for src in top_level_sources:
             blk = outcomes[src]
-            out[src] = {
+            src_block: dict[str, Any] = {
                 "ok": bool(blk.get("ok")),
                 "status": str(blk.get("status") or ("ok" if blk.get("ok") else "error")),
                 "count": int(blk.get("count") if blk.get("count") is not None else len(blk.get("results") or [])),
                 "results": list(blk.get("results") or []),
                 **({"reason": str(blk.get("reason"))} if blk.get("reason") else {}),
             }
+            for page_key in ("cursor", "has_more", "total_upstream"):
+                if page_key in blk:
+                    src_block[page_key] = blk[page_key]
+            out[src] = src_block
             extra_blocks.append(blk)
 
         sources_list = _extract_sources(hits, extra_blocks, self.registry.federated_sources)

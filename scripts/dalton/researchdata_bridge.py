@@ -1777,6 +1777,20 @@ RESEARCH_HOST_FORWARD_CATALOG_RULE: str = (
     "已由研究宿主服务承载，经本入口自动透明转发至研究宿主。"
 )
 
+RESEARCH_IMAGE_PREVIEW_MAX_BYTES: int = 5 * 1024 * 1024
+
+_SALES_MAIL_MIGRATION_META: dict[str, str] = {
+    "deprecated_route": "sales-mail",
+    "engine": "research_library",
+    "result_format": "document_v1",
+    "replacement": "sales-notes / tmtb / all",
+    "note": "旧名称只作转发；返回 document_id/snippet，用 read 读取正文，不再返回旧分块 JSON。",
+}
+
+_LOCAL_LIBRARY_SOURCE_IDS: frozenset[str] = frozenset(
+    {"company-wiki", "sales-notes", "tmtb", "funda-ai"}
+)
+
 
 def _normalize_research_host_url(raw_url: str) -> str:
     """Normalize a ``DALTON_RESEARCH_HOST_URL`` for direct host-side HTTP forwarding.
@@ -6307,6 +6321,12 @@ def _is_empty_non_community_payload(
     status = str(payload.get("status") or "").strip().lower()
     if status in ("no_match", "empty"):
         return True
+    if route == "all" and any(
+        isinstance((payload.get(k) or {}).get("results"), list)
+        and len(payload[k]["results"]) > 0
+        for k in ("alphaengine", "guidepoint")
+    ):
+        return False
     for container in (payload, data_dict, sc_dict if isinstance(sc_dict, dict) else {}):
         if not isinstance(container, dict):
             continue
@@ -8673,20 +8693,18 @@ class ResearchDataBridge:
     def _resolve_research_host_url(self) -> str:
         """Return normalized ``dalton-research-host`` base URL when cutover is active.
 
-        Returns ``""`` for Core profile or whenever ``DALTON_RESEARCH_HOST_URL`` /
-        ``DALTON_RESEARCH_HOST_BASE_URL`` is unset, keeping pre-cutover & Core
-        behavior untouched.
+        Only recognizes ``DALTON_RESEARCH_HOST_URL`` (never
+        ``DALTON_RESEARCH_HOST_BASE_URL`` alone) and returns ``""`` for Core
+        profile, keeping pre-cutover & Core behavior untouched.
         """
         env = self._effective_capability_env()
         app_env = str(env.get("APP_ENV") or "").strip().lower()
         profile = str(env.get("DALTON_PROFILE") or "").strip().lower()
         if app_env == "core" or profile == "core":
             return ""
-        for key in ("DALTON_RESEARCH_HOST_URL", "DALTON_RESEARCH_HOST_BASE_URL"):
-            url = _normalize_research_host_url(str(env.get(key) or ""))
-            if url:
-                return url
-        return ""
+        return _normalize_research_host_url(
+            str(env.get("DALTON_RESEARCH_HOST_URL") or "")
+        )
 
     def _resolve_research_host_token(self) -> str:
         env = self._effective_capability_env()
@@ -8738,6 +8756,8 @@ class ResearchDataBridge:
         operation: str,
         call_args: Mapping[str, Any],
         eff_timeout: int,
+        *,
+        online_all_sources: tuple[str, ...] = (),
     ) -> tuple[str, str, dict[str, Any]]:
         """Map a legacy ``research(route=...)`` call to ``(connector_id, tool_name, arguments)``."""
         cleaned_route = str(route or "").strip().lower()
@@ -8745,7 +8765,8 @@ class ResearchDataBridge:
         fwd_args: dict[str, Any] = {
             k: v
             for k, v in call_args.items()
-            if k not in ("route", "operation", "action", "timeout") and v is not None
+            if k not in ("route", "operation", "action", "timeout", "mode")
+            and v is not None
         }
         if cleaned_route == "guidepoint":
             tool_name = operation or "search_library"
@@ -8755,7 +8776,409 @@ class ResearchDataBridge:
             fwd_args["operation"] = operation or "search"
         else:
             tool_name = operation or "search"
+        if (
+            cleaned_route == "all"
+            and tool_name == "search"
+            and online_all_sources
+            and isinstance(fwd_args.get("params"), dict)
+        ):
+            raw_sources = fwd_args["params"].get("sources")
+            if isinstance(raw_sources, list) and raw_sources:
+                cleaned_sources = [
+                    str(s).strip() for s in raw_sources if isinstance(s, str) and str(s).strip()
+                ]
+                if cleaned_sources and all(
+                    s in _LOCAL_LIBRARY_SOURCE_IDS for s in cleaned_sources
+                ):
+                    expanded = list(
+                        dict.fromkeys([*cleaned_sources, *online_all_sources])
+                    )
+                    fwd_args["params"] = {**fwd_args["params"], "sources": expanded}
         return connector_id, tool_name, fwd_args
+
+    def _load_legacy_route_entry(self, route: str) -> dict[str, Any]:
+        """Load the legacy ``config/data_sources.json`` route entry (including hidden routes)."""
+        code_root = self._research_code_root()
+        cache: tuple[Path, dict[str, dict[str, Any]]] | None = getattr(
+            self, "_legacy_route_registry_cache", None
+        )
+        routes_map: dict[str, dict[str, Any]]
+        if cache is not None and cache[0] == code_root:
+            routes_map = cache[1]
+        else:
+            routes_map = {}
+            reg_path = code_root / "config" / "data_sources.json"
+            try:
+                raw_reg = json.loads(reg_path.read_text(encoding="utf-8"))
+                for item in raw_reg.get("routes") or []:
+                    if isinstance(item, dict) and item.get("id"):
+                        routes_map[str(item["id"])] = item
+            except (OSError, ValueError):
+                routes_map = {}
+            self._legacy_route_registry_cache = (code_root, routes_map)
+        found = routes_map.get(route)
+        if isinstance(found, dict):
+            return copy.deepcopy(found)
+        return {"id": route, "category": "research"}
+
+    @staticmethod
+    def _build_legacy_request_meta(
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        """Build the legacy ``data_gateway.py`` ``request`` metadata dict."""
+        req_meta: dict[str, Any] = {"route": route}
+        if operation:
+            req_meta["operation"] = operation
+        for key in (
+            "ticker",
+            "query",
+            "series",
+            "concept",
+            "item",
+            "document",
+            "form",
+            "dataset",
+            "start",
+            "end",
+            "as_of",
+            "vintage",
+        ):
+            val = call_args.get(key)
+            if val is not None and val != "":
+                req_meta[key] = val
+        params = call_args.get("params")
+        if isinstance(params, Mapping) and params:
+            req_meta["params_json"] = json.dumps(dict(params), ensure_ascii=False)
+        raw_limit = call_args.get("limit")
+        req_meta["limit"] = (
+            int(raw_limit)
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 3
+        )
+        req_meta["timeout"] = int(eff_timeout)
+        return req_meta
+
+    @staticmethod
+    def _build_legacy_guidepoint_parameters(call_args: Mapping[str, Any]) -> dict[str, Any]:
+        """Build ``parameters`` matching ``data_gateway.native_request`` for ``guidepoint``."""
+        raw_p = call_args.get("params")
+        gp_params: dict[str, Any] = dict(raw_p) if isinstance(raw_p, Mapping) else {}
+        query = call_args.get("query")
+        if isinstance(query, str) and query.strip():
+            gp_params["query"] = query
+        raw_limit = call_args.get("limit")
+        limit = (
+            int(raw_limit)
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 3
+        )
+        gp_params.setdefault("size", min(limit, 30))
+        if call_args.get("start"):
+            gp_params["start_date"] = call_args["start"]
+        if call_args.get("end"):
+            gp_params["end_date"] = call_args["end"]
+        return gp_params
+
+    def _build_research_host_plan_payload(
+        self,
+        *,
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        """Return the legacy ``mode='plan'`` preview payload (``executed: False``) without calling research-host."""
+        cleaned_route = str(route or "").strip().lower()
+        route_entry = self._load_legacy_route_entry(cleaned_route)
+        eff_op = operation or (
+            "search_library"
+            if cleaned_route == "guidepoint"
+            else (
+                str(route_entry["operations"][0])
+                if isinstance(route_entry.get("operations"), list)
+                and route_entry["operations"]
+                else "search"
+            )
+        )
+        req_meta = self._build_legacy_request_meta(
+            cleaned_route, eff_op, call_args, eff_timeout
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if cleaned_route == "guidepoint":
+            return {
+                "ok": True,
+                "status": "planned",
+                "executed": False,
+                "route": route_entry,
+                "argv": None,
+                "request": req_meta,
+                "operation": eff_op,
+                "parameters": self._build_legacy_guidepoint_parameters(call_args),
+                "gateway_at": now_iso,
+            }
+
+        code_root = self._research_code_root()
+        raw_p = call_args.get("params")
+        params: dict[str, Any] = dict(raw_p) if isinstance(raw_p, Mapping) else {}
+        enabled_sources = self._enabled_local_library_sources()
+        target = "all" if cleaned_route == "sales-mail" else cleaned_route
+        if cleaned_route == "sales-mail":
+            sm_valid = ("sales-notes", "tmtb")
+            if "sources" not in params:
+                if eff_op in ("search", "list"):
+                    params["sources"] = [
+                        s for s in sm_valid if s in enabled_sources
+                    ] or list(sm_valid)
+                elif eff_op == "read":
+                    doc_str = str(call_args.get("document") or "").strip()
+                    prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                    if prefix == "tmtb":
+                        params["sources"] = ["tmtb"]
+                    elif prefix in ("mail", "digest"):
+                        params["sources"] = ["sales-notes"]
+                    else:
+                        params["sources"] = [
+                            s for s in sm_valid if s in enabled_sources
+                        ] or list(sm_valid)
+            if eff_op in ("search", "list"):
+                eff_sources = params.get("sources") or list(sm_valid)
+                default_layer = "all" if "sales-notes" in eff_sources else "raw"
+                params = {"layer": default_layer, "media": "text", **params}
+        cmd: list[str] = [
+            "bash",
+            str(code_root / "scripts" / "research_library.sh"),
+            target,
+            f"--operation={eff_op}",
+            f"--limit={req_meta['limit']}",
+            "--params-json=" + json.dumps(params, ensure_ascii=False),
+            "--allowed-sources=" + ",".join(enabled_sources),
+        ]
+        for field in ("query", "document", "start", "end"):
+            val = call_args.get(field)
+            if val:
+                cmd.append(f"--{field}={val}")
+        plan_out: dict[str, Any] = {
+            "ok": True,
+            "status": "planned",
+            "executed": False,
+            "route": route_entry,
+            "argv": cmd,
+            "request": req_meta,
+            "gateway_at": now_iso,
+        }
+        if cleaned_route == "sales-mail":
+            plan_out["migration"] = dict(_SALES_MAIL_MIGRATION_META)
+        return plan_out
+
+    def _restore_legacy_research_host_payload(
+        self,
+        *,
+        route: str,
+        operation: str,
+        call_args: Mapping[str, Any],
+        eff_timeout: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore a flat research-host payload back to the pre-cutover ``data_gateway`` envelope.
+
+        Keeps ``data.document`` / ``data.results`` (and Guidepoint's
+        ``data.structuredContent.data``) in their pre-cutover positions instead of
+        hoisting them to top level, while retaining top-level ``alphaengine``,
+        ``guidepoint``, and ``source_status`` on federated ``route='all'`` searches.
+        """
+        cleaned_route = str(route or "").strip().lower()
+        route_entry = self._load_legacy_route_entry(cleaned_route)
+        eff_op = operation or (
+            "search_library" if cleaned_route == "guidepoint" else "search"
+        )
+        req_meta = self._build_legacy_request_meta(
+            cleaned_route, eff_op, call_args, eff_timeout
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        upstream_sources = (
+            list(payload["_sources"])
+            if isinstance(payload.get("_sources"), list) and payload["_sources"]
+            else None
+        )
+        ok_flag = bool(payload.get("ok", True))
+        status_val = str(payload.get("status") or ("ok" if ok_flag else "error"))
+
+        if cleaned_route == "guidepoint":
+            if not ok_flag and "data" not in payload and "results" not in payload:
+                return dict(payload)
+            gp_data = payload.get("data")
+            if not isinstance(gp_data, dict):
+                rows = (
+                    list(payload["results"])
+                    if isinstance(payload.get("results"), list)
+                    else []
+                )
+                gp_data = {"structuredContent": {"data": rows}}
+            elif "structuredContent" not in gp_data and isinstance(
+                payload.get("results"), list
+            ):
+                gp_data = {
+                    **gp_data,
+                    "structuredContent": {"data": list(payload["results"])},
+                }
+            restored_gp: dict[str, Any] = {
+                "ok": ok_flag,
+                "status": status_val,
+                "executed": True,
+                "route": route_entry,
+                "argv": None,
+                "request": req_meta,
+                "operation": eff_op,
+                "parameters": self._build_legacy_guidepoint_parameters(call_args),
+                "data": gp_data,
+                "gateway_at": now_iso,
+            }
+            if upstream_sources is not None:
+                restored_gp["_sources"] = upstream_sources
+            for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                if err_k in payload:
+                    restored_gp[err_k] = payload[err_k]
+            return restored_gp
+
+        # Defensive guard: if payload is already in the legacy data-envelope shape, keep it
+        existing_data = payload.get("data")
+        if isinstance(existing_data, dict) and (
+            "document" in existing_data or "results" in existing_data
+        ):
+            return dict(payload)
+
+        has_body = (
+            "document" in payload
+            or "results" in payload
+            or "alphaengine" in payload
+            or "guidepoint" in payload
+        )
+        if not ok_flag and not has_body:
+            return dict(payload)
+
+        if cleaned_route == "all" and eff_op == "search":
+            ae_block = payload.get("alphaengine")
+            gp_block = payload.get("guidepoint")
+            top_source_status = payload.get("source_status")
+            inner_all: dict[str, Any] = {
+                k: v
+                for k, v in payload.items()
+                if k
+                not in (
+                    "_sources",
+                    "_declared_sources",
+                    "alphaengine",
+                    "guidepoint",
+                    "source_status",
+                )
+            }
+            inner_all.setdefault("local_only", True)
+            if isinstance(top_source_status, dict):
+                local_status = {
+                    k: v
+                    for k, v in top_source_status.items()
+                    if k not in ("alphaengine", "guidepoint")
+                }
+                if local_status:
+                    inner_all["source_status"] = local_status
+            restored_all: dict[str, Any] = {
+                "ok": ok_flag,
+                "status": status_val,
+                "executed": True,
+                "route": route_entry,
+                "request": req_meta,
+                "data": inner_all,
+                "gateway_at": now_iso,
+            }
+            if isinstance(top_source_status, dict):
+                restored_all["source_status"] = dict(top_source_status)
+            if isinstance(ae_block, dict):
+                ae_copy = dict(ae_block)
+                ae_copy.setdefault("route", "alphaengine")
+                restored_all["alphaengine"] = ae_copy
+            if isinstance(gp_block, dict):
+                gp_copy = dict(gp_block)
+                gp_copy.setdefault("route", "guidepoint")
+                restored_all["guidepoint"] = gp_copy
+            if upstream_sources is not None:
+                restored_all["_sources"] = upstream_sources
+            if not ok_flag:
+                for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                    if err_k in payload:
+                        restored_all[err_k] = payload[err_k]
+            return restored_all
+
+        inner_lib: dict[str, Any] = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("_sources", "_declared_sources")
+        }
+        restored_lib: dict[str, Any] = {
+            "ok": ok_flag,
+            "status": status_val,
+            "executed": True,
+            "route": route_entry,
+            "request": req_meta,
+            "data": inner_lib,
+            "gateway_at": now_iso,
+        }
+        if cleaned_route == "sales-mail":
+            restored_lib["migration"] = dict(_SALES_MAIL_MIGRATION_META)
+        if upstream_sources is not None:
+            restored_lib["_sources"] = upstream_sources
+        if not ok_flag:
+            for err_k in ("error", "error_code", "hint", "http_status", "connector"):
+                if err_k in payload:
+                    restored_lib[err_k] = payload[err_k]
+        return restored_lib
+
+    def _load_research_host_image_block(
+        self,
+        restored_payload: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Read host preview file into an MCP ``image`` block for image reads.
+
+        Mirrors legacy ``researchdata_mcp.py`` path containment under
+        ``<research_home>/state/research-images/assets`` and 5 MiB size limit.
+        """
+        if not restored_payload.get("ok"):
+            return None, None
+        data_obj = restored_payload.get("data")
+        if not isinstance(data_obj, Mapping):
+            return None, None
+        doc = data_obj.get("document")
+        if not isinstance(doc, Mapping) or doc.get("media_type") != "image":
+            return None, None
+        raw_preview = doc.get("preview_path")
+        if not isinstance(raw_preview, str) or not raw_preview.strip():
+            return None, "invalid image asset path"
+        try:
+            assets_root = (
+                self._research_home_root() / "state" / "research-images" / "assets"
+            ).resolve()
+            preview = Path(raw_preview).expanduser().resolve()
+        except OSError:
+            return None, "invalid image asset path"
+        if not preview.is_relative_to(assets_root):
+            return None, "invalid image asset path"
+        try:
+            st = preview.stat()
+            if st.st_size > RESEARCH_IMAGE_PREVIEW_MAX_BYTES:
+                return None, "image preview too large"
+            img_bytes = preview.read_bytes()
+        except OSError as exc:
+            return None, f"image preview unreadable: {type(exc).__name__}"
+        if len(img_bytes) > RESEARCH_IMAGE_PREVIEW_MAX_BYTES:
+            return None, "image preview too large"
+        mime_type = str(doc.get("preview_mime") or "image/jpeg").strip() or "image/jpeg"
+        return {
+            "type": "image",
+            "mimeType": mime_type,
+            "data": base64.b64encode(img_bytes).decode("ascii"),
+        }, None
 
     async def _post_research_host_json(
         self,
@@ -8819,22 +9242,52 @@ class ResearchDataBridge:
         return None, True, "Missing JSON-RPC result"
 
     @staticmethod
+    def _extract_research_host_mcp_result(
+        body: Any,
+    ) -> tuple[dict[str, Any] | None, bool, str | None, list[dict[str, Any]]]:
+        """Extract ``(payload_dict, is_error, rpc_error_msg, extra_image_blocks)`` from a research-host MCP reply."""
+        payload, is_err, rpc_err = ResearchDataBridge._extract_research_host_mcp_payload(
+            body
+        )
+        extra_blocks: list[dict[str, Any]] = []
+        if isinstance(body, dict) and isinstance(body.get("result"), dict):
+            for blk in body["result"].get("content") or []:
+                if (
+                    isinstance(blk, dict)
+                    and blk.get("type") == "image"
+                    and isinstance(blk.get("data"), str)
+                    and isinstance(blk.get("mimeType"), str)
+                ):
+                    extra_blocks.append(
+                        {
+                            "type": "image",
+                            "mimeType": blk["mimeType"],
+                            "data": blk["data"],
+                        }
+                    )
+        return payload, is_err, rpc_err, extra_blocks
+
+    @staticmethod
     def _wrap_research_host_mcp_reply(
         req_id: Any,
         payload: dict[str, Any],
         *,
         is_error: bool,
+        extra_content_blocks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": json.dumps(payload, ensure_ascii=False),
+            }
+        ]
+        if extra_content_blocks:
+            content.extend(dict(b) for b in extra_content_blocks)
         return {
             "jsonrpc": "2.0",
             "id": req_id if req_id is not None else 1,
             "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(payload, ensure_ascii=False),
-                    }
-                ],
+                "content": content,
                 "structuredContent": dict(payload),
                 "isError": bool(is_error),
             },
@@ -8859,8 +9312,18 @@ class ResearchDataBridge:
         import httpx
 
         base_url = self._resolve_research_host_url()
+        online_all_sources: list[str] = []
+        if str(route or "").strip().lower() == "all":
+            if not self._is_route_capability_disabled("alphaengine"):
+                online_all_sources.append("alphaengine")
+            if not self._is_route_capability_disabled("guidepoint"):
+                online_all_sources.append("guidepoint")
         connector_id, rh_tool_name, fwd_args = self._build_research_host_mcp_request(
-            route, operation, call_args, eff_timeout
+            route,
+            operation,
+            call_args,
+            eff_timeout,
+            online_all_sources=tuple(online_all_sources),
         )
         url = f"{base_url}/mcp/{connector_id}"
         host_token = self._resolve_research_host_token()
@@ -8941,12 +9404,39 @@ class ResearchDataBridge:
             parsed_body = None
 
         if status_code == 200:
-            payload, is_err, rpc_err = self._extract_research_host_mcp_payload(parsed_body)
+            payload, is_err, rpc_err, extra_blocks = self._extract_research_host_mcp_result(
+                parsed_body
+            )
             if payload is not None:
+                restored = self._restore_legacy_research_host_payload(
+                    route=route,
+                    operation=operation,
+                    call_args=call_args,
+                    eff_timeout=eff_timeout,
+                    payload=payload,
+                )
+                reply_is_err = is_err or (restored.get("ok") is False)
+                if not extra_blocks and not reply_is_err:
+                    img_block, img_err = self._load_research_host_image_block(restored)
+                    if img_err is not None:
+                        return self._wrap_research_host_mcp_reply(
+                            req_id,
+                            {
+                                "ok": False,
+                                "status": "error",
+                                "error_code": "research_host_image_error",
+                                "connector": connector_id,
+                                "error": img_err,
+                            },
+                            is_error=True,
+                        )
+                    if img_block is not None:
+                        extra_blocks = [img_block]
                 return self._wrap_research_host_mcp_reply(
                     req_id,
-                    payload,
-                    is_error=is_err or (payload.get("ok") is False),
+                    restored,
+                    is_error=reply_is_err,
+                    extra_content_blocks=extra_blocks or None,
                 )
             return self._wrap_research_host_mcp_reply(
                 req_id,
@@ -15561,51 +16051,71 @@ class ResearchDataBridge:
         call_queue_stats: dict[str, int] = {}
         try:
             if forward_to_research_host:
-                connector_id = self._research_host_connector_for_route(tool_name, route) or route
-                try:
-                    async with self._get_research_host_concurrency().acquire_call(
-                        caller_key,
-                        caller_display,
-                        is_automation=is_automation,
-                        timeout_s=float(eff_timeout),
-                        stats=call_queue_stats,
-                    ):
-                        if test_delay_s > 0.0:
-                            rem_delay = max(
-                                0.1, float(eff_timeout) - (time.monotonic() - t0)
-                            )
-                            await asyncio.wait_for(
-                                asyncio.sleep(test_delay_s),
-                                timeout=rem_delay,
-                            )
-                        remaining_budget_s = max(0.1, deadline_mono - time.monotonic())
-                        rh_reply = await self._forward_research_host_mcp(
-                            req_id=req_id,
-                            route=route,
-                            operation=operation,
-                            call_args=call_args,
-                            eff_timeout=eff_timeout,
-                            remaining_budget_s=remaining_budget_s,
-                            raw_caller_token=raw_caller_token,
-                            corr_id=corr_id,
-                        )
-                        resps = [rh_reply]
-                except asyncio.TimeoutError:
+                if str(call_args.get("mode") or "fetch").strip().lower() == "plan":
+                    plan_payload = self._build_research_host_plan_payload(
+                        route=route,
+                        operation=operation,
+                        call_args=call_args,
+                        eff_timeout=eff_timeout,
+                    )
                     resps = [
                         self._wrap_research_host_mcp_reply(
                             req_id,
-                            {
-                                "ok": False,
-                                "status": "timeout",
-                                "error_code": "research_host_timeout",
-                                "connector": connector_id,
-                                "error": (
-                                    f"research-host connector '{connector_id}' timed out after {eff_timeout}s"
-                                ),
-                            },
-                            is_error=True,
+                            plan_payload,
+                            is_error=not bool(plan_payload.get("ok", True)),
                         )
                     ]
+                else:
+                    connector_id = (
+                        self._research_host_connector_for_route(tool_name, route)
+                        or route
+                    )
+                    try:
+                        async with self._get_research_host_concurrency().acquire_call(
+                            caller_key,
+                            caller_display,
+                            is_automation=is_automation,
+                            timeout_s=float(eff_timeout),
+                            stats=call_queue_stats,
+                        ):
+                            if test_delay_s > 0.0:
+                                rem_delay = max(
+                                    0.1, float(eff_timeout) - (time.monotonic() - t0)
+                                )
+                                await asyncio.wait_for(
+                                    asyncio.sleep(test_delay_s),
+                                    timeout=rem_delay,
+                                )
+                            remaining_budget_s = max(
+                                0.1, deadline_mono - time.monotonic()
+                            )
+                            rh_reply = await self._forward_research_host_mcp(
+                                req_id=req_id,
+                                route=route,
+                                operation=operation,
+                                call_args=call_args,
+                                eff_timeout=eff_timeout,
+                                remaining_budget_s=remaining_budget_s,
+                                raw_caller_token=raw_caller_token,
+                                corr_id=corr_id,
+                            )
+                            resps = [rh_reply]
+                    except asyncio.TimeoutError:
+                        resps = [
+                            self._wrap_research_host_mcp_reply(
+                                req_id,
+                                {
+                                    "ok": False,
+                                    "status": "timeout",
+                                    "error_code": "research_host_timeout",
+                                    "connector": connector_id,
+                                    "error": (
+                                        f"research-host connector '{connector_id}' timed out after {eff_timeout}s"
+                                    ),
+                                },
+                                is_error=True,
+                            )
+                        ]
             elif is_cached_direct:
                 cached_op = (
                     _ae_cache.OP_TRANSCRIPT
