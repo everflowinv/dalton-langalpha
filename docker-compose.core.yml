@@ -374,6 +374,8 @@ services:
       DOMAIN: ${DALTON_CADDY_HOST:-${DOMAIN:-localhost}}
       DALTON_TLS_MODE: ${DALTON_TLS_MODE:-loopback}
       DALTON_EDGE_HTTPS_PORT: ${DALTON_EDGE_HTTPS_PORT:-18443}
+      STORAGE_BUCKET_NAME: ${STORAGE_BUCKET_NAME:-${S3_BUCKET_NAME:-dalton-storage}}
+      STORAGE_KEY_PREFIX: ${STORAGE_KEY_PREFIX:-}
     ports:
       - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
     volumes:
