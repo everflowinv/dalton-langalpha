@@ -262,4 +262,59 @@ describe('useCapabilities build-time initial state and server authority', () => 
       mod.hasRequiredCapability(new Set(['researchdata_bridge']), ['company_wiki', 'sales_notes']),
     ).toBe(false);
   });
+
+  it('configures 60s staleTime and refetchOnWindowFocus so capability updates sync on focus', async () => {
+    vi.stubEnv('VITE_DALTON_PROFILE', 'core');
+    vi.resetModules();
+
+    mockApiGet
+      .mockResolvedValueOnce({
+        data: { profile: 'core', capabilities: ['company_wiki'], brand_name: 'Dalton' },
+      } as Awaited<ReturnType<typeof api.get>>)
+      .mockResolvedValueOnce({
+        data: { profile: 'core', capabilities: ['company_wiki', 'channel_feishu'], brand_name: 'Dalton' },
+      } as Awaited<ReturnType<typeof api.get>>);
+
+    const { useCapabilities } = await import('../useCapabilities');
+    const { queryKeys } = await import('@/lib/queryKeys');
+
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+      },
+    });
+
+    function FocusProbe() {
+      const caps = useCapabilities();
+      return <span data-testid="feishu-cap">{String(caps.hasCapability('channel_feishu'))}</span>;
+    }
+
+    render(
+      <QueryClientProvider client={client}>
+        <FocusProbe />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.getByTestId('feishu-cap')).toHaveTextContent('false');
+
+    const cachedQuery = client.getQueryCache().find({ queryKey: queryKeys.dalton.capabilities() });
+    expect(cachedQuery).toBeDefined();
+    const observerOpts = cachedQuery?.observers[0]?.options;
+    expect(observerOpts?.staleTime).toBe(60_000);
+    expect(observerOpts?.refetchOnWindowFocus).toBe(true);
+
+    // Mark stale (simulating >60s elapsed) and notify React Query focusManager -> refetches updated capabilities.
+    const { focusManager } = await import('@tanstack/react-query');
+    await client.invalidateQueries({ queryKey: queryKeys.dalton.capabilities(), refetchType: 'none' });
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId('feishu-cap')).toHaveTextContent('true');
+    });
+  });
 });

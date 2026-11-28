@@ -5,6 +5,7 @@ import {
   CircleUser,
   Cpu,
   FlaskConical,
+  KeyRound, // DALTON-HOOK(deployment-credentials)
   Layers,
   MessageSquare,
   PieChart,
@@ -37,6 +38,7 @@ import { canShowDaltonHomeTeamMemoryCard } from './panels/dalton/DaltonHomeTeamM
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
 import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
 import { canShowDaltonWeixinBindCard } from './panels/dalton/weixinVisibility'; // DALTON-HOOK(weixin-multi-account)
+import { buildDeploymentCredentialsSearchKeywords } from './panels/dalton/deploymentCredentialsVisibility'; // DALTON-HOOK(deployment-credentials)
 
 /** Discord channels card & search visibility: requires verified admin tier and channel_discord capability. */
 export function canShowDaltonDiscordChannelsCard(
@@ -106,6 +108,8 @@ export const SECTIONS = {
   teamModels: { labelKey: 'settings:section.teamModels', descKey: 'settings:sectionDesc.teamModels', icon: ServerCog, minTier: 'admin' },
   teamMembers: { labelKey: 'settings:section.teamMembers', descKey: 'settings:sectionDesc.teamMembers', icon: Users, minTier: 'internal', daltonAuthOnly: true },
   teamChannels: { labelKey: 'settings:section.teamChannels', descKey: 'settings:sectionDesc.teamChannels', icon: Bot, minTier: 'internal' },
+  // DALTON-HOOK(deployment-credentials): admin-only deployment credentials tab (renders static notice in OSS mode)
+  deploymentCredentials: { labelKey: 'settings:section.deploymentCredentials', descKey: 'settings:sectionDesc.deploymentCredentials', icon: KeyRound, minTier: 'admin' },
   // Upstream stubs retained as permanently hidden sections
   trading: { labelKey: 'settings:section.trading', descKey: 'settings:definition.trading', icon: CandlestickChart },
   experiments: { labelKey: 'settings:section.experiments', descKey: 'settings:definition.experiments', icon: FlaskConical },
@@ -134,6 +138,11 @@ export function sectionShown(
   // DALTON-HOOK(standalone-core): enforce capability gating and hide empty Integrations section in Core
   if (section === 'trading' || section === 'experiments') return false;
   if ((section === 'computers' || section === 'server') && isDaltonBuild) return false;
+  // DALTON-HOOK(deployment-credentials): hide in hosted platform mode; allow single-user OSS static notice
+  if (section === 'deploymentCredentials') {
+    if (isPlatformMode) return false;
+    if (ctx?.isSingleUserOss) return true;
+  }
   const meta: SectionMeta = SECTIONS[section];
   if (meta.desktopOnly && !canDesktopSettings()) return false;
   if (meta.selfHostedOnly && isPlatformMode) return false;
@@ -178,7 +187,8 @@ export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }
   },
   {
     labelKey: 'settings:group.team',
-    sections: ['teamModels', 'teamMembers', 'teamChannels'],
+    // DALTON-HOOK(deployment-credentials): add deploymentCredentials under Team Management
+    sections: ['teamModels', 'teamMembers', 'teamChannels', 'deploymentCredentials'],
   },
 ];
 
@@ -338,6 +348,8 @@ export const SETTINGS = {
   daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings:dalton.feishuGroupsLabel', descKey: 'settings:dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups', capability: 'channel_feishu' },
   daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings:dalton.discordChannelsLabel', descKey: 'settings:dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', capability: 'channel_discord', visibleWhen: canShowDaltonDiscordChannelsCard },
   daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings:dalton.systemJobsLabel', descKey: 'settings:dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron', capability: 'data_jobs' },
+  // DALTON-HOOK(deployment-credentials): register neutral base keywords; channel tokens appended dynamically by capability
+  daltonDeploymentCredentials: { section: 'deploymentCredentials', anchor: 'dalton-deployment-credentials', labelKey: 'settings:dalton.deploymentCredentialsLabel', descKey: 'settings:dalton.deploymentCredentialsDesc', keywords: '集成凭据 部署凭据 OAuth Google 日历 邮箱 搜索 数据源 SEC FMP integration credentials calendar email' },
 
   tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings:tradingPermission.title', descKey: 'settings:tradingPermission.desc' },
   experiments: { section: 'experiments', anchor: 'experiments', labelKey: 'settings:experiments', descKey: 'settings:experimentsIntro' },
@@ -413,6 +425,8 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   'team-models': 'teamModels',
   'team-members': 'teamMembers',
   'team-channels': 'teamChannels',
+  // DALTON-HOOK(deployment-credentials): hyphenated tab alias
+  'deployment-credentials': 'deploymentCredentials',
 };
 
 // DALTON-HOOK(standalone-core): resolve capability-aware section subtitle so disabled integrations never appear
@@ -490,6 +504,7 @@ export function settingSearchText(
         ? `通知目标 自动推送 消息提醒 notify targets 推送总开关 总开关 推送开关 ${channelTokens.join(' ')}`.trim()
         : `账号绑定 绑定码 私聊 机器人 bind code account ${channelTokens.join(' ')}`.trim();
   }
+<<<<<<< HEAD
   // DALTON-HOOK(personal-integrations): include provider search tokens only for enabled personal capabilities
   if (entry.anchor === 'dalton-personal-integrations') {
     const tokens = ['个人日历 个人邮箱 外部账号连接 personal calendar mail'];
@@ -500,6 +515,11 @@ export function settingSearchText(
       tokens.push('飞书 feishu 飞书日历 飞书邮箱');
     }
     keywords = tokens.join(' ');
+=======
+  // DALTON-HOOK(deployment-credentials): delegate dynamic capability-gated search keywords to Dalton helper
+  if (entry.anchor === 'dalton-deployment-credentials') {
+    keywords = buildDeploymentCredentialsSearchKeywords(keywords, ctx);
+>>>>>>> refs/lane/84
   }
   return [
     t(labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)

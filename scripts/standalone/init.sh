@@ -1334,28 +1334,54 @@ main() {
 
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
-    cat <<EOF
-  1. Configure LLM provider keys, optional financial data (FMP), and optional
-     web search/fetch keys via the interactive setup wizard:
-       make config
-
-  2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
-     for SEC EDGAR compliance identification.
-
-  3. Build the images (clearing any exported shell VITE_DALTON_AUTH so Compose
+    if [[ "${auth_mode_now}" == "local" ]]; then
+      cat <<EOF
+  1. Build the images (clearing any exported shell VITE_DALTON_AUTH so Compose
      reads the value from .env) and start the Standalone Core stack:
        ${compose_build_cmd}
        ${compose_start_cmd}
-     (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
-      with \`env -u VITE_DALTON_AUTH ${compose_base_cmd} build edge && ${compose_start_cmd}\`
-      so the frontend bundle picks up the new authentication mode.)
+     (Whenever you modify .env, recreate the affected services with \`${compose_start_cmd}\`;
+      when switching DALTON_AUTH_MODE / VITE_DALTON_AUTH, rebuild edge first with
+      \`env -u VITE_DALTON_AUTH ${compose_base_cmd} build edge && ${compose_start_cmd}\`.)
 
-  4. Open the web UI at ${public_url}
+  2. Create the initial administrator account at ${public_url}/setup/admin
+     using BOOTSTRAP_SETUP_TOKEN from .env (read via \`grep '^BOOTSTRAP_SETUP_TOKEN=' .env\`),
+     then complete /setup/model with at least one LLM provider API key.
+
+  3. Configure deployment-level integration credentials (Google OAuth / Feishu App &
+     Event Verification keys) directly in the web UI:
+       Settings -> Team Management -> Integration Credentials (${public_url}/settings?tab=deploymentCredentials)
+     (Google OAuth requires a publicly resolvable HTTPS domain with a public suffix,
+      or loopback http://localhost / http://127.0.0.1.)
+
+  4. Optional: run \`make config\` for additional data/search keys, or set
+     SEC_USER_AGENT="Dalton <your-email@example.com>" in .env and apply with \`${compose_start_cmd}\`.
 EOF
+    else
+      cat <<EOF
+  1. Build the images (clearing any exported shell VITE_DALTON_AUTH so Compose
+     reads the value from .env) and start the Standalone Core stack:
+       ${compose_build_cmd}
+       ${compose_start_cmd}
+
+  2. Open the loopback trial UI at ${public_url} (single-user evaluation mode;
+     configure your first LLM API key in the web onboarding or via \`make config\`).
+
+  3. To enable team accounts and web-managed deployment credentials (Settings ->
+     Team Management -> Integration Credentials), switch to standard login mode:
+       bash scripts/standalone/init.sh --domain <your-domain> --tls-mode auto
+     (See docs/dalton/dev-guide/STANDALONE-DEPLOY.md §4.1 for loopback local login.)
+EOF
+    fi
   else
-    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_TLS_MODE=${tls_mode}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
+    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_AUTH_MODE=${auth_mode_now}, DALTON_TLS_MODE=${tls_mode}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
     info "Build images with: ${compose_build_cmd}"
     info "Start the stack with: ${compose_start_cmd}"
+    if [[ "${auth_mode_now}" == "local" ]]; then
+      info "Bootstrap admin at ${public_url}/setup/admin, then configure integrations at ${public_url}/settings?tab=deploymentCredentials"
+    else
+      info "Open loopback trial UI at ${public_url} (switch to DALTON_AUTH_MODE=local via init.sh --domain <domain> for web-managed integration credentials)."
+    fi
   fi
 }
 

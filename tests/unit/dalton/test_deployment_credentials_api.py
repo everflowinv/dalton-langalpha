@@ -24,10 +24,13 @@ from src.dalton.deployment_credentials import (
     auth as dc_auth,
     catalog as dc_catalog,
     hooks as dc_hooks,
+    probes as dc_probes,
     router as dc_router,
     snapshot as dc_snapshot,
     store as dc_store,
 )
+
+_ORIG_CREATE_PROBE_HTTP_CLIENT = dc_probes.create_probe_http_client
 from src.dalton.deployment_credentials.catalog import (
     BATCH1_FIELD_SPECS,
     DaltonDeploymentFieldSpec,
@@ -1036,3 +1039,484 @@ class TestRedirectUriRedactionAndVaultHooks:
         publish_mock2.assert_awaited_once()
         _assert_no_secrets_leaked(caplog.text)
         assert dc_hooks.on_vault_secrets_changed is not None
+
+
+class TestDeploymentCredentialProbes:
+    """Real-endpoint probe contract tests for Google OAuth and Feishu App (§3.2, §5)."""
+
+    def _patch_probe_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        response: Any = None,
+        side_effect: Any = None,
+    ):
+        import httpx
+
+        mock_client = create_autospec(httpx.AsyncClient, instance=True)
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = False
+        if side_effect is not None:
+            mock_client.post.side_effect = side_effect
+        else:
+            mock_client.post.return_value = response
+
+        factory = create_autospec(
+            _ORIG_CREATE_PROBE_HTTP_CLIENT, return_value=mock_client
+        )
+        monkeypatch.setattr(dc_probes, "create_probe_http_client", factory)
+        return mock_client
+
+    def test_probe_endpoint_enforces_admin_session_auth_matrix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client()
+
+        # OSS mode -> 403 login_mode_required
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        resp_oss = client.post(
+            f"{ENDPOINT}/test", json={"target": "google_oauth", "values": {}}
+        )
+        assert resp_oss.status_code == 403
+        assert resp_oss.json()["detail"]["code"] == "login_mode_required"
+
+        # Service token -> 403 session_auth_required
+        _patch_local_admin(monkeypatch, is_admin=True)
+        resp_svc = client.post(
+            f"{ENDPOINT}/test",
+            json={"target": "google_oauth", "values": {}},
+            headers={"X-Service-Token": "svc-token-not-allowed"},
+        )
+        assert resp_svc.status_code == 403
+        assert resp_svc.json()["detail"]["code"] == "session_auth_required"
+
+        # Non-admin member -> 403
+        _patch_local_admin(monkeypatch, is_admin=False)
+        resp_member = client.post(
+            f"{ENDPOINT}/test", json={"target": "google_oauth", "values": {}}
+        )
+        assert resp_member.status_code == 403
+
+    def test_google_oauth_token_endpoint_contract_and_zero_secret_leak(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import httpx
+
+        _patch_local_admin(monkeypatch, is_admin=True)
+        monkeypatch.setenv("PUBLIC_APP_URL", "https://research.example.com")
+        fake_store = _FakeEncryptedStore(
+            revision=1,
+            rows={
+                "DALTON_GOOGLE_OAUTH_CLIENT_ID": "google-client-id.apps.googleusercontent.com",
+                "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": FAKE_GOOGLE_SECRET,
+            },
+        )
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # 1) 400 invalid_grant => valid client credentials
+        mock_http = self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "Bad Request"},
+            ),
+        )
+        with caplog.at_level(logging.DEBUG):
+            resp = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp.status_code == 200
+        assert resp.headers.get("cache-control") == "no-store"
+        assert resp.json() == {
+            "ok": True,
+            "network_reachable": True,
+            "credentials_valid": True,
+            "verdict": "valid",
+            "detail_code": "invalid_grant_verified",
+        }
+        mock_http.post.assert_awaited_once()
+        call_args = mock_http.post.call_args
+        assert call_args.args[0] == dc_probes.GOOGLE_TOKEN_ENDPOINT
+        sent_form = call_args.kwargs["data"]
+        assert sent_form["client_id"] == "google-client-id.apps.googleusercontent.com"
+        assert sent_form["client_secret"] == FAKE_GOOGLE_SECRET
+        assert sent_form["grant_type"] == "authorization_code"
+        assert sent_form["code"] == dc_probes.GOOGLE_PROBE_INVALID_CODE
+        assert sent_form["redirect_uri"] == build_integration_redirect_uri("google")
+        _assert_no_secrets_leaked(resp.text)
+        _assert_no_secrets_leaked(caplog.text)
+
+        # 2) 401 invalid_client => invalid credentials (network reachable)
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(
+                401,
+                json={"error": "invalid_client", "error_description": "Unauthorized"},
+            ),
+        )
+        resp_inv = client.post(
+            f"{ENDPOINT}/test",
+            json={
+                "target": "google_oauth",
+                "values": {
+                    "DALTON_GOOGLE_OAUTH_CLIENT_ID": "bad-client-id",
+                    "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": FAKE_GOOGLE_SECRET,
+                },
+            },
+        )
+        assert resp_inv.status_code == 200
+        assert resp_inv.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": False,
+            "verdict": "invalid_credentials",
+            "detail_code": "invalid_client",
+        }
+        _assert_no_secrets_leaked(resp_inv.text)
+
+        # 3) 400 unauthorized_client => invalid credentials
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(400, json={"error": "unauthorized_client"}),
+        )
+        resp_unauth = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_unauth.status_code == 200
+        assert resp_unauth.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": False,
+            "verdict": "invalid_credentials",
+            "detail_code": "unauthorized_client",
+        }
+
+        # 4) 429 rate limited
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(429, json={"error": "rate_limit_exceeded"}),
+        )
+        resp_429 = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_429.status_code == 200
+        assert resp_429.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": None,
+            "verdict": "rate_limited",
+            "detail_code": "rate_limited",
+        }
+
+        # 5) ConnectTimeout / ConnectError => network_error
+        self._patch_probe_client(
+            monkeypatch,
+            side_effect=httpx.ConnectTimeout(f"timeout near {FAKE_GOOGLE_SECRET}"),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            resp_net = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_net.status_code == 200
+        assert resp_net.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "network_error",
+            "detail_code": "network_timeout",
+        }
+        _assert_no_secrets_leaked(resp_net.text)
+        _assert_no_secrets_leaked(caplog.text)
+
+    def test_feishu_app_token_endpoint_contract_discards_token_and_distinguishes_errors(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import httpx
+
+        _patch_local_admin(monkeypatch, is_admin=True)
+        fake_store = _FakeEncryptedStore(
+            revision=1,
+            rows={
+                "DALTON_FEISHU_APP_ID": "cli_a1b2c3d4e5",
+                "DALTON_FEISHU_APP_SECRET": FAKE_FEISHU_SECRET,
+            },
+        )
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # 1) code == 0 => valid, tenant_access_token immediately discarded
+        fake_issued_token = "t-g104fake-token-not-real-9999"
+        mock_http = self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "msg": "ok",
+                    "tenant_access_token": fake_issued_token,
+                    "expire": 7200,
+                },
+            ),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            resp = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp.status_code == 200
+        assert resp.headers.get("cache-control") == "no-store"
+        assert resp.json() == {
+            "ok": True,
+            "network_reachable": True,
+            "credentials_valid": True,
+            "verdict": "valid",
+            "detail_code": "feishu_token_verified",
+        }
+        mock_http.post.assert_awaited_once()
+        assert mock_http.post.call_args.args[0] == dc_probes.FEISHU_TENANT_TOKEN_ENDPOINT
+        assert mock_http.post.call_args.kwargs["json"] == {
+            "app_id": "cli_a1b2c3d4e5",
+            "app_secret": FAKE_FEISHU_SECRET,
+        }
+        assert fake_issued_token not in resp.text
+        assert fake_issued_token not in caplog.text
+        _assert_no_secrets_leaked(resp.text)
+        _assert_no_secrets_leaked(caplog.text)
+
+        # 2) code == 10003 => feishu_invalid_param
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(200, json={"code": 10003, "msg": "invalid param"}),
+        )
+        resp_10003 = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_10003.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": False,
+            "verdict": "invalid_credentials",
+            "detail_code": "feishu_invalid_param",
+        }
+
+        # 3) code == 10014 => feishu_app_unavailable
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(200, json={"code": 10014, "msg": "app unavailable"}),
+        )
+        resp_10014 = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_10014.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": False,
+            "verdict": "invalid_credentials",
+            "detail_code": "feishu_app_unavailable",
+        }
+
+        # 4) code == 10004 (secret error) => feishu_invalid_secret
+        self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(200, json={"code": 10004, "msg": "app secret invalid"}),
+        )
+        resp_secret = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_secret.json() == {
+            "ok": False,
+            "network_reachable": True,
+            "credentials_valid": False,
+            "verdict": "invalid_credentials",
+            "detail_code": "feishu_invalid_secret",
+        }
+
+        # 5) ConnectError => network_error
+        self._patch_probe_client(
+            monkeypatch,
+            side_effect=httpx.ConnectError("DNS lookup failed"),
+        )
+        resp_net = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_net.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "network_error",
+            "detail_code": "network_error",
+        }
+
+    def test_probe_validation_incomplete_group_and_sanitized_422(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_local_admin(monkeypatch, is_admin=True)
+        fake_store = _FakeEncryptedStore(revision=0, rows={})
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # Unset group with no draft values -> format_invalid / incomplete_credential_group
+        resp_empty = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_empty.status_code == 200
+        assert resp_empty.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "format_invalid",
+            "detail_code": "incomplete_credential_group",
+        }
+
+        # Draft value with internal whitespace -> format_invalid / invalid_format
+        resp_bad_fmt = client.post(
+            f"{ENDPOINT}/test",
+            json={
+                "target": "google_oauth",
+                "values": {
+                    "DALTON_GOOGLE_OAUTH_CLIENT_ID": "id-1",
+                    "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": f"bad {FAKE_GOOGLE_SECRET}",
+                },
+            },
+        )
+        assert resp_bad_fmt.status_code == 200
+        assert resp_bad_fmt.json()["verdict"] == "format_invalid"
+        assert resp_bad_fmt.json()["detail_code"] == "invalid_format"
+        _assert_no_secrets_leaked(resp_bad_fmt.text)
+
+        # Unknown key in values -> redacted 422
+        resp_unknown_key = client.post(
+            f"{ENDPOINT}/test",
+            json={
+                "target": "google_oauth",
+                "values": {"UNKNOWN_SECRET_KEY": FAKE_GOOGLE_SECRET},
+            },
+        )
+        assert resp_unknown_key.status_code == 422
+        assert resp_unknown_key.json() == {
+            "code": "validation_error",
+            "errors": [{"setting_name": "_unknown", "reason": "unknown_setting"}],
+        }
+        assert "UNKNOWN_SECRET_KEY" not in resp_unknown_key.text
+        _assert_no_secrets_leaked(resp_unknown_key.text)
+
+        # Invalid target -> redacted 422
+        resp_bad_target = client.post(
+            f"{ENDPOINT}/test",
+            json={"target": FAKE_GOOGLE_SECRET},
+        )
+        assert resp_bad_target.status_code == 422
+        assert resp_bad_target.json()["code"] == "validation_error"
+        _assert_no_secrets_leaked(resp_bad_target.text)
+
+    def test_feishu_probe_reads_vault_readonly_and_handles_vault_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        _patch_local_admin(monkeypatch, is_admin=True)
+        fake_store = _FakeEncryptedStore(revision=2, rows={})
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # Vault readonly pair -> probes Feishu with Vault credentials
+        monkeypatch.setattr(
+            dc_probes,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                dc_snapshot.query_feishu_vault_pair_strict,
+                return_value=(
+                    {
+                        "DALTON_FEISHU_APP_ID": "cli_vault_probe_id",
+                        "DALTON_FEISHU_APP_SECRET": FAKE_FEISHU_SECRET,
+                    },
+                    False,
+                    None,
+                ),
+            ),
+        )
+        mock_http = self._patch_probe_client(
+            monkeypatch,
+            response=httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "t-vault-discard-not-real-0009"},
+            ),
+        )
+        resp_ok = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_ok.status_code == 200
+        assert resp_ok.json()["verdict"] == "valid"
+        assert "t-vault-discard-not-real-0009" not in resp_ok.text
+        assert mock_http.post.call_args.kwargs["json"]["app_id"] == "cli_vault_probe_id"
+        _assert_no_secrets_leaked(resp_ok.text)
+
+        # Vault error -> format_invalid / vault_error without outbound HTTP call
+        monkeypatch.setattr(
+            dc_probes,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                dc_snapshot.query_feishu_vault_pair_strict,
+                return_value=(None, True, None),
+            ),
+        )
+        mock_http_unused = self._patch_probe_client(
+            monkeypatch, response=httpx.Response(200, json={"code": 0})
+        )
+        resp_err = client.post(f"{ENDPOINT}/test", json={"target": "feishu_app"})
+        assert resp_err.status_code == 200
+        assert resp_err.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "format_invalid",
+            "detail_code": "vault_error",
+        }
+        mock_http_unused.post.assert_not_awaited()
+
+    def test_probe_explicit_null_draft_clears_existing_value_and_total_timeout_caps_pre_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import asyncio
+        import httpx
+
+        _patch_local_admin(monkeypatch, is_admin=True)
+        fake_store = _FakeEncryptedStore(
+            revision=3,
+            rows={
+                "DALTON_GOOGLE_OAUTH_CLIENT_ID": "google-saved-id.apps.googleusercontent.com",
+                "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": FAKE_GOOGLE_SECRET,
+            },
+        )
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # 1) Passing explicit null for an existing saved ID refuses fallback to old ID (matches PUT 422)
+        mock_http_unused = self._patch_probe_client(
+            monkeypatch, response=httpx.Response(400, json={"error": "invalid_grant"})
+        )
+        resp_cleared = client.post(
+            f"{ENDPOINT}/test",
+            json={
+                "target": "google_oauth",
+                "values": {"DALTON_GOOGLE_OAUTH_CLIENT_ID": None},
+            },
+        )
+        assert resp_cleared.status_code == 200
+        assert resp_cleared.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "format_invalid",
+            "detail_code": "incomplete_credential_group",
+        }
+        mock_http_unused.post.assert_not_awaited()
+
+        # 2) Hung DB/Vault lookup hits PROBE_TOTAL_TIMEOUT_SECONDS and returns structured probe_timeout
+        async def _slow_resolve(target: dc_probes.ProbeTarget) -> tuple[dict[str, str], bool]:
+            _ = target
+            await asyncio.sleep(0.5)
+            return {}, False
+
+        monkeypatch.setattr(dc_probes, "PROBE_TOTAL_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(
+            dc_probes,
+            "_resolve_existing_group_values",
+            create_autospec(
+                dc_probes._resolve_existing_group_values,
+                side_effect=_slow_resolve,
+            ),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            resp_timeout = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_timeout.status_code == 200
+        assert resp_timeout.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "network_error",
+            "detail_code": "probe_timeout",
+        }
+        _assert_no_secrets_leaked(resp_timeout.text)
+        _assert_no_secrets_leaked(caplog.text)

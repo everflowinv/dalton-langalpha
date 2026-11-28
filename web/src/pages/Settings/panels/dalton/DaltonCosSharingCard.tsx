@@ -30,6 +30,7 @@ export interface DaltonSettingVisibilityContext {
   hasPersonalIntegrations?: boolean;
   capabilities?: ReadonlySet<CapabilityId>;
   capabilitiesLoading?: boolean;
+  isSingleUserOss?: boolean;
 }
 
 export interface UserSharingSettingsResponse {

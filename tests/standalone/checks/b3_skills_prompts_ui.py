@@ -852,6 +852,7 @@ import { isDocIncluded, transformDocSource } from './docs-site/src/integrations/
 
 const docsRoot = path.resolve('docs-site/src/content/docs');
 const forbidden = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|feishu|飞书|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
+const forbiddenAdminIntegrations = /alphaengine|guidepoint|researchdata|sales-notes|tmtb|funda|飞书文档|知识库|群聊绑定|机器人|weixin|微信|everflowinv\.com|\/help\/everflow\/|what-is-everflow|公司\s*wiki|销售纪要|自动入库|团队对话归档|\/transcribe/i;
 const everflowWord = /\beverflow\b/i;
 
 function walk(dir) {
@@ -879,8 +880,9 @@ for (const fp of walk(docsRoot)) {
   if (/dalton_doc/i.test(coreText)) {
     errors.push(`${rel}: unresolved DALTON_DOC marker`);
   }
-  if (forbidden.test(coreText)) {
-    errors.push(`${rel}: forbidden proprietary term matched: ${coreText.match(forbidden)?.[0]}`);
+  const activeForbidden = rel === 'get-started/admin-integrations.mdx' ? forbiddenAdminIntegrations : forbidden;
+  if (activeForbidden.test(coreText)) {
+    errors.push(`${rel}: forbidden proprietary term matched: ${coreText.match(activeForbidden)?.[0]}`);
   }
   if (everflowWord.test(coreText)) {
     errors.push(`${rel}: leftover 'Everflow' mention in Core doc`);

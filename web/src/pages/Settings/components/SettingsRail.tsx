@@ -56,6 +56,8 @@ export function useDaltonSettingsVisibility(
     hasPersonalIntegrations,
     capabilities,
     capabilitiesLoading,
+    // DALTON-HOOK(deployment-credentials): expose single-user OSS mode for static login-mode notice
+    isSingleUserOss: identity.isSingleUserOss,
   };
 }
 
