@@ -114,6 +114,10 @@ async def capture_sandbox_images(
     default savefig target). Folding to a work-dir-relative form first would
     re-root those under the work dir and the image would vanish.
     """
+    # DALTON-HOOK(storage-private-bucket-urls): keep sandbox paths for backend proxy when public_bucket_urls=false
+    from src.dalton.private_bucket_urls import allow_public_bucket_image_capture
+    if not allow_public_bucket_image_capture():
+        return {}
 
     async def _capture_one(path: str) -> tuple[str, str] | None:
         try:
@@ -207,6 +211,10 @@ class ImageCaptureMiddleware(AgentMiddleware):
     async def _arecord(self, messages: list[Any]) -> list[Any] | None:
         """The messages with their captures recorded, or None when nothing
         was captured."""
+        # DALTON-HOOK(storage-private-bucket-urls): skip direct bucket image URLs when public_bucket_urls=false
+        from src.dalton.private_bucket_urls import allow_public_bucket_image_capture
+        if not allow_public_bucket_image_capture():
+            return None
         sandbox = getattr(self._session, "sandbox", None)
         if sandbox is None or not is_storage_enabled():
             return None

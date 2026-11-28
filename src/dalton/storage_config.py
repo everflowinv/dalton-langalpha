@@ -398,6 +398,47 @@ def is_wsfiles_write_inline_only(
     return bool(yaml_val)
 
 
+def is_wsfiles_public_bucket_urls(
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether browsers may receive direct object-storage URLs.
+
+    Read live on every call (never cached at import time):
+    1. ``DALTON_WSFILES_PUBLIC_BUCKET_URLS`` env var (``1/true/yes/on`` -> True,
+       ``0/false/no/off`` -> False; unrecognized non-empty values log a WARNING
+       and evaluate as False).
+    2. ``workspace_files.public_bucket_urls`` in merged Dalton YAML (default False).
+    """
+    em = _env_map(env)
+    raw_env = em.get("DALTON_WSFILES_PUBLIC_BUCKET_URLS")
+    if raw_env is not None:
+        cleaned = raw_env.strip().lower()
+        if cleaned:
+            if cleaned in _TRUTHY:
+                return True
+            if cleaned in _FALSY:
+                return False
+            logger.warning(
+                "Invalid DALTON_WSFILES_PUBLIC_BUCKET_URLS=%r; treating as False "
+                "(expected 1/true/yes/on or 0/false/no/off)",
+                raw_env,
+            )
+            return False
+
+    section = _load_dalton_workspace_files_raw(_active_profile(em))
+    yaml_val = section.get("public_bucket_urls", False)
+    if isinstance(yaml_val, bool):
+        return yaml_val
+    if isinstance(yaml_val, str):
+        norm = yaml_val.strip().lower()
+        if norm in _TRUTHY:
+            return True
+        if norm in _FALSY:
+            return False
+    return bool(yaml_val)
+
+
 def _clean_string_list(raw: Any) -> list[str]:
     if not isinstance(raw, (list, tuple)):
         return []

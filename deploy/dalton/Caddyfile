@@ -117,6 +117,38 @@
 		}
 	}
 
+	# 1b. Read-only avatar proxy (GET/HEAD /storage/avatars/* -> MinIO current version only,
+	#     stripping versionId); every other /storage/* path or method returns 404.
+	@storage_avatars {
+		method GET HEAD
+		path /storage/avatars/*
+		not path /storage/avatars/
+	}
+	handle @storage_avatars {
+		route {
+			uri query -versionId
+			uri query -versionid
+			uri query -VersionId
+			uri strip_prefix /storage
+			rewrite * /dalton-main{path}
+			request_header -X-Service-Token
+			request_header -X-User-Id
+			request_header -Authorization
+			request_header -Cookie
+			reverse_proxy minio:9000 {
+				header_up -X-Service-Token
+				header_up -X-User-Id
+				header_up -Authorization
+				header_up -Cookie
+			}
+		}
+	}
+
+	@storage_blocked path /storage /storage/*
+	handle @storage_blocked {
+		respond 404
+	}
+
 	# 2. Build version manifest (/version.json): never cached, never SPA-fallback (must 404 when absent).
 	@version_manifest {
 		method GET HEAD

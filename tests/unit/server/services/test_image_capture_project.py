@@ -48,6 +48,8 @@ async def test_capture_reads_the_project_folder_outside_the_run_context(monkeypa
     project = ProjectContext('ws-a', 'alpha-ab12')
     assert current_project() is None
     monkeypatch.setattr('src.server.services.persistence.image_capture.is_storage_enabled', lambda: True)
+    # DALTON-HOOK(storage-private-bucket-urls): opt into public bucket URLs to exercise upstream late capture
+    monkeypatch.setenv('DALTON_WSFILES_PUBLIC_BUCKET_URLS', '1')
     monkeypatch.setattr('ptc_agent.agent.middleware.image_capture.upload_bytes', lambda *args: True)
     monkeypatch.setattr('ptc_agent.agent.middleware.image_capture.get_public_url', lambda key: 'https://images.example/'+key)
     placement = AsyncMock(return_value=SimpleNamespace(

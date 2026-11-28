@@ -667,6 +667,8 @@ web/src/pages/SharedChat/__tests__/SharedChatView.filePanelDownload.redaction.te
 web/src/pages/ChatAgent/components/__tests__/ThreadSharePanel.redaction.test.tsx
 # workspace-file-storage (Batch 1 Step 2): frontend download-ticket unit test.
 web/src/pages/ChatAgent/utils/api/__tests__/files.dlToken.test.ts
+# workspace-file-storage (Batch 1 Step 4): Playwright E2E spec.
+web/e2e/workspace-file-storage.spec.js
 # Prod-audit-2 Batch 3 (§5 & §6): web phase/tool-boundary/continuation folding & discard id mismatch tests.
 web/src/pages/ChatAgent/components/messageList/__tests__/deliverablePhaseFold.test.ts
 web/src/pages/ChatAgent/session/stream/__tests__/messageDiscardedMismatch.test.ts

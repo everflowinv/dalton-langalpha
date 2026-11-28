@@ -175,14 +175,18 @@ async def build_attachment_metadata(
         else f"private-media/attachments/{batch_id}"
     )
 
+    # DALTON-HOOK(storage-private-bucket-urls): omit direct bucket attachment URLs when public_bucket_urls=false
+    from src.dalton.private_bucket_urls import allow_public_bucket_attachment_urls
+    emit_public_urls = allow_public_bucket_attachment_urls()
+
     async def entry(att: TurnAttachment) -> Dict[str, Any]:
         meta: Dict[str, Any] = {"name": att.name, "type": att.kind, "size": att.size}
         source = att.source
         if not isinstance(source, InlineSource):
-            if source.object_key:
+            if source.object_key and emit_public_urls:
                 meta["url"] = _object_url(source.object_key)
             return meta
-        if is_storage_enabled():
+        if is_storage_enabled() and emit_public_urls:
             # The key's extension comes off the type as a data URL states it.
             safe_key = sanitize_storage_key(att.name, f"data:{att.mime_type};")
             # Its own folder: two files of one name in a turn are two objects.

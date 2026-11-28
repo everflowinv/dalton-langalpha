@@ -574,6 +574,7 @@ ALLOWED_HOOKS=(
   "workspace-file-write-mode"
   "workspace-file-exclusions"
   "workspace-file-download-ticket"
+  "storage-private-bucket-urls"
   # Prod Audit 2 Batch 1 (§4): Redis write-timeout diagnostics (InstrumentedAsyncConnection,
   # per-worker client windows, dedicated PG advisory-lock leader sampler, and heavy_task tags).
   "redis-write-diag"
