@@ -40,6 +40,8 @@ import { withServerTotals } from '../tokenUsage';
 import { BUSY_REPLY_KEYS, isBusyCode } from '../../hooks/utils/forkRefusal';
 import {
   handleReasoningSignal, handleReasoningContent, handleTextContent,
+  // DALTON-HOOK(empty-turn-guard): live message_discarded handler
+  handleMessageDiscarded,
   handleToolCalls, handleToolCallResult, handleToolCallChunks,
   handleHtmlWidget, handlePlanBilled, handleCliQueue,
 } from './mainEventHandlers';
@@ -344,8 +346,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // Each image the reply streamed as a path, and where it was captured:
       // the copy the reply showed, which a later rewrite of the file leaves.
       const images = event.images;
-      if (images && Object.keys(images).length) {
-        queueMessagesForHandlers((prev) => pinCapturedImages(prev, assistantMessageId, images));
+      const imagesByMessage = event.images_by_message; // DALTON-HOOK(deliverable-text): per-segment run_end images
+      if ((images && Object.keys(images).length) || (imagesByMessage && Object.keys(imagesByMessage).length)) {
+        queueMessagesForHandlers((prev) => pinCapturedImages(prev, assistantMessageId, images ?? {}, imagesByMessage));
       }
       if (event.outcome === 'cancelled') {
         // Stopped by the account's suspension rather than by its user: the
@@ -939,12 +942,25 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           setMessages: queueMessagesForHandlers,
           eventId,
           phase: event.phase,
+          // DALTON-HOOK(empty-turn-guard): pass server message id and continuation link for retraction and folding
+          messageId: typeof event.id === 'string' ? event.id : undefined,
+          continuedFromMessageId: typeof event.continued_from_message_id === 'string' ? event.continued_from_message_id : undefined,
         })) {
           return;
         }
       }
 
       // Skip other content types
+      return;
+    } else if (eventType === 'message_discarded') {
+      // DALTON-HOOK(empty-turn-guard): retract streamed text fragments matching final or stream chunk id
+      handleMessageDiscarded({
+        assistantMessageId,
+        discardedMessageId: typeof event.id === 'string' ? event.id : undefined,
+        discardedStreamId: typeof event.stream_id === 'string' ? event.stream_id : undefined,
+        discardedMessageIds: Array.isArray(event.ids) ? event.ids.filter((x): x is string => typeof x === 'string') : undefined,
+        setMessages: setMessagesForHandlers,
+      });
       return;
     } else if (eventType === 'error' || event.error) {
       // DALTON-HOOK(provenance-batch): flush buffered provenance immediately on turn error

@@ -557,6 +557,9 @@ export async function loadConversationHistory(
             setMessages: setMessagesForHandlers,
             eventId: event._eventId as number | undefined,
             phase: event.phase,
+            // DALTON-HOOK(deliverable-text): preserve server messageId and continuation link on replay
+            messageId: typeof event.id === 'string' ? event.id : undefined,
+            continuedFromMessageId: typeof event.continued_from_message_id === 'string' ? event.continued_from_message_id : undefined,
           });
           return;
         }

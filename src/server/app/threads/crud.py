@@ -361,6 +361,8 @@ class ThreadOutputResponse(BaseModel):
     workspace_id: Optional[str]
     status: str
     text: str
+    # DALTON-HOOK(deliverable-text): current turn's own deliverable answer ("" when empty)
+    answer: Optional[str] = None
 
 
 @router.get("/{thread_id}/output", response_model=ThreadOutputResponse)

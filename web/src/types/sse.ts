@@ -38,6 +38,8 @@ export type SSEEventType =
   | 'steering_delivered'
   // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
   | 'steering_returned'
+  // DALTON-HOOK(empty-turn-guard): live retraction of a discarded retried fragment
+  | 'message_discarded'
   | 'task_steering_accepted'
   | 'interrupt'
   | 'finish'
@@ -47,6 +49,10 @@ export type SSEEventType =
 export interface BaseSSEEvent {
   event: SSEEventType;
   agent?: string;
+  // DALTON-HOOK(empty-turn-guard): server AIMessage.id / stream chunk ids carried by message_chunk / message_discarded
+  id?: string;
+  stream_id?: string;
+  ids?: string[];
   _eventId?: number | string;
   timestamp?: string | number;
 }
@@ -86,6 +92,8 @@ export interface MessageChunkEvent extends BaseSSEEvent {
   finish_reason?: string | null;
   /** OpenAI Responses text-block phase. Absent on every other provider. */
   phase?: 'commentary' | 'final_answer';
+  // DALTON-HOOK(deliverable-text): output_cap continuation predecessor message id
+  continued_from_message_id?: string;
 }
 
 export interface ToolCallData {

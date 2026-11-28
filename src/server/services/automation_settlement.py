@@ -842,9 +842,11 @@ async def settle_by_run(
                 )
                 answer = RunAnswer()
         excerpt = (plain_excerpt(answer.text) or None) if answer.text else None
-        # A run that sent its result last wrote something else, such as
-        # where it sent it: the chats it didn't reach get that result.
-        final_text = answer.sent or answer.text
+        # DALTON-HOOK(deliverable-text): resolve empty-text automation excerpt from dalton_channel_deliveries truth and order extracted_text -> sent
+        from src.dalton.channels.deliverable_text import resolve_automation_final_text, resolve_completed_automation_excerpt_from_db
+        if excerpt is None:
+            excerpt = await resolve_completed_automation_excerpt_from_db(execution_id, answer=answer, excerpt=excerpt, thread_id=thread_id, run_id=run_id)
+        final_text = resolve_automation_final_text(answer)
     # DALTON-HOOK(automation-subscription-fallback): surface subscription fallback notice in execution excerpt and delivery text
     from src.dalton.services.automation_subscription_fallback import apply_execution_fallback_notice
 

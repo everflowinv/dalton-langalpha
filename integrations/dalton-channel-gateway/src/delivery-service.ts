@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  computeSendPayloadDigest,
+  extractUnresolvedSandboxImagePaths,
+} from "./shared/deliverable-text.js";
 import { basename } from "node:path";
 import {
   type BackendClient,
@@ -153,6 +157,10 @@ export interface ExecuteDeliveryOptions {
   sourceScopeKey?: string | null;
   sourceGeneration?: number | null;
   activityOrigin?: DeliveryActivityOrigin | null;
+  retryDedupByTarget?: boolean;
+  payloadDigest?: string | null;
+  sourceMessageId?: string | null;
+  capturedImages?: Record<string, string> | null;
 }
 
 export interface FirstCurrentDeliveryInfo {
@@ -346,6 +354,10 @@ export class DeliveryService {
    * - Otherwise fallback hash: `${run_id}:notcid:${sha256(canonical_json({target, text, files, reply, new_thread}))}`
    */
   static makeAgentSendDeliveryKey(req: AgentSendRequest): string {
+    const idemp = (req.idempotency_key ?? "").trim();
+    if (idemp.length > 0) {
+      return idemp;
+    }
     const tcid = (req.tool_call_id ?? "").trim();
     if (tcid.length > 0) {
       return `${req.run_id}:${tcid}`;
@@ -505,6 +517,13 @@ export class DeliveryService {
       options.deliveryKey.startsWith("deliverables:") ||
       options.deliveryKey.startsWith("deliverables-links:");
 
+    const effectivePayloadDigest =
+      typeof options.payloadDigest === "string" && options.payloadDigest.trim().length > 0
+        ? options.payloadDigest.trim()
+        : options.kind === "agent_send"
+          ? computeSendPayloadDigest(options.text ?? "", files, options.workspaceId ?? null)
+          : null;
+
     let claim: I6AuthorizeAndClaimResponse;
     try {
       claim = await this.claimDeliveryWith503Retry({
@@ -523,6 +542,8 @@ export class DeliveryService {
         source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
         source_generation: options.sourceGeneration ?? null,
         activity_origin: options.activityOrigin ?? null,
+        ...(options.retryDedupByTarget ? { retry_dedup_by_target: true } : {}),
+        ...(effectivePayloadDigest ? { payload_digest: effectivePayloadDigest } : {}),
       });
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
@@ -2096,13 +2117,52 @@ export class DeliveryService {
         ? (chunkFailure?.errorDetail ?? fileFailureErrorDetail)
         : undefined;
 
+    const unresolvedImagePaths =
+      (options.kind === "fallback" || options.kind === "agent_send") &&
+      (finalStatus === "sent" || finalStatus === "partial")
+        ? extractUnresolvedSandboxImagePaths(options.text ?? "")
+        : [];
+
+    const sourceMessageId =
+      typeof options.sourceMessageId === "string" && options.sourceMessageId.trim().length > 0
+        ? options.sourceMessageId.trim()
+        : null;
+    const deliveryCapturedImages: Record<string, string> = {};
+    if (
+      options.capturedImages &&
+      typeof options.capturedImages === "object" &&
+      !Array.isArray(options.capturedImages)
+    ) {
+      for (const [k, v] of Object.entries(options.capturedImages)) {
+        if (k.length > 0 && typeof v === "string" && v.length > 0) {
+          deliveryCapturedImages[k] = v;
+        }
+      }
+    }
+
+    const firstResponsePayload: Record<string, unknown> = {
+      ...(responseObj as unknown as Record<string, unknown>),
+      ...(unresolvedImagePaths.length > 0
+        ? {
+            unresolved_sandbox_images: true,
+            unresolved_sandbox_image_paths: unresolvedImagePaths,
+            delivered_text: options.text ?? "",
+            ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
+            ...(Object.keys(deliveryCapturedImages).length > 0
+              ? { captured_images: deliveryCapturedImages }
+              : {}),
+          }
+        : {}),
+      ...(effectivePayloadDigest ? { payload_digest: effectivePayloadDigest } : {}),
+    };
+
     await recordProgress({
       delivery_key: options.deliveryKey,
       sent_chunks: sentChunks,
       total_chunks: totalChunks,
       platform_message_ids: platformMessageIds,
       files_status: fileOutcomes,
-      first_response_json: responseObj as unknown as Record<string, unknown>,
+      first_response_json: firstResponsePayload,
       status: finalStatus,
       error_code: recordedErrorCode,
       ...(recordedErrorDetail ? { error_detail: recordedErrorDetail } : {}),

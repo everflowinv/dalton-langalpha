@@ -2101,8 +2101,10 @@ def get_stop_backup_close_timeout_s() -> float:
     )
 
 
-def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool = True) -> bool:
-    """Resolve a channel runtime switch from ``env_var`` -> merged YAML ``channels.<yaml_key>`` -> ``default``.
+def _parse_bool_env_or_section_yaml(
+    env_var: str, section: str, yaml_key: str, default: bool = True
+) -> bool:
+    """Resolve a runtime switch from ``env_var`` -> merged YAML ``<section>.<yaml_key>`` -> ``default``.
 
     Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
     for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
@@ -2115,10 +2117,15 @@ def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool 
         if cleaned in ("1", "true", "yes", "on"):
             return True
     raw_yaml = _load_profile_dalton_raw(resolve_profile())
-    channels_cfg = raw_yaml.get("channels")
-    if isinstance(channels_cfg, Mapping) and isinstance(channels_cfg.get(yaml_key), bool):
-        return bool(channels_cfg[yaml_key])
+    section_cfg = raw_yaml.get(section)
+    if isinstance(section_cfg, Mapping) and isinstance(section_cfg.get(yaml_key), bool):
+        return bool(section_cfg[yaml_key])
     return bool(default)
+
+
+def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool = True) -> bool:
+    """Resolve a channel runtime switch from ``env_var`` -> merged YAML ``channels.<yaml_key>`` -> ``default``."""
+    return _parse_bool_env_or_section_yaml(env_var, "channels", yaml_key, default=default)
 
 
 def is_channel_interactive_actions_enabled() -> bool:
@@ -2159,34 +2166,33 @@ def is_redis_diagnostics_enabled() -> bool:
     )
 
 
+def is_strict_deliverable_text_enabled() -> bool:
+    """Switch for unified strict deliverable-text extraction (``DALTON_STRICT_DELIVERABLE_TEXT``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_STRICT_DELIVERABLE_TEXT",
+        "strict_deliverable_text_enabled",
+        default=True,
+    )
+
+
+def is_near_empty_retry_enabled() -> bool:
+    """Switch for near-empty reply retry detection (``DALTON_NEAR_EMPTY_RETRY_ENABLED``)."""
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_NEAR_EMPTY_RETRY_ENABLED",
+        "llm",
+        "near_empty_retry_enabled",
+        default=True,
+    )
+
+
+
+
 def get_redis_diag_ops_dir() -> Path:
     """Return directory for per-worker/server Redis diagnostics JSON files (default ``var/dalton/ops``)."""
     raw = os.getenv("DALTON_REDIS_DIAG_DIR", "").strip()
     if raw:
         return Path(raw).expanduser()
     return REPO_ROOT / "var" / "dalton" / "ops"
-
-
-def _parse_bool_env_or_section_yaml(
-    env_var: str, section: str, yaml_key: str, default: bool = True
-) -> bool:
-    """Resolve a boolean switch from ``env_var`` -> merged YAML ``<section>.<yaml_key>`` -> ``default``.
-
-    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
-    for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
-    """
-    raw = os.getenv(env_var)
-    if raw is not None and raw.strip():
-        cleaned = raw.strip().lower()
-        if cleaned in ("0", "false", "no", "off"):
-            return False
-        if cleaned in ("1", "true", "yes", "on"):
-            return True
-    raw_yaml = _load_profile_dalton_raw(resolve_profile())
-    sec_cfg = raw_yaml.get(section)
-    if isinstance(sec_cfg, Mapping) and isinstance(sec_cfg.get(yaml_key), bool):
-        return bool(sec_cfg[yaml_key])
-    return bool(default)
 
 
 def is_monitor_verify_readback_enabled() -> bool:

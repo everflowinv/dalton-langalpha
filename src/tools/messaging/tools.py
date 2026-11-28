@@ -596,6 +596,11 @@ async def _send(
         "reply": bool(reply),
         "new_thread": bool(new_thread),
     }
+    # DALTON-HOOK(empty-turn-guard): attach payload digest and durable retry-send idempotency metadata
+    from src.dalton.llm.near_empty_reply import aattach_retry_send_dedup
+    body = await aattach_retry_send_dedup(
+        body, run_id=turn["run_id"], tool_call_id=tool_call_id, thread_id=turn["thread_id"]
+    )
     # An automation's turn names its run, so the send may reach the run's targets.
     execution_id = _sends_for(config, body["target"])
     if execution_id:

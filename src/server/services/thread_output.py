@@ -402,6 +402,8 @@ class ThreadOutput(NamedTuple):
     #: ``running`` while a turn streams, else the thread's stored status.
     status: str
     text: str
+    # DALTON-HOOK(deliverable-text): explicit current-turn deliverable answer (empty string when current turn has no text)
+    answer: str = ""
 
 
 async def extract_text_from_thread(
@@ -445,13 +447,15 @@ async def extract_text_from_thread(
         # row's run stream directly. Resolving through local BTM state can
         # pick a retained terminal LocalRunExecution from a prior run on this worker
         # while the live run executes elsewhere (v4 2.4c review F6).
-        text = await _extract_from_redis(
+        raw_text = await _extract_from_redis(
             thread_id, str(active_run["conversation_response_id"])
         )
+        qualified = _qualify_file_paths(raw_text, workspace_id, *where)
+        answer = qualified
         text = _truncate_single(
             _run_block(
                 active_run,
-                _qualify_file_paths(text, workspace_id, *where),
+                qualified,
                 zone,
             )
         )
@@ -472,8 +476,10 @@ async def extract_text_from_thread(
             room = MAX_OUTPUT_CHARS - len(blocks[1]) - len(_TURN_SEPARATOR)
             blocks[0] = _truncate_within(blocks[0], room)
         text = _join_recent_turns(blocks)
+        # DALTON-HOOK(deliverable-text): expose current turn's own deliverable answer explicitly ("" when empty)
+        answer = _qualify_file_paths(runs[-1]["main_text"], workspace_id, *where) if runs else ""
 
-    return ThreadOutput(workspace_id=workspace_id or None, status=status, text=text)
+    return ThreadOutput(workspace_id=workspace_id or None, status=status, text=text, answer=answer)
 
 
 def _run_block(run: dict[str, Any], text: str, zone: Zone) -> str:
@@ -531,6 +537,10 @@ async def _extract_from_redis(thread_id: str, run_id: str) -> str:
         return ""
 
     chunks: list[str] = []
+    # DALTON-HOOK(deliverable-text): accumulate final deliverable text from Redis stream events
+    from src.dalton.channels.deliverable_text import DeliverableTextAccumulator
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+    strict_acc = DeliverableTextAccumulator() if is_strict_deliverable_text_enabled() else None
     # XREVRANGE returns newest first; reverse so chunks concatenate in order.
     for _entry_id, fields in reversed(entries or []):
         raw = fields.get(b"event")
@@ -544,6 +554,9 @@ async def _extract_from_redis(thread_id: str, run_id: str) -> str:
         if parsed is None:
             continue
         event_type, data = parsed
+        if strict_acc is not None:
+            strict_acc.push_event(event_type, data)
+            continue
         if (
             event_type == "message_chunk"
             and isinstance(data, dict)
@@ -553,7 +566,7 @@ async def _extract_from_redis(thread_id: str, run_id: str) -> str:
             if content:
                 chunks.append(content)
 
-    return "".join(chunks)
+    return strict_acc.result().text if strict_acc is not None else "".join(chunks)
 
 
 async def _with_main_text(
@@ -594,7 +607,9 @@ async def _runs_to_read(thread_id: str, turns: int = 1) -> list[dict[str, Any]]:
     runs = await _with_main_text(
         thread_id, await get_recent_responses_for_thread(thread_id, limit=1)
     )
-    if not runs or runs[0]["main_text"]:
+    # DALTON-HOOK(deliverable-text): under strict mode never attach an earlier turn's text onto an empty current turn
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+    if not runs or runs[0]["main_text"] or is_strict_deliverable_text_enabled():
         return runs
     window = await _with_main_text(
         thread_id,

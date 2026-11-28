@@ -16,6 +16,8 @@ import { appendNotificationSegmentOnce } from '../../hooks/utils/messageFinalize
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
 // DALTON-HOOK(provenance-batch): single-copy provenance record merge helper
 import { mergeProvenanceRecords } from './provenanceBatch';
+// DALTON-HOOK(deliverable-text): explicit-ID message_discarded retraction helper
+import { collectDiscardedIds, retractDiscardedSegmentsOnMessage } from '@/lib/dalton/streamDiscard';
 import { appendTextChunk } from './textChunks';
 import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from './toolCallChunks';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
@@ -170,7 +172,7 @@ export function handleReasoningContent({ assistantMessageId, content, refs, setM
  * @param {Function} params.setMessages - State setter for messages
  * @returns {boolean} True if event was handled
  */
-export function handleTextContent({ assistantMessageId, content, finishReason, stop = true, refs, setMessages, eventId, phase }: {
+export function handleTextContent({ assistantMessageId, content, finishReason, stop = true, refs, setMessages, eventId, phase, messageId, continuedFromMessageId }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
@@ -180,6 +182,9 @@ export function handleTextContent({ assistantMessageId, content, finishReason, s
   setMessages: SetMessages;
   eventId?: number | null;
   phase?: TextSegment['phase'];
+  // DALTON-HOOK(empty-turn-guard): server AIMessage.id and continuation link for text segments
+  messageId?: string;
+  continuedFromMessageId?: string;
 }): boolean {
   const { contentOrderCounterRef } = refs;
 
@@ -221,7 +226,8 @@ export function handleTextContent({ assistantMessageId, content, finishReason, s
       prev.map((msg: MessageRecord) => {
         if (msg.id !== assistantMessageId) return msg;
 
-        const newSegments = appendTextChunk((msg.contentSegments as ContentSegment[]) || [], content, currentOrder, phase);
+        // DALTON-HOOK(empty-turn-guard): preserve server messageId and continuation link on text segments
+        const newSegments = appendTextChunk((msg.contentSegments as ContentSegment[]) || [], content, currentOrder, phase, messageId, continuedFromMessageId);
 
         const accumulatedText = ((msg.content as string) || '') + content;
 
@@ -247,6 +253,14 @@ export function handleTextContent({ assistantMessageId, content, finishReason, s
     return true;
   }
   return false;
+}
+
+// DALTON-HOOK(deliverable-text): delegate message_discarded retraction to Dalton module (explicit ID match only)
+export function handleMessageDiscarded({ assistantMessageId, discardedMessageId, discardedStreamId, discardedMessageIds, setMessages }: { assistantMessageId: string; discardedMessageId?: string; discardedStreamId?: string; discardedMessageIds?: string[]; setMessages: SetMessages; }): boolean {
+  const ids = collectDiscardedIds({ discardedMessageId, discardedStreamId, discardedMessageIds });
+  if (ids.size === 0) return false;
+  setMessages((prev: MessageRecord[]) => prev.map((msg: MessageRecord) => (msg.id === assistantMessageId ? retractDiscardedSegmentsOnMessage(msg, ids) : msg)));
+  return true;
 }
 
 /**

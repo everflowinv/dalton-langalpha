@@ -579,6 +579,9 @@ ALLOWED_HOOKS=(
   "redis-write-diag"
   # Prod Audit 2 Batch 3 (§5, pre-registered in Batch 1): unified deliverable-text contract
   # across checkpoint projection, SSE producer, and channel gateway.
+  # Prod-audit-2 Batch 3 (§5 & §6): unified deliverable-text extraction, phase/close_out/continuation
+  # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
+  # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
 )
 
