@@ -243,24 +243,24 @@ def inspect_tarball(
                     )
 
             rel_posix = "/".join(rel_parts)
-            exempt_ci_content = bool(is_ci_test_exempt is not None and is_ci_test_exempt(rel_posix))
+            exempt_ci_content = bool(
+                member.isfile() and is_ci_test_exempt is not None and is_ci_test_exempt(rel_posix)
+            )
 
-            if not exempt_ci_content:
-                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
-                    if pattern.search(member.name):
-                        violations.append(
-                            f"forbidden proprietary member path ({rule_name}): {member.name}"
-                        )
+            for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                if pattern.search(member.name):
+                    violations.append(
+                        f"forbidden proprietary member path ({rule_name}): {member.name}"
+                    )
 
             if (member.issym() or member.islnk()) and member.linkname:
                 link_target = member.linkname
-                if not exempt_ci_content:
-                    for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
-                        if pattern.search(link_target):
-                            violations.append(
-                                f"forbidden proprietary link target ({rule_name}): "
-                                f"{member.name} -> {link_target}"
-                            )
+                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                    if pattern.search(link_target):
+                        violations.append(
+                            f"forbidden proprietary link target ({rule_name}): "
+                            f"{member.name} -> {link_target}"
+                        )
                 if link_target.endswith(".dalton.yaml") or link_target.endswith(
                     "everflow_defaults.yaml"
                 ):

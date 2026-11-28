@@ -283,12 +283,14 @@ def build_dalton_skill_definitions(
     definitions: dict[str, SkillDefinition] = {}
     for name, command, requires in _DALTON_SKILL_SPECS:
         if (
-            DALTON_SKILL_CAPABILITY_MAP.get(name) is not None
+            is_core_profile()
+            and DALTON_SKILL_CAPABILITY_MAP.get(name) is not None
             and not (skills_dir / name / "SKILL.md").is_file()
         ):
             # The core release package strips Everflow-only skills
-            # (scripts/standalone/package_release.sh DENY_PATHS); a skill that
-            # needs a capability is simply absent there. Core skills still fail loud.
+            # (scripts/standalone/package_release.sh DENY_PATHS); only under the
+            # core profile is a stripped capability-gated skill omitted. Core
+            # skills and Everflow deployments still fail loud on missing SKILL.md.
             continue
         definitions[name] = SkillDefinition(
             name=name,

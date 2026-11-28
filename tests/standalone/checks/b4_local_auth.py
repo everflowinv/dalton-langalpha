@@ -65,6 +65,10 @@ def _extract_cookie(headers: dict[str, str], cookie_name: str) -> str:
     return ""
 
 
+def _cookie_value(cookie_pair: str) -> str:
+    return cookie_pair.split("=", 1)[1].strip() if "=" in cookie_pair else cookie_pair.strip()
+
+
 def _ws_handshake(
     base_url: str,
     path: str,
@@ -275,11 +279,13 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
     status_before = _lib.http_request("GET", f"{base}/api/v1/dalton/bootstrap/status")
     _assert(
         status_before.status == 200 and status_before.json().get("needs_bootstrap") is True,
-        f"Expected needs_bootstrap=true before setup, got {status_before.status} {status_before.text}",
+        f"Expected needs_bootstrap=true before setup, got status={status_before.status}, "
+        f"fields={_lib.response_fields(status_before)}",
     )
 
     admin_email = f"admin-{secrets.token_hex(4)}@core.local"
     admin_password = f"AdminPass!{secrets.token_hex(6)}"
+    _lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", admin_password)
 
     # Wrong bootstrap token is rejected
     wrong_resp = _lib.http_request(
@@ -310,23 +316,35 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
     )
     _assert(
         boot_resp.status == 201,
-        f"Expected 201 on first admin bootstrap, got {boot_resp.status}: {boot_resp.text}",
+        f"Expected 201 on first admin bootstrap, got status={boot_resp.status}, "
+        f"fields={_lib.response_fields(boot_resp)}",
     )
     boot_data = boot_resp.json()
     admin_token = str(boot_data.get("access_token") or "")
+    _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", admin_token)
     admin_user = boot_data.get("user") or {}
     admin_uid = str(admin_user.get("user_id") or "")
-    _assert(bool(admin_token) and bool(admin_uid), "Bootstrap response missing access_token/user_id")
-    _assert(admin_user.get("tier") == "admin", f"Expected admin tier, got {admin_user}")
+    _assert(
+        bool(admin_token) and bool(admin_uid),
+        f"Bootstrap response missing access_token/user_id "
+        f"(status={boot_resp.status}, fields={_lib.response_field_names(boot_data)})",
+    )
+    _assert(
+        admin_user.get("tier") == "admin",
+        f"Expected admin tier (status={boot_resp.status}, "
+        f"user_fields={_lib.response_field_names(admin_user)})",
+    )
 
     refresh_cookie_1 = _extract_cookie(boot_resp.headers, "dalton_refresh_token")
+    _lib.record_runtime_secret("LOCAL_REFRESH_COOKIE", _cookie_value(refresh_cookie_1))
     _assert(bool(refresh_cookie_1), "Bootstrap response missing dalton_refresh_token Set-Cookie")
 
     # Status now permanently false, repeat POST permanently 409
     status_after = _lib.http_request("GET", f"{base}/api/v1/dalton/bootstrap/status")
     _assert(
         status_after.status == 200 and status_after.json().get("needs_bootstrap") is False,
-        f"Expected needs_bootstrap=false after setup, got {status_after.status} {status_after.text}",
+        f"Expected needs_bootstrap=false after setup, got status={status_after.status}, "
+        f"fields={_lib.response_fields(status_after)}",
     )
     repeat_resp = _lib.http_request(
         "POST",
@@ -351,7 +369,8 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
     _assert(
         me_resp.status == 200
         and (me_resp.json().get("user") or {}).get("user_id") == admin_uid,
-        f"Expected 200 with the bootstrapped admin on /users/me, got {me_resp.status}: {me_resp.text}",
+        f"Expected 200 with the bootstrapped admin on /users/me, got status={me_resp.status}, "
+        f"fields={_lib.response_fields(me_resp)}",
     )
 
     # Refresh cookie rotation: cookie 1 -> cookie 2 (distinct) -> cookie 3 (distinct)
@@ -360,11 +379,16 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
         f"{base}/api/v1/dalton/auth/local/refresh",
         headers={"Cookie": refresh_cookie_1, "Origin": base},
     )
+    refresh_data_1 = refresh_resp_1.json() if refresh_resp_1.status == 200 else {}
+    if isinstance(refresh_data_1, dict):
+        _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", str(refresh_data_1.get("access_token") or ""))
     _assert(
-        refresh_resp_1.status == 200 and bool(refresh_resp_1.json().get("access_token")),
-        f"Expected 200 on first cookie refresh, got {refresh_resp_1.status}: {refresh_resp_1.text}",
+        refresh_resp_1.status == 200 and bool(refresh_data_1.get("access_token")),
+        f"Expected 200 on first cookie refresh, got status={refresh_resp_1.status}, "
+        f"fields={_lib.response_fields(refresh_resp_1)}",
     )
     refresh_cookie_2 = _extract_cookie(refresh_resp_1.headers, "dalton_refresh_token")
+    _lib.record_runtime_secret("LOCAL_REFRESH_COOKIE", _cookie_value(refresh_cookie_2))
     _assert(
         bool(refresh_cookie_2) and refresh_cookie_2 != refresh_cookie_1,
         "Expected rotated dalton_refresh_token cookie distinct from initial cookie",
@@ -375,16 +399,22 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
         f"{base}/api/v1/dalton/auth/local/refresh",
         headers={"Cookie": refresh_cookie_2, "Origin": base},
     )
+    refresh_data_2 = refresh_resp_2.json() if refresh_resp_2.status == 200 else {}
+    refreshed_token = (
+        str(refresh_data_2.get("access_token") or "") if isinstance(refresh_data_2, dict) else ""
+    )
+    _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", refreshed_token)
     _assert(
-        refresh_resp_2.status == 200 and bool(refresh_resp_2.json().get("access_token")),
-        f"Expected 200 on second cookie refresh, got {refresh_resp_2.status}: {refresh_resp_2.text}",
+        refresh_resp_2.status == 200 and bool(refreshed_token),
+        f"Expected 200 on second cookie refresh, got status={refresh_resp_2.status}, "
+        f"fields={_lib.response_fields(refresh_resp_2)}",
     )
     refresh_cookie_3 = _extract_cookie(refresh_resp_2.headers, "dalton_refresh_token")
+    _lib.record_runtime_secret("LOCAL_REFRESH_COOKIE", _cookie_value(refresh_cookie_3))
     _assert(
         bool(refresh_cookie_3) and refresh_cookie_3 != refresh_cookie_2,
         "Expected second rotated dalton_refresh_token cookie distinct from previous cookie",
     )
-    refreshed_token = str(refresh_resp_2.json()["access_token"])
 
     # Short-lived HMAC WebSocket ticket succeeds (HTTP 101, stays open); raw JWT in ?ticket= fails
     ws_ticket_resp = _lib.http_request(
@@ -394,13 +424,16 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
     )
     _assert(
         ws_ticket_resp.status == 200,
-        f"Expected 200 minting WS ticket, got {ws_ticket_resp.status}: {ws_ticket_resp.text}",
+        f"Expected 200 minting WS ticket, got status={ws_ticket_resp.status}, "
+        f"fields={_lib.response_fields(ws_ticket_resp)}",
     )
     ws_ticket_data = ws_ticket_resp.json()
     ws_ticket = str(ws_ticket_data.get("ticket") or "")
+    _lib.record_runtime_secret("LOCAL_WS_TICKET", ws_ticket)
     _assert(
         bool(ws_ticket) and ws_ticket_data.get("expires_in") == 60,
-        f"Unexpected WS ticket payload: {ws_ticket_data}",
+        f"Unexpected WS ticket payload (status={ws_ticket_resp.status}, "
+        f"fields={_lib.response_field_names(ws_ticket_data)})",
     )
     ws_ok_status, ws_ok_close = _ws_handshake(
         base,
@@ -429,12 +462,20 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
         f"{base}/api/v1/dalton/auth/local/login",
         json_body={"identifier": admin_email, "password": admin_password},
     )
-    _assert(
-        login_resp.status == 200 and login_resp.json().get("user", {}).get("tier") == "admin",
-        f"Expected 200 on admin login, got {login_resp.status}",
+    login_data = login_resp.json() if login_resp.status == 200 else {}
+    logout_session_token = (
+        str(login_data.get("access_token") or "") if isinstance(login_data, dict) else ""
     )
-    logout_session_token = str(login_resp.json()["access_token"])
+    _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", logout_session_token)
+    _assert(
+        login_resp.status == 200
+        and bool(logout_session_token)
+        and (login_data.get("user") or {}).get("tier") == "admin",
+        f"Expected 200 on admin login, got status={login_resp.status}, "
+        f"fields={_lib.response_fields(login_resp)}",
+    )
     logout_session_cookie = _extract_cookie(login_resp.headers, "dalton_refresh_token")
+    _lib.record_runtime_secret("LOCAL_REFRESH_COOKIE", _cookie_value(logout_session_cookie))
     _assert(bool(logout_session_cookie), "Admin login response missing refresh cookie")
 
     pre_logout_me = _lib.http_request(
@@ -451,7 +492,8 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
     )
     _assert(
         logout_resp.status == 200,
-        f"Expected 200 on logout, got {logout_resp.status}: {logout_resp.text}",
+        f"Expected 200 on logout, got status={logout_resp.status}, "
+        f"fields={_lib.response_fields(logout_resp)}",
     )
 
     post_logout_me = _lib.http_request(
@@ -498,12 +540,22 @@ def _check_tiered_invites_and_password_change(
         )
         _assert(
             inv_resp.status == 200,
-            f"Expected 200 creating {tier} invite, got {inv_resp.status}: {inv_resp.text}",
+            f"Expected 200 creating {tier} invite, got status={inv_resp.status}, "
+            f"fields={_lib.response_fields(inv_resp)}",
         )
         inv_data = inv_resp.json()
-        _assert(inv_data.get("tier") == tier, f"Expected invite tier={tier}, got {inv_data}")
         raw_token = str(inv_data.get("token") or "")
-        _assert(bool(raw_token), f"Invite response missing token for tier={tier}")
+        _lib.record_runtime_secret("LOCAL_INVITE_TOKEN", raw_token)
+        _assert(
+            inv_data.get("tier") == tier,
+            f"Expected invite tier={tier} (status={inv_resp.status}, "
+            f"fields={_lib.response_field_names(inv_data)})",
+        )
+        _assert(
+            bool(raw_token),
+            f"Invite response missing token for tier={tier} "
+            f"(status={inv_resp.status}, fields={_lib.response_field_names(inv_data)})",
+        )
 
         check_resp = _lib.http_request(
             "POST",
@@ -512,11 +564,13 @@ def _check_tiered_invites_and_password_change(
         )
         _assert(
             check_resp.status == 200 and check_resp.json().get("valid") is True,
-            f"Expected valid invite check for {tier}, got {check_resp.status}: {check_resp.text}",
+            f"Expected valid invite check for {tier}, got status={check_resp.status}, "
+            f"fields={_lib.response_fields(check_resp)}",
         )
 
         username = f"u_{tier}_{secrets.token_hex(3)}"
         password = f"MemberPass!{secrets.token_hex(6)}"
+        _lib.record_runtime_secret("LOCAL_MEMBER_PASSWORD", password)
         redeem_resp = _lib.http_request(
             "POST",
             f"{base}/api/v1/dalton/invites/redeem",
@@ -524,12 +578,14 @@ def _check_tiered_invites_and_password_change(
         )
         _assert(
             redeem_resp.status == 200,
-            f"Expected 200 redeeming {tier} invite, got {redeem_resp.status}: {redeem_resp.text}",
+            f"Expected 200 redeeming {tier} invite, got status={redeem_resp.status}, "
+            f"fields={_lib.response_fields(redeem_resp)}",
         )
         redeem_data = redeem_resp.json()
         _assert(
             redeem_data.get("tier") == tier,
-            f"Expected redeemed tier={tier}, got {redeem_data}",
+            f"Expected redeemed tier={tier} (status={redeem_resp.status}, "
+            f"fields={_lib.response_field_names(redeem_data)})",
         )
 
         # One-time use enforcement
@@ -551,17 +607,22 @@ def _check_tiered_invites_and_password_change(
         )
         _assert(
             login_resp.status == 200,
-            f"Expected 200 logging in {tier} invitee, got {login_resp.status}: {login_resp.text}",
+            f"Expected 200 logging in {tier} invitee, got status={login_resp.status}, "
+            f"fields={_lib.response_fields(login_resp)}",
         )
         login_data = login_resp.json()
+        member_access_token = str(login_data.get("access_token") or "")
+        _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", member_access_token)
         _assert(
-            login_data.get("user", {}).get("tier") == tier,
-            f"Expected logged-in user tier={tier}, got {login_data}",
+            bool(member_access_token) and login_data.get("user", {}).get("tier") == tier,
+            f"Expected logged-in user tier={tier} (status={login_resp.status}, "
+            f"fields={_lib.response_field_names(login_data)})",
         )
         login_cookie = _extract_cookie(login_resp.headers, "dalton_refresh_token")
+        _lib.record_runtime_secret("LOCAL_REFRESH_COOKIE", _cookie_value(login_cookie))
         _assert(bool(login_cookie), f"Missing refresh cookie on login for {tier}")
         created[tier] = (
-            str(login_data["access_token"]),
+            member_access_token,
             str(login_data["user"]["user_id"]),
             username,
             password,
@@ -576,9 +637,13 @@ def _check_tiered_invites_and_password_change(
         headers={"Authorization": f"Bearer {invited_admin_token}"},
         json_body={"tier": "internal"},
     )
+    inv_admin_data = inv_admin_create.json() if inv_admin_create.status == 200 else {}
+    if isinstance(inv_admin_data, dict):
+        _lib.record_runtime_secret("LOCAL_INVITE_TOKEN", str(inv_admin_data.get("token") or ""))
     _assert(
-        inv_admin_create.status == 200 and inv_admin_create.json().get("tier") == "internal",
-        f"Invited admin should be able to create internal invite, got {inv_admin_create.status}: {inv_admin_create.text}",
+        inv_admin_create.status == 200 and inv_admin_data.get("tier") == "internal",
+        f"Invited admin should be able to create internal invite, got status={inv_admin_create.status}, "
+        f"fields={_lib.response_fields(inv_admin_create)}",
     )
 
     # Verify rotated cookie replay is refused (401 or 409 concurrent-grace conflict)
@@ -586,6 +651,14 @@ def _check_tiered_invites_and_password_change(
         "POST",
         f"{base}/api/v1/dalton/auth/local/refresh",
         headers={"Cookie": inv_admin_cookie, "Origin": base},
+    )
+    if inv_admin_rot.status == 200:
+        rot_data = inv_admin_rot.json()
+        if isinstance(rot_data, dict):
+            _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", str(rot_data.get("access_token") or ""))
+    _lib.record_runtime_secret(
+        "LOCAL_REFRESH_COOKIE",
+        _cookie_value(_extract_cookie(inv_admin_rot.headers, "dalton_refresh_token")),
     )
     _assert(
         inv_admin_rot.status == 200,
@@ -617,6 +690,7 @@ def _check_tiered_invites_and_password_change(
 
     # Password change revokes all existing sessions (old access token & old refresh cookie -> 401)
     new_internal_pass = f"ChangedPass!{secrets.token_hex(6)}"
+    _lib.record_runtime_secret("LOCAL_MEMBER_PASSWORD", new_internal_pass)
     chpwd_resp = _lib.http_request(
         "POST",
         f"{base}/api/v1/dalton/auth/local/change-password",
@@ -628,7 +702,8 @@ def _check_tiered_invites_and_password_change(
     )
     _assert(
         chpwd_resp.status == 200 and int(chpwd_resp.json().get("sessions_revoked") or 0) >= 1,
-        f"Expected 200 with sessions_revoked>=1 on change-password, got {chpwd_resp.status}: {chpwd_resp.text}",
+        f"Expected 200 with sessions_revoked>=1 on change-password, got status={chpwd_resp.status}, "
+        f"fields={_lib.response_fields(chpwd_resp)}",
     )
     old_token_me = _lib.http_request(
         "GET",
@@ -664,9 +739,21 @@ def _check_tiered_invites_and_password_change(
     )
     _assert(
         new_pass_login.status == 200,
-        f"Expected 200 logging in with new password, got {new_pass_login.status}: {new_pass_login.text}",
+        f"Expected 200 logging in with new password, got status={new_pass_login.status}, "
+        f"fields={_lib.response_fields(new_pass_login)}",
     )
-    new_internal_token = str(new_pass_login.json()["access_token"])
+    new_pass_data = new_pass_login.json()
+    new_internal_token = str(new_pass_data.get("access_token") or "")
+    _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", new_internal_token)
+    _lib.record_runtime_secret(
+        "LOCAL_REFRESH_COOKIE",
+        _cookie_value(_extract_cookie(new_pass_login.headers, "dalton_refresh_token")),
+    )
+    _assert(
+        bool(new_internal_token),
+        f"New-password login missing access_token (status={new_pass_login.status}, "
+        f"fields={_lib.response_field_names(new_pass_data)})",
+    )
 
     return new_internal_token, internal_uid, ext_token, ext_uid
 

@@ -324,8 +324,83 @@ SECRET_ENV_KEYS: tuple[str, ...] = (
     "EGRESS_RELAY_SECRET",
     "JWT_SIGNING_SECRET",
     "BOOTSTRAP_SETUP_TOKEN",
+    "DALTON_RESEARCH_HOST_TOKEN",
+    "DALTON_RESEARCH_ADMIN_TOKEN",
     OWNER_SECRET_ENV_KEY,
 )
+
+RUNTIME_SECRETS_ENV_VAR = "STANDALONE_RUNTIME_SECRETS_FILE"
+
+
+def response_field_names(payload: Any) -> str:
+    """Return a safe summary of JSON payload top-level field names (never values)."""
+    if isinstance(payload, dict):
+        return str(sorted(str(k) for k in payload.keys()))
+    return f"<{type(payload).__name__}>"
+
+
+def response_fields(resp: HttpResponse) -> str:
+    """Return a safe summary of an :class:`HttpResponse` JSON payload's field names only."""
+    try:
+        payload = resp.json()
+    except Exception:
+        return "<non-json>"
+    return response_field_names(payload)
+
+
+def record_runtime_secret(
+    label: str,
+    value: str,
+    *,
+    secrets_file: Path | None = None,
+) -> None:
+    """Append a runtime-generated secret to the 0600 sidecar file for leak scanning.
+
+    No-op when neither ``secrets_file`` nor ``STANDALONE_RUNTIME_SECRETS_FILE`` is set,
+    or when ``value`` is empty. Never logs or prints the secret value.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return
+    target = secrets_file
+    if target is None:
+        raw_path = (os.environ.get(RUNTIME_SECRETS_ENV_VAR) or "").strip()
+        if not raw_path:
+            return
+        target = Path(raw_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    record = json.dumps({"label": label, "value": cleaned}, ensure_ascii=False) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with fh:
+        fh.write(record)
+
+
+def load_runtime_secrets(secrets_file: Path | None) -> list[tuple[str, str]]:
+    """Load ``(label, value)`` pairs from a runtime-secrets JSONL file."""
+    if secrets_file is None or not secrets_file.is_file():
+        return []
+    loaded: list[tuple[str, str]] = []
+    for raw_line in secrets_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        label = str(obj.get("label") or "").strip()
+        val = str(obj.get("value") or "").strip()
+        if label and val:
+            loaded.append((label, val))
+    return loaded
 
 
 def ensure_oss_owner_secret(env_path: Path, *, num_bytes: int = 32) -> None:
@@ -438,23 +513,51 @@ def scan_artifacts_for_secrets(
     env_path: Path,
     *,
     min_secret_len: int = 12,
+    runtime_secrets_path: Path | None = None,
+    extra_secrets: Sequence[tuple[str, str]] | None = None,
 ) -> list[str]:
-    """Scan text/log files in ``artifacts_dir`` for any secret values from ``env_path``.
+    """Scan text/log files in ``artifacts_dir`` for secret values from ``env_path`` and runtime sources.
 
-    Never returns or logs the secret value itself — only ``<relpath>: leaked <KEY>``.
+    Covers all ``SECRET_ENV_KEYS`` in ``env_path`` (including Research Host tokens and
+    ``LANGALPHA_OWNER_SECRET``), plus any runtime-generated credentials (access tokens,
+    WebSocket tickets, invite tokens, refresh cookies, passwords) recorded in
+    ``runtime_secrets_path`` / ``STANDALONE_RUNTIME_SECRETS_FILE`` or passed via
+    ``extra_secrets``.
+
+    Never returns or logs any secret value — only ``<relpath>: leaked <KEY>``.
     """
     env_map = load_env_file(env_path)
-    secrets: list[tuple[str, str]] = []
+    secret_entries: list[tuple[str, str]] = []
     for key in SECRET_ENV_KEYS:
         val = (env_map.get(key) or "").strip()
         if len(val) >= min_secret_len:
-            secrets.append((key, val))
-    if not secrets or not artifacts_dir.is_dir():
+            secret_entries.append((key, val))
+
+    resolved_runtime_path = runtime_secrets_path
+    if resolved_runtime_path is None:
+        env_rt = (os.environ.get(RUNTIME_SECRETS_ENV_VAR) or "").strip()
+        if env_rt:
+            resolved_runtime_path = Path(env_rt)
+    for label, val in load_runtime_secrets(resolved_runtime_path):
+        if len(val) >= min_secret_len:
+            secret_entries.append((label, val))
+
+    if extra_secrets:
+        for label, raw_val in extra_secrets:
+            val = (raw_val or "").strip()
+            if label and len(val) >= min_secret_len:
+                secret_entries.append((label, val))
+
+    if not secret_entries or not artifacts_dir.is_dir():
         return []
 
+    skip_resolved = resolved_runtime_path.resolve() if resolved_runtime_path is not None else None
     hits: list[str] = []
+    seen_hits: set[tuple[str, str]] = set()
     for path in sorted(artifacts_dir.rglob("*")):
         if not path.is_file():
+            continue
+        if skip_resolved is not None and path.resolve() == skip_resolved:
             continue
         # Skip binary PostgreSQL custom dumps
         if path.suffix.lower() in (".dump", ".gz", ".tar", ".tgz", ".png", ".jpg"):
@@ -464,8 +567,9 @@ def scan_artifacts_for_secrets(
         except OSError:
             continue
         rel = str(path.relative_to(artifacts_dir))
-        for key, val in secrets:
-            if val in content:
+        for key, val in secret_entries:
+            if val in content and (rel, key) not in seen_hits:
+                seen_hits.add((rel, key))
                 hits.append(f"{rel}: leaked {key}")
     return hits
 

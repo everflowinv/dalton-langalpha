@@ -45,6 +45,7 @@ from src.server.utils import api as api_utils
 from tests.standalone.checks import _lib as standalone_lib
 from tests.standalone.checks import b1_dev_mode as b1_check
 from tests.standalone.checks import b2_backend_capabilities as b2_check
+from tests.standalone.checks import b4_local_auth as b4_check
 from tests.standalone.checks import b6_tls_backup_upgrade as b6_check
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -531,7 +532,203 @@ class TestStandaloneOssOwnerSecretHelpers:
         caddy_src = (REPO_ROOT / "deploy" / "standalone" / "Caddyfile").read_text(
             encoding="utf-8"
         )
-        assert "request>headers>X-Langalpha-Owner delete" in caddy_src
+        # Both global default/error logger and access-log snippet redact sensitive headers.
+        assert caddy_src.count("request>headers>X-Langalpha-Owner delete") >= 2
+        assert caddy_src.count("request>headers>X-LangAlpha-Owner delete") >= 2
+        assert caddy_src.count("request>headers>Authorization delete") >= 2
+        assert caddy_src.count("request>headers>Cookie delete") >= 2
+        assert "log default {" in caddy_src
+
+    def test_secret_scan_covers_research_host_and_runtime_credentials(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert "DALTON_RESEARCH_HOST_TOKEN" in standalone_lib.SECRET_ENV_KEYS
+        assert "DALTON_RESEARCH_ADMIN_TOKEN" in standalone_lib.SECRET_ENV_KEYS
+
+        rh_tok = "rh-host-token-secret-0123456789abcdef"
+        rh_adm = "rh-admin-token-secret-0123456789abcdef"
+        rt_jwt = "eyJhbGciOiJIUzI1NiJ9.runtime-access-token-secret"
+        rt_ws = "ws-ticket-runtime-secret-9876543210"
+        rt_inv = "invite-token-runtime-secret-abcdef1234"
+        rt_pwd = "AdminPass!runtime987654"
+
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            f"DALTON_RESEARCH_HOST_TOKEN={rh_tok}\nDALTON_RESEARCH_ADMIN_TOKEN={rh_adm}\n",
+            encoding="utf-8",
+        )
+        rt_file = tmp_path / "runtime-secrets.jsonl"
+        monkeypatch.setenv(standalone_lib.RUNTIME_SECRETS_ENV_VAR, str(rt_file))
+        standalone_lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", rt_jwt)
+        standalone_lib.record_runtime_secret("LOCAL_WS_TICKET", rt_ws)
+        standalone_lib.record_runtime_secret("LOCAL_INVITE_TOKEN", rt_inv)
+        standalone_lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", rt_pwd)
+        assert (rt_file.stat().st_mode & 0o777) == 0o600
+
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "check-output-local.txt").write_text(
+            f"a={rh_tok}\nb={rh_adm}\nc={rt_jwt}\nd={rt_ws}\ne={rt_inv}\nf={rt_pwd}\n",
+            encoding="utf-8",
+        )
+        leaks = standalone_lib.scan_artifacts_for_secrets(artifacts, env_file)
+        assert leaks == [
+            "check-output-local.txt: leaked DALTON_RESEARCH_HOST_TOKEN",
+            "check-output-local.txt: leaked DALTON_RESEARCH_ADMIN_TOKEN",
+            "check-output-local.txt: leaked LOCAL_ACCESS_TOKEN",
+            "check-output-local.txt: leaked LOCAL_WS_TICKET",
+            "check-output-local.txt: leaked LOCAL_INVITE_TOKEN",
+            "check-output-local.txt: leaked LOCAL_ADMIN_PASSWORD",
+        ]
+        for secret_val in (rh_tok, rh_adm, rt_jwt, rt_ws, rt_inv, rt_pwd):
+            assert all(secret_val not in hit for hit in leaks)
+
+    def test_auth_assertions_report_status_and_field_names_without_leaking_tokens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 1. b2 docstring documents manual-only local bootstrap warning
+        doc = b2_check._acquire_auth_session.__doc__ or ""
+        assert "local 分支会消耗一次性自举，仅供手动排查" in doc
+
+        # 2. b2 bootstrap & login assertions omit access_token value when user_id is missing
+        for var in (
+            "STANDALONE_ACCESS_TOKEN",
+            "STANDALONE_ADMIN_IDENTIFIER",
+            "STANDALONE_ADMIN_EMAIL",
+            "STANDALONE_ADMIN_PASSWORD",
+            "BOOTSTRAP_SETUP_TOKEN",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        boot_secret_jwt = "jwt-bootstrap-must-not-appear-in-assertion"
+
+        def _fake_boot_missing_uid(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> standalone_lib.HttpResponse:
+            _ = method, headers, json_body, data, timeout
+            if url.endswith("/api/v1/dalton/bootstrap/status"):
+                return _json_response(200, {"needs_bootstrap": True})
+            if url.endswith("/api/v1/dalton/capabilities"):
+                return _json_response(401, {"detail": "Missing authentication"})
+            if url.endswith("/api/v1/dalton/bootstrap/admin"):
+                return _json_response(201, {"access_token": boot_secret_jwt, "user": {}})
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(
+            b2_check._lib,
+            "http_request",
+            create_autospec(standalone_lib.http_request, side_effect=_fake_boot_missing_uid),
+        )
+        ctx = create_autospec(standalone_lib.ComposeContext, instance=True)
+        ctx.env = {"BOOTSTRAP_SETUP_TOKEN": "boot-secret-token"}
+        with pytest.raises(AssertionError) as boot_exc:
+            b2_check._acquire_auth_session(ctx, "http://127.0.0.1:8088")
+        assert boot_secret_jwt not in str(boot_exc.value)
+        assert "status=201" in str(boot_exc.value)
+        assert "access_token" in str(boot_exc.value)
+
+        # 2b. b2 login assertion omits access_token value when user_id is missing
+        login_secret_jwt = "jwt-login-must-not-appear-in-assertion"
+        monkeypatch.setenv("STANDALONE_ADMIN_EMAIL", "admin@core.local")
+        monkeypatch.setenv("STANDALONE_ADMIN_PASSWORD", "StrongPass!123456")
+
+        def _fake_login_missing_uid(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> standalone_lib.HttpResponse:
+            _ = method, headers, json_body, data, timeout
+            if url.endswith("/api/v1/dalton/bootstrap/status"):
+                return _json_response(200, {"needs_bootstrap": False})
+            if url.endswith("/api/v1/dalton/capabilities"):
+                return _json_response(401, {"detail": "Missing authentication"})
+            if url.endswith("/api/v1/dalton/auth/local/login"):
+                return _json_response(200, {"access_token": login_secret_jwt, "user": {}})
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(
+            b2_check._lib,
+            "http_request",
+            create_autospec(standalone_lib.http_request, side_effect=_fake_login_missing_uid),
+        )
+        with pytest.raises(AssertionError) as login_exc:
+            b2_check._acquire_auth_session(ctx, "http://127.0.0.1:8088")
+        assert login_secret_jwt not in str(login_exc.value)
+        assert "status=200" in str(login_exc.value)
+        assert "access_token" in str(login_exc.value)
+
+        # 3. b4 WS ticket assertion omits ticket value when expires_in is unexpected
+        ws_secret_ticket = "hmac-ws-ticket-must-not-appear-in-assertion"
+        refresh_count = {"n": 0}
+
+        def _fake_b4_http(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> standalone_lib.HttpResponse:
+            _ = method, headers, data, timeout
+            if url.endswith("/bootstrap/status"):
+                return _json_response(200, {"needs_bootstrap": refresh_count["n"] == 0})
+            if url.endswith("/bootstrap/admin"):
+                if (json_body or {}).get("bootstrap_token") == "wrong-bootstrap-token":
+                    return _json_response(401, {"detail": "invalid"})
+                if refresh_count["n"] == 0:
+                    refresh_count["n"] = 1
+                    return standalone_lib.HttpResponse(
+                        status=201,
+                        headers={"set-cookie": "dalton_refresh_token=rcookie1-secret; HttpOnly"},
+                        body=json.dumps(
+                            {
+                                "access_token": "adm-tok-secret-1",
+                                "user": {"user_id": "uid-1", "tier": "admin"},
+                            }
+                        ).encode("utf-8"),
+                    )
+                return _json_response(409, {"detail": "already bootstrapped"})
+            if url.endswith("/users/me"):
+                return _json_response(200, {"user": {"user_id": "uid-1"}})
+            if url.endswith("/auth/local/refresh"):
+                refresh_count["n"] += 1
+                idx = refresh_count["n"]
+                return standalone_lib.HttpResponse(
+                    status=200,
+                    headers={"set-cookie": f"dalton_refresh_token=rcookie{idx}-secret; HttpOnly"},
+                    body=json.dumps({"access_token": f"refreshed-tok-secret-{idx}"}).encode("utf-8"),
+                )
+            if url.endswith("/auth/local/ws-ticket"):
+                return _json_response(200, {"ticket": ws_secret_ticket, "expires_in": 999})
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(
+            b4_check._lib,
+            "http_request",
+            create_autospec(standalone_lib.http_request, side_effect=_fake_b4_http),
+        )
+        b4_ctx = create_autospec(standalone_lib.ComposeContext, instance=True)
+        b4_ctx.edge_url = "http://127.0.0.1:8088"
+        b4_ctx.env = {"BOOTSTRAP_SETUP_TOKEN": "boot-secret-token"}
+        with pytest.raises(AssertionError) as ws_exc:
+            b4_check._check_bootstrap_and_sessions(b4_ctx)
+        assert ws_secret_ticket not in str(ws_exc.value)
+        assert "status=200" in str(ws_exc.value)
+        assert "ticket" in str(ws_exc.value)
 
     def test_run_checks_oss_writes_owner_secret_without_printing_it(
         self,
@@ -891,6 +1088,45 @@ class TestB1AndB6OwnerHeaderAndEnvContracts:
         assert 'assert cur_env_map.get("DALTON_AUTH_MODE") == "oss"' not in b6_src
         assert '_lib.OWNER_SECRET_ENV_KEY: restore_owner_secret' in b6_src
         assert '_lib.OWNER_SECRET_ENV_KEY: upgrade_owner_secret' in b6_src
+
+    def test_b6_stage_init_dir_copies_all_init_sh_sourced_helpers(self, tmp_path: Path) -> None:
+        init_src = (REPO_ROOT / "scripts" / "standalone" / "init.sh").read_text(encoding="utf-8")
+        sourced_scripts: set[str] = set()
+        for raw_line in init_src.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(r"^(?:source|\.)\s+(.+)$", stripped)
+            if not m:
+                continue
+            target = m.group(1).strip().strip('"').strip("'")
+            m_rel = re.match(r"^\$\{?SCRIPT_DIR\}?/(.+)$", target)
+            assert m_rel is not None, (
+                f"init.sh sources unexpected non-SCRIPT_DIR target: {stripped!r}"
+            )
+            sourced_scripts.add(m_rel.group(1))
+
+        assert sourced_scripts == {"env_tokens.sh", "_compose_env.sh"}
+        assert sourced_scripts.issubset(set(b6_check._INIT_STAGE_SCRIPTS))
+
+        staged_init = b6_check._stage_init_dir(REPO_ROOT, tmp_path)
+        assert staged_init.is_file()
+        assert (tmp_path / ".env.core.example").is_file()
+        for helper in sourced_scripts:
+            assert (staged_init.parent / helper).is_file(), (
+                f"_stage_init_dir did not copy sourced helper {helper}"
+            )
+        help_proc = subprocess.run(
+            ["bash", str(staged_init), "--help"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert help_proc.returncode == 0, (
+            f"Staged init.sh --help failed (missing sourced helper?): {help_proc.stderr}"
+        )
 
 
 class TestCustomerSmokeWorkflowContract:

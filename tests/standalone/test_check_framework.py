@@ -535,18 +535,39 @@ def test_leak_scan_exempts_ci_test_paths_only_under_include_ci(tmp_path: Path) -
     }
     assert set(test_only_fixtures.keys()).issubset(customer_hit_paths)
 
-    # 3. Production & lookalike paths STILL fail even when `include_ci=True`
+    # 3. Production, hidden-dir, out-of-scope test-suffix, path-name & symlink leaks STILL fail
+    #    even when `include_ci=True`
+    assert checker.is_ci_test_exempt_path("./tests/standalone/x.py") is True
+    assert checker.is_ci_test_exempt_path("./.tests/standalone/x.py") is False
+    assert checker.is_ci_test_exempt_path(".tests/standalone/x.py") is False
+    assert checker.is_ci_test_exempt_path("..tests/standalone/x.py") is False
+    assert checker.is_ci_test_exempt_path(".web/e2e/x.js") is False
+    assert checker.is_ci_test_exempt_path("src/service.spec.js") is False
+    assert checker.is_ci_test_exempt_path("src/service.test.ts") is False
+
     prod_leaks = {
         "src/dalton/settings.py": 'INTERNAL = "everflowinv.com"\n',
         "web/src/pages/Settings/Notify.tsx": "const ch = 'discord:channel:123456789012345678';\n",
         "src/tests/standalone/not_root.py": 'INTERNAL = "everflowinv.com"\n',
         "web/src/utils/helper.test.ts.bak": "const host = 'clapi.guidepoint.io';\n",
         "web/src/__tests__": 'INTERNAL = "everflowinv.com"\n',
+        ".tests/standalone/x.py": 'INTERNAL = "everflowinv.com"\n',
+        ".web/e2e/x.js": "const id = 'oc_1234567890abcdef123456';\n",
+        "src/service.spec.js": 'INTERNAL = "everflowinv.com"\n',
+        "tests/standalone/everflowinv_named.py": "clean = True\n",
     }
     for rel, content in prod_leaks.items():
         fp = export_dir / rel
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding="utf-8")
+
+    # Symlinks inside exempt test directories pointing to forbidden targets must still be reported.
+    symlink_in_test_dir = export_dir / "tests" / "standalone" / "bad_link"
+    symlink_in_test_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("/Users/richardlu/private_secret", symlink_in_test_dir)
+    overlay_symlink = export_dir / "web" / "e2e" / "overlay_link"
+    overlay_symlink.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("../agent_config.dalton.yaml", overlay_symlink)
 
     ci_prod_report = checker.check_core_release_package(export_dir=export_dir, include_ci=True)
     assert ci_prod_report.ok is False
@@ -557,7 +578,73 @@ def test_leak_scan_exempts_ci_test_paths_only_under_include_ci(tmp_path: Path) -
             + ci_prod_report.whole_export_commercial_hits
         )
     }
-    assert set(prod_leaks.keys()) == ci_prod_hit_paths
+    expected_hit_paths = set(prod_leaks.keys()) | {
+        "tests/standalone/bad_link",
+        "web/e2e/overlay_link",
+    }
+    assert expected_hit_paths == ci_prod_hit_paths
+
+    # 4. Tarball verifier (`verify_release_tarball.py`) enforces the exact same tightened rules
+    verify_path = REPO_ROOT / "scripts" / "standalone" / "verify_release_tarball.py"
+    vspec = importlib.util.spec_from_file_location("verify_release_tarball_under_test", verify_path)
+    assert vspec is not None and vspec.loader is not None
+    verifier = importlib.util.module_from_spec(vspec)
+    sys.modules[vspec.name] = verifier
+    vspec.loader.exec_module(verifier)
+
+    top = "dalton-core-test"
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w:gz") as tf:
+        top_dir = tarfile.TarInfo(top)
+        top_dir.type = tarfile.DIRTYPE
+        tf.addfile(top_dir)
+        # Exempt regular-file content inside real test paths
+        for rel, content in (
+            ("tests/standalone/checks/b3.py", 'DOMAIN = "everflowinv.com"\n'),
+            ("web/e2e/flow.spec.js", "const d = 'everflowinv.com';\n"),
+            ("web/src/util.test.ts", "const d = 'everflowinv.com';\n"),
+        ):
+            data = content.encode("utf-8")
+            ti = tarfile.TarInfo(f"{top}/{rel}")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+        # Negative cases that MUST still be reported even with include_ci=True
+        for rel, content in (
+            (".tests/standalone/x.py", 'INTERNAL = "everflowinv.com"\n'),
+            (".web/e2e/x.js", "const d = 'everflowinv.com';\n"),
+            ("src/service.spec.js", 'INTERNAL = "everflowinv.com"\n'),
+            ("tests/standalone/everflowinv_named.py", "clean = True\n"),
+        ):
+            data = content.encode("utf-8")
+            ti = tarfile.TarInfo(f"{top}/{rel}")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+        sym_ti = tarfile.TarInfo(f"{top}/tests/standalone/bad_link")
+        sym_ti.type = tarfile.SYMTYPE
+        sym_ti.linkname = "/Users/richardlu/private_secret"
+        tf.addfile(sym_ti)
+        ov_ti = tarfile.TarInfo(f"{top}/web/e2e/overlay_link")
+        ov_ti.type = tarfile.SYMTYPE
+        ov_ti.linkname = "../agent_config.dalton.yaml"
+        tf.addfile(ov_ti)
+
+    tar_buf.seek(0)
+    tar_violations = verifier.inspect_tarball(
+        fileobj=tar_buf, expected_top_dir=top, include_ci=True
+    )
+    joined = "\n".join(tar_violations)
+    assert f"{top}/tests/standalone/checks/b3.py" not in joined
+    assert f"{top}/web/e2e/flow.spec.js" not in joined
+    assert f"{top}/web/src/util.test.ts" not in joined
+    for must_report in (
+        f"{top}/.tests/standalone/x.py",
+        f"{top}/.web/e2e/x.js",
+        f"{top}/src/service.spec.js",
+        f"{top}/tests/standalone/everflowinv_named.py",
+        f"{top}/tests/standalone/bad_link -> /Users/richardlu/private_secret",
+        f"{top}/web/e2e/overlay_link -> ../agent_config.dalton.yaml",
+    ):
+        assert must_report in joined, f"Expected violation for {must_report!r} in:\n{joined}"
 
 
 def test_package_release_include_ci_vs_customer_and_prod_leak_gates(tmp_path: Path) -> None:

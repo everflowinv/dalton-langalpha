@@ -221,6 +221,8 @@ def _acquire_auth_session(
       acquires a Bearer session via ``STANDALONE_ACCESS_TOKEN``, first-admin bootstrap
       (``POST /api/v1/dalton/bootstrap/admin``), or local login
       (``POST /api/v1/dalton/auth/local/login``).
+      注意：local 分支会消耗一次性自举，仅供手动排查；请勿在 ``local`` 组中早于
+      ``b4_local_auth`` 运行 ``b2``。
     - In ``oss`` auth mode (``bootstrap/status`` returns 404): resolves
       ``X-LangAlpha-Owner`` via ``_lib.oss_owner_headers(ctx)``.
     """
@@ -233,21 +235,26 @@ def _acquire_auth_session(
         )
         assert unauth_cap.status == 401, (
             f"Expected 401 for unauthenticated GET /dalton/capabilities in local auth mode, "
-            f"got {unauth_cap.status}: {unauth_cap.text}"
+            f"got status={unauth_cap.status}"
         )
 
         preset_token = os.environ.get("STANDALONE_ACCESS_TOKEN", "").strip()
         if preset_token:
+            _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", preset_token)
             headers = {"Authorization": f"Bearer {preset_token}"}
             me_resp = _lib.http_request(
                 "GET", f"{base_url}/api/v1/users/me", headers=headers, timeout=HTTP_TIMEOUT_S
             )
             assert me_resp.status == 200, (
                 f"GET /api/v1/users/me with STANDALONE_ACCESS_TOKEN failed: "
-                f"{me_resp.status} {me_resp.text}"
+                f"status={me_resp.status}, fields={_lib.response_fields(me_resp)}"
             )
-            uid = str((me_resp.json().get("user") or {}).get("user_id") or "").strip()
-            assert uid, f"GET /api/v1/users/me returned no user_id: {me_resp.text}"
+            me_data = me_resp.json()
+            uid = str((me_data.get("user") or {}).get("user_id") or "").strip()
+            assert uid, (
+                f"GET /api/v1/users/me returned no user_id "
+                f"(status={me_resp.status}, fields={_lib.response_field_names(me_data)})"
+            )
             return headers, uid
 
         needs_bootstrap = bool(boot_resp.json().get("needs_bootstrap"))
@@ -260,6 +267,8 @@ def _acquire_auth_session(
             assert bootstrap_token, (
                 "BOOTSTRAP_SETUP_TOKEN is required to bootstrap local auth session in b2"
             )
+            boot_password = f"B2AdminPass!{secrets.token_hex(6)}"
+            _lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", boot_password)
             boot_post = _lib.http_request(
                 "POST",
                 f"{base_url}/api/v1/dalton/bootstrap/admin",
@@ -268,18 +277,21 @@ def _acquire_auth_session(
                     "email": f"b2-admin-{secrets.token_hex(4)}@core.local",
                     "username": f"b2_admin_{secrets.token_hex(3)}",
                     "name": "B2 Capabilities Admin",
-                    "password": f"B2AdminPass!{secrets.token_hex(6)}",
+                    "password": boot_password,
                 },
                 timeout=HTTP_TIMEOUT_S,
             )
             assert boot_post.status == 201, (
-                f"POST /api/v1/dalton/bootstrap/admin failed: {boot_post.status} {boot_post.text}"
+                f"POST /api/v1/dalton/bootstrap/admin failed: "
+                f"status={boot_post.status}, fields={_lib.response_fields(boot_post)}"
             )
             boot_data = boot_post.json()
             access_token = str(boot_data.get("access_token") or "").strip()
+            _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", access_token)
             admin_uid = str((boot_data.get("user") or {}).get("user_id") or "").strip()
             assert access_token and admin_uid, (
-                f"Bootstrap response missing access_token/user_id: {boot_data!r}"
+                f"Bootstrap response missing access_token/user_id "
+                f"(status={boot_post.status}, fields={_lib.response_field_names(boot_data)})"
             )
             return {"Authorization": f"Bearer {access_token}"}, admin_uid
 
@@ -293,6 +305,7 @@ def _acquire_auth_session(
             "Local auth instance is already bootstrapped; set STANDALONE_ACCESS_TOKEN or "
             "STANDALONE_ADMIN_IDENTIFIER + STANDALONE_ADMIN_PASSWORD to run b2"
         )
+        _lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", password)
         login_resp = _lib.http_request(
             "POST",
             f"{base_url}/api/v1/dalton/auth/local/login",
@@ -300,12 +313,17 @@ def _acquire_auth_session(
             timeout=HTTP_TIMEOUT_S,
         )
         assert login_resp.status == 200, (
-            f"POST /api/v1/dalton/auth/local/login failed: {login_resp.status} {login_resp.text}"
+            f"POST /api/v1/dalton/auth/local/login failed: "
+            f"status={login_resp.status}, fields={_lib.response_fields(login_resp)}"
         )
         login_data = login_resp.json()
         access_token = str(login_data.get("access_token") or "").strip()
+        _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", access_token)
         uid = str((login_data.get("user") or {}).get("user_id") or "").strip()
-        assert access_token and uid, f"Login response missing access_token/user_id: {login_data!r}"
+        assert access_token and uid, (
+            f"Login response missing access_token/user_id "
+            f"(status={login_resp.status}, fields={_lib.response_field_names(login_data)})"
+        )
         return {"Authorization": f"Bearer {access_token}"}, uid
 
     headers = _lib.oss_owner_headers(ctx)

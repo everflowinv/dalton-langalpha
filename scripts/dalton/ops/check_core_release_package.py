@@ -133,39 +133,70 @@ _SKIP_DIR_NAMES = frozenset({"__pycache__", ".git", "node_modules", ".venv"})
 # Single source of truth for test-only path exemptions, active ONLY when `--include-ci`
 # is explicitly passed (CI test tarballs). Customer release packages NEVER use this list.
 #
+# Exemptions skip ONLY regular-file content scans; member paths, symlinks and their
+# targets, `.dalton.yaml` checks, and forbidden-subpath checks always run.
+#
 # Rationale:
 # - `tests/standalone/**`: standalone verification harness itself embeds forbidden-term
 #   regexes (e.g. `b3_skills_prompts_ui.py`) and scanner self-test fixtures
 #   (`test_check_framework.py`) that cannot be rewritten without breaking the checks.
-# - `web/e2e/**`, `**/__tests__/**`, `*.test.ts`, `*.test.tsx`, `*.spec.js`: frontend
-#   test suites kept only in `--include-ci` test tarballs (customer releases strip
-#   `web/e2e` and `**/__tests__`, and never pass `--include-ci`).
+# - `web/e2e/**`, `**/__tests__/**`, and `*.test.ts` / `*.test.tsx` / `*.spec.js`
+#   strictly under `web/src/**` or `web/e2e/**`: frontend test suites kept only in
+#   `--include-ci` test tarballs (customer releases strip `web/e2e` and `**/__tests__`,
+#   and never pass `--include-ci`).
 #
 # Production code paths are NEVER exempted.
 CI_TEST_EXEMPT_PATH_PATTERNS: tuple[str, ...] = (
     "tests/standalone/**",
     "web/e2e/**",
     "**/__tests__/**",
-    "*.test.ts",
-    "*.test.tsx",
-    "*.spec.js",
+    "web/src/**/*.test.ts",
+    "web/src/**/*.test.tsx",
+    "web/src/**/*.spec.js",
+    "web/e2e/**/*.test.ts",
+    "web/e2e/**/*.test.tsx",
+    "web/e2e/**/*.spec.js",
 )
 
 
+def _posix_rel_parts(rel_posix: str) -> tuple[str, ...]:
+    """Split a POSIX relative path into components, stripping only leading ``./`` segments.
+
+    Hidden directory names (e.g. ``.tests``, ``.web``) are preserved verbatim.
+    Absolute paths and parent-traversal segments (``..``) never match.
+    """
+    trimmed = rel_posix
+    while trimmed.startswith("./"):
+        trimmed = trimmed[2:]
+    if not trimmed or trimmed.startswith("/"):
+        return ()
+    parts = tuple(part for part in PurePosixPath(trimmed).parts if part not in ("", "."))
+    if not parts or ".." in parts:
+        return ()
+    return parts
+
+
 def _matches_ci_test_pattern(rel_posix: str, pattern: str) -> bool:
-    rel = rel_posix.lstrip("./")
-    parts = PurePosixPath(rel).parts
+    parts = _posix_rel_parts(rel_posix)
     if not parts:
         return False
     if pattern.startswith("**/") and pattern.endswith("/**"):
         segment = pattern[3:-3]
         return segment in parts[:-1]
+    if "/**/" in pattern:
+        prefix_str, file_glob = pattern.split("/**/", 1)
+        prefix_parts = tuple(p for p in PurePosixPath(prefix_str).parts if p not in ("", "."))
+        if not prefix_parts or "/" in file_glob:
+            return False
+        return (
+            len(parts) > len(prefix_parts)
+            and parts[: len(prefix_parts)] == prefix_parts
+            and fnmatch.fnmatchcase(parts[-1], file_glob)
+        )
     if pattern.endswith("/**"):
-        prefix = pattern[:-2]
-        return rel.startswith(prefix)
-    if "/" not in pattern:
-        return fnmatch.fnmatchcase(parts[-1], pattern)
-    return fnmatch.fnmatchcase(rel, pattern)
+        prefix_parts = tuple(p for p in PurePosixPath(pattern[:-3]).parts if p not in ("", "."))
+        return len(parts) > len(prefix_parts) and parts[: len(prefix_parts)] == prefix_parts
+    return False
 
 
 def is_ci_test_exempt_path(rel_posix: str) -> bool:
@@ -272,8 +303,6 @@ def _scan_export_for_forbidden_regex(
         if any(part in _SKIP_DIR_NAMES for part in rel_parts):
             continue
         rel = p.relative_to(base_root).as_posix()
-        if exempt_ci_test_paths and _is_ci_test_exempt_path(rel):
-            continue
         if p.is_symlink():
             try:
                 link_target = os.readlink(p)
@@ -291,8 +320,31 @@ def _scan_export_for_forbidden_regex(
                             "snippet": link_target[:160],
                         }
                     )
+            if link_target.endswith(".dalton.yaml") or link_target.endswith(
+                "everflow_defaults.yaml"
+            ):
+                hits.append(
+                    {
+                        "kind": "symlink",
+                        "path": rel,
+                        "line": 0,
+                        "rule": "everflow_overlay_symlink",
+                        "snippet": link_target[:160],
+                    }
+                )
             continue
         if not p.is_file():
+            for rule_name, pattern in patterns:
+                if pattern.search(rel):
+                    hits.append(
+                        {
+                            "kind": "path",
+                            "path": rel,
+                            "line": 0,
+                            "rule": rule_name,
+                            "snippet": rel[:160],
+                        }
+                    )
             continue
         for rule_name, pattern in patterns:
             if pattern.search(rel):
@@ -305,6 +357,8 @@ def _scan_export_for_forbidden_regex(
                         "snippet": rel[:160],
                     }
                 )
+        if exempt_ci_test_paths and _is_ci_test_exempt_path(rel):
+            continue
         if p.suffix.lower() in _BINARY_SUFFIXES:
             continue
         try:

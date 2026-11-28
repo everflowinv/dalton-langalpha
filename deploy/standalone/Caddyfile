@@ -10,6 +10,29 @@
 # access-log redaction, and internal-endpoint blocking boundary.
 {
 	admin off
+	# Apply the same single-layer filter redaction to Caddy's default logger (which handles
+	# `http.log.error` and other runtime HTTP error logs) so owner/auth headers and share
+	# tokens never leak into container stderr logs even if error handling itself fails.
+	log default {
+		output stderr
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
+				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
+				request>headers>X-Service-Token delete
+				request>headers>X-User-Id delete
+				request>headers>X-Dalton-Relay-Token delete
+				# Go net/http canonicalizes X-LangAlpha-Owner -> X-Langalpha-Owner in logged request headers;
+				# delete both spellings defensively.
+				request>headers>X-Langalpha-Owner delete
+				request>headers>X-LangAlpha-Owner delete
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				resp_headers>Location delete
+			}
+		}
+	}
 }
 
 # Shared internal-header stripping snippets imported by /api/*, /ws/*,
@@ -43,8 +66,10 @@
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete
 				request>headers>X-Dalton-Relay-Token delete
-				# Go net/http canonicalizes X-LangAlpha-Owner -> X-Langalpha-Owner in logged request headers.
+				# Go net/http canonicalizes X-LangAlpha-Owner -> X-Langalpha-Owner in logged request headers;
+				# delete both spellings defensively.
 				request>headers>X-Langalpha-Owner delete
+				request>headers>X-LangAlpha-Owner delete
 				request>headers>Authorization delete
 				request>headers>Cookie delete
 				resp_headers>Location delete

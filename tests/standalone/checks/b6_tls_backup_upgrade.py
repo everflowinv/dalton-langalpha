@@ -307,13 +307,20 @@ def _tls_ctx(ctx: _lib.ComposeContext) -> _lib.ComposeContext:
     )
 
 
+_INIT_STAGE_SCRIPTS: tuple[str, ...] = (
+    "init.sh",
+    "env_tokens.sh",
+    "_compose_env.sh",
+)
+
+
 def _stage_init_dir(src_work_dir: Path, dst_dir: Path) -> Path:
     script_dir = dst_dir / "scripts" / "standalone"
     script_dir.mkdir(parents=True, exist_ok=True)
-    init_dst = script_dir / "init.sh"
-    shutil.copy2(src_work_dir / "scripts" / "standalone" / "init.sh", init_dst)
+    for rel_script in _INIT_STAGE_SCRIPTS:
+        shutil.copy2(src_work_dir / "scripts" / "standalone" / rel_script, script_dir / rel_script)
     shutil.copy2(src_work_dir / ".env.core.example", dst_dir / ".env.core.example")
-    return init_dst
+    return script_dir / "init.sh"
 
 
 def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
@@ -578,6 +585,25 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
         assert "apps" in adapted and "http" in adapted["apps"], (
             f"caddy adapt output for mode={mode} missing apps.http"
         )
+        default_enc = (
+            ((adapted.get("logging") or {}).get("logs") or {})
+            .get("default", {})
+            .get("encoder")
+            or {}
+        )
+        assert default_enc.get("format") == "filter", (
+            f"caddy adapt output for mode={mode} missing filter encoder on default/error log"
+        )
+        default_fields = default_enc.get("fields") or {}
+        for req_field in (
+            "request>headers>X-Langalpha-Owner",
+            "request>headers>X-LangAlpha-Owner",
+            "request>headers>Authorization",
+            "request>headers>Cookie",
+        ):
+            assert (default_fields.get(req_field) or {}).get("filter") == "delete", (
+                f"caddy adapt default/error log for mode={mode} missing delete filter on {req_field}"
+            )
         if mode == "auto" and https_port == "18443":
             assert ":18443" in proc.stdout, (
                 "Loopback auto mode HTTP->HTTPS redirect must include host port :18443"
