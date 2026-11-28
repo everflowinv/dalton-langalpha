@@ -61,7 +61,7 @@ _由 Eve 自动生成；新闻与业绩会为发送前 24 小时，GitHub 总 st
 
 GitHub：日/周/月榜与持久观察池发现，官方增星历史核验 96/100 个仓库；本轮展示 8/8 个，其中首次 2 个、持续 6 个。核验缺口 4 个仓库（页面未找到）：NotRexed/Hookshot、HunYiSage/dsh-purge、YuJunZhiXue/dsh-purge、worldonlyu/Google_AI_Pro_2Year_ZeroCost_Auto；待核验 7 个，待复核新候选 0 个；12 个候选已全部复核，名额外观察 0 个。发现榜单来源失败：无。Trendshift 仅用于发现，正文数字均为官方增星历史。
 
-GitHub 状态：本轮确认降温的已报项目为 meta/astryx、heydamir/unslop、expo/exact、debpalash/VoiceStudio、storytold/craft-anything、deepseek-ai/dsh-superagent-prototype、vercel-labs/agent-desktop、NVIDIA/auto-ontology、milind-soni/OpenMausBot、google/elephant-goldfish-model、cloudflare/security-audit-skill、anomalyco/rune、JuneYaooo/rea-video、patch-gg/pixelfx、FluentRead/FluentRead、HKUDS/DeepTutor、amosblomqvist/learnharness、anomalyco/hex。48 小时上游聚类检出 12 组，确认 4 组、未能确认 8 组：cluster com 未能确认上游；cluster windows 未能确认上游；cluster dsh 未能确认上游；cluster cpp 未能确认上游；cluster emulator 未能确认上游；cluster anything 未能确认上游；cluster aws 未能确认上游；cluster rea 未能确认上游。
+GitHub 状态：本轮确认降温的已报项目为 meta/astryx、heydamir/unslop、expo/exact、debpalash/VoiceStudio、storytold/craft-anything、deepseek-ai/dsh-superagent-prototype、vercel-labs/agent-desktop、NVIDIA/auto-ontology、milind-soni/OpenMausBot、google/elephant-goldfish-model、cloudflare/security-audit-skill、anomalyco/rune、JuneYaooo/rea-video、patch-gg/pixelfx、FluentRead/FluentRead、HKUDS/DeepTutor、amosblomqvist/learnharness、anomalyco/hex。48 小时上游聚类检出 12 组，确认 4 组、未能确认 8 组。
 
 业绩会：AlphaEngine Earnings Calls（type_id: IND_SECOND_5FA442AE），过去 24 小时无市场/行业/市值限制的 AI 关键词检索；命中 1 篇，按相关性排序后全文扫描 0 篇，80篇预算跳过 0 篇，失败 1 篇；AI candidates 0 篇中 signal 0 / watchlist 0 / reject 0。13 条检索均成功，失败发生在全文获取阶段。
 

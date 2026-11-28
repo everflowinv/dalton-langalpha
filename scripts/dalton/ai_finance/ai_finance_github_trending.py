@@ -87,6 +87,13 @@ UPSTREAM_STOPWORDS = {
     "test", "text", "tool", "toolkit", "tools", "ts", "ui", "use", "v1", "v2", "vector",
     "video",
     "vision", "voice", "web", "workflow",
+    # Address parts and generic words that grouped unrelated repos (11-28 report:
+    # com, org, github, software, community, design, daily, pro ...).
+    "com", "org", "net", "io", "www", "http", "https", "github", "gitlab", "html",
+    "anything", "best", "build", "builder", "community", "control",
+    "daily", "design", "downloader", "easy", "engineer", "engineering", "guide",
+    "learn", "manager", "modern", "online", "pro", "protocol", "simple", "software",
+    "source", "suite", "super", "ultimate", "victory",
 }
 UPSTREAM_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{2,}")
 UPSTREAM_WINDOW_HOURS = 48.0
@@ -199,8 +206,9 @@ def recent_repo_tokens(
             )
             # Snapshots written before token storage existed still yield name tokens.
             fallback = _tokens(str(full_name).replace("/", " "))
-            entry["name_tokens"] |= set(meta.get("name_tokens") or fallback)
-            entry["mention_tokens"] |= set(meta.get("mention_tokens") or fallback)
+            # Stored tokens predate later stopwords; filter them again here.
+            entry["name_tokens"] |= set(meta.get("name_tokens") or fallback) - UPSTREAM_STOPWORDS
+            entry["mention_tokens"] |= set(meta.get("mention_tokens") or fallback) - UPSTREAM_STOPWORDS
     return seen
 
 

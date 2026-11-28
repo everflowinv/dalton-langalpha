@@ -264,3 +264,32 @@ def test_github_failure_does_not_cool_pool_or_touch_seen(tmp_path: Path, monkeyp
         trending.collect_trending(state_file=state, seen_file=seen, now=FIXED)
     assert state.read_bytes() == state_bytes
     assert seen.read_bytes() == seen_bytes
+
+
+def test_address_parts_and_generic_words_do_not_form_upstream_clusters():
+    # 11-28 report listed clusters named com, org, github, software, daily, pro ...
+    items = [
+        {"full_name": "alice/daily-pro-com", "description": "software for the community",
+         "github": {"homepage": "https://alice.github.io/daily.com"}},
+        {"full_name": "bob/pro-software-org", "description": "daily design control protocol",
+         "github": {"homepage": "https://www.bob.org"}},
+    ]
+    assert trending.upstream_clusters(items, {"snapshots": []}) == []
+
+
+def test_tokens_stored_before_new_stopwords_are_filtered_again():
+    now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+    state = {"snapshots": [{
+        "captured_at": "2026-11-28T00:00:00+00:00",
+        "repos": {"carol/com-tool": {"name_tokens": ["com"], "mention_tokens": ["com"]}},
+    }]}
+    items = [{"full_name": "dave/com-kit", "description": "x"}]
+    assert trending.upstream_clusters(items, state, now=now) == []
+
+
+def test_a_real_shared_upstream_still_clusters():
+    items = [
+        {"full_name": "browser-use/jev-ultrafast", "description": "Ultrafast browser agent"},
+        {"full_name": "jarrodwatts/jev-trader", "description": "Onchain trading agent"},
+    ]
+    assert [c["upstream_token"] for c in trending.upstream_clusters(items, {"snapshots": []})] == ["jev"]
