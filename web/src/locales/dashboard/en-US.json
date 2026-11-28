@@ -522,6 +522,12 @@
       "unlisted": "Unlisted",
       "coverageTruncated": "Showing top {{shown}} of {{total}}",
       "viewAllCoverage": "View all",
+      "addToCoverageTier": "Add to Watchlist · {{tier}}",
+      "quickAddSuccess": "Added {{symbol}} to personal watchlist ({{tier}})",
+      "alreadyInCoverage": "{{symbol}} is already in personal watchlist ({{tier}})",
+      "quickAddFailed": "Failed to add to personal watchlist",
+      "confirmTierChangeTitle": "Confirm Watchlist Tier Change",
+      "scopeChanged": "Watchlist state changed. Please retry.",
       "addSymbol": "Add Symbol",
       "addTransaction": "Add Transaction",
       "cardTitle": "Portfolio"

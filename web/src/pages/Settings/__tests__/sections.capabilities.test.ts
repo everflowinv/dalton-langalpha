@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { zhCN, lookup } from '@/test/catalogs';
+
+// Pin self-hosted (oss) mode so a prior test file's top-level `vi.stubEnv('VITE_HOST_MODE', 'platform')`
+// in the shared vmThreads worker (or a local web/.env) never flips `isPlatformMode` to true.
+vi.mock('@/config/hostMode', () => ({ HOST_MODE: 'oss', isPlatformMode: false }));
+
 import {
   EVERFLOW_DEFAULT_CAPABILITY_SET,
   CORE_DEFAULT_CAPABILITY_SET,
@@ -66,6 +71,10 @@ describe('Settings sections & search capability gating', () => {
     // Core settings remain searchable.
     expect(coreAnchors.has('dalton-providers')).toBe(true);
     expect(coreAnchors.has('dalton-budget')).toBe(true);
+    // DALTON-HOOK(watchlist): Personal tier monitoring policies are always visible in Coverage, while team coverage units require colleague_sharing
+    expect(sectionShown('coverage', { ...coreAdminCtx, coverageUnitsEnabled: false })).toBe(true);
+    expect(coreAnchors.has('dalton-tier-policies')).toBe(true);
+    expect(coreAnchors.has('dalton-coverage')).toBe(false);
   });
 
   it('returns zero proprietary keyword hits from Core settings search', () => {

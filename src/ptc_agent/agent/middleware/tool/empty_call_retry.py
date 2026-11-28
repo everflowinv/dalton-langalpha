@@ -27,13 +27,22 @@ from langgraph.constants import TAG_NOSTREAM
 from ptc_agent.agent.middleware.model_resilience import RESILIENCE_TRACE_ATTR
 from ptc_agent.agent.middleware.thinking_binding import is_bound_answer
 from ptc_agent.agent.transcript.classify import EMPTY_CALL_RETRY_SOURCE
-# DALTON-HOOK(empty-turn-guard): the one emptiness rule the transcript already
-# renders by — thinking blocks never count as visible text, for any provider.
-from ptc_agent.agent.transcript.render import visible_text
 from src.llms.error_classification import UnfinishedReplyError
 # DALTON-HOOK(empty-turn-guard): how a provider-compaction summary call is
 # told apart from a turn's own model call, so the guard never retries one.
 from src.llms.provider_compaction import is_compaction_request
+
+
+# DALTON-HOOK(refusal-handling): lazy import avoids circular init via src.dalton.middleware.__init__.
+def _refusal_fallback():
+    from src.dalton.middleware import refusal_fallback
+    return refusal_fallback
+
+
+# DALTON-HOOK(empty-turn-guard): lazy import avoids circular init via src.dalton.llm.
+def _near_empty_reply():
+    from src.dalton.llm import near_empty_reply
+    return near_empty_reply
 
 logger = logging.getLogger(__name__)
 
@@ -171,14 +180,7 @@ def _has_tool_calls(ai_msg: AIMessage) -> bool:
 # already decides exactly as the transcript renders it. A compaction block
 # is a provider's native summary, not a reply: it has no text on purpose.
 def _visible_reply_empty(ai_msg: AIMessage) -> bool:
-    if getattr(ai_msg, "tool_calls", None) or getattr(ai_msg, "invalid_tool_calls", None):
-        return False
-    content = ai_msg.content
-    if isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") == "compaction" for block in content
-    ):
-        return False
-    return not visible_text(content).strip()
+    return _near_empty_reply().is_deliverable_reply_empty(ai_msg)
 
 
 # DALTON-HOOK(empty-turn-guard): the run's config as the model node sees it.
@@ -329,8 +331,12 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
             return "output_cap"
         if malformed_call_stop_reason(ai_msg) is not None:
             return "malformed_call"
-        if _visible_reply_empty(ai_msg) and _user_sent_turn(_turn_messages(request)):
+        # DALTON-HOOK(refusal-handling): treat safety-intercepted replies on user-sent turns as retryable.
+        if (_visible_reply_empty(ai_msg) or _refusal_fallback().is_refusal_reply(ai_msg)) and _user_sent_turn(_turn_messages(request)):
             return "empty_reply"
+        # DALTON-HOOK(empty-turn-guard): catch non-refusal near-empty fragments (e.g. "═") on user-sent turns.
+        if _user_sent_turn(_turn_messages(request)) and _near_empty_reply().is_near_empty_reply(ai_msg, _turn_messages(request)):
+            return "near_empty_reply"
         return None
 
     @staticmethod
@@ -338,30 +344,21 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
         # DALTON-HOOK(empty-turn-guard): each broken shape tells the model
         # what to fix in its own words; pure-text output_cap replies ask the
         # model to continue directly from the cut-off point.
+        if kind == "near_empty_reply":
+            return _near_empty_reply().NEAR_EMPTY_REPLY_HINT
         if (
             kind == "output_cap"
             and ai_msg is not None
-            and visible_text(ai_msg.content, attachments=False).strip()
+            and _near_empty_reply().deliverable_text_of_ai_message(ai_msg).strip()
             and not _has_tool_calls(ai_msg)
         ):
             return _OUTPUT_CAP_CONTINUE_HINT
         return _HINTS.get(kind, _REMEDIATION_HINT)
 
-    # DALTON-HOOK(empty-turn-guard): strip tool calls, tool blocks, thinking
-    # blocks, and attachment placeholders from an output_cap/malformed_call
-    # reply before re-sending or saving to history, keeping only plain visible
-    # text plus id and metadata; return None when empty.
+    # DALTON-HOOK(deliverable-text): delegate output_cap/malformed_call sanitization to preserve block-level phase.
     @staticmethod
     def _sanitize_output_cap_reply(ai_msg: AIMessage) -> AIMessage | None:
-        text = visible_text(ai_msg.content, attachments=False)
-        if not text.strip():
-            return None
-        return AIMessage(
-            content=text,
-            id=ai_msg.id,
-            response_metadata=dict(getattr(ai_msg, "response_metadata", None) or {}),
-            usage_metadata=getattr(ai_msg, "usage_metadata", None),
-        )
+        return _near_empty_reply().sanitize_output_cap_reply(ai_msg)
 
     def _log_retry(self, ai_msg: AIMessage, attempt: int, kind: str) -> None:
         meta = getattr(ai_msg, "response_metadata", {}) or {}
@@ -391,12 +388,13 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
                 self.max_retries,
             )
             return
-        if kind == "empty_reply":
-            # DALTON-HOOK(empty-turn-guard): an empty final reply has no
-            # tool_calls story to tell, only that nothing was said.
+        if kind in ("empty_reply", "near_empty_reply"):
+            # DALTON-HOOK(empty-turn-guard): an empty/near-empty final reply has no
+            # tool_calls story to tell, only that nothing substantive was said.
             logger.warning(
-                "[EmptyToolCallRetry] final reply is empty (stop_reason=%s), "
+                "[EmptyToolCallRetry] final reply is %s (stop_reason=%s), "
                 "retrying (%d/%d)",
+                "near-empty" if kind == "near_empty_reply" else "empty",
                 stop,
                 attempt + 1,
                 self.max_retries,
@@ -491,6 +489,7 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
         reason_map = {
             "output_cap": "hit output cap",
             "malformed_call": "malformed tool call",
+            "near_empty_reply": "final reply still near-empty",
         }
         reason = reason_map.get(kind, "final reply still empty")
         logger.warning(
@@ -500,7 +499,6 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
             reason,
             self.max_retries,
         )
-        last_meta = dict(getattr(last, "response_metadata", None) or {})
         additional_kwargs: dict = {}
         if kind in _SANITIZED_KINDS:
             fail_turn = not _subagent_call() and not _user_sent_turn(turn_messages)
@@ -508,94 +506,52 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
                 "kind": kind,
                 "fail_turn": fail_turn,
             }
-        notice = AIMessage(
-            content=_EXHAUSTED_NOTICES[kind],
-            additional_kwargs=additional_kwargs,
-            usage_metadata=getattr(last, "usage_metadata", None),
-            response_metadata=last_meta,
+        # DALTON-HOOK(empty-turn-guard): build notice chained to prefix and emit live exhausted_notice.
+        notice = _near_empty_reply().build_and_emit_exhausted_notice(
+            last=last, kind=kind, prefix=prefix, default_notices=_EXHAUSTED_NOTICES,
+            additional_kwargs=additional_kwargs, is_subagent=_subagent_call(),
         )
         return dataclasses.replace(response, result=[*prefix, notice])
 
-    # DALTON-HOOK(empty-turn-guard): shared step-update and exhaustion helpers
-    # for sync/async loops. Every output_cap/malformed_call appends its
-    # sanitized reply and hint to both ``injected`` and ``request.messages``.
-    # Non-sanitized retries keep their replacement behavior (replacing both
-    # reply and hint with the latest attempt, even when consecutive attempts
-    # share the same kind) before any sanitized kind, or append after one
-    # without overwriting its hint.
-    def _advance_retry(
-        self,
-        request,
-        ai_msg: AIMessage,
-        kind: str,
-        injected: list,
-        rehintable: bool,
-    ) -> tuple[list, bool]:
-        hint_text = self._hint_for(kind, ai_msg)
-        if kind in _SANITIZED_KINDS:
-            sanitized = self._sanitize_output_cap_reply(ai_msg)
-            added = self._inject_output_cap(request, sanitized, hint_text)
-            return [*injected, *added], False
-        if not injected or not rehintable:
-            added = self._inject_hint(request, ai_msg, hint_text)
-            return [*injected, *added], True
-        injected = self._rehint(request, injected, ai_msg, hint_text)
-        return injected, True
+    # DALTON-HOOK(deliverable-text): delegate retry step advancement and terminal
+    # policy dispatch to RetryLoopBudget so upstream keeps only thin wrappers.
+    def _advance_retry(self, request, ai_msg: AIMessage, kind: str, injected: list, rehintable: bool, *, loop=None) -> tuple[list, bool]:
+        budget = loop if loop is not None else _near_empty_reply().RetryLoopBudget(self.max_retries)
+        return budget.advance_retry(self, request, ai_msg, kind, injected, rehintable, is_subagent=_subagent_call(), has_tool_calls=_has_tool_calls)
 
-    def _finish_retry(
-        self,
-        response,
-        request,
-        kind: str | None,
-        injected: list,
-        last_sanitized_kind: str | None,
-    ):
-        failure_kind = kind if kind in _SANITIZED_KINDS else (last_sanitized_kind or kind)
-        if failure_kind in _EXHAUSTED_NOTICES:
-            prefix = injected if last_sanitized_kind is not None else []
-            return self._exhausted_failure(
-                response,
-                failure_kind,
-                prefix=prefix,
-                turn_messages=_turn_messages(request),
-            )
-        return self._keep_injected(response, injected)
+    # DALTON-HOOK(deliverable-text): delegate terminal retry policy dispatch to RetryLoopBudget.
+    def _finish_retry(self, response, request, kind: str | None, injected: list, last_sanitized_kind: str | None, *, loop=None):
+        budget = loop if loop is not None else _near_empty_reply().RetryLoopBudget(self.max_retries)
+        return budget.finish_retry(self, response, kind, injected, last_sanitized_kind, config=_turn_config(), is_subagent=_subagent_call(), default_notices=_EXHAUSTED_NOTICES, turn_messages=_turn_messages(request))
 
-    # DALTON-HOOK(empty-turn-guard): the loop now classifies each broken reply,
-    # appends every output_cap/malformed_call sanitized segment + hint, keeps
-    # each non-sanitized hint paired with its own reply, and preserves history.
+    # DALTON-HOOK(empty-turn-guard): the loop now delegates retry budgets,
+    # continuation stamping, and exhaustion handling to RetryLoopBudget.
     def wrap_model_call(self, request, handler):
         injected: list = []
         last_sanitized_kind: str | None = None
         rehintable = False
         kind: str | None = None
+        loop = _near_empty_reply().RetryLoopBudget(self.max_retries)  # DALTON-HOOK(empty-turn-guard)
         for attempt in range(1 + self.max_retries):
+            loop.begin_attempt(attempt, is_subagent=_subagent_call())  # DALTON-HOOK(deliverable-text)
             response = handler(request)
             ai_msg = response.result[0]
+            loop.on_response(ai_msg, injected)
             kind = self._retry_kind(ai_msg, request)
             if kind is None:
+                loop.on_success(ai_msg, _turn_messages(request), config=_turn_config(), attempt=attempt, injected=injected)
                 return self._keep_injected(
                     response, injected, keep_all=(last_sanitized_kind is not None)
                 )
             if kind in _SANITIZED_KINDS:
                 last_sanitized_kind = kind
-            if attempt == self.max_retries:
-                if kind in _SANITIZED_KINDS:
-                    injected = [
-                        *injected,
-                        *self._build_output_cap_injection(
-                            self._sanitize_output_cap_reply(ai_msg),
-                            self._hint_for(kind, ai_msg),
-                        ),
-                    ]
+            # DALTON-HOOK(empty-turn-guard): delegate retry sub-budget and terminal branch.
+            if loop.should_stop(attempt, kind, ai_msg):
+                injected = loop.finalize_stopped_attempt(self, kind, ai_msg, injected, is_subagent=_subagent_call())
                 break
             self._log_retry(ai_msg, attempt, kind)
-            injected, rehintable = self._advance_retry(
-                request, ai_msg, kind, injected, rehintable
-            )
-        return self._finish_retry(
-            response, request, kind, injected, last_sanitized_kind
-        )
+            injected, rehintable = self._advance_retry(request, ai_msg, kind, injected, rehintable, loop=loop)
+        return self._finish_retry(response, request, kind, injected, last_sanitized_kind, loop=loop)
 
     # DALTON-HOOK(empty-turn-guard): the async loop, using the same helpers.
     async def awrap_model_call(self, request, handler):
@@ -603,33 +559,27 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
         last_sanitized_kind: str | None = None
         rehintable = False
         kind: str | None = None
+        loop = _near_empty_reply().RetryLoopBudget(self.max_retries)  # DALTON-HOOK(empty-turn-guard)
         for attempt in range(1 + self.max_retries):
+            loop.begin_attempt(attempt, is_subagent=_subagent_call())  # DALTON-HOOK(deliverable-text)
             response = await handler(request)
             ai_msg = response.result[0]
+            loop.on_response(ai_msg, injected)
             kind = self._retry_kind(ai_msg, request)
             if kind is None:
+                await loop.aon_success(ai_msg, _turn_messages(request), config=_turn_config(), attempt=attempt, injected=injected)
                 return self._keep_injected(
                     response, injected, keep_all=(last_sanitized_kind is not None)
                 )
             if kind in _SANITIZED_KINDS:
                 last_sanitized_kind = kind
-            if attempt == self.max_retries:
-                if kind in _SANITIZED_KINDS:
-                    injected = [
-                        *injected,
-                        *self._build_output_cap_injection(
-                            self._sanitize_output_cap_reply(ai_msg),
-                            self._hint_for(kind, ai_msg),
-                        ),
-                    ]
+            # DALTON-HOOK(empty-turn-guard): delegate retry sub-budget and terminal branch.
+            if loop.should_stop(attempt, kind, ai_msg):
+                injected = loop.finalize_stopped_attempt(self, kind, ai_msg, injected, is_subagent=_subagent_call())
                 break
             self._log_retry(ai_msg, attempt, kind)
-            injected, rehintable = self._advance_retry(
-                request, ai_msg, kind, injected, rehintable
-            )
-        return self._finish_retry(
-            response, request, kind, injected, last_sanitized_kind
-        )
+            injected, rehintable = self._advance_retry(request, ai_msg, kind, injected, rehintable, loop=loop)
+        return self._finish_retry(response, request, kind, injected, last_sanitized_kind, loop=loop)
 
     # DALTON-HOOK(empty-turn-guard): after the checkpoint commits the failure
     # notice on a non-user main-agent turn (session a30afade), read the marker

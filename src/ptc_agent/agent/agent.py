@@ -1567,6 +1567,9 @@ class PTCAgent:
                 # The workflow store the file tools mount (``workflow_fs``).
                 user_id=owner_id,
                 prebuilt_workflows=get_prebuilt_workflows(),
+                # DALTON-HOOK(workflow-discovered-tools): pass workspace MCP registry
+                # for server-side tool discovery in topic-research when bridge is off.
+                mcp_registry=mcp_registry,
             )
             tools.append(run_workflow_tool)
 

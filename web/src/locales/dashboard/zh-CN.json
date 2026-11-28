@@ -522,6 +522,12 @@
       "unlisted": "未上市",
       "coverageTruncated": "已展示前 {{shown}} / 共 {{total}} 只",
       "viewAllCoverage": "查看全部",
+      "addToCoverageTier": "加入关注列表 · {{tier}}",
+      "quickAddSuccess": "已将 {{symbol}} 加入关注列表（{{tier}}）",
+      "alreadyInCoverage": "{{symbol}} 已在关注列表（{{tier}}）中",
+      "quickAddFailed": "加入关注列表失败，请稍后重试",
+      "confirmTierChangeTitle": "确认调整关注列表分档",
+      "scopeChanged": "情况已变化，请重新发起",
       "addSymbol": "添加标的",
       "addTransaction": "添加交易",
       "cardTitle": "投资组合"

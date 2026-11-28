@@ -13,6 +13,7 @@
  */
 import type { QueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { mergeWsQuoteRow } from '@/lib/dalton/quotes/quoteMerge'; // DALTON-HOOK(watchlist)
 import { stockKey, type QuoteRow } from './quoteBatcher';
 
 /** The live fields a WS aggregate frame contributes. A null change (no
@@ -41,19 +42,7 @@ export function writeQuoteFromWs(
     // undefined = nobody watching; null = REST resolved "unknown symbol".
     // Neither may be seeded into a partial, previous_close-less row.
     if (prev == null) return prev;
-    const base: QuoteRow = prev;
-    // DALTON-HOOK(extended-hours-quotes): Stamp live_tick_at so deriveQuoteDisplay detects WS write-through even when price === settledClose.
-    return {
-      ...base,
-      symbol: base.symbol ?? key,
-      price: fields.price,
-      // A frame is a minute aggregate: its close is the row's last minute close,
-      // which an extended-hours row prints as its session price.
-      last_minute_close: fields.price,
-      ...(fields.change != null && fields.changePercent != null
-        ? { change: fields.change, change_percent: fields.changePercent }
-        : {}),
-      live_tick_at: fields.timestamp ?? Date.now(),
-    };
+    // DALTON-HOOK(watchlist): unify WS write-through with shared trade-timestamp merge rule
+    return mergeWsQuoteRow(prev, key, fields);
   });
 }

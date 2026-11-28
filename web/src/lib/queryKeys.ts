@@ -573,12 +573,14 @@ export const queryKeys = {
     ],
     watchlistTierPolicies: () => [...queryKeys.dalton.all, 'watchlist', 'tier-policies'],
   },
-  // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, and company members
+  // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, shared documents, and company members
   daltonMonitors: {
     all: ['daltonMonitors'],
     list: () => [...queryKeys.daltonMonitors.all, 'list'],
     detail: (slug: string) => [...queryKeys.daltonMonitors.all, 'detail', slug],
     byArtifact: (artifactId: string) => [...queryKeys.daltonMonitors.all, 'byArtifact', artifactId],
+    sharedDocuments: () => [...queryKeys.daltonMonitors.all, 'sharedDocuments'],
+    sharedDocumentByArtifact: (artifactId: string) => [...queryKeys.daltonMonitors.all, 'sharedDocumentByArtifact', artifactId],
     companyMembers: () => [...queryKeys.daltonMonitors.all, 'companyMembers'],
   },
   // The user's watchlists themselves (id, name), for picking one. What is on

@@ -320,6 +320,23 @@ class _Exclusions:
         self.tails = tuple(t.strip("/") for t in (spec.get("exclude_tails") or ()))
         self.name_patterns = tuple(spec.get("exclude_name_patterns") or ())
         self.same_as = _identities(spec.get("exclude_same_as") or ())
+        # DALTON-HOOK(workspace-file-exclusions): non-empty globs prune mirrored rows on next sync (§4)
+        self.rel_globs = tuple(p.strip("/") for p in (spec.get("exclude_rel_globs") or ()) if p and p.strip("/"))
+        self._prot: dict[str, bool] = {}
+
+    def _has_prot(self, path: str | None, rel: str) -> bool:
+        if not path or path in self._prot: return self._prot.get(path or "", False)
+        try:
+            with os.scandir(path) as it:
+                for c in it:
+                    if c.is_dir(follow_symlinks=False) and (c.name == ".git" or c.name in self.whole or f"{rel}/{c.name}" == "work/uploads" or (c.name not in self.dir_names and f"{rel}/{c.name}" not in self.rel_dirs and not f"{rel}/{c.name}".startswith(self.rel_dir_prefixes) and self._has_prot(c.path, f"{rel}/{c.name}"))):
+                        return self._prot.setdefault(path, True)
+        except FileNotFoundError as exc:
+            raise OSError(errno.EAGAIN, str(exc)) from exc
+        return self._prot.setdefault(path, False)
+
+    def _left_out_by_glob(self, rel: str, child: Any = None, *, is_dir: bool = False) -> bool:
+        return bool(self.rel_globs) and ".git" not in (ps := rel.split("/")) and rel != "work/uploads" and not rel.startswith("work/uploads/") and not (is_dir and rel == "work") and any(fnmatch.fnmatchcase("/".join(ps[: i + 1]), p) for i in range(len(ps)) for p in self.rel_globs) and not (is_dir and self._has_prot(getattr(child, "path", None), rel))
 
     def _left_out_by_copy(self, child: Any, rel: str) -> bool:
         full = self.tail_base + rel
@@ -370,6 +387,7 @@ class _Exclusions:
                 or rel in self.rel_files
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "symlink"
         if child.is_dir(follow_symlinks=False):
@@ -377,10 +395,11 @@ class _Exclusions:
                 name in self.dir_names
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel, child, is_dir=True)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "dir"
         if child.is_file(follow_symlinks=False):
-            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes)
+            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes) or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             return None if left_out else "file"
         # Sockets, fifos and devices are not files a backup can carry.
         return None

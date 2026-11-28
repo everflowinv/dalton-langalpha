@@ -529,6 +529,7 @@ def get_capabilities_payload() -> dict[str, Any]:
             "name": brand_name,
         },
         "ticker_logos": bool(GINLIX_DATA_ENABLED),
+        "market_enabled": True,
     }
 
 
@@ -1039,6 +1040,8 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "DriveTrashSweep": CORE_CAPABILITY,
         "WorkspaceFileGCService": CORE_CAPABILITY,
         "SetupSettings": CORE_CAPABILITY,
+        # Prod Audit 2 Batch 1: per-worker Redis diagnostics flush + PG leader sampler
+        "RedisDiagnosticsService": CORE_CAPABILITY,
     }
 )
 
@@ -1049,10 +1052,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
     tuple[str, str], CapabilityId | tuple[CapabilityId, ...] | None
 ] = MappingProxyType(
     {
+        # --- public_og.py --- (share-preview OpenGraph fragment; brand-only fallback, no credentials)
+        ("public_og.py", "get_public_og_meta"): CORE_CAPABILITY,
         # --- router.py ---
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_browser_memory_diagnostics_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_admin_redis_diagnostics_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_native_models_status_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "check_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "sync_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
@@ -1163,6 +1169,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_mint_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_bind_card_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_inspect_gate_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_consume_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_resumes_claim_text_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_resumes_ack_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_runtime_config_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_register_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_finish_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_weixin_accounts_reconcile_endpoint"): (
@@ -1275,12 +1288,16 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "upload_chat_part_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "complete_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
+        ("workspace_file_download.py", "download_workspace_file_with_ticket"): CORE_CAPABILITY,  # one-time ticket from download-url
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
         # --- watchlist.py (Personal Watchlist three-tier & outbox reconciler) ---
         ("watchlist.py", "get_watchlist_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "get_watchlist_metrics_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "get_watchlist_tier_policies_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "preview_watchlist_tier_policy_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "update_watchlist_tier_policy_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "reset_watchlist_tier_policy_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "preview_watchlist_mutation_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "mutate_watchlist_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "reconcile_watchlist_endpoint"): CORE_CAPABILITY,

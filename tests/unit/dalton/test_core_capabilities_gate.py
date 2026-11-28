@@ -2726,10 +2726,11 @@ class TestBatch3BackendTextAndSkillGates:
     ) -> None:
         from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
         from ptc_agent.agent.middleware.skills import dalton_registry as dr_mod
+        from src.dalton.capabilities import effective_capabilities
         from src.dalton.content_assembly import read_assembled_text
 
         _clean_cap_env(monkeypatch, app_env="core")
-        core_caps = frozenset()
+        core_caps = effective_capabilities()
 
         # All 30 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
         core_skills = sorted(

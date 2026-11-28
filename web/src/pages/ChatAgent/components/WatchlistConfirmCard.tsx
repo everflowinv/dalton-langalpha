@@ -80,6 +80,7 @@ export function WatchlistConfirmCard({
     affected_workspaces = [],
     task_summary,
     preserve_workspace_notice,
+    policy_diff,
     failure_code,
     failure_error,
     reconcile_status,
@@ -151,6 +152,66 @@ export function WatchlistConfirmCard({
     <div className="space-y-2 text-xs">
       {description && (
         <div style={{ color: 'var(--color-text-secondary)' }}>{description}</div>
+      )}
+
+      {policy_diff?.before && policy_diff?.after && (
+        <div
+          className="rounded-md border p-2 space-y-1 text-[11px]"
+          style={{
+            backgroundColor: 'var(--color-bg-page)',
+            borderColor: 'var(--color-border-muted)',
+          }}
+        >
+          <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {t('chat.watchlistConfirm.policyDiffTitle')}
+          </div>
+          {(
+            [
+              [
+                t('chat.watchlistConfirm.tasks.watch'),
+                policy_diff.before.watch_enabled ? policy_diff.before.watch_cron || 'ON' : t('chat.watchlistConfirm.policyOff'),
+                policy_diff.after.watch_enabled ? policy_diff.after.watch_cron || 'ON' : t('chat.watchlistConfirm.policyOff'),
+              ],
+              [
+                t('chat.watchlistConfirm.tasks.delta'),
+                policy_diff.before.delta_enabled
+                  ? `${policy_diff.before.delta_cron || 'ON'} (${policy_diff.before.delta_timezone || 'Asia/Shanghai'})`
+                  : t('chat.watchlistConfirm.policyOff'),
+                policy_diff.after.delta_enabled
+                  ? `${policy_diff.after.delta_cron || 'ON'} (${policy_diff.after.delta_timezone || 'Asia/Shanghai'})`
+                  : t('chat.watchlistConfirm.policyOff'),
+              ],
+              [
+                t('chat.watchlistConfirm.tasks.move'),
+                policy_diff.before.move_enabled ? `±${policy_diff.before.move_threshold_pct ?? 4}%` : t('chat.watchlistConfirm.policyOff'),
+                policy_diff.after.move_enabled ? `±${policy_diff.after.move_threshold_pct ?? 4}%` : t('chat.watchlistConfirm.policyOff'),
+              ],
+              [
+                t('chat.watchlistConfirm.tasks.earnings'),
+                (policy_diff.before.earnings_stages || []).length > 0
+                  ? (policy_diff.before.earnings_stages || []).join(', ')
+                  : t('chat.watchlistConfirm.policyOff'),
+                (policy_diff.after.earnings_stages || []).length > 0
+                  ? (policy_diff.after.earnings_stages || []).join(', ')
+                  : t('chat.watchlistConfirm.policyOff'),
+              ],
+            ] as const
+          ).map(([label, beforeVal, afterVal]) => {
+            const changed = beforeVal !== afterVal;
+            return (
+              <div
+                key={label}
+                className="flex flex-wrap items-center justify-between gap-2"
+                style={{ color: changed ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
+              >
+                <span>{label}</span>
+                <span className="font-mono">
+                  {changed ? `${beforeVal} → ${afterVal}` : afterVal}
+                </span>
+              </div>
+            );
+          })}
+        </div>
       )}
 
       {affected_tickers.length > 0 && (

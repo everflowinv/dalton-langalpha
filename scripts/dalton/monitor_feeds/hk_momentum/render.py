@@ -30,6 +30,7 @@ HKMOM_EXTRA_CSS = r"""
 .showmore{color:var(--blue);cursor:pointer;font-size:12px;margin-top:8px;display:inline-block}
 .showmore:hover{text-decoration:underline}
 .partial-note{font-size:11px;color:var(--temp-warm);margin-top:4px}
+.suspended-tag{margin-left:6px;background:rgba(255,191,60,.14);border-color:#7d551b;color:#ffd08a;font-size:10.5px}
 .info-banner{background:#12253e;border:1px solid #355a8a;color:#cfe2ff;border-radius:10px;padding:9px 13px;font-size:12.5px;margin:8px 0 0;display:none}
 .info-banner.show{display:block}
 """
@@ -53,6 +54,43 @@ def _collect_source_notes(
             parts.append(f"{label}：{ent['note']}")
     if not parts and isinstance(meta, dict) and meta.get("ggt_skipped_note"):
         parts.append(f"深交所港股通名单：{meta['ggt_skipped_note']}")
+    if isinstance(meta, dict) and isinstance(meta.get("suspended_constituents"), dict):
+        seen_susp: set[str] = set()
+        for items in meta["suspended_constituents"].values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not item.get("code"):
+                    continue
+                code = str(item["code"])
+                if code in seen_susp:
+                    continue
+                seen_susp.add(code)
+                note = str(
+                    item.get("note")
+                    or f"停牌，沿用 {item.get('carried_close_date') or '最近'} 日收盘价"
+                )
+                label = f"{code}({item['name']})" if item.get("name") and item["name"] != code else code
+                frag = f"{label} {note}"
+                if note not in "；".join(parts) or code not in "；".join(parts):
+                    parts.append(frag)
+    if isinstance(meta, dict) and isinstance(meta.get("removed_suspended_constituents"), dict):
+        seen_rem: set[str] = set()
+        for items in meta["removed_suspended_constituents"].values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not item.get("code"):
+                    continue
+                code = str(item["code"])
+                if code in seen_rem:
+                    continue
+                seen_rem.add(code)
+                note = str(item.get("note") or "已停牌超过 20 个交易日，移出计算")
+                label = f"{code}({item['name']})" if item.get("name") and item["name"] != code else code
+                frag = f"{label} {note}"
+                if note not in "；".join(parts) or code not in "；".join(parts):
+                    parts.append(frag)
     if isinstance(meta, dict) and (meta.get("excluded_codes") or []):
         excl_n = len(meta["excluded_codes"])
         suffix = f"已从所有指数候选池排除身份未确认代码 {excl_n} 只"
@@ -166,6 +204,38 @@ function formatSourceNotes(sources, metaObj) {
   }
   if (!parts.length && metaObj && metaObj.ggt_skipped_note) {
     parts.push(`深交所港股通名单：${metaObj.ggt_skipped_note}`);
+  }
+  if (metaObj && metaObj.suspended_constituents && typeof metaObj.suspended_constituents === 'object') {
+    const seenSusp = new Set();
+    for (const items of Object.values(metaObj.suspended_constituents)) {
+      if (!Array.isArray(items)) continue;
+      for (const item of items) {
+        if (!item || !item.code || seenSusp.has(item.code)) continue;
+        seenSusp.add(item.code);
+        const note = item.note || `停牌，沿用 ${item.carried_close_date || '最近'} 日收盘价`;
+        const lbl = (item.name && item.name !== item.code) ? `${item.code}(${item.name})` : item.code;
+        const joined = parts.join('；');
+        if (!joined.includes(item.code) || !joined.includes(note)) {
+          parts.push(`${lbl} ${note}`);
+        }
+      }
+    }
+  }
+  if (metaObj && metaObj.removed_suspended_constituents && typeof metaObj.removed_suspended_constituents === 'object') {
+    const seenRem = new Set();
+    for (const items of Object.values(metaObj.removed_suspended_constituents)) {
+      if (!Array.isArray(items)) continue;
+      for (const item of items) {
+        if (!item || !item.code || seenRem.has(item.code)) continue;
+        seenRem.add(item.code);
+        const note = item.note || '已停牌超过 20 个交易日，移出计算';
+        const lbl = (item.name && item.name !== item.code) ? `${item.code}(${item.name})` : item.code;
+        const joined = parts.join('；');
+        if (!joined.includes(item.code) || !joined.includes(note)) {
+          parts.push(`${lbl} ${note}`);
+        }
+      }
+    }
   }
   if (metaObj && Array.isArray(metaObj.excluded_codes) && metaObj.excluded_codes.length) {
     parts.push(`已从所有指数候选池排除身份未确认代码 ${metaObj.excluded_codes.length} 只`);
@@ -377,17 +447,29 @@ function drawChart(hoverIdx) {
 
 function renderTables() {
   const rebal = (meta && meta.last_rebalance_date) || '上月末';
-  document.getElementById('sub-smallcap').textContent = COPY.tables.smallcap_sub_tpl.replace('{rebal_date}', rebal);
+  const remByIdx = (meta && meta.removed_suspended_constituents && typeof meta.removed_suspended_constituents === 'object')
+    ? meta.removed_suspended_constituents
+    : {};
+  const remSuffix = (k) => {
+    const items = Array.isArray(remByIdx[k]) ? remByIdx[k] : [];
+    const codes = items.map(x => x && x.code).filter(Boolean);
+    return codes.length ? `（已停牌超过 20 个交易日，移出计算：${codes.join('、')}）` : '';
+  };
+  document.getElementById('sub-smallcap').textContent =
+    COPY.tables.smallcap_sub_tpl.replace('{rebal_date}', rebal) + remSuffix('smallcap');
   const exclCnt = (meta && Array.isArray(meta.excluded_codes)) ? meta.excluded_codes.length : 0;
   const nonggtSub = COPY.tables.nonggt_sub_tpl.replace('{rebal_date}', rebal)
-    + (exclCnt > 0 ? `（已排除身份未确认 ${exclCnt} 只）` : '');
+    + (exclCnt > 0 ? `（已排除身份未确认 ${exclCnt} 只）` : '')
+    + remSuffix('nonggt');
   document.getElementById('sub-nonggt').textContent = nonggtSub;
   for (const k of ['smallcap', 'nonggt']) {
     const rows = cons[k] || [];
     const lim = S.expanded[k] ? rows.length : 10;
     let h = `<thead><tr>${COPY.tables.headers.map((hd, idx) => `<th${idx <= 2 ? ' style="text-align:left"' : ''}>${esc(hd)}</th>`).join('')}</tr></thead><tbody>`;
     rows.slice(0, lim).forEach((r, i) => {
-      h += `<tr><td style="text-align:left">${i + 1}</td><td style="text-align:left">${esc(r.code)}</td><td style="text-align:left">${esc(r.name)}</td>`
+      const suspNote = r.suspended_note || (r.suspended ? `停牌，沿用 ${r.carried_close_date || '最近'} 日收盘价` : '');
+      const suspBadge = suspNote ? `<span class="pill suspended-tag">${esc(suspNote)}</span>` : '';
+      h += `<tr><td style="text-align:left">${i + 1}</td><td style="text-align:left">${esc(r.code)}</td><td style="text-align:left">${esc(r.name)}${suspBadge}</td>`
         + `<td>${r.score ?? '—'}</td>`
         + `<td class="${cls(r.ret12)}">${r.ret12 != null ? (r.ret12 >= 0 ? '+' : '') + r.ret12 + '%' : '—'}</td>`
         + `<td>${r.mktcap_e8 ?? '—'}</td></tr>`;

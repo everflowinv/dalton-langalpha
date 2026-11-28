@@ -32,6 +32,8 @@ import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
 import { useMessageActions } from './MessageActionsContext';
 import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
+// DALTON-HOOK(deliverable-text): per-segment captured image scope for live run_end images_by_message
+import { CapturedImagesContext } from '../../contexts/CapturedImagesContext';
 import { FoldPanel } from './FoldPanel';
 import { CardArrivals, type ArrivingCard } from './CardArrivals';
 import { useMotionSafe } from '@/lib/reducedMotion';
@@ -168,7 +170,9 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   const rendersNow = !!textContent
     && (!isStreaming || streamingMode === 'token' || visibleParagraphPrefix(textContent) !== '');
   // An empty block has no line to land on; the landing falls back to the bubble.
-  return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
+  const body = isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
+  // DALTON-HOOK(deliverable-text): provide per-segment capturedImages when present so same-path rewrites resolve per message
+  return block.segment.capturedImages ? <CapturedImagesContext.Provider value={block.segment.capturedImages}>{body}</CapturedImagesContext.Provider> : body;
 }
 
 export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
@@ -444,7 +448,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
         if (block.type === 'html_widget') {
           const widgetSeg = (block as HtmlWidgetRenderBlock).segment;
-          const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string> }> | undefined)?.[widgetSeg.widgetId!];
+          // DALTON-HOOK(share-redaction): preserve redacted flag on widgetData so redacted placeholders never mount an iframe
+          const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string>; redacted?: boolean }> | undefined)?.[widgetSeg.widgetId!];
           if (!widgetData) return null;
           // DALTON-HOOK(channel-deep-links): strip internal 'widget-' segment prefix so data-widget-id matches ShowWidget's persistent artifact_id
           const deepLinkWidgetId = widgetSeg.widgetId?.startsWith('widget-')
@@ -462,6 +467,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                 onSendPrompt={onWidgetSendPrompt}
                 exports={widgetExports} // DALTON-HOOK(shared-widgets)
                 data={widgetData.data}
+                redacted={widgetData.redacted} // DALTON-HOOK(share-redaction)
               />
             </div>
           );

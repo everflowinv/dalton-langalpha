@@ -669,9 +669,24 @@ class TestReadEndpointsAllowColleagues:
         monkeypatch.setattr(slices_db, "upsert_turn_slices", upsert_turns_spy)
         monkeypatch.setattr(slices_db, "update_turns", update_turns_spy)
 
+        from starlette.requests import Request as StarletteRequest
+
+        replay_req = StarletteRequest(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": f"/api/v1/threads/{thread_id}/messages/replay",
+                "headers": [],
+                "query_string": b"",
+                "client": ("127.0.0.1", 12345),
+                "scheme": "http",
+                "server": ("127.0.0.1", 8000),
+            }
+        )
         replay_resp = await threads_messaging.replay_thread_messages(
             thread_id=thread_id,
             x_user_id="u-rex",
+            request=replay_req,
             source="auto",
             limit=None,
             before_turn=None,

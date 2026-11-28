@@ -29,6 +29,8 @@ import { snapshotRowSpellings } from './quoteAdapters';
 import { normalizeIndexKey } from '@/lib/marketUtils';
 import { queryKeys } from '@/lib/queryKeys';
 import { asQuoteTier } from '@/lib/freshness';
+import { chunkQuotePool } from '@/lib/dalton/quotes/chunkQuotePool'; // DALTON-HOOK(watchlist)
+import { mergeRestQuoteRow } from '@/lib/dalton/quotes/quoteMerge'; // DALTON-HOOK(watchlist)
 import type { SnapshotData } from '@/types/market';
 
 /** The canonical quote row: the snapshot endpoints' wire row, with its tier
@@ -106,9 +108,10 @@ export class QuoteBatcher {
     const indexes = this.pendingIndexes;
     this.pendingStocks = new Map();
     this.pendingIndexes = new Map();
+    // DALTON-HOOK(watchlist): split coalesced pools to <=250 symbols per snapshot request so each batch settles independently
     await Promise.all([
-      this.flushGroup(stocks, false),
-      this.flushGroup(indexes, true),
+      ...chunkQuotePool(stocks).map((chunk) => this.flushGroup(chunk, false)),
+      ...chunkQuotePool(indexes).map((chunk) => this.flushGroup(chunk, true)),
     ]);
   }
 
@@ -146,13 +149,19 @@ export class QuoteBatcher {
       }
       // Missing / unknown symbol → null (not undefined): React Query rejects an
       // `undefined` queryFn result, and the hooks map null → `quote: undefined`.
-      const value: QuoteRow | null = row ?? null;
+      // DALTON-HOOK(watchlist): preserve newer WS/cached trade prices on REST backfill
+      const value: QuoteRow | null = row
+        ? mergeRestQuoteRow(this.queryClient.getQueryData<QuoteRow | null>(queryKeys.quote.detail(key)), row)
+        : null;
       this.queryClient.setQueryData(queryKeys.quote.detail(key), value);
       // A row shown under another spelling also seeds that key, so a page
       // adopting the shown spelling lands on a warm entry.
       const shown = value ? quoteKey(String(value.symbol), isIndex) : key;
       if (shown !== key && !pool.has(shown)) {
-        this.queryClient.setQueryData(queryKeys.quote.detail(shown), value);
+        // DALTON-HOOK(watchlist): preserve newer WS/cached trade prices on alias backfill
+        this.queryClient.setQueryData<QuoteRow | null>(queryKeys.quote.detail(shown), (prev) =>
+          value ? mergeRestQuoteRow(prev, value) : null,
+        );
       }
       this.settle(key, isIndex, deferred, { value });
     }

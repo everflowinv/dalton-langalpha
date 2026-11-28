@@ -2410,14 +2410,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "query": "ask",
             "search": "ask",
         },
-        "accepted_params": ["ticker", "query", "start", "end", "limit"],
-        "accepted_nested_params": [],
+        "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
+        "accepted_nested_params": ["max_pages", "start_page", "deadline_at", "deadline_s"],
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
             "quote": ["ticker"],
         },
-        "optional_params": ["operation", "ticker", "start", "end", "limit"],
+        "optional_params": ["operation", "ticker", "start", "end", "limit", "params"],
         "param_formats": {
             "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'。filings / quote 用；ask 不单独接受 ticker（桥接层会并入 query）",
             "start": "YYYY-MM-DD（filings 必填；ask 的日期写进 query）",
@@ -4539,6 +4539,13 @@ def _normalize_and_validate_call_args(
             cn_hk_refused = [
                 k for k in ("query", "start", "end") if str(normalized.get(k) or "").strip()
             ]
+        if (
+            route == "cn-hk"
+            and eff_op != "filings"
+            and isinstance(normalized.get("params"), dict)
+            and any(v is not None for v in normalized["params"].values())
+        ):
+            cn_hk_refused.append("params")
         if cn_hk_refused:
             return normalized, norm_view, {
                 "_declared_sources": [],
@@ -4550,11 +4557,66 @@ def _normalize_and_validate_call_args(
                 "unsupported_parameters": cn_hk_refused,
                 "error": (
                     f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
-                    "filings 用 ticker/start/end；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "filings 用 ticker/start/end（可选 params.max_pages/start_page/deadline_at/deadline_s）；quote 只用 ticker（当前报价，没有历史日期）；"
                     "自然语言问题用 operation='ask'，公司和日期写进 query。"
                 ),
                 "normalized_params": norm_view,
             }
+        if route == "cn-hk" and eff_op == "filings" and isinstance(normalized.get("params"), dict):
+            for cn_pk, cn_max in (("max_pages", 20), ("start_page", 200)):
+                cn_pv = normalized["params"].get(cn_pk)
+                if cn_pv is None:
+                    continue
+                if isinstance(cn_pv, bool) or not isinstance(cn_pv, int) or not 1 <= cn_pv <= cn_max:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.{cn_pk} 须为 1–{cn_max} 的正整数（当前为 {cn_pv!r}）。",
+                        "hint": f"请将 params.{cn_pk} 设为 1–{cn_max} 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_da = normalized["params"].get("deadline_at")
+            if cn_da is not None:
+                if (
+                    isinstance(cn_da, bool)
+                    or not isinstance(cn_da, (int, float))
+                    or not math.isfinite(float(cn_da))
+                    or not 0 < float(cn_da) < 1e11
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_at 须为有效的 Unix 时间戳（秒）（当前为 {cn_da!r}）。",
+                        "hint": "请将 params.deadline_at 设为正的 Unix 时间戳（秒），或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_dl = normalized["params"].get("deadline_s")
+            if cn_dl is not None:
+                if (
+                    isinstance(cn_dl, bool)
+                    or not isinstance(cn_dl, (int, float))
+                    or not math.isfinite(float(cn_dl))
+                    or not 0 < float(cn_dl) <= 600
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_s 须为 0–600 之间的正数（当前为 {cn_dl!r}）。",
+                        "hint": "请将 params.deadline_s 设为 0–600 之间的正数（秒），或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
         missing_req: list[str] = []
         if route == "alphaengine":
             p_cur = dict(normalized.get("params")) if isinstance(normalized.get("params"), dict) else {}
@@ -8364,7 +8426,47 @@ class ResearchDataBridge:
                 "x-search",
             }
 
-    def compute_timeout(self, tool_name: str, arguments: dict[str, Any]) -> int:
+    @staticmethod
+    def _extract_cnhk_deadline_remaining_s(
+        arguments: Mapping[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> float | None:
+        """Return remaining seconds until cn-hk filings deadline_at (or legacy deadline_s)."""
+        route = str(arguments.get("route") or "").strip()
+        if route != "cn-hk":
+            return None
+        params = arguments.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        raw_at = params.get("deadline_at")
+        if (
+            raw_at is not None
+            and not isinstance(raw_at, bool)
+            and isinstance(raw_at, (int, float))
+            and math.isfinite(float(raw_at))
+            and 0 < float(raw_at) < 1e11
+        ):
+            cur = time.time() if now_ts is None else float(now_ts)
+            return max(0.0, float(raw_at) - cur)
+        raw_s = params.get("deadline_s")
+        if (
+            raw_s is not None
+            and not isinstance(raw_s, bool)
+            and isinstance(raw_s, (int, float))
+            and math.isfinite(float(raw_s))
+            and float(raw_s) > 0
+        ):
+            return min(float(raw_s), 600.0)
+        return None
+
+    def compute_timeout(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> int:
         """Compute clamped timeout in seconds for a tool call."""
         ceiling = max(10, self.cfg.caller_budget_s - 25)
         if tool_name == "catalog":
@@ -8390,7 +8492,11 @@ class ResearchDataBridge:
             chosen = min(req_timeout, max_s)
         else:
             chosen = default_s
-        return max(5, min(chosen, max_s, ceiling))
+        orig_timeout = max(5, min(chosen, max_s, ceiling))
+        cnhk_rem_s = self._extract_cnhk_deadline_remaining_s(arguments, now_ts=now_ts)
+        if cnhk_rem_s is not None:
+            return min(orig_timeout, max(1, int(math.ceil(cnhk_rem_s + 5.0))))
+        return orig_timeout
 
     def _research_code_root(self) -> Path:
         """Resolve active research_runtime code directory."""
@@ -14704,6 +14810,25 @@ class ResearchDataBridge:
                     remaining_budget_s = max(
                         5.0, float(eff_timeout) - elapsed_so_far + 5.0
                     )
+                    if tool_name != "catalog" and route == "cn-hk":
+                        cnhk_rem_after_q = self._extract_cnhk_deadline_remaining_s(call_args)
+                        if cnhk_rem_after_q is not None:
+                            params_map = call_args.get("params")
+                            if (
+                                isinstance(params_map, Mapping)
+                                and params_map.get("deadline_at") is None
+                                and params_map.get("deadline_s") is not None
+                            ):
+                                cnhk_rem_after_q = max(0.0, cnhk_rem_after_q - elapsed_so_far)
+                            subproc_cap_s = min(float(eff_timeout), cnhk_rem_after_q + 5.0)
+                            remaining_budget_s = min(remaining_budget_s, max(1.0, subproc_cap_s))
+                            call_args["timeout"] = max(
+                                1,
+                                min(
+                                    int(call_args.get("timeout") or eff_timeout),
+                                    int(math.ceil(cnhk_rem_after_q + 5.0)),
+                                ),
+                            )
                     rpc_req = {
                         "jsonrpc": "2.0",
                         "id": req_id if req_id is not None else 1,
@@ -20588,11 +20713,14 @@ class ResearchDataBridge:
                         data_root=data_root,
                         ocw_root=ocw_root,
                     )
-                except HostCommandRejected:
+                except HostCommandRejected as exc:
+                    detail = str(exc)
+                    logger.warning("Host task rejected (job_key=%s): %s", job_key, detail)
                     return 400, {
                         "ok": False,
                         "rejected": True,
                         "error": "host_command_rejected",
+                        "detail": detail,
                     }
                 host_workspace_env = str(run_spec["workspace_env"])
                 gate_spec = {
@@ -21743,6 +21871,67 @@ def _load_host_job_manifest():
     return module.load_data_task_manifest()
 
 
+def _load_host_task_config_module() -> Any | None:
+    """Load stdlib-only ``src/dalton/data_jobs/task_config.py`` without requiring backend ``src``."""
+    canonical = "src.dalton.data_jobs.task_config"
+    existing = sys.modules.get(canonical)
+    if existing is not None:
+        return existing
+    if "src" not in sys.modules or sys.modules["src"] is not None:
+        try:
+            import importlib
+
+            return importlib.import_module(canonical)
+        except ImportError:
+            pass
+    fallback_name = "_dalton_bridge_data_task_config"
+    cached = sys.modules.get(fallback_name)
+    if cached is not None:
+        return cached
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2] / "src" / "dalton" / "data_jobs" / "task_config.py"
+    )
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(fallback_name, module_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fallback_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(fallback_name, None)
+        return None
+    return module
+
+
+def _read_host_data_tasks_env(cfg_path: Path) -> dict[str, str]:
+    task_cfg = _load_host_task_config_module()
+    if task_cfg is not None:
+        return task_cfg.parse_data_tasks_env_file(cfg_path)
+    values: dict[str, str] = {}
+    if not cfg_path.is_file():
+        return values
+    for raw_line in cfg_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k:
+            values[k] = v
+    return values
+
+
 def resolve_host_run_command_spec(
     *,
     job_key: str,
@@ -21785,8 +21974,46 @@ def resolve_host_run_command_spec(
     if not isinstance(cwd, str) or cwd != expected_cwd:
         raise HostCommandRejected("host cwd does not match the manifest")
     resolved = root if expected_cwd == HOST_DATA_COPY_CWD else Path(expected_cwd)
+    task_cfg = _load_host_task_config_module()
+    expanded_argv: list[str] = []
+    cfg_cache: dict[str, str] | None = None
+    for item in expected_argv:
+        m = re.fullmatch(r"\$\{(DALTON_DATA_TASK_[A-Z0-9_]+)\}", item)
+        if not m:
+            expanded_argv.append(item)
+            continue
+        env_key = m.group(1)
+        val = (os.environ.get(env_key) or "").strip()
+        if not val:
+            if cfg_cache is None:
+                cfg_override = (os.environ.get("DALTON_DATA_TASKS_CONFIG") or "").strip()
+                if cfg_override:
+                    mapped_host = (
+                        task_cfg.resolve_data_tasks_config_host_path(
+                            cfg_override,
+                            host_data_root=resolved,
+                        )
+                        if task_cfg is not None
+                        and hasattr(task_cfg, "resolve_data_tasks_config_host_path")
+                        else None
+                    )
+                    if mapped_host is not None:
+                        cfg_path = mapped_host
+                    else:
+                        cfg_path = Path(cfg_override)
+                        if not cfg_path.is_absolute():
+                            cfg_path = resolved / cfg_path
+                else:
+                    cfg_path = resolved / "config" / "data_tasks.env"
+                cfg_cache = _read_host_data_tasks_env(cfg_path)
+            val = (cfg_cache.get(env_key) or "").strip()
+        if not val and task_cfg is not None and hasattr(task_cfg, "get_everflow_data_task_default"):
+            val = str(task_cfg.get_everflow_data_task_default(env_key) or "").strip()
+        if not val or "\x00" in val:
+            raise HostCommandRejected(f"未配置 {env_key}（请设置环境变量或在 config/data_tasks.env 中配置）")
+        expanded_argv.append(val)
     return {
-        "command_argv": expected_argv,
+        "command_argv": expanded_argv,
         "cwd": str(resolved),
         "workspace_env": str(resolved),
     }

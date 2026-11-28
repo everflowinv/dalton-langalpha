@@ -31,6 +31,8 @@ from ptc_agent.agent.middleware.tool.empty_call_retry import (
     malformed_call_stop_reason,
     output_cap_stop_reason,
 )
+# DALTON-HOOK(deliverable-text): record per-send_message source_message_id and captured images for :imgfix
+from src.dalton.channels.deliverable_text import record_agent_send_image_context
 
 from src.server.utils.content_normalizer import (
     normalize_text_content,
@@ -334,6 +336,9 @@ class RunSSEProducer:
         # finish_reason arrives (e.g. Antigravity), keyed by (agent_name, message_id),
         # so an output_cap/malformed_call finish can settle them with error results.
         self._emitted_tool_calls: dict[tuple[str, str], list[dict]] = {}
+        # DALTON-HOOK(deliverable-text): delegate continuation links, fragment retractions, and notice dedup.
+        from src.dalton.channels.sse_control import DaltonStreamControl
+        self._dalton_stream_control = DaltonStreamControl(thread_id)
 
         # Event sequence numbering for reconnection support
         self.event_sequence: int = 0
@@ -619,6 +624,15 @@ class RunSSEProducer:
                 if stream_mode == "custom":
                     if isinstance(event_data, dict):
                         event_type = event_data.get("type")
+
+                        # DALTON-HOOK(deliverable-text): delegate continuation_link, message_discarded, and exhausted_notice control events
+                        handled, dalton_frames = self._dalton_stream_control.handle_custom_event(
+                            event_data, self._extract_agent_name(agent_from_stream, event_data) if agent_from_stream else "main", self._build_sse_event
+                        )
+                        if handled:
+                            for frame in dalton_frames:
+                                yield frame
+                            continue
 
                         # Handle unified context_window events (token_usage, summarize, offload)
                         if event_type == "context_window":
@@ -923,6 +937,10 @@ class RunSSEProducer:
                     is_compaction=is_compaction_chunk,
                 ):
                     yield event
+
+            # DALTON-HOOK(deliverable-text): emit any deferred exhausted_notice that did not arrive as a node message
+            for frame in self._dalton_stream_control.flush_deferred_notices(self._build_sse_event):
+                yield frame
 
             # DALTON-HOOK(thinking-leak): the stream ended with a message
             # still open, so its hold is shown as a final reply.
@@ -1240,22 +1258,8 @@ class RunSSEProducer:
         return str(message_metadata.get("langgraph_node", "agent"))
 
     def _frames_for_released(self, released: list[tuple[str, str]]) -> list[StreamFrame]:
-        frames: list[StreamFrame] = []
-        for message_id, text in released:
-            frames.append(
-                self._build_sse_event(
-                    "message_chunk",
-                    {
-                        "thread_id": self.thread_id,
-                        "agent": self._thinking_agent.get(message_id, "main"),
-                        "id": message_id,
-                        "role": "assistant",
-                        "content": text,
-                        "content_type": "text",
-                    },
-                )
-            )
-        return frames
+        # DALTON-HOOK(deliverable-text): restore per-block phase and continuation link on released held text
+        return self._dalton_stream_control.frames_for_released(released, self._thinking_agent, self._build_sse_event)
 
     def flush_open_thinking(self) -> list[StreamFrame]:
         """DALTON-HOOK(thinking-leak): show held text as a final reply.
@@ -1341,6 +1345,10 @@ class RunSSEProducer:
         # create_agent registers the tool node as graph.add_node("tools", ...).
         metadata = message_metadata or {}
         is_tool_node = metadata.get("langgraph_node") == "tools"
+
+        # DALTON-HOOK(empty-turn-guard): track stream chunk ids and dedup synthetic exhausted notices across custom/node paths
+        if not is_compaction and not is_tool_node and self._dalton_stream_control.should_suppress_message(message_chunk, agent_name, message_id):
+            return
 
         # DALTON-HOOK(empty-turn-guard): if a new message opens in the same
         # agent lane while an earlier message still has un-finished emitted
@@ -1540,12 +1548,21 @@ class RunSSEProducer:
                         yield self._build_sse_event("tool_call_chunks", event_stream_message)
                         return  # Don't process input_json_delta as regular content
 
-        # Resolve before normalization: the frame that announces the phase has
-        # empty text and is dropped below, so the table must be filled first.
-        text_phase = self._text_phase.resolve(agent_name, message_id, message_chunk.content)
+        is_inner_llm_chunk = is_tool_node and isinstance(message_chunk, (AIMessage, AIMessageChunk))
 
-        # Normalize main content - extract text and get content type
-        text_content, content_type = normalize_text_content(message_chunk.content)
+        # DALTON-HOOK(deliverable-text): bind pending continuation link on the first live chunk of the continuation message
+        live_continued_from = (
+            self._dalton_stream_control.resolve_continuation(agent_name, message_id, message_chunk)
+            if (not is_compaction and not is_inner_llm_chunk and isinstance(message_chunk, (AIMessage, AIMessageChunk)))
+            else None
+        )
+
+        # DALTON-HOOK(deliverable-text): delegate mixed-phase extraction and reasoning lifecycle to Dalton
+        leading_phase_frames, text_content, content_type, text_phase = self._dalton_stream_control.extract_chunk_content(
+            self, message_chunk, agent_name=agent_name, message_id=message_id, chunk_event_type=chunk_event_type, is_compaction=is_compaction, is_inner_llm_chunk=is_inner_llm_chunk, live_continued_from=live_continued_from,
+        )
+        for pf in leading_phase_frames:
+            yield pf
 
         # Also check for reasoning content in additional_kwargs
         if reasoning_content_from_kwargs:
@@ -1559,8 +1576,6 @@ class RunSSEProducer:
                     text_content = reasoning_text
                 # Override content type to reasoning since we have reasoning content
                 content_type = "reasoning"
-
-        is_inner_llm_chunk = is_tool_node and isinstance(message_chunk, (AIMessage, AIMessageChunk))
 
         # Whitespace alone never opens a reasoning section (the client would
         # render an empty thought), but it is still text: hold it until visible
@@ -1622,7 +1637,12 @@ class RunSSEProducer:
             if replayed_complete:
                 text_content = None
             else:
-                text_content = self._thinking_leak.feed(message_id, text_content)
+                # DALTON-HOOK(deliverable-text): preserve thinking-filter state across phase switches and restore per-block phase
+                leading_thinking_frames, text_content, text_phase = self._dalton_stream_control.feed_thinking(
+                    self, message_chunk, agent_name=agent_name, message_id=message_id, text_content=text_content, text_phase=text_phase, live_continued_from=live_continued_from,
+                )
+                for pf in leading_thinking_frames:
+                    yield pf
 
         if text_content and content_type and not is_inner_llm_chunk:
             # Check if we need to emit reasoning completion signal
@@ -1640,6 +1660,9 @@ class RunSSEProducer:
             event_stream_message["content_type"] = content_type  # "text" or "reasoning"
             if content_type == "text" and text_phase:
                 event_stream_message["phase"] = text_phase
+            # DALTON-HOOK(deliverable-text): stamp continued_from_message_id on live continuation text chunks
+            if content_type == "text" and live_continued_from:
+                event_stream_message["continued_from_message_id"] = live_continued_from
 
             # Handle reasoning content lifecycle
             if content_type == "reasoning":
@@ -1811,6 +1834,9 @@ class RunSSEProducer:
                         }
                         if args_parse_error:
                             tool_calls_message["args_parse_error"] = True
+                        # DALTON-HOOK(deliverable-text): propagate close_out marker on live tool_calls
+                        if (getattr(message_chunk, "additional_kwargs", None) or {}).get("plan_close_out"):
+                            tool_calls_message["close_out"] = True
 
                         logger.debug(
                             f"[TOOL_CALLS_COMPLETE] agent={agent_name} provider={provider_type} "
@@ -1851,23 +1877,12 @@ class RunSSEProducer:
             and event_stream_message.get("content_type") != "reasoning"
             and (finish_reason or getattr(message_chunk, "tool_calls", None))
         ):
-            leak_unsent = self._thinking_leak.pending(message_id)
-            already = event_stream_message.get("content")
-            visible = self._thinking_leak.settle(
-                message_id,
-                tool_call=(
-                    finish_reason == "tool_calls"
-                    or bool(getattr(message_chunk, "tool_calls", None))
-                ),
-                already_visible=already if isinstance(already, str) else None,
+            # DALTON-HOOK(deliverable-text): settle thinking filter and restore per-block phases
+            leak_unsent, settled_frames = self._dalton_stream_control.settle_thinking(
+                self, message_chunk, event_stream_message, agent_name=agent_name, message_id=message_id, tool_call=(finish_reason == "tool_calls" or bool(getattr(message_chunk, "tool_calls", None))), fallback_phase=text_phase, fallback_continued_from=live_continued_from,
             )
-            if visible:
-                event_stream_message["content"] = visible
-                event_stream_message["content_type"] = "text"
-            elif event_stream_message.get("content_type") == "text":
-                event_stream_message.pop("content", None)
-                event_stream_message.pop("content_type", None)
-                event_stream_message.pop("phase", None)
+            for pf in settled_frames:
+                yield pf
         elif (
             not is_compaction
             and not is_inner_llm_chunk
@@ -1876,18 +1891,12 @@ class RunSSEProducer:
             and event_stream_message.get("content_type") != "reasoning"
             and self._thinking_leak.pending(message_id)
         ):
-            # DALTON-HOOK(thinking-leak): this message has no finish
-            # metadata, so the hold is shown as a final reply.
-            leak_unsent = True
-            already = event_stream_message.get("content")
-            visible = self._thinking_leak.settle(
-                message_id,
-                tool_call=False,
-                already_visible=already if isinstance(already, str) else None,
+            # DALTON-HOOK(deliverable-text): settle no-finish complete message and restore per-block phases
+            leak_unsent, settled_frames = self._dalton_stream_control.settle_thinking(
+                self, message_chunk, event_stream_message, agent_name=agent_name, message_id=message_id, tool_call=False, fallback_phase=text_phase, fallback_continued_from=live_continued_from,
             )
-            if visible:
-                event_stream_message["content"] = visible
-                event_stream_message["content_type"] = "text"
+            for pf in settled_frames:
+                yield pf
 
         # Handle different message types
         if isinstance(message_chunk, ToolMessage):
@@ -1968,6 +1977,9 @@ class RunSSEProducer:
                 # Only emit event if we have valid tool calls
                 if filtered_tool_calls:
                     event_stream_message["tool_calls"] = filtered_tool_calls
+                    # DALTON-HOOK(deliverable-text): propagate close_out marker on live tool_calls
+                    if (getattr(message_chunk, "additional_kwargs", None) or {}).get("plan_close_out"):
+                        event_stream_message["close_out"] = True
                     # Don't include tool_call_chunks in complete tool_calls event
                     # This makes behavior consistent with Response API and Anthropic
                     yield self._build_sse_event("tool_calls", event_stream_message)
@@ -1993,6 +2005,9 @@ class RunSSEProducer:
                 )
 
                 if has_content:
+                    # DALTON-HOOK(deliverable-text): carry per-message captured image URLs when present on the message
+                    if event_stream_message.get("content_type") == "text" and (chunk_images := recorded_images(message_chunk)):
+                        event_stream_message["images"] = chunk_images
                     if is_chunk and event_stream_message.get("content"):
                         self._streamed_content_ids.add(message_id)
                     yield self._build_sse_event(chunk_event_type, event_stream_message)
@@ -2093,6 +2108,8 @@ class RunSSEProducer:
                         path: captured.get(path)
                         for path in collect_sandbox_paths([message])
                     }
+                    # DALTON-HOOK(deliverable-text): record per-send_message source_message_id and delivery-time captured images
+                    record_agent_send_image_context(self.run_id, message, captured)
 
     @property
     def saved_image_paths(self) -> Set[str]:
@@ -2115,6 +2132,11 @@ class RunSSEProducer:
             for path, url in images.items()
             if url is not None
         }
+
+    # DALTON-HOOK(deliverable-text): per-message captured image map (with stream-id aliases) for run_end parity
+    @property
+    def captured_images_by_message(self) -> Dict[str, Dict[str, str]]:
+        return self._dalton_stream_control.expand_saved_images_by_message(self._saved_images)
 
     def record(self, stop_events: Optional[List[Dict[str, Any]]] = None) -> ProducerRecord:
         """What the finalize stores beside the status that the checkpoint

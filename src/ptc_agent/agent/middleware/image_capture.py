@@ -87,7 +87,12 @@ def is_sandbox_image_path(path: str) -> bool:
 
 def image_storage_key(thread_id: str, sha_hex: str, basename: str) -> str:
     """Content-addressed storage key — deterministic, so re-captures converge."""
-    prefix = f"response-images/{thread_id}" if thread_id else "response-images"
+    # DALTON-HOOK(share-redaction): write new sandbox captures under private-media/ prefix
+    prefix = (
+        f"private-media/response-images/{thread_id}"
+        if thread_id
+        else "private-media/response-images"
+    )
     return f"{prefix}/{sha_hex[:16]}/{basename}"
 
 

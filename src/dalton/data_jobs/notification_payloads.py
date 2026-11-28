@@ -16,7 +16,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from src.dalton.data_jobs.runner_wrapper import SecretRedactor
+from src.dalton.data_jobs.runner_wrapper import DEFAULT_WORKSPACE_DIR, SecretRedactor
 from src.dalton.data_jobs.safe_fs import (
     SafeFsError,
     safe_atomic_write_bytes,
@@ -43,7 +43,7 @@ T27_EXPECTED_CHARTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("tw", "tw_latest.png", ("台湾", "加权")),
 )
 
-CONTAINER_WORKSPACE_PREFIX = "/Users/everflow/.openclaw/workspace"
+CONTAINER_WORKSPACE_PREFIX = DEFAULT_WORKSPACE_DIR
 
 ARTIFACT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")

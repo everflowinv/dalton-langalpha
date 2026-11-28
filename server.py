@@ -89,6 +89,8 @@ if __name__ == "__main__":
 
     try:
         logger.info(f"Starting server on {args.host}:{args.port}")
+        # DALTON-HOOK(workspace-file-download-ticket): redact dl_token from uvicorn.access logs
+        from src.dalton.download_ticket import build_uvicorn_log_config
         uvicorn.run(
             "src.server.app:app",
             host=args.host,
@@ -96,6 +98,7 @@ if __name__ == "__main__":
             reload=reload,
             workers=args.workers,
             log_level=args.log_level,
+            log_config=build_uvicorn_log_config(),
             timeout_keep_alive=300,  # 5 minutes - for long-running workflows
             # TCP_NODELAY on every connection; see the module.
             http="src.server.http_protocol:NoDelayHTTPProtocol",

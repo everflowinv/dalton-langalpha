@@ -72,6 +72,11 @@ def _resolve_addressing_style() -> str:
     return raw
 
 
+# DALTON-HOOK(standalone-core): resolve bucket and endpoint via shared storage_config module
+from src.dalton.storage_config import resolve_storage_bucket as _resolve_storage_bucket
+from src.dalton.storage_config import resolve_storage_endpoint_url as _resolve_storage_endpoint_url
+
+
 class StorageConfig:
     """Storage configuration loaded from environment variables.
 
@@ -81,9 +86,9 @@ class StorageConfig:
 
     ACCESS_KEY_ID = os.getenv("STORAGE_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
     SECRET_ACCESS_KEY = os.getenv("STORAGE_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
-    BUCKET_NAME = os.getenv("STORAGE_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME")
+    BUCKET_NAME = _resolve_storage_bucket("s3") or None
     REGION = os.getenv("STORAGE_REGION") or os.getenv("S3_REGION", "us-east-1")
-    ENDPOINT_URL = os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
+    ENDPOINT_URL = _resolve_storage_endpoint_url() or None
     PUBLIC_URL_BASE = os.getenv("STORAGE_PUBLIC_URL_BASE") or os.getenv("S3_PUBLIC_URL_BASE")
     # The endpoint a browser reaches the store at, when it differs from the
     # one this process uses (a MinIO addressed by its compose service name).

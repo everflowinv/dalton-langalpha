@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from functools import lru_cache
@@ -1233,6 +1234,24 @@ def get_dalton_transcription_ticket_secret() -> str:
     return os.getenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip()
 
 
+def is_dalton_transcription_ticket_using_dev_fallback() -> bool:
+    """Return True when transcription tickets are signed by the predictable local dev seed.
+
+    Decoupled from ``LANGALPHA_OWNER_SECRET``: whenever ``DALTON_TRANSCRIPTION_TICKET_SECRET``,
+    ``INTERNAL_SERVICE_TOKEN``, and ``DALTON_BRIDGE_ADMIN_TOKEN`` are all unset in ``oss``
+    auth mode, tickets use the predictable dev seed and MUST be restricted to direct
+    loopback non-proxied requests.
+    """
+    if is_dalton_local_auth_enabled():
+        return False
+    explicit_seed = (
+        get_dalton_transcription_ticket_secret()
+        or get_internal_service_token()
+        or get_dalton_bridge_admin_token()
+    )
+    return not explicit_seed and get_dalton_auth_mode() == "oss"
+
+
 def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
     """Derive the HMAC-SHA256 signing key for per-job transcription tickets.
 
@@ -1945,6 +1964,36 @@ def get_dalton_audit_cache_hmac_key() -> bytes | None:
     return hmac.new(seed.encode("utf-8"), b"dalton-audit-cache-v1", hashlib.sha256).digest()
 
 
+_EPHEMERAL_WORKFLOW_DECISION_KEY: bytes = secrets.token_bytes(32)
+
+
+def get_dalton_workflow_decision_hmac_key() -> bytes:
+    """Derive the server-only HMAC-SHA256 key for signing workflow launch decisions.
+
+    Uses a deployment server secret (never exposed to sandboxes) when configured so
+    signatures survive process restarts and multi-worker routing, falling back to a
+    process-ephemeral 32-byte key in local/test runs without env secrets.
+    """
+    for env_name in (
+        "JWT_SIGNING_SECRET",
+        "DALTON_AUDIT_CACHE_KEY",
+        "SUPABASE_SECRET_KEY",
+        "DALTON_RESEARCH_HOST_ADMIN_TOKEN",
+    ):
+        seed = os.getenv(env_name, "").strip()
+        if seed:
+            return hmac.new(
+                seed.encode("utf-8"),
+                b"dalton-workflow-decision-v1",
+                hashlib.sha256,
+            ).digest()
+    return hmac.new(
+        _EPHEMERAL_WORKFLOW_DECISION_KEY,
+        b"dalton-workflow-decision-v1",
+        hashlib.sha256,
+    ).digest()
+
+
 DEFAULT_INVITE_EMAIL_DOMAIN = "team.dalton.local"
 
 
@@ -2052,12 +2101,97 @@ def get_stop_backup_close_timeout_s() -> float:
     )
 
 
+<<<<<<< HEAD
 BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH = (
     "plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx"
 )
 WORKSPACE_CUSTOM_MODEL_TEMPLATE_RELPATH = (
     ".agents/modeling_cache/custom_default_template.xlsx"
 )
+=======
+def _parse_bool_env_or_section_yaml(
+    env_var: str, section: str, yaml_key: str, default: bool = True
+) -> bool:
+    """Resolve a runtime switch from ``env_var`` -> merged YAML ``<section>.<yaml_key>`` -> ``default``.
+
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
+    for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
+    """
+    raw = os.getenv(env_var)
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("0", "false", "no", "off"):
+            return False
+        if cleaned in ("1", "true", "yes", "on"):
+            return True
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    section_cfg = raw_yaml.get(section)
+    if isinstance(section_cfg, Mapping) and isinstance(section_cfg.get(yaml_key), bool):
+        return bool(section_cfg[yaml_key])
+    return bool(default)
+
+
+def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool = True) -> bool:
+    """Resolve a channel runtime switch from ``env_var`` -> merged YAML ``channels.<yaml_key>`` -> ``default``."""
+    return _parse_bool_env_or_section_yaml(env_var, "channels", yaml_key, default=default)
+
+
+def is_channel_interactive_actions_enabled() -> bool:
+    """Static switch for channel interactive action buttons (``DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED",
+        "interactive_actions_enabled",
+        default=True,
+    )
+
+
+def is_channel_interrupt_ledger_enabled() -> bool:
+    """Static switch for channel HITL interrupt resume ledger (``DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED",
+        "interrupt_ledger_enabled",
+        default=True,
+    )
+
+
+def is_channel_bt2_link_recovery_enabled() -> bool:
+    """Static switch for BT2 deliverable link crash recovery enrollment (``DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED",
+        "bt2_link_recovery_enabled",
+        default=True,
+    )
+
+
+def is_redis_diagnostics_enabled() -> bool:
+    """Runtime switch for Redis write-timeout diagnostics & sampling (``DALTON_REDIS_DIAG_ENABLED``).
+
+    Defaults to ``True``; disable via ``DALTON_REDIS_DIAG_ENABLED=0`` or YAML
+    ``observability.redis_diagnostics_enabled: false``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_REDIS_DIAG_ENABLED", "observability", "redis_diagnostics_enabled", default=True
+    )
+
+
+def is_strict_deliverable_text_enabled() -> bool:
+    """Switch for unified strict deliverable-text extraction (``DALTON_STRICT_DELIVERABLE_TEXT``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_STRICT_DELIVERABLE_TEXT",
+        "strict_deliverable_text_enabled",
+        default=True,
+    )
+
+
+def is_near_empty_retry_enabled() -> bool:
+    """Switch for near-empty reply retry detection (``DALTON_NEAR_EMPTY_RETRY_ENABLED``)."""
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_NEAR_EMPTY_RETRY_ENABLED",
+        "llm",
+        "near_empty_retry_enabled",
+        default=True,
+    )
+>>>>>>> origin/dalton/main
 
 
 def get_dalton_model_default_template_path() -> str:
@@ -2076,4 +2210,42 @@ def resolve_default_model_template_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return REPO_ROOT / BUNDLED_DEFAULT_MODEL_TEMPLATE_RELPATH
+
+
+def get_redis_diag_ops_dir() -> Path:
+    """Return directory for per-worker/server Redis diagnostics JSON files (default ``var/dalton/ops``)."""
+    raw = os.getenv("DALTON_REDIS_DIAG_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return REPO_ROOT / "var" / "dalton" / "ops"
+
+
+def is_monitor_verify_readback_enabled() -> bool:
+    """Switch for 3-stage monitor publish verification & readback (``DALTON_MONITOR_VERIFY_READBACK_ENABLED``)."""
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_MONITOR_VERIFY_READBACK_ENABLED",
+        "monitors",
+        "verify_readback_enabled",
+        default=True,
+    )
+
+
+def get_monitor_multi_binding_publish_mode() -> Literal["per_panel", "all_or_nothing"]:
+    """Return multi-panel data-job cut strategy: ``'per_panel'`` (default) or ``'all_or_nothing'``."""
+    raw = os.getenv("DALTON_MONITOR_MULTI_BINDING_PUBLISH_MODE")
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("per_panel", "all_or_nothing"):
+            return cleaned  # type: ignore[return-value]
+        logger.warning(
+            "Ignoring invalid DALTON_MONITOR_MULTI_BINDING_PUBLISH_MODE=%r; using 'per_panel'",
+            raw,
+        )
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    mon_cfg = raw_yaml.get("monitors")
+    if isinstance(mon_cfg, Mapping):
+        val = str(mon_cfg.get("multi_binding_publish_mode") or "").strip().lower()
+        if val in ("per_panel", "all_or_nothing"):
+            return val  # type: ignore[return-value]
+    return "per_panel"
 

@@ -20,6 +20,10 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from src.dalton.data_jobs.notification_payloads import DataTaskNotificationPrepError
+from src.dalton.data_jobs.task_config import (
+    get_everflow_data_task_default,
+    parse_data_tasks_env_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +31,84 @@ logger = logging.getLogger(__name__)
 # the overlay constants DEV and TRACKING. Batch 4 personal targets stay in the
 # OpenClaw ``user:`` / ``ou_`` form here; ``canonical_route_target`` is what the
 # notification route and the binding check consume.
-FDE_WEEKLY_DISCORD_TARGET = "channel:1481256083589697566"
-SEMI_BOTTOM_DISCORD_TARGET = "channel:1480405100672581875"
-E_WATCH_DISCORD_DM = "user:1134818575211839498"
-A_SHARE_FEISHU_DM = "user:ou_75b483fb76c31370c715e3a3df1e0a61"
+# Delivery targets resolve in priority order:
+#   1) DALTON_DATA_TASK_* env var
+#   2) $DALTON_DATA_TASKS_CONFIG or <workspace>/config/data_tasks.env
+#   3) Everflow-only everflow_defaults.yaml (loaded ONLY when src.dalton.profile is Everflow)
+ENV_FDE_WEEKLY_DISCORD_TARGET = "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL"
+ENV_SEMI_BOTTOM_DISCORD_TARGET = "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL"
+ENV_E_WATCH_DISCORD_DM = "DALTON_DATA_TASK_DISCORD_DM_TARGET"
+ENV_A_SHARE_FEISHU_DM = "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET"
+
+
+def _read_data_task_config_file(config_path: Path) -> dict[str, str]:
+    return parse_data_tasks_env_file(config_path)
+
+
+def _resolve_target_from_config(
+    env_key: str,
+    *,
+    fallback_value: str = "",
+    workspace_dir: Path | None = None,
+) -> str:
+    env_val = (os.environ.get(env_key) or "").strip()
+    if env_val:
+        return env_val
+    cfg_override = (os.environ.get("DALTON_DATA_TASKS_CONFIG") or "").strip()
+    if cfg_override:
+        cfg_path = Path(cfg_override)
+        if not cfg_path.is_absolute() and workspace_dir is not None:
+            cfg_path = Path(workspace_dir) / cfg_path
+        val = _read_data_task_config_file(cfg_path).get(env_key, "").strip()
+        if val:
+            return val
+    else:
+        cfg_candidates: list[Path] = []
+        if workspace_dir is not None:
+            cfg_candidates.append(Path(workspace_dir) / "config" / "data_tasks.env")
+        for var in ("DALTON_DATA_TASK_WORKSPACE", "DALTON_WORKSPACE", "OPENCLAW_WORKSPACE", "WORKDIR"):
+            raw_ws = (os.environ.get(var) or "").strip()
+            if raw_ws:
+                cfg_candidates.append(Path(raw_ws) / "config" / "data_tasks.env")
+        for cfg_path in cfg_candidates:
+            val = _read_data_task_config_file(cfg_path).get(env_key, "").strip()
+            if val:
+                return val
+    everflow_default = get_everflow_data_task_default(env_key)
+    if everflow_default:
+        return everflow_default
+    return fallback_value.strip()
+
+
+def _require_target(
+    env_key: str,
+    *,
+    fallback_value: str = "",
+    workspace_dir: Path | None = None,
+) -> str:
+    target = _resolve_target_from_config(
+        env_key,
+        fallback_value=fallback_value,
+        workspace_dir=workspace_dir,
+    )
+    if not target:
+        raise DataTaskNotificationPrepError(
+            f"未配置 {env_key}（请设置环境变量或在 config/data_tasks.env 中配置）"
+        )
+    return target
+
+
+FDE_WEEKLY_DISCORD_TARGET = _resolve_target_from_config(ENV_FDE_WEEKLY_DISCORD_TARGET)
+SEMI_BOTTOM_DISCORD_TARGET = _resolve_target_from_config(ENV_SEMI_BOTTOM_DISCORD_TARGET)
+E_WATCH_DISCORD_DM = _resolve_target_from_config(ENV_E_WATCH_DISCORD_DM)
+A_SHARE_FEISHU_DM = _resolve_target_from_config(ENV_A_SHARE_FEISHU_DM)
 E_WATCH_INTRADAY_JOB_KEY = "e-watch-intraday"
 A_SHARE_VOLUME_JOB_KEY = "a-share-bottom-volume-watch"
-_ANNOUNCE_STDOUT_TARGETS: dict[str, tuple[str, str]] = {
-    E_WATCH_INTRADAY_JOB_KEY: ("discord", E_WATCH_DISCORD_DM),
-    "T2": ("discord", E_WATCH_DISCORD_DM),
-    A_SHARE_VOLUME_JOB_KEY: ("feishu", A_SHARE_FEISHU_DM),
-    "T38": ("feishu", A_SHARE_FEISHU_DM),
+_ANNOUNCE_STDOUT_TARGET_SPECS: dict[str, tuple[str, str]] = {
+    E_WATCH_INTRADAY_JOB_KEY: ("discord", ENV_E_WATCH_DISCORD_DM),
+    "T2": ("discord", ENV_E_WATCH_DISCORD_DM),
+    A_SHARE_VOLUME_JOB_KEY: ("feishu", ENV_A_SHARE_FEISHU_DM),
+    "T38": ("feishu", ENV_A_SHARE_FEISHU_DM),
 }
 FDE_WEEKLY_FAILURE_PREFIX = "⚠️ FDE 周报生成失败（"
 
@@ -105,8 +176,8 @@ def _md_us_day(value: Any) -> str:
     return f"{day.month}/{day.day}"
 
 
-# Seeded by scripts/dalton/seed_openclaw_data.sh from data_assets into the data copy.
-# The data-task container mounts that copy and /app/src, not /app/scripts.
+# Runtime loads from the workspace data copy first; the repo data_assets copy
+# is only a fallback when the workspace copy is absent (e.g. backend process calls).
 _DATA_COPY_CARD_SCRIPT = Path("scripts") / "feishu_send_card.py"
 _REPO_ASSET_FEISHU_SEND_CARD = (
     Path(__file__).resolve().parents[3]
@@ -236,10 +307,12 @@ def adjust_batch3_payload(
     payload: dict[str, Any] | None,
     stdout_text: str = "",
     workspace_dir: Path | None = None,
+    config_workspace_dir: Path | None = None,
     run_artifacts_dir: Path | None = None,
 ) -> dict[str, Any] | _SuppressOutbox | None:
     """Return a replacement outbox, ``SUPPRESS_OUTBOX``, or None to keep ``payload``."""
     key = str(job_key or "").strip()
+    cfg_ws = config_workspace_dir if config_workspace_dir is not None else workspace_dir
     if key in SEMI_RESCUE_JOB_KEYS:
         return _adjust_semi_rescue(
             key,
@@ -252,19 +325,21 @@ def adjust_batch3_payload(
             payload,
             stdout_text,
             job_key=key,
-            target=SEMI_BOTTOM_DISCORD_TARGET,
+            target_env_key=ENV_SEMI_BOTTOM_DISCORD_TARGET,
+            workspace_dir=cfg_ws,
             suppress_no_reply=True,
         )
     if key == "fde-hiring-weekly-report":
-        return _adjust_fde_weekly(payload, stdout_text)
-    if key in _ANNOUNCE_STDOUT_TARGETS:
-        channel, target = _ANNOUNCE_STDOUT_TARGETS[key]
+        return _adjust_fde_weekly(payload, stdout_text, workspace_dir=cfg_ws)
+    if key in _ANNOUNCE_STDOUT_TARGET_SPECS:
+        channel, env_key = _ANNOUNCE_STDOUT_TARGET_SPECS[key]
         return _adjust_announce_stdout(
             payload,
             stdout_text,
             job_key=key,
             channel=channel,
-            target=target,
+            target_env_key=env_key,
+            workspace_dir=cfg_ws,
         )
     return None
 
@@ -274,7 +349,10 @@ def _adjust_plain_discord(
     stdout_text: str,
     *,
     job_key: str,
-    target: str,
+    target: str = "",
+    target_env_key: str = "",
+    fallback_target: str = "",
+    workspace_dir: Path | None = None,
     suppress_no_reply: bool,
     channel: str = "discord",
 ) -> dict[str, Any] | _SuppressOutbox | None:
@@ -284,11 +362,18 @@ def _adjust_plain_discord(
     first = text.splitlines()[0].strip() if text.splitlines() else ""
     if suppress_no_reply and first == "NO_REPLY":
         return SUPPRESS_OUTBOX
+    resolved_target = target.strip()
+    if not resolved_target and target_env_key:
+        resolved_target = _require_target(
+            target_env_key,
+            fallback_value=fallback_target,
+            workspace_dir=workspace_dir,
+        )
     out = dict(payload or {})
     out["job_key"] = job_key
     out["format"] = "text"
     out["channel"] = channel
-    out["target"] = target
+    out["target"] = resolved_target
     out["text"] = text
     out["feishu_message"] = text
     out["preserve_exact_text"] = True
@@ -302,7 +387,10 @@ def _adjust_announce_stdout(
     *,
     job_key: str,
     channel: str,
-    target: str,
+    target: str = "",
+    target_env_key: str = "",
+    fallback_target: str = "",
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any] | _SuppressOutbox | None:
     """Send the same stdout OpenClaw announce would, including a failure sentence.
 
@@ -315,12 +403,15 @@ def _adjust_announce_stdout(
         stdout_text,
         job_key=_canonical_announce_job_key(job_key),
         target=target,
+        target_env_key=target_env_key,
+        fallback_target=fallback_target,
+        workspace_dir=workspace_dir,
         suppress_no_reply=True,
         channel=channel,
     )
     if adjusted is SUPPRESS_OUTBOX or not isinstance(adjusted, dict):
         return adjusted
-    adjusted["route_target"] = canonical_route_target(channel, target)
+    adjusted["route_target"] = canonical_route_target(channel, str(adjusted["target"]))
     adjusted["notify_on_failure"] = True
     return adjusted
 
@@ -328,12 +419,15 @@ def _adjust_announce_stdout(
 def _adjust_fde_weekly(
     payload: dict[str, Any] | None,
     stdout_text: str,
+    *,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any] | _SuppressOutbox | None:
     adjusted = _adjust_plain_discord(
         payload,
         stdout_text,
         job_key="fde-hiring-weekly-report",
-        target=FDE_WEEKLY_DISCORD_TARGET,
+        target_env_key=ENV_FDE_WEEKLY_DISCORD_TARGET,
+        workspace_dir=workspace_dir,
         suppress_no_reply=False,
     )
     if adjusted is SUPPRESS_OUTBOX or not isinstance(adjusted, dict):
@@ -638,7 +732,7 @@ def _discord_target_from_mirror(raw: Mapping[str, Any]) -> str | None:
 
 
 def _load_eve_tracking_mirror(workspace: Path):
-    script = workspace / "scripts" / "eve_tracking_mirror.py"
+    script = Path(workspace) / "scripts" / "eve_tracking_mirror.py"
     if script.is_symlink() or not script.is_file():
         return None
     spec = importlib.util.spec_from_file_location("dalton_eve_tracking_mirror", script)

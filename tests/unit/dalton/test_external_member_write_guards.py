@@ -1301,10 +1301,25 @@ async def test_five_thread_routes_and_external_stop_sharing_legacy_payload(
             threads_messaging.get_replay_thread_data, return_value=fake_replay_rows
         ),
     )
+    from starlette.requests import Request as StarletteRequest
+
+    ext_replay_req = StarletteRequest(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": f"/api/v1/threads/{THREAD_ID}/messages/replay",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "scheme": "http",
+            "server": ("127.0.0.1", 8000),
+        }
+    )
     with pytest.raises(HTTPException) as e_replay:
         await threads_messaging.replay_thread_messages(
             THREAD_ID,
             x_user_id="ext-1",
+            request=ext_replay_req,
             source="auto",
             limit=None,
             before_turn=None,

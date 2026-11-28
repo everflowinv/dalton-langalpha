@@ -1128,14 +1128,32 @@ def _dalton_stage_card_to_outbox(card: dict[str, Any], chat_id: str) -> dict[str
         _collect_placeholders(card["elements"])
 
     images_entries: list[dict[str, str]] = []
-    ocw_prefix = "/Users/everflow/.openclaw/workspace/"
+    ocw_prefix = (os.environ.get("DALTON_DATA_TASK_LEGACY_WORKSPACE_PREFIX") or "").strip()
+    if not ocw_prefix:
+        cfg_override = (os.environ.get("DALTON_DATA_TASKS_CONFIG") or "").strip()
+        cfg_path = Path(cfg_override) if cfg_override else (Path(workspace_dir) / "config" / "data_tasks.env")
+        if cfg_path.is_file():
+            for raw_line in cfg_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if line.startswith("DALTON_DATA_TASK_LEGACY_WORKSPACE_PREFIX="):
+                    val = line.split("=", 1)[1].strip()
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                        val = val[1:-1]
+                    ocw_prefix = val.strip()
+                    break
+    if ocw_prefix and not ocw_prefix.endswith("/"):
+        ocw_prefix += "/"
     for img_idx, placeholder in enumerate(placeholders):
         src_path = Path(placeholder)
         if not src_path.is_file() and not src_path.is_absolute():
             alt = Path(workspace_dir) / placeholder
             if alt.is_file():
                 src_path = alt
-        if not src_path.is_file() and placeholder.startswith(ocw_prefix):
+        if ocw_prefix and not src_path.is_file() and placeholder.startswith(ocw_prefix):
             alt = Path(workspace_dir) / placeholder[len(ocw_prefix):]
             if alt.is_file():
                 src_path = alt

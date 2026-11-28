@@ -1,4 +1,5 @@
 // DALTON-HOOK(extended-hours-quotes): Single shared quote display derivation and 2-decimal formatters across Dashboard, MarketView, and agent exports.
+import { isUSEquity } from '@/lib/bars/exchanges';
 import { grouped2 } from '@/lib/format';
 import { getExtendedHoursInfo } from './extendedHoursCore';
 
@@ -38,6 +39,8 @@ export interface QuoteDisplayInput {
   extPct?: number | null;
   liveTickAt?: number | null;
   live_tick_at?: number | null;
+  regularOnly?: boolean | null;
+  regular_only?: boolean | null;
   market_status?: string | null;
   marketStatus?: string | null;
 }
@@ -109,9 +112,13 @@ export function deriveQuoteDisplay(
           ? { market: 'extended-hours', afterHours: true, earlyHours: false }
           : null;
 
-  const info = getExtendedHoursInfo(effectiveStatus ?? null, row ?? null);
-  const extType = (row?.extType !== undefined ? row.extType : info.extType) ?? null;
-  const session: 'regular' | 'pre' | 'post' = extType ?? 'regular';
+  const isUs = isUSEquity(row?.symbol);
+  const info = isUs ? getExtendedHoursInfo(effectiveStatus ?? null, row ?? null) : null;
+  const extType = isUs ? ((row?.extType !== undefined ? row.extType : info?.extType) ?? null) : null;
+  const isUnprintedPreMarket =
+    row != null && isUs && effectiveStatus?.earlyHours === true && extType == null;
+  const session: 'regular' | 'pre' | 'post' =
+    extType ?? (isUnprintedPreMarket ? 'pre' : 'regular');
 
   const rowPrice = row?.price ?? null;
   const rowChange = row?.change ?? null;
@@ -121,12 +128,18 @@ export function deriveQuoteDisplay(
   const tickHasTimestamp =
     liveTick != null &&
     (liveTick.timestamp != null || liveTick.liveTickAt != null || liveTick.live_tick_at != null);
+  const rowLastMinuteClose = row?.lastMinuteClose ?? row?.last_minute_close ?? null;
   const rowHasLiveTick =
     row != null && (row.liveTickAt != null || row.live_tick_at != null);
   const rawTickPrice = tickHasTimestamp
     ? liveTick?.price
     : rowHasLiveTick
-      ? (liveTick?.price ?? rowPrice)
+      ? (liveTick?.price ??
+          (rowLastMinuteClose != null
+            ? rowLastMinuteClose
+            : row?.lastMinuteClose === null || row?.last_minute_close === null
+              ? null
+              : rowPrice))
       : null;
   const tickPrice =
     typeof rawTickPrice === 'number' && Number.isFinite(rawTickPrice) ? rawTickPrice : null;
@@ -157,47 +170,67 @@ export function deriveQuoteDisplay(
     };
   }
 
-  const prevClose = info.prevClose ?? row?.fallbackPreviousClose ?? null;
-  const regularClose = info.regularClose ?? null;
+  const prevClose = info?.prevClose ?? row?.fallbackPreviousClose ?? null;
+  const regularClose = info?.regularClose ?? null;
+  const explicitRegularClose = row?.regularClose ?? row?.regular_close ?? null;
   const regChangeField = row?.regularTradingChange ?? row?.regular_trading_change ?? null;
   const regChangePctField =
     row?.regularTradingChangePercent ?? row?.regular_trading_change_percent ?? null;
+  const isRegularOnlySnapshot = row?.regularOnly === true || row?.regular_only === true;
 
-  const settledClose = (session === 'post' ? regularClose : prevClose) ?? null;
+  // In pre-market with current-session prints (`extType === 'pre'`), the snapshot has
+  // rolled to today so `prevClose` is yesterday's close (the PM anchor). When pre-market
+  // has no prints yet (`isUnprintedPreMarket`), core-install Yahoo/FMP fallback rows and
+  // prior-session AH rows still hold yesterday's close in `regular_close` / `price` and
+  // the session-before-yesterday in `previous_close` — pick the latest regular close.
+  const settledClose =
+    session === 'post'
+      ? regularClose
+      : isUnprintedPreMarket
+        ? (explicitRegularClose ?? (isRegularOnlySnapshot ? rowPrice : null) ?? prevClose)
+        : (prevClose ?? explicitRegularClose);
 
-  const prePriorClose =
-    session === 'pre' && settledClose != null && regChangeField != null
-      ? settledClose - regChangeField
+  const unprintedRegularFallbackChange =
+    isUnprintedPreMarket && isRegularOnlySnapshot
+      ? (rowChange ?? (settledClose != null && prevClose != null ? settledClose - prevClose : null))
       : null;
 
   const mainChange =
     session === 'post' && regularClose != null && prevClose != null
       ? regularClose - prevClose
       : session === 'pre'
-        ? regChangeField
+        ? (regChangeField ?? unprintedRegularFallbackChange)
         : null;
+
+  const prePriorClose =
+    session === 'pre' && settledClose != null && mainChange != null
+      ? settledClose - mainChange
+      : null;
 
   const mainChangePct =
     session === 'post'
       ? (mainChange != null && prevClose ? (mainChange / prevClose) * 100 : null)
       : session === 'pre'
         ? (regChangePctField ??
+            (isUnprintedPreMarket && isRegularOnlySnapshot ? rowChangePct : null) ??
             (mainChange != null && prePriorClose ? (mainChange / prePriorClose) * 100 : null))
         : null;
 
   // In after-hours (`post`), require `regularClose` as the session anchor; do not accept
   // a post-market price synthesized against `prevClose` when `regularClose` is missing.
-  const hasPostAnchor = session !== 'post' || regularClose != null;
-  const extAnchor = hasPostAnchor ? (info.extAnchor ?? null) : null;
-  const baseExtPrice = hasPostAnchor ? (row?.extPrice ?? info.extPrice ?? null) : null;
-  const baseExtChange = hasPostAnchor ? (row?.extChange ?? info.extChange ?? null) : null;
-  const baseExtPct = hasPostAnchor ? (row?.extPct ?? info.extPct ?? null) : null;
+  // In pre-market without current-session prints (`extType == null`), suppress the
+  // extended-hours sub-row so stale prior-session WS ticks never render as PM.
+  const hasExtSessionTrade = extType != null && (session !== 'post' || regularClose != null);
+  const extAnchor = hasExtSessionTrade ? (info?.extAnchor ?? null) : null;
+  const baseExtPrice = hasExtSessionTrade ? (row?.extPrice ?? info?.extPrice ?? null) : null;
+  const baseExtChange = hasExtSessionTrade ? (row?.extChange ?? info?.extChange ?? null) : null;
+  const baseExtPct = hasExtSessionTrade ? (row?.extPct ?? info?.extPct ?? null) : null;
 
-  const extPrice = hasPostAnchor ? (tickPrice ?? baseExtPrice) : null;
-  const extChange = hasPostAnchor
+  const extPrice = hasExtSessionTrade ? (tickPrice ?? baseExtPrice) : null;
+  const extChange = hasExtSessionTrade
     ? (tickPrice != null && extAnchor != null ? tickPrice - extAnchor : baseExtChange)
     : null;
-  const extChangePct = hasPostAnchor
+  const extChangePct = hasExtSessionTrade
     ? (tickPrice != null && extAnchor ? ((tickPrice - extAnchor) / extAnchor) * 100 : baseExtPct)
     : null;
 

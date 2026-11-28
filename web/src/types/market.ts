@@ -96,6 +96,12 @@ export interface SnapshotData {
   tier?: QuoteTier | null;
   /** Time of the quoted print (Unix ms) when the provider reports one. */
   as_of?: number | null;
+  /** Last trade print timestamp (Unix ms), separate from composite bid/ask as_of. */
+  last_trade_at?: number | null; // DALTON-HOOK(watchlist)
+  /** Regular-session close print timestamp (Unix ms). */
+  regular_as_of?: number | null; // DALTON-HOOK(watchlist)
+  /** True when snapshot carries only regular-session prices; false when extended-hours enriched. */
+  regular_only?: boolean | null; // DALTON-HOOK(watchlist)
   /** Timestamp (Unix ms) stamped by writeQuoteFromWs when a live WS tick merges into this row. */
   live_tick_at?: number | null; // DALTON-HOOK(extended-hours-quotes)
   /** Freshness measured for this quote at response time. */
@@ -149,6 +155,7 @@ export interface StockPrice {
   lastMinuteClose?: number | null;
   lastTradePrice?: number | null;
   liveTickAt?: number | null;
+  regularOnly?: boolean | null; // DALTON-HOOK(watchlist)
 }
 
 // --- Chart Data ---

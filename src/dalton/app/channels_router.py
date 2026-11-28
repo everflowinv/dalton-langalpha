@@ -48,6 +48,7 @@ from src.dalton.database.channel_gateway import (
 )
 from src.dalton.database import weixin_multi_account as wx_db
 from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
+from src.dalton import channel_action_tokens as cat_svc
 from src.dalton.settings import redact_weixin_secrets
 from src.server.utils.api import CurrentUserId, ServiceUserId
 
@@ -235,6 +236,7 @@ class PreflightSendRequest(BaseModel):
 
 class VerifyDmRecipientRequest(BaseModel):
     delivery_attempt: int | None = None
+    resolved_recipient_id: str | None = None
 
 
 class TopicsLookupRequest(BaseModel):
@@ -363,6 +365,13 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     source_scope_key: str | None = None
     source_generation: int | None = None
     activity_origin: str | None = "none"
+    requested_files: list[dict[str, Any]] | None = None
+    source_delivery_key: str | None = None
+    attempt_id: str | None = None
+    reclaim_stale_attempt_id: str | None = None
+    reclaim_stale_source_attempt_id: str | None = None
+    retry_dedup_by_target: bool = False
+    payload_digest: str | None = None
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -381,7 +390,101 @@ class DeliveryProgressRequest(BaseModel):
     confirmed_thread_address: str | None = None
     discord_body_phase: str | None = None
     delivery_attempt: int | None = None
+    claim_attempt_id: str | None = None
     bot_topic_registration: dict[str, Any] | None = None
+
+
+class ActionTokenMintRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    platform: str
+    dalton_user_id: str
+    initiator_platform_user_id: str
+    origin_chat_type: str
+    origin_chat_address: str
+    origin_scope_key: str
+    session_generation: int
+    thread_id: str
+    run_id: str
+    interrupt_id: str
+    interrupt_value: dict[str, Any]
+    pending_interrupt_count: int = 1
+    card_chat_type: str | None = None
+    card_delivery_address: str | None = None
+    prompt_summary: dict[str, Any] | None = None
+    approval_snapshots: dict[str, Any] | None = None
+
+
+class ActionTokenBindCardRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str | None = None
+    token_hash: str | None = None
+    phase: str = "confirm_bound"
+    platform: str | None = None
+    card_channel_id: str | None = None
+    card_message_id: str | None = None
+    send_reconcile_meta: dict[str, Any] | None = None
+
+
+class ActionTokenInspectGateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str
+    clicker_platform_user_id: str
+    channel_id: str
+    message_id: str
+
+
+class ActionTokenConsumeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    approval_nonce: str
+    decision: str
+    clicker_platform_user_id: str
+    platform: str | None = None
+    channel_id: str | None = None
+    message_id: str | None = None
+    reason: str | None = None
+    answer_text: str | None = None
+    option_index: int | None = None
+
+
+class InterruptResumeClaimTextRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    platform: str
+    message_id: str
+    dalton_user_id: str
+    scope_key: str
+    generation: int
+    thread_id: str
+    run_id: str
+    interrupt_id: str
+    resume_payload: dict[str, Any]
+
+
+class InterruptResumeAckRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    thread_id: str | None = None
+    run_id: str | None = None
+    interrupt_id: str | None = None
+    claim_id: str | None = None
+    outcome: str | None = None
+    settle_delivery: bool = False
+    error: str | None = None
+    card_results: list[dict[str, Any]] | None = None
+    late_card_results: list[dict[str, Any]] | None = None
+
+
+class InterruptRuntimeConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mode: str | None = None
+    interactive_actions_enabled: bool | None = None
+    interrupt_ledger_enabled: bool | None = None
+    bt2_link_recovery_enabled: bool | None = None
 
 
 class InboundProgressRequest(BaseModel):
@@ -814,6 +917,7 @@ async def internal_deliveries_verify_dm_recipient_endpoint(
         return await verify_dm_delivery_recipient(
             delivery_key=delivery_key,
             delivery_attempt=body.delivery_attempt,
+            resolved_recipient_id=body.resolved_recipient_id,
             gateway_epoch=raw_epoch,
             require_gateway_epoch=True,
         )
@@ -1424,6 +1528,13 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             source_scope_key=body.source_scope_key,
             source_generation=body.source_generation,
             activity_origin=body.activity_origin,
+            requested_files=body.requested_files,
+            source_delivery_key=body.source_delivery_key,
+            attempt_id=body.attempt_id,
+            reclaim_stale_attempt_id=body.reclaim_stale_attempt_id,
+            reclaim_stale_source_attempt_id=body.reclaim_stale_source_attempt_id,
+            retry_dedup_by_target=body.retry_dedup_by_target,
+            payload_digest=body.payload_digest,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
@@ -1461,6 +1572,7 @@ async def internal_deliveries_progress_endpoint(
             confirmed_thread_address=body.confirmed_thread_address,
             discord_body_phase=body.discord_body_phase,
             delivery_attempt=body.delivery_attempt,
+            claim_attempt_id=body.claim_attempt_id,
             bot_topic_registration=body.bot_topic_registration,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
@@ -1563,15 +1675,235 @@ async def internal_recover_endpoint(
     mode: str = Query(default="startup"),
     thread_id: str | None = Query(default=None),
 ) -> Any:
-    """I-7 (4): Recover channel gateway state on `startup` or `watch_reconnect`."""
+    """I-7 (4): Recover channel gateway state on `startup`, `watch_reconnect`, or `interrupt_resumes`."""
     _resolve_optional_internal_user_id(request)
     try:
+        # Check enabled platform capabilities BEFORE parsing X-Gateway-Epoch (§3.1 #5)
+        if not cat_svc.get_enabled_channel_platforms():
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "channel_platforms_disabled",
+                    "message": "All channel platform capabilities are disabled.",
+                },
+            )
         epoch = _parse_gateway_epoch(request, required=False)
         return await recover_channel_state(
             mode=mode,
             thread_id=thread_id,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Channel Phase 2 Batch 3: Interactive Action Tokens & Interrupt Resumes
+# ---------------------------------------------------------------------------
+
+
+@channels_router.post(
+    "/internal/action-tokens/mint",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_mint_endpoint(
+    body: ActionTokenMintRequest,
+    request: Request,
+) -> Any:
+    """Classify an HITL interrupt (L0–L3 / credit_pause) and mint an opaque action token."""
+    _resolve_optional_internal_user_id(request, body.dalton_user_id)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.mint_channel_action_token(
+            platform=body.platform,
+            dalton_user_id=body.dalton_user_id,
+            initiator_platform_user_id=body.initiator_platform_user_id,
+            origin_chat_type=body.origin_chat_type,
+            origin_chat_address=body.origin_chat_address,
+            origin_scope_key=body.origin_scope_key,
+            session_generation=body.session_generation,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            interrupt_value=body.interrupt_value,
+            pending_interrupt_count=body.pending_interrupt_count,
+            card_chat_type=body.card_chat_type,
+            card_delivery_address=body.card_delivery_address,
+            prompt_summary=body.prompt_summary,
+            approval_snapshots=body.approval_snapshots,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/bind-card",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_bind_card_endpoint(
+    body: ActionTokenBindCardRequest,
+    request: Request,
+) -> Any:
+    """Persist pre-send `send_in_flight`, confirm card message binding, or record `send_failed` / `send_unknown`."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.bind_channel_action_card(
+            approval_nonce=body.approval_nonce,
+            token_hash=body.token_hash,
+            phase=body.phase,
+            platform=body.platform,
+            card_channel_id=body.card_channel_id,
+            card_message_id=body.card_message_id,
+            send_reconcile_meta=body.send_reconcile_meta,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/inspect-gate",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_inspect_gate_endpoint(
+    body: ActionTokenInspectGateRequest,
+    request: Request,
+) -> Any:
+    """Verify Discord group gate card click, write `gate_verified_at`, and mint ephemeral detail token."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.inspect_discord_gate_token(
+            approval_nonce=body.approval_nonce,
+            clicker_platform_user_id=body.clicker_platform_user_id,
+            channel_id=body.channel_id,
+            message_id=body.message_id,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/action-tokens/consume",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_action_tokens_consume_endpoint(
+    body: ActionTokenConsumeRequest,
+    request: Request,
+) -> Any:
+    """Verify channel card button click and atomically claim the interrupt resume slot."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.consume_channel_action_token(
+            approval_nonce=body.approval_nonce,
+            decision=body.decision,
+            clicker_platform_user_id=body.clicker_platform_user_id,
+            platform=body.platform,
+            channel_id=body.channel_id,
+            message_id=body.message_id,
+            reason=body.reason,
+            answer_text=body.answer_text,
+            option_index=body.option_index,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-resumes/claim-text",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_resumes_claim_text_endpoint(
+    body: InterruptResumeClaimTextRequest,
+    request: Request,
+) -> Any:
+    """Claim an `ask_user_question` or `credit_pause` interrupt via channel text reply."""
+    _resolve_optional_internal_user_id(request, body.dalton_user_id)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.claim_channel_text_interrupt_resume(
+            platform=body.platform,
+            message_id=body.message_id,
+            dalton_user_id=body.dalton_user_id,
+            scope_key=body.scope_key,
+            generation=body.generation,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            resume_payload=body.resume_payload,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-resumes/ack",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_resumes_ack_endpoint(
+    body: InterruptResumeAckRequest,
+    request: Request,
+) -> Any:
+    """Ack origin-channel dispatch/delivery settlement or per-card / late-card terminal patches."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await cat_svc.ack_channel_interrupt_resume(
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            interrupt_id=body.interrupt_id,
+            claim_id=body.claim_id,
+            outcome=body.outcome,
+            settle_delivery=body.settle_delivery,
+            error=body.error,
+            card_results=body.card_results,
+            late_card_results=body.late_card_results,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/interrupt-runtime-config",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_interrupt_runtime_config_endpoint(
+    body: InterruptRuntimeConfigRequest,
+    request: Request,
+) -> Any:
+    """Update single-row 7b-0 runtime barrier config or enter three-switch production drain mode."""
+    _resolve_optional_internal_user_id(request)
+    try:
+        cleaned_mode = str(body.mode or "").strip().lower()
+        if cleaned_mode == "enter_drain":
+            return await cat_svc.enter_interrupt_drain_mode()
+        if (
+            body.interrupt_ledger_enabled is not None
+            or body.bt2_link_recovery_enabled is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "drain_mode_required",
+                    "message": "Only interactive_actions_enabled may be changed outside mode='enter_drain'.",
+                },
+            )
+        return await cat_svc.set_interrupt_runtime_config(
+            interactive_actions_enabled=body.interactive_actions_enabled,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)

@@ -1,12 +1,27 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, FolderOpen, Star, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, FolderOpen, RefreshCw, Star, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
-import { compactNumber, DASH } from '@/lib/format';
+import { DASH } from '@/lib/format';
 import { formatMoney, quoteCurrency } from '@/lib/bars';
+import { quoteKey, roundQuote2, type MarketStatusInput, type QuoteRow } from '@/lib/quotes';
+import {
+  ExtendedHours,
+  formatExtendedQuotePrice,
+  resolveExtendedHoursDisplay,
+  type ResolvedExtendedHoursDisplay,
+} from '@/components/dalton/ExtendedHours';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import {
   WATCHLIST_TIERS,
   type PersonalWatchlistCompany,
+  type ValuationStatus,
   type WatchlistColumnKey,
   type WatchlistMetricRow,
   type WatchlistTier,
@@ -14,9 +29,11 @@ import {
 
 export type WatchlistSortField = 'ticker' | WatchlistColumnKey;
 
-interface WatchlistFullTableProps {
+export interface WatchlistFullTableProps {
   companies: readonly PersonalWatchlistCompany[];
   metrics: Record<string, WatchlistMetricRow>;
+  quotes?: Record<string, QuoteRow | undefined>;
+  marketStatus?: MarketStatusInput | null;
   metricsLoading: boolean;
   visibleColumns: readonly WatchlistColumnKey[];
   groupedByTier: boolean;
@@ -47,6 +64,9 @@ const COL_LABEL_KEY: Record<WatchlistColumnKey, string> = {
   chg_3m: 'marketView:watchlist.columns.chg_3m',
   chg_ytd: 'marketView:watchlist.columns.chg_ytd',
   chg_1y: 'marketView:watchlist.columns.chg_1y',
+  pe_fy1: 'marketView:watchlist.columns.pe_fy1',
+  pe_fy2: 'marketView:watchlist.columns.pe_fy2',
+  eps_growth_fy2: 'marketView:watchlist.columns.eps_growth_fy2',
   range_52w: 'marketView:watchlist.columns.range_52w',
   rsi_14d: 'marketView:watchlist.columns.rsi_14d',
   rsi_30d: 'marketView:watchlist.columns.rsi_30d',
@@ -55,6 +75,32 @@ const COL_LABEL_KEY: Record<WatchlistColumnKey, string> = {
 };
 
 const TIER_ORDER: Record<WatchlistTier, number> = { core: 0, watch: 1, radar: 2 };
+
+const MARKET_CAP_CURRENCY_GROUP_ORDER: Record<string, number> = {
+  USD: 0,
+  HKD: 1,
+  CNY: 2,
+  EUR: 3,
+  GBP: 4,
+  JPY: 5,
+};
+
+function resolveMarketCapCurrency(
+  company: PersonalWatchlistCompany,
+  metric: WatchlistMetricRow | undefined,
+): string | null {
+  return quoteCurrency(metric?.market_cap_currency ?? metric?.currency ?? null, company.ticker, 'equity');
+}
+
+function compareCurrencyGroup(curA: string | null, curB: string | null): number {
+  if (curA === curB) return 0;
+  if (curA == null) return 1;
+  if (curB == null) return -1;
+  const rankA = MARKET_CAP_CURRENCY_GROUP_ORDER[curA] ?? 999;
+  const rankB = MARKET_CAP_CURRENCY_GROUP_ORDER[curB] ?? 999;
+  if (rankA !== rankB) return rankA - rankB;
+  return curA.localeCompare(curB);
+}
 
 function signedPctColor(val: number | null | undefined): string {
   if (val == null || val === 0) return 'var(--color-text-secondary)';
@@ -69,6 +115,8 @@ function formatSignedPct(val: number | null | undefined): string {
 export function WatchlistFullTable({
   companies,
   metrics,
+  quotes,
+  marketStatus = null,
   metricsLoading,
   visibleColumns,
   groupedByTier,
@@ -116,21 +164,45 @@ export function WatchlistFullTable({
     }
   };
 
+  const extendedDisplayByTicker = useMemo(() => {
+    const out: Record<string, ResolvedExtendedHoursDisplay> = {};
+    for (const company of companies) {
+      const m = metrics[company.ticker];
+      if (company.is_private || m?.is_private) continue;
+      const quote = quotes?.[quoteKey(company.ticker)];
+      if (!quote) continue;
+      out[company.ticker] = resolveExtendedHoursDisplay(quote, marketStatus, {
+        symbol: company.ticker,
+        fallbackCurrency: m?.currency ?? null,
+        locale,
+      });
+    }
+    return out;
+  }, [companies, metrics, quotes, marketStatus, locale]);
+
   const sortedCompanies = useMemo(() => {
     const list = [...companies];
     if (!sortField) return list;
     const dir = sortDir === 'asc' ? 1 : -1;
     const metricValue = (c: PersonalWatchlistCompany): number | string | null => {
       const m = metrics[c.ticker];
+      const extInfo = extendedDisplayByTicker[c.ticker];
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
       switch (sortField) {
         case 'ticker':
           return c.ticker;
         case 'tier':
           return TIER_ORDER[c.tier] ?? 9;
         case 'price':
-          return c.is_private ? null : (m?.price ?? null);
+          return c.is_private
+            ? null
+            : inExtSession
+              ? extInfo.mainPrice
+              : (m?.price ?? null);
         case 'chg_1d':
-          return m?.chg_1d ?? null;
+          return inExtSession
+            ? (extInfo.mainChangePct != null ? roundQuote2(extInfo.mainChangePct) : null)
+            : (m?.chg_1d ?? null);
         case 'chg_1w':
           return m?.chg_1w ?? null;
         case 'chg_1m':
@@ -141,6 +213,12 @@ export function WatchlistFullTable({
           return m?.chg_ytd ?? null;
         case 'chg_1y':
           return m?.chg_1y ?? null;
+        case 'pe_fy1':
+          return m?.pe_fy1 ?? null;
+        case 'pe_fy2':
+          return m?.pe_fy2 ?? null;
+        case 'eps_growth_fy2':
+          return m?.eps_growth_fy2 ?? null;
         case 'range_52w':
           return m?.position_52w ?? null;
         case 'rsi_14d':
@@ -154,6 +232,23 @@ export function WatchlistFullTable({
       }
     };
     list.sort((a, b) => {
+      if (sortField === 'market_cap') {
+        const ma = metrics[a.ticker];
+        const mb = metrics[b.ticker];
+        const va = ma?.market_cap ?? null;
+        const vb = mb?.market_cap ?? null;
+        if (va == null && vb == null) return a.ticker.localeCompare(b.ticker);
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        // Group by quote currency (unknown currency last) so HKD/CNY/USD are never mixed as one unit
+        const curDiff = compareCurrencyGroup(
+          resolveMarketCapCurrency(a, ma),
+          resolveMarketCapCurrency(b, mb),
+        );
+        if (curDiff !== 0) return curDiff;
+        const capDiff = (va - vb) * dir;
+        return capDiff !== 0 ? capDiff : a.ticker.localeCompare(b.ticker);
+      }
       const va = metricValue(a);
       const vb = metricValue(b);
       if (va == null && vb == null) return a.ticker.localeCompare(b.ticker);
@@ -165,7 +260,7 @@ export function WatchlistFullTable({
       return (Number(va) - Number(vb)) * dir;
     });
     return list;
-  }, [companies, metrics, sortField, sortDir]);
+  }, [companies, metrics, extendedDisplayByTicker, sortField, sortDir]);
 
   const sections = useMemo(() => {
     if (!groupedByTier) {
@@ -184,31 +279,53 @@ export function WatchlistFullTable({
     if (col === 'tier') {
       return (
         <td key={col} className="px-2.5 py-2 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
-          <select
-            aria-label={t('marketView:watchlist.changeTierAria', { symbol: company.ticker })}
-            value={company.tier}
-            onChange={(e) => {
-              const nextTier = e.target.value as WatchlistTier;
-              if (nextTier !== company.tier) onRequestTierChange(company, nextTier);
-            }}
-            className="text-xs rounded-full px-2 py-0.5 border font-medium cursor-pointer"
-            style={{
-              backgroundColor: 'var(--color-bg-page)',
-              borderColor: 'var(--color-border-muted)',
-              color: 'var(--color-text-primary)',
-            }}
-          >
-            {WATCHLIST_TIERS.map((tierOpt) => (
-              <option key={tierOpt} value={tierOpt}>
-                {t(TIER_LABEL_KEY[tierOpt])}
-              </option>
-            ))}
-          </select>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                data-testid={`watchlist-tier-badge-${company.ticker}`}
+                aria-label={t('marketView:watchlist.changeTierAria', { symbol: company.ticker })}
+                className="inline-flex items-center gap-1 text-xs rounded-full px-2 py-0.5 border font-medium cursor-pointer"
+                style={{
+                  backgroundColor: 'var(--color-bg-page)',
+                  borderColor: 'var(--color-border-muted)',
+                  color: 'var(--color-text-primary)',
+                }}
+              >
+                <span>{t(TIER_LABEL_KEY[company.tier])}</span>
+                <ChevronDown className="h-3 w-3 opacity-60 shrink-0" aria-hidden="true" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="min-w-[96px]"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <DropdownMenuRadioGroup
+                value={company.tier}
+                onValueChange={(value) => {
+                  const nextTier = value as WatchlistTier;
+                  if (nextTier !== company.tier) onRequestTierChange(company, nextTier);
+                }}
+              >
+                {WATCHLIST_TIERS.map((tierOpt) => (
+                  <DropdownMenuRadioItem
+                    key={tierOpt}
+                    value={tierOpt}
+                    className="text-xs flex items-center justify-between gap-2"
+                  >
+                    <span>{t(TIER_LABEL_KEY[tierOpt])}</span>
+                    {company.tier === tierOpt && <Check className="h-3 w-3 shrink-0" aria-hidden="true" />}
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </td>
       );
     }
 
-    if (isUnlisted) {
+    if (isUnlisted && col !== 'pe_fy1' && col !== 'pe_fy2' && col !== 'eps_growth_fy2') {
       return (
         <td
           key={col}
@@ -221,14 +338,29 @@ export function WatchlistFullTable({
     }
 
     if (col === 'price') {
-      const code = quoteCurrency(m?.currency ?? null, company.ticker, 'equity');
+      const extInfo = extendedDisplayByTicker[company.ticker];
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
+      const code = extInfo?.currency ?? quoteCurrency(m?.currency ?? null, company.ticker, 'equity');
+      const mainPrice = inExtSession ? extInfo.mainPrice : (m?.price ?? null);
+      const extBadge = extInfo?.ext ?? null;
       return (
         <td
           key={col}
-          className="px-2.5 py-2 text-right text-xs font-medium tabular-nums whitespace-nowrap"
+          className={`px-2.5 ${extBadge ? 'py-1.5' : 'py-2'} text-right text-xs font-medium tabular-nums whitespace-nowrap leading-tight`}
           style={{ color: 'var(--color-text-primary)' }}
         >
-          {m?.price != null ? formatMoney(m.price, code, locale) : metricsLoading ? '…' : DASH}
+          <span className="block leading-tight">
+            {mainPrice != null
+              ? formatExtendedQuotePrice(mainPrice, code, locale, extInfo?.places)
+              : !inExtSession && metricsLoading
+                ? '…'
+                : DASH}
+          </span>
+          {extBadge && (
+            <span className="block leading-none mt-0.5">
+              <ExtendedHours label={extBadge.label} price={extBadge.price} pct={extBadge.pct} />
+            </span>
+          )}
         </td>
       );
     }
@@ -241,7 +373,12 @@ export function WatchlistFullTable({
       col === 'chg_ytd' ||
       col === 'chg_1y'
     ) {
-      const val = m?.[col];
+      const extInfo = col === 'chg_1d' ? extendedDisplayByTicker[company.ticker] : undefined;
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
+      const val =
+        col === 'chg_1d' && inExtSession
+          ? (extInfo.mainChangePct != null ? roundQuote2(extInfo.mainChangePct) : null)
+          : m?.[col];
       return (
         <td
           key={col}
@@ -249,6 +386,167 @@ export function WatchlistFullTable({
           style={{ color: signedPctColor(val) }}
         >
           {formatSignedPct(val)}
+        </td>
+      );
+    }
+
+    if (col === 'pe_fy1' || col === 'pe_fy2' || col === 'eps_growth_fy2') {
+      const valMeta = m?.valuation;
+      const cellStatus: ValuationStatus | undefined = isUnlisted
+        ? 'unlisted'
+        : col === 'pe_fy1'
+          ? (valMeta?.pe_fy1_status ?? valMeta?.status)
+          : col === 'pe_fy2'
+            ? (valMeta?.pe_fy2_status ?? valMeta?.status)
+            : (valMeta?.eps_growth_fy2_status ?? valMeta?.status);
+      const numVal =
+        col === 'pe_fy1'
+          ? m?.pe_fy1
+          : col === 'pe_fy2'
+            ? m?.pe_fy2
+            : m?.eps_growth_fy2;
+
+      const fyEnd = col === 'pe_fy1' ? valMeta?.fy1_end : valMeta?.fy2_end;
+      const fyMonth = fyEnd ? fyEnd.slice(0, 7) : null;
+      const providerStr = valMeta?.provider ?? '';
+      const analystsStr =
+        valMeta?.analyst_count != null
+          ? t('marketView:watchlist.valuation.analysts', { count: valMeta.analyst_count })
+          : '';
+      const metaParts = [
+        fyMonth ? t('marketView:watchlist.valuation.fyEnd', { date: fyMonth }) : '',
+        providerStr ? t('marketView:watchlist.valuation.source', { provider: providerStr }) : '',
+        analystsStr,
+      ].filter(Boolean);
+
+      if (cellStatus === 'unlisted') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="unlisted"
+            title={t('marketView:watchlist.unlisted')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {t('marketView:watchlist.unlisted')}
+          </td>
+        );
+      }
+
+      if (cellStatus === 'loss') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="loss"
+            title={[t('marketView:watchlist.valuation.lossTooltip'), ...metaParts].join(' · ')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap italic"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            NM
+          </td>
+        );
+      }
+
+      if (cellStatus === 'unit_unverified') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="unit_unverified"
+            title={t('marketView:watchlist.valuation.unitUnverifiedTooltip')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {DASH}
+          </td>
+        );
+      }
+
+      if (cellStatus === 'rate_limited') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="rate_limited"
+            title={t('marketView:watchlist.valuation.rateLimitedTooltip')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-warning)' }}
+          >
+            <span className="inline-flex items-center gap-1 justify-end">
+              <RefreshCw className="h-3 w-3 animate-spin" />
+              <span>{t('marketView:watchlist.valuation.rateLimitedLabel')}</span>
+            </span>
+          </td>
+        );
+      }
+
+      if (cellStatus === 'loading') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="loading"
+            title={t('marketView:watchlist.loading')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            …
+          </td>
+        );
+      }
+
+      if (cellStatus === 'no_coverage' || numVal == null) {
+        return (
+          <td
+            key={col}
+            data-valuation-status={cellStatus ?? 'no_coverage'}
+            title={
+              !valMeta && metricsLoading
+                ? t('marketView:watchlist.loading')
+                : t('marketView:watchlist.valuation.noCoverageTooltip')
+            }
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {!valMeta && metricsLoading ? '…' : DASH}
+          </td>
+        );
+      }
+
+      const isStale = cellStatus === 'stale';
+      const formatted =
+        col === 'eps_growth_fy2'
+          ? formatSignedPct(numVal)
+          : `${numVal.toFixed(1)}x`;
+      const tooltip = [
+        ...(isStale ? [t('marketView:watchlist.valuation.staleTooltip')] : []),
+        ...metaParts,
+      ].join(' · ');
+
+      return (
+        <td
+          key={col}
+          data-valuation-status={isStale ? 'stale' : 'ok'}
+          title={tooltip || undefined}
+          className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+          style={{
+            color:
+              col === 'eps_growth_fy2'
+                ? signedPctColor(numVal)
+                : 'var(--color-text-primary)',
+          }}
+        >
+          <span className="inline-flex items-center gap-1 justify-end">
+            <span>{formatted}</span>
+            {isStale && (
+              <span
+                className="text-[9px] px-1 rounded"
+                style={{
+                  backgroundColor: 'var(--color-bg-elevated)',
+                  color: 'var(--color-text-tertiary)',
+                }}
+              >
+                {t('marketView:watchlist.valuation.staleBadge')}
+              </span>
+            )}
+          </span>
         </td>
       );
     }
@@ -304,13 +602,14 @@ export function WatchlistFullTable({
 
     if (col === 'market_cap') {
       const val = m?.market_cap;
+      const code = resolveMarketCapCurrency(company, m);
       return (
         <td
           key={col}
           className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
           style={{ color: 'var(--color-text-secondary)' }}
         >
-          {val != null ? compactNumber(val, locale) : DASH}
+          {val != null ? formatMoney(val, code, locale, { compact: true }) : DASH}
         </td>
       );
     }

@@ -144,7 +144,11 @@ export async function getSharedMetadata(
   if (asVisitor) params.set('as', 'visitor');
   if (path) params.set('path', path);
   const query = params.toString() ? `?${params}` : '';
-  const res = await fetch(`${baseURL}/api/v1/public/shared/${encodeURIComponent(code)}${query}`, { headers });
+  // DALTON-HOOK(share-redaction): bypass browser HTTP cache on public share metadata reads
+  const res = await fetch(`${baseURL}/api/v1/public/shared/${encodeURIComponent(code)}${query}`, {
+    headers,
+    cache: 'no-store',
+  });
   // The body goes with the status: an app that cannot be opened says why
   // (the owner's machine not answering, say), which its page shows.
   if (!res.ok) throw sharedFileError(res.status, `Shared link not found (${res.status})`, await errorBody(res));
@@ -158,8 +162,13 @@ export async function getSharedMetadata(
  * download endpoint is gated on `allow_download` rather than `allow_files`,
  * so its 403 names that.
  */
-async function served(url: string, verb: 'load' | 'read' | 'download' = 'load'): Promise<Response> {
-  const res = await fetch(url);
+async function served(
+  url: string,
+  verb: 'load' | 'read' | 'download' = 'load',
+  signal?: AbortSignal,
+): Promise<Response> {
+  // DALTON-HOOK(share-redaction): bypass browser HTTP cache on public served file requests
+  const res = await fetch(url, { cache: 'no-store', ...(signal ? { signal } : {}) });
   if (res.ok) return res;
   if (res.status === 403) {
     throw sharedFileError(403, verb === 'download' ? 'File download not permitted' : 'File access not permitted');
@@ -187,14 +196,40 @@ export function sharedServePrefix(shareToken: string): string {
   return `/api/v1/public/shared/${encodeURIComponent(shareToken)}/files/serve/`;
 }
 
+// DALTON-HOOK(share-redaction): append metadata refresh stamp query param for allow_files=true previews and ?format=pdf URLs
+export function buildSharedServeUrl(
+  prefix: string,
+  path: string,
+  opts?: { format?: 'pdf'; refreshStamp?: string | number | null },
+): string {
+  const base = buildServeUrl(prefix, path);
+  const extra = new URLSearchParams();
+  if (opts?.format === 'pdf') extra.set('format', 'pdf');
+  if (opts?.refreshStamp != null && opts.refreshStamp !== '') {
+    extra.set('v', String(opts.refreshStamp));
+  }
+  const suffix = extra.toString();
+  if (!suffix) return base;
+  return `${base}${base.includes('?') ? '&' : '?'}${suffix}`;
+}
+
 /** The bytes of a file under a serve prefix (a share's base or the owner's grant). */
-export async function servedBytes(prefix: string, path: string): Promise<ArrayBuffer> {
-  return (await served(buildServeUrl(prefix, path))).arrayBuffer();
+export async function servedBytes(
+  prefix: string,
+  path: string,
+  opts?: { refreshStamp?: string | number | null; signal?: AbortSignal },
+): Promise<ArrayBuffer> {
+  return (await served(buildSharedServeUrl(prefix, path, opts), 'load', opts?.signal)).arrayBuffer();
 }
 
 /** A file under a serve prefix as an object URL, for an image a document embeds. */
-export async function servedObjectUrl(prefix: string, path: string): Promise<string> {
-  return URL.createObjectURL(await (await served(buildServeUrl(prefix, path))).blob());
+// DALTON-HOOK(share-redaction): forward refreshStamp and AbortSignal to shared serve URL
+export async function servedObjectUrl(
+  prefix: string,
+  path: string,
+  opts?: { refreshStamp?: string | number | null; signal?: AbortSignal },
+): Promise<string> {
+  return URL.createObjectURL(await (await served(buildSharedServeUrl(prefix, path, opts), 'load', opts?.signal)).blob());
 }
 
 /**
@@ -202,10 +237,12 @@ export async function servedObjectUrl(prefix: string, path: string): Promise<str
  * handed goes unused: the prefix is the credential.
  */
 export function servedReaders(prefix: string): BodyReaders {
-  const text = async (_workspaceId: string, path: string) => ({
-    content: await (await served(buildServeUrl(prefix, path))).text(),
-    from: LIVE,
-  });
+  // DALTON-HOOK(monitors): preserve response Content-Type so text/markdown files render as Markdown
+  const text = async (_workspaceId: string, path: string) => {
+    const res = await served(buildServeUrl(prefix, path));
+    const mime = res.headers?.get?.('content-type') || undefined;
+    return { content: await res.text(), from: LIVE, ...(mime ? { mime } : {}) };
+  };
   return {
     readFile: text,
     readFileFull: text,
@@ -221,11 +258,19 @@ export async function downloadServedFile(url: string, fileName: string): Promise
 /**
  * Replay a shared thread's conversation as SSE events.
  */
+// DALTON-HOOK(share-redaction): support beforeTurn pagination cursor, AbortSignal, and cache:'no-store'
 export async function replaySharedThread(
   shareToken: string,
   onEvent: (event: SSEEvent) => void = () => {},
+  { beforeTurn, signal }: { beforeTurn?: number; signal?: AbortSignal } = {},
 ): Promise<void> {
-  const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/replay`);
+  const params = new URLSearchParams();
+  if (beforeTurn != null) params.set('before_turn', String(beforeTurn));
+  const query = params.toString() ? `?${params}` : '';
+  const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/replay${query}`, {
+    cache: 'no-store',
+    ...(signal ? { signal } : {}),
+  });
   if (!res.ok) throw new Error(`Failed to replay shared thread (${res.status})`);
   if (!res.body) throw new Error('Replay stream returned no body');
 
@@ -271,9 +316,14 @@ export async function replaySharedThread(
 export async function getSharedFiles(
   shareToken: string,
   path: string = '.',
+  opts?: { signal?: AbortSignal },
 ): Promise<SharedFileListResponse> {
   const params = new URLSearchParams({ path });
-  const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/files?${params}`);
+  // DALTON-HOOK(share-redaction): bypass browser HTTP cache on public file list requests
+  const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/files?${params}`, {
+    cache: 'no-store',
+    ...(opts?.signal ? { signal: opts.signal } : {}),
+  });
   if (!res.ok) {
     if (res.status === 403) throw sharedFileError(res.status, 'File access not permitted');
     throw sharedFileError(res.status, `Failed to list shared files (${res.status})`);
@@ -288,11 +338,15 @@ export async function resolveSharedFile(
   shareToken: string,
   candidates: string[],
   recentWrites: string[] = [],
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
 ): Promise<FileRefResolution> {
+  // DALTON-HOOK(share-redaction): bypass browser HTTP cache and forward AbortSignal on public file resolve requests
   const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/files/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ candidates, recent_writes: recentWrites }),
+    cache: 'no-store',
+    ...(opts?.signal ? { signal: opts.signal } : {}),
   });
   if (!res.ok) {
     if (res.status === 403) throw sharedFileError(res.status, 'File access not permitted');
@@ -307,9 +361,11 @@ export async function resolveSharedFile(
 export async function readSharedFile(
   shareToken: string,
   path: string,
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
 ): Promise<SharedFileReadResponse> {
   const params = new URLSearchParams({ path });
-  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/read?${params}`, 'read');
+  // DALTON-HOOK(share-redaction): forward AbortSignal on public file read requests
+  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/read?${params}`, 'read', opts?.signal);
   return res.json() as Promise<SharedFileReadResponse>;
 }
 
@@ -317,8 +373,15 @@ export async function readSharedFile(
  * Save a file from a chat share. This is the one read gated on
  * `allow_download`; previews go through {@link sharedServePrefix}.
  */
-export async function downloadSharedFile(shareToken: string, path: string): Promise<void> {
+export async function downloadSharedFile(
+  shareToken: string,
+  path: string,
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
+): Promise<void> {
   const params = new URLSearchParams({ path });
-  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/download?${params}`, 'download');
-  saveBlob(await res.blob(), path.split('/').pop() || 'download');
+  // DALTON-HOOK(share-redaction): forward AbortSignal and skip saveBlob if aborted before save
+  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/download?${params}`, 'download', opts?.signal);
+  const blob = await res.blob();
+  if (opts?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  saveBlob(blob, path.split('/').pop() || 'download');
 }

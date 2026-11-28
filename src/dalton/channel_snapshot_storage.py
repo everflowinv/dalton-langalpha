@@ -171,17 +171,43 @@ def put_snapshot_bytes(
     bucket = _upload_store._bucket_name()
     full_key = _upload_store.resolve_full_key(snapshot_key)
     client = _upload_store._get_client()
+    from src.dalton.share_media import (
+        is_acl_not_supported_error,
+        mark_bucket_acl_unsupported,
+        probe_bucket_object_acl_mode,
+        storage_private_acl_kwargs,
+    )
+
+    ep = _upload_store._endpoint_url()
+    acl_kwargs = storage_private_acl_kwargs(
+        snapshot_key, provider="s3", endpoint_url=ep
+    )
+    if (
+        acl_kwargs
+        and probe_bucket_object_acl_mode(client, bucket, endpoint_url=ep) == "disabled"
+    ):
+        acl_kwargs = {}
+    put_kwargs: dict[str, Any] = {
+        "Bucket": bucket,
+        "Key": full_key,
+        "Body": data,
+        "ContentType": content_type,
+        "ContentLength": len(data),
+        **acl_kwargs,
+    }
 
     try:
-        client.put_object(
-            Bucket=bucket,
-            Key=full_key,
-            Body=data,
-            ContentType=content_type,
-            ContentLength=len(data),
-        )
+        client.put_object(**put_kwargs)
         return True
     except Exception as exc:  # noqa: BLE001
+        if acl_kwargs and is_acl_not_supported_error(exc):
+            mark_bucket_acl_unsupported(bucket, endpoint_url=ep)
+            put_kwargs.pop("ACL", None)
+            try:
+                client.put_object(**put_kwargs)
+                return True
+            except Exception as acl_retry_exc:  # noqa: BLE001
+                exc = acl_retry_exc
         err_code = ""
         resp = getattr(exc, "response", None)
         if isinstance(resp, dict):
@@ -189,15 +215,16 @@ def put_snapshot_bytes(
         if err_code in ("NoSuchBucket", "404"):
             _ensure_bucket_if_missing(client, bucket)
             try:
-                client.put_object(
-                    Bucket=bucket,
-                    Key=full_key,
-                    Body=data,
-                    ContentType=content_type,
-                    ContentLength=len(data),
-                )
+                client.put_object(**put_kwargs)
                 return True
             except Exception as retry_exc:  # noqa: BLE001
+                if "ACL" in put_kwargs and is_acl_not_supported_error(retry_exc):
+                    put_kwargs.pop("ACL", None)
+                    try:
+                        client.put_object(**put_kwargs)
+                        return True
+                    except Exception as retry2_exc:  # noqa: BLE001
+                        retry_exc = retry2_exc
                 logger.error(
                     "Failed to upload chart snapshot %s after bucket init: %s",
                     snapshot_key,

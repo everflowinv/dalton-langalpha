@@ -1129,3 +1129,42 @@ async def test_the_tunnel_gateway_down_is_a_service_error_retried_as_before(coor
     assert "error_kind" not in data
     _, outcome = coordinator.finalize_run.await_args.args
     assert "error_kind" not in outcome.metadata
+
+
+# DALTON-HOOK(antigravity-series): verify SSE duplicate_request frame exposes adopted run's metadata.llm_model
+@pytest.mark.asyncio
+async def test_sse_duplicate_request_exposes_adopted_run_llm_model(coordinator):
+    from fastapi import HTTPException
+
+    from src.server.database.runs import lifecycle as runs_lifecycle
+    from src.server.handlers.chat.admission_gate import admission_conflict_detail
+
+    existing_with_model = {
+        **_FIRST_COPY,
+        "metadata": {"llm_model": "gemini-4-neon-high-oauth"},
+    }
+    find = create_autospec(
+        runs_lifecycle.find_run_by_request_key,
+        return_value=existing_with_model,
+    )
+    get_owner = create_autospec(
+        error_handling.qr_db.get_thread_owner_id,
+        return_value="u-1",
+    )
+    with (
+        patch(_FIND_KEY, find),
+        patch.object(error_handling.qr_db, "get_thread_owner_id", get_owner),
+    ):
+        frames = await _fail(
+            HTTPException(status_code=409, detail=admission_conflict_detail("running")),
+            scope=_scope(),
+            request=_keyed_send(),
+        )
+
+    assert len(frames) == 1
+    name, data = frames[0]
+    assert name == "error"
+    assert data["code"] == "duplicate_request"
+    assert data["run_id"] == "r-first"
+    assert data["llm_model"] == "gemini-4-neon-high-oauth"
+    coordinator.finalize_run.assert_not_awaited()

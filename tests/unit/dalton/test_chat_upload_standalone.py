@@ -1105,7 +1105,7 @@ class TestSandboxNetworkAndInitScript:
             assert res_bg.returncode == 0, res_bg.stderr
             assert _parse_env(guard_bind_env)["DALTON_EDGE_TLS_BIND"] == "127.0.0.1"
 
-        # 3. ::1 and localhost keep loopback passwordless trial (DALTON_AUTH_MODE=oss, DALTON_ALLOW_DEV_OSS_AUTH=1)
+        # 3. Fresh ::1 and localhost Compose installs default to local auth so owner requests work through Caddy edge
         inst_v6, init_v6 = self._stage_init_install(tmp_path, "inst-v6")
         res_v6 = subprocess.run(
             [
@@ -1124,8 +1124,9 @@ class TestSandboxNetworkAndInitScript:
         assert res_v6.returncode == 0
         assert (inst_v6 / ".env").is_file()
         parsed_v6 = _parse_env(inst_v6 / ".env")
-        assert parsed_v6["DALTON_AUTH_MODE"] == "oss"
-        assert parsed_v6["DALTON_ALLOW_DEV_OSS_AUTH"] == "1"
+        assert parsed_v6["DALTON_AUTH_MODE"] == "local"
+        assert parsed_v6["VITE_DALTON_AUTH"] == "local"
+        assert "DALTON_ALLOW_DEV_OSS_AUTH" not in parsed_v6
 
         # 3b. validate_domain_for_auth refuses a public domain when SCRIPT_WROTE_LOCAL_AUTH != 1,
         #     even if .env already contains DALTON_AUTH_MODE=local.
@@ -5265,8 +5266,8 @@ class TestSandboxNetworkAndInitScript:
             )
             assert res_lb.returncode == 0, f"{v6_loopback}: {res_lb.stderr}"
             parsed_lb = _parse_env(inst_lb / ".env")
-            assert parsed_lb["DALTON_AUTH_MODE"] == "oss", f"{v6_loopback}: {parsed_lb}"
-            assert parsed_lb["DALTON_ALLOW_DEV_OSS_AUTH"] == "1"
+            assert parsed_lb["DALTON_AUTH_MODE"] == "local", f"{v6_loopback}: {parsed_lb}"
+            assert parsed_lb["VITE_DALTON_AUTH"] == "local"
             assert parsed_lb["DALTON_EDGE_TLS_BIND"] == "[::1]"
             assert parsed_lb["DALTON_EDGE_HTTP_PORT"] == "18080"
             assert parsed_lb["DALTON_EDGE_HTTPS_PORT"] == "18443"

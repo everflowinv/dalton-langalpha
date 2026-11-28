@@ -108,11 +108,12 @@ async def test_captures_a_sandbox_image_and_keeps_its_path_in_the_text(storage):
     out = await _run(_mw(sandbox), _response(msg))
 
     assert out.result[0].content == "Result: ![rev](work/charts/rev.png) done"
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        "work/charts/rev.png": f"https://cdn.test/response-images/{PNG_SHA16}/rev.png",
+        "work/charts/rev.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/rev.png",
     }
     assert out.result[0].id == "m1"  # id preserved → same message upserted
-    assert storage[0][0] == f"response-images/{PNG_SHA16}/rev.png"
+    assert storage[0][0] == f"private-media/response-images/{PNG_SHA16}/rev.png"
     assert storage[0][2] == "image/png"
 
 
@@ -128,10 +129,11 @@ async def test_a_message_records_only_what_was_captured(storage):
 
     out = await _run(_mw(sandbox), _response(msg))
 
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert out.result[0].response_metadata == {
         "model_name": "m",
         CAPTURED_IMAGES_KEY: {
-            "work/charts/rev.png": f"https://cdn.test/response-images/{PNG_SHA16}/rev.png",
+            "work/charts/rev.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/rev.png",
         },
     }
 
@@ -150,8 +152,9 @@ async def test_records_images_named_in_text_blocks(storage):
     out = await _run(_mw(sandbox), _response(msg))
 
     assert out.result[0].content == msg.content
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        "a.png": f"https://cdn.test/response-images/{PNG_SHA16}/a.png",
+        "a.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/a.png",
     }
 
 
@@ -244,9 +247,10 @@ async def test_multiple_images_and_non_ai_messages(storage):
 
     out = await _run(_mw(sandbox), _response(ai, tool))
 
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        "work/a.png": f"https://cdn.test/response-images/{PNG_SHA16}/a.png",
-        "work/b.jpg": f"https://cdn.test/response-images/{other_sha16}/b.jpg",
+        "work/a.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/a.png",
+        "work/b.jpg": f"https://cdn.test/private-media/response-images/{other_sha16}/b.jpg",
     }
     assert len(storage) == 2  # dedup: a.png downloaded/uploaded once
     assert out.result[1] is tool  # non-AIMessage untouched
@@ -259,8 +263,9 @@ async def test_absolute_work_dir_path_normalized(storage):
 
     out = await _run(_mw(sandbox), _response(msg))
 
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        "/home/workspace/work/a.png": f"https://cdn.test/response-images/{PNG_SHA16}/a.png",
+        "/home/workspace/work/a.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/a.png",
     }
 
 
@@ -284,8 +289,9 @@ async def test_an_image_under_an_allowed_root_outside_the_work_dir_is_captured(s
     out = await _run(_mw(sandbox), _response(msg))
 
     assert sandbox.downloads == ["/tmp/chart.png"]
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        "/tmp/chart.png": f"https://cdn.test/response-images/{PNG_SHA16}/chart.png",
+        "/tmp/chart.png": f"https://cdn.test/private-media/response-images/{PNG_SHA16}/chart.png",
     }
 
 
@@ -300,12 +306,14 @@ async def test_a_path_that_repeats_the_work_dir_keeps_its_segments(storage):
     out = await _run(_mw(sandbox), _response(AIMessage(content=f"![c]({path})")))
 
     assert sandbox.downloads == [path]
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
     assert _recorded(out.result[0]) == {
-        path: f"https://cdn.test/response-images/{PNG_SHA16}/c.png",
+        path: f"https://cdn.test/private-media/response-images/{PNG_SHA16}/c.png",
     }
 
 
 def test_image_storage_key_thread_scoping():
     sha = "ab" * 32
-    assert image_storage_key("t1", sha, "a.png") == f"response-images/t1/{sha[:16]}/a.png"
-    assert image_storage_key("", sha, "a.png") == f"response-images/{sha[:16]}/a.png"
+    # DALTON-HOOK(share-redaction): new response images live under private-media/response-images/
+    assert image_storage_key("t1", sha, "a.png") == f"private-media/response-images/t1/{sha[:16]}/a.png"
+    assert image_storage_key("", sha, "a.png") == f"private-media/response-images/{sha[:16]}/a.png"

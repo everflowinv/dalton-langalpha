@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
-import { Download } from 'lucide-react';
+import React, { useCallback, useEffect, useEffectEvent, useState } from 'react';
+import { Code, Download, Eye } from 'lucide-react'; // DALTON-HOOK(monitors)
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
+import { isMarkdownFile } from '@/lib/dalton/sharedMarkdown'; // DALTON-HOOK(monitors)
+import { useSharedMarkdownView } from '@/lib/dalton/useSharedMarkdownView'; // DALTON-HOOK(monitors)
 import { cn } from '@/lib/utils';
 import { bodyMode } from '../ChatAgent/components/filePanel/fileBody';
 import { getFileExtension } from '../ChatAgent/components/filePanel/fileMeta';
@@ -10,7 +12,7 @@ import { useFileBody, useFileBodyCache } from '../ChatAgent/components/filePanel
 import { buildServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
 import { WorkspaceProvider } from '../ChatAgent/contexts/WorkspaceContext';
 import { ShareTopBar, ShareTopBarAction } from './ShareTopBar';
-import { downloadServedFile, servedObjectUrl, servedReaders, type SharedFileMetadata } from './api';
+import { downloadServedFile, type SharedFileMetadata } from './api';
 import './SharePage.css';
 
 interface SharedFileViewProps {
@@ -19,7 +21,7 @@ interface SharedFileViewProps {
 }
 
 /** Every non-HTML file, read and rendered the way the owner's panel does. */
-export function FileBody({ scope, path, frameBase, onDownload, downloading, onGone }: {
+export function FileBody({ scope, path, frameBase, onDownload, downloading, onGone, rawSource = false, entryUrl, anonymousEntry = false }: {
   /** The body cache's scope: the same bytes, whatever prefix renews under it. */
   scope: string;
   path: string;
@@ -28,33 +30,36 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
   downloading: boolean;
   /** The file answered 404: under a version, most likely one an Update just ended. */
   onGone?: () => void;
+  // DALTON-HOOK(monitors): raw Markdown toggle and anonymous /m/ entry override
+  rawSource?: boolean;
+  entryUrl?: string;
+  anonymousEntry?: boolean;
 }) {
-  const readers = useMemo(() => servedReaders(frameBase), [frameBase]);
-  const cache = useFileBodyCache({ scope, workspaceId: '', readers });
-  const { body, loading, error, refetch } = useFileBody({ cache, path });
+  const scrollToAnchor = useCallback((id: string) => {
+    document.getElementById(id)?.scrollIntoView({ block: 'start' });
+  }, []);
+  // DALTON-HOOK(monitors): resolve & authorize relative Markdown links/images strictly in this shared version
+  const sharedView = useSharedMarkdownView({ path, frameBase, entryUrl, anonymousEntry, onAnchorLink: scrollToAnchor });
+  const cache = useFileBodyCache({ scope, workspaceId: '', readers: sharedView.readers });
+  const { body, loading, error, refetch } = useFileBody({ cache, path: sharedView.activePath });
   const tellGone = useEffectEvent(() => onGone?.());
   useEffect(() => {
     if (error?.category === 'not_found') tellGone();
   }, [error]);
-  // Markdown images are workspace paths, fetched under the same prefix as the file.
-  const imageDownloader = useCallback((imagePath: string) => servedObjectUrl(frameBase, imagePath), [frameBase]);
-  // With an anchor handler and no file opener, a link to another workspace
-  // file is plain text: a visitor can open only the files listed.
-  const scrollToAnchor = useCallback((id: string) => {
-    document.getElementById(id)?.scrollIntoView({ block: 'start' });
-  }, []);
   // A grid or a paged document uses the width; prose and code read in a column.
-  const wide = bodyMode(path) === 'buffer' || getFileExtension(path) === 'csv';
+  const wide = bodyMode(sharedView.activePath) === 'buffer' || getFileExtension(sharedView.activePath) === 'csv';
   // A PDF scrolls inside its own viewer, which needs the page's height for it:
   // left to grow with its pages, it would draw every one of them at once.
-  const fill = getFileExtension(path) === 'pdf';
+  const fill = getFileExtension(sharedView.activePath) === 'pdf';
 
   return (
     <div className="share-scroll">
+      {sharedView.subDocBar}
       <div className={cn(!wide && 'share-document', fill && 'share-fill')}>
-        <WorkspaceProvider workspaceId={null} downloadFile={imageDownloader} imageScope={scope}>
+        {/* DALTON-HOOK(monitors): include resolved target path in shared image cache keys */}
+        <WorkspaceProvider workspaceId={null} downloadFile={sharedView.imageDownloader} imageScope={scope} resolveImagePath={sharedView.resolveImagePath}>
           <FileViewer
-            path={path}
+            path={sharedView.activePath}
             body={body}
             loading={loading}
             error={error}
@@ -64,6 +69,8 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
             downloadState={downloading ? 'preparing' : 'idle'}
             workspaceId=""
             onAnchorLink={scrollToAnchor}
+            markdownSource={rawSource} // DALTON-HOOK(monitors)
+            renderFileLink={sharedView.renderFileLink} // DALTON-HOOK(monitors)
           />
         </WorkspaceProvider>
       </div>
@@ -80,6 +87,9 @@ export default function SharedFileView({ code, metadata }: SharedFileViewProps):
   const { t } = useTranslation();
   const { path, name, frame_base: frameBase } = metadata;
   const [busy, setBusy] = useState(false);
+  // DALTON-HOOK(monitors): toggle raw Markdown source on shared file page
+  const isMarkdown = isMarkdownFile(path);
+  const [rawSource, setRawSource] = useState(false);
 
   const download = async () => {
     setBusy(true);
@@ -97,12 +107,19 @@ export default function SharedFileView({ code, metadata }: SharedFileViewProps):
     <div className="share-page">
       <ShareTopBar
         name={name}
-        actions={<ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={() => void download()} disabled={busy} />}
+        actions={(
+          <>
+            {/* DALTON-HOOK(monitors): View raw / View rendered toggle for Markdown files */}
+            {isMarkdown && (
+              <ShareTopBarAction icon={rawSource ? Eye : Code} label={rawSource ? t('filePanel:viewRendered') : t('filePanel:viewRaw')} onClick={() => setRawSource((v) => !v)} />
+            )}
+            <ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={() => void download()} disabled={busy} />
+          </>
+        )}
       />
       <div className="share-content">
-        {/* Scoped by the code, not the prefix: an owner's grant renews under a
-            new prefix, and the bytes on screen are still the same file's. */}
-        <FileBody scope={`share:${code}`} path={path} frameBase={frameBase} onDownload={() => void download()} downloading={busy} />
+        {/* DALTON-HOOK(monitors): pass rawSource toggle to FileBody */}
+        <FileBody scope={`share:${code}`} path={path} frameBase={frameBase} onDownload={() => void download()} downloading={busy} rawSource={isMarkdown && rawSource} />
       </div>
     </div>
   );

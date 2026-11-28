@@ -52,8 +52,9 @@ describe('SharedFileView', () => {
   });
 
   it('reads Markdown and its images under frame_base, encoded per buildServeUrl', async () => {
+    // DALTON-HOOK(monitors): shared Markdown resolves relative images against the document directory (no root fallback)
     const fetchMock = serve({
-      'notes/README.md': '# Notes\n\n![chart](notes/img/c 1.png)\n',
+      'notes/README.md': '# Notes\n\n![chart](img/c 1.png)\n',
       'notes/img/c 1.png': 'png-bytes',
     });
     renderWithProviders(<SharedFileView code={CODE} metadata={metadata('notes/README.md')} />);
@@ -84,12 +85,14 @@ describe('SharedFileView', () => {
   });
 
   it('renders a Markdown link to another workspace file as plain text', async () => {
+    // DALTON-HOOK(monitors): shared Markdown probes relative sibling links via HEAD and renders missing/unshared ones as non-clickable text
     const fetchMock = serve({
-      'notes/index.md': 'See [the other one](notes/other.md) and [docs](https://example.com/docs).\n',
+      'notes/index.md': 'See [the other one](other.md) and [docs](https://example.com/docs).\n',
     });
     renderWithProviders(<SharedFileView code={CODE} metadata={metadata('notes/index.md')} />);
 
     const sibling = await screen.findByText('the other one');
+    await screen.findByTestId('shared-link-placeholder');
     expect(sibling.tagName).toBe('SPAN');
     expect(sibling.closest('a')).toBeNull();
     expect(sibling).not.toHaveAttribute('href');
@@ -97,7 +100,9 @@ describe('SharedFileView', () => {
     // The control: a web link keeps its href.
     const web = screen.getByText('docs');
     expect(web.closest('a')).toHaveAttribute('href', 'https://example.com/docs');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, buildServeUrl(FRAME_BASE, 'notes/index.md'), { cache: 'no-store' });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, buildServeUrl(FRAME_BASE, 'notes/other.md'), { method: 'HEAD' });
   });
 
   it('a file that will not load says why, the way the panel does', async () => {

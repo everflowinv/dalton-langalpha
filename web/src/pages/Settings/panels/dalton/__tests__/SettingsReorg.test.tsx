@@ -303,8 +303,12 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     expect(sectionShown('teamMembers', { callerTier: 'internal' })).toBe(true);
     expect(sectionShown('teamMembers', { callerTier: 'external' })).toBe(false);
     expect(sectionShown('teamChannels', { callerTier: null })).toBe(false);
-    expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: false })).toBe(false);
+    // Coverage section is always visible for personal tier policies; team coverage units card is gated inside by colleague_sharing + coverageUnitsEnabled.
+    expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: false })).toBe(true);
     expect(sectionShown('coverage', { callerTier: 'internal', coverageUnitsEnabled: true })).toBe(true);
+    const covWithoutUnits = searchableSettings(false, { callerTier: 'internal', coverageUnitsEnabled: false }).map((s) => s.anchor);
+    expect(covWithoutUnits).toContain('dalton-tier-policies');
+    expect(covWithoutUnits).not.toContain('dalton-coverage');
 
     const internalSearch = searchableSettings(false, { callerTier: 'internal' }).map((s) => s.anchor);
     expect(internalSearch).not.toContain('dalton-providers');

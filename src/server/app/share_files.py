@@ -64,9 +64,12 @@ from src.server.utils.secret_redactor import (
 )
 from src.utils.mime import resolve_content_type
 
+from src.dalton.share_media import NoStorePublicAPIRoute  # DALTON-HOOK(share-redaction)
+
 logger = logging.getLogger(__name__)
 
-share_files_router = APIRouter(tags=["Public Sharing"])
+# DALTON-HOOK(share-redaction): enforce Cache-Control: no-store across all public file responses and errors
+share_files_router = APIRouter(tags=["Public Sharing"], route_class=NoStorePublicAPIRoute)
 
 # Every sandbox failure on these routes collapses into the same 404 an absent
 # path gets. They are unauthenticated, so a 503 would confirm that a guessed
@@ -385,7 +388,11 @@ async def download_shared_file(
     return StreamingResponse(
         iter([content]),
         media_type=resolved.mime or "application/octet-stream",
-        headers={"Content-Disposition": content_disposition(filename)},
+        headers={
+            "Content-Disposition": content_disposition(filename),
+            # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -441,7 +448,7 @@ async def serve_shared_file(
         target = await resolve_shared_files(share_token, require_files=True)
 
         if format == "pdf":
-            return await render_workspace_file_pdf(
+            resp = await render_workspace_file_pdf(
                 target.workspace_id,
                 path,
                 workspace=target.workspace,
@@ -451,8 +458,11 @@ async def serve_shared_file(
                 visible=target.visible,
                 serve_base=prefix,
             )
+            # DALTON-HOOK(share-redaction): override _WSFILES_CACHE_CONTROL to no-store for public shares
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
 
-        return await serve_workspace_file(
+        resp = await serve_workspace_file(
             target.workspace_id,
             path,
             # A visitor never comments, so any bridge asked for is the view's.
@@ -460,6 +470,9 @@ async def serve_shared_file(
             workspace=target.workspace,
             visible=target.visible,
         )
+        # DALTON-HOOK(share-redaction): override _WSFILES_CACHE_CONTROL to no-store for public shares
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     except (SandboxGoneError, SandboxTransientError):
         # This route is unauthenticated, so it must never distinguish "sandbox
         # down" from "no such file", a 503 would confirm that a guessed
@@ -467,6 +480,7 @@ async def serve_shared_file(
         # here; this keeps the 404 posture from depending on that.
         page = unavailable_response(request, 404)
         if page is not None:
+            page.headers["Cache-Control"] = "no-store"
             return page
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
     except HTTPException as exc:
@@ -475,5 +489,9 @@ async def serve_shared_file(
         # (Accept without text/html) keep the default JSON error.
         page = unavailable_response(request, exc.status_code)
         if page is not None:
+            # DALTON-HOOK(share-redaction): propagate no-store and Clear-Site-Data on 403 HTML fallback
+            page.headers["Cache-Control"] = "no-store"
+            if exc.status_code == 403:
+                page.headers["Clear-Site-Data"] = '"cache"'
             return page
         raise

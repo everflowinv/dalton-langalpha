@@ -561,13 +561,16 @@ async def capture_workspace_monitor_snapshot(
     reviewed_page: str | None = None,
 ) -> Snapshot:
     """Capture and seal a workspace artifact snapshot for a monitor."""
+    # DALTON-HOOK(monitors): include same-directory and data/*.json files in monitor snapshots.
+    from src.dalton.monitors.verify import monitor_page_matches_reviewed, monitor_walked_source
+
     snapshot = await _capture(
         artifact,
         user_id=user_id,
         mode=mode,
-        source=_Walked(reviewed, loaded, earlier),
+        source=monitor_walked_source(_Walked(reviewed, loaded, earlier)),
     )
-    if reviewed_page is not None and snapshot.page_sha256 != reviewed_page:
+    if reviewed_page is not None and not monitor_page_matches_reviewed(snapshot, reviewed_page):
         raise SnapshotRefused("files_changed", files=snapshot.entries)
     await _store_blobs(user_id, snapshot)
     return snapshot
@@ -593,6 +596,11 @@ async def capture_reader_monitor_snapshot(
                 if canonical not in seen:
                     entries.append(ManifestEntry(canonical, size, "listed"))
                     seen.add(canonical)
+        # DALTON-HOOK(monitors): include same-directory and data/*.json files in reader monitor snapshots.
+        from src.dalton.monitors.verify import discover_sibling_json_entries
+        for json_entry in await discover_sibling_json_entries(reader, entry_path, existing_paths=seen):
+            entries.append(json_entry)
+            seen.add(json_entry.path)
         byte_total = sum({e.path: (e.size or 0) for e in entries}.values())
         _VERSION_CAPS.check(
             len(entries),
@@ -950,12 +958,14 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
     # vault are all owner-scoped, so the cut runs as the owner, the way the
     # legacy first read already does.
     try:
-        # DALTON-HOOK(monitors): refresh workspace monitors with keep_updated=TRUE
+        # DALTON-HOOK(monitors): refresh workspace monitors and shared documents with keep_updated=TRUE
         # regardless of share_links.shared_at / kept_at.
         try:
             from src.dalton.monitors.service import republish_workspace_monitors_after_turn
+            from src.dalton.monitors.shared_documents import republish_workspace_shared_documents_after_turn
 
             await republish_workspace_monitors_after_turn(workspace_id=workspace_id)
+            await republish_workspace_shared_documents_after_turn(workspace_id=workspace_id)
         except Exception:
             logger.warning(
                 "Keeping monitors updated in workspace %s failed",
@@ -1106,7 +1116,10 @@ def keep_updated_after_change(*, workspace_id: str, user_id: str) -> None:
 async def _after_change(workspace_id: str, user_id: str) -> None:
     try:
         if not await artifacts_db.list_kept_updated(workspace_id):
-            return
+            # DALTON-HOOK(monitors): also run pass for non-public workspace monitors with keep_updated=TRUE
+            from src.dalton.monitors import db as monitor_db
+            if not await monitor_db.has_workspace_auto_update_monitors(workspace_id):
+                return
         if not await _claim_change_pass(workspace_id):
             return
     except Exception:

@@ -535,7 +535,7 @@ export function handleHistoryReasoningContent({ assistantMessageId, content, pai
 }
 
 /** Handles text content chunks and finish_reason in history replay. */
-export function handleHistoryTextContent({ assistantMessageId, content, finishReason, stop = true, pairState, setMessages, eventId, phase }: {
+export function handleHistoryTextContent({ assistantMessageId, content, finishReason, stop = true, pairState, setMessages, eventId, phase, messageId, continuedFromMessageId }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
@@ -545,6 +545,9 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
   setMessages: SetMessages;
   eventId?: number | null;
   phase?: TextSegment['phase'];
+  // DALTON-HOOK(deliverable-text): carry messageId and continuation link onto replayed text segments
+  messageId?: string;
+  continuedFromMessageId?: string;
 }): boolean {
   if (content) {
     const currentOrder = eventId != null ? eventId : ++pairState.contentOrderCounter;
@@ -560,6 +563,8 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
             content,
             order: currentOrder,
             ...(phase ? { phase } : {}),
+            ...(messageId ? { messageId } : {}),
+            ...(continuedFromMessageId ? { continuedFromMessageId } : {}),
           },
         ];
 
@@ -1031,6 +1036,10 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
       };
       if (payload.data) {
         widgetEntry.data = payload.data;
+      }
+      // DALTON-HOOK(share-redaction): preserve redacted placeholder flag from strict shared replays
+      if (payload.redacted === true) {
+        widgetEntry.redacted = true;
       }
       htmlWidgetProcesses[segmentId] = widgetEntry;
 

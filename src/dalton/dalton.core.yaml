@@ -63,3 +63,14 @@ conversations:
 
 internal_llm:
   allowed_models: []
+
+channels:
+  interactive_actions_enabled: true
+  interrupt_ledger_enabled: true
+  bt2_link_recovery_enabled: true
+
+workspace_files:
+  write_inline_only: false
+  exclude_dir_names: []
+  exclude_rel_dirs: []
+  exclude_rel_globs: []

@@ -421,6 +421,10 @@ async def project_stale(
     stored, so it is projected again on the next read. A database fault ends
     the read: it would fail every turn alike.
     """
+    # DALTON-HOOK(share-redaction): record actual cold projection miss for singleflight background warm
+    from src.dalton.share_redaction import mark_cold_projection_miss
+
+    mark_cold_projection_miss()
     read = _ColdRead(reader, inputs, anchored, stale, policy)
     out: dict[Any, list[Line]] = {}
     try:

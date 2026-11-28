@@ -12,12 +12,15 @@ from fastapi.responses import JSONResponse
 from src.config import env
 from src.dalton.auth import is_dalton_service_request
 from src.dalton.monitors import service as monitor_service
+from src.dalton.monitors import shared_documents as shared_doc_service
 from src.dalton.monitors.models import (
     DataJobMonitorPublishRequest,
     MonitorDataPutRequest,
     PublishMonitorRequest,
     RepublishMonitorRequest,
+    ShareDocumentRequest,
     UpdateMonitorRequest,
+    UpdateSharedDocumentRequest,
 )
 from src.dalton.settings import get_dalton_settings
 from src.server.preview_proxy.artifacts import ArtifactFileUnavailable
@@ -82,6 +85,23 @@ async def get_monitor_by_artifact_endpoint(
     return {"monitor": monitor}
 
 
+@router.get("/shared-documents")
+@handle_api_exceptions("list shared non-HTML documents", logger)
+async def list_shared_documents_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
+    return await shared_doc_service.list_grouped_shared_documents_for_user(user_id)
+
+
+@router.get("/shared-documents/by-artifact/{artifact_id}")
+@handle_api_exceptions("get shared document by artifact id", logger)
+async def get_shared_document_by_artifact_endpoint(
+    artifact_id: str, user_id: CurrentUserId
+) -> dict[str, Any]:
+    doc = await shared_doc_service.get_shared_document_by_artifact(
+        artifact_id, viewer_id=user_id
+    )
+    return {"document": doc}
+
+
 from src.dalton.colleague_outbound_guard import (
     NON_SESSION_CLEAR_FORBIDDEN_DETAIL,
     is_interactive_owner_session,
@@ -115,6 +135,38 @@ async def publish_monitor_endpoint(
         )
     return await monitor_service.publish_workspace_monitor(
         body, caller_id=user_id, allow_clear_pause=can_clear_pause
+    )
+
+
+@router.post("/shared-documents")
+@handle_api_exceptions("share workspace non-HTML document", logger)
+async def share_document_endpoint(
+    body: ShareDocumentRequest,
+    user_id: CurrentUserId,
+    interactive_session: bool = Depends(_interactive_session_for_clear),
+) -> dict[str, Any]:
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    can_clear_pause = sharing_auth_enabled and interactive_session is True
+    if sharing_auth_enabled and body.confirm_pause_token and not can_clear_pause:
+        raise HTTPException(
+            status_code=403, detail=NON_SESSION_CLEAR_FORBIDDEN_DETAIL
+        )
+    return await shared_doc_service.share_workspace_document(
+        body, caller_id=user_id, allow_clear_pause=can_clear_pause
+    )
+
+
+@router.patch("/shared-documents/by-artifact/{artifact_id}")
+@handle_api_exceptions("update shared document settings", logger)
+async def update_shared_document_endpoint(
+    artifact_id: str,
+    body: UpdateSharedDocumentRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    return await shared_doc_service.update_shared_document_settings(
+        artifact_id, body, caller_id=user_id
     )
 
 
@@ -180,15 +232,21 @@ async def serve_public_monitor_entry_endpoint(
     slug: str,
     seq: str,
     request: Request,
+    rel: str | None = None,
     if_none_match: Annotated[str | None, Header()] = None,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
 ) -> Response:
     try:
         served = await monitor_service.serve_public_monitor_file(
             slug,
             seq,
             "",
+            rel=rel,
             if_none_match=if_none_match,
             head=request.method == "HEAD",
+            candidate_probe=x_dalton_candidate_probe,
         )
     except ArtifactFileUnavailable as exc:
         logger.warning("Public monitor file could not be served: %s", exc)
@@ -203,6 +261,9 @@ async def serve_public_monitor_file_endpoint(
     path: str,
     request: Request,
     if_none_match: Annotated[str | None, Header()] = None,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
 ) -> Response:
     try:
         served = await monitor_service.serve_public_monitor_file(
@@ -211,6 +272,7 @@ async def serve_public_monitor_file_endpoint(
             path,
             if_none_match=if_none_match,
             head=request.method == "HEAD",
+            candidate_probe=x_dalton_candidate_probe,
         )
     except ArtifactFileUnavailable as exc:
         logger.warning("Public monitor file could not be served: %s", exc)
@@ -234,8 +296,20 @@ async def read_public_monitor_data_endpoint(
 
 @router.get("/public/{slug}")
 @handle_api_exceptions("get public monitor detail", logger)
-async def get_public_monitor_detail_endpoint(slug: str) -> dict[str, Any]:
-    return await monitor_service.get_public_monitor_detail(slug)
+async def get_public_monitor_detail_endpoint(
+    slug: str,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
+) -> Response:
+    payload = await monitor_service.get_public_monitor_detail(
+        slug, candidate_probe=x_dalton_candidate_probe
+    )
+    return JSONResponse(
+        status_code=200,
+        content=payload,
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +333,14 @@ async def put_monitor_data_internal_endpoint(
             status_code=400, detail="Caller user identity override is not permitted."
         )
     return await monitor_service.write_monitor_data_internal(
-        slug, key, body.data, as_of=body.as_of
+        slug,
+        key,
+        body.data,
+        as_of=body.as_of,
+        attempt_seq=body.attempt_seq,
+        is_stale=body.is_stale,
+        error=body.error,
+        last_attempt_at=body.last_attempt_at,
     )
 
 
@@ -292,8 +373,13 @@ async def republish_data_job_monitor_endpoint(
 @handle_api_exceptions("get monitor detail", logger)
 async def get_monitor_detail_endpoint(
     slug: str, user_id: CurrentUserId
-) -> dict[str, Any]:
-    return await monitor_service.get_monitor_detail(slug, viewer_id=user_id)
+) -> Response:
+    payload = await monitor_service.get_monitor_detail(slug, viewer_id=user_id)
+    return JSONResponse(
+        status_code=200,
+        content=payload,
+        headers={"Cache-Control": "private, no-cache"},
+    )
 
 
 @router.patch("/{slug}")

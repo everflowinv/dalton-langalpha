@@ -195,6 +195,88 @@ def test_cnhk_probe_request_matches_bridge_route_contract() -> None:
     )
     assert_valid_bridge_call(tool_name, arguments)
 
+    tool_name_pag, arguments_pag = build_cnhk_filings_request(
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        start_page=2,
+        max_pages=3,
+    )
+    assert arguments_pag["params"] == {"start_page": 2, "max_pages": 3}
+    assert_valid_bridge_call(tool_name_pag, arguments_pag)
+
+    tool_name_da, arguments_da = build_cnhk_filings_request(
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        deadline_at=1_795_000_008.0,
+    )
+    assert arguments_da["params"] == {"deadline_at": 1_795_000_008.0}
+    assert_valid_bridge_call(tool_name_da, arguments_da)
+
+    tool_name_dl, arguments_dl = build_cnhk_filings_request(
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        deadline_s=8.0,
+    )
+    assert arguments_dl["params"] == {"deadline_s": 8.0}
+    assert_valid_bridge_call(tool_name_dl, arguments_dl)
+
+    _, _, err_quote_params = _normalize_and_validate_call_args(
+        "finance",
+        {"route": "cn-hk", "operation": "quote", "ticker": "00700", "params": {"max_pages": 2}},
+    )
+    assert err_quote_params is not None
+    assert err_quote_params["error_code"] == "unsupported_parameters"
+
+    _, _, err_bad_pages = _normalize_and_validate_call_args(
+        "finance",
+        {
+            "route": "cn-hk",
+            "operation": "filings",
+            "ticker": "00700",
+            "start": "2026-10-22",
+            "end": "2026-10-22",
+            "params": {"max_pages": 0},
+        },
+    )
+    assert err_bad_pages is not None
+    assert err_bad_pages["error_code"] == "invalid_nested_param_value"
+
+    for bad_deadline_at in (0, -1, 1e12, True, "1795000008"):
+        _, _, err_bad_da = _normalize_and_validate_call_args(
+            "finance",
+            {
+                "route": "cn-hk",
+                "operation": "filings",
+                "ticker": "00700",
+                "start": "2026-10-22",
+                "end": "2026-10-22",
+                "params": {"deadline_at": bad_deadline_at},
+            },
+        )
+        assert err_bad_da is not None
+        assert err_bad_da["error_code"] == "invalid_nested_param_value"
+
+    for bad_deadline in (0, -1, 601, True, "8"):
+        _, _, err_bad_dl = _normalize_and_validate_call_args(
+            "finance",
+            {
+                "route": "cn-hk",
+                "operation": "filings",
+                "ticker": "00700",
+                "start": "2026-10-22",
+                "end": "2026-10-22",
+                "params": {"deadline_s": bad_deadline},
+            },
+        )
+        assert err_bad_dl is not None
+        assert err_bad_dl["error_code"] == "invalid_nested_param_value"
+
 
 def test_cn_price_fallback_quote_request_matches_bridge_route_contract() -> None:
     """cn_price_fallback 的 cn-hk 备用报价请求符合路由契约（quote 只收 ticker）。"""

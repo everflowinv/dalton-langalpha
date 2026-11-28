@@ -170,6 +170,38 @@ def _check_config_tools_metadata(
     return None
 
 
+def _inspect_wrapper_tool_signature(
+    server_name: str,
+    tool_name: str,
+    required_params: set[str],
+) -> tuple[bool | None, str]:
+    """Inspect generated sandbox wrapper `tools.<server_name>` for `tool_name` and parameters.
+
+    Returns `(True, "")` when confirmed, `(False, reason)` when wrapper imports but does not
+    expose the tool/params, or `(None, import_error_reason)` when the wrapper cannot be imported.
+    """
+    try:
+        wrapper = __import__(f"tools.{server_name}", fromlist=[tool_name])
+    except Exception as exc:  # noqa: BLE001
+        return None, f"无法导入沙箱包装模块 tools.{server_name}（{str(exc)[:160]}）"
+    fn = getattr(wrapper, tool_name, None)
+    if not callable(fn):
+        return False, f"tools.{server_name} 未暴露工具 {tool_name}"
+    if not required_params:
+        return True, ""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True, ""
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return True, ""
+    accepted = set(sig.parameters.keys())
+    missing = sorted(required_params - accepted)
+    if missing:
+        return False, f"tools.{server_name}.{tool_name} 缺少参数 {', '.join(missing)}"
+    return True, ""
+
+
 def _check_wrapper_tool_signature(
     server_name: str,
     tool_name: str,
@@ -179,23 +211,50 @@ def _check_wrapper_tool_signature(
 
     Returns True/False when the wrapper module can be imported, or None when unavailable.
     """
-    try:
-        wrapper = __import__(f"tools.{server_name}", fromlist=[tool_name])
-    except Exception:  # noqa: BLE001
-        return None
-    fn = getattr(wrapper, tool_name, None)
-    if not callable(fn):
-        return False
-    if not required_params:
-        return True
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return True
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return True
-    accepted = set(sig.parameters.keys())
-    return required_params.issubset(accepted)
+    verdict, _ = _inspect_wrapper_tool_signature(server_name, tool_name, required_params)
+    return verdict
+
+
+def _diagnose_server_tool_support(
+    server_name: str,
+    tool_name: str | None,
+    *,
+    required_params: set[str] | list[str] | tuple[str, ...] | None = None,
+    servers_cfg: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Return `(supported, reason)` strictly from discovered `tools` metadata or wrapper signature."""
+    if not servers_cfg or server_name not in servers_cfg:
+        return False, f"工作区未启用 {server_name} MCP 服务器"
+    server_entry = servers_cfg.get(server_name)
+    if isinstance(server_entry, dict) and server_entry.get("enabled") is False:
+        return False, f"{server_name} MCP 服务器已禁用"
+    if not tool_name:
+        return True, ""
+
+    req_set = {str(k) for k in (required_params or ()) if k}
+
+    # 1. Explicit tool manifest in config (if present)
+    cfg_verdict = _check_config_tools_metadata(server_entry, tool_name, req_set)
+    if cfg_verdict is not None:
+        if cfg_verdict:
+            return True, ""
+        return (
+            False,
+            f"{server_name} 配置的 tools 清单未包含 {tool_name}"
+            + (f"（需要参数 {', '.join(sorted(req_set))}）" if req_set else ""),
+        )
+
+    # 2. Generated sandbox wrapper module `tools.<server_name>` (ground truth in live sandboxes)
+    wrapper_verdict, wrapper_reason = _inspect_wrapper_tool_signature(server_name, tool_name, req_set)
+    if wrapper_verdict is not None:
+        return wrapper_verdict, wrapper_reason
+
+    # 3. Fail-closed whenever neither explicit `tools` metadata nor an importable
+    #    `tools.<server_name>` wrapper confirms the requested tool and parameters exist.
+    return (
+        False,
+        f"{wrapper_reason}，且 {server_name} 配置缺少 tools 清单，无法确认工具 {tool_name}",
+    )
 
 
 def server_supports_tool(
@@ -206,47 +265,13 @@ def server_supports_tool(
     servers_cfg: dict[str, Any] | None = None,
 ) -> bool:
     """Return True only when `server_name` is mounted AND exposes `tool_name` + `required_params`."""
-    if not servers_cfg or server_name not in servers_cfg:
-        return False
-    if not tool_name:
-        return True
-
-    req_set = {str(k) for k in (required_params or ()) if k}
-    server_entry = servers_cfg.get(server_name)
-
-    # 1. Explicit tool manifest in config (if present)
-    cfg_verdict = _check_config_tools_metadata(server_entry, tool_name, req_set)
-    if cfg_verdict is not None:
-        return cfg_verdict
-
-    # 2. Generated sandbox wrapper module `tools.<server_name>` (ground truth in live sandboxes)
-    wrapper_verdict = _check_wrapper_tool_signature(server_name, tool_name, req_set)
-    if wrapper_verdict is not None:
-        return wrapper_verdict
-
-    # 3. Fail-closed when neither explicit `tools` metadata nor generated wrapper
-    #    `tools.<server_name>` confirms the requested tool & parameters exist:
-    #    - Whenever `researchdata` is also mounted (mixed / pre-cutover workspace),
-    #      never guess that an unverified dedicated server exposes the tool.
-    #    - For `dalton_sec`, also never assume extended tools/params without discovery.
-    if LEGACY_SERVER in servers_cfg:
-        return False
-
-    if server_name == "dalton_sec":
-        ext_env = os.environ.get("DALTON_SEC_EXTENDED_TOOLS", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if not ext_env:
-            base_params = _BASELINE_DALTON_SEC_TOOLS.get(tool_name)
-            if base_params is None:
-                return False
-            if not req_set.issubset(base_params):
-                return False
-
-    return True
+    supported, _ = _diagnose_server_tool_support(
+        server_name,
+        tool_name,
+        required_params=required_params,
+        servers_cfg=servers_cfg,
+    )
+    return supported
 
 
 def _resolve_mcp_callable(server_name: str) -> tuple[Any, str]:
@@ -305,16 +330,21 @@ def resolve_connector_transport(
     if not prefer_dedicated and dedicated_server:
         order.append(("dedicated", dedicated_server))
 
+    reasons: list[str] = []
     for mode, server_name in order:
         if server_name not in servers_cfg:
             continue
-        if mode == "dedicated" and not server_supports_tool(
-            server_name,
-            tool_name,
-            required_params=required_params,
-            servers_cfg=servers_cfg,
-        ):
-            continue
+        if mode == "dedicated":
+            supported, support_err = _diagnose_server_tool_support(
+                server_name,
+                tool_name,
+                required_params=required_params,
+                servers_cfg=servers_cfg,
+            )
+            if not supported:
+                if support_err:
+                    reasons.append(support_err)
+                continue
         call_fn, call_err = _resolve_mcp_callable(server_name)
         if callable(call_fn):
             return {
@@ -323,14 +353,20 @@ def resolve_connector_transport(
                 "call": call_fn,
                 "error": "",
             }
-        return {"mode": None, "server": server_name, "call": None, "error": call_err}
+        if call_err:
+            reasons.append(call_err)
 
     wanted = dedicated_server or LEGACY_SERVER
+    if reasons:
+        detail = "；".join(dict.fromkeys(reasons))
+        err_msg = f"无法为路由 {route} 选择可用入口（已检查 {wanted} / {LEGACY_SERVER}）：{detail}"
+    else:
+        err_msg = f"工作区未启用 {wanted} 或 {LEGACY_SERVER} MCP 服务器"
     return {
         "mode": None,
         "server": None,
         "call": None,
-        "error": f"工作区未启用 {wanted} 或 {LEGACY_SERVER} MCP 服务器",
+        "error": err_msg,
     }
 
 

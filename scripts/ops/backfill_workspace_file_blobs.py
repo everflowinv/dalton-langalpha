@@ -488,13 +488,10 @@ async def _reverse(
                     )
                     continue
 
-            content_text, content_binary = _inline_columns(data, row["is_binary"])
-            # The rollback target reads BYTEA only when is_binary is true, so a
-            # NUL-bearing text row put into content_binary has to be relabelled
-            # or the code we are rolling back to cannot read it — which would
-            # make this whole mode a no-op for exactly the rows it exists for.
-            is_binary = row["is_binary"] or content_binary is not None
-            if content_binary is not None and not row["is_binary"]:
+            # DALTON-HOOK(backfill-readback-verify): keep >100 MiB reverse rows in content_binary with original is_binary
+            from src.dalton.wsfiles_backfill import choose_reverse_inline_target
+            content_text, content_binary, is_binary, _relabelled = choose_reverse_inline_target(data, row["is_binary"], _inline_columns)
+            if _relabelled:
                 as_binary += 1
                 logger.warning(
                     "text file is not clean UTF-8 (NUL or invalid bytes), "
@@ -595,23 +592,25 @@ async def _run(
     batch: int,
     workspace_id: str | None,
     include_legacy_owners: bool = False,
+    *,  # DALTON-HOOK(backfill-readback-verify): stats-only & sleep-ms options
+    stats_only: bool = False,
+    sleep_ms: int = 0,
 ) -> int:
-    if not is_storage_enabled():
+    if not stats_only and not is_storage_enabled():  # DALTON-HOOK(backfill-readback-verify)
         logger.error(
             "Object storage is disabled (STORAGE_PROVIDER=none / "
             "agent_config.yaml storage.provider). Refusing to run."
         )
         return 2
-    if not apply:
+    if not apply and not stats_only:  # DALTON-HOOK(backfill-readback-verify)
         logger.info("DRY RUN — nothing will be written. Re-run with --apply.")
     async with await psycopg.AsyncConnection.connect(
         build_db_uri(), autocommit=True
     ) as conn:
-        if reverse:
-            return await _reverse(conn, apply, batch, workspace_id)
-        return await _forward(
-            conn, apply, batch, workspace_id, include_legacy_owners
-        )
+        # DALTON-HOOK(backfill-readback-verify): delegate --stats-only and hardened forward to Dalton
+        from src.dalton.wsfiles_backfill import dispatch_backfill
+        return await dispatch_backfill(conn, apply=apply, reverse=reverse, batch=batch, workspace_id=workspace_id,
+            include_legacy_owners=include_legacy_owners, stats_only=stats_only, sleep_ms=sleep_ms, reverse_fn=_reverse)
 
 
 def main() -> int:
@@ -641,6 +640,9 @@ def main() -> int:
         "pass this once no such login can still arrive, or on a build without "
         "platform auth, where every id is local.",
     )
+    # DALTON-HOOK(backfill-readback-verify): --stats-only and --sleep-ms CLI flags
+    parser.add_argument("--stats-only", action="store_true", help="Read-only preflight stats without object storage.")
+    parser.add_argument("--sleep-ms", type=int, default=0, help="Pause in milliseconds between flushed batches.")
     args = parser.parse_args()
     return asyncio.run(
         _run(
@@ -649,6 +651,8 @@ def main() -> int:
             args.batch,
             args.workspace,
             args.include_legacy_owners,
+            stats_only=args.stats_only,  # DALTON-HOOK(backfill-readback-verify)
+            sleep_ms=args.sleep_ms,
         )
     )
 

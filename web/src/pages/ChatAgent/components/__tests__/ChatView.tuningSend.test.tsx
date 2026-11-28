@@ -18,6 +18,15 @@ const mocks = vi.hoisted(() => ({
   getWorkspace: vi.fn(),
   updateThread: vi.fn(),
   setValue: vi.fn(),
+  isDaltonBuild: false,
+  lastReadComposerOptions: null as (() => Record<string, unknown> | undefined) | null,
+}));
+
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return mocks.isDaltonBuild;
+  },
 }));
 
 vi.mock('@/lib/framer', async () => (await import('./chatViewHarness')).framerMock());
@@ -36,13 +45,30 @@ vi.mock('../../../../components/ui/chat-input', async () => {
   const { default: Stub } = (await import('./chatViewHarness')).chatInputMock();
   return {
     default: function ChatInputStub(props: Record<string, unknown>) {
-      useImperativeHandle(props.ref as React.Ref<unknown>, () => ({ setValue: mocks.setValue }));
+      useImperativeHandle(props.ref as React.Ref<unknown>, () => ({
+        setValue: mocks.setValue,
+        getModelOptions: () => ({
+          model: (props.sendModel as string | null | undefined) ?? null,
+          reasoningEffort: null,
+          fastMode: false,
+        }),
+      }));
       return Stub(props);
     },
   };
 });
-vi.mock('../../hooks/useChatMessages', async (importOriginal) =>
-  (await import('./chatViewHarness')).chatMessagesMock(await importOriginal()));
+vi.mock('../../hooks/useChatMessages', async (importOriginal) => {
+  const mocked = (await import('./chatViewHarness')).chatMessagesMock(await importOriginal());
+  const orig = mocked.useChatMessages;
+  return {
+    ...mocked,
+    useChatMessages: (...args: unknown[]) => {
+      const opts = args[2] as { readComposerOptions?: () => Record<string, unknown> | undefined } | undefined;
+      mocks.lastReadComposerOptions = opts?.readComposerOptions ?? null;
+      return orig();
+    },
+  };
+});
 vi.mock('../../hooks/useWorkspaceFiles', async () => (await import('./chatViewHarness')).workspaceFilesMock());
 vi.mock('../../hooks/useNavigationData', async (importOriginal) =>
   (await import('./chatViewHarness')).navigationDataMock(await importOriginal()));
@@ -81,6 +107,8 @@ beforeEach(() => {
   mocks.getWorkspace.mockReset();
   mocks.updateThread.mockReset();
   mocks.setValue.mockReset();
+  mocks.isDaltonBuild = false;
+  mocks.lastReadComposerOptions = null;
 });
 
 describe('ChatView: the thread\'s effort and fast mode', () => {
@@ -131,5 +159,25 @@ describe('ChatView: the thread\'s effort and fast mode', () => {
       fastModeOverride: true,
     });
     expect(chatInput.props?.tuning).toEqual({ reasoningEffort: 'low', fastMode: true });
+  });
+
+  // DALTON-HOOK(antigravity-series): R5 — ChatView forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions
+  it('forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions in Dalton builds', async () => {
+    mocks.isDaltonBuild = true;
+    mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Harness WS', status: 'active' });
+    mocks.getThread.mockResolvedValue({ thread_id: THREAD_ID, llm_model: 'model-a', reasoning_effort: null, fast_mode: null });
+    mocks.updateThread.mockResolvedValue({ thread_id: THREAD_ID, llm_model: 'model-b', reasoning_effort: null, fast_mode: null });
+    mountChatView(ChatView);
+
+    await waitFor(() => expect(chatInput.props?.onPickModel).toBeTypeOf('function'));
+    await act(async () => {
+      await (chatInput.props!.onPickModel as (m: string) => Promise<boolean>)('model-b');
+    });
+
+    expect(chatInput.props?.sendModelSeq).toEqual(expect.any(Number));
+    expect(mocks.lastReadComposerOptions?.()).toMatchObject({
+      model: 'model-b',
+      modelPickSeq: chatInput.props?.sendModelSeq,
+    });
   });
 });

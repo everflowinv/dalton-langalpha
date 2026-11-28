@@ -33,6 +33,10 @@ LIVE_LINK_MIN_BYTES = 8 * 1024 * 1024
 
 
 async def _sign(user_id: str, sha256: str, filename: str) -> str | None:
+    # DALTON-HOOK(workspace-file-download-ticket): skip internal-endpoint presign when browser endpoint is unset
+    from src.dalton.download_ticket import has_browser_endpoint_url
+    if not has_browser_endpoint_url():
+        return None
     return await asyncio.to_thread(
         get_signed_url,
         blob_key(user_id, sha256),

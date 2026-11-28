@@ -6,7 +6,8 @@ import hashlib
 import inspect
 import json
 import posixpath
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_DNS, uuid5
@@ -28,6 +29,7 @@ from src.dalton.monitors.models import (
     MonitorRecord,
     MonitorSourceKind,
     MonitorVisibility,
+    is_html_entry_path,
     is_valid_slug,
     slugify_candidate,
 )
@@ -35,9 +37,11 @@ from src.dalton.monitors.permissions import can_manage_monitor_fields
 from src.server.database.artifacts import records as artifacts_records_db
 from src.server.database.artifacts import versions as artifacts_versions_db
 from src.server.database.artifacts.versions import (
+    LeftOutChanged,
     Origin,
     PublishResult,
     ReadBasis,
+    SharingChanged,
     VersionFile,
 )
 from src.server.database.pool import get_db_connection
@@ -62,6 +66,8 @@ _MONITOR_SELECT = """
         m.last_publish_run_id,
         m.last_publish_error,
         m.last_publish_failed_at,
+        m.last_verified_seq,
+        m.last_verified_at,
         m.created_at,
         m.updated_at,
         l.code AS artifact_code,
@@ -84,6 +90,7 @@ _MONITOR_SELECT = """
         ) AS member_user_ids
       FROM dalton_monitors m
       JOIN share_links l ON l.artifact_id = m.artifact_id
+      JOIN workspaces w ON w.workspace_id = l.workspace_id AND w.status <> 'deleted'
       LEFT JOIN users u ON u.user_id = m.owner_user_id
 """
 
@@ -111,6 +118,12 @@ def _row_to_record(row: dict[str, Any] | None) -> MonitorRecord | None:
         last_publish_run_id=row.get("last_publish_run_id"),
         last_publish_error=row.get("last_publish_error"),
         last_publish_failed_at=row.get("last_publish_failed_at"),
+        last_verified_seq=(
+            int(row["last_verified_seq"])
+            if row.get("last_verified_seq") is not None
+            else None
+        ),
+        last_verified_at=row.get("last_verified_at"),
         artifact_code=row.get("artifact_code"),
         workspace_id=row.get("workspace_id"),
         entry_path=row.get("entry_path"),
@@ -207,11 +220,64 @@ async def list_workspace_auto_update_monitors(workspace_id: str) -> list[Monitor
                 WHERE m.source_kind = 'workspace'
                   AND m.keep_updated = TRUE
                   AND l.workspace_id = %s::uuid
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM dalton_shared_documents d
+                       WHERE d.artifact_id = m.artifact_id
+                  )
                 ORDER BY m.slug
                 """,
                 (workspace_id,),
             )
             return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
+
+
+async def has_workspace_auto_update_monitors(workspace_id: str) -> bool:
+    """Return True if ``workspace_id`` has any workspace monitor with ``keep_updated=TRUE``."""
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT 1
+                  FROM dalton_monitors m
+                  JOIN share_links l ON l.artifact_id = m.artifact_id
+                 WHERE m.source_kind = 'workspace'
+                   AND m.keep_updated = TRUE
+                   AND l.workspace_id = %s::uuid
+                 LIMIT 1
+                """,
+                (workspace_id,),
+            )
+            return await cur.fetchone() is not None
+
+
+class MonitorSupersededBySharedDocumentError(HTTPException):
+    """Raised when a legacy non-HTML monitor mutation is rejected after shared-document takeover."""
+
+    def __init__(
+        self,
+        detail: str = "该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+    ) -> None:
+        super().__init__(status_code=403, detail=detail)
+
+
+async def _reject_if_superseded_by_shared_document_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Reject mutations on a legacy non-HTML monitor already taken over by ``dalton_shared_documents``."""
+    if not entry_path or is_html_entry_path(entry_path):
+        return
+    await cur.execute(
+        """
+        SELECT 1
+          FROM dalton_shared_documents
+         WHERE artifact_id = %s::uuid
+           FOR SHARE
+        """,
+        (artifact_id,),
+    )
+    if await cur.fetchone() is not None:
+        raise MonitorSupersededBySharedDocumentError()
 
 
 async def pick_available_slug(base_raw: str) -> str:
@@ -546,7 +612,7 @@ async def update_monitor_settings_tx(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await artifacts_records_db.lock_owned(
+                locked = await artifacts_records_db.lock_owned(
                     cur, user_id=owner_user_id, artifact_id=artifact_id
                 )
                 await cur.execute(
@@ -562,6 +628,10 @@ async def update_monitor_settings_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row["source_kind"] == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 cur_visibility: MonitorVisibility = row["visibility"]
                 was_public = cur_visibility == "public"
@@ -906,6 +976,10 @@ async def commit_monitor_publish_tx(
                     (artifact_id,),
                 )
                 existing = await cur.fetchone()
+                if source_kind == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 if is_company_system_user(monitor_owner_id) or source_kind == "data_job":
                     if share_public and verify_public_authority is not None:
                         await _call_with_optional_conn(
@@ -1059,12 +1133,14 @@ async def commit_monitor_publish_tx(
                     """
                     UPDATE dalton_monitors
                        SET published_seq = %s,
+                           last_verified_seq = %s,
+                           last_verified_at = NOW(),
                            last_publish_error = NULL,
                            last_publish_failed_at = NULL,
                            updated_at = NOW()
                      WHERE monitor_id = %s::uuid
                     """,
-                    (result.seq, monitor_id),
+                    (result.seq, result.seq, monitor_id),
                 )
                 loaded = await _select_monitor_in_cur(cur, monitor_id)
     if loaded is None:
@@ -1264,6 +1340,8 @@ async def _cut_and_finalize_monitor_in_cur(
         """
         UPDATE dalton_monitors
            SET published_seq = %s,
+               last_verified_seq = %s,
+               last_verified_at = NOW(),
                owner_user_id = %s,
                last_publish_run_id = COALESCE(%s, last_publish_run_id),
                last_publish_error = NULL,
@@ -1271,7 +1349,7 @@ async def _cut_and_finalize_monitor_in_cur(
                updated_at = NOW()
          WHERE monitor_id = %s::uuid
         """,
-        (result.seq, effective_owner, run_id, monitor_id),
+        (result.seq, result.seq, effective_owner, run_id, monitor_id),
     )
     loaded = await _select_monitor_in_cur(cur, monitor_id)
     if loaded is None:
@@ -1322,6 +1400,10 @@ async def commit_monitor_version_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
                     from src.dalton.settings import is_dalton_sharing_auth_enabled
@@ -1518,10 +1600,56 @@ async def record_monitor_publish_failure(
     *,
     error_message: str,
     run_id: str | None = None,
+    expected_claim_epoch: int | None = None,
 ) -> MonitorRecord | None:
-    """Record the latest failure message/timestamp without marking ``run_id`` as processed."""
-    _ = run_id
+    """Record the latest failure message/timestamp without marking ``run_id`` as processed.
+
+    When both ``run_id`` and ``expected_claim_epoch`` are supplied, the write is fenced
+    against ``dalton_data_task_runs`` so a late/stale worker cannot overwrite
+    ``last_publish_error`` after another worker has taken over or settled the run.
+    Skips updating legacy workspace monitors already taken over by ``dalton_shared_documents``.
+    """
     clipped = _clip_publish_error(error_message, limit=1000)
+    if run_id is not None and expected_claim_epoch is not None:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT monitor_publish_status,
+                               monitor_publish_claim_epoch
+                          FROM dalton_data_task_runs
+                         WHERE run_id = %s::uuid
+                           FOR SHARE
+                        """,
+                        (run_id,),
+                    )
+                    run_row = await cur.fetchone()
+                    if (
+                        run_row is not None
+                        and str(run_row.get("monitor_publish_status") or "") == "publishing"
+                        and int(run_row.get("monitor_publish_claim_epoch") or 0)
+                        == int(expected_claim_epoch)
+                    ):
+                        await cur.execute(
+                            """
+                            UPDATE dalton_monitors
+                               SET last_publish_error = %s,
+                                   last_publish_failed_at = NOW()
+                             WHERE monitor_id = %s::uuid
+                               AND NOT (
+                                   source_kind = 'workspace'
+                                   AND EXISTS (
+                                       SELECT 1
+                                         FROM dalton_shared_documents d
+                                        WHERE d.artifact_id = dalton_monitors.artifact_id
+                                   )
+                               )
+                            """,
+                            (clipped, monitor_id),
+                        )
+        return await get_monitor_by_id(monitor_id)
+
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1530,6 +1658,14 @@ async def record_monitor_publish_failure(
                    SET last_publish_error = %s,
                        last_publish_failed_at = NOW()
                  WHERE monitor_id = %s::uuid
+                   AND NOT (
+                       source_kind = 'workspace'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM dalton_shared_documents d
+                            WHERE d.artifact_id = dalton_monitors.artifact_id
+                       )
+                   )
                 """,
                 (clipped, monitor_id),
             )
@@ -1554,7 +1690,7 @@ async def delete_monitor_tx(
                 )
                 await cur.execute(
                     """
-                    SELECT visibility, owner_user_id
+                    SELECT visibility, owner_user_id, source_kind
                       FROM dalton_monitors
                      WHERE monitor_id = %s::uuid
                        FOR UPDATE
@@ -1564,6 +1700,10 @@ async def delete_monitor_tx(
                 row = await cur.fetchone()
                 if row is None:
                     return False
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 from src.dalton.settings import is_dalton_local_auth_enabled
 
                 if (
@@ -1592,6 +1732,1332 @@ async def delete_monitor_tx(
                 return (cur.rowcount or 0) > 0
 
 
+_UNSET: Any = object()
+
+
+@dataclass(frozen=True)
+class StagedMonitorCandidate:
+    """Result of Stage 1 staging: candidate files stored in ``artifact_versions`` without moving visitor pointers."""
+
+    artifact_id: str
+    candidate_seq: int
+    cut: bool
+    deduped: bool = False
+    paused: bool = False
+    existing_monitor: MonitorRecord | None = None
+    share_revision: int | None = None
+    share_audience: str | None = None
+    monitor_acl_revision: int | None = None
+    left_out_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PromotedMonitorResult:
+    """Result of Stage 3 atomic pointer promotion."""
+
+    monitor: MonitorRecord | None
+    promoted: bool
+    deduped: bool = False
+    superseded_by_newer: bool = False
+    fenced_out: bool = False
+    deferred_to_newer: bool = False
+
+
+@dataclass(frozen=True)
+class PromoteMonitorItem:
+    """Per-panel parameters for single-transaction multi-panel ``all_or_nothing`` promotion."""
+
+    artifact_id: str
+    candidate_seq: int
+    workspace_owner_id: str
+    paths: Sequence[str]
+    monitor_id: str | None = None
+    slug: str | None = None
+    monitor_owner_id: str | None = None
+    title: str | None = None
+    category: MonitorCategory | None = None
+    sort_order: int | None = None
+    visibility: MonitorVisibility | None = None
+    keep_updated: bool | None = None
+    source_kind: MonitorSourceKind = "data_job"
+    source_ref: str | None = None
+    member_user_ids: Sequence[str] | None = None
+    new_owner_user_id: str | None = None
+    caller_user_id: str | None = None
+    verify_public_authority: Callable[..., Awaitable[None]] | None = None
+    check_pending_outbound_confirm: bool = False
+    reject_if_pending_outbound_confirm: bool = False
+    update_metadata: bool = False
+    is_update_flow: bool = False
+    expected_share_revision: int | None = None
+    expected_share_audience: Any = _UNSET
+    expected_acl_revision: int | None = None
+    expected_left_out_files: Collection[str] | None = None
+    migrate_entry_path: str | None = None
+    migrate_legacy_entry_path: str | None = None
+    migrate_source_ref: str | None = None
+    migrate_workspace_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchPromoteResult:
+    """Result of atomic single-transaction multi-panel promotion."""
+
+    results: list[PromotedMonitorResult]
+    promoted: bool
+    superseded_by_newer: bool = False
+    fenced_out: bool = False
+    deferred_to_newer: bool = False
+
+
+class _BatchPromoteSuperseded(Exception):
+    """Internal rollback sentinel when any panel in an ``all_or_nothing`` batch is superseded."""
+
+
+_FAILED_OR_CANCELLED_RUN_STATUSES = frozenset(
+    {
+        "failed",
+        "timed_out",
+        "aborted",
+        "skipped_low_memory",
+        "skipped_superseded",
+        "cancelled",
+    }
+)
+_ACTIVE_RUN_STATUSES = frozenset({"queued", "starting", "running"})
+_TERMINAL_SUPERSEDING_MONITOR_PUBLISH_STATUSES = frozenset(
+    {"published", "unchanged", "partial_failed"}
+)
+_IN_FLIGHT_MONITOR_PUBLISH_STATUSES = frozenset({"pending", "retrying", "publishing"})
+_FAILED_MONITOR_PUBLISH_STATUSES = frozenset({"failed", "disabled"})
+
+
+def _classify_newer_data_job_run(row: Mapping[str, Any]) -> str:
+    """Classify a newer ``dalton_data_task_runs`` row for cross-run publish fencing.
+
+    Returns:
+    - ``'superseded'``: newer run succeeded and reached a terminal publish state
+      (``published`` / ``unchanged`` / ``partial_failed``), so older runs are permanently superseded.
+    - ``'deferred'``: newer run is still active (``queued`` / ``starting`` / ``running``) or
+      succeeded with publish still in-flight (``pending`` / ``retrying`` / ``publishing``), so
+      older runs must not advance pointers yet but must remain reclaimable if the newer run fails.
+    - ``'none'``: newer run failed, was cancelled, or failed/disabled monitor publishing and does
+      not block older runs.
+    """
+    r_status = str(row.get("status") or "")
+    r_mp_status = str(row.get("monitor_publish_status") or "")
+    if r_status in _FAILED_OR_CANCELLED_RUN_STATUSES:
+        return "none"
+    if r_status in _ACTIVE_RUN_STATUSES:
+        return "deferred"
+    if r_status == "succeeded":
+        if r_mp_status in _TERMINAL_SUPERSEDING_MONITOR_PUBLISH_STATUSES:
+            return "superseded"
+        if r_mp_status in _IN_FLIGHT_MONITOR_PUBLISH_STATUSES:
+            return "deferred"
+        return "none"
+    return "none"
+
+
+def _is_blocking_newer_data_job_run(row: Mapping[str, Any]) -> bool:
+    """Return True if a newer run row either defers or terminally supersedes an older run."""
+    return _classify_newer_data_job_run(row) != "none"
+
+
+async def _check_data_job_run_fences_in_cur(
+    cur: Any,
+    *,
+    run_id: str | None,
+    expected_claim_epoch: int | None,
+    check_superseded: bool,
+) -> str:
+    """Verify ``claim_epoch`` and in-transaction newer-run fences on ``dalton_data_task_runs``.
+
+    Returns ``'ok'``, ``'fenced_out'``, ``'superseded'``, or ``'deferred'``.
+    """
+    if run_id is None or (expected_claim_epoch is None and not check_superseded):
+        return "ok"
+    await cur.execute(
+        """
+        SELECT run_id::text AS run_id,
+               job_key,
+               status,
+               scheduled_slot_utc,
+               completed_at,
+               monitor_publish_status,
+               monitor_publish_claim_epoch
+          FROM dalton_data_task_runs
+         WHERE run_id = %s::uuid
+           FOR UPDATE
+        """,
+        (run_id,),
+    )
+    run_row = await cur.fetchone()
+    if expected_claim_epoch is not None:
+        if (
+            run_row is None
+            or str(run_row.get("monitor_publish_status") or "") != "publishing"
+            or int(run_row.get("monitor_publish_claim_epoch") or 0) != int(expected_claim_epoch)
+        ):
+            return "fenced_out"
+    if check_superseded and run_row is not None and str(run_row.get("status") or "") == "succeeded":
+        # Lock all newer non-failed/non-cancelled runs (including queued/starting/running
+        # and succeeded runs) FOR SHARE (ordered by run_id to avoid deadlocks) AFTER holding
+        # the artifact lock so an older replay never advances pointers ahead of a newer run.
+        await cur.execute(
+            """
+            SELECT run_id::text AS run_id,
+                   status,
+                   monitor_publish_status
+              FROM dalton_data_task_runs
+             WHERE job_key = %(job_key)s
+               AND run_id <> %(run_id)s::uuid
+               AND status NOT IN (
+                   'failed',
+                   'timed_out',
+                   'aborted',
+                   'skipped_low_memory',
+                   'skipped_superseded',
+                   'cancelled'
+               )
+               AND (
+                   (%(slot_utc)s::timestamptz IS NOT NULL AND scheduled_slot_utc > %(slot_utc)s::timestamptz)
+                   OR (
+                       (%(slot_utc)s::timestamptz IS NULL OR scheduled_slot_utc = %(slot_utc)s::timestamptz)
+                       AND COALESCE(completed_at, updated_at) > COALESCE(%(completed_at)s::timestamptz, '-infinity'::timestamptz)
+                   )
+               )
+             ORDER BY run_id ASC
+               FOR SHARE
+            """,
+            {
+                "job_key": str(run_row["job_key"]),
+                "run_id": str(run_row["run_id"]),
+                "slot_utc": run_row.get("scheduled_slot_utc"),
+                "completed_at": run_row.get("completed_at"),
+            },
+        )
+        newer_rows = await cur.fetchall()
+        classifications = [_classify_newer_data_job_run(r) for r in (newer_rows or ())]
+        if "superseded" in classifications:
+            return "superseded"
+        if "deferred" in classifications:
+            return "deferred"
+    return "ok"
+
+
+async def _verify_stage_or_promote_authority_in_cur(
+    cur: Any,
+    *,
+    existing: dict[str, Any] | None,
+    visibility: MonitorVisibility,
+    monitor_owner_id: str,
+    source_kind: MonitorSourceKind,
+    caller_user_id: str | None = None,
+    new_owner_user_id: str | None = None,
+    verify_public_authority: Callable[..., Awaitable[None]] | None = None,
+    is_update_flow: bool = False,
+) -> str:
+    """Re-verify publish/update authority under row locks and return ``effective_owner``."""
+    cur_conn = getattr(cur, "connection", None)
+    share_public = visibility == "public"
+    locked_owner = str(existing["owner_user_id"]) if existing is not None else str(monitor_owner_id)
+    effective_owner = locked_owner if is_update_flow else str(monitor_owner_id)
+
+    if source_kind == "data_job" or (
+        is_company_system_user(new_owner_user_id or effective_owner)
+        and caller_user_id is None
+    ):
+        effective_owner = new_owner_user_id or effective_owner
+        if share_public and verify_public_authority is not None:
+            await _call_with_optional_conn(
+                verify_public_authority, effective_owner, conn=cur_conn
+            )
+        return effective_owner
+
+    from src.dalton.auth_guards import raise_external_member_forbidden
+    from src.dalton.monitors.permissions import (
+        EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE,
+        can_manage_monitor_fields,
+        require_monitor_publish_visibility,
+    )
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
+    if not is_update_flow:
+        live_tier = await _resolve_live_tier_in_cur(cur, monitor_owner_id)
+        if (
+            existing is not None
+            and live_tier == "external"
+            and existing["visibility"] != "own"
+        ):
+            raise_external_member_forbidden(EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE)
+        if live_tier == "external" and visibility != "own":
+            require_monitor_publish_visibility(live_tier, visibility)
+        if share_public and verify_public_authority is not None:
+            if is_dalton_local_auth_enabled():
+                if live_tier != "admin":
+                    from src.dalton.monitors.service import (
+                        PUBLIC_PERMISSION_LOST_MESSAGE,
+                        PublicAuthorityLostError,
+                    )
+
+                    raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            else:
+                await _call_with_optional_conn(
+                    verify_public_authority, monitor_owner_id, conn=cur_conn
+                )
+        require_monitor_publish_visibility(live_tier, visibility)
+        return str(monitor_owner_id)
+
+    uids_to_lock = sorted(
+        {
+            str(u).strip()
+            for u in (caller_user_id, new_owner_user_id, locked_owner)
+            if u and str(u).strip()
+        }
+    )
+    live_tiers: dict[str, str] = {}
+    for uid in uids_to_lock:
+        live_tiers[uid] = await _resolve_live_tier_in_cur(cur, uid)
+
+    if caller_user_id is not None:
+        caller_uid = str(caller_user_id)
+        caller_tier = live_tiers[caller_uid]
+        if not can_manage_monitor_fields(
+            owner_user_id=locked_owner,
+            visibility=visibility,
+            caller_id=caller_uid,
+            caller_tier=caller_tier,
+        ):
+            raise_external_member_forbidden("无权重新发布此监控面板")
+        if new_owner_user_id is not None and str(new_owner_user_id) != locked_owner:
+            if not (share_public and source_kind == "workspace" and caller_tier == "admin"):
+                raise_external_member_forbidden("无权重新发布此监控面板")
+            effective_owner = str(new_owner_user_id)
+        if caller_tier == "external" and visibility != "own":
+            require_monitor_publish_visibility(caller_tier, visibility)
+        if share_public and verify_public_authority is not None:
+            if is_dalton_local_auth_enabled():
+                if caller_tier != "admin":
+                    from src.dalton.monitors.service import (
+                        PUBLIC_PERMISSION_LOST_MESSAGE,
+                        PublicAuthorityLostError,
+                    )
+
+                    raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            else:
+                await _call_with_optional_conn(
+                    verify_public_authority, caller_uid, conn=cur_conn
+                )
+        require_monitor_publish_visibility(caller_tier, visibility)
+    elif new_owner_user_id is not None and str(new_owner_user_id) != locked_owner:
+        raise_external_member_forbidden("无权重新发布此监控面板")
+
+    if not is_company_system_user(effective_owner) and (
+        caller_user_id is None or str(effective_owner) != str(caller_user_id)
+    ):
+        live_tier = live_tiers[str(effective_owner)]
+        if live_tier == "external" and visibility != "own":
+            require_monitor_publish_visibility(live_tier, visibility)
+        if share_public and verify_public_authority is not None:
+            if is_dalton_local_auth_enabled():
+                if live_tier != "admin":
+                    from src.dalton.monitors.service import (
+                        PUBLIC_PERMISSION_LOST_MESSAGE,
+                        PublicAuthorityLostError,
+                    )
+
+                    raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            else:
+                await _call_with_optional_conn(
+                    verify_public_authority, effective_owner, conn=cur_conn
+                )
+        require_monitor_publish_visibility(live_tier, visibility)
+
+    return effective_owner
+
+
+async def stage_monitor_candidate_version_tx(
+    *,
+    artifact_id: str,
+    workspace_owner_id: str,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    read_basis: ReadBasis | None = None,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+    monitor_id: str | None = None,
+    monitor_owner_id: str | None = None,
+    visibility: MonitorVisibility | None = None,
+    source_kind: MonitorSourceKind = "workspace",
+    caller_user_id: str | None = None,
+    new_owner_user_id: str | None = None,
+    verify_public_authority: Callable[..., Awaitable[None]] | None = None,
+    check_pending_outbound_confirm: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
+    run_id: str | None = None,
+    is_update_flow: bool = False,
+    candidate_entry_path: str | None = None,
+    expected_legacy_entry_path: str | None = None,
+    expected_slug: str | None = None,
+    expected_workspace_id: str | None = None,
+) -> StagedMonitorCandidate:
+    """Stage 1: write candidate rows to ``artifact_versions`` / ``artifact_version_files`` only.
+
+    Leaves ``share_links.shared_seq``, ``share_links.files``, ``share_links.path``,
+    ``dalton_monitors.published_seq``, ``dalton_monitors.last_verified_seq``,
+    ``dalton_monitor_versions``, and ``dalton_monitor_publish_runs`` completely untouched.
+    On first-time publish, no row is created in ``dalton_monitors`` yet so a failed
+    verification leaves zero shell rows.
+    """
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                locked = await artifacts_records_db.lock_owned(
+                    cur, user_id=workspace_owner_id, artifact_id=artifact_id
+                )
+                if read_basis is not None:
+                    read_basis.check(locked)
+
+                existing_row: dict[str, Any] | None = None
+                if monitor_id is not None:
+                    await cur.execute(
+                        """
+                        SELECT monitor_id::text AS monitor_id,
+                               slug,
+                               artifact_id::text AS artifact_id,
+                               visibility,
+                               owner_user_id,
+                               source_kind,
+                               source_ref,
+                               title,
+                               published_seq,
+                               last_verified_seq,
+                               acl_revision
+                          FROM dalton_monitors
+                         WHERE monitor_id = %s::uuid
+                           FOR UPDATE
+                        """,
+                        (monitor_id,),
+                    )
+                    existing_row = await cur.fetchone()
+                    if existing_row is None:
+                        raise LookupError(f"Monitor {monitor_id} not found")
+                else:
+                    await cur.execute(
+                        """
+                        SELECT monitor_id::text AS monitor_id,
+                               slug,
+                               artifact_id::text AS artifact_id,
+                               visibility,
+                               owner_user_id,
+                               source_kind,
+                               source_ref,
+                               title,
+                               published_seq,
+                               last_verified_seq,
+                               acl_revision
+                          FROM dalton_monitors
+                         WHERE artifact_id = %s::uuid
+                           FOR UPDATE
+                        """,
+                        (artifact_id,),
+                    )
+                    existing_row = await cur.fetchone()
+
+                # Same takeover guard as commit_monitor_version_tx (D4 shared documents).
+                if existing_row is not None and existing_row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=candidate_entry_path or getattr(locked, "path", None)
+                    )
+
+                if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
+                    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                    if is_dalton_sharing_auth_enabled():
+                        from src.dalton.colleague_outbound_guard import (
+                            WorkspaceAutoPublishPaused,
+                            is_workspace_pending_outbound_confirm_in_cur,
+                        )
+
+                        if await is_workspace_pending_outbound_confirm_in_cur(
+                            cur, locked.workspace_id
+                        ):
+                            if reject_if_pending_outbound_confirm:
+                                raise WorkspaceAutoPublishPaused(locked.workspace_id)
+                            existing_mon = (
+                                await _select_monitor_in_cur(cur, str(existing_row["monitor_id"]))
+                                if existing_row is not None
+                                else None
+                            )
+                            return StagedMonitorCandidate(
+                                artifact_id=artifact_id,
+                                candidate_seq=int(locked.latest_seq or 0),
+                                cut=False,
+                                paused=True,
+                                existing_monitor=existing_mon,
+                            )
+
+                if existing_row is not None and run_id is not None:
+                    await cur.execute(
+                        """
+                        SELECT 1 FROM dalton_monitor_publish_runs
+                         WHERE monitor_id = %s::uuid AND run_id = %s
+                        """,
+                        (existing_row["monitor_id"], run_id),
+                    )
+                    if await cur.fetchone() is not None:
+                        existing_mon = await _select_monitor_in_cur(
+                            cur, str(existing_row["monitor_id"])
+                        )
+                        return StagedMonitorCandidate(
+                            artifact_id=artifact_id,
+                            candidate_seq=int(
+                                existing_mon.published_seq
+                                if existing_mon is not None
+                                else (existing_row.get("published_seq") or 0)
+                            ),
+                            cut=False,
+                            deduped=True,
+                            existing_monitor=existing_mon,
+                        )
+
+                eff_visibility: MonitorVisibility = (
+                    visibility
+                    if visibility is not None
+                    else (existing_row["visibility"] if existing_row is not None else "own")
+                )
+                eff_source_kind: MonitorSourceKind = (
+                    existing_row["source_kind"]
+                    if existing_row is not None and is_update_flow
+                    else source_kind
+                )
+                eff_owner_arg = (
+                    monitor_owner_id
+                    if monitor_owner_id is not None
+                    else (
+                        str(existing_row["owner_user_id"])
+                        if existing_row is not None
+                        else workspace_owner_id
+                    )
+                )
+                await _verify_stage_or_promote_authority_in_cur(
+                    cur,
+                    existing=existing_row,
+                    visibility=eff_visibility,
+                    monitor_owner_id=eff_owner_arg,
+                    source_kind=eff_source_kind,
+                    caller_user_id=caller_user_id,
+                    new_owner_user_id=new_owner_user_id,
+                    verify_public_authority=verify_public_authority,
+                    is_update_flow=is_update_flow,
+                )
+
+                stage_target = locked
+                if candidate_entry_path is not None and locked.path != candidate_entry_path:
+                    if (
+                        existing_row is None
+                        or existing_row["source_kind"] != "data_job"
+                        or not is_company_system_user(str(existing_row["owner_user_id"]))
+                        or (expected_slug is not None and existing_row.get("slug") != expected_slug)
+                        or str(existing_row.get("artifact_id") or "") != locked.artifact_id
+                        or (
+                            expected_workspace_id is not None
+                            and locked.workspace_id != expected_workspace_id
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"监控面板 '{expected_slug or artifact_id}' 不符合遗留数据任务面板自动迁移条件",
+                        )
+                    if (
+                        expected_legacy_entry_path is not None
+                        and locked.path != expected_legacy_entry_path
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"监控面板 '{expected_slug or artifact_id}' 仍绑定路径 '{locked.path}'，"
+                                f"无法自动迁移到 '{candidate_entry_path}'"
+                            ),
+                        )
+                    # Fail fast before staging candidate rows if target path is already occupied.
+                    await cur.execute(
+                        """
+                        SELECT artifact_id::text AS artifact_id
+                          FROM share_links
+                         WHERE workspace_id = %s::uuid
+                           AND kind = 'file'
+                           AND path = %s
+                           AND artifact_id <> %s::uuid
+                        """,
+                        (locked.workspace_id, candidate_entry_path, locked.artifact_id),
+                    )
+                    occupant = await cur.fetchone()
+                    if occupant is not None:
+                        occupant_aid = str(occupant.get("artifact_id") or "")
+                        occupant_hint = f"（artifact_id={occupant_aid}）" if occupant_aid else ""
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"目标资源路径 '{candidate_entry_path}' 已被另一资源占用"
+                                f"{occupant_hint}，无法自动迁移"
+                            ),
+                        )
+                    # Stage candidate version under target entry_path while keeping share_links.path untouched until Stage 3.
+                    stage_target = replace(locked, path=candidate_entry_path)
+
+                result = await artifacts_versions_db.cut_monitor_in_cur(
+                    cur,
+                    stage_target,
+                    user_id=workspace_owner_id,
+                    files=files,
+                    title=title or (str(existing_row["title"]) if existing_row else None),
+                    label=label,
+                    share_public=False,
+                    origin=origin,
+                    loaded_files=loaded_files,
+                    left_out_files=left_out_files,
+                )
+                existing_mon = (
+                    await _select_monitor_in_cur(cur, str(existing_row["monitor_id"]))
+                    if existing_row is not None
+                    else None
+                )
+                staged_share_rev = int(result.artifact.revision)
+                staged_share_audience = result.artifact.audience
+                staged_left_out = tuple(sorted(result.artifact.left_out_files))
+                staged_acl_rev = (
+                    int(existing_row["acl_revision"])
+                    if existing_row is not None and existing_row.get("acl_revision") is not None
+                    else None
+                )
+    return StagedMonitorCandidate(
+        artifact_id=artifact_id,
+        candidate_seq=result.seq,
+        cut=result.cut,
+        deduped=False,
+        paused=False,
+        existing_monitor=existing_mon,
+        share_revision=staged_share_rev,
+        share_audience=staged_share_audience,
+        monitor_acl_revision=staged_acl_rev,
+        left_out_files=staged_left_out,
+    )
+
+
+async def _promote_verified_monitor_in_cur(
+    cur: Any,
+    *,
+    artifact_id: str,
+    candidate_seq: int,
+    workspace_owner_id: str,
+    paths: Sequence[str],
+    locked_artifact: Any = None,
+    monitor_id: str | None = None,
+    slug: str | None = None,
+    monitor_owner_id: str | None = None,
+    title: str | None = None,
+    category: MonitorCategory | None = None,
+    sort_order: int | None = None,
+    visibility: MonitorVisibility | None = None,
+    keep_updated: bool | None = None,
+    source_kind: MonitorSourceKind = "workspace",
+    source_ref: str | None = None,
+    member_user_ids: Sequence[str] | None = None,
+    run_id: str | None = None,
+    new_owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
+    verify_public_authority: Callable[..., Awaitable[None]] | None = None,
+    check_pending_outbound_confirm: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
+    update_metadata: bool = False,
+    is_update_flow: bool = False,
+    expected_share_revision: int | None = None,
+    expected_share_audience: Any = _UNSET,
+    expected_acl_revision: int | None = None,
+    expected_left_out_files: Collection[str] | None = None,
+    migrate_entry_path: str | None = None,
+    migrate_legacy_entry_path: str | None = None,
+    migrate_source_ref: str | None = None,
+    migrate_workspace_id: str | None = None,
+) -> PromotedMonitorResult:
+    """Promote one verified monitor candidate inside an active transaction cursor."""
+    sorted_paths = sorted(dict.fromkeys(str(p) for p in paths if str(p)))
+    clean_members: list[str] | None = (
+        list(dict.fromkeys(str(m).strip() for m in member_user_ids if str(m).strip()))
+        if member_user_ids is not None
+        else None
+    )
+    locked = (
+        locked_artifact
+        if locked_artifact is not None
+        else await artifacts_records_db.lock_owned(
+            cur, user_id=workspace_owner_id, artifact_id=artifact_id
+        )
+    )
+
+    # Fence 2a: share_links revision, audience & left_out_files must match what was staged.
+    if expected_share_revision is not None and int(locked.revision) != int(expected_share_revision):
+        raise SharingChanged(
+            f"share_links revision moved during verification ({expected_share_revision} -> {locked.revision})"
+        )
+    if expected_share_audience is not _UNSET and locked.audience != expected_share_audience:
+        raise SharingChanged(
+            f"share_links audience changed during verification ({expected_share_audience!r} -> {locked.audience!r})"
+        )
+    locked_left_out = frozenset(getattr(locked, "left_out_files", ()) or ())
+    if expected_left_out_files is not None and locked_left_out != frozenset(expected_left_out_files):
+        raise LeftOutChanged(
+            f"share_links left_out_files changed during verification "
+            f"({sorted(expected_left_out_files)!r} -> {sorted(locked_left_out)!r})"
+        )
+    excluded_overlap = sorted(set(sorted_paths) & locked_left_out)
+    if excluded_overlap:
+        raise LeftOutChanged(
+            f"Candidate v{candidate_seq} includes files excluded in left_out_files: {excluded_overlap}"
+        )
+
+    if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                WorkspaceAutoPublishPaused,
+                is_workspace_pending_outbound_confirm_in_cur,
+            )
+
+            if await is_workspace_pending_outbound_confirm_in_cur(
+                cur, locked.workspace_id
+            ):
+                if reject_if_pending_outbound_confirm:
+                    raise WorkspaceAutoPublishPaused(locked.workspace_id)
+                if monitor_id is not None:
+                    paused_mon = await _select_monitor_in_cur(cur, monitor_id)
+                    if paused_mon is not None:
+                        return PromotedMonitorResult(
+                            monitor=paused_mon,
+                            promoted=False,
+                            deduped=False,
+                        )
+                raise WorkspaceAutoPublishPaused(locked.workspace_id)
+
+    if monitor_id is not None:
+        await cur.execute(
+            """
+            SELECT monitor_id::text AS monitor_id,
+                   slug,
+                   artifact_id::text AS artifact_id,
+                   visibility,
+                   owner_user_id,
+                   source_kind,
+                   source_ref,
+                   title,
+                   published_seq,
+                   last_verified_seq,
+                   acl_revision
+              FROM dalton_monitors
+             WHERE monitor_id = %s::uuid
+               FOR UPDATE
+            """,
+            (monitor_id,),
+        )
+    else:
+        await cur.execute(
+            """
+            SELECT monitor_id::text AS monitor_id,
+                   slug,
+                   artifact_id::text AS artifact_id,
+                   visibility,
+                   owner_user_id,
+                   source_kind,
+                   source_ref,
+                   title,
+                   published_seq,
+                   last_verified_seq,
+                   acl_revision
+              FROM dalton_monitors
+             WHERE artifact_id = %s::uuid
+               FOR UPDATE
+            """,
+            (artifact_id,),
+        )
+    existing = await cur.fetchone()
+
+    # Fence 2b: monitor ACL revision must match what was staged (detects concurrent unshare / audience change).
+    if expected_acl_revision is not None:
+        if existing is None or int(existing["acl_revision"]) != int(expected_acl_revision):
+            raise SharingChanged(
+                f"monitor acl_revision changed during verification ({expected_acl_revision} -> "
+                f"{existing['acl_revision'] if existing is not None else None})"
+            )
+
+    if existing is None:
+        if not slug or title is None or category is None or visibility is None:
+            raise ValueError("First-time monitor promotion requires slug, title, category, and visibility")
+        eff_owner = await _verify_stage_or_promote_authority_in_cur(
+            cur,
+            existing=None,
+            visibility=visibility,
+            monitor_owner_id=monitor_owner_id or workspace_owner_id,
+            source_kind=source_kind,
+            caller_user_id=caller_user_id,
+            new_owner_user_id=new_owner_user_id,
+            verify_public_authority=verify_public_authority,
+            is_update_flow=False,
+        )
+        await cur.execute(
+            """
+            INSERT INTO dalton_monitors (
+                slug, artifact_id, owner_user_id, title, category,
+                sort_order, visibility, published_seq,
+                last_verified_seq, last_verified_at,
+                keep_updated, source_kind, source_ref, last_publish_run_id
+            )
+            VALUES (
+                %s, %s::uuid, %s, %s, %s,
+                %s, %s, %s,
+                %s, NOW(),
+                %s, %s, %s, %s
+            )
+            RETURNING monitor_id::text AS monitor_id
+            """,
+            (
+                slug,
+                artifact_id,
+                eff_owner,
+                title,
+                category,
+                int(sort_order or 0),
+                visibility,
+                candidate_seq,
+                candidate_seq,
+                bool(keep_updated),
+                source_kind,
+                source_ref,
+                run_id,
+            ),
+        )
+        inserted = await cur.fetchone()
+        resolved_monitor_id = str(inserted["monitor_id"])
+        if visibility == "members" and clean_members:
+            await cur.executemany(
+                """
+                INSERT INTO dalton_monitor_members (monitor_id, user_id)
+                VALUES (%s::uuid, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                [(resolved_monitor_id, mid) for mid in clean_members],
+            )
+        await _record_monitor_version_in_cur(cur, resolved_monitor_id, candidate_seq)
+        if run_id is not None:
+            await cur.execute(
+                """
+                INSERT INTO dalton_monitor_publish_runs (monitor_id, run_id, published_seq)
+                VALUES (%s::uuid, %s, %s)
+                ON CONFLICT (monitor_id, run_id) DO NOTHING
+                """,
+                (resolved_monitor_id, run_id, candidate_seq),
+            )
+        if visibility == "public":
+            await _sync_share_link_promoted_in_cur(
+                cur,
+                artifact_id=artifact_id,
+                seq=candidate_seq,
+                sorted_paths=sorted_paths,
+                share_public=True,
+            )
+        elif locked.shared:
+            await artifacts_records_db.unshare_in_cur(
+                cur, user_id=workspace_owner_id, artifact_id=artifact_id
+            )
+        await _prune_monitor_versions_in_cur(
+            cur,
+            artifact_id,
+            published_seq=candidate_seq,
+            keep_count=MAX_MONITOR_VERSIONS,
+        )
+        loaded = await _select_monitor_in_cur(cur, resolved_monitor_id)
+        if loaded is None:
+            raise RuntimeError(f"Monitor {resolved_monitor_id} disappeared after promote")
+        return PromotedMonitorResult(monitor=loaded, promoted=True)
+
+    # Existing monitor row locked FOR UPDATE
+    resolved_monitor_id = str(existing["monitor_id"])
+    dedup_mon = await _reserve_monitor_publish_run_in_cur(
+        cur, monitor_id=resolved_monitor_id, run_id=run_id
+    )
+    if dedup_mon is not None:
+        return PromotedMonitorResult(
+            monitor=dedup_mon, promoted=False, deduped=True
+        )
+
+    eff_visibility: MonitorVisibility = (
+        visibility if (update_metadata and visibility is not None) else existing["visibility"]
+    )
+    eff_source_kind: MonitorSourceKind = (
+        source_kind if update_metadata else existing["source_kind"]
+    )
+    eff_owner = await _verify_stage_or_promote_authority_in_cur(
+        cur,
+        existing=existing,
+        visibility=eff_visibility,
+        monitor_owner_id=monitor_owner_id or str(existing["owner_user_id"]),
+        source_kind=eff_source_kind,
+        caller_user_id=caller_user_id,
+        new_owner_user_id=new_owner_user_id,
+        verify_public_authority=verify_public_authority,
+        is_update_flow=is_update_flow and not update_metadata,
+    )
+
+    current_published_seq = max(
+        int(existing["published_seq"] or 0),
+        int(existing.get("last_verified_seq") or 0),
+    )
+    if candidate_seq < current_published_seq:
+        # Stale verification completed after a newer version already promoted.
+        if run_id is not None:
+            await cur.execute(
+                """
+                DELETE FROM dalton_monitor_publish_runs
+                 WHERE monitor_id = %s::uuid AND run_id = %s AND published_seq = 0
+                """,
+                (resolved_monitor_id, run_id),
+            )
+        loaded = await _select_monitor_in_cur(cur, resolved_monitor_id)
+        if loaded is None:
+            raise LookupError(f"Monitor {resolved_monitor_id} not found")
+        return PromotedMonitorResult(
+            monitor=loaded,
+            promoted=False,
+            deduped=False,
+            superseded_by_newer=True,
+        )
+
+    if migrate_entry_path is not None and locked.path != migrate_entry_path:
+        if (
+            existing["source_kind"] != "data_job"
+            or not is_company_system_user(str(existing["owner_user_id"]))
+            or (slug is not None and existing.get("slug") != slug)
+            or str(existing.get("artifact_id") or "") != locked.artifact_id
+            or (migrate_workspace_id is not None and locked.workspace_id != migrate_workspace_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"监控面板 '{slug or resolved_monitor_id}' 不符合遗留数据任务面板自动迁移条件",
+            )
+        if migrate_legacy_entry_path is not None and locked.path != migrate_legacy_entry_path:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"监控面板 '{slug or resolved_monitor_id}' 仍绑定路径 '{locked.path}'，"
+                    f"无法自动迁移到 '{migrate_entry_path}'"
+                ),
+            )
+        try:
+            locked = await artifacts_records_db.rename_artifact_path_in_cur(
+                cur,
+                user_id=workspace_owner_id,
+                artifact_id=locked.artifact_id,
+                workspace_id=locked.workspace_id,
+                new_path=migrate_entry_path,
+            )
+        except artifacts_records_db.ArtifactPathConflict as exc:
+            occupant_hint = (
+                f"（artifact_id={exc.occupant_artifact_id}）"
+                if exc.occupant_artifact_id
+                else ""
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"目标资源路径 '{migrate_entry_path}' 已被另一资源占用"
+                    f"{occupant_hint}，无法自动迁移"
+                ),
+            ) from None
+        if migrate_source_ref is not None and existing.get("source_ref") != migrate_source_ref:
+            await cur.execute(
+                """
+                UPDATE dalton_monitors
+                   SET source_ref = %s,
+                       updated_at = NOW()
+                 WHERE monitor_id = %s::uuid
+                """,
+                (migrate_source_ref, resolved_monitor_id),
+            )
+
+    if update_metadata:
+        await cur.execute(
+            "SELECT user_id FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
+            (resolved_monitor_id,),
+        )
+        old_members = {str(r["user_id"]) for r in await cur.fetchall()}
+        next_members = clean_members if clean_members is not None else sorted(old_members)
+        acl_changed = (
+            existing["visibility"] != eff_visibility
+            or (eff_visibility == "members" and old_members != set(next_members))
+            or (eff_visibility != "members" and bool(old_members))
+        )
+        await cur.execute(
+            """
+            UPDATE dalton_monitors
+               SET owner_user_id = %s,
+                   title = %s,
+                   category = %s,
+                   sort_order = %s,
+                   visibility = %s,
+                   keep_updated = %s,
+                   source_kind = %s,
+                   source_ref = %s,
+                   acl_revision = acl_revision + %s,
+                   updated_at = NOW()
+             WHERE monitor_id = %s::uuid
+            """,
+            (
+                eff_owner,
+                title or str(existing["title"]),
+                category or "other",
+                int(sort_order or 0),
+                eff_visibility,
+                bool(keep_updated),
+                eff_source_kind,
+                source_ref,
+                1 if acl_changed else 0,
+                resolved_monitor_id,
+            ),
+        )
+        await cur.execute(
+            "DELETE FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
+            (resolved_monitor_id,),
+        )
+        if eff_visibility == "members" and next_members:
+            await cur.executemany(
+                """
+                INSERT INTO dalton_monitor_members (monitor_id, user_id)
+                VALUES (%s::uuid, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                [(resolved_monitor_id, mid) for mid in next_members],
+            )
+
+    if candidate_seq > current_published_seq:
+        await cur.execute(
+            """
+            UPDATE dalton_monitors
+               SET published_seq = %s,
+                   last_verified_seq = %s,
+                   last_verified_at = NOW(),
+                   owner_user_id = %s,
+                   last_publish_run_id = COALESCE(%s, last_publish_run_id),
+                   last_publish_error = NULL,
+                   last_publish_failed_at = NULL,
+                   updated_at = NOW()
+             WHERE monitor_id = %s::uuid
+               AND published_seq < %s
+            """,
+            (
+                candidate_seq,
+                candidate_seq,
+                eff_owner,
+                run_id,
+                resolved_monitor_id,
+                candidate_seq,
+            ),
+        )
+        if cur.rowcount != 1:
+            loaded = await _select_monitor_in_cur(cur, resolved_monitor_id)
+            if loaded is None:
+                raise LookupError(f"Monitor {resolved_monitor_id} not found")
+            return PromotedMonitorResult(
+                monitor=loaded,
+                promoted=False,
+                superseded_by_newer=True,
+            )
+    else:
+        # Unchanged seq (candidate_seq == current_published_seq): refresh verified timestamp and clear error.
+        await cur.execute(
+            """
+            UPDATE dalton_monitors
+               SET last_verified_seq = %s,
+                   last_verified_at = NOW(),
+                   owner_user_id = %s,
+                   last_publish_run_id = COALESCE(%s, last_publish_run_id),
+                   last_publish_error = NULL,
+                   last_publish_failed_at = NULL,
+                   updated_at = NOW()
+             WHERE monitor_id = %s::uuid
+            """,
+            (candidate_seq, eff_owner, run_id, resolved_monitor_id),
+        )
+
+    await _record_monitor_version_in_cur(cur, resolved_monitor_id, candidate_seq)
+    if run_id is not None:
+        await cur.execute(
+            """
+            UPDATE dalton_monitor_publish_runs
+               SET published_seq = %s
+             WHERE monitor_id = %s::uuid AND run_id = %s
+            """,
+            (candidate_seq, resolved_monitor_id, run_id),
+        )
+    if eff_visibility == "public":
+        await _sync_share_link_promoted_in_cur(
+            cur,
+            artifact_id=artifact_id,
+            seq=candidate_seq,
+            sorted_paths=sorted_paths,
+            share_public=True,
+        )
+    elif locked.shared:
+        await artifacts_records_db.unshare_in_cur(
+            cur, user_id=workspace_owner_id, artifact_id=artifact_id
+        )
+    await _prune_monitor_versions_in_cur(
+        cur,
+        artifact_id,
+        published_seq=candidate_seq,
+        keep_count=MAX_MONITOR_VERSIONS,
+    )
+    loaded = await _select_monitor_in_cur(cur, resolved_monitor_id)
+    if loaded is None:
+        raise LookupError(f"Monitor {resolved_monitor_id} not found")
+    return PromotedMonitorResult(monitor=loaded, promoted=True)
+
+
+async def promote_verified_monitor_version_tx(
+    *,
+    artifact_id: str,
+    candidate_seq: int,
+    workspace_owner_id: str,
+    paths: Sequence[str],
+    monitor_id: str | None = None,
+    slug: str | None = None,
+    monitor_owner_id: str | None = None,
+    title: str | None = None,
+    category: MonitorCategory | None = None,
+    sort_order: int | None = None,
+    visibility: MonitorVisibility | None = None,
+    keep_updated: bool | None = None,
+    source_kind: MonitorSourceKind = "workspace",
+    source_ref: str | None = None,
+    member_user_ids: Sequence[str] | None = None,
+    run_id: str | None = None,
+    new_owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
+    verify_public_authority: Callable[..., Awaitable[None]] | None = None,
+    check_pending_outbound_confirm: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
+    update_metadata: bool = False,
+    is_update_flow: bool = False,
+    expected_claim_epoch: int | None = None,
+    check_superseded: bool = False,
+    expected_share_revision: int | None = None,
+    expected_share_audience: Any = _UNSET,
+    expected_acl_revision: int | None = None,
+    expected_left_out_files: Collection[str] | None = None,
+    migrate_entry_path: str | None = None,
+    migrate_legacy_entry_path: str | None = None,
+    migrate_source_ref: str | None = None,
+    migrate_workspace_id: str | None = None,
+) -> PromotedMonitorResult:
+    """Stage 3: atomically promote a verified candidate version under all fences AFTER holding the artifact lock:
+
+    0. Acquire ``share_links`` row lock (``lock_owned``) first to serialize concurrent promotes;
+    1. ``claim_epoch`` + in-tx ``superseded`` (``FOR SHARE`` on newer runs) fence on ``dalton_data_task_runs``;
+    2. ``share_links.revision`` / ``audience`` / ``left_out_files`` / ``dalton_monitors.acl_revision`` fence;
+    3. Optional atomic legacy ``index.html`` -> ``<slug>/index.html`` path rename + pointer advance.
+    """
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Acquire artifact lock FIRST so cross-run supersede & left_out checks run under the lock.
+                locked = await artifacts_records_db.lock_owned(
+                    cur, user_id=workspace_owner_id, artifact_id=artifact_id
+                )
+                fence = await _check_data_job_run_fences_in_cur(
+                    cur,
+                    run_id=run_id,
+                    expected_claim_epoch=expected_claim_epoch,
+                    check_superseded=check_superseded,
+                )
+                if fence != "ok":
+                    existing_mon = (
+                        await _select_monitor_in_cur(cur, monitor_id)
+                        if monitor_id is not None
+                        else None
+                    )
+                    return PromotedMonitorResult(
+                        monitor=existing_mon,
+                        promoted=False,
+                        superseded_by_newer=(fence == "superseded"),
+                        fenced_out=(fence == "fenced_out"),
+                        deferred_to_newer=(fence == "deferred"),
+                    )
+                return await _promote_verified_monitor_in_cur(
+                    cur,
+                    artifact_id=artifact_id,
+                    candidate_seq=candidate_seq,
+                    workspace_owner_id=workspace_owner_id,
+                    paths=paths,
+                    locked_artifact=locked,
+                    monitor_id=monitor_id,
+                    slug=slug,
+                    monitor_owner_id=monitor_owner_id,
+                    title=title,
+                    category=category,
+                    sort_order=sort_order,
+                    visibility=visibility,
+                    keep_updated=keep_updated,
+                    source_kind=source_kind,
+                    source_ref=source_ref,
+                    member_user_ids=member_user_ids,
+                    run_id=run_id,
+                    new_owner_user_id=new_owner_user_id,
+                    caller_user_id=caller_user_id,
+                    verify_public_authority=verify_public_authority,
+                    check_pending_outbound_confirm=check_pending_outbound_confirm,
+                    reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+                    update_metadata=update_metadata,
+                    is_update_flow=is_update_flow,
+                    expected_share_revision=expected_share_revision,
+                    expected_share_audience=expected_share_audience,
+                    expected_acl_revision=expected_acl_revision,
+                    expected_left_out_files=expected_left_out_files,
+                    migrate_entry_path=migrate_entry_path,
+                    migrate_legacy_entry_path=migrate_legacy_entry_path,
+                    migrate_source_ref=migrate_source_ref,
+                    migrate_workspace_id=migrate_workspace_id,
+                )
+
+
+async def promote_verified_monitor_batch_tx(
+    items: Sequence[PromoteMonitorItem],
+    *,
+    run_id: str | None = None,
+    expected_claim_epoch: int | None = None,
+    check_superseded: bool = False,
+) -> BatchPromoteResult:
+    """Atomically promote ALL verified panels for an ``all_or_nothing`` batch in ONE transaction.
+
+    Acquires all ``share_links`` artifact locks in sorted ``artifact_id`` order BEFORE checking
+    ``claim_epoch`` / ``superseded`` / ``left_out_files``. If any fence fails or any panel
+    fails/is superseded, the entire transaction rolls back so zero visitor pointers move.
+    """
+    if not items:
+        return BatchPromoteResult(results=[], promoted=True)
+
+    indexed = sorted(enumerate(items), key=lambda pair: (pair[1].artifact_id, pair[0]))
+    try:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    locked_by_idx: dict[int, Any] = {}
+                    for orig_idx, item in indexed:
+                        locked_by_idx[orig_idx] = await artifacts_records_db.lock_owned(
+                            cur,
+                            user_id=item.workspace_owner_id,
+                            artifact_id=item.artifact_id,
+                        )
+                    fence = await _check_data_job_run_fences_in_cur(
+                        cur,
+                        run_id=run_id,
+                        expected_claim_epoch=expected_claim_epoch,
+                        check_superseded=check_superseded,
+                    )
+                    if fence != "ok":
+                        return BatchPromoteResult(
+                            results=[],
+                            promoted=False,
+                            superseded_by_newer=(fence == "superseded"),
+                            fenced_out=(fence == "fenced_out"),
+                            deferred_to_newer=(fence == "deferred"),
+                        )
+
+                    ordered: list[PromotedMonitorResult | None] = [None] * len(items)
+                    for orig_idx, item in indexed:
+                        res = await _promote_verified_monitor_in_cur(
+                            cur,
+                            artifact_id=item.artifact_id,
+                            candidate_seq=item.candidate_seq,
+                            workspace_owner_id=item.workspace_owner_id,
+                            paths=item.paths,
+                            locked_artifact=locked_by_idx[orig_idx],
+                            monitor_id=item.monitor_id,
+                            slug=item.slug,
+                            monitor_owner_id=item.monitor_owner_id,
+                            title=item.title,
+                            category=item.category,
+                            sort_order=item.sort_order,
+                            visibility=item.visibility,
+                            keep_updated=item.keep_updated,
+                            source_kind=item.source_kind,
+                            source_ref=item.source_ref,
+                            member_user_ids=item.member_user_ids,
+                            run_id=run_id,
+                            new_owner_user_id=item.new_owner_user_id,
+                            caller_user_id=item.caller_user_id,
+                            verify_public_authority=item.verify_public_authority,
+                            check_pending_outbound_confirm=item.check_pending_outbound_confirm,
+                            reject_if_pending_outbound_confirm=item.reject_if_pending_outbound_confirm,
+                            update_metadata=item.update_metadata,
+                            is_update_flow=item.is_update_flow,
+                            expected_share_revision=item.expected_share_revision,
+                            expected_share_audience=item.expected_share_audience,
+                            expected_acl_revision=item.expected_acl_revision,
+                            expected_left_out_files=item.expected_left_out_files,
+                            migrate_entry_path=item.migrate_entry_path,
+                            migrate_legacy_entry_path=item.migrate_legacy_entry_path,
+                            migrate_source_ref=item.migrate_source_ref,
+                            migrate_workspace_id=item.migrate_workspace_id,
+                        )
+                        if res.superseded_by_newer:
+                            raise _BatchPromoteSuperseded()
+                        ordered[orig_idx] = res
+                    final_results = [r for r in ordered if r is not None]
+                    return BatchPromoteResult(results=final_results, promoted=True)
+    except _BatchPromoteSuperseded:
+        return BatchPromoteResult(
+            results=[],
+            promoted=False,
+            superseded_by_newer=True,
+        )
+
+
+async def _sync_share_link_promoted_in_cur(
+    cur: Any,
+    *,
+    artifact_id: str,
+    seq: int,
+    sorted_paths: Sequence[str],
+    share_public: bool,
+) -> None:
+    """Atomically advance ``share_links`` visitor fields (``shared_seq``, ``files``, ``shared_at``, ``revision``)."""
+    sets = [
+        "shared_seq = %(seq)s",
+        "files = %(files)s::text[]",
+        "legacy_refused = NULL",
+    ]
+    if share_public:
+        sets += [
+            "shared_at = COALESCE(l.shared_at, NOW())",
+            "revision = l.revision + CASE WHEN l.shared_at IS NULL THEN 1 ELSE 0 END",
+        ]
+    await cur.execute(
+        f"""
+        UPDATE share_links l
+           SET {", ".join(sets)}
+         WHERE l.artifact_id = %(artifact_id)s::uuid
+        """,
+        {
+            "seq": seq,
+            "files": list(sorted_paths),
+            "artifact_id": artifact_id,
+        },
+    )
+
+
 async def _prune_monitor_versions_in_cur(
     cur,
     artifact_id: str,
@@ -1604,6 +3070,12 @@ async def _prune_monitor_versions_in_cur(
         DELETE FROM artifact_versions v
          WHERE v.artifact_id = %(artifact_id)s::uuid
            AND v.seq <> %(published_seq)s
+           AND v.seq <> COALESCE(
+               (SELECT GREATEST(COALESCE(last_verified_seq, 0), COALESCE(published_seq, 0))
+                  FROM dalton_monitors
+                 WHERE artifact_id = %(artifact_id)s::uuid),
+               0
+           )
            AND v.seq <> COALESCE(
                (SELECT latest_seq FROM share_links WHERE artifact_id = %(artifact_id)s::uuid),
                0
@@ -1666,72 +3138,319 @@ def _normalize_utc(ts: datetime) -> datetime:
     return ts.astimezone(UTC)
 
 
+def _row_to_monitor_data_entry(row: dict[str, Any]) -> MonitorDataEntry:
+    return MonitorDataEntry(
+        monitor_id=str(row["monitor_id"]),
+        data_key=str(row["data_key"]),
+        payload=row.get("payload"),
+        as_of=row.get("as_of"),
+        sha256=str(row["sha256"]) if row.get("sha256") is not None else None,
+        updated_at=row["updated_at"],
+        attempt_seq=int(row.get("attempt_seq") or 0),
+        is_stale=bool(row.get("is_stale", False)),
+        last_attempt_at=row.get("last_attempt_at"),
+        last_error=row.get("last_error"),
+    )
+
+
 async def upsert_monitor_data(
     monitor_id: str,
     data_key: str,
-    payload: Any,
+    payload: Any = None,
     *,
     as_of: datetime | None = None,
+    attempt_seq: int | None = None,
+    is_stale: bool = False,
+    error: str | None = None,
+    last_attempt_at: datetime | None = None,
 ) -> MonitorDataEntry:
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    ts = _normalize_utc(as_of) if as_of is not None else datetime.now(UTC)
+    """Dual-axis monitor data upsert: snapshot axis (``as_of``) + collector health axis (``attempt_seq``).
+
+    - Snapshot axis (``payload``, ``as_of``, ``sha256``): evaluated only when ``is_stale`` is False
+      and ``payload is not None``; advances on ``stored.as_of IS NULL`` or ``incoming.as_of > stored.as_of``,
+      accepts idempotent equal ``as_of`` + ``sha256`` (or legacy wall-clock stale payload self-heal),
+      and returns HTTP 409 on backwards ``as_of`` against a fresh snapshot.
+    - Health axis (``attempt_seq``, ``is_stale``, ``last_attempt_at``, ``last_error``): advances
+      strictly monotonically on ``incoming.attempt_seq > stored.attempt_seq``. Out-of-order late
+      packets with smaller/equal ``attempt_seq`` never overwrite newer health state.
+    - Failure reports (``is_stale=True``) leave existing snapshots intact and create a snapshot-less
+      row (``payload=NULL, as_of=NULL, sha256=NULL``) on first boot.
+    """
+    if not is_stale and payload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Fresh monitor data push requires non-null data payload",
+        )
+
+    attempt_ts = _normalize_utc(last_attempt_at) if last_attempt_at is not None else datetime.now(UTC)
+    clean_error = (
+        str(error).strip()[:1000]
+        if error is not None and str(error).strip()
+        else None
+    )
+
+    canonical: str | None = None
+    digest: str | None = None
+    ts: datetime | None = None
+    if not is_stale and payload is not None:
+        canonical = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        ts = _normalize_utc(as_of) if as_of is not None else datetime.now(UTC)
+
+    legacy_payload_stale = (
+        attempt_seq is None
+        and not is_stale
+        and isinstance(payload, dict)
+        and payload.get("stale") is True
+    )
+    eff_initial_stale = bool(is_stale or legacy_payload_stale)
+    initial_attempt_seq = int(attempt_seq) if attempt_seq is not None else 1
+
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                INSERT INTO dalton_monitor_data (
-                    monitor_id, data_key, payload, as_of, sha256, updated_at
-                )
-                VALUES (%s::uuid, %s, %s::jsonb, %s, %s, NOW())
-                ON CONFLICT (monitor_id, data_key) DO UPDATE
-                   SET payload = EXCLUDED.payload,
-                       as_of = EXCLUDED.as_of,
-                       sha256 = EXCLUDED.sha256,
-                       updated_at = NOW()
-                 WHERE EXCLUDED.as_of > dalton_monitor_data.as_of
-                RETURNING monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
-                """,
-                (monitor_id, data_key, canonical, ts, digest),
-            )
-            row = await cur.fetchone()
-            if row is None:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
+                    SELECT monitor_id::text AS monitor_id,
+                           data_key,
+                           payload,
+                           as_of,
+                           sha256,
+                           updated_at,
+                           attempt_seq,
+                           is_stale,
+                           last_attempt_at,
+                           last_error
                       FROM dalton_monitor_data
                      WHERE monitor_id = %s::uuid AND data_key = %s
+                       FOR UPDATE
                     """,
                     (monitor_id, data_key),
                 )
                 existing = await cur.fetchone()
+
                 if existing is None:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Monitor data upsert produced no row",
-                    )
-                existing_as_of = _normalize_utc(existing["as_of"])
-                existing_sha = str(existing["sha256"])
-                if existing_as_of == ts and existing_sha == digest:
-                    # Idempotent replay of the exact same snapshot: keep original updated_at untouched.
-                    row = existing
-                else:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Rejected stale monitor snapshot for {data_key}: "
-                            f"incoming as_of={ts.isoformat()} is not newer than "
-                            f"stored as_of={existing_as_of.isoformat()}"
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_monitor_data (
+                            monitor_id, data_key, payload, as_of, sha256, updated_at,
+                            attempt_seq, is_stale, last_attempt_at, last_error
+                        )
+                        VALUES (%s::uuid, %s, %s::jsonb, %s, %s, NOW(), %s, %s, %s, %s)
+                        ON CONFLICT (monitor_id, data_key) DO NOTHING
+                        RETURNING monitor_id::text AS monitor_id,
+                                  data_key,
+                                  payload,
+                                  as_of,
+                                  sha256,
+                                  updated_at,
+                                  attempt_seq,
+                                  is_stale,
+                                  last_attempt_at,
+                                  last_error
+                        """,
+                        (
+                            monitor_id,
+                            data_key,
+                            canonical,
+                            ts,
+                            digest,
+                            initial_attempt_seq,
+                            eff_initial_stale,
+                            attempt_ts,
+                            clean_error if eff_initial_stale else None,
                         ),
                     )
-    return MonitorDataEntry(
-        monitor_id=str(row["monitor_id"]),
-        data_key=str(row["data_key"]),
-        payload=row["payload"],
-        as_of=row["as_of"],
-        sha256=str(row["sha256"]),
-        updated_at=row["updated_at"],
-    )
+                    inserted = await cur.fetchone()
+                    if inserted is not None:
+                        return _row_to_monitor_data_entry(inserted)
+                    # Concurrent insert won the race; lock and continue to update path.
+                    await cur.execute(
+                        """
+                        SELECT monitor_id::text AS monitor_id,
+                               data_key,
+                               payload,
+                               as_of,
+                               sha256,
+                               updated_at,
+                               attempt_seq,
+                               is_stale,
+                               last_attempt_at,
+                               last_error
+                          FROM dalton_monitor_data
+                         WHERE monitor_id = %s::uuid AND data_key = %s
+                           FOR UPDATE
+                        """,
+                        (monitor_id, data_key),
+                    )
+                    existing = await cur.fetchone()
+                    if existing is None:
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Monitor data upsert produced no row",
+                        )
+
+                stored_payload = existing.get("payload")
+                stored_as_of_raw = existing.get("as_of")
+                stored_as_of = (
+                    _normalize_utc(stored_as_of_raw)
+                    if stored_as_of_raw is not None
+                    else None
+                )
+                stored_sha = (
+                    str(existing["sha256"])
+                    if existing.get("sha256") is not None
+                    else None
+                )
+                stored_attempt_seq = int(existing.get("attempt_seq") or 0)
+                stored_was_legacy_stale = (
+                    isinstance(stored_payload, dict)
+                    and stored_payload.get("stale") is True
+                )
+
+                stored_is_stale = bool(existing.get("is_stale", False))
+                is_identical_healthy_replay = (
+                    attempt_seq is None
+                    and not is_stale
+                    and not stored_is_stale
+                    and ts is not None
+                    and stored_as_of is not None
+                    and ts == stored_as_of
+                    and digest is not None
+                    and stored_sha == digest
+                )
+                incoming_seq = (
+                    int(attempt_seq)
+                    if attempt_seq is not None
+                    else (stored_attempt_seq if is_identical_healthy_replay else stored_attempt_seq + 1)
+                )
+                advance_health = incoming_seq > stored_attempt_seq
+
+                # Evaluate snapshot axis
+                update_snapshot = False
+                if not is_stale and ts is not None and digest is not None:
+                    if stored_as_of is None or ts > stored_as_of:
+                        update_snapshot = True
+                    elif ts == stored_as_of:
+                        if stored_sha == digest:
+                            update_snapshot = False
+                        elif stored_was_legacy_stale or (attempt_seq is not None and advance_health):
+                            update_snapshot = True
+                        else:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    f"Rejected stale monitor snapshot for {data_key}: "
+                                    f"incoming as_of={ts.isoformat()} is not newer than "
+                                    f"stored as_of={stored_as_of.isoformat()}"
+                                ),
+                            )
+                    else:
+                        # ts < stored_as_of: allow one-time self-heal if stored row was legacy wall-clock stale
+                        if stored_was_legacy_stale:
+                            update_snapshot = True
+                        else:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    f"Rejected stale monitor snapshot for {data_key}: "
+                                    f"incoming as_of={ts.isoformat()} is not newer than "
+                                    f"stored as_of={stored_as_of.isoformat()}"
+                                ),
+                            )
+
+                if not update_snapshot and not advance_health:
+                    return _row_to_monitor_data_entry(existing)
+
+                next_attempt_seq = incoming_seq if advance_health else stored_attempt_seq
+                next_is_stale = (
+                    eff_initial_stale
+                    if advance_health
+                    else bool(existing.get("is_stale", False))
+                )
+                next_last_attempt_at = (
+                    attempt_ts if advance_health else existing.get("last_attempt_at")
+                )
+                next_last_error = (
+                    (clean_error if next_is_stale else None)
+                    if advance_health
+                    else existing.get("last_error")
+                )
+
+                if update_snapshot:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_monitor_data
+                           SET payload = %s::jsonb,
+                               as_of = %s,
+                               sha256 = %s,
+                               attempt_seq = %s,
+                               is_stale = %s,
+                               last_attempt_at = %s,
+                               last_error = %s,
+                               updated_at = NOW()
+                         WHERE monitor_id = %s::uuid AND data_key = %s
+                        RETURNING monitor_id::text AS monitor_id,
+                                  data_key,
+                                  payload,
+                                  as_of,
+                                  sha256,
+                                  updated_at,
+                                  attempt_seq,
+                                  is_stale,
+                                  last_attempt_at,
+                                  last_error
+                        """,
+                        (
+                            canonical,
+                            ts,
+                            digest,
+                            next_attempt_seq,
+                            next_is_stale,
+                            next_last_attempt_at,
+                            next_last_error,
+                            monitor_id,
+                            data_key,
+                        ),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_monitor_data
+                           SET attempt_seq = %s,
+                               is_stale = %s,
+                               last_attempt_at = %s,
+                               last_error = %s,
+                               updated_at = NOW()
+                         WHERE monitor_id = %s::uuid AND data_key = %s
+                        RETURNING monitor_id::text AS monitor_id,
+                                  data_key,
+                                  payload,
+                                  as_of,
+                                  sha256,
+                                  updated_at,
+                                  attempt_seq,
+                                  is_stale,
+                                  last_attempt_at,
+                                  last_error
+                        """,
+                        (
+                            next_attempt_seq,
+                            next_is_stale,
+                            next_last_attempt_at,
+                            next_last_error,
+                            monitor_id,
+                            data_key,
+                        ),
+                    )
+                updated = await cur.fetchone()
+                if updated is None:
+                    raise HTTPException(
+                        status_code=500, detail="Monitor data update produced no row"
+                    )
+                return _row_to_monitor_data_entry(updated)
 
 
 async def get_monitor_data(monitor_id: str, data_key: str) -> MonitorDataEntry | None:
@@ -1739,7 +3458,16 @@ async def get_monitor_data(monitor_id: str, data_key: str) -> MonitorDataEntry |
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
+                SELECT monitor_id::text AS monitor_id,
+                       data_key,
+                       payload,
+                       as_of,
+                       sha256,
+                       updated_at,
+                       attempt_seq,
+                       is_stale,
+                       last_attempt_at,
+                       last_error
                   FROM dalton_monitor_data
                  WHERE monitor_id = %s::uuid AND data_key = %s
                 """,
@@ -1748,14 +3476,7 @@ async def get_monitor_data(monitor_id: str, data_key: str) -> MonitorDataEntry |
             row = await cur.fetchone()
     if row is None:
         return None
-    return MonitorDataEntry(
-        monitor_id=str(row["monitor_id"]),
-        data_key=str(row["data_key"]),
-        payload=row["payload"],
-        as_of=row["as_of"],
-        sha256=str(row["sha256"]),
-        updated_at=row["updated_at"],
-    )
+    return _row_to_monitor_data_entry(row)
 
 
 async def list_company_members() -> list[CompanyMember]:

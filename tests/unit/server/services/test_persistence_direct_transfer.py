@@ -193,7 +193,9 @@ async def test_store_rejection_withholds_the_row_and_counts_an_error(db):
     db["scan"].return_value = _scan(_entry("a.txt", A), _entry("b.txt", B))
     db["push"].return_value = {A: {"status": "failed", "http": 403}, B: {"status": "changed", "http": 400}}
 
-    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+    # DALTON-HOOK(workspace-file-write-mode): pin fallback budget to 0 to exercise upstream store-rejection path
+    with patch("src.dalton.wsfiles_write_mode.UPLOAD_FALLBACK_BUDGET_BYTES", 0):
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["store"].assert_not_awaited()  # no relay after a rejection
     db["upsert"].assert_not_awaited()

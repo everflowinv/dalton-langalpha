@@ -773,7 +773,7 @@ Guidepoint 只返回摘录，没有全文，也没有翻页游标。`ok: false` 
 
 写「本周结论」之前先回答这六件，答案融进正文：有没有此前没有的变现方式；有没有公司第一次披露 AI 分项；上期拐点观察本期被验证还是被证伪；有没有公司口径发生变化；有没有反向证据说明 AI 在侵蚀原有收入；下周哪些财报和发布会会给出新数字。
 
-正文最前面 3 句以内给出本周判断。每条先写发生了什么，再写为什么重要，最后写证据与限制。数字紧跟口径、证据等级、来源和日期。关键数字至少两个独立来源交叉验证，优先公司侧一手来源。演示标「演示级证据」，订单标「订单，尚非收入」，累计数标「累计口径」。未披露写「未披露」，不推算。不用「大幅增长」「显著提升」。不用 Markdown 表格。事实与判断分开。没有高质量增量时报告可以很短。
+正文最前面 3 句以内给出本周判断。每条先写发生了什么，再写为什么重要，最后写证据与限制。数字紧跟口径、证据等级、来源和日期。正文与摘要中的数字、股票代码、期间直接写成普通文本，反引号仅用于路径、命令和字段名（写法见 dalton-conventions 技能的 `references/writing.md` §5）。关键数字至少两个独立来源交叉验证，优先公司侧一手来源。演示标「演示级证据」，订单标「订单，尚非收入」，累计数标「累计口径」。未披露写「未披露」，不推算。不用「大幅增长」「显著提升」。不用 Markdown 表格。事实与判断分开。没有高质量增量时报告可以很短。
 
 全量回填与覆盖池维护见 `.agents/skills/dalton-ai-app-weekly-monitor/references/backfill-protocol.md` 和 `.agents/skills/dalton-ai-app-weekly-monitor/references/universe-maintenance.md`。窗口是 2025Q1 至最近一个已经过了 45 天的完整季度。
 
@@ -6910,7 +6910,7 @@ X 帖子只读数据包里已采集的「X 帖子」一节。
 写法：
 
 - 中文。链接用 `[文字](url)`。不用表格，不用图片。
-- 数字区间写「至」。金额写「美元」「亿美元」，不用 `$`。股票代码直接写本公司 ticker。
+- 数字区间写「至」。金额写「美元」「亿美元」，不用 `$`。数字、股票代码与期间直接写成普通文本（见 dalton-conventions 技能的 `references/writing.md` §5），股票代码直接写本公司 ticker。
 - 「来源」一栏由构造程序显示成灰色小字。
 - 卡片读者看不到工作底稿。每条多空分歧（Debate）在卡片里第一次出现时写成 `D1（用一句话说这条分歧在争什么）`，之后可以只写编号。多空写「看多」「看空」。漏写括号时，构造程序用工作底稿里 `### D1 标题` 这种标题补上第一次出现，已有括号的不重复补，链接里的编号不补。
 - 标题、副标题和公司标签由构造程序生成。`card.md` 不写这些，也不写接收方。
@@ -7541,7 +7541,7 @@ python3 .agents/skills/dalton-china-consumer-weekly/scripts/china_consumer_weekl
 
 成稿补扫周日 08:00 采集之后的公告：`finance(route="cn-hk", operation="filings", ticker=..., start=采集时刻, end=成稿时刻)`。命中的用 `add-note` 入库。
 
-卡片按 `templates/weekly-card.md` 写到 `temp/china-consumer-weekly/<friday>-card.md`。全文按 `templates/weekly-report.md` 写到 `temp/china-consumer-weekly/<friday>.md`。卡片最后一节是待验证。不用 Markdown 表格，正文不出现 `$`。
+卡片按 `templates/weekly-card.md` 写到 `temp/china-consumer-weekly/<friday>-card.md`。全文按 `templates/weekly-report.md` 写到 `temp/china-consumer-weekly/<friday>.md`。卡片最后一节是待验证。不用 Markdown 表格，正文不出现 `$`。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 ```bash
 python3 .agents/skills/dalton-china-consumer-weekly/scripts/china_consumer_weekly.py \
@@ -10232,7 +10232,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 每次会向 PM 推送的运行（`earnings_tm3`、`earnings_t0`、`earnings_tp1`、需推送的 price_move（verdict 非 NO_CHANGE 或赔率发生实质变化）、`director_weekly`、`earnings_calendar`），在结束与调用 `dalton_check_done` 前必须执行推送稿两轮语言审查：
 
-1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织（通知卡片无 `## 附注`；取数失败或数据缺口在 `## 来源` 节写成一句人话，如“本轮未取得专家访谈：连接超时”，不写工具报错原文；`## 来源` 每行先写可读来源说明，文档编号可放在行末），**`## 结论` 段必须放在最前**（卡片空间受限时只取首段），且推送正文遵守 `references/writing.md` §2「正文给人读」（不写知识层编号、枚举值、字段名、函数/脚本/工具名、文件路径或工具报错原文）。`price_move`（`dalton-stock-move`）把论点结论（`verdict`）和当前价格下的赔率（`payoff_assessment`）分开记：只要论点变了（`verdict` 不是 `NO_CHANGE`）或当前价格下的赔率发生实质变化（`payoff_assessment.changed` 为 `true`），都要写推送稿、跑两轮语言审查并向 PM 推送；仅当 `verdict` 为 `NO_CHANGE` 且 `payoff_assessment.changed` 为 `false`（含赔率未变，或 `comparable: false` 尚未评估）时，才不推送、不写推送稿、不跑语言审查。
+1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织（通知卡片无 `## 附注`；取数失败或数据缺口在 `## 来源` 节写成一句人话，如“本轮未取得专家访谈：连接超时”，不写工具报错原文；`## 来源` 每行先写可读来源说明，文档编号可放在行末），**`## 结论` 段必须放在最前**（卡片空间受限时只取首段），且推送正文遵守 `references/writing.md` §2「正文给人读」与 §5「数字、比例、区间与货币符号规范」（不写知识层编号、枚举值、字段名、函数/脚本/工具名、文件路径或工具报错原文；数字、股票代码与期间直接写成普通文本）。`price_move`（`dalton-stock-move`）把论点结论（`verdict`）和当前价格下的赔率（`payoff_assessment`）分开记：只要论点变了（`verdict` 不是 `NO_CHANGE`）或当前价格下的赔率发生实质变化（`payoff_assessment.changed` 为 `true`），都要写推送稿、跑两轮语言审查并向 PM 推送；仅当 `verdict` 为 `NO_CHANGE` 且 `payoff_assessment.changed` 为 `false`（含赔率未变，或 `comparable: false` 尚未评估）时，才不推送、不写推送稿、不跑语言审查。
 2. **两轮语言审查后原样回复**：对本轮写入的推送稿依次调用 `check_language(draft_path=..., round=1)`、按 `.language.md` 清单修改、再调用 `check_language(draft_path=..., round=2)`（若第 2 轮后仍有改动，再跑一次 `round=2` 使记录绑定终稿哈希）；**最后一条回复的正文必须与定稿后的推送稿文件内容逐字相同**。`dalton_check_done` 会检查推送稿是本轮写的、且审完两轮语言审查。
 3. **同一文件"写入 → 审查 → 提交"必须串行**：不要把对同一文件的 `Write`/`Edit` 与 `check_language` / `check_draft` 放在同一批并行调用里。审查读到的必须是落盘后的内容；同一文件（含 `.agents/user/automations/*.json`）也不要两路并行编辑——先写完、再审查、按审查结果改、最后提交，每一步等上一步的返回。
 
@@ -11210,9 +11210,11 @@ Dalton 是基本面长仓导向（fundamental long-biased）基金。下表的�
 1. **"相当于" vs "占"**：
    - 当分子并非分母的子集时（例如比较资产负债表项与利润表项，或资本开支与净利润），必须写 **"Capex 相当于净利润的 x%"** 或 **"净现金相当于市值的 x%"**，**严禁写成"Capex 占净利润的 x%"**（只有部分属于整体时才能写"占"，如"广告收入占总收入的 98%"）。
 2. **区间连接符**：
-   - 数字区间统一写 **"至"** 或 **"–"**（如 `15% 至 18%`、`120 亿至 130 亿美元`），**严禁使用波浪号 `~`**（易与约等于号混淆，且在 Markdown 中易触发删除线渲染错误）。
+   - 数字区间统一写 **"至"** 或 **"–"**（如 15% 至 18%、120 亿至 130 亿美元），**严禁使用波浪号 `~`**（易与约等于号混淆，且在 Markdown 中易触发删除线渲染错误）。
 3. **货币金额写法（禁用 `$` 符号）**：
-   - 正文与表格说明中的美元金额统一写 **`USD`** 或 **`美元`**（如 `USD 45.2B`、`452 亿美元`、`每股 18.5 美元`），**严禁使用 `$` 符号**（避免 Markdown 渲染器将同行的两个 `$` 之间内容误解析为 LaTeX 数学公式导致排版错乱）。
+   - 正文与表格说明中的美元金额统一写 **USD** 或 **美元**（如 USD 45.2B、452 亿美元、每股 18.5 美元），**严禁使用 `$` 符号**（避免 Markdown 渲染器将同行的两个 `$` 之间内容误解析为 LaTeX 数学公式导致排版错乱）。
+4. **普通文本写法（飞书卡片与正文）**：
+   - 正文与飞书卡片中的数字、金额、百分比、倍数、区间、股票代码和期间直接写成普通文本（如 16,956.0、+46.7%、3.2x、ANT、0700.HK、2026Q3），反引号仅用于路径、命令和代码字段，让飞书卡片保持清爽排版。
 
 ---
 
@@ -11630,7 +11632,7 @@ python3 .agents/skills/dalton-daily-filing-alert/scripts/buyback_parse.py --text
   - 按扫描记录逐家公司确定更正关系：同公司扫描记录（`buyback_results` 或 `results`）里有标题含「更正」「修訂/修订」「補充/补充」、正文「狀態：更正」或 `is_amendment: true` 的公告（即使该更正公告确认为无回购的翌日披露），无论 `payload` 是否保留更正条目，`render-card` 均会移除同公司被更正的原回购公告，按剩余条目重建摘要，并将过滤掉的原公告写入返回的 `day_errors`。解析失败缺口同样写进最终回复的缺口说明。
   - **渲染输出前去数字保护**：若公司在扫描记录中有任何翌日披露或回购公告（不论是否确认回购），或 `payload` 任意条目的 `tag`/`title`/`text`（或 `summary`）含回购关键词，则该公司判定为涉及翌日披露/回购的公司，**这类公司的模型文字不会显示数字**。输出前该公司所有来自模型的显示字段（条目 `text`/`title`/`tag`/`date`、公司 `name`、`summary`）里的**任何数字字符**（阿拉伯数字、全角数字、中文数字大小写与异体「〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億兩貳參叄貮陸」等）一律删除，**且除显示文字外，模型提供的所有数值/金额/数量/币种字段（`amount_usd`、`total_amount`、`total_amount_raw`、`shares`、`price`、`currency` 等）一律清除**；导语、合计、排序只用代码生成的已校验数据；仅保留脚本根据已校验扫描结果生成的字段与句子中的数字，条目日期用扫描记录日期（无扫描日期时留空），公司名用名单；`lead` 与 `footer` 按上文规则由脚本生成。
   - 公告类型/标签为「增持」（非回购类型）时，`item[].tag` 设为 `「增持」`（或 `A股公告` / `港股公告`），即使条目带 `total_amount` 也不按回购处理；`summary` 首句点明增持；减持类公告保持减持描述与 `「权益变动」` / 原公告标签。没有扫描记录的普通条目只要正文或标题出现回购关键词（不用「未回购」等否定短语整体排除），即按未核对回购处理。
-  - 其余非回购 A 股 `text` 优先用 `digest`，没有则用 `body_excerpt`，再没有才用标题；其余港股按 `title` 和 `type` 写一句 `text`，数字和日期以标题为准，省略标题未列出的金额。`summary` 只写正文或标题里已经出现的增持、业绩或股份变动。
+  - 其余非回购 A 股 `text` 优先用 `digest`，没有则用 `body_excerpt`，再没有才用标题；其余港股按 `title` 和 `type` 写一句 `text`，数字和日期以标题为准，省略标题未列出的金额。`summary` 只写正文或标题里已经出现的增持、业绩或股份变动。正文里的数字、股票代码与期间直接写成普通文本，格式见 dalton-conventions 技能的 `references/writing.md` §5 第 4 条。
 - 卡片上省略警告。抓取超时、接口报错、返回条数达到 `limit`、CIK 不唯一或回购 PDF 解析失败都留到最终回复的缺口说明。
 - 窗口内没有新动态时，两个 section 的 `companies` 用空数组，`stats` 照常填。仍要提交这张灰色卡片，`material`（实质内容标记，保持为 yes 以确认卡片有效提交）用 `yes`。
 
@@ -15383,7 +15385,7 @@ python3 .agents/skills/dalton-global-consumer-weekly/scripts/global_consumer_wee
 
 补扫采集之后的增量：`jp-disclosures --days 1`。不传 `--as-of`，截止日期是香港时间当天，不折成周五。美股 8-K。命中的用 `add-note` 入库。行情命令仍传周五。
 
-卡片八节按 `templates/card.md`，顺序固定，最后一节是待验证，不设细分指数节。全文按 `templates/full-report.md`。专家、成本和观察写不出时分别写「本周无相关新增访谈」「本周大宗成本无显著变动」「本期无降级事项」。正文不出现 `$`，不用 Markdown 表格。
+卡片八节按 `templates/card.md`，顺序固定，最后一节是待验证，不设细分指数节。全文按 `templates/full-report.md`。专家、成本和观察写不出时分别写「本周无相关新增访谈」「本周大宗成本无显著变动」「本期无降级事项」。正文不出现 `$`，不用 Markdown 表格。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 ```bash
 python3 .agents/skills/dalton-global-consumer-weekly/scripts/global_consumer_weekly.py \
@@ -17746,7 +17748,7 @@ Reddit 当前没有对应数据工具。名单只作来源记录，不要用代�
 
 ## 8. 成稿、校验、发送
 
-按模板写 `temp/humanoid-robot-weekly/<report_date>.md`。标题用 `🤖 人形机器人行业周报 — <report_date>`。副标题写监控窗口，日期用「至」。没有内容的栏目仍留模板里的那句空栏说明。新稿的模型栏目标题用 `## 🧠 模型与控制`。不用 Markdown 表格。公司演示写「演示级证据」。订单写「订单，尚非部署」。部署写「已运行」。每个数字紧跟来源和日期。
+按模板写 `temp/humanoid-robot-weekly/<report_date>.md`。标题用 `🤖 人形机器人行业周报 — <report_date>`。副标题写监控窗口，日期用「至」。没有内容的栏目仍留模板里的那句空栏说明。新稿的模型栏目标题用 `## 🧠 模型与控制`。不用 Markdown 表格。公司演示写「演示级证据」。订单写「订单，尚非部署」。部署写「已运行」。每个数字紧跟来源和日期。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 `report_run_id` 用 `humanoid-robot-weekly-<report_date>`。
 
@@ -23896,7 +23898,7 @@ python3 .agents/skills/dalton-tob-industry-weekly/scripts/tob_industry_weekly.py
   --file temp/tob-industry-weekly/<friday>.md --profile report
 ```
 
-`vague_phrase`、`missing_section`、`feishu_latex_risk`、`caliber_label`、`card_too_long` 清零才提交。`number_without_period` 是提醒。卡片上限 10000 字。不用 Markdown 表格，正文不出现 `$`。
+`vague_phrase`、`missing_section`、`feishu_latex_risk`、`caliber_label`、`card_too_long` 清零才提交。`number_without_period` 是提醒。卡片上限 10000 字。不用 Markdown 表格，正文不出现 `$`。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 三组口径必须标清：指引和实际分开；营收、ARR、cRPO 不混用；beat/miss 写明对比的是市场共识还是公司指引。卖方修正那行要出现「盈利预测」或「目标价」。公司改指引时写明「指引」并给新旧区间。
 
@@ -25931,7 +25933,7 @@ web_search(
 
 ## 5. 写周报并提交卡片
 
-先把正文写到 `temp/us-weekly-movers/<week_end>-delivery.md`。不用 Markdown 表格，不用 `#` 标题。金额写「美元」。区间写「至」。跌幅用 Unicode 减号 `−`。主题之间空一行。编号用 ①②③，不用 `1.`。每个主题一个加粗标题行（主题名、中位涨跌幅、只数和最多 4 个代码），下面两条 bullet，分别是「催化」和「判断」，各一句。
+先把正文写到 `temp/us-weekly-movers/<week_end>-delivery.md`。不用 Markdown 表格，不用 `#` 标题。金额写「美元」。区间写「至」。跌幅用 Unicode 减号 `−`。主题之间空一行。编号用 ①②③，不用 `1.`。每个主题一个加粗标题行（主题名、中位涨跌幅、只数和最多 4 个代码），下面两条 bullet，分别是「催化」和「判断」，各一句。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 ```
 📈 **美股周涨跌幅共性｜<week_start> 至 <week_end>**
@@ -26283,7 +26285,7 @@ feishu_create_doc(title="VIP 采访记录 — <summary_date>", markdown=TRANSCRI
 
 ## 5. 卡片
 
-卡片由脚本渲染。不要手写卡片 Markdown，也不要在人物栏目里使用三级或四级标题。
+卡片由脚本渲染。不要手写卡片 Markdown，也不要在人物栏目里使用三级或四级标题。摘要与要点里的数字、股票代码与期间直接写成普通文本，格式见 dalton-conventions 技能的 `references/writing.md` §5 第 4 条。
 
 ```bash
 python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
@@ -27088,7 +27090,7 @@ python3 .agents/skills/dalton-x-accounts-daily/scripts/x_accounts_daily.py \
 
 ## 5. 摘要和 Markdown
 
-每条帖用一句中文概括，保留关键数字、公司或产品名、时间点和方向。不要把不同帖合并成一条。英文只在术语或原句必要时留短语。摘要不要自己写链接。
+每条帖用一句中文概括，保留关键数字、公司或产品名、时间点和方向。不要把不同帖合并成一条。英文只在术语或原句必要时留短语。摘要不要自己写链接。数字、股票代码与期间直接写成普通文本，格式见 dalton-conventions 技能的 `references/writing.md` §5 第 4 条。
 
 把摘要写到 `temp/x-accounts-daily/<summary_date>/summaries.json`，键是推文 ID（`status id`）：
 

@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.dalton.llm.providers.antigravity.client import (
     _CALL_SIGNATURES_KEY,
+    _SIGNATURE_FAMILY_KEY,
     _SKIP_SIGNATURE,
     _THOUGHT_SIGNATURES_KEY,
     ChatAntigravity,
@@ -34,7 +35,10 @@ def _flat_parts(contents):
     return [p for c in contents for p in c["parts"]]
 
 
-def _history(extra):
+def _history(extra, *, family: str | None = "gemini"):
+    kwargs = dict(extra)
+    if family is not None and kwargs and _SIGNATURE_FAMILY_KEY not in kwargs:
+        kwargs[_SIGNATURE_FAMILY_KEY] = family
     return [
         HumanMessage(content="go"),
         AIMessage(
@@ -43,7 +47,7 @@ def _history(extra):
                 {"name": "a", "args": {}, "id": "c1"},
                 {"name": "b", "args": {}, "id": "c2"},
             ],
-            additional_kwargs=extra,
+            additional_kwargs=kwargs,
         ),
         ToolMessage(content="1", tool_call_id="c1"),
         ToolMessage(content="2", tool_call_id="c2"),
@@ -92,7 +96,11 @@ def test_an_unmapped_list_is_not_matched_to_calls_on_gemini():
 
 
 def test_claude_keeps_the_previous_replay():
-    _, contents = _messages_to_gemini(_history({_THOUGHT_SIGNATURES_KEY: ["s1"]}), gemini_target=False)
+    _, contents = _messages_to_gemini(
+        _history({_THOUGHT_SIGNATURES_KEY: ["s1"]}, family="claude"),
+        gemini_target=False,
+        target_model="claude-sonnet-5-5-medium",
+    )
     calls = _calls(contents)
     assert calls[0]["thoughtSignature"] == "s1"
     assert "thoughtSignature" not in calls[1]
@@ -187,8 +195,9 @@ def test_gemini_keeps_the_stand_in_when_the_first_call_is_mapped():
 
 def test_a_non_gemini_target_never_takes_the_first_call_rule():
     _, contents = _messages_to_gemini(
-        _history({_THOUGHT_SIGNATURES_KEY: ["sig-text"], _CALL_SIGNATURES_KEY: {}}),
+        _history({_THOUGHT_SIGNATURES_KEY: ["sig-text"], _CALL_SIGNATURES_KEY: {}}, family="claude"),
         gemini_target=False,
+        target_model="claude-sonnet-5-5-medium",
     )
     assert all("thoughtSignature" not in c for c in _calls(contents))
     assert any(set(p) == {"thoughtSignature"} for p in _flat_parts(contents))

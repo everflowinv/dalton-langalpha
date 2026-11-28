@@ -188,6 +188,7 @@ export interface I1RegisterAndResolveResponse {
   workspace_owner_id?: string | null;
   external_thread_id: string | null;
   generation: number;
+  strict_deliverable_text_enabled?: boolean;
   fallback_pending: boolean;
   sent_to_current_count: number;
   uploaded_attachments: UploadedAttachmentRecord[];
@@ -459,6 +460,8 @@ export interface I6AuthorizeAndClaimRequest {
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: DeliveryActivityOrigin | null;
+  retry_dedup_by_target?: boolean;
+  payload_digest?: string | null;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -756,6 +759,14 @@ export interface I7InboundProgressRequest {
   };
 }
 
+export interface UnresolvedCurrentAgentSend {
+  delivery_key: string;
+  delivered_text?: string | null;
+  unresolved_image_paths?: string[];
+  source_message_id?: string | null;
+  captured_images?: Record<string, string> | null;
+}
+
 export interface I7InboundProgressResponse {
   ok: boolean;
   run_id: string | null;
@@ -763,7 +774,15 @@ export interface I7InboundProgressResponse {
   has_unknown_current_text: boolean;
   has_in_flight_or_unknown_current_text: boolean;
   sent_to_current_count: number;
+  has_delivered_current_agent_send?: boolean;
+  has_delivered_current_files_only?: boolean;
+  has_failed_current_agent_send?: boolean;
+  has_unresolved_current_agent_send_images?: boolean;
+  unresolved_current_agent_sends?: UnresolvedCurrentAgentSend[];
+  resolved_run_images?: Record<string, string>;
+  resolved_run_images_by_message?: Record<string, Record<string, string>>;
   session_is_current_for_interrupt?: boolean | null;
+  strict_deliverable_text_enabled?: boolean;
 }
 
 export interface I7SteersReconcileRequest {
@@ -879,10 +898,12 @@ export interface RecoverAutomationRunRow {
     | null;
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
+  strict_deliverable_text_enabled?: boolean;
 }
 
 export interface I7RecoverResponse {
   mode: "startup" | "watch_reconnect";
+  strict_deliverable_text_enabled?: boolean;
   inbound_events?: RecoverInboundEventRow[];
   background_runs: RecoverBackgroundRunRow[];
   thread_watches: RecoverThreadWatchRow[];
@@ -925,6 +946,7 @@ export interface I8AutomationRunFinishResponse {
   finish_status: string | null;
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
+  strict_deliverable_text_enabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------

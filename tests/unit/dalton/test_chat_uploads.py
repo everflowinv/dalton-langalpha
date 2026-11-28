@@ -1026,8 +1026,9 @@ def test_storage_key_isolation_never_touches_asr_prefix() -> None:
     ws_id = str(uuid.uuid4())
     up_id = str(uuid.uuid4())
     key = chat_upload_storage.build_chat_upload_key(ws_id, up_id, "deck.pdf")
-    assert key == f"chat-uploads/{ws_id}/{up_id}/deck.pdf"
+    assert key == f"private-media/chat-uploads/{ws_id}/{up_id}/deck.pdf"
     assert chat_upload_storage.is_chat_upload_key(key) is True
+    assert chat_upload_storage.is_chat_upload_key(f"chat-uploads/{ws_id}/{up_id}/deck.pdf") is True
 
     # ASR transcription keys and upstream uploads/ keys must be rejected unconditionally
     asr_key = f"transcriptions/{ws_id}/{up_id}/recording.wav"
@@ -1160,7 +1161,7 @@ async def test_part_actual_byte_count_and_checksum_enforcement(upload_env) -> No
             expected_part_sha256="0" * 64,
         )
     assert sha_exc.value.status_code == 400
-    assert upload_env["store"].open_uploads[(f"chat-uploads/{ws_id}/{uid}/dataset.parquet", "mp-1")] == {}
+    assert upload_env["store"].open_uploads[(f"private-media/chat-uploads/{ws_id}/{uid}/dataset.parquet", "mp-1")] == {}
 
 
 @pytest.mark.asyncio

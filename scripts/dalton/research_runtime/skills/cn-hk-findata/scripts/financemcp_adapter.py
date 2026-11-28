@@ -7,10 +7,12 @@ import argparse
 import datetime as dt
 import inspect
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -1275,9 +1277,9 @@ def run_ask_akshare(question: str, max_rows: int = 50):
 # ---------------------------------------------------------------------------
 # Legacy / financials
 # ---------------------------------------------------------------------------
-def run_legacy(python_bin: str, legacy_script: str, argv_for_legacy):
+def run_legacy(python_bin: str, legacy_script: str, argv_for_legacy, timeout: float | None = None):
     cmd = [python_bin, legacy_script] + argv_for_legacy
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError((p.stderr or p.stdout or "legacy script failed").strip())
     out = p.stdout.strip()
@@ -1287,6 +1289,17 @@ def run_legacy(python_bin: str, legacy_script: str, argv_for_legacy):
         return json.loads(out)
     except Exception:
         raise RuntimeError(f"legacy script returned non-json: {out[:300]}")
+
+
+def _resolve_legacy_timeout(args) -> float | None:
+    deadline_at = getattr(args, "deadline_at", None)
+    if deadline_at is not None and math.isfinite(float(deadline_at)) and float(deadline_at) > 0:
+        rem_s = max(0.0, float(deadline_at) - time.time())
+        return rem_s + 3.5
+    deadline_s = getattr(args, "deadline_s", None)
+    if deadline_s is not None and math.isfinite(float(deadline_s)) and float(deadline_s) > 0:
+        return float(deadline_s) + 3.5
+    return None
 
 
 def build_financials_from_akshare(args):
@@ -1396,9 +1409,11 @@ def main():
                         help="Market hint for fallback commands")
     parser.add_argument("--days", type=int, default=120, help="History lookback days")
     # passthrough flags for legacy compat
-    for flag in ["--limit", "--max-pages", "--date-from", "--date-to", "--max-chars", "--window", "--max-matches",
+    for flag in ["--limit", "--max-pages", "--start-page", "--date-from", "--date-to", "--max-chars", "--window", "--max-matches",
                  "--facts-limit", "--report-index", "--read-report-index", "--extract-financials-index"]:
-        parser.add_argument(flag, type=int if "index" in flag or "limit" in flag or "pages" in flag or "chars" in flag or "window" in flag or "matches" in flag else str, default=None)
+        parser.add_argument(flag, type=int if "index" in flag or "limit" in flag or "page" in flag or "chars" in flag or "window" in flag or "matches" in flag else str, default=None)
+    parser.add_argument("--deadline-at", type=float, default=None)
+    parser.add_argument("--deadline-s", type=float, default=None)
     for flag in ["--search-text", "--facts-metric", "--report-keyword", "--read-report-keyword",
                  "--extract-financials-keyword", "--ocr-fallback"]:
         parser.add_argument(flag, type=str, default=None)
@@ -1445,7 +1460,7 @@ def main():
             return
         if args.backend == "legacy":
             argv = [a for a in sys.argv[1:] if a not in ("--backend", "legacy", "akshare", "financemcp")]
-            payload = run_legacy(python_bin, legacy_script, argv)
+            payload = run_legacy(python_bin, legacy_script, argv, timeout=_resolve_legacy_timeout(args))
             if isinstance(payload, dict):
                 payload.setdefault("backend", "legacy")
             emit(payload)
@@ -1466,7 +1481,7 @@ def main():
                 return
         # fallback
         argv = [a for a in sys.argv[1:] if a not in ("--backend", "legacy", "akshare", "financemcp")]
-        payload = run_legacy(python_bin, legacy_script, argv)
+        payload = run_legacy(python_bin, legacy_script, argv, timeout=_resolve_legacy_timeout(args))
         if isinstance(payload, dict):
             payload["backend"] = "legacy-fallback"
         emit(payload)

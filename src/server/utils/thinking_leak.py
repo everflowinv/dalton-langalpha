@@ -342,6 +342,12 @@ class ThinkingLeakGate:
         """Text is held and has not been shown yet."""
         return bool(self._buf.get(message_id)) or bool(self._parts.get(message_id))
 
+    def reset(self, message_id: str) -> None:
+        """Clear opening-classification state for ``message_id`` (e.g. on phase switch)."""
+        self._buf.pop(message_id, None)
+        self._parts.pop(message_id, None)
+        self._mode.pop(message_id, None)
+
     def _pending_ids(self) -> list[str]:
         ids: list[str] = []
         seen: set[str] = set()

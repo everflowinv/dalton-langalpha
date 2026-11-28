@@ -101,6 +101,7 @@ ALLOWED_HOOKS=(
   "reviewer-contract"
   "workflow-as-of-default"
   "workflow-subject-kind"
+  "workflow-discovered-tools"
   "subagent-model-pin"
   "html-md-canonical"
   # One user-visible-text rule in the main agent's output guidelines and in
@@ -560,6 +561,7 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+<<<<<<< HEAD
   # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
   # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
   "xlsx-preserve-calcpr"
@@ -570,6 +572,30 @@ ALLOWED_HOOKS=(
   # Modeling v2 P0-b: per-workspace exclusive modeling lock at RunWorkflow / WorkflowDriver
   # entry for company-model, earnings-deep-update (with model_path), and full-coverage.
   "modeling-lock"
+=======
+  # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
+  # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
+  "share-redaction"
+  # HF2: surface-aware safety-refusal exhaustion notice delegated to
+  # src/dalton/middleware/refusal_fallback.py (empty_call_retry.py).
+  "refusal-handling"
+  # workspace-file-storage (Batch 1)
+  "company-system-blob-key"
+  "backfill-readback-verify"
+  "workspace-file-streaming"
+  "workspace-file-write-mode"
+  "workspace-file-exclusions"
+  "workspace-file-download-ticket"
+  # Prod Audit 2 Batch 1 (§4): Redis write-timeout diagnostics (InstrumentedAsyncConnection,
+  # per-worker client windows, dedicated PG advisory-lock leader sampler, and heavy_task tags).
+  "redis-write-diag"
+  # Prod Audit 2 Batch 3 (§5, pre-registered in Batch 1): unified deliverable-text contract
+  # across checkpoint projection, SSE producer, and channel gateway.
+  # Prod-audit-2 Batch 3 (§5 & §6): unified deliverable-text extraction, phase/close_out/continuation
+  # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
+  # answer/image parity, and web phase-aware collapsed projection.
+  "deliverable-text"
+>>>>>>> origin/dalton/main
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -687,6 +713,8 @@ AUDIT_EXEMPT_FILES = {
     "web/src/locales/memoPanel/zh-CN.json",
     "web/src/locales/plugins/en-US.json",
     "web/src/locales/plugins/zh-CN.json",
+    "web/src/locales/publish/en-US.json",
+    "web/src/locales/publish/zh-CN.json",
     "web/src/locales/settings/en-US.json",
     "web/src/locales/settings/zh-CN.json",
     "web/src/locales/setup/en-US.json",

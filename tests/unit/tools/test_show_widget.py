@@ -436,13 +436,14 @@ class TestAttachWidgetData:
 
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True).encode()
         sha = hashlib.sha256(payload).hexdigest()
+        # DALTON-HOOK(share-redaction): new widget payloads live under private-media/widgets/
         assert artifact["data_ref"] == {
-            "key": f"widgets/{sha}.json",
+            "key": f"private-media/widgets/{sha}.json",
             "sha256": sha,
             "size": len(payload),
         }
         assert "data" not in artifact
-        assert uploads == [(f"widgets/{sha}.json", payload, "application/json")]
+        assert uploads == [(f"private-media/widgets/{sha}.json", payload, "application/json")]
 
     @pytest.mark.asyncio
     async def test_large_data_inlines_when_storage_disabled(self, monkeypatch):
@@ -473,8 +474,9 @@ class TestAttachWidgetData:
 
     def test_widget_data_storage_key_thread_scoping(self):
         sha = "ab" * 32
-        assert widget_data_storage_key("t1", sha) == f"widgets/t1/{sha}.json"
-        assert widget_data_storage_key("", sha) == f"widgets/{sha}.json"
+        # DALTON-HOOK(share-redaction): new widget payloads live under private-media/widgets/
+        assert widget_data_storage_key("t1", sha) == f"private-media/widgets/t1/{sha}.json"
+        assert widget_data_storage_key("", sha) == f"private-media/widgets/{sha}.json"
 
     @pytest.mark.asyncio
     async def test_tool_checkpointed_artifact_carries_data(self, monkeypatch):

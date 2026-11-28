@@ -257,7 +257,11 @@ async def test_a_chunk_the_store_rejected_withholds_its_members_rows(db):
         i["sha256"]: {"status": "failed" if i["sha256"] == CHUNK else "ok"} for i in items
     }
     sb = _sandbox()
-    with patch.object(blobs, "unlink_direct", new=AsyncMock(return_value=1)) as unlink:
+    # DALTON-HOOK(workspace-file-write-mode): pin fallback budget to 0 to exercise upstream chunk-rejection path
+    with (
+        patch("src.dalton.wsfiles_write_mode.UPLOAD_FALLBACK_BUDGET_BYTES", 0),
+        patch.object(blobs, "unlink_direct", new=AsyncMock(return_value=1)) as unlink,
+    ):
         result = await backup.sync_to_db(WS, sb, layout=LAYOUT)
     rows = _rows(db)
     assert set(rows) == {"big.bin"}

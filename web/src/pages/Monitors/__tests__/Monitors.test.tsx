@@ -11,9 +11,18 @@ const bridgeCallbacks = vi.hoisted(() => ({
   lastPosted: [] as unknown[],
 }));
 
+vi.mock('@/contexts/ThemeContext', () => ({
+  useTheme: () => ({ theme: 'light', setTheme: () => {} }),
+}));
+
 vi.mock('@/components/ui/use-toast', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/components/ui/use-toast')>();
   return { ...actual, toast: vi.fn<typeof actual.toast>() };
+});
+
+vi.mock('@/pages/ChatAgent/utils/api/artifacts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api/artifacts')>();
+  return { ...actual, unshareArtifact: vi.fn<typeof actual.unshareArtifact>() };
 });
 
 vi.mock('@/pages/ChatAgent/components/viewers/html/BridgedFrame', () => ({
@@ -67,13 +76,22 @@ vi.mock('../api', async (importOriginal) => {
   return {
     ...actual,
     listMonitors: vi.fn<typeof actual.listMonitors>(),
+    listSharedDocuments: vi.fn<typeof actual.listSharedDocuments>(async () => []),
     getMonitorDetail: vi.fn<typeof actual.getMonitorDetail>(),
     getPublicMonitorDetail: vi.fn<typeof actual.getPublicMonitorDetail>(),
     mintMonitorGrant: vi.fn<typeof actual.mintMonitorGrant>(),
   };
 });
 
-import { getMonitorDetail, getPublicMonitorDetail, listMonitors, mintMonitorGrant } from '../api';
+import {
+  getMonitorDetail,
+  getPublicMonitorDetail,
+  listMonitors,
+  listSharedDocuments,
+  mintMonitorGrant,
+  type SharedDocumentSummary,
+} from '../api';
+import { unshareArtifact } from '@/pages/ChatAgent/utils/api/artifacts';
 import {
   CORE_DEFAULT_CAPABILITY_SET,
   EVERFLOW_DEFAULT_CAPABILITY_SET,
@@ -111,9 +129,11 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
 });
 
 const mockListMonitors = vi.mocked(listMonitors);
+const mockListSharedDocuments = vi.mocked(listSharedDocuments);
 const mockGetMonitorDetail = vi.mocked(getMonitorDetail);
 const mockGetPublicMonitorDetail = vi.mocked(getPublicMonitorDetail);
 const mockMintMonitorGrant = vi.mocked(mintMonitorGrant);
+const mockUnshareArtifact = vi.mocked(unshareArtifact);
 let mockClipboardWriteText = vi.fn<typeof navigator.clipboard.writeText>();
 
 function makeSummary(overrides: Partial<MonitorSummary> = {}): MonitorSummary {
@@ -187,12 +207,15 @@ function LocationProbe() {
 describe('Monitors page (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockListSharedDocuments.mockResolvedValue([]);
     capabilitiesMock.enabled = true;
     bridgeCallbacks.onNavigate = null;
     bridgeCallbacks.lastPosted = [];
     mockClipboardWriteText = vi.fn<typeof navigator.clipboard.writeText>(async () => {});
-    Object.assign(navigator, {
-      clipboard: {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      writable: true,
+      value: {
         writeText: mockClipboardWriteText,
       },
     });
@@ -468,5 +491,542 @@ describe('Monitors page (Checklist 8)', () => {
     expect(errBanner.className).toContain('whitespace-normal');
     expect(errBanner.className).toContain('break-words');
     expect(errBanner.querySelector('.truncate')).toBeNull();
+  });
+
+  it('pins public and authenticated viewers to detail.monitor.last_verified_seq and shows has_recent_publish_issue notice', async () => {
+    const publicMonitor = makeSummary({
+      slug: 'public-verified-pin',
+      title: 'Public Verified Pin',
+      visibility: 'public',
+      published_seq: 5,
+      last_verified_seq: 4,
+      last_publish_error: null,
+      last_publish_failed_at: null,
+      has_recent_publish_issue: true,
+    });
+    delete publicMonitor.workspace_id;
+    delete publicMonitor.artifact_id;
+    delete publicMonitor.owner_user_id;
+    delete publicMonitor.entry_path;
+
+    mockGetPublicMonitorDetail.mockResolvedValue(
+      makeDetail({
+        monitor: publicMonitor,
+        frame_base: '/api/v1/dalton/monitors/public/public-verified-pin/',
+        data_base: '/api/v1/dalton/monitors/public/public-verified-pin/data',
+        monitor_grant: '',
+        expires_in: 0,
+        versions: [],
+      }),
+    );
+
+    const { unmount } = renderWithProviders(
+      <Routes>
+        <Route path="/m/:slug" element={<PublicMonitorPage />} />
+      </Routes>,
+      { route: '/m/public-verified-pin' },
+    );
+
+    const publicFrame = await screen.findByTestId('bridged-frame');
+    expect(publicFrame.getAttribute('data-src')).toContain(
+      '/api/v1/dalton/monitors/public/public-verified-pin/v/4/',
+    );
+    const issueBanner = screen.getByTestId('monitor-publish-issue');
+    expect(issueBanner).toBeInTheDocument();
+    unmount();
+
+    // Authenticated mode also prefers last_verified_seq over published_seq until user selects another version.
+    mockGetMonitorDetail.mockResolvedValue(
+      makeDetail({
+        monitor: makeSummary({
+          slug: 'auth-verified-pin',
+          title: 'Auth Verified Pin',
+          entry_path: 'index.html',
+          published_seq: 6,
+          last_verified_seq: 5,
+          has_recent_publish_issue: true,
+          last_publish_error: null,
+          last_publish_failed_at: null,
+        }),
+        versions: [
+          {
+            seq: 5,
+            entry_path: 'index.html',
+            origin: 'owner',
+            title: 'Auth Verified Pin',
+            label: 'Verified',
+            byte_len: 1000,
+            published_at: '2026-11-27T10:00:00Z',
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors/:slug" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors/auth-verified-pin' },
+    );
+
+    const authFrame = await screen.findByTestId('bridged-frame');
+    expect(authFrame.getAttribute('data-src')).toContain('/v/5/index.html');
+  });
+
+  it('excludes non-HTML entries from monitor cards, groups shared documents into Shared by me and Shared with me, revokes own doc after confirmation, and hides Stop sharing on others', async () => {
+    const user = userEvent.setup();
+    mockListMonitors.mockResolvedValue([
+      makeSummary({
+        monitor_id: 'm-html',
+        slug: 'html-dashboard',
+        title: 'HTML Dashboard',
+        entry_path: 'dashboard.html',
+        category: 'overview',
+      }),
+      makeSummary({
+        monitor_id: 'm-legacy-md',
+        slug: 'legacy-notes',
+        title: 'Legacy Markdown Entry',
+        entry_path: 'notes/memo.md',
+        category: 'other',
+      }),
+    ]);
+
+    const myDoc: SharedDocumentSummary = {
+      doc_id: 'd-mine',
+      artifact_id: 'a-md-mine',
+      artifact_code: 'mycode123456',
+      workspace_id: 'ws-1',
+      entry_path: 'notes/my-outlook.md',
+      file_name: 'my-outlook.md',
+      title: 'My Outlook',
+      owner_user_id: 'local-user',
+      owner_name: 'Alice',
+      owner_email: 'alice@company.com',
+      visibility: 'company',
+      member_user_ids: [],
+      published_seq: 1,
+      keep_updated: false,
+      acl_revision: 1,
+      url: '/a/mycode123456',
+      created_at: '2026-11-26T10:00:00Z',
+      updated_at: '2026-11-27T09:00:00Z',
+      can_manage: true,
+      is_owner: true,
+    };
+    const otherMembersDoc: SharedDocumentSummary = {
+      doc_id: 'd-1',
+      artifact_id: 'a-md-1',
+      artifact_code: 'doccode12345',
+      workspace_id: 'ws-2',
+      entry_path: 'notes/q4-memo.md',
+      file_name: 'q4-memo.md',
+      title: 'Q4 Memo',
+      owner_user_id: 'u-2',
+      owner_name: 'Bob',
+      owner_email: 'bob@company.com',
+      visibility: 'members',
+      member_user_ids: ['local-user'],
+      published_seq: 2,
+      keep_updated: false,
+      acl_revision: 1,
+      url: '/a/doccode12345',
+      created_at: '2026-11-26T10:00:00Z',
+      updated_at: '2026-11-27T08:30:00Z',
+      can_manage: false,
+      is_owner: false,
+    };
+    const otherPublicDoc: SharedDocumentSummary = {
+      ...otherMembersDoc,
+      doc_id: 'd-2',
+      artifact_id: 'a-pdf-2',
+      artifact_code: 'pubcode12345',
+      entry_path: 'briefs/public.pdf',
+      file_name: 'public.pdf',
+      title: 'Public Brief',
+      owner_user_id: 'u-3',
+      owner_name: 'Carol',
+      visibility: 'public',
+      url: '/a/pubcode12345',
+    };
+
+    mockListSharedDocuments.mockResolvedValue([myDoc, otherMembersDoc, otherPublicDoc]);
+    mockUnshareArtifact.mockResolvedValue({
+      artifact_id: myDoc.artifact_id,
+      code: myDoc.artifact_code!,
+      workspace_id: 'ws-1',
+      path: myDoc.entry_path,
+      name: myDoc.file_name,
+      url: myDoc.url,
+      shared: false,
+      keep_updated: false,
+      latest_seq: 1,
+      shared_seq: 0,
+      created_at: myDoc.created_at,
+    } as never);
+
+    const { unmount } = renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+
+    expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
+    expect(screen.queryByText('Legacy Markdown Entry')).not.toBeInTheDocument();
+
+    const byMeGroup = await screen.findByTestId('shared-documents-by-me');
+    expect(within(byMeGroup).getByText('my-outlook.md')).toBeInTheDocument();
+    expect(within(byMeGroup).getByText('Team')).toBeInTheDocument();
+    expect(within(byMeGroup).getByText(/Alice/)).toBeInTheDocument();
+    expect(within(byMeGroup).getByText(/Updated:/i)).toBeInTheDocument();
+    expect(within(byMeGroup).getByRole('link', { name: /Open/i })).toHaveAttribute('href', '/a/mycode123456');
+    const stopBtn = within(byMeGroup).getByRole('button', { name: /Stop sharing/i });
+
+    const withMeGroup = await screen.findByTestId('shared-documents-with-me');
+    expect(within(withMeGroup).getByText('q4-memo.md')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('Selected colleagues')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText(/Bob/)).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('public.pdf')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('Public link')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText(/Carol/)).toBeInTheDocument();
+    expect(within(withMeGroup).queryByRole('button', { name: /Stop sharing/i })).toBeNull();
+
+    // Clicking Stop sharing opens confirmation dialog; confirming calls unshareArtifact and removes the item.
+    mockListSharedDocuments.mockResolvedValue([otherMembersDoc, otherPublicDoc]);
+    await user.click(stopBtn);
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/my-outlook\.md/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: /Stop sharing/i }));
+
+    await waitFor(() => expect(mockUnshareArtifact).toHaveBeenCalledWith('a-md-mine'));
+    await waitFor(() => expect(screen.queryByTestId('shared-documents-by-me')).toBeNull());
+    expect(screen.getByTestId('shared-documents-with-me')).toBeInTheDocument();
+    unmount();
+
+    // When only Shared by me is present, Shared with me is hidden.
+    mockListSharedDocuments.mockResolvedValue([myDoc]);
+    const onlyMine = renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+    expect(await screen.findByTestId('shared-documents-by-me')).toBeInTheDocument();
+    expect(screen.queryByTestId('shared-documents-with-me')).toBeNull();
+    onlyMine.unmount();
+
+    // When both groups are empty, the entire shared-documents section stays hidden.
+    mockListSharedDocuments.mockResolvedValue([]);
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+    expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
+    expect(screen.queryByTestId('shared-documents-section')).toBeNull();
+  });
+
+  it('renders a legacy Markdown monitor using Markdown viewer with raw toggle instead of raw iframe', async () => {
+    const user = userEvent.setup();
+    const mdBody = [
+      '# Earnings Recap',
+      '',
+      'Summary with **strong growth**.',
+      '',
+      '| Metric | Value |',
+      '| --- | --- |',
+      '| Revenue | $10B |',
+      '',
+      '<script>window.__mdMonitorXss = true;</script>',
+    ].join('\n');
+
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/markdown; charset=utf-8' }),
+      text: async () => mdBody,
+      blob: async () => new Blob([mdBody], { type: 'text/markdown' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      mockGetMonitorDetail.mockResolvedValue(
+        makeDetail({
+          monitor: makeSummary({
+            slug: 'legacy-recap',
+            title: 'Earnings Recap',
+            entry_path: 'notes/recap.md',
+            published_seq: 1,
+          }),
+          versions: [
+            {
+              seq: 1,
+              entry_path: 'notes/recap.md',
+              origin: 'owner',
+              title: 'Earnings Recap',
+              label: null,
+              byte_len: mdBody.length,
+              published_at: '2026-11-27T08:00:00Z',
+            },
+          ],
+        }),
+      );
+
+      renderWithProviders(
+        <Routes>
+          <Route path="/monitors/:slug" element={<Monitors />} />
+        </Routes>,
+        { route: '/monitors/legacy-recap' },
+      );
+
+      const bold = await screen.findByText('strong growth', {}, { timeout: 5000 });
+      expect(bold.tagName).toBe('STRONG');
+      expect(screen.queryByTestId('bridged-frame')).toBeNull();
+      const host = document.querySelector('.monitors-frame-host') as HTMLElement;
+      expect(within(host).getByRole('heading', { level: 1, name: 'Earnings Recap' })).toBeInTheDocument();
+      expect(within(host).getByRole('table')).toBeInTheDocument();
+      expect(document.querySelector('script')).toBeNull();
+      expect((window as unknown as Record<string, unknown>).__mdMonitorXss).toBeUndefined();
+
+      // Switch to raw Markdown view and back.
+      await user.click(screen.getByRole('button', { name: /View raw/i }));
+      expect(await screen.findByText(/\*\*strong growth\*\*/)).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /View rendered/i }));
+      expect((await screen.findByText('strong growth')).tagName).toBe('STRONG');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('renders an anonymous public /m/ legacy Markdown page from real trimmed public payload with raw toggle and download', async () => {
+    const user = userEvent.setup();
+    const mdBody = [
+      '# Public Weekly Note',
+      '',
+      'Highlights: **margin expansion** this quarter.',
+      '',
+      '<script>window.__publicMdXss = true;</script>',
+    ].join('\n');
+
+    const createObjectURLMock = vi.fn<typeof URL.createObjectURL>(() => 'blob:public-md-download');
+    const revokeObjectURLMock = vi.fn<typeof URL.revokeObjectURL>();
+    URL.createObjectURL = createObjectURLMock;
+    URL.revokeObjectURL = revokeObjectURLMock;
+
+    const publicDetailPayload: MonitorDetail = {
+      monitor: {
+        monitor_id: 'm-pub-md',
+        slug: 'public-weekly-note',
+        owner_name: 'Alice',
+        owner_email: null,
+        title: 'Public Weekly Note',
+        category: 'other',
+        sort_order: 0,
+        visibility: 'public',
+        member_user_ids: [],
+        published_seq: 2,
+        keep_updated: false,
+        source_kind: 'workspace',
+        source_ref: null,
+        acl_revision: 1,
+        last_publish_error: null,
+        last_publish_failed_at: null,
+        data_as_of: null,
+        created_at: '2026-11-27T08:00:00Z',
+        updated_at: '2026-11-27T08:00:00Z',
+        can_manage: false,
+        entry_file_type: 'markdown',
+      },
+      versions: [],
+      monitor_grant: '',
+      frame_base: '/api/v1/dalton/monitors/public/public-weekly-note/',
+      data_base: '/api/v1/dalton/monitors/public/public-weekly-note/data',
+      expires_in: 0,
+    };
+
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url === '/api/v1/dalton/monitors/public/public-weekly-note/v/2/') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'text/markdown; charset=utf-8' }),
+          text: async () => mdBody,
+          blob: async () => new Blob([mdBody], { type: 'text/markdown' }),
+        } as Response;
+      }
+      return { ok: false, status: 404, headers: new Headers() } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    mockGetPublicMonitorDetail.mockResolvedValue(publicDetailPayload);
+
+    try {
+      renderWithProviders(
+        <Routes>
+          <Route path="/m/:slug" element={<PublicMonitorPage />} />
+        </Routes>,
+        { route: '/m/public-weekly-note' },
+      );
+
+      const bold = await screen.findByText('margin expansion', {}, { timeout: 5000 });
+      expect(bold.tagName).toBe('STRONG');
+      expect(screen.queryByTestId('bridged-frame')).toBeNull();
+      expect(document.querySelector('script')).toBeNull();
+      expect((window as unknown as Record<string, unknown>).__publicMdXss).toBeUndefined();
+
+      // View raw / View rendered toggle works in anonymous mode
+      await user.click(screen.getByRole('button', { name: /View raw/i }));
+      expect(await screen.findByText(/\*\*margin expansion\*\*/)).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /View rendered/i }));
+      expect((await screen.findByText('margin expansion')).tagName).toBe('STRONG');
+
+      // Download button fetches the anonymous entry endpoint
+      await user.click(screen.getByRole('button', { name: /Download/i }));
+      await waitFor(() => expect(createObjectURLMock).toHaveBeenCalled());
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/dalton/monitors/public/public-weekly-note/v/2/',
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('resolves ../ relative image and link on anonymous /m/ entry in a subdirectory without root fallback', async () => {
+    const user = userEvent.setup();
+    const entryDir = ['reports', 'q4'];
+    const versionFiles: Record<string, { body: string; contentType: string }> = {
+      'reports/q4/memo.md': {
+        body: [
+          '# Q4 Subdir Memo',
+          '',
+          '![Shared Logo](../shared/logo.png)',
+          '![Root Decoy](shared/logo.png)',
+          '',
+          'See [Shared Overview](../shared/overview.md), [Root Decoy Doc](shared/overview.md), and [Outside](../../../etc/passwd.md).',
+        ].join('\n'),
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'reports/shared/logo.png': { body: 'parent-shared-logo', contentType: 'image/png' },
+      'reports/shared/overview.md': {
+        body: '# Shared Overview\n\nOpened via **parent relative link**.',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      // Workspace-root decoys with the same suffix must never be returned for entry-relative paths.
+      'shared/logo.png': { body: 'wrong-root-logo', contentType: 'image/png' },
+      'shared/overview.md': { body: '# Wrong Root Overview', contentType: 'text/markdown; charset=utf-8' },
+    };
+
+    const resolveEntryRel = (rel: string): string | null => {
+      const stack = [...entryDir];
+      for (const seg of rel.split('/')) {
+        if (!seg || seg === '.') continue;
+        if (seg === '..') {
+          if (stack.length === 0) return null;
+          stack.pop();
+          continue;
+        }
+        stack.push(seg);
+      }
+      return stack.length > 0 ? stack.join('/') : null;
+    };
+
+    const createObjectURLMock = vi.fn<typeof URL.createObjectURL>(() => 'blob:parent-shared-logo');
+    const revokeObjectURLMock = vi.fn<typeof URL.revokeObjectURL>();
+    URL.createObjectURL = createObjectURLMock;
+    URL.revokeObjectURL = revokeObjectURLMock;
+
+    const publicDetailPayload: MonitorDetail = {
+      monitor: {
+        monitor_id: 'm-pub-subdir-md',
+        slug: 'public-q4-memo',
+        owner_name: 'Alice',
+        owner_email: null,
+        title: 'Q4 Subdir Memo',
+        category: 'other',
+        sort_order: 0,
+        visibility: 'public',
+        member_user_ids: [],
+        published_seq: 2,
+        keep_updated: false,
+        source_kind: 'workspace',
+        source_ref: null,
+        acl_revision: 1,
+        last_publish_error: null,
+        last_publish_failed_at: null,
+        data_as_of: null,
+        created_at: '2026-11-27T08:00:00Z',
+        updated_at: '2026-11-27T08:00:00Z',
+        can_manage: false,
+        entry_file_type: 'markdown',
+      },
+      versions: [],
+      monitor_grant: '',
+      frame_base: '/api/v1/dalton/monitors/public/public-q4-memo/',
+      data_base: '/api/v1/dalton/monitors/public/public-q4-memo/data',
+      expires_in: 0,
+    };
+
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const urlStr = String(input);
+      const parsed = new URL(urlStr, 'http://localhost');
+      if (parsed.pathname === '/api/v1/dalton/monitors/public/public-q4-memo/v/2/') {
+        const rel = parsed.searchParams.get('rel');
+        const target = rel === null ? 'reports/q4/memo.md' : resolveEntryRel(rel);
+        const hit = target ? versionFiles[target] : undefined;
+        if (hit) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': hit.contentType }),
+            text: async () => hit.body,
+            blob: async () => new Blob([hit.body], { type: hit.contentType }),
+          } as Response;
+        }
+      }
+      return { ok: false, status: 404, headers: new Headers() } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    mockGetPublicMonitorDetail.mockResolvedValue(publicDetailPayload);
+
+    try {
+      renderWithProviders(
+        <Routes>
+          <Route path="/m/:slug" element={<PublicMonitorPage />} />
+        </Routes>,
+        { route: '/m/public-q4-memo' },
+      );
+
+      expect(await screen.findByRole('heading', { level: 1, name: 'Q4 Subdir Memo' })).toBeInTheDocument();
+
+      // ../shared/logo.png loads via ?rel=..%2Fshared%2Flogo.png (resolved to reports/shared/logo.png)
+      const logoImg = await screen.findByAltText('Shared Logo');
+      await waitFor(() => expect(logoImg).toHaveAttribute('src', 'blob:parent-shared-logo'));
+
+      // Root decoy image (shared/logo.png -> reports/q4/shared/logo.png) does NOT resolve to workspace root
+      expect(await screen.findByText(/logo\.png/i)).toBeInTheDocument();
+
+      // ../shared/overview.md probes OK and opens inside the viewer
+      const overviewLink = await screen.findByRole('link', { name: 'Shared Overview' });
+      expect(overviewLink).toHaveAttribute(
+        'href',
+        '/api/v1/dalton/monitors/public/public-q4-memo/v/2/?rel=..%2Fshared%2Foverview.md',
+      );
+
+      // Root decoy link and escaping ../../../etc/passwd.md stay placeholders
+      const placeholders = await screen.findAllByTestId('shared-link-placeholder');
+      const placeholderText = placeholders.map((el) => el.textContent).join(' ');
+      expect(placeholderText).toContain('Root Decoy Doc');
+      expect(placeholderText).toContain('Outside');
+      expect(screen.queryByRole('link', { name: 'Root Decoy Doc' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'Outside' })).toBeNull();
+
+      await user.click(overviewLink);
+      expect(await screen.findByRole('heading', { level: 1, name: 'Shared Overview' })).toBeInTheDocument();
+      expect(screen.getByText('parent relative link').tagName).toBe('STRONG');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

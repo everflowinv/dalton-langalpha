@@ -68,14 +68,11 @@ def upload_file(key: str, file_path: str, content_type: str | None = None) -> bo
 
     try:
         client = _get_client()
-        put_args: dict[str, Any] = {
-            "Bucket": StorageConfig.BUCKET_NAME,
-            "Key": key,
-            "ContentType": content_type,
-        }
+        # DALTON-HOOK(share-redaction): attach object-level private ACL via Dalton helper
+        from src.dalton.share_media import s3_put_object_with_private_acl
+
         with path_obj.open("rb") as f:
-            put_args["Body"] = f
-            client.put_object(**put_args)
+            s3_put_object_with_private_acl(client, bucket=StorageConfig.BUCKET_NAME, key=key, body=f, content_type=content_type, endpoint_url=StorageConfig.ENDPOINT_URL)
         logger.debug(f"Uploaded {path_obj} as {key}")
         return True
     except ClientError:
@@ -125,13 +122,10 @@ def upload_bytes(
 
     try:
         client = _get_client()
-        put_args: dict[str, Any] = {
-            "Bucket": StorageConfig.BUCKET_NAME,
-            "Key": key,
-            "Body": data,
-            "ContentType": content_type,
-        }
-        client.put_object(**put_args)
+        # DALTON-HOOK(share-redaction): attach object-level private ACL via Dalton helper
+        from src.dalton.share_media import s3_put_object_with_private_acl
+
+        s3_put_object_with_private_acl(client, bucket=StorageConfig.BUCKET_NAME, key=key, body=data, content_type=content_type, endpoint_url=StorageConfig.ENDPOINT_URL)
         logger.debug(f"Uploaded bytes as {key}")
         return True
     except ClientError:
@@ -273,26 +267,14 @@ def get_signed_upload_url(
     uploader from the body it streams.
     """
     checksum_b64 = base64.b64encode(bytes.fromhex(sha256_hex)).decode("ascii")
+    # DALTON-HOOK(share-redaction): probe bucket ACL mode & bind private ACL on presigned single PUT
+    from src.dalton.share_media import s3_presign_put_with_private_acl
+
     try:
-        client = _get_client()
-        url = client.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": StorageConfig.BUCKET_NAME,
-                "Key": key,
-                "ContentLength": content_length,
-                "ContentType": content_type,
-                "ChecksumSHA256": checksum_b64,
-            },
-            ExpiresIn=expires_in,
-        )
+        return s3_presign_put_with_private_acl(_get_client(), bucket=StorageConfig.BUCKET_NAME, key=key, checksum_b64=checksum_b64, content_length=content_length, content_type=content_type, expires_in=expires_in, endpoint_url=StorageConfig.ENDPOINT_URL)
     except Exception as e:
         logger.error(f"Failed to presign upload for {key}: {e}")
         return None
-    return url, {
-        "Content-Type": content_type,
-        "x-amz-checksum-sha256": checksum_b64,
-    }
 
 
 # The store's own multipart limits, and the part size chosen against them.
@@ -354,10 +336,11 @@ def create_signed_multipart_upload(
 
 def open_multipart_upload(key: str, *, content_type: str) -> str | None:
     """Start a multipart upload under ``key``; its upload id, or ``None`` if refused."""
+    # DALTON-HOOK(share-redaction): attach object-level private ACL on multipart initiation via Dalton helper
+    from src.dalton.share_media import s3_create_multipart_with_private_acl
+
     try:
-        created = _get_client().create_multipart_upload(
-            Bucket=StorageConfig.BUCKET_NAME, Key=key, ContentType=content_type
-        )
+        created = s3_create_multipart_with_private_acl(_get_client(), bucket=StorageConfig.BUCKET_NAME, key=key, content_type=content_type, endpoint_url=StorageConfig.ENDPOINT_URL)
         return created["UploadId"]
     except Exception as e:
         logger.error(f"Failed to open a multipart upload for {key}: {e}")

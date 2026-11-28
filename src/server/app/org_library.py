@@ -199,6 +199,10 @@ async def list_library(
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cursor")
+    # DALTON-HOOK(share-redaction): redact titles & summaries for allow_files=false thread library items
+    from src.dalton.share_redaction import redact_org_library_rows
+
+    rows = await redact_org_library_rows(rows)
     return LibraryPage(
         items=[LibraryItem(**_item(row, user_id)) for row in rows],
         next_cursor=next_cursor,
@@ -255,6 +259,11 @@ async def find_published(
         row = await library_db.find_item(thread_id=thread, artifact_id=artifact)
     if row is not None and row["org_id"] != member.org.id:
         row = None
+    # DALTON-HOOK(share-redaction): redact title & summary on single published lookup
+    if row is not None:
+        from src.dalton.share_redaction import redact_org_library_rows
+
+        row = (await redact_org_library_rows([row]))[0]
     lookup = PublishedLookup(
         item=LibraryItem(**_item(row, user_id)) if row else None,
         can_publish=member.policy.allows(ORG_LIBRARY_PUBLISH),
@@ -287,6 +296,10 @@ async def publish_item(request: PublishRequest, user_id: CurrentUserId) -> Libra
         row = await library.publish_skill(
             member.org.id, user_id, request.skill_name or "", title, summary
         )
+        # DALTON-HOOK(share-redaction): route all org-library write responses through unified redaction exit
+        from src.dalton.share_redaction import redact_org_library_rows
+
+        row = (await redact_org_library_rows([row]))[0]
         return LibraryItem(**_item(row, user_id))
     target_id = str(request.target_id)
     thread_id, artifact_id = (
@@ -297,6 +310,10 @@ async def publish_item(request: PublishRequest, user_id: CurrentUserId) -> Libra
         member.org.id, user_id, request.kind, target_id,
         access=access, artifact=artifact, title=title, summary=summary,
     )
+    # DALTON-HOOK(share-redaction): redact title & summary on publish write response
+    from src.dalton.share_redaction import redact_org_library_rows
+
+    row = (await redact_org_library_rows([row]))[0]
     return LibraryItem(**_item(row, user_id))
 
 
@@ -312,6 +329,10 @@ async def install_skill(item_id: UUID, user_id: CurrentUserId) -> LibraryItem:
     """
     member = await _member(user_id)
     row = await library.install_skill(member.org.id, user_id, str(item_id))
+    # DALTON-HOOK(share-redaction): pass through unified library row redactor
+    from src.dalton.share_redaction import redact_org_library_rows
+
+    row = (await redact_org_library_rows([row]))[0]
     return LibraryItem(**_item(row, user_id))
 
 
@@ -325,6 +346,10 @@ async def edit_item(
     row = await library.edit_item(
         member.org.id, user_id, str(item_id), request.title, request.summary
     )
+    # DALTON-HOOK(share-redaction): redact title & summary on edit write response
+    from src.dalton.share_redaction import redact_org_library_rows
+
+    row = (await redact_org_library_rows([row]))[0]
     return LibraryItem(**_item(row, user_id))
 
 
@@ -359,6 +384,10 @@ async def list_for_console(
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cursor")
+    # DALTON-HOOK(share-redaction): redact titles & summaries on console service list
+    from src.dalton.share_redaction import redact_org_library_rows
+
+    rows = await redact_org_library_rows(rows)
     return ServiceLibraryPage(
         items=[
             ServiceLibraryItem(

@@ -7,10 +7,11 @@ from uuid import UUID, uuid4
 
 import asyncio
 
-from fastapi import Depends, Header, HTTPException, Query, Request
+from fastapi import Depends, Header, HTTPException, Query, Request  # DALTON-HOOK(share-redaction)
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config.settings import get_sse_keepalive_interval
+from src.dalton.llm.run_model import adopted_run_llm_model  # DALTON-HOOK(antigravity-series)
 from src.llms.model_identity import client_effort
 from src.server.utils.api import (
     CurrentUserId,
@@ -353,7 +354,6 @@ def _is_service_request(raw_request: Request | None) -> bool:
     self-dispatch, from anything the owner fallback would answer
     (``owner_requests``)."""
     from src.config.settings import HOST_MODE
-    from src.server.auth.owner_requests import is_owner
     # DALTON-HOOK(dalton-auth): require service token match for self-dispatch when Dalton auth is enabled
     from src.dalton.auth import is_dalton_service_request, is_dalton_supabase_auth_enabled
 
@@ -362,12 +362,19 @@ def _is_service_request(raw_request: Request | None) -> bool:
     if is_dalton_supabase_auth_enabled():
         return is_dalton_service_request(sent, token)
     # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
-    from src.dalton.auth.dispatch import dispatch_oss_service_request
+    # DALTON-HOOK(share-redaction): enforce trusted loopback/owner gate on unkeyed OSS self-dispatch
+    from src.dalton.auth.dispatch import dispatch_oss_service_request, is_trusted_oss_local_owner
     from src.dalton.settings import get_dalton_auth_mode
 
     if HOST_MODE == "oss" and get_dalton_auth_mode() != "oss":
-        return dispatch_oss_service_request(sent, token, host_mode=HOST_MODE)
-    trusted = HOST_MODE == "oss" and not token and (raw_request is None or is_owner(raw_request.scope))
+        return dispatch_oss_service_request(
+            sent, token, host_mode=HOST_MODE, scope=raw_request.scope if raw_request else None
+        )
+    trusted = (
+        HOST_MODE == "oss"
+        and not token
+        and (raw_request is None or is_trusted_oss_local_owner(raw_request.scope))
+    )
     return service_token_matches(sent, token) or trusted
 
 
@@ -475,6 +482,9 @@ async def _reject_duplicate_request(
             run_status=existing["status"],
             retryable=can_retry(existing),
         )
+        # DALTON-HOOK(antigravity-series): expose adopted run's effective llm_model on 409 duplicate_request
+        if adopted_model := adopted_run_llm_model(existing):
+            detail["llm_model"] = adopted_model
         # A steer's run is another message's turn, not one to retry or adopt.
         if keyed.steered:
             detail["steered"] = True
@@ -1583,6 +1593,8 @@ async def watch_thread(thread_id: str, x_user_id: ReadUserId, request: Request =
 async def replay_thread_messages(
     thread_id: str,
     x_user_id: ReadUserId,
+    # DALTON-HOOK(share-redaction): accept Request to mint dalton_oss_media_session cookie & origin-bound owner media tokens
+    request: Request,
     source: Literal["auto", "checkpoint"] = Query(
         "auto",
         description=(
@@ -1711,6 +1723,13 @@ async def replay_thread_messages(
             await name_turn_senders(thread_id, replay_lines)
         paged = limit is not None or before_turn is not None
 
+        # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs
+        from src.dalton.share_media import prepare_owner_replay_media
+
+        replay_lines, _media_set_cookies = await prepare_owner_replay_media(
+            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id
+        )
+
         async def event_generator():
             seq = 0
             if paged:
@@ -1809,7 +1828,7 @@ async def replay_thread_messages(
             seq += 1
             yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps(done, default=str)}\n\n"
 
-        return StreamingResponse(
+        stream_resp = StreamingResponse(
             observe_replay_stream(event_generator(), source="private"),
             media_type="text/event-stream",
             headers={
@@ -1817,6 +1836,10 @@ async def replay_thread_messages(
                 "X-Replay-Source": resolved_source,
             },
         )
+        # DALTON-HOOK(share-redaction): attach minted dalton_oss_media_session Set-Cookie header to owner replay response
+        for _cookie_val in _media_set_cookies:
+            stream_resp.headers.append("set-cookie", _cookie_val)
+        return stream_resp
 
     except DATABASE_UNAVAILABLE as e:
         # Replay ends the read on a database fault rather than show the

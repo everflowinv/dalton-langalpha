@@ -4,7 +4,7 @@ import { authSessionCheck } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
 import { patchThreadShared } from '@/lib/threadListCache';
 import type { ThreadSharePermissions, ThreadShareStatus } from '@/types/api';
-import { updateThreadSharing } from '../utils/api';
+import { getThreadShareStatus, updateThreadSharing } from '../utils/api'; // DALTON-HOOK(share-redaction)
 import { threadShareQuery } from '../utils/threadQueries';
 
 // DALTON-HOOK(external-share-guard): stopping a thread share sends `{ is_shared: false }` without permissions
@@ -18,9 +18,28 @@ export interface ThreadShareUpdateBody {
  * panel read, so a change from either shows on both. The cached thread lists
  * follow it, for the gallery's public-link badge.
  */
-export function useThreadShareStatus(threadId: string, { refetchOnMount }: { refetchOnMount?: boolean | 'always' } = {}) {
+// DALTON-HOOK(share-redaction): request include_summary=true only when share panel is open
+export function useThreadShareStatus(
+  threadId: string,
+  {
+    refetchOnMount,
+    includeSummary = false,
+  }: { refetchOnMount?: boolean | 'always'; includeSummary?: boolean } = {},
+) {
   const queryClient = useQueryClient();
-  const query = useQuery({ ...threadShareQuery(threadId), enabled: !!threadId, refetchOnMount });
+  const baseQuery = threadShareQuery(threadId);
+  const query = useQuery({
+    ...baseQuery,
+    queryKey: includeSummary ? [...baseQuery.queryKey, 'summary'] : baseQuery.queryKey,
+    queryFn: includeSummary
+      ? () => getThreadShareStatus(threadId, { includeSummary: true })
+      : baseQuery.queryFn,
+    placeholderData: includeSummary
+      ? () => queryClient.getQueryData<ThreadShareStatus>(baseQuery.queryKey)
+      : undefined,
+    enabled: !!threadId,
+    refetchOnMount,
+  });
   const isShared = query.data?.is_shared;
   useEffect(() => {
     if (isShared !== undefined) patchThreadShared(queryClient, threadId, isShared === true);
@@ -45,4 +64,6 @@ export async function saveThreadSharing(
   const queryKey = queryKeys.threads.share(threadId);
   await queryClient.cancelQueries({ queryKey });
   queryClient.setQueryData(queryKey, result);
+  // DALTON-HOOK(share-redaction): hydrate summary cache entry directly from POST /share response
+  queryClient.setQueryData([...queryKey, 'summary'], result);
 }

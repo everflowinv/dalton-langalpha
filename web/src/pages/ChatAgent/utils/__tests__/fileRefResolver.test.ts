@@ -183,4 +183,14 @@ describe('downloadTarget', () => {
     }, ['a/report.md', 'b/report.md']);
     expect(seen).toEqual([['report.md'], ['a/report.md', 'b/report.md']]);
   });
+
+  // DALTON-HOOK(share-redaction): aborted lookups must terminate the download instead of falling back to the raw path
+  it('propagates AbortError instead of falling back to the raw path', async () => {
+    const abortErr = new DOMException('Aborted', 'AbortError');
+    await expect(
+      downloadTarget('results/report.md', async () => {
+        throw abortErr;
+      }),
+    ).rejects.toBe(abortErr);
+  });
 });

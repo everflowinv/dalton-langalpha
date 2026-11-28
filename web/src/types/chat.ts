@@ -39,6 +39,11 @@ export interface TextSegment {
   phase?: 'commentary' | 'final_answer';
   /** Set on text that arrived live: one segment holds a run of chunks. */
   chunks?: TextChunkMark;
+  // DALTON-HOOK(empty-turn-guard): server AIMessage.id for message_discarded retraction
+  messageId?: string;
+  // DALTON-HOOK(deliverable-text): output_cap continuation predecessor message id and per-segment captured images
+  continuedFromMessageId?: string;
+  capturedImages?: Record<string, string>;
 }
 
 export interface ToolCallSegment {

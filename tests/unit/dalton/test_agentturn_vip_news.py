@@ -1497,3 +1497,162 @@ def test_vip_news_nested_bridge_coverage_and_utc_window() -> None:
     )
     trump_wire = _person(filtered_0730, "Trump")["wire_headlines"]
     assert [row["status_id"] for row in trump_wire] == ["899"]
+
+
+@pytest.mark.asyncio
+async def test_vip_card_with_inline_code_number_matches_automation_report_digest_and_commits_seen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any
+    from unittest.mock import create_autospec
+
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.database.automation_reports import (
+        read_automation_report_status,
+        submit_automation_report,
+    )
+    from src.dalton.notify.dispatch import dispatch_automation_report
+    from src.dalton.tools import automation_report_tools as report_tools
+
+    cli = _load("vip_news_inline_digest", CLI_PATH)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    headline_url = "https://x.com/DeItaone/status/912"
+    headline_title = "TRUMP cited 16,956.0 figure"
+    events_payload = {
+        "summary_date": "2026-11-12",
+        "people": [
+            {
+                "key": "Trump",
+                "headlines": [
+                    {
+                        "summary": "提到核心指标 `16,956.0`（同比 `+46.7%`）与标的 `ANT`",
+                        "source": "DeItaone",
+                        "title": headline_title,
+                        "url": headline_url,
+                    }
+                ],
+            }
+        ],
+    }
+    _write_json(workspace, "events.json", events_payload)
+    code, rendered = _run(
+        cli,
+        [
+            "--json",
+            "render",
+            "--workspace-dir",
+            str(workspace),
+            "--events",
+            "events.json",
+            "--markdown",
+            "temp/vip-news-alert/2026-11-12/card.md",
+            "--output",
+            "temp/vip-news-alert/2026-11-12/card.json",
+            "--as-of",
+            AS_OF,
+        ],
+    )
+    assert code == 0 and rendered["empty"] is False, rendered
+    card = json.loads(
+        (workspace / "temp/vip-news-alert/2026-11-12/card.json").read_text(encoding="utf-8")
+    )
+    assert "`16,956.0`" in json.dumps(card, ensure_ascii=False)
+    expected_digest = cli.card_content_sha256(card)
+
+    saved_state: dict[str, Any] = {}
+
+    async def _fake_submit(**kwargs: Any) -> dict[str, Any]:
+        forwarded_cards = kwargs["cards"]
+        digest = automation_report_content_sha256(
+            profile=PROFILE,
+            content_kind="cards",
+            cards=forwarded_cards,
+            failure_text=None,
+        )
+        saved_state["digest"] = digest
+        return {
+            "ok": True,
+            "action": "submit",
+            "quiet": False,
+            "report_run_id": kwargs["report_run_id"],
+            "profile": PROFILE,
+            "content_kind": "cards",
+            "content_sha256": digest,
+            "execution_id": kwargs["execution_id"],
+            "delivery_confirmed": False,
+            "status": "pending",
+            "targets": ["feishu:chat:oc_vip"],
+            "created": True,
+        }
+
+    async def _fake_status(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "action": "status",
+            "quiet": False,
+            "found": True,
+            "report_run_id": kwargs["report_run_id"],
+            "profile": PROFILE,
+            "content_kind": "cards",
+            "content_sha256": saved_state["digest"],
+            "execution_id": kwargs["execution_id"],
+            "delivery_confirmed": True,
+            "status": "sent",
+            "targets": ["feishu:chat:oc_vip"],
+        }
+
+    monkeypatch.setattr(
+        report_tools,
+        "submit_automation_report",
+        create_autospec(submit_automation_report, side_effect=_fake_submit),
+    )
+    monkeypatch.setattr(
+        report_tools,
+        "read_automation_report_status",
+        create_autospec(read_automation_report_status, side_effect=_fake_status),
+    )
+    monkeypatch.setattr(
+        report_tools,
+        "dispatch_automation_report",
+        create_autospec(
+            dispatch_automation_report,
+            return_value={"ok": True, "delivery_confirmed": True, "status": "sent"},
+        ),
+    )
+    monkeypatch.setattr(
+        report_tools,
+        "is_internal_or_admin",
+        create_autospec(is_internal_or_admin, return_value=True),
+    )
+
+    tool = report_tools.create_automation_report_tools()[0]
+    cfg = {
+        "configurable": {
+            "user_id": "user-vip-1",
+            "workspace_id": "ws-vip-1",
+            "thread_id": "thread-vip-1",
+            "run_id": "run-vip-1",
+            "turn_origin_automation_id": "22222222-2222-4222-8222-222222222222",
+            "automation_execution_id": "11111111-1111-4111-8111-111111111111",
+        }
+    }
+    raw_res = await tool.ainvoke(
+        {
+            "action": "submit",
+            "report_run_id": RUN_ID,
+            "material": "yes",
+            "cards": [card],
+        },
+        config=cfg,
+    )
+    confirm = json.loads(raw_res)
+    assert confirm["ok"] is True
+    assert confirm["delivery_confirmed"] is True
+    assert confirm["status"] == "sent"
+    assert confirm["content_sha256"] == expected_digest
+
+    committed = cli.commit_seen(workspace, confirm, as_of=AS_OF)
+    assert committed["ok"] is True
+    assert committed["added"] >= 1

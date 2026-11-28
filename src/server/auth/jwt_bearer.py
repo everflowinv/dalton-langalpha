@@ -23,7 +23,6 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID, SUPABASE_URL
-from src.server.auth import owner_requests
 
 logger = logging.getLogger(__name__)
 
@@ -219,12 +218,15 @@ async def verify_jwt_token(
         return resolved
     if HOST_MODE == "oss":
         # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
-        from src.dalton.auth.dispatch import dispatch_oss_jwt_user_id
+        # DALTON-HOOK(share-redaction): enforce trusted loopback/owner gate in unkeyed single-user oss mode
+        from src.dalton.auth.dispatch import dispatch_oss_jwt_user_id, verify_oss_local_owner
         from src.dalton.settings import get_dalton_auth_mode
 
         if get_dalton_auth_mode() != "oss":
-            return await dispatch_oss_jwt_user_id(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
-        owner_requests.refuse_unless_owner(request.scope)
+            return await dispatch_oss_jwt_user_id(
+                credentials, local_dev_user_id=LOCAL_DEV_USER_ID, request=request
+            )
+        verify_oss_local_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
     if credentials is None:
@@ -253,12 +255,15 @@ async def get_current_auth_info(
         return info
     if HOST_MODE == "oss":
         # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
-        from src.dalton.auth.dispatch import dispatch_oss_auth_info
+        # DALTON-HOOK(share-redaction): enforce trusted loopback/owner gate in unkeyed single-user oss mode
+        from src.dalton.auth.dispatch import dispatch_oss_auth_info, verify_oss_local_owner
         from src.dalton.settings import get_dalton_auth_mode
 
         if get_dalton_auth_mode() != "oss":
-            return await dispatch_oss_auth_info(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
-        owner_requests.refuse_unless_owner(request.scope)
+            return await dispatch_oss_auth_info(
+                credentials, local_dev_user_id=LOCAL_DEV_USER_ID, request=request
+            )
+        verify_oss_local_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return AuthInfo(user_id=LOCAL_DEV_USER_ID)
     if credentials is None:

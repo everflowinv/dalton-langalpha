@@ -1792,4 +1792,165 @@ describe("`/watch` `workflow_started` Shapes, Silent EOF Reconnect & 7-Condition
     ).toBe(false);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
   });
+
+  it("retries `watch_reconnect` without closing the watch when backend returns HTTP 409 `watch_busy`, and delivers backfilled wakeup after unlock (r5 Item 1)", async () => {
+    const recoverSettledTurn2 = loadFixtureKey<I7RecoverResponse>(
+      "i7_progress_and_reconcile.json",
+      "recover_watch_reconnect_settled_turn_2",
+    );
+    const backfilledReplayPage = loadFixtureKey<
+      Array<{ event: string; data: unknown }>
+    >("replay_events.json", "backfilled_turn_2_single_page");
+    const baseIdle = loadFixtureKey<ThreadStatusInfo>(
+      "status_liveness_wakeups_watch.json",
+      "status_full_idle",
+    );
+
+    const watchBusyErr = new BackendHttpError("I-7 recover failed (409)", 409, {
+      code: "watch_busy",
+      message: "Thread watch is currently locked by another transaction; retry watch_reconnect.",
+      thread_id: THREAD_ID,
+    });
+
+    // 1) First `/watch` disconnects cleanly (EOF); first `watch_reconnect` gets 409 `watch_busy`.
+    // 2) Second `/watch` also hits EOF while still locked -> second `watch_reconnect` gets 409 `watch_busy`,
+    //    proving `evaluateWatchCloseConditions` is NEVER allowed to set `watch_active: false` on `watch_busy`.
+    // 3) Third `/watch` hits EOF after unlock -> third `watch_reconnect` succeeds with backfilled wakeup,
+    //    delivers the wakeup report, and ONLY THEN closes the watch (`watch_active: false`).
+    vi.mocked(h.backend.watchThread)
+      .mockResolvedValueOnce({
+        status: 200,
+        isSse: true,
+        events: makeSseEvents([]),
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        isSse: true,
+        events: makeSseEvents([]),
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        isSse: true,
+        events: makeSseEvents([]),
+      });
+
+    let recoverCalls = 0;
+    let sawWatchClosedBeforeUnlock = false;
+    vi.mocked(h.backend.recoverState).mockImplementation(async () => {
+      recoverCalls++;
+      if (recoverCalls <= 2) {
+        if (
+          h.backend.progressUpdates.some(
+            (u) => u.thread_watch?.watch_active === false,
+          )
+        ) {
+          sawWatchClosedBeforeUnlock = true;
+        }
+        throw watchBusyErr;
+      }
+      return structuredClone(recoverSettledTurn2);
+    });
+
+    vi.mocked(h.backend.replayThreadMessages).mockResolvedValueOnce({
+      status: 200,
+      isSse: true,
+      events: makeSseEventsFromFixture(backfilledReplayPage),
+    });
+    vi.mocked(h.backend.getThreadStatus).mockResolvedValue({
+      ...baseIdle,
+      latest_turn_index: 2,
+      turn_index: 2,
+    });
+    vi.mocked(h.backend.getThreadWakeups).mockResolvedValue([]);
+
+    const handle = h.app.orchestrator.ensureThreadWatch({
+      threadId: THREAD_ID,
+      userId: USER_ID,
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      scopeKey: "dm:ou_alice",
+      generation: 1,
+      lastSeenTurnIndex: 1,
+    });
+    await handle.promise;
+
+    expect(recoverCalls).toBe(3);
+    expect(sawWatchClosedBeforeUnlock).toBe(false);
+    expect(h.backend.recoverState).toHaveBeenCalledWith({
+      mode: "watch_reconnect",
+      thread_id: THREAD_ID,
+    });
+    expect(h.backend.deliveryClaims.map((c) => c.delivery_key)).toContain(
+      "fallback:bg_backfill_2",
+    );
+    expect(h.feishuAdapter.sentTexts.map((t) => t.text)).toContain(
+      "Backfilled wakeup report from disconnect window.",
+    );
+    const closeUpdates = h.backend.progressUpdates.filter(
+      (u) => u.thread_watch?.watch_active === false,
+    );
+    expect(closeUpdates).toHaveLength(1);
+  });
+
+  it("refuses to close watch in `evaluateWatchCloseConditions` when `watch_reconnect` returns HTTP 409 `watch_busy` (r5 Item 1)", async () => {
+    const baseIdle = loadFixtureKey<ThreadStatusInfo>(
+      "status_liveness_wakeups_watch.json",
+      "status_full_idle",
+    );
+
+    vi.mocked(h.backend.watchThread).mockImplementation(
+      async (_uid, _tid, signal) => ({
+        status: 200,
+        isSse: true,
+        events: (async function* () {
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) {
+              resolve();
+              return;
+            }
+            signal?.addEventListener("abort", () => resolve(), {
+              once: true,
+            });
+          });
+        })(),
+      }),
+    );
+
+    const handle = h.app.orchestrator.ensureThreadWatch({
+      threadId: THREAD_ID,
+      userId: USER_ID,
+      platform: "feishu",
+      targetAddress: "feishu:@me",
+      scopeKey: "dm:ou_alice",
+      generation: 1,
+      lastSeenTurnIndex: 1,
+    });
+
+    vi.mocked(h.backend.getThreadStatus).mockResolvedValueOnce({
+      ...baseIdle,
+      latest_turn_index: 2,
+      turn_index: 2,
+    });
+    vi.mocked(h.backend.getThreadWakeups).mockResolvedValueOnce([]);
+    vi.mocked(h.backend.recoverState).mockRejectedValueOnce(
+      new BackendHttpError("I-7 recover failed (409)", 409, {
+        code: "watch_busy",
+        message: "Thread watch is currently locked",
+        thread_id: THREAD_ID,
+      }),
+    );
+
+    const closed = await h.app.orchestrator.evaluateWatchCloseConditions(
+      USER_ID,
+      THREAD_ID,
+    );
+    expect(closed).toBe(false);
+    expect(handle.needsReconnectSync).toBe(true);
+    expect(
+      h.backend.progressUpdates.some(
+        (u) => u.thread_watch?.watch_active === false,
+      ),
+    ).toBe(false);
+    expect(handle.abortController.signal.aborted).toBe(false);
+  });
 });

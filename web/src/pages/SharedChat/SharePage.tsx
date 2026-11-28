@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect } from 'react';
+import React, { Suspense, useEffect, useState } from 'react'; // DALTON-HOOK(share-redaction)
 import { useParams, useSearchParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { Loader } from '@/components/ui/loader';
@@ -11,6 +11,14 @@ import { getSharedMetadata, type ShareMetadata } from './api';
 import ShareUnavailable from './ShareUnavailable';
 import SharedAppView from './SharedAppView';
 import { withCopy } from '@/i18n';
+// DALTON-HOOK(share-redaction): revocation unmount and initial-revalidation gate helpers
+import {
+  advanceShareRevalidationGate,
+  createShareRevalidationGate,
+  getStaleThreadFilesGate,
+  isShareRevalidated,
+  shouldUnmountShareView,
+} from '@/lib/dalton/shareFileGuard';
 
 // A file or app page never loads the chat replay, and an app page never loads
 // the file viewers.
@@ -49,6 +57,11 @@ function renewalDelay({ data, dataUpdatedAt }: { data?: ShareMetadata; dataUpdat
  */
 function followsLink(data?: ShareMetadata): boolean {
   return data?.kind === 'file' && data.access === 'public';
+}
+
+// DALTON-HOOK(share-redaction): public thread links carry no member grant and revalidate on focus/reconnect/visibility
+function isPublicThreadShare(data?: ShareMetadata): boolean {
+  return data?.kind === 'thread' && !data.grant;
 }
 
 function titleOf(data: ShareMetadata): string {
@@ -94,7 +107,9 @@ export default function SharePage(): React.ReactElement {
     queryKey: queryKeys.share.metadata(shareToken, userId, asVisitor, path),
     queryFn: () => getSharedMetadata(shareToken, { asVisitor, path }),
     enabled: !!shareToken && isInitialized,
-    staleTime: 60_000,
+    // DALTON-HOOK(share-redaction): always revalidate share metadata on mount; public thread links revalidate on focus/reconnect while org grant links keep renewal-only schedule
+    staleTime: 0,
+    refetchOnMount: 'always',
     refetchInterval: (query) => {
       const delay = renewalDelay(query.state);
       return delay === null ? false : Math.max(delay, MIN_RENEW_INTERVAL_MS);
@@ -102,8 +117,8 @@ export default function SharePage(): React.ReactElement {
     // The interval sleeps with a hidden tab, so one that comes back past its
     // renewal asks at once rather than on the next tick. Any earlier read
     // would mint a new grant and reload the page the owner is reading.
-    refetchOnWindowFocus: (query) => followsLink(query.state.data) || renewalDelay(query.state) === 0,
-    refetchOnReconnect: (query) => followsLink(query.state.data) || renewalDelay(query.state) === 0,
+    refetchOnWindowFocus: (query) => isPublicThreadShare(query.state.data) || followsLink(query.state.data) || renewalDelay(query.state) === 0,
+    refetchOnReconnect: (query) => isPublicThreadShare(query.state.data) || followsLink(query.state.data) || renewalDelay(query.state) === 0,
     // DALTON-HOOK(colleague-access): skip auto-retry on 503 auto_publish_paused so visitor sees readable pause copy immediately
     retry: (failureCount, err) => {
       if (apiErrorStatus(err) === 503 && apiErrorObject(err)?.code === 'auto_publish_paused') {
@@ -121,6 +136,33 @@ export default function SharePage(): React.ReactElement {
     return () => { document.title = previous; };
   }, [title]);
 
+  // DALTON-HOOK(share-redaction): revalidate public thread shares on visibilitychange and hold stale cached allow_files=true behind <Loading /> until initial revalidation settles
+  const isPublicThread = isPublicThreadShare(metadata.data);
+  const refetchMetadata = metadata.refetch;
+  useEffect(() => {
+    if (!isPublicThread) return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refetchMetadata({ cancelRefetch: false });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, [isPublicThread, refetchMetadata]);
+
+  // DALTON-HOOK(share-redaction): require a fresh successful revalidation on this mount before painting cached allow_files=true
+  const mountKey = `${shareToken}:${userId ?? ''}:${asVisitor}:${path ?? ''}`;
+  const { isFetching, isSuccess, isError, dataUpdatedAt } = metadata;
+  const [mountGate, setMountGate] = useState(() =>
+    createShareRevalidationGate(mountKey, { isFetching, isSuccess, isError, dataUpdatedAt }),
+  );
+  const hasRevalidated = isShareRevalidated(mountGate, mountKey, { isFetching, isSuccess, isError, dataUpdatedAt });
+  useEffect(() => {
+    setMountGate((prev) =>
+      advanceShareRevalidationGate(prev, mountKey, { isFetching, isSuccess, isError, dataUpdatedAt }),
+    );
+  }, [mountKey, isFetching, isSuccess, isError, dataUpdatedAt]);
+
   // A failed refetch keeps the last answer, and the page it drew keeps working
   // until that answer's own credential lapses. A visitor's link answering 404
   // is a stop, not a failure: its files already refuse the grant on screen.
@@ -132,7 +174,8 @@ export default function SharePage(): React.ReactElement {
   // DALTON-HOOK(colleague-access): legacy shared link paused pending owner confirmation (HTTP 503)
   const paused = metadata.isError && apiErrorStatus(metadata.error) === 503
     && apiErrorObject(metadata.error)?.code === 'auto_publish_paused';
-  if (!data || ((gone || membersOnly) && followsLink(data))) {
+  // DALTON-HOOK(share-redaction): unmount shared thread and public file views on 404 or 401 members_only
+  if (!data || shouldUnmountShareView(data, gone || membersOnly)) {
     if (!metadata.isError) return <Loading />;
     if (gone) return <ShareUnavailable />;
     if (membersOnly) return <ShareUnavailable variant="membersOnly" />;
@@ -147,11 +190,25 @@ export default function SharePage(): React.ReactElement {
     return <ShareUnavailable variant="failed" onRetry={() => void metadata.refetch()} />;
   }
 
+  // DALTON-HOOK(share-redaction): gate stale cached allow_files=true until initial mount revalidation succeeds
+  const staleGate = getStaleThreadFilesGate(data, { isFetching, isError }, hasRevalidated);
+  if (staleGate === 'loading') return <Loading />;
+  if (staleGate === 'failed') {
+    return <ShareUnavailable variant="failed" onRetry={() => void metadata.refetch()} />;
+  }
+
   switch (data.kind) {
     case 'thread':
       return (
         <Suspense fallback={<Loading />}>
-          <SharedChatView key={shareToken} shareToken={shareToken} access={data.grant} metadata={data} />
+          <SharedChatView
+            key={shareToken}
+            shareToken={shareToken}
+            access={data.grant}
+            metadata={data}
+            refreshStamp={metadata.dataUpdatedAt}
+            onPermissionForbidden={() => void metadata.refetch({ cancelRefetch: false })}
+          />
         </Suspense>
       );
     case 'file':

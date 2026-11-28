@@ -7,7 +7,6 @@ import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec, patch
 
@@ -324,7 +323,6 @@ async def test_checklist_3_public_downgrade_unshares_and_invalidates_old_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.server.app import public as public_app
-    from src.server.database import artifacts as artifacts_db
     from src.server.database.share_links import ShareLink
 
     public_monitor = _make_monitor(
@@ -567,7 +565,6 @@ async def test_checklist_5_workspace_after_turn_update_dedup_and_prune(
         create_autospec(artifacts_db.get_artifact, return_value=artifact),
     )
 
-    v1_bytes = b"<html><body>v1</body></html>"
     v2_bytes = b"<html><body>v2</body></html>"
     snap_v2 = Snapshot(
         entries=[ManifestEntry("report.html", len(v2_bytes), "entry")],
@@ -642,7 +639,6 @@ async def test_checklist_5_workspace_after_turn_update_dedup_and_prune(
         executed_sql.append((sql, params))
 
     cur.execute.side_effect = _capture_exec
-    conn = create_autospec(AsyncConnection, instance=True)
     deleted_count = await real_prune(
         cur, ARTIFACT_ID, published_seq=105, keep_count=100
     )
@@ -886,6 +882,11 @@ async def test_checklist_7_realtime_data_origin_null_etag_304_and_sandbox_csp(
                 "sha256": sha,
                 "updated_at": NOW.isoformat(),
                 "data": payload,
+                "attempt_seq": 0,
+                "is_stale": False,
+                "last_attempt_at": None,
+                "has_fetch_error": False,
+                "last_error": None,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -1620,10 +1621,20 @@ async def test_r2_3_public_write_paths_check_current_admin_and_data_job_approver
     monkeypatch.setattr(
         "src.dalton.settings.is_dalton_supabase_auth_enabled", lambda: True
     )
+    from src.dalton.monitors import shared_documents as shared_doc_service
+
     monkeypatch.setattr(
         monitor_db,
         "list_workspace_auto_update_monitors",
         create_autospec(orig_list_auto, return_value=[]),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "list_workspace_auto_update_shared_documents",
+        create_autospec(
+            shared_doc_service.list_workspace_auto_update_shared_documents,
+            return_value=[],
+        ),
     )
     monkeypatch.setattr(
         artifacts_db,
@@ -1738,6 +1749,11 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         "category": "overview",
         "visibility": "company",
         "published_seq": 0,
+        "last_verified_seq": None,
+        "last_verified_at": None,
+        "source_kind": "data_job",
+        "source_ref": "monitor-live-demo",
+        "acl_revision": 1,
         "last_publish_run_id": None,
         "last_publish_error": None,
         "last_publish_failed_at": None,
@@ -1751,8 +1767,10 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         cur.__aenter__.return_value = cur
         cur.__aexit__.return_value = False
         cur._rows: list[Any] = []
+        cur.rowcount = 0
 
         async def _exec(sql: str, params: Any = None) -> None:
+            cur.rowcount = 0
             if "FROM dalton_monitors" in sql and "FOR UPDATE" in sql:
                 cur._rows = [dict(monitor_row)]
             elif "FROM dalton_monitor_publish_runs" in sql and sql.lstrip().startswith(
@@ -1767,18 +1785,31 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
                 else:
                     pk_ledger[(mid, rid)] = params[2] if len(params) > 2 else 0
                     cur._rows = [{"monitor_id": mid}]
+            elif "DELETE FROM dalton_monitor_publish_runs" in sql:
+                mid, rid = params[0], params[1]
+                pk_ledger.pop((mid, rid), None)
+                cur._rows = []
             elif "UPDATE dalton_monitor_publish_runs" in sql:
                 pseq, mid, rid = params
                 pk_ledger[(mid, rid)] = pseq
                 cur._rows = []
             elif "UPDATE dalton_monitors" in sql and "last_publish_error = NULL" in sql:
-                monitor_row["published_seq"] = params[0]
-                monitor_row["last_publish_run_id"] = params[2]
-                monitor_row["last_publish_error"] = None
+                if "SET published_seq = %s" in sql:
+                    monitor_row["published_seq"] = params[0]
+                    monitor_row["last_verified_seq"] = params[1]
+                    monitor_row["last_publish_run_id"] = params[3] if len(params) >= 5 else params[2]
+                    monitor_row["last_publish_error"] = None
+                    cur.rowcount = 1
+                else:
+                    monitor_row["last_verified_seq"] = params[0]
+                    monitor_row["last_publish_run_id"] = params[2]
+                    monitor_row["last_publish_error"] = None
+                    cur.rowcount = 1
                 cur._rows = []
             elif "UPDATE dalton_monitors" in sql and "last_publish_error = %s" in sql:
                 monitor_row["last_publish_error"] = params[0]
                 monitor_row["last_publish_failed_at"] = NOW
+                cur.rowcount = 1
                 cur._rows = []
             elif "FROM dalton_monitors m" in sql:
                 cur._rows = [
@@ -1877,6 +1908,23 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         monitor_db,
         "_prune_monitor_versions_in_cur",
         create_autospec(monitor_db._prune_monitor_versions_in_cur, return_value=0),
+    )
+    from src.dalton.monitors import verify as monitor_verify
+
+    async def _ok_verify(**kwargs: Any) -> monitor_verify.VerifiedCandidateResult:
+        return monitor_verify.VerifiedCandidateResult(
+            artifact_id=kwargs["artifact_id"],
+            candidate_seq=kwargs["candidate_seq"],
+            entry_path=kwargs["entry_path"],
+            entry_sha256=kwargs["snap_entry_sha256"],
+            verified_dependencies=0,
+            public_probed=False,
+        )
+
+    monkeypatch.setattr(
+        monitor_verify,
+        "verify_candidate_monitor_version",
+        create_autospec(monitor_verify.verify_candidate_monitor_version, side_effect=_ok_verify),
     )
 
     # 1) run-A succeeds -> seq 1; run-B succeeds -> seq 2; replaying run-A is STILL deduplicated!
@@ -4151,6 +4199,20 @@ async def test_all_registered_data_job_monitors_coexist_without_overwriting(
     shared_dir = data_root / data_job_registry.SENTIMENT_SHARED_REL_DIR
     shared_dir.mkdir(parents=True)
     (shared_dir / "panel.css").write_text(":root{}", encoding="utf-8")
+    pm_status_file = data_root / "state" / "monitor-feeds" / "pm_cockpit" / "status.json"
+    pm_status_file.parent.mkdir(parents=True, exist_ok=True)
+    pm_status_file.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "us": {"ok": True, "stale": False},
+                    "cn": {"ok": True, "stale": False},
+                    "cn_valuation": {"ok": True, "stale": False},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     expected_bindings: list[MonitorDataJobBinding] = []
     for jk in all_jobs:
@@ -4737,6 +4799,27 @@ def _setup_legacy_migration_db(
                 link = share_links.get(aid)
                 cur._rows = [_artifact_row(link)] if link else []
                 return
+            if (
+                "FROM SHARE_LINKS L" in upper
+                and "WHERE L.ARTIFACT_ID = %(ARTIFACT_ID)S AND L.KIND = 'FILE'" in upper
+            ):
+                aid = params["artifact_id"]
+                link = share_links.get(aid)
+                cur._rows = [_artifact_row(link)] if link else []
+                return
+            if (
+                "FROM SHARE_LINKS" in upper
+                and "AND PATH = %S" in upper
+                and "AND ARTIFACT_ID <> %S::UUID" in upper
+            ):
+                ws_id, target_path, self_aid = params
+                occ = _find_link_by_path(ws_id, target_path)
+                cur._rows = (
+                    [{"artifact_id": occ["artifact_id"]}]
+                    if occ is not None and occ["artifact_id"] != self_aid
+                    else []
+                )
+                return
             if "FROM SHARE_LINKS L WHERE L.WORKSPACE_ID = %S AND L.KIND = 'FILE' AND L.PATH = %S" in upper:
                 link = _find_link_by_path(params[0], params[1])
                 cur._rows = [_artifact_row(link)] if link else []
@@ -4797,7 +4880,27 @@ def _setup_legacy_migration_db(
                 cur._rows = [dict(row)] if row else []
                 return
             if "INSERT INTO DALTON_MONITORS (" in upper:
-                slug, aid, owner_uid, title, cat, sort_order, vis, keep_upd, src_kind, src_ref = params
+                if len(params) == 13:
+                    (
+                        slug,
+                        aid,
+                        owner_uid,
+                        title,
+                        cat,
+                        sort_order,
+                        vis,
+                        pub_seq,
+                        ver_seq,
+                        keep_upd,
+                        src_kind,
+                        src_ref,
+                        run_id,
+                    ) = params
+                else:
+                    slug, aid, owner_uid, title, cat, sort_order, vis, keep_upd, src_kind, src_ref = params
+                    pub_seq = 0
+                    ver_seq = None
+                    run_id = None
                 mid = f"60000000-0000-4000-8000-{len(monitors_table) + 1:012d}"
                 monitors_table[mid] = {
                     "monitor_id": mid,
@@ -4808,12 +4911,14 @@ def _setup_legacy_migration_db(
                     "category": cat,
                     "sort_order": sort_order,
                     "visibility": vis,
-                    "published_seq": 0,
+                    "published_seq": pub_seq,
+                    "last_verified_seq": ver_seq,
+                    "last_verified_at": NOW if ver_seq is not None else None,
                     "keep_updated": keep_upd,
                     "source_kind": src_kind,
                     "source_ref": src_ref,
                     "acl_revision": 1,
-                    "last_publish_run_id": None,
+                    "last_publish_run_id": run_id,
                     "last_publish_error": None,
                     "last_publish_failed_at": None,
                     "created_at": NOW,
@@ -4827,13 +4932,34 @@ def _setup_legacy_migration_db(
                 cur._rows = []
                 return
             if "UPDATE DALTON_MONITORS SET PUBLISHED_SEQ = %S" in upper:
-                seq, owner_uid, run_id, mid = params
+                if len(params) == 6:
+                    seq, ver_seq, owner_uid, run_id, mid, _expected = params
+                elif len(params) == 5:
+                    seq, ver_seq, owner_uid, run_id, mid = params
+                else:
+                    seq, owner_uid, run_id, mid = params
+                    ver_seq = seq
                 monitors_table[mid]["published_seq"] = seq
+                monitors_table[mid]["last_verified_seq"] = ver_seq
+                monitors_table[mid]["last_verified_at"] = NOW
                 monitors_table[mid]["owner_user_id"] = owner_uid
                 if run_id is not None:
                     monitors_table[mid]["last_publish_run_id"] = run_id
                 monitors_table[mid]["last_publish_error"] = None
                 monitors_table[mid]["last_publish_failed_at"] = None
+                cur.rowcount = 1
+                cur._rows = []
+                return
+            if "UPDATE DALTON_MONITORS SET LAST_VERIFIED_SEQ = %S" in upper:
+                ver_seq, owner_uid, run_id, mid = params
+                monitors_table[mid]["last_verified_seq"] = ver_seq
+                monitors_table[mid]["last_verified_at"] = NOW
+                monitors_table[mid]["owner_user_id"] = owner_uid
+                if run_id is not None:
+                    monitors_table[mid]["last_publish_run_id"] = run_id
+                monitors_table[mid]["last_publish_error"] = None
+                monitors_table[mid]["last_publish_failed_at"] = None
+                cur.rowcount = 1
                 cur._rows = []
                 return
             if "UPDATE DALTON_MONITORS SET LAST_PUBLISH_ERROR = %S" in upper:

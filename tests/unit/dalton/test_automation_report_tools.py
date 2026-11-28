@@ -820,3 +820,92 @@ async def test_text_submit_forwards_the_markdown_body(storage: SimpleNamespace) 
     _assert_sender_received_only(storage, _EXECUTION)
     assert payload["content_kind"] == "text"
     assert payload["payload"]["text"] == "# Hi"
+
+
+@pytest.mark.asyncio
+async def test_submit_normalizes_cards_and_returns_warnings(
+    storage: SimpleNamespace,
+) -> None:
+    malformed_cards = [
+        {
+            "schema": "2.0",
+            "header": {
+                "title": "ANT 多空跟踪",
+                "text_tag_list": [
+                    {
+                        "text": {"tag": "plain_text", "content": "ANT"},
+                        "color": "purple",
+                    }
+                ],
+            },
+            "body": {
+                "elements": [
+                    {"tag": "text", "content": "核心跟踪结论"},
+                ]
+            },
+        }
+    ]
+    payload = await _invoke(_submit_args(cards=malformed_cards))
+    forwarded_cards = storage.submit.await_args.kwargs["cards"]
+    assert forwarded_cards == [
+        {
+            "schema": "2.0",
+            "header": {
+                "title": {"tag": "plain_text", "content": "ANT 多空跟踪"},
+                "text_tag_list": [
+                    {
+                        "tag": "text_tag",
+                        "text": {"tag": "plain_text", "content": "ANT"},
+                        "color": "purple",
+                    }
+                ],
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "核心跟踪结论"},
+                ]
+            },
+        }
+    ]
+    assert payload["ok"] is True
+    assert payload["action"] == "submit"
+    assert payload["status"] == "pending"
+    assert payload["delivery_confirmed"] is False
+    assert payload["warnings"] == [
+        "cards[0].header.title",
+        "cards[0].header.text_tag_list[0].tag",
+        "cards[0].body.elements[0]",
+    ]
+    # Body text must not leak into warnings
+    assert all("核心跟踪结论" not in w for w in payload["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_submit_valid_cards_omits_warnings_field(
+    storage: SimpleNamespace,
+) -> None:
+    payload = await _invoke(_submit_args())
+    assert "warnings" not in payload
+
+
+@pytest.mark.asyncio
+async def test_submit_preserves_inline_code_backticks_for_digest_stability(
+    storage: SimpleNamespace,
+) -> None:
+    cards = [
+        {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "营收 `16,956.0`，同比 `+46.7%`，代码 `ANT`。",
+                    }
+                ]
+            },
+        }
+    ]
+    payload = await _invoke(_submit_args(cards=cards))
+    forwarded_cards = storage.submit.await_args.kwargs["cards"]
+    assert forwarded_cards == cards
+    assert "warnings" not in payload

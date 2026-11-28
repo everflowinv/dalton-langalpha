@@ -413,6 +413,10 @@ def _snapshot_matches_action(
             and snapshot.get("target_tier") == action_req.get("target_tier")
             and snapshot.get("affected_workspaces")
             == action_req.get("affected_workspaces")
+            and (
+                action_type != "watchlist_tier_policy"
+                or snapshot.get("policy_diff") == action_req.get("policy_diff")
+            )
         )
     # --- DALTON-HOOK(watchlist): end ---
     return False

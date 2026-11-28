@@ -216,6 +216,8 @@ class RunOutcome:
     images: Dict[str, str] = field(default_factory=dict)
     # DALTON-HOOK(budget): proven zero LLM calls during this run so finalize may stamp usage_settled_at without a usage row.
     no_model_calls: bool = field(default=False, kw_only=True)
+    # DALTON-HOOK(deliverable-text): per-message captured image URL map persisted for replay and I-7 :imgfix isolation.
+    images_by_message: Dict[str, Dict[str, str]] = field(default_factory=dict, kw_only=True)
 
 
 @asynccontextmanager
@@ -788,6 +790,9 @@ async def finalize_run(
         replay_facts["error_frame"] = record.error_frame
     if outcome.images:
         replay_facts["images"] = outcome.images
+    # DALTON-HOOK(deliverable-text): persist per-message captured images in replay_facts for per-delivery :imgfix
+    if outcome.images_by_message:
+        replay_facts["images_by_message"] = outcome.images_by_message
     run_metadata = dict(outcome.metadata or {})
     # A checkpoint the run did not write was there before START. For a fork
     # whose run died before its first step, that is the abandoned branch's

@@ -3438,3 +3438,1841 @@ async def test_r8_wiki_pause_lease_owner_ttl_dotenv_disabled_feishu_pkg_and_sec_
     assert inc["Missing Date"] is None
     assert inc["Missing NA"] is None
     assert inc["Total Revenue"] == 95000000000.0
+
+
+# ---------------------------------------------------------------------------
+# 11. Small Fix Pack 3: BZ1 (wiki image index tx), BZ2 (sales-notes vectors &
+#     hybrid merge), BZ3 (discovered-tool routing fallbacks & clear errors)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bz1_wiki_image_index_rolls_back_with_document_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ1: When wiki ingest fails after document insert (before commit), image index & new asset file roll back too."""
+    wiki = OpenWikiStore(tmp_path / "wiki_bz1")
+    wiki._cli_checked = True
+    wiki._cli_module = None
+    wiki.ensure_schema()
+
+    png_bytes = _make_minimal_png_bytes()
+
+    # Case 1: DB failure on ingest_receipts AFTER documents/chunks/image insert -> images_db & asset file must roll back
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        conn.execute(
+            "CREATE TRIGGER fail_receipt_for_bz1 BEFORE INSERT ON ingest_receipts "
+            "WHEN NEW.request_id = 'bz1-fail-receipt' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated receipt failure'); END;"
+        )
+        conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated receipt failure"):
+        await wiki.ingest(
+            {
+                "request_id": "bz1-fail-receipt",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "研报笔记",
+                "date": "2026-11-26",
+                "file": {
+                    "filename": "architecture_diagram.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    if wiki.images_db.is_file():
+        with sqlite3.connect(wiki.images_db) as img_conn:
+            assert img_conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0] == 0
+            assert img_conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+    assets_dir = wiki.images_dir / "assets"
+    if assets_dir.exists():
+        assert [p for p in assets_dir.rglob("*") if p.is_file()] == []
+
+    # Case 2: Disk write failure on original binary file (os.open) -> images_db & documents both roll back cleanly
+    orig_os_open = os.open
+
+    def _fail_original_open(path: Any, flags: int, *a: Any, **kw: Any) -> int:
+        if "originals" in str(path):
+            raise OSError("simulated disk full on original write")
+        return orig_os_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(os, "open", create_autospec(os.open, side_effect=_fail_original_open))
+    with pytest.raises(OSError, match="simulated disk full on original write"):
+        await wiki.ingest(
+            {
+                "request_id": "bz1-fail-orig",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "研报笔记",
+                "date": "2026-11-26",
+                "file": {
+                    "filename": "rack_layout.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.undo()
+
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    if wiki.images_db.is_file():
+        with sqlite3.connect(wiki.images_db) as img_conn:
+            assert img_conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0] == 0
+            assert img_conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+
+    # Case 3: Subsequent valid image ingest commits both wiki_db and images_db atomically and is searchable/readable
+    code_ok, res_ok = await wiki.ingest(
+        {
+            "request_id": "bz1-ok-1",
+            "target_type": "company",
+            "target": "NVDA",
+            "content_type": "研报笔记",
+            "date": "2026-11-26",
+            "file": {
+                "filename": "rack_layout.png",
+                "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+            },
+        }
+    )
+    assert code_ok == 200 and res_ok["ok"] is True
+    assert str(res_ok.get("image_id") or "").startswith("image:")
+    img_hits = wiki.query("search", query="rack_layout", params={"media": "images"})
+    assert img_hits["ok"] is True and img_hits["result_count"] == 1
+    assert img_hits["results"][0]["document_id"] == res_ok["image_id"]
+
+
+@pytest.mark.asyncio
+async def test_bz2_sales_notes_ingest_writes_embeddings_and_search_merges_keyword_and_semantic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ2: Sales-notes ingest persists chunk embeddings and default search merges keyword + semantic hits."""
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_bz2")
+    store.ensure_schema()
+
+    # Deterministic 4-dim semantic space:
+    # - AI/accelerator topic: [1, 0, 0, 0]
+    # - Consumer retail topic: [0, 1, 0, 0]
+    def _vec_for(text: str) -> list[float]:
+        low = text.lower()
+        if any(tok in low for tok in ("cowos", "packaging", "accelerator", "gpu", "rubin")):
+            return [1.0, 0.0, 0.0, 0.0]
+        if any(tok in low for tok in ("retail", "store", "apparel")):
+            return [0.0, 1.0, 0.0, 0.0]
+        return [0.0, 0.0, 1.0, 0.0]
+
+    md_cli = store._library().module("sales-notes")
+    spy_embed_texts = create_autospec(
+        md_cli.embed_texts,
+        side_effect=lambda texts, config: [_vec_for(t) for t in texts],
+    )
+    spy_embed_query = create_autospec(
+        md_cli.embed_query,
+        side_effect=lambda text, config: _vec_for(text),
+    )
+    monkeypatch.setattr(md_cli, "embed_texts", spy_embed_texts)
+    monkeypatch.setattr(md_cli, "embed_query", spy_embed_query)
+    # Reuse the patched module inside store._library() calls
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(
+        store,
+        "_library",
+        create_autospec(orig_lib, side_effect=_patched_lib),
+    )
+
+    # Seed one older unindexed note (NULL embedding, matches keyword 'accelerator' directly)
+    # and one embedded unrelated retail note (to prove keyword hits aren't buried by embedded noise)
+    retail_blob = np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float32).tobytes()
+    with sqlite3.connect(store.mail_db) as conn:
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-20",
+                "em-kw",
+                "mail-kw-only",
+                "GS",
+                "Legacy Accelerator Note",
+                0,
+                "Legacy accelerator backlog note without vector",
+                None,
+                "2026-11-20T10:00:00Z",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-21",
+                "em-ret",
+                "mail-retail",
+                "MS",
+                "Retail Foot Traffic",
+                0,
+                "Mall retail store apparel sales update",
+                retail_blob,
+                "2026-11-21T10:00:00Z",
+            ),
+        )
+        conn.commit()
+
+    # 1. Ingest a new sales note that uses "CoWoS packaging" (NO literal word "accelerator")
+    code, res = await store.ingest_sales_note(
+        {
+            "request_id": "bz2-note-1",
+            "institution": "Morgan Stanley",
+            "title": "Taiwan Foundry Check",
+            "date": "2026-11-25",
+            "content": "CoWoS packaging ramp continues strongly into 2027.",
+        }
+    )
+    assert code == 200 and res["ok"] is True
+    assert spy_embed_texts.call_count == 1
+
+    # Verify embedding BLOB was actually persisted in email_chunks
+    with sqlite3.connect(store.mail_db) as conn:
+        emb_row = conn.execute(
+            "SELECT embedding FROM email_chunks WHERE message_id = ?",
+            (res["doc_key"],),
+        ).fetchone()
+    assert emb_row is not None and emb_row[0] is not None
+    stored_vec = np.frombuffer(emb_row[0], dtype=np.float32)
+    assert stored_vec.shape == (4,)
+    assert np.allclose(stored_vec, [1.0, 0.0, 0.0, 0.0])
+
+    # 2. Semantic-only query ("GPU") has zero keyword match on the new note, yet default search MUST return it
+    sales_conn = lib_mod.SalesNotesConnector(store)
+    sem_only = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "limit": 5},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert sem_only["ok"] is True
+    assert any(r["original_document_id"] == res["doc_key"] for r in sem_only["results"])
+    assert sem_only["results"][0]["original_document_id"] == res["doc_key"]
+
+    # 3. Query matching keyword on unindexed note AND semantic on newly ingested note returns BOTH merged
+    merged = await sales_conn.call_tool(
+        "search",
+        {"query": "accelerator", "limit": 2},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert merged["ok"] is True
+    merged_keys = {r["original_document_id"] for r in merged["results"]}
+    assert res["doc_key"] in merged_keys, f"Semantic hit missing from merged results: {merged['results']}"
+    assert "mail-kw-only" in merged_keys, f"Keyword hit buried in merged results: {merged['results']}"
+
+    # 4. Explicit search_mode="keyword" skips query embedding and returns only keyword matches
+    prev_q_calls = spy_embed_query.call_count
+    kw_only = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "params": {"search_mode": "keyword"}},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert kw_only["ok"] is True
+    assert kw_only["results"] == []
+    assert spy_embed_query.call_count == prev_q_calls
+
+
+@pytest.mark.asyncio
+async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing_tools_and_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ3: Handle unimportable wrapper in connector_transport, missing `tools` in health check,
+    and discovered-tool awareness in content_assembly + topic-research/workflow.js."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        compile_check,
+        run_workflow_script,
+    )
+    from src.dalton.data_map import health as dm_health
+
+    ct_mod = _load_module_from_path(
+        "_test_ct_bz3",
+        REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-conventions" / "scripts" / "connector_transport.py",
+    )
+
+    # 1. connector_transport.py: unimportable wrapper + no `tools` metadata MUST fail closed (not guess True!)
+    cfg_dedicated_only = tmp_path / "mcp_dedicated_only.json"
+    cfg_dedicated_only.write_text(
+        json.dumps({"servers": {"dalton_company_wiki": {"enabled": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(cfg_dedicated_only))
+    monkeypatch.delitem(sys.modules, "tools.dalton_company_wiki", raising=False)
+    monkeypatch.setitem(sys.modules, "tools", type(sys)("tools"))
+
+    from ptc_agent.core.sandbox import mcp_client_runtime
+
+    fake_mcp_call = create_autospec(
+        mcp_client_runtime.call_mcp_tool_with_error_flag,
+        side_effect=lambda server_name, tool_name, arguments: (
+            False,
+            {"ok": True, "server": server_name, "tool": tool_name, "args": arguments},
+        ),
+    )
+    fake_legacy_call = create_autospec(
+        mcp_client_runtime._call_mcp_tool,
+        side_effect=lambda server_name, tool_name, arguments: {
+            "ok": True,
+            "server": server_name,
+            "tool": tool_name,
+            "args": arguments,
+        },
+    )
+
+    fake_mcp_flagged = type(sys)("mcp_client")
+    fake_mcp_flagged.call_mcp_tool_with_error_flag = fake_mcp_call  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_flagged)
+
+    assert ct_mod.server_supports_tool(
+        "dalton_company_wiki",
+        "search",
+        servers_cfg={"dalton_company_wiki": {"enabled": True}},
+    ) is False
+    tr_unverified = ct_mod.resolve_connector_transport("company-wiki", tool_name="search")
+    assert tr_unverified["mode"] is None
+    assert "dalton_company_wiki" in tr_unverified["error"]
+    assert "tools" in tr_unverified["error"]
+
+    # 1b. Mixed workspace where dedicated server passes config `tools`, mcp_client lacks flagged helper,
+    #     and `tools.dalton_company_wiki` fails to import -> MUST fall back to `researchdata`!
+    cfg_mixed_broken = tmp_path / "mcp_mixed_broken.json"
+    cfg_mixed_broken.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "dalton_company_wiki": {
+                        "enabled": True,
+                        "tools": [{"name": "search", "inputSchema": {"properties": {"query": {}}}}],
+                    },
+                    "researchdata": {"enabled": True},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(cfg_mixed_broken))
+    fake_mcp_unflagged = type(sys)("mcp_client")
+    monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_unflagged)
+    fake_tools_pkg = type(sys)("tools")
+    fake_rd = type(sys)("tools.researchdata")
+    fake_rd._call_mcp_tool = fake_legacy_call  # type: ignore[attr-defined]
+    fake_tools_pkg.researchdata = fake_rd  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tools", fake_tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.researchdata", fake_rd)
+    monkeypatch.delitem(sys.modules, "tools.dalton_company_wiki", raising=False)
+
+    tr_fb = ct_mod.resolve_connector_transport("company-wiki", tool_name="search")
+    assert tr_fb["mode"] == "legacy", f"Expected fallback to legacy researchdata when wrapper unimportable: {tr_fb}"
+    assert tr_fb["server"] == "researchdata"
+
+    # 2. data_map/health.py: tools/list response missing `tools` MUST fail closed and never invoke tools/call
+    _clean_profile_env(monkeypatch, profile="core")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_URL", "http://research-host:8951")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_TOKEN", "tok-bz3")
+    seen_rpc_methods: list[str] = []
+
+    def _missing_tools_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_rpc_methods.append(str(body.get("method")))
+        if body.get("method") == "tools/list":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}})
+
+    orig_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        create_autospec(
+            httpx.AsyncClient,
+            side_effect=lambda *a, **kw: orig_async_client(*a, **{**kw, "transport": httpx.MockTransport(_missing_tools_handler)}),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="tools"):
+        await dm_health.default_call_research_host_connector("company-wiki", "list", {"limit": 1})
+    assert seen_rpc_methods == ["tools/list"], f"tools/call must not run when tools/list omits `tools`: {seen_rpc_methods}"
+
+    # 3. content_assembly.py: discovered_servers overrides deployment-only assumptions
+    wf_path = REPO_ROOT / "workflows" / "topic-research" / "workflow.js"
+    # 3a. Core with COMPANY_WIKI deployment cap, but workspace discovered NO internal research server
+    wf_core_no_server = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_sec": {"enabled": True}},
+    )
+    assert "internal-memory.md" not in wf_core_no_server
+    compile_check(wf_core_no_server)
+
+    # 3b. Core with COMPANY_WIKI deployment cap, server present in config but `tools: []` (no usable tool)
+    wf_core_empty_tools = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_company_wiki": {"enabled": True, "tools": []}},
+    )
+    assert "internal-memory.md" not in wf_core_empty_tools
+    compile_check(wf_core_empty_tools)
+
+    # 3c. Post-cutover Everflow (RESEARCHDATA_BRIDGE + COMPANY_WIKI + DALTON_RESEARCH_HOST_URL),
+    #     workspace only discovered `researchdata` with `research` tool (no dedicated connector) -> keeps researchdata fallback!
+    _clean_profile_env(monkeypatch, profile="everflow")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_URL", "http://host.docker.internal:8951")
+    wf_ef_fallback = read_assembled_text(
+        wf_path,
+        discovered_servers={"researchdata": {"enabled": True, "tools": ["research"]}},
+    )
+    assert "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）" in wf_ef_fallback
+    compile_check(wf_ef_fallback)
+
+    # 3d. Name + enabled WITHOUT `tools` is NOT usable (in content_assembly and in workflow.js)
+    wf_core_name_only = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_company_wiki": {"enabled": True}},
+    )
+    assert "internal-memory.md" not in wf_core_name_only
+    compile_check(wf_core_name_only)
+
+    # 4. workflows/topic-research/workflow.js runtime: prebuilt Core workflow (assembled from deployment caps only)
+    #    checks args.discovered_mcp_servers at runtime so missing connectors don't hard-block at line 265!
+    wf_core_prebuilt = read_assembled_text(wf_path, capabilities=frozenset({CapabilityId.COMPANY_WIKI}))
+    compile_check(wf_core_prebuilt)
+
+    async def _run_topic(script_src: str, extra_args: dict[str, Any], *, fail_internal: bool = False) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        dispatches: list[tuple[str, str]] = []
+
+        async def _agent(prompt: str, opts: dict[str, Any] | None = None) -> Any:
+            label = str((opts or {}).get("label") or "")
+            dispatches.append((label, prompt))
+            if label == "规划":
+                return {
+                    "file": "./research/2026-11-26-topic-ai/plan.md",
+                    "clusters": [
+                        {"id": "a", "name": "簇 A", "queries": ["q1"]},
+                        {"id": "b", "name": "簇 B", "queries": ["q2"]},
+                        {"id": "c", "name": "簇 C", "queries": ["q3"]},
+                    ],
+                    "questions": ["Q1"],
+                    "summary": "plan ok",
+                }
+            if label == "支线核验":
+                paths = [
+                    ln[2:].split("（")[0].strip()
+                    for ln in prompt.splitlines()
+                    if ln.startswith("- ") and "|" not in ln
+                ]
+                return {"files": [f"{p}|ok" for p in paths]}
+            if label == "内部记忆" and fail_internal:
+                return None
+            if label == "产物核验":
+                paths = [
+                    ln[2:].strip()
+                    for ln in prompt.splitlines()
+                    if ln.startswith("- ") and "|" not in ln
+                ]
+                return {"files": [f"{p}|{'e' * 64}" for p in paths]}
+            if (opts or {}).get("agentType") == "dalton-reviewer":
+                return {
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "items": [{"check": n, "result": "pass", "reason": "ok"} for n in range(1, 10)],
+                }
+            return {"files": ["./research/2026-11-26-topic-ai/out.md"], "summary": "done", "sha256": "a" * 64}
+
+        host = create_autospec(WorkflowHost, instance=True)
+        host.agent.side_effect = _agent
+        host.phase.side_effect = lambda _t: None
+        host.log.side_effect = lambda _m: None
+        params = {
+            "topic": "AI Capex",
+            "slug": "ai",
+            "workspace_dir": ".",
+            "as_of": "2026-11-26",
+            **extra_args,
+        }
+        outcome = await run_workflow_script(
+            script_src,
+            params,
+            host,
+            WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0),
+        )
+        assert outcome.status == "completed", outcome.error
+        return outcome.result, dispatches
+
+    # 4a. No internal research server discovered at runtime -> skips 内部记忆 branch & does NOT block at line 265
+    res_skip, disp_skip = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_sec": {"enabled": True}}},
+    )
+    assert res_skip["ok"] is True, res_skip
+    assert not any(lbl == "内部记忆" for lbl, _ in disp_skip)
+
+    # 4b. Direct connector missing, `dalton_research_all` discovered -> falls back to `dalton_research_all`
+    res_rd, disp_rd = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_research_all": {"enabled": True, "tools": [{"name": "search"}]}}},
+    )
+    assert res_rd["ok"] is True, res_rd
+    internal_prompts = [p for lbl, p in disp_rd if lbl == "内部记忆"]
+    assert internal_prompts and "dalton_research_all" in internal_prompts[0]
+
+    # 4c. Dedicated server discovered with `search` tool, but subagent fails -> blocks cleanly at line 265
+    res_blk, _ = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": [{"name": "search"}]}}},
+        fail_internal=True,
+    )
+    assert res_blk["ok"] is False
+    assert "内部记忆检索" in str(res_blk.get("blocked") or "")
+
+    # 4d. Direct server has only {enabled: true} (no tools), federated `dalton_research_all` has `search`
+    #     -> direct server MUST NOT suppress federated fallback!
+    res_name_only_fb, disp_name_only_fb = await _run_topic(
+        wf_core_prebuilt,
+        {
+            "discovered_mcp_servers": {
+                "dalton_company_wiki": {"enabled": True},
+                "dalton_research_all": {"enabled": True, "tools": ["search"]},
+            }
+        },
+    )
+    assert res_name_only_fb["ok"] is True, res_name_only_fb
+    fb_prompts = [p for lbl, p in disp_name_only_fb if lbl == "内部记忆"]
+    assert fb_prompts and "dalton_research_all" in fb_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_r2_workflow_server_discovery_overwrites_caller_and_aligns_check_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 items 2, 3 & 5:
+    - Core default capabilities (`COMPANY_WIKI`) assemble `topic-research/workflow.js` without proprietary names.
+    - `resolve_launch_discovered_mcp_servers` builds minimal tools strictly from server `mcp_registry`,
+      overwrites caller `discovered_mcp_servers`/`mcp_servers`/`internal_memory_decision`, rejects
+      tool-less servers, and explicitly falls back on discovery error.
+    - `dalton_check_done` honors the same server-recorded decision from `args.json` (and ignores caller spoofing).
+    """
+    from ptc_agent.core.mcp_registry import MCPRegistry, MCPToolInfo
+    from src.dalton.capabilities import effective_capabilities
+    from src.dalton.content_assembly import (
+        read_assembled_text,
+        resolve_launch_discovered_mcp_servers,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    _clean_profile_env(monkeypatch, profile="core")
+    core_caps = effective_capabilities()
+    assert core_caps == frozenset({CapabilityId.COMPANY_WIKI})
+
+    # Item 5: Core default assembled workflow.js has zero proprietary connector names
+    wf_js = read_assembled_text(
+        REPO_ROOT / "workflows" / "topic-research" / "workflow.js",
+        capabilities=core_caps,
+    )
+    assert "dalton_company_wiki" in wf_js
+    for banned in ("dalton_tmtb", "tmtb", "dalton_sales_notes", "dalton_funda_ai", "sales_mail"):
+        assert banned not in wf_js.lower(), f"Core default workflow.js leaked {banned!r}"
+
+    # Item 2a: Server discovery overwrites caller-supplied discovered_mcp_servers / mcp_servers / decision
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {
+        "dalton_company_wiki": [],  # enabled name with zero tools -> NOT usable
+        "dalton_sec": [MCPToolInfo(name="search_filings", description="sec", input_schema={}, server_name="dalton_sec")],
+    }
+    spoofed_params = {
+        "topic": "AI Capex",
+        "slug": "ai",
+        "workspace_dir": ".",
+        "as_of": "2026-11-26",
+        "discovered_mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": ["search"]}},
+        "mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": ["search"]}},
+        "internal_memory_decision": {"run": True, "mode": "direct"},
+    }
+    resolved_skip = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", spoofed_params, mcp_registry=reg_empty
+    )
+    assert "mcp_servers" not in resolved_skip
+    assert "dalton_company_wiki" not in resolved_skip["discovered_mcp_servers"]
+    assert resolved_skip["discovered_mcp_servers"] == {"dalton_sec": {"enabled": True, "tools": ["search_filings"]}}
+    assert resolved_skip["internal_memory_decision"] == {
+        "run": False,
+        "mode": "skip",
+        "discovery_status": "ok",
+    }
+
+    # Item 2b: Discovery exception -> explicit fallback (empty servers, skip internal memory, status="error")
+    reg_err = create_autospec(MCPRegistry, instance=True)
+    reg_err.config = None
+    reg_err.get_all_tools.side_effect = RuntimeError("registry broken")
+    resolved_err = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", spoofed_params, mcp_registry=reg_err
+    )
+    assert resolved_err["discovered_mcp_servers"] == {}
+    assert resolved_err["internal_memory_decision"] == {
+        "run": False,
+        "mode": "skip",
+        "discovery_status": "error",
+    }
+
+    # Item 2c: Direct connector empty, federated connector usable -> explicit federated fallback
+    reg_fed = create_autospec(MCPRegistry, instance=True)
+    reg_fed.config = None
+    reg_fed.get_all_tools.return_value = {
+        "dalton_company_wiki": [],
+        "dalton_research_all": [MCPToolInfo(name="search", description="s", input_schema={}, server_name="dalton_research_all")],
+    }
+    resolved_fed = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", {"topic": "AI", "slug": "ai", "workspace_dir": "."}, mcp_registry=reg_fed
+    )
+    assert resolved_fed["internal_memory_decision"] == {
+        "run": True,
+        "mode": "federated",
+        "discovery_status": "ok",
+    }
+
+    # Item 3: dalton_check_done uses the SAME server-signed decision from args.json
+    # Build a minimal backend exposing files for topic-research WITHOUT internal-memory.md
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from src.dalton.content_assembly import sign_topic_research_internal_memory_decision
+
+    signed_skip = sign_topic_research_internal_memory_decision(
+        resolved_skip,
+        short_thread_id="th123456",
+        run_id="wf-skip",
+    )
+    signed_fed = sign_topic_research_internal_memory_decision(
+        resolved_fed,
+        short_thread_id="th123456",
+        run_id="wf-run",
+    )
+    files_map: dict[str, str] = {
+        ".agents/threads/th123456/workflows/wf-skip/args.json": json.dumps(signed_skip, ensure_ascii=False),
+        ".agents/threads/th123456/workflows/wf-skip/status.json": json.dumps(
+            {"run_id": "wf-skip", "name": "topic-research", "status": "completed", "updated_at": 1.0}
+        ),
+        ".agents/threads/th123456/workflows/wf-run/args.json": json.dumps(signed_fed, ensure_ascii=False),
+        ".agents/threads/th123456/workflows/wf-run/status.json": json.dumps(
+            {"run_id": "wf-run", "name": "topic-research", "status": "completed", "updated_at": 2.0}
+        ),
+        "research/2026-11-26-topic-ai/plan.md": "p" * 120,
+        "research/2026-11-26-topic-ai/primary.md": "p" * 120,
+        "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-b.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-c.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cross-check.md": ("x" * 120) + "\n盲区检查完成\n",
+        "research/2026-11-26-topic-ai/number-audit.md": "n" * 80,
+        "research/2026-11-26-topic-ai/knowledge-revision.json": json.dumps({"ok": True, "pad": "x" * 50}),
+        "drafts/2026-11-26-topic-ai.md": "d" * 600,
+    }
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = None
+
+    async def _fake_aread(path: str) -> str | None:
+        norm = path[2:] if path.startswith("./") else path.lstrip("/")
+        return files_map.get(norm)
+
+    async def _fake_aglob(pattern: str, _root: str = ".") -> list[str]:
+        import fnmatch
+
+        return sorted(k for k in files_map if fnmatch.fnmatch(k, pattern))
+
+    backend.aread_text.side_effect = _fake_aread
+    backend.aglob_paths.side_effect = _fake_aglob
+    backend.aexecute = None
+
+    check_skip = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=backend,
+        workspace_id=None,
+        run_id="wf-skip",
+        thread_id="th123456-full",
+    )
+    assert not any("internal-memory.md" in m for m in check_skip["missing"]), check_skip["missing"]
+
+    # Negative: when args.json recorded run=True, caller CANNOT spoof params to skip internal-memory.md
+    check_run = await run_check_done(
+        workflow="topic-research",
+        params={
+            "topic": "AI Capex",
+            "slug": "ai",
+            "workspace_dir": ".",
+            "as_of": "2026-11-26",
+            "internal_memory_decision": {"run": False, "mode": "skip"},
+        },
+        backend=backend,
+        workspace_id=None,
+        run_id="wf-run",
+        thread_id="th123456-full",
+    )
+    assert any("internal-memory.md" in m for m in check_run["missing"]), check_run["missing"]
+
+
+@pytest.mark.asyncio
+async def test_r2_sales_notes_streamed_search_tmtb_keyword_default_and_embedding_retry_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 items 4 & 7:
+    - TMTB keeps default `keyword` search (never invokes query embedding unless explicitly requested).
+    - Sales-notes hybrid search avoids `SELECT *` and never loads full-table embedding BLOBs on keyword pass;
+      semantic pass only selects `(id, doc_key, embedding)` filtered to `embedding IS NOT NULL`.
+    - Embedding calls never use global `contextlib.redirect_stdout`.
+    - Transient embedding failure during ingest marks `embedding_pending=True`; retrying with same `request_id`
+      after recovery backfills `email_chunks.embedding` so semantic search immediately finds the note.
+    """
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_r2")
+    store.ensure_schema()
+
+    def _vec(text: str) -> list[float]:
+        low = text.lower()
+        if any(k in low for k in ("cowos", "gpu", "accelerator")):
+            return [1.0, 0.0, 0.0, 0.0]
+        return [0.0, 1.0, 0.0, 0.0]
+
+    md_cli = store._library().module("sales-notes")
+    fail_once = {"fail": True}
+
+    def _flaky_embed_texts(texts: list[str], config: dict[str, Any]) -> list[list[float]]:
+        if fail_once["fail"]:
+            fail_once["fail"] = False
+            raise RuntimeError("transient 503 embedding outage")
+        return [_vec(t) for t in texts]
+
+    spy_texts = create_autospec(md_cli.embed_texts, side_effect=_flaky_embed_texts)
+    spy_query = create_autospec(md_cli.embed_query, side_effect=lambda q, c: _vec(q))
+    monkeypatch.setattr(md_cli, "embed_texts", spy_texts)
+    monkeypatch.setattr(md_cli, "embed_query", spy_query)
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(
+        store,
+        "_library",
+        create_autospec(orig_lib, side_effect=_patched_lib),
+    )
+
+    # Seed one TMTB row + one unindexed sales-note row
+    with sqlite3.connect(store.mail_db) as conn:
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-11-20", "ae-1", "alphaengine:doc1", "TMTB", "Cloud Capex", 0, "Hyperscaler capex rising", None, "2026-11-20T00:00:00Z"),
+        )
+        conn.commit()
+
+    # 1. TMTB search defaults to keyword -> zero embed_query calls!
+    tmtb_conn = lib_mod.TmtbConnector(store)
+    tm_res = await tmtb_conn.call_tool(
+        "search",
+        {"query": "Hyperscaler", "limit": 5},
+        active_caps=frozenset({CapabilityId.TMTB}),
+    )
+    assert tm_res["ok"] is True and len(tm_res["results"]) == 1
+    assert spy_query.call_count == 0, "TMTB default search must stay keyword and not invoke embed_query"
+
+    # 2. Item 7: Attempt 1 embedding fails -> records embedding_pending=True, NOT permanently lost!
+    note_payload = {
+        "request_id": "r2-emb-retry-1",
+        "institution": "Goldman Sachs",
+        "title": "Foundry Supply Check",
+        "date": "2026-11-25",
+        "content": "CoWoS wafer capacity expanding sharply.",
+    }
+    code1, res1 = await store.ingest_sales_note(note_payload)
+    assert code1 == 200 and res1["ok"] is True
+    assert res1["embedding_indexed"] is False
+    assert res1["embedding_pending"] is True
+
+    # Retry with same request_id once embedding recovers -> backfills vectors!
+    code2, res2 = await store.ingest_sales_note(note_payload)
+    assert code2 == 200 and res2["ok"] is True
+    assert res2["idempotent_replay"] is True
+    assert res2["embedding_indexed"] is True
+    assert res2["embedding_pending"] is False
+    assert res2.get("embedding_backfilled") is True
+
+    # Verify DB now holds the embedding and semantic-only query ("GPU") finds the note!
+    with sqlite3.connect(store.mail_db) as conn:
+        emb = conn.execute("SELECT embedding FROM email_chunks WHERE message_id = ?", (res2["doc_key"],)).fetchone()[0]
+    assert emb is not None and np.allclose(np.frombuffer(emb, dtype=np.float32), [1.0, 0.0, 0.0, 0.0])
+
+    # 3. Item 4: Trace SQL executed during sales-notes hybrid search -> zero `SELECT *`,
+    #    semantic query selects only minimal columns with `embedding IS NOT NULL`!
+    traced_sql: list[str] = []
+    orig_readonly = lib_mod.research_library_mod.readonly
+
+    import contextlib as _cl
+
+    @_cl.contextmanager
+    def _tracing_readonly(path: Path) -> Any:
+        with orig_readonly(path) as c:
+            c.set_trace_callback(traced_sql.append)
+            yield c
+
+    monkeypatch.setattr(
+        lib_mod.research_library_mod,
+        "readonly",
+        create_autospec(orig_readonly, side_effect=_tracing_readonly),
+    )
+    sales_conn = lib_mod.SalesNotesConnector(store)
+    sem_hit = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "limit": 5},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert sem_hit["ok"] is True
+    assert any(r["original_document_id"] == res2["doc_key"] for r in sem_hit["results"])
+    assert traced_sql, "Expected SQL trace statements"
+    assert not any("SELECT *" in q.upper() for q in traced_sql), f"Must never run SELECT *: {traced_sql}"
+    emb_queries = [q for q in traced_sql if "embedding" in q.lower() and "count(" not in q.lower()]
+    assert emb_queries, f"Expected semantic embedding query in {traced_sql}"
+    for q in emb_queries:
+        assert "embedding is not null" in q.lower(), f"Semantic query must filter non-NULL embeddings: {q}"
+        assert "content" not in q.lower(), f"Semantic vector scan must not fetch content column: {q}"
+
+
+@pytest.mark.asyncio
+async def test_r2_shared_image_asset_rollback_preserves_concurrently_referenced_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 item 6: Exclusive image asset creation + images_db write-lock cleanup on rollback.
+
+    When Wiki creates a shared image file and rolls back while Sales Notes concurrently commits
+    a `refs` row pointing to that same image SHA, Wiki's rollback MUST NOT delete the file.
+    When zero `refs` remain, rollback cleans up the newly created file.
+    """
+    from src.dalton.research_host.wiki_store import OpenWikiStore
+
+    _, lib_mod = _load_commercial_connectors()
+    data_root = tmp_path / "shared_img_r2"
+    wiki = OpenWikiStore(data_root)
+    sn_store = lib_mod.MarketDigestPartitionStore(data_root)
+    wiki.ensure_schema()
+    sn_store.ensure_schema()
+
+    png_bytes = _make_minimal_png_bytes()
+    _, _, _, sha, _, asset_abs = wiki._prepare_image_asset(image_bytes=png_bytes, suffix=".png")
+
+    # 1. Exclusive creation: first writer returns True, second returns False
+    assert wiki._persist_image_asset_file(asset_abs, png_bytes) is True
+    assert wiki._persist_image_asset_file(asset_abs, png_bytes) is False
+    asset_abs.unlink()
+
+    # 2. Simulate Wiki rollback after Sales Notes concurrently commits a reference to the same SHA:
+    #    Inject failure when Wiki writes the final markdown file (after asset_abs was created),
+    #    and hook `_cleanup_unreferenced_image_asset` to first let Sales Notes commit a ref for `sha`!
+    orig_cleanup = wiki._cleanup_unreferenced_image_asset
+    cleanup_results: list[bool] = []
+
+    def _race_cleanup(path_arg: Path, sha_arg: str) -> bool:
+        # Simulate Sales Notes committing its reference between Wiki's ROLLBACK and Wiki's cleanup
+        wiki.register_image_asset(
+            image_bytes=png_bytes,
+            suffix=".png",
+            source="sales-notes",
+            doc_key="sn-concurrent-1",
+            title="Concurrent Sales Note Chart",
+            doc_date="2026-11-25",
+            metadata={"caption": "concurrent"},
+            created_at="2026-11-25T10:00:00Z",
+            write_asset_file=False,
+        )
+        deleted = orig_cleanup(path_arg, sha_arg)
+        cleanup_results.append(deleted)
+        return deleted
+
+    monkeypatch.setattr(
+        wiki,
+        "_cleanup_unreferenced_image_asset",
+        create_autospec(orig_cleanup, side_effect=_race_cleanup),
+    )
+
+    real_os_open = os.open
+
+    def _fail_md_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if str(path).endswith(".md"):
+            raise OSError("simulated markdown disk failure")
+        return real_os_open(path, flags, mode)
+
+    fail_open_spec = create_autospec(real_os_open, side_effect=_fail_md_open)
+    monkeypatch.setattr(os, "open", fail_open_spec)
+    with pytest.raises(OSError, match="simulated markdown disk failure"):
+        await wiki.ingest(
+            {
+                "request_id": "wiki-race-1",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "memo",
+                "date": "2026-11-25",
+                "file": {
+                    "filename": "shared_chart.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.setattr(os, "open", real_os_open)
+
+    assert cleanup_results == [False], "Rollback must NOT unlink asset still referenced by Sales Notes"
+    assert asset_abs.is_file(), "Shared image file referenced by Sales Notes was erroneously deleted!"
+
+    # 3. Contrast: unreferenced image asset IS cleaned up on rollback
+    png_orphan = _make_minimal_png_bytes() + b"\x00orphan"
+    _, _, _, _, _, orphan_abs = wiki._prepare_image_asset(image_bytes=png_orphan, suffix=".png")
+    monkeypatch.setattr(wiki, "_cleanup_unreferenced_image_asset", orig_cleanup)
+    monkeypatch.setattr(os, "open", fail_open_spec)
+    with pytest.raises(OSError, match="simulated markdown disk failure"):
+        await wiki.ingest(
+            {
+                "request_id": "wiki-orphan-1",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "memo",
+                "date": "2026-11-25",
+                "file": {
+                    "filename": "orphan_chart.png",
+                    "content_b64": base64.b64encode(png_orphan).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.setattr(os, "open", real_os_open)
+    assert not orphan_abs.exists(), "Unreferenced newly created image asset should be removed on rollback"
+
+
+@pytest.mark.asyncio
+async def test_r3_internal_memory_decision_forged_and_snapshot_write_failure_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 item 1:
+    - Everflow legacy bridge enabled: caller-supplied `internal_memory_decision` /
+      `discovered_mcp_servers` / `mcp_servers` are stripped, and `dalton_check_done`
+      still requires `internal-memory.md` even if `{run: false}` appears in `args.json`.
+    - Core (bridge disabled): unsigned, tampered, or cross-run replayed `{run: false}`
+      in `args.json` is rejected and `internal-memory.md` is still required; deleting
+      `internal_memory_decision` and spoofing `discovered_mcp_servers: {}` is also rejected.
+    - `RunWorkflow` refuses launch (aborting the admitted run without spawning driver)
+      when `args.json` snapshot write fails (exception OR returning False).
+    """
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTask,
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.content_assembly import (
+        resolve_launch_discovered_mcp_servers,
+        sign_topic_research_internal_memory_decision,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    # 1. Everflow (legacy researchdata_bridge enabled): strip spoofed decision + require internal-memory.md
+    monkeypatch.setenv("DALTON_PROFILE", "everflow")
+    monkeypatch.delenv("DALTON_CAPABILITIES", raising=False)
+    monkeypatch.delenv("DALTON_CAPABILITIES_DISABLE", raising=False)
+
+    spoofed_everflow = {
+        "topic": "AI Capex",
+        "slug": "ai",
+        "workspace_dir": ".",
+        "as_of": "2026-11-26",
+        "internal_memory_decision": {"run": False, "mode": "skip"},
+        "discovered_mcp_servers": {},
+        "mcp_servers": {},
+    }
+    cleaned_ef = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", spoofed_everflow, mcp_registry=None
+    )
+    assert "internal_memory_decision" not in cleaned_ef
+    assert "discovered_mcp_servers" not in cleaned_ef
+    assert "mcp_servers" not in cleaned_ef
+
+    base_files: dict[str, str] = {
+        "research/2026-11-26-topic-ai/plan.md": "p" * 120,
+        "research/2026-11-26-topic-ai/primary.md": "p" * 120,
+        "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-b.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-c.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cross-check.md": ("x" * 120) + "\n盲区检查完成\n",
+        "research/2026-11-26-topic-ai/number-audit.md": "n" * 80,
+        "research/2026-11-26-topic-ai/knowledge-revision.json": json.dumps({"ok": True, "pad": "x" * 50}),
+        "drafts/2026-11-26-topic-ai.md": "d" * 600,
+    }
+
+    def _make_backend(extra_files: dict[str, str]) -> Any:
+        files_map = {**base_files, **extra_files}
+        be = create_autospec(SandboxBackend, instance=True)
+        be.workspace_dir = None
+
+        async def _aread(path: str) -> str | None:
+            norm = path[2:] if path.startswith("./") else path.lstrip("/")
+            return files_map.get(norm)
+
+        async def _aglob(pattern: str, _root: str = ".") -> list[str]:
+            import fnmatch
+
+            return sorted(k for k in files_map if fnmatch.fnmatch(k, pattern))
+
+        be.aread_text.side_effect = _aread
+        be.aglob_paths.side_effect = _aglob
+        be.aexecute = None
+        return be
+
+    # Even if args.json on Everflow holds forged `{run: false}`, internal-memory.md is still required
+    ef_forged_signed = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="ef123456",
+        run_id="wf-ef",
+    )
+    be_ef = _make_backend(
+        {".agents/threads/ef123456/workflows/wf-ef/args.json": json.dumps(ef_forged_signed)}
+    )
+    res_ef = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=be_ef,
+        workspace_id=None,
+        run_id="wf-ef",
+        thread_id="ef123456-full",
+    )
+    assert any("internal-memory.md" in m for m in res_ef["missing"]), res_ef["missing"]
+
+    # 2. Core (bridge disabled): unsigned, tampered, cross-run replayed, or stripped-decision args.json MUST NOT skip
+    monkeypatch.setenv("DALTON_PROFILE", "core")
+    monkeypatch.delenv("DALTON_CAPABILITIES", raising=False)
+    monkeypatch.delenv("DALTON_CAPABILITIES_DISABLE", raising=False)
+
+    valid_other_run = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-other",
+    )
+    tampered_run = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": True, "mode": "direct", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-tampered",
+    )
+    tampered_run["internal_memory_decision"]["run"] = False
+
+    be_core_forged = _make_backend(
+        {
+            ".agents/threads/co123456/workflows/wf-unsigned/args.json": json.dumps(
+                {"internal_memory_decision": {"run": False, "mode": "skip"}}
+            ),
+            ".agents/threads/co123456/workflows/wf-replayed/args.json": json.dumps(
+                valid_other_run
+            ),
+            ".agents/threads/co123456/workflows/wf-tampered/args.json": json.dumps(
+                tampered_run
+            ),
+            ".agents/threads/co123456/workflows/wf-no-decision/args.json": json.dumps(
+                {"discovered_mcp_servers": {}}
+            ),
+        }
+    )
+    for forged_run_id in ("wf-unsigned", "wf-replayed", "wf-tampered", "wf-no-decision"):
+        res_forged = await run_check_done(
+            workflow="topic-research",
+            params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+            backend=be_core_forged,
+            workspace_id=None,
+            run_id=forged_run_id,
+            thread_id="co123456-full",
+        )
+        assert any("internal-memory.md" in m for m in res_forged["missing"]), (
+            f"Forged run {forged_run_id} bypassed internal-memory.md check: {res_forged['missing']}"
+        )
+
+    # 3. Snapshot write failure (exception AND False return) refuses workflow launch & aborts admitted run
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {}
+
+    minimal_topic_script = (
+        "const meta = { name: 'topic-research', description: 'topic' };\n"
+        "async function run() { return { ok: true }; }\n"
+    )
+    real_spawn_task_writer = wf_tool_mod.spawn_task_writer
+
+    async def _attempt_launch(write_behavior: Any) -> tuple[Any, Any, Any, dict[str, str]]:
+        written: dict[str, str] = {}
+        be_launch = create_autospec(SandboxBackend, instance=True)
+        be_launch.workspace_dir = None
+
+        async def _awrite(path: str, content: str) -> bool:
+            if path.endswith("/args.json"):
+                if isinstance(write_behavior, Exception):
+                    raise write_behavior
+                if write_behavior is False:
+                    return False
+            written[path] = content
+            return True
+
+        be_launch.awrite_text.side_effect = _awrite
+
+        mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+        mw.workflow_config = WorkflowOrchestrationConfig()
+        mw.checkpointer = None
+        mw.admit_task_run.return_value = "admitted-row-1"
+        mw._abort_admitted_run.return_value = None
+
+        task_reg = create_autospec(BackgroundTaskRegistry, instance=True)
+        task_reg.run_ledger = None
+        task_reg.get_all_tasks.return_value = []
+        task_reg.get_by_tool_call_id.return_value = None
+        run_task = BackgroundTask(
+            task_id="wf-snap-1",
+            description="topic",
+            prompt="p",
+            subagent_type="workflow",
+            tool_call_id="tc-snap-1",
+        )
+        task_reg.register.return_value = run_task
+        task_reg.discard_unstarted.return_value = None
+
+        dispatcher = create_autospec(SubagentDispatcher, instance=True)
+        dispatcher.middleware = mw
+        dispatcher.registry = task_reg
+
+        spawn_spy = create_autospec(real_spawn_task_writer, return_value=None)
+        monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", spawn_spy)
+
+        wf_tool = wf_tool_mod.create_run_workflow_tool(
+            dispatcher=dispatcher,
+            backend=be_launch,
+            thread_id="co123456-full",
+            short_thread_id="co123456",
+            mcp_registry=reg_empty,
+        )
+        reply = await wf_tool.ainvoke(
+            {
+                "name": "RunWorkflow",
+                "id": "tc-snap-1",
+                "type": "tool_call",
+                "args": {
+                    "script": minimal_topic_script,
+                    "params": {
+                        "topic": "AI Capex",
+                        "slug": "ai",
+                        "subject_kind": "theme",
+                        "workspace_dir": ".",
+                        "as_of": "2026-11-26",
+                        "internal_memory_decision": {"run": True, "mode": "direct"},
+                    },
+                },
+            }
+        )
+        return reply, mw, spawn_spy, written
+
+    # 3a. awrite_text raises OSError on args.json -> refused + admitted run aborted + driver never spawned
+    reply_exc, mw_exc, spawn_exc, _ = await _attempt_launch(OSError("ENOSPC"))
+    assert "failed to snapshot launch args" in str(reply_exc).lower()
+    assert mw_exc._abort_admitted_run.await_count == 1
+    assert spawn_exc.await_count == 0
+
+    # 3b. awrite_text returns False on args.json -> refused + admitted run aborted + driver never spawned
+    reply_false, mw_false, spawn_false, _ = await _attempt_launch(False)
+    assert "failed to snapshot launch args" in str(reply_false).lower()
+    assert mw_false._abort_admitted_run.await_count == 1
+    assert spawn_false.await_count == 0
+
+    # 3c. Positive control: awrite_text succeeds -> signed args.json written and accepted by run_check_done
+    reply_ok, mw_ok, spawn_ok, written_ok = await _attempt_launch(True)
+    assert "Workflow run started" in str(reply_ok)
+    assert mw_ok._abort_admitted_run.await_count == 0
+    assert spawn_ok.await_count == 1
+    args_path = ".agents/threads/co123456/workflows/wf-snap-1/args.json"
+    assert args_path in written_ok
+    saved_args = json.loads(written_ok[args_path])
+    assert saved_args["internal_memory_decision"]["run"] is False
+    assert saved_args["internal_memory_decision"]["signature"]
+    be_verified = _make_backend(
+        {
+            args_path: written_ok[args_path],
+            ".agents/threads/co123456/workflows/wf-snap-1/status.json": json.dumps(
+                {"run_id": "wf-snap-1", "name": "topic-research", "status": "completed", "updated_at": 1.0}
+            ),
+        }
+    )
+    res_verified = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=be_verified,
+        workspace_id=None,
+        run_id="wf-snap-1",
+        thread_id="co123456-full",
+    )
+    assert not any("internal-memory.md" in m for m in res_verified["missing"]), res_verified["missing"]
+
+
+@pytest.mark.asyncio
+async def test_r3_sales_notes_embedding_retry_pending_not_duplicate_and_legacy_partial_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 item 2:
+    - Retrying without `request_id` while embeddings still fail returns a retryable
+      `embedding_pending=True` response (NEVER `status="duplicate"`).
+    - Once embeddings recover, retry backfills missing vectors and subsequent retry
+      returns `duplicate`.
+    - Legacy r1 partial-success receipts (`embedding_indexed=True`, no `embedding_pending`,
+      one chunk embedded and one chunk NULL) still check actual NULL chunks on retry and
+      backfill only the missing chunks.
+    """
+    import re
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_r3_retry")
+    store.ensure_schema()
+
+    def _vec(text: str) -> list[float]:
+        return [1.0, 0.0, 0.0, 0.0] if "cowos" in text.lower() else [0.0, 1.0, 0.0, 0.0]
+
+    md_cli = store._library().module("sales-notes")
+    embed_state = {"fail": True}
+    seen_embed_batches: list[list[str]] = []
+
+    def _controlled_embed(texts: list[str], config: dict[str, Any]) -> list[list[float]]:
+        seen_embed_batches.append(list(texts))
+        if embed_state["fail"]:
+            raise RuntimeError("embedding provider down")
+        return [_vec(t) for t in texts]
+
+    monkeypatch.setattr(
+        md_cli,
+        "embed_texts",
+        create_autospec(md_cli.embed_texts, side_effect=_controlled_embed),
+    )
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(store, "_library", create_autospec(orig_lib, side_effect=_patched_lib))
+
+    # 1. No request_id + repeated embedding failure stays retryable (never falls through to duplicate)
+    no_req_payload = {
+        "institution": "Morgan Stanley",
+        "title": "Packaging Capacity Check",
+        "date": "2026-11-26",
+        "content": "CoWoS supply remains tight across 2026.",
+    }
+    code1, res1 = await store.ingest_sales_note(no_req_payload)
+    assert code1 == 200 and res1["ok"] is True
+    assert res1["embedding_pending"] is True and res1["embedding_indexed"] is False
+
+    # Retry while still failing (NO request_id) -> retryable, NOT duplicate!
+    code2, res2 = await store.ingest_sales_note(no_req_payload)
+    assert code2 == 200 and res2["ok"] is True
+    assert res2["status"] != "duplicate"
+    assert res2["embedding_pending"] is True
+    assert res2.get("retryable") is True
+
+    # Recover embedding -> retry backfills NULL chunk
+    embed_state["fail"] = False
+    code3, res3 = await store.ingest_sales_note(no_req_payload)
+    assert code3 == 200 and res3["ok"] is True
+    assert res3["embedding_indexed"] is True
+    assert res3["embedding_pending"] is False
+    assert res3.get("embedding_backfilled") is True
+
+    # Subsequent retry after all chunks are indexed -> duplicate
+    code4, res4 = await store.ingest_sales_note(no_req_payload)
+    assert code4 == 200 and res4["ok"] is False and res4["status"] == "duplicate"
+
+    # 2. Legacy r1 partial-success receipt (embedding_indexed=True, no embedding_pending, chunk 1 NULL)
+    legacy_body = "CoWoS chunk zero content.\n\n" + ("Second chunk detail. " * 90)
+    legacy_payload = {
+        "institution": "UBS",
+        "title": "Legacy Partial Note",
+        "date": "2026-11-26",
+        "content": legacy_body,
+    }
+    digest_bytes = re.sub(r"\s+", " ", legacy_body).strip().encode("utf-8")
+    legacy_doc_key = lib_mod.sales_notes_store_mod.content_key(digest_bytes)
+    chunks = store._chunk_sales_note(legacy_body, "[UBS] Legacy Partial Note\n\n", max_chunk_chars=1500)
+    assert len(chunks) >= 2
+    emb0 = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32).tobytes()
+    legacy_manifest_entry = {
+        "doc_key": legacy_doc_key,
+        "institution": "UBS",
+        "title": "Legacy Partial Note",
+        "date": "2026-11-26",
+        "path": "state/sales-notes/legacy-partial.md",
+        "origin": "manual",
+        "created_at": "2026-11-26T00:00:00Z",
+    }
+    # Legacy r1 receipt claimed embedding_indexed=True with NO embedding_pending key!
+    legacy_receipt = {
+        "ok": True,
+        "status": "ingested",
+        "doc_key": legacy_doc_key,
+        "document_id": "mail:999",
+        "filepath": "state/sales-notes/legacy-partial.md",
+        "chunk_count": len(chunks),
+        "embedding_indexed": True,
+    }
+    lib_mod.sales_notes_store_mod.append_manifest(store.data_root, legacy_manifest_entry)
+    store._append_audit_entry(legacy_receipt)
+    with sqlite3.connect(store.mail_db) as conn:
+        for idx, body_chunk in enumerate(chunks):
+            conn.execute(
+                "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "2026-11-26",
+                    legacy_doc_key,
+                    legacy_doc_key,
+                    "UBS",
+                    "Legacy Partial Note",
+                    idx,
+                    body_chunk,
+                    emb0 if idx == 0 else None,
+                    "2026-11-26T00:00:00Z",
+                ),
+            )
+        conn.execute(
+            "INSERT INTO sales_ingest_receipts (request_id, doc_key, document_id, filepath, manifest_json, receipt_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"doc:{legacy_doc_key}",
+                legacy_doc_key,
+                "mail:999",
+                "state/sales-notes/legacy-partial.md",
+                json.dumps(legacy_manifest_entry, ensure_ascii=False),
+                json.dumps(legacy_receipt, ensure_ascii=False),
+                "2026-11-26T00:00:00Z",
+            ),
+        )
+        conn.commit()
+
+    # Retry legacy partial receipt while embedding still fails -> detects NULL chunk, returns retryable (not duplicate!)
+    embed_state["fail"] = True
+    seen_embed_batches.clear()
+    l_code1, l_res1 = await store.ingest_sales_note(legacy_payload)
+    assert l_code1 == 200 and l_res1["ok"] is True
+    assert l_res1["status"] != "duplicate"
+    assert l_res1["embedding_pending"] is True
+    assert l_res1.get("retryable") is True
+    assert len(seen_embed_batches) == 1 and len(seen_embed_batches[0]) == len(chunks) - 1
+
+    # Retry legacy partial receipt once embedding recovers -> backfills ONLY missing chunks!
+    embed_state["fail"] = False
+    seen_embed_batches.clear()
+    l_code2, l_res2 = await store.ingest_sales_note(legacy_payload)
+    assert l_code2 == 200 and l_res2["ok"] is True
+    assert l_res2["embedding_indexed"] is True
+    assert l_res2["embedding_pending"] is False
+    assert l_res2.get("embedding_backfilled") is True
+    assert len(seen_embed_batches) == 1 and len(seen_embed_batches[0]) == len(chunks) - 1
+
+    with sqlite3.connect(store.mail_db) as conn:
+        null_cnt = conn.execute(
+            "SELECT COUNT(*) FROM email_chunks WHERE message_id = ? AND embedding IS NULL",
+            (legacy_doc_key,),
+        ).fetchone()[0]
+    assert null_cnt == 0, "All missing chunks on legacy partial receipt must be backfilled"
+
+
+@pytest.mark.asyncio
+async def test_r3_sales_notes_layer_all_cross_layer_ranking_before_rrf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 item 3: When `layer='all'`, semantic and keyword arms each rank across layers
+    BEFORE RRF fusion, so with `limit=1` a high-similarity digest (0.99) ranks ahead of
+    a low-similarity raw email (0.01)."""
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_r3_rrf")
+    store.ensure_schema()
+
+    raw_vec = np.asarray([0.01, 0.99995, 0.0, 0.0], dtype=np.float32)
+    digest_vec = np.asarray([0.99, 0.141067, 0.0, 0.0], dtype=np.float32)
+    query_vec = [1.0, 0.0, 0.0, 0.0]
+
+    with sqlite3.connect(store.mail_db) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chunks ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "date TEXT, period TEXT, section_id TEXT, section_label TEXT, "
+            "content TEXT, source_emails TEXT, embedding BLOB, created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-26",
+                "raw-low-1",
+                "msg-raw-low-1",
+                "BrokerA",
+                "Unrelated Macro Wrap",
+                0,
+                "General macro overview with no target keywords.",
+                raw_vec.tobytes(),
+                "2026-11-26T00:00:00Z",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO chunks (date, period, section_id, section_label, content, source_emails, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-26",
+                "daily",
+                "sec-ai",
+                "AI Supply Chain Digest",
+                "Digest summary covering high-similarity accelerator demand.",
+                "[]",
+                digest_vec.tobytes(),
+                "2026-11-26T00:00:00Z",
+            ),
+        )
+        conn.commit()
+
+    md_cli = store._library().module("sales-notes")
+    monkeypatch.setattr(
+        md_cli,
+        "embed_query",
+        create_autospec(md_cli.embed_query, side_effect=lambda q, c: query_vec),
+    )
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(store, "_library", create_autospec(orig_lib, side_effect=_patched_lib))
+
+    sales_conn = lib_mod.SalesNotesConnector(store)
+    res_top1 = await sales_conn.call_tool(
+        "search",
+        {
+            "query": "GPU accelerator demand",
+            "limit": 1,
+            "params": {"layer": "all", "search_mode": "hybrid"},
+        },
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert res_top1["ok"] is True
+    assert len(res_top1["results"]) == 1
+    top = res_top1["results"][0]
+    assert top["layer"] == "digest", f"High-similarity digest must outrank low-similarity raw: {top}"
+    assert float(top["score"]) > 0.95, f"Expected ~0.99 digest similarity, got {top}"
+
+
+@pytest.mark.asyncio
+async def test_r4_non_topic_research_workflow_forged_decision_stripped_and_check_done_requires_internal_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 item 1:
+    - Non-`topic-research` workflows strip caller-supplied `internal_memory_decision`,
+      `discovered_mcp_servers`, and `mcp_servers`, and NEVER receive a signed decision.
+    - `dalton_check_done` reading a snapshot by explicit `run_id` verifies workflow name
+      and run identity against the server-written `status.json` run record; any mismatch
+      (wrong workflow name, mismatched run_id, or missing status.json) falls back to
+      requiring `internal-memory.md`.
+    """
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTask,
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.content_assembly import (
+        resolve_launch_discovered_mcp_servers,
+        sign_topic_research_internal_memory_decision,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    _clean_profile_env(monkeypatch, profile="core")
+
+    forged_params = {
+        "note": "ok",
+        "internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"},
+        "discovered_mcp_servers": {},
+        "mcp_servers": {},
+    }
+
+    # 1. Direct helper checks: non-topic-research strips fields and refuses signing
+    cleaned = await resolve_launch_discovered_mcp_servers(
+        None, "helper-wf", forged_params, mcp_registry=None
+    )
+    assert "internal_memory_decision" not in cleaned
+    assert "discovered_mcp_servers" not in cleaned
+    assert "mcp_servers" not in cleaned
+
+    unsigned = sign_topic_research_internal_memory_decision(
+        forged_params,
+        short_thread_id="co123456",
+        run_id="wf-helper-1",
+        workflow_name="helper-wf",
+    )
+    assert "internal_memory_decision" not in unsigned
+
+    # 2. End-to-end RunWorkflow launch of non-topic-research workflow with forged params
+    written: dict[str, str] = {}
+    be_launch = create_autospec(SandboxBackend, instance=True)
+    be_launch.workspace_dir = None
+
+    async def _awrite(path: str, content: str) -> bool:
+        written[path] = content
+        return True
+
+    be_launch.awrite_text.side_effect = _awrite
+
+    mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+    mw.workflow_config = WorkflowOrchestrationConfig()
+    mw.checkpointer = None
+    mw.admit_task_run.return_value = "admitted-row-helper"
+    mw._abort_admitted_run.return_value = None
+    mw._finalize_cancelled_before_spawn.return_value = None
+
+    task_reg = create_autospec(BackgroundTaskRegistry, instance=True)
+    task_reg.run_ledger = None
+    task_reg.get_all_tasks.return_value = []
+    task_reg.get_by_tool_call_id.return_value = None
+    run_task = BackgroundTask(
+        task_id="wf-helper-1",
+        description="helper",
+        prompt="p",
+        subagent_type="workflow",
+        tool_call_id="tc-helper-1",
+    )
+    task_reg.register.return_value = run_task
+    task_reg.discard_unstarted.return_value = None
+
+    dispatcher = create_autospec(SubagentDispatcher, instance=True)
+    dispatcher.middleware = mw
+    dispatcher.registry = task_reg
+
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {}
+
+    spawn_spy = create_autospec(wf_tool_mod.spawn_task_writer, return_value=None)
+    monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", spawn_spy)
+
+    helper_script = (
+        "const meta = { name: 'helper-wf', description: 'helper' };\n"
+        "async function run() { return { ok: true }; }\n"
+    )
+    wf_tool = wf_tool_mod.create_run_workflow_tool(
+        dispatcher=dispatcher,
+        backend=be_launch,
+        thread_id="co123456-full",
+        short_thread_id="co123456",
+        mcp_registry=reg_empty,
+    )
+    reply = await wf_tool.ainvoke(
+        {
+            "name": "RunWorkflow",
+            "id": "tc-helper-1",
+            "type": "tool_call",
+            "args": {"script": helper_script, "params": forged_params},
+        }
+    )
+    assert "Workflow run started" in str(reply)
+    helper_args_path = ".agents/threads/co123456/workflows/wf-helper-1/args.json"
+    assert helper_args_path in written
+    saved_helper_args = json.loads(written[helper_args_path])
+    assert "internal_memory_decision" not in saved_helper_args
+    assert "discovered_mcp_servers" not in saved_helper_args
+    assert "mcp_servers" not in saved_helper_args
+
+    # 3. check_done on topic-research pointing at helper-wf run_id (and mismatched server run records)
+    #    MUST still require internal-memory.md even if args.json carries a signed skip payload!
+    base_files: dict[str, str] = {
+        "research/2026-11-26-topic-ai/plan.md": "p" * 120,
+        "research/2026-11-26-topic-ai/primary.md": "p" * 120,
+        "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-b.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-c.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cross-check.md": ("x" * 120) + "\n盲区检查完成\n",
+        "research/2026-11-26-topic-ai/number-audit.md": "n" * 80,
+        "research/2026-11-26-topic-ai/knowledge-revision.json": json.dumps({"ok": True, "pad": "x" * 50}),
+        "drafts/2026-11-26-topic-ai.md": "d" * 600,
+    }
+
+    def _make_check_backend(extra_files: dict[str, str]) -> Any:
+        files_map = {**base_files, **extra_files}
+        be = create_autospec(SandboxBackend, instance=True)
+        be.workspace_dir = None
+
+        async def _aread(path: str) -> str | None:
+            norm = path[2:] if path.startswith("./") else path.lstrip("/")
+            return files_map.get(norm)
+
+        async def _aglob(pattern: str, _root: str = ".") -> list[str]:
+            import fnmatch
+
+            return sorted(k for k in files_map if fnmatch.fnmatch(k, pattern))
+
+        be.aread_text.side_effect = _aread
+        be.aglob_paths.side_effect = _aglob
+        be.aexecute = None
+        return be
+
+    signed_wrong_wf = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-wrong-wf",
+    )
+    signed_wrong_runid = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-wrong-id",
+    )
+    signed_no_status = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-no-status",
+    )
+    signed_valid = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-valid-tr",
+    )
+
+    be_check = _make_check_backend(
+        {
+            helper_args_path: written[helper_args_path],
+            ".agents/threads/co123456/workflows/wf-helper-1/status.json": json.dumps(
+                {"run_id": "wf-helper-1", "name": "helper-wf", "status": "completed", "updated_at": 1.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-wrong-wf/args.json": json.dumps(signed_wrong_wf),
+            ".agents/threads/co123456/workflows/wf-wrong-wf/status.json": json.dumps(
+                {"run_id": "wf-wrong-wf", "name": "helper-wf", "status": "completed", "updated_at": 2.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-wrong-id/args.json": json.dumps(signed_wrong_runid),
+            ".agents/threads/co123456/workflows/wf-wrong-id/status.json": json.dumps(
+                {"run_id": "wf-different", "name": "topic-research", "status": "completed", "updated_at": 3.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-no-status/args.json": json.dumps(signed_no_status),
+            ".agents/threads/co123456/workflows/wf-valid-tr/args.json": json.dumps(signed_valid),
+            ".agents/threads/co123456/workflows/wf-valid-tr/status.json": json.dumps(
+                {"run_id": "wf-valid-tr", "name": "topic-research", "status": "completed", "updated_at": 4.0}
+            ),
+        }
+    )
+
+    for bad_run_id in ("wf-helper-1", "wf-wrong-wf", "wf-wrong-id", "wf-no-status"):
+        res_bad = await run_check_done(
+            workflow="topic-research",
+            params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+            backend=be_check,
+            workspace_id=None,
+            run_id=bad_run_id,
+            thread_id="co123456-full",
+        )
+        assert any("internal-memory.md" in m for m in res_bad["missing"]), (
+            f"Run {bad_run_id} must NOT bypass internal-memory.md check: {res_bad['missing']}"
+        )
+
+    # Positive control: matching server status.json + signed topic-research decision skips internal-memory.md
+    res_ok = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=be_check,
+        workspace_id=None,
+        run_id="wf-valid-tr",
+        thread_id="co123456-full",
+    )
+    assert not any("internal-memory.md" in m for m in res_ok["missing"]), res_ok["missing"]
+
+
+@pytest.mark.asyncio
+async def test_r4_workflow_snapshot_cancelled_after_admission_finalizes_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 item 2:
+    When `asyncio.CancelledError` is raised during post-admission artifact snapshotting
+    (`workflow.js` or `args.json`), `RunWorkflow` runs terminal cancellation cleanup
+    (`_finalize_cancelled_before_spawn`, marks task cancelled, never spawns writer) and
+    re-raises `CancelledError`.
+    """
+    import asyncio
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTask,
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+
+    _clean_profile_env(monkeypatch, profile="core")
+
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {}
+    real_spawn_task_writer = wf_tool_mod.spawn_task_writer
+
+    for cancel_suffix, wf_name, params in (
+        (
+            "/args.json",
+            "topic-research",
+            {
+                "topic": "AI Capex",
+                "slug": "ai",
+                "subject_kind": "theme",
+                "workspace_dir": ".",
+                "as_of": "2026-11-26",
+            },
+        ),
+        (
+            "/workflow.js",
+            "helper-wf",
+            {"note": "x"},
+        ),
+    ):
+        be = create_autospec(SandboxBackend, instance=True)
+        be.workspace_dir = None
+
+        async def _awrite_cancel(path: str, _content: str, *, _suffix: str = cancel_suffix) -> bool:
+            if path.endswith(_suffix):
+                raise asyncio.CancelledError()
+            return True
+
+        be.awrite_text.side_effect = _awrite_cancel
+
+        mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+        mw.workflow_config = WorkflowOrchestrationConfig()
+        mw.checkpointer = None
+        mw.admit_task_run.return_value = f"admitted-{wf_name}"
+        mw._abort_admitted_run.return_value = None
+        mw._finalize_cancelled_before_spawn.return_value = None
+
+        task_reg = create_autospec(BackgroundTaskRegistry, instance=True)
+        task_reg.run_ledger = None
+        task_reg.get_all_tasks.return_value = []
+        task_reg.get_by_tool_call_id.return_value = None
+        run_task = BackgroundTask(
+            task_id=f"wf-cancel-{wf_name}",
+            description=wf_name,
+            prompt="p",
+            subagent_type="workflow",
+            tool_call_id=f"tc-cancel-{wf_name}",
+        )
+        task_reg.register.return_value = run_task
+        task_reg.discard_unstarted.return_value = None
+
+        dispatcher = create_autospec(SubagentDispatcher, instance=True)
+        dispatcher.middleware = mw
+        dispatcher.registry = task_reg
+
+        spawn_spy = create_autospec(real_spawn_task_writer, return_value=None)
+        monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", spawn_spy)
+
+        script = (
+            f"const meta = {{ name: '{wf_name}', description: '{wf_name}' }};\n"
+            "async function run() { return { ok: true }; }\n"
+        )
+        wf_tool = wf_tool_mod.create_run_workflow_tool(
+            dispatcher=dispatcher,
+            backend=be,
+            thread_id="co123456-full",
+            short_thread_id="co123456",
+            mcp_registry=reg_empty,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await wf_tool.ainvoke(
+                {
+                    "name": "RunWorkflow",
+                    "id": f"tc-cancel-{wf_name}",
+                    "type": "tool_call",
+                    "args": {"script": script, "params": params},
+                }
+            )
+
+        mw._finalize_cancelled_before_spawn.assert_awaited_once_with(run_task)
+        assert mw._abort_admitted_run.await_count == 0
+        assert task_reg.discard_unstarted.await_count == 0
+        assert spawn_spy.await_count == 0
+        assert run_task.completed is True
+        assert run_task.terminal_status == "cancelled"
+
+
+class _R5FilesBackend:
+    """Minimal read-only backend over an in-memory file map (aread_text only)."""
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self._files = files
+
+    async def aread_text(self, path: str) -> str:
+        if path not in self._files:
+            raise FileNotFoundError(path)
+        return self._files[path]
+
+
+@pytest.mark.asyncio
+async def test_r5_as_of_inherited_when_status_json_missing_but_rejected_on_mismatch() -> None:
+    from src.dalton.tools import check_done_tools as cdt
+
+    thread_id = "abcdef12-0000-0000-0000-000000000000"
+    run_dir = ".agents/threads/abcdef12/workflows/wf-r5"
+    args = json.dumps({"as_of": "2026-11-20"})
+
+    # status.json never written: explicit run keeps its as_of.
+    backend = _R5FilesBackend({f"{run_dir}/args.json": args})
+    assert await cdt._run_args_as_of(backend, "topic-research", "wf-r5", thread_id) == "2026-11-20"
+    # The strict loader used for the internal-memory skip still refuses it.
+    doc, _ = await cdt._load_run_args_with_dir(backend, "topic-research", "wf-r5", thread_id)
+    assert doc is None
+
+    # A present status.json naming another workflow is still rejected.
+    backend = _R5FilesBackend(
+        {
+            f"{run_dir}/args.json": args,
+            f"{run_dir}/status.json": json.dumps({"name": "other-workflow", "run_id": "wf-r5"}),
+        }
+    )
+    assert await cdt._run_args_as_of(backend, "topic-research", "wf-r5", thread_id) is None
