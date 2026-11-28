@@ -213,8 +213,6 @@ vi.mock('../../../hooks/useOpenClaw', () => ({
     isPending: false,
   }),
   useDaltonSystemJobs: () => ({ data: { ok: true, jobs: [] }, isLoading: false, isError: false }),
-  useToggleDaltonSystemJob: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useRunDaltonSystemJobNow: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 
 vi.mock('../DaltonTeamModelsPanel', () => ({

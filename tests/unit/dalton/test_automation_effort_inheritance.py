@@ -189,7 +189,8 @@ async def test_wakeup_inherits_creator_automation_effort_not_other_running_task_
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
         identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
-        thread={"reasoning_effort": "low"},
+        # The stored effort applies to the thread's own model (lane 108), so the row names it.
+        thread={"llm_model": "claude-sonnet-5-5", "reasoning_effort": "low"},
         is_byok=False,
     )
 

@@ -220,10 +220,10 @@
     "newChat": "新对话",
     "workspaces": "工作区",
     "workspaceGallery": "工作区总览",
-    "collapse": "收起侧边栏",
+    "collapse": "隐藏侧边栏",
     "back": "后退",
     "forward": "前进",
-    "expand": "展开侧边栏",
+    "expand": "显示侧边栏",
     "resize": "调整侧边栏宽度",
     "plugins": "插件",
     "orders": "订单",
@@ -1333,6 +1333,8 @@
     "errorLinkViewUsage": "查看用量",
     "errorLinkReconnect": "重新连接",
     "errorLinkAddApiKey": "添加 API 密钥",
+    "errorLinkChooseModel": "选择模型",
+    "modelRequired": "请先选择一个用于对话的模型，你还没有设置默认模型。",
     "errorUpstreamHeadlineModel": "{{model}} 返回错误",
     "errorUpstreamHeadlineModelStatus": "{{model}} 返回错误 ({{status}})",
     "errorAttemptedModels": "还尝试了：",
@@ -2102,7 +2104,12 @@
     "attachmentTooLarge": "{{name}} 超过 {{max}} MB 上限，未添加。",
     "attachmentsTotalTooLarge": "{{name}} 未添加：单条消息的附件总大小不能超过 {{max}} MB。",
     "attachmentsTooMany": "未添加：单条消息的附件总数（含截图）不能超过 {{max}} 个。",
-    "steerTemporaryRetry": "暂时失败，可重试。"
+    "steerTemporaryRetry": "暂时失败，可重试。",
+    "dockMinimize": "收起输入框",
+    "dockRestore": "发消息",
+    "dockWorking": "运行中",
+    "dockPillHint": "点击展开，拖动可移动",
+    "dockWaiting": "等你回复"
   },
   "context": {
     "quote": {
@@ -4269,34 +4276,6 @@
       "estimated": "估算",
       "thirdParty": "第三方"
     },
-    "openclaw": {
-      "title": "OpenClaw 模型同步（Dalton Broker）",
-      "healthChecking": "检查中...",
-      "healthNotInstalled": "broker 未安装",
-      "healthRestarting": "网关重启中",
-      "healthAuthError": "令牌无效",
-      "healthTokenMissing": "未配置令牌",
-      "healthUnreachable": "不可达",
-      "checkNow": "立即检查",
-      "resyncButton": "重新同步模型",
-      "lastSync": "上次同步",
-      "neverSynced": "尚未同步",
-      "modelTableToggle": "模型明细",
-      "diffTitle": "OpenClaw 模型同步预览",
-      "diffSummary": "确认以下变更后写入模型目录覆盖层",
-      "upToDate": "已与 OpenClaw 保持一致，无新增或变更",
-      "unchangedCount": "{{count}} 个模型无变化",
-      "inUseWarning": "注意：被移除或隐藏的模型当前正被角色配置使用",
-      "editDefaultModel": "修改主模型",
-      "editSubagentModels": "修改子代理模型",
-      "added": "新增模型",
-      "removed": "移除 / 隐藏模型",
-      "changed": "参数或价格变更",
-      "priceDiscrepancies": "价格来源差异（已按保守最高价取值）",
-      "applying": "正在应用...",
-      "applySync": "确认同步",
-      "forceApply": "仍然强制同步"
-    },
     "nativeModels": {
       "title": "模型目录同步",
       "foundNew": "发现 {{count}} 个可同步模型",
@@ -4413,8 +4392,6 @@
       "probeBtn": "测试连接",
       "probing": "检测中…",
       "connectLink": "去连接",
-      "brokerParallelTitle": "OpenClaw broker（并行路径）",
-      "brokerSectionTitle": "OpenClaw broker（并行路径）",
       "subscriptionBadge": "订阅",
       "cashBadge": "现金",
       "tosRiskBadge": "条款风险",
@@ -4436,8 +4413,7 @@
         "background": "后台任务",
         "assist": "轻量辅助",
         "audit": "数据核验",
-        "reviewer": "独立复核",
-        "extract": "记忆整理"
+        "reviewer": "独立复核"
       },
       "expandModels": "查看可用模型（{{count}}）",
       "collapseModels": "收起模型列表",
@@ -4918,5 +4894,12 @@
         "street_estimate": "一致预期"
       }
     }
+  },
+  "pageTabs": {
+    "label": "已打开的页面",
+    "newTab": "新标签页",
+    "close": "关闭{{title}}",
+    "untitled": "LangAlpha",
+    "full": "已打开 {{count}} 个标签页，请先关闭一个再打开新的。"
   }
 }

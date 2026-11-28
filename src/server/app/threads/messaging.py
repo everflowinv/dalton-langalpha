@@ -901,6 +901,12 @@ async def _handle_send_message(
             enabled_subagents=request.subagents_enabled,
             # DALTON-HOOK(cos-settings-tools): forward execution-level system-catalog flag on server firing requests
             **({"ignore_custom_models": True} if getattr(request, "llm_model_system_only", False) else {}),
+            # DALTON-HOOK(model-picker-races): preserve built-in Antigravity variant on user/web requests (explicit or thread-following) so a stale client reasoning_effort never remaps Neon Low -> Neon High
+            **(
+                {"preserve_antigravity_variant": True}
+                if (not from_service or bool(request.platform))
+                else {}
+            ),
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -1033,6 +1039,8 @@ async def _handle_send_message(
                 from_service=from_service,
                 is_server_retry=is_server_retry,
                 retry_of_run_id=retry_of_run_id,
+                # DALTON-HOOK(quota-exhaustion): pass payer_user_id for pre-dispatch unattended fallback admission
+                payer_user_id=identity.recorded_as,
                 # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
                 **(
                     {"retry_source_execution_id": retry_source_execution_id}

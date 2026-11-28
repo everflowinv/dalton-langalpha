@@ -262,10 +262,9 @@ class TestUnifiedEffectiveRoleModelResolution:
             keys_by_user={"u-core": {"byok_enabled": True, "keys": {"openai": "sk-openai-test"}, "base_urls": {}}},
         )
 
-        # Assist & extract prefer background slot; audit, language & reviewer prefer primary slot.
+        # Assist prefers background slot; audit, language & reviewer prefer primary slot.
         assert await assist_mod.resolve_assist_model(role="assist", user_id="u-core") == "gpt-6-luna"
         assert await mp_mod.resolve_dalton_assist_model("u-core") == "gpt-6-luna"
-        assert await mp_mod.resolve_dalton_extract_model("u-core") == "gpt-6-luna"
         assert await mp_mod.resolve_dalton_audit_model("u-core") == "gpt-6.2-astra"
         assert await mp_mod.resolve_dalton_language_model("u-core") == "gpt-6.2-astra"
         assert await resolve_effective_role_model(role="reviewer", user_id="u-core") == "gpt-6.2-astra"

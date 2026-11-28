@@ -11,7 +11,7 @@ import { isPlatformMode } from '@/config/hostMode';
 import type { ProviderModelsData, CustomModelEntry } from '@/components/model/types';
 import type { ModelsResponse } from '@/api/model';
 import type { PlatformModelsResponse } from '@/types/platform';
-import { modelPrefs } from '@/lib/modelPreferences';
+import { modelPrefs, runnableDeploymentDefaults } from '@/lib/modelPreferences';
 import { ownKeyRule, payerResolver, type Payer } from '@/lib/modelPayer';
 import { CLAUDE_CODE_CONNECTION, isClaudeCodeModel } from '@/lib/claudeCode';
 import { useClaudeCodeStatus } from './useClaudeCode';
@@ -43,7 +43,6 @@ export interface SystemDefaults {
   dalton_assist_model?: string;
   dalton_assist_fallback_models?: string[];
   dalton_reviewer_models?: string[];
-  dalton_extract_model?: string;
 }
 
 export interface CompactionProfilePreset {
@@ -108,7 +107,8 @@ export interface UseAllModelsResult {
   offPlanModels: Set<string>;
   /** Platform response (null in OSS mode or when endpoint unavailable). */
   platform: PlatformModelsResponse | null;
-  /** System-level default model selections from the API. */
+  /** System-level default model selections from the API; standalone,
+   *  without a Default model nothing runs (`runnableDeploymentDefaults`). */
   systemDefaults: SystemDefaults | null;
   /** User-defined custom models from preferences. */
   customModels: CustomModelEntry[];
@@ -219,7 +219,7 @@ export function useAllModels(): UseAllModelsResult {
     [rawPlatform, accessProviders, byokEnabled],
   );
 
-  const systemDefaults = modelsData?.system_defaults ?? null;
+  const publishedDefaults = modelsData?.system_defaults ?? null;
   const compactionProfiles = modelsData?.compaction_profiles ?? null;
   const searchProviders = modelsData?.search_providers ?? null;
 
@@ -429,6 +429,16 @@ export function useAllModels(): UseAllModelsResult {
     [seriesCatalog, offeredSlots, rawMetadata, customModels, visible.customPairs],
   );
 
+  const isLoading = modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading;
+  const unread = (modelsError && !modelsData) || !!configuredUnread || claudeCode.unread;
+  // On a platform the plan serves the deployment's models; standalone only a
+  // key does, which is known once every list has been read.
+  const systemDefaults = useMemo(() => (
+    !publishedDefaults || isPlatformMode || isLoading || unread
+      ? publishedDefaults
+      : runnableDeploymentDefaults(publishedDefaults, (m) => visible.validModelNames.has(m))
+  ), [publishedDefaults, isLoading, unread, visible]);
+
   return {
     models: offered,
     slotModels: offeredSlots,
@@ -448,8 +458,8 @@ export function useAllModels(): UseAllModelsResult {
     searchProviders,
     taskCostBaseline: modelsData?.task_cost_baseline ?? null,
     rawApiResponse: modelsData,
-    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading,
-    unread: (modelsError && !modelsData) || !!configuredUnread || claudeCode.unread,
+    isLoading,
+    unread,
     listedProviders,
     // DALTON-HOOK(antigravity-series): return separated unfiltered catalog and selectable series indexes
     seriesCatalog,

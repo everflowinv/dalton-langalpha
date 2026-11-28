@@ -5494,7 +5494,7 @@ GitHub 材料是 `ai_finance_read` 的 `github` 资源。`version` 必须是 3�
 
 `upstream_clusters` 是过去 48 小时内、至少两个不同 owner 的 trending repo 共用同一个非通用 token 的线索。token 本身不直接写进日报。用 README 或上游官方页面核实后，才放进 `#### 跨日共性与新趋势`。48 小时内至少两个不同 owner 的 trending repo 共用一个此前没有独立播报过的上游，且 README 或上游官方页面已经独立确认时，在对应 signal 的 `signal_types` 加上 `upstream_primitive_adoption`。趋势小节的写法见 `signals.md`。这只增加趋势分析，不增加热点展示名额，也不把名额外仓库另列成清单。
 
-确认不了的聚类不写入趋势。来源说明写“cluster X 未能确认上游”。X 用该聚类在 `upstream_clusters` 里的 token。
+未确认的聚类只计入「GitHub 状态」中的未确认组数，趋势小节只收录已确认的聚类。
 
 ## 5. 栏目里的每一条
 
@@ -5624,9 +5624,9 @@ X 是 `news.md` 的成功条数。十四条全部失败时，同一节写“搜�
 
 H 是 `coverage.history_verified`，N 是 `coverage.checked_repositories`，T 是正文编号项目数，F 是其中首次入榜，C 是其中持续热点。同一节写明失败来源、`data_gaps`、待核验或待复核的数量，以及名额外观察数量。不列候补项目名称。没有缺口时写“无”。第三方榜单增量不作为正文数字。
 
-`GitHub 状态：本轮确认降温的已报项目逐个列名；没有则写无。48 小时上游聚类检出 K 组，确认 M 组、未能确认 K-M 组。`
+`GitHub 状态：本轮确认降温的已报项目逐个列名；没有则写无。48 小时上游聚类检出 K 组，已确认 M 组，未确认 K-M 组。`
 
-降温名单只来自 `cooled` 里已经报过的仓库。核验失败的仓库留在缺口，不写入这句的降温名单。K 是 `upstream_clusters` 的组数，M 是 README 或官方页面已经核实的组数。未能确认的聚类按 `github.md` 写“cluster X 未能确认上游”。
+降温名单只收录 `cooled` 中已报过的仓库，核验失败的仓库计入缺口。K 是 `upstream_clusters` 的组数，M 是经 README 或上游官方页面确认的组数。上游聚类只报告检出、已确认、未确认三个组数。
 
 `业绩会：AlphaEngine Earnings Calls（type_id: IND_SECOND_5FA442AE），过去 24 小时无市场/行业/市值限制的 AI 关键词检索；命中 N 篇，按相关性排序后全文扫描 X 篇，80篇预算跳过 B 篇，失败 Z 篇；AI candidates C 篇中 signal S / watchlist W / reject R。`
 

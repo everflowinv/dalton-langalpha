@@ -49,6 +49,7 @@ def thread_resolver(
     fast_mode: bool | None = None,
     enabled_subagents: list[str] | None = None,
     ignore_custom_models: bool = False,  # DALTON-HOOK(cos-settings-tools)
+    preserve_antigravity_variant: bool = False,  # DALTON-HOOK(model-picker-races)
 ) -> Callable[..., Awaitable[AgentConfig]]:
     """Maps a model name (None for the account default) to the config a turn
     on the thread runs it under, in the route's workspace and role.
@@ -63,7 +64,8 @@ def thread_resolver(
     from src.server.services.llm.config import resolve_llm_config
 
     row = thread or {}
-    effort = reasoning_effort or row.get("reasoning_effort")
+    row_model = row.get("llm_model")
+    row_effort = row.get("reasoning_effort")
     fast = fast_mode if fast_mode is not None else row.get("fast_mode")
 
     async def resolve(
@@ -72,11 +74,22 @@ def thread_resolver(
         reasoning_effort_override: Any = _UNSET_EFFORT,  # DALTON-HOOK(automation-effort)
         ignore_custom_models_override: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
     ) -> AgentConfig:
-        effective_effort = (
-            effort
-            if reasoning_effort_override is _UNSET_EFFORT
-            else reasoning_effort_override
-        )
+        if reasoning_effort_override is not _UNSET_EFFORT:
+            effective_effort = reasoning_effort_override
+        elif reasoning_effort is not None:
+            effective_effort = reasoning_effort
+        else:
+            # DALTON-HOOK(model-picker-races): never let the thread row's stored effort override a different requested model or built-in Antigravity variant
+            from src.dalton.llm.thread_model_dalton import (
+                resolve_thread_row_effort_for_model,
+            )
+
+            effective_effort = await resolve_thread_row_effort_for_model(
+                user_id,
+                model=model,
+                row_model=row_model,
+                row_effort=row_effort,
+            )
         # DALTON-HOOK(cos-settings-tools): enforce system-catalog model resolution when execution-level flag applies
         effective_ignore_custom = (
             bool(ignore_custom_models)
@@ -97,6 +110,12 @@ def thread_resolver(
             role=route.role,
             # DALTON-HOOK(cos-settings-tools): only forward ignore_custom_models when True so normal calls stay identical to upstream
             **({"ignore_custom_models": True} if effective_ignore_custom else {}),
+            # DALTON-HOOK(model-picker-races): keep an explicit web-selected Antigravity variant instead of remapping it with raw effort
+            **(
+                {"preserve_antigravity_variant": True}
+                if preserve_antigravity_variant
+                else {}
+            ),
         )
 
     return resolve

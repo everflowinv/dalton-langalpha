@@ -613,7 +613,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
 
       // 2. Onboarding cards & intro scenes
       h.gettingStartedTasks = DEPLOYED_TASKS.map((def) => ({ def: def as unknown as Record<string, unknown>, done: false }));
-      const launcher = renderWithProviders(<GettingStartedLauncher variant="row" />);
+      const launcher = renderWithProviders(<GettingStartedLauncher />);
       assertNoUpstreamBrand(launcher.container, 'GettingStartedLauncher', locale);
       launcher.unmount();
 

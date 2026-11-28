@@ -15,6 +15,8 @@ import sys
 
 import uvicorn
 
+from src.dalton.uvicorn_runtime import configure_uv_threadpool_size, default_uvicorn_loop
+
 from .app import create_app
 
 
@@ -31,8 +33,16 @@ def main() -> None:
             "INTERNAL_SERVICE_TOKEN is empty: every /fetch request will be "
             "refused (401). Set it in .env for the crawl service."
         )
+    configure_uv_threadpool_size()
     port = int(os.environ.get("CRAWL_SERVICE_PORT", "8100"))
-    uvicorn.run(create_app(), host="0.0.0.0", port=port, workers=1, log_level="info")
+    uvicorn.run(
+        create_app(),
+        host="0.0.0.0",
+        port=port,
+        workers=1,
+        log_level="info",
+        loop=default_uvicorn_loop(),
+    )
 
 
 if __name__ == "__main__":

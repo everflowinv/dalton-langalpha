@@ -45,7 +45,6 @@ const h = vi.hoisted(() => ({
     dalton_language_model: 'gemini-4-argon-medium-oauth',
     dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
     dalton_audit_timeout_s: 300,
-    dalton_extract_model: 'deepseek-flash',
   } as Record<string, unknown>,
   /** What the slots list; null lists the whole catalog. */
   slotModels: null as Record<string, { models?: string[] }> | null,
@@ -189,11 +188,6 @@ vi.mock('@/pages/Onboarding', () => ({
   useOnboarding: () => ({ replayGuides: vi.fn(), resetOnboarding: vi.fn() }),
 }));
 
-// DALTON-HOOK(settings-section): stub DaltonSection card in Settings shell harness
-vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
-  DaltonSection: () => null,
-}));
-
 // DALTON-HOOK(settings-reorg): control daltonAuth flag for ModelsPanel permission tests
 vi.mock('@/config/daltonAuth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
@@ -273,7 +267,6 @@ beforeEach(() => {
     dalton_language_model: 'gemini-4-argon-medium-oauth',
     dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
     dalton_audit_timeout_s: 300,
-    dalton_extract_model: 'deepseek-flash',
   };
   h.slotModels = null;
   h.metadata = {};
@@ -371,7 +364,6 @@ describe('Settings: Auto defaults', () => {
         dalton_language_model: 'gemini-4-argon-medium-oauth',
         dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
         dalton_audit_timeout_s: 300,
-        dalton_extract_model: 'deepseek-flash',
       };
     }
   });
@@ -414,8 +406,6 @@ describe('Settings: Dalton routing controls', () => {
 
     const auditSelect = screen.getByRole('combobox', { name: 'Figure audit model' }) as HTMLSelectElement;
     expect(auditSelect.options[0].textContent).toContain('gemini-4-argon-medium-oauth');
-    const extractSelect = screen.getByRole('combobox', { name: 'Research memory extraction model' }) as HTMLSelectElement;
-    expect(extractSelect.options[0].textContent).toContain('deepseek-flash');
     expect(
       screen.getByText(/gpt-6\.1-sol-oauth, claude-opus-5-5-oauth/),
     ).toBeInTheDocument();

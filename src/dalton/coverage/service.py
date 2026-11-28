@@ -137,13 +137,8 @@ def _can_reach_coverage_db(conn: Any = None) -> bool:
 
 
 def invalidate_user_aliases_cache(user_id: str | None = None) -> None:
-    """Invalidate cached ticker/company alias tables after coverage roster mutations."""
-    try:
-        from src.dalton.conversations.extractor import invalidate_ticker_company_aliases_cache
-
-        invalidate_ticker_company_aliases_cache(user_id)
-    except Exception:
-        pass
+    """No-op hook retained for callers after coverage roster mutations."""
+    _ = user_id
 
 
 def _run_coro_sync(coro: Any) -> Any:
@@ -911,7 +906,7 @@ async def get_user_aliases(
     base: dict[str, tuple[str, ...]] = {}
     if include_supplemental:
         try:
-            from src.dalton.conversations.extractor import SUPPLEMENTAL_TICKER_ALIASES
+            from src.dalton.coverage.aliases import SUPPLEMENTAL_TICKER_ALIASES
 
             base = dict(SUPPLEMENTAL_TICKER_ALIASES)
         except Exception:
@@ -968,7 +963,7 @@ def get_user_aliases_sync(
     if not _can_reach_coverage_db():
         if include_supplemental:
             try:
-                from src.dalton.conversations.extractor import SUPPLEMENTAL_TICKER_ALIASES
+                from src.dalton.coverage.aliases import SUPPLEMENTAL_TICKER_ALIASES
 
                 return dict(SUPPLEMENTAL_TICKER_ALIASES)
             except Exception:
@@ -983,7 +978,7 @@ def get_user_aliases_sync(
             logger.warning("[DALTON_COVERAGE] get_user_aliases_sync failed: %s", exc)
         if include_supplemental:
             try:
-                from src.dalton.conversations.extractor import SUPPLEMENTAL_TICKER_ALIASES
+                from src.dalton.coverage.aliases import SUPPLEMENTAL_TICKER_ALIASES
 
                 return dict(SUPPLEMENTAL_TICKER_ALIASES)
             except Exception:

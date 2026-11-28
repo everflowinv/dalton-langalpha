@@ -278,6 +278,8 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     subagents_allowed?: boolean | null;
     reasoning_effort?: string | null;
     fast_mode?: boolean | null;
+    // DALTON-HOOK(model-picker-races): thread_model lifecycle event payload
+    llm_model?: string | null;
     updated_at?: string | null;
   };
   switch (evt.type) {
@@ -393,6 +395,23 @@ function onFeedEvent(raw: Record<string, unknown>): void {
         const agrees = !!cached
           && (cached.reasoning_effort ?? null) === evt.reasoning_effort
           && (cached.fast_mode ?? null) === evt.fast_mode;
+        if (reading || !agrees) {
+          const saving = qc.isMutating({ mutationKey: threadFieldMutationKey(evt.thread_id) }) > 0;
+          void qc.invalidateQueries({ queryKey: key, ...(saving ? { refetchType: 'none' as const } : {}) });
+        }
+      }
+      return;
+    }
+    // DALTON-HOOK(model-picker-races): thread's llm_model changed in another tab or by the agent;
+    // reread detail rather than patching, and only mark stale while a save on this thread is out.
+    case 'thread_model': {
+      const qc = getLifecycleQueryClient();
+      // null is a value here: the thread went back to following the account default.
+      if (qc && evt.thread_id && evt.llm_model !== undefined) {
+        const key = queryKeys.threads.detail(evt.thread_id);
+        const cached = qc.getQueryData<Thread>(key);
+        const reading = qc.isFetching({ queryKey: key }) > 0;
+        const agrees = !!cached && (cached.llm_model ?? null) === evt.llm_model;
         if (reading || !agrees) {
           const saving = qc.isMutating({ mutationKey: threadFieldMutationKey(evt.thread_id) }) > 0;
           void qc.invalidateQueries({ queryKey: key, ...(saving ? { refetchType: 'none' as const } : {}) });

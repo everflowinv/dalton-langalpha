@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { resolveThemeVars } from './buildHtmlSrcDoc';
+import { paletteCss, readThemePalette } from './frameTheme';
 // DALTON-HOOK(mobile-web): import PageReadyPathState for tri-state bridge location tracking
 import { parsePageMessage, type PageReadyPathState, type PageToViewer, type ViewerToPage } from './pageProtocol';
 
@@ -116,7 +116,7 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     [ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe],
   );
 
-  const pushTheme = useCallback(() => post({ type: 'page:theme', css: resolveThemeVars() }), [post]);
+  const pushTheme = useCallback(() => post({ type: 'page:theme', css: paletteCss(readThemePalette()) }), [post]);
 
   const onMessage = useEffectEvent((e: MessageEvent) => {
     const win = frameRef.current?.contentWindow;

@@ -69,7 +69,6 @@ export interface ModelPreferences extends AccountTuning {
   dalton_assist_model?: string | null;
   dalton_assist_fallback_models?: string[] | null;
   dalton_reviewer_models?: string[] | null;
-  dalton_extract_model?: string | null;
   dalton_notify_enabled?: boolean | null;
   dalton_notify_targets?: string[] | null;
   dalton_notify_overrides?: Record<string, boolean> | null;
@@ -115,7 +114,6 @@ export const DaltonModelPrefsSchema = z.object({
   dalton_assist_model: daltonStrOrNull,
   dalton_assist_fallback_models: daltonStrListOrNull,
   dalton_reviewer_models: daltonStrListOrNull,
-  dalton_extract_model: daltonStrOrNull,
   dalton_notify_enabled: daltonBoolOrNull,
   dalton_notify_targets: daltonStrListOrNull,
   dalton_notify_overrides: daltonBoolMapOrNull,
@@ -176,7 +174,6 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'dalton_assist_model',
   'dalton_assist_fallback_models',
   'dalton_reviewer_models',
-  'dalton_extract_model',
   'dalton_notify_enabled',
   'dalton_notify_targets',
   'dalton_notify_overrides',
@@ -339,6 +336,18 @@ export type ModelSlot = 'default' | 'background';
 export interface DeploymentModelDefaults {
   default_model?: string;
   background_model?: string;
+}
+
+/**
+ * The deployment's defaults as a standalone server can run them: without its
+ * Default model where nothing runs it, on a key of the user's or the
+ * server's. That model is only a name in the server's config, so an account
+ * that chose none has no default, and the server refuses a turn naming none
+ * (`model_required`) rather than fail on the missing key. The Background
+ * model stays as published, since Background work runs on it either way.
+ */
+export function runnableDeploymentDefaults<T extends DeploymentModelDefaults>(defaults: T, runs: (model: string) => boolean): T {
+  return defaults.default_model && !runs(defaults.default_model) ? { ...defaults, default_model: undefined } : defaults;
 }
 
 /** The preference key that holds the default for `slot`. The one place a

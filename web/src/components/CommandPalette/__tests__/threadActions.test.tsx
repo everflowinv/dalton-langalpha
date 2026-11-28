@@ -35,11 +35,10 @@ vi.mock('@/api/search', () => ({
 // DALTON-HOOK(global-search): stub Dalton document search & home workspace helpers
 vi.mock('@/lib/dalton/searchApi', () => ({
   fetchGlobalSearch: vi.fn<
-    (q: string, limit?: number, signal?: AbortSignal, options?: { includeConversations?: boolean }) => Promise<{
-      conversations: never[];
+    (q: string, limit?: number, signal?: AbortSignal, options?: { workspaceId?: string; includeContent?: boolean }) => Promise<{
       documents: never[];
     }>
-  >(async () => ({ conversations: [], documents: [] })),
+  >(async () => ({ documents: [] })),
 }));
 vi.mock('@/hooks/useAllWorkspaces', () => ({
   useAllWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws1', name: 'Semis', status: 'running', is_home: false }] } }),

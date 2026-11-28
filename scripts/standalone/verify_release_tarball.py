@@ -14,6 +14,8 @@ Rejects any release archive containing:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+import importlib.util
 import re
 import sys
 import tarfile
@@ -148,15 +150,42 @@ def _normalized_parts(member_name: str) -> tuple[str, ...]:
     return tuple(p for p in parts if p not in ("", ".", "/"))
 
 
+def _load_ci_test_exempt_checker() -> Callable[[str], bool]:
+    """Load the single-source CI test-path exemption matcher from check_core_release_package.py."""
+    checker_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "dalton"
+        / "ops"
+        / "check_core_release_package.py"
+    )
+    if not checker_path.is_file():
+        raise RuntimeError(
+            f"--include-ci requires out-of-package scanner at {checker_path}"
+        )
+    mod_name = "_dalton_check_core_release_package"
+    mod = sys.modules.get(mod_name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(mod_name, checker_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load out-of-package scanner at {checker_path}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+    return mod.is_ci_test_exempt_path
+
+
 def inspect_tarball(
     tar_path: Path | str | None = None,
     *,
     fileobj: BinaryIO | None = None,
     expected_top_dir: str | None = None,
+    include_ci: bool = False,
 ) -> list[str]:
     """Inspect a tar archive (path or in-memory fileobj) and return policy violations."""
     if tar_path is None and fileobj is None:
         raise ValueError("inspect_tarball requires tar_path or fileobj")
+    is_ci_test_exempt = _load_ci_test_exempt_checker() if include_ci else None
     violations: list[str] = []
     member_count = 0
     recognized_top_dirs: set[str] = set()
@@ -213,6 +242,11 @@ def inspect_tarball(
                         f"forbidden metadata pax header on {member.name}: {key}"
                     )
 
+            rel_posix = "/".join(rel_parts)
+            exempt_ci_content = bool(
+                member.isfile() and is_ci_test_exempt is not None and is_ci_test_exempt(rel_posix)
+            )
+
             for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
                 if pattern.search(member.name):
                     violations.append(
@@ -234,7 +268,7 @@ def inspect_tarball(
                         f"forbidden Everflow overlay link target: {member.name} -> {link_target}"
                     )
 
-            if member.isfile():
+            if member.isfile() and not exempt_ci_content:
                 suffix = PurePosixPath(member.name).suffix.lower()
                 if suffix not in _BINARY_SUFFIXES:
                     extracted = tf.extractfile(member)
@@ -308,9 +342,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Require every archive member to live under this single top-level directory",
     )
+    parser.add_argument(
+        "--include-ci",
+        action="store_true",
+        help="Exempt CI test-only paths from forbidden content pattern checks (CI test tarballs only)",
+    )
     args = parser.parse_args(argv)
 
-    violations = inspect_tarball(args.tarball, expected_top_dir=args.expected_top_dir)
+    violations = inspect_tarball(
+        args.tarball,
+        expected_top_dir=args.expected_top_dir,
+        include_ci=args.include_ci,
+    )
     if violations:
         print(
             f"ERROR: Release tarball gate failed for {args.tarball} ({len(violations)} violation(s)):",

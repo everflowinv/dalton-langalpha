@@ -13,7 +13,6 @@ scripts/bbg_remote_refresh.sh
 scripts/cron_command_tasks.py
 scripts/eve_tracking_mirror.py
 scripts/feishu_send_card.py
-scripts/sentiment_dashboard_cos_upload.py
 scripts/sentiment_dashboard_digest.sh
 
 # Everflow internal watchlists, Gmail/AlphaEngine/GS Prime feeds & Discord/Feishu digests

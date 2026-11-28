@@ -10,11 +10,55 @@ the resilience middleware rebuilds that client, which re-reads the stored token
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextvars import ContextVar
 import hashlib
 from dataclasses import dataclass
 from typing import Any
 
 _ATTR = "_dalton_oauth_rebuild"
+_TRANSIENT_REFRESH_ATTR = "_dalton_oauth_refresh_error"
+_rebuild_error_sink: ContextVar[list[BaseException] | None] = ContextVar(
+    "_rebuild_error_sink", default=None
+)
+
+
+def _is_transient_refresh_error(exc: BaseException) -> bool:
+    """Return True when a refresh exception is transient (network/timeout/503) rather than terminal auth."""
+    from fastapi import HTTPException
+
+    from src.server.services.oauth_health import OAuthReauthRequired, OAuthRefreshUnavailable
+    from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
+
+    if isinstance(exc, OAuthRefreshUnavailable):
+        return True
+    if isinstance(exc, (OAuthReauthRequired, OAuthPlanNoApiAccess)):
+        return False
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, Mapping):
+        dtype = exc.detail.get("type")
+        if dtype == "oauth_refresh_unavailable":
+            return True
+        if dtype in {
+            "oauth_reauth_required",
+            "oauth_plan_no_api_access",
+            "oauth_required",
+            "oauth_plan_unsupported",
+        }:
+            return False
+    return True
+
+
+def get_transient_oauth_refresh_error(exc: BaseException | None) -> BaseException | None:
+    """Return the transient OAuth refresh failure attached to ``exc`` (or its cause chain), if any."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        attached = getattr(cur, _TRANSIENT_REFRESH_ATTR, None)
+        if isinstance(attached, BaseException):
+            return attached
+        cur = getattr(cur, "__cause__", None)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +188,10 @@ async def rebuild_oauth_client(client: Any) -> Any | None:
             if fresh_spec is None or fresh_spec.token_digest == spec.token_digest:
                 return None
         return _carry_prompt_cache_key(client, fresh)
-    except Exception:
+    except Exception as exc:
+        sink = _rebuild_error_sink.get()
+        if sink is not None:
+            sink[:] = [exc]
         return None
 
 
@@ -185,8 +232,25 @@ async def call_with_oauth_refresh(client: Any, fn: Any, *, prepare: Any = None) 
     except Exception as exc:
         if extract_status_code(exc) != 401:
             raise
-        fresh = await rebuild_oauth_client(client)
+        err_sink: list[BaseException] = []
+        token = _rebuild_error_sink.set(err_sink)
+        try:
+            fresh = await rebuild_oauth_client(client)
+        finally:
+            _rebuild_error_sink.reset(token)
         if fresh is None:
+            if err_sink and _is_transient_refresh_error(err_sink[-1]):
+                refresh_exc = err_sink[-1]
+                try:
+                    setattr(exc, _TRANSIENT_REFRESH_ATTR, refresh_exc)
+                except (AttributeError, TypeError):
+                    from src.server.services.oauth_health import OAuthRefreshUnavailable
+
+                    spec = oauth_rebuild_spec(client)
+                    raise OAuthRefreshUnavailable(
+                        spec.provider if spec is not None else "",
+                        "refresh_failed",
+                    ) from exc
             raise
         if prepare is not None:
             prepare(fresh)

@@ -27,9 +27,6 @@ STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5s'"
 CONTENT_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '15s'"
 MEMO_INDEX_KEY = "memo.md"
 MEMO_USER_PATH_PREFIX = ".agents/user/memo"
-TRANSCRIPT_BATCH_SIZE = 200
-TRANSCRIPT_MAX_SCANNED_FILES = 2000
-_TURN_FILE_RE = re.compile(r"^turn-\d{4}\.jsonl$")
 
 
 def escape_like(value: str) -> str:
@@ -114,65 +111,6 @@ def build_snippet(
     return snippet, highlights
 
 
-def extract_transcript_turn_hit(
-    raw_jsonl: bytes | bytearray | memoryview | str | None,
-    query: str,
-    stored_at: Any = None,
-) -> tuple[str, datetime | None] | None:
-    """Parse a ``turn-NNNN.jsonl`` payload and match only ``user`` / ``assistant`` ``text`` fields.
-
-    Never searches ``tool_call`` or ``tool_result`` records, and never returns raw JSON lines.
-    Timestamp prefers the ``at`` field of the first ``user`` record in the turn, falling back to ``stored_at``.
-    """
-    if raw_jsonl is None:
-        return None
-    if isinstance(raw_jsonl, (bytes, bytearray, memoryview)):
-        decoded = bytes(raw_jsonl).decode("utf-8", errors="replace")
-    elif isinstance(raw_jsonl, str):
-        decoded = raw_jsonl
-    else:
-        return None
-
-    norm_query = _collapse_whitespace(query)
-    if not norm_query:
-        return None
-    pattern = re.compile(re.escape(norm_query), re.IGNORECASE)
-
-    first_user_at: datetime | None = None
-    matched_text: str | None = None
-
-    for raw_line in decoded.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-
-        rec_type = record.get("type")
-        if rec_type == "user" and first_user_at is None:
-            first_user_at = _parse_ts(record.get("at"))
-
-        if rec_type not in ("user", "assistant"):
-            continue
-
-        text_val = record.get("text")
-        if not isinstance(text_val, str):
-            continue
-        collapsed_text = _collapse_whitespace(text_val)
-        if collapsed_text and pattern.search(collapsed_text):
-            matched_text = text_val
-
-    if matched_text is None:
-        return None
-
-    turn_ts = first_user_at if first_user_at is not None else _parse_ts(stored_at)
-    return matched_text, turn_ts
-
-
 def parse_optional_uuid(value: str | None) -> str | None:
     """Validate and canonicalize an optional UUID string before hitting Postgres."""
     if value is None:
@@ -197,81 +135,6 @@ async def _run_timed_query(
             rows = await cur.fetchall()
             return [dict(r) for r in (rows or []) if isinstance(r, dict)]
 
-
-_SQL_SEARCH_THREAD_TITLES = """
-    SELECT
-        t.conversation_thread_id::text AS thread_id,
-        t.workspace_id::text AS workspace_id,
-        COALESCE(t.title, '') AS title,
-        w.name AS workspace_name,
-        COALESCE(t.updated_at, t.created_at) AS hit_at
-    FROM conversation_threads t
-    JOIN workspaces w
-      ON w.workspace_id = t.workspace_id
-    WHERE w.user_id = %s
-      AND w.status != 'deleted'
-      AND t.archived_at IS NULL
-      AND t.title ILIKE %s ESCAPE '\\'
-    ORDER BY COALESCE(t.updated_at, t.created_at) DESC NULLS LAST
-    LIMIT %s
-"""
-
-_SQL_SEARCH_CONVERSATION_QUERIES = """
-    SELECT * FROM (
-        SELECT DISTINCT ON (t.conversation_thread_id)
-            t.conversation_thread_id::text AS thread_id,
-            t.workspace_id::text AS workspace_id,
-            COALESCE(t.title, '') AS title,
-            w.name AS workspace_name,
-            q.content AS content,
-            q.created_at AS created_at,
-            q.turn_index AS turn_index
-        FROM conversation_queries q
-        JOIN conversation_threads t
-          ON t.conversation_thread_id = q.conversation_thread_id
-        JOIN workspaces w
-          ON w.workspace_id = t.workspace_id
-        WHERE w.user_id = %s
-          AND w.status != 'deleted'
-          AND t.archived_at IS NULL
-          AND q.content ILIKE %s ESCAPE '\\'
-        ORDER BY t.conversation_thread_id, q.created_at DESC NULLS LAST, q.turn_index DESC
-    ) sub
-    ORDER BY created_at DESC NULLS LAST, turn_index DESC
-    LIMIT %s
-"""
-
-_SQL_SEARCH_TRANSCRIPT_FILES = """
-    SELECT
-        t.conversation_thread_id::text AS thread_id,
-        t.workspace_id::text AS workspace_id,
-        COALESCE(t.title, '') AS title,
-        w.name AS workspace_name,
-        f.path AS path,
-        f.content AS content,
-        COALESCE(tt.stored_at, t.updated_at, t.created_at) AS stored_at
-    FROM thread_transcript_files f
-    JOIN conversation_threads t
-      ON t.conversation_thread_id = f.conversation_thread_id
-    JOIN workspaces w
-      ON w.workspace_id = t.workspace_id
-    LEFT JOIN thread_transcripts tt
-      ON tt.conversation_thread_id = f.conversation_thread_id
-     AND tt.prefix = f.prefix
-    WHERE w.user_id = %s
-      AND w.status != 'deleted'
-      AND t.archived_at IS NULL
-      AND f.content IS NOT NULL
-      AND f.path ~ '^turn-[0-9]{4}\\.jsonl$'
-      AND (
-          convert_from(f.content, 'UTF8') ILIKE %s ESCAPE '\\'
-          OR convert_from(f.content, 'UTF8') ILIKE %s ESCAPE '\\'
-      )
-    ORDER BY COALESCE(tt.stored_at, t.updated_at, t.created_at) DESC NULLS LAST,
-             t.conversation_thread_id DESC,
-             f.path DESC
-    LIMIT %s OFFSET %s
-"""
 
 _SQL_SEARCH_MEMOS = """
     SELECT
@@ -330,192 +193,14 @@ def _build_workspace_files_sql(*, has_workspace_id: bool, include_content: bool)
 """
 
 
-def _row_owned_and_active(row: dict[str, Any], user_id: str, *, check_archived: bool = False) -> bool:
+def _row_owned_and_active(row: dict[str, Any], user_id: str) -> bool:
     """Defensive ownership/status check when test doubles return unfiltered rows."""
     if "user_id" in row and row["user_id"] != user_id:
         return False
     status = row.get("workspace_status") or row.get("status")
     if status == "deleted":
         return False
-    if check_archived and row.get("archived_at") is not None:
-        return False
     return True
-
-
-async def search_conversations(
-    user_id: str,
-    query: str,
-    limit: int = 20,
-    *,
-    conn: Any = None,
-) -> list[dict[str, Any]]:
-    """Search conversation titles, user queries, and transcript user/assistant text for owned workspaces."""
-    norm_q = (query or "").strip()
-    if len(norm_q) < 2:
-        return []
-    clamped_limit = max(1, min(int(limit), 50))
-    like_pattern = f"%{escape_like(norm_q)}%"
-    json_escaped_q = json.dumps(norm_q, ensure_ascii=False)[1:-1]
-    json_like_pattern = f"%{escape_like(json_escaped_q)}%"
-
-    # Deduplicate by thread_id, keeping the single most recent hit per conversation.
-    # Candidate tuple: (ts_sort_key, source_priority, secondary_order, hit_dt, raw_text, meta_dict)
-    best_by_thread: dict[str, tuple[float, int, str, datetime | None, str, dict[str, Any]]] = {}
-
-    def _consider_hit(
-        thread_id: str,
-        workspace_id: str,
-        title: str,
-        workspace_name: str,
-        raw_text: str,
-        hit_dt: datetime | None,
-        *,
-        source_priority: int,
-        secondary_key: str = "",
-    ) -> None:
-        if not thread_id:
-            return
-        snippet, highlights = build_snippet(raw_text, norm_q)
-        if not highlights:
-            return
-        sort_ts = _ts_sort_key(hit_dt)
-        candidate_key = (sort_ts, source_priority, secondary_key)
-        existing = best_by_thread.get(thread_id)
-        if existing is not None:
-            existing_key = (existing[0], existing[1], existing[2])
-            if candidate_key <= existing_key:
-                return
-        best_by_thread[thread_id] = (
-            sort_ts,
-            source_priority,
-            secondary_key,
-            hit_dt,
-            raw_text,
-            {
-                "kind": "conversation",
-                "thread_id": thread_id,
-                "workspace_id": workspace_id,
-                "title": title,
-                "workspace_name": workspace_name,
-                "timestamp": _format_ts(hit_dt),
-                "snippet": snippet,
-                "highlights": highlights,
-            },
-        )
-
-    async with get_db_connection(conn) as db_conn:
-        title_rows = await _run_timed_query(
-            db_conn,
-            _SQL_SEARCH_THREAD_TITLES,
-            (user_id, like_pattern, clamped_limit),
-        )
-        query_rows = await _run_timed_query(
-            db_conn,
-            _SQL_SEARCH_CONVERSATION_QUERIES,
-            (user_id, like_pattern, clamped_limit),
-        )
-
-        for row in title_rows:
-            if not _row_owned_and_active(row, user_id, check_archived=True):
-                continue
-            thread_id = str(row.get("thread_id") or row.get("conversation_thread_id") or "")
-            workspace_id = str(row.get("workspace_id") or "")
-            title = str(row.get("title") or "")
-            workspace_name = str(row.get("workspace_name") or "")
-            hit_dt = _parse_ts(row.get("hit_at") or row.get("updated_at") or row.get("created_at"))
-            _consider_hit(
-                thread_id,
-                workspace_id,
-                title,
-                workspace_name,
-                title,
-                hit_dt,
-                source_priority=1,
-            )
-
-        for row in query_rows:
-            if not _row_owned_and_active(row, user_id, check_archived=True):
-                continue
-            thread_id = str(row.get("thread_id") or row.get("conversation_thread_id") or "")
-            workspace_id = str(row.get("workspace_id") or "")
-            title = str(row.get("title") or "")
-            workspace_name = str(row.get("workspace_name") or "")
-            content = str(row.get("content") or "")
-            hit_dt = _parse_ts(row.get("created_at") or row.get("hit_at"))
-            turn_idx = int(row.get("turn_index") or 0)
-            _consider_hit(
-                thread_id,
-                workspace_id,
-                title,
-                workspace_name,
-                content,
-                hit_dt,
-                source_priority=2,
-                secondary_key=f"{turn_idx:08d}",
-            )
-
-        scanned_files = 0
-        offset = 0
-        transcript_threads_matched: set[str] = set()
-        while (
-            scanned_files < TRANSCRIPT_MAX_SCANNED_FILES
-            and len(transcript_threads_matched) < clamped_limit
-        ):
-            batch_limit = min(
-                TRANSCRIPT_BATCH_SIZE,
-                TRANSCRIPT_MAX_SCANNED_FILES - scanned_files,
-            )
-            transcript_rows = await _run_timed_query(
-                db_conn,
-                _SQL_SEARCH_TRANSCRIPT_FILES,
-                (user_id, like_pattern, json_like_pattern, batch_limit, offset),
-            )
-            if not transcript_rows:
-                break
-            for row in transcript_rows:
-                if not _row_owned_and_active(row, user_id, check_archived=True):
-                    continue
-                path = str(row.get("path") or "")
-                if path and not _TURN_FILE_RE.match(posixpath.basename(path)):
-                    continue
-                raw_content = row.get("content")
-                if raw_content is None:
-                    continue
-                extracted = extract_transcript_turn_hit(
-                    raw_content,
-                    norm_q,
-                    stored_at=row.get("stored_at"),
-                )
-                if extracted is None:
-                    continue
-                matched_text, hit_dt = extracted
-                thread_id = str(row.get("thread_id") or row.get("conversation_thread_id") or "")
-                workspace_id = str(row.get("workspace_id") or "")
-                title = str(row.get("title") or "")
-                workspace_name = str(row.get("workspace_name") or "")
-                if thread_id:
-                    transcript_threads_matched.add(thread_id)
-                _consider_hit(
-                    thread_id,
-                    workspace_id,
-                    title,
-                    workspace_name,
-                    matched_text,
-                    hit_dt,
-                    source_priority=3,
-                    secondary_key=path,
-                )
-            scanned_files += len(transcript_rows)
-            offset += len(transcript_rows)
-            if len(transcript_rows) < batch_limit:
-                break
-
-    sorted_entries = sorted(
-        best_by_thread.values(),
-        key=lambda item: (item[0], item[1], item[2]),
-        reverse=True,
-    )
-    return [entry[5] for entry in sorted_entries[:clamped_limit]]
 
 
 async def _search_workspace_files_rows(
@@ -678,7 +363,7 @@ async def search_documents(
         )
 
     for row in file_rows:
-        if not _row_owned_and_active(row, user_id, check_archived=False):
+        if not _row_owned_and_active(row, user_id):
             continue
         if "kind" in row and row["kind"] != "file":
             continue
@@ -737,21 +422,15 @@ async def global_search(
     query: str,
     limit: int = 20,
     *,
-    include_conversations: bool = True,
     workspace_id: str | None = None,
     include_content: bool = True,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """Run keyword global search across owned conversations and documents."""
+    """Run keyword document search across personal memos and owned workspace files."""
     norm_q = (query or "").strip()
     if len(norm_q) < 2:
         raise ValueError("Search query must be at least 2 characters after trimming whitespace.")
     clamped_limit = max(1, min(int(limit), 50))
-    conversations = (
-        await search_conversations(user_id, norm_q, limit=clamped_limit, conn=conn)
-        if include_conversations
-        else []
-    )
     content_timed_out_flags: list[bool] = []
     documents = await search_documents(
         user_id,
@@ -763,7 +442,6 @@ async def global_search(
         conn=conn,
     )
     payload: dict[str, Any] = {
-        "conversations": conversations,
         "documents": documents,
     }
     if content_timed_out_flags:

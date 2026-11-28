@@ -41,7 +41,7 @@ describe('AccountMenu help links in Dalton build', () => {
     vi.resetModules();
 
     const { default: AccountMenu } = await import('../AccountMenu');
-    renderWithProviders(<AccountMenu variant="row" />);
+    renderWithProviders(<AccountMenu />);
 
     const hrefs = screen.getAllByRole('link').map((el) => el.getAttribute('href'));
     expect(hrefs).toContain('/help/whats-new/');

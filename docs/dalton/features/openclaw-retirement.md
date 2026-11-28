@@ -23,6 +23,7 @@ OpenClaw 已于 2026-11-19 全部停用，宿主机 `~/.openclaw` 已归档移�
 3. **旧单目录运行模式**：`DALTON_OCW_ROOT` / `legacy_ocw_mode` 与 `host_services_switch.sh --rollback` 已移除，`DALTON_RESEARCH_CODE` + `DALTON_RESEARCH_HOME` 为唯一支持模式。
 4. **一次性迁移工具与历史会话导出**：`import_openclaw_skill_state.py`、`migrate_legacy_knowledge.py`、`wiki_coverage_report.py`、`build_coverage.py`、`check_skill_refs.py`、`data_tasks_parity.py`、`scripts/dalton/conversations/export_openclaw.py`、`scripts/dalton/conversation_archive.py`、`reextract_conversations.py` 及 `com.dalton.conversation-archive` 已移除。
 5. **`seed_openclaw_data.sh` 旧同步路径与 `openclaw_overlays/`**：`openclaw_overlays/` 中的活跃脚本已迁至 `scripts/dalton/data_assets/`，`seed_openclaw_data.sh` 仅从仓库 `data_assets/` 安装到 `var/dalton/openclaw-data/`。
+6. **后续停用代码清理（抽取管线、COS 上传、Broker 读取、桥接嵌入回退与 `agent-reach`）**：移除团队对话卡片自动抽取管线（`src/dalton/conversations/extractor.py`、调度任务、设置项 `daltonExtractModel` 及界面文案与帮助文档条目，保留只读归档检索）、腾讯云 COS 上传脚本与 `cos_mode` / `cos-python-sdk-v5` 依赖（`seed_openclaw_data.sh cleanup-retired-cos` 负责清理生产数据卷内残留文件并同步新版 `kweb_dashboard_cli.py`）、`DALTON_BROKER_TOKEN`（11-28 已从生产 `.env` 删除）、`DALTON_EMBED_VIA_BRIDGE` / `get_dalton_bridge_embed_url` 应急回退路径，以及 `agent-reach` 技能文件与未用前端/脚本残留（桥侧路由过滤继续拦截上游返回的 `agent-reach`）。
 
 ## 3. 沿用历史命名的在用组件
 

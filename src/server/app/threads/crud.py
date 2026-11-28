@@ -25,6 +25,7 @@ from src.server.services.thread_lifecycle import project_lifecycle
 from src.server.services.thread_lifecycle_feed import (
     publish_thread_archived,
     publish_thread_deleted,
+    publish_thread_model,  # DALTON-HOOK(model-picker-races)
     publish_thread_pinned,
     publish_thread_subagents,
     publish_thread_tuning,
@@ -838,16 +839,44 @@ async def update_thread_endpoint(
             updates["reasoning_effort"] = request.reasoning_effort
         if "fast_mode" in provided:
             updates["fast_mode"] = request.fast_mode
+        # DALTON-HOOK(model-picker-races): atomically clear standard reasoning_effort in the same SQL UPDATE when switching to a built-in Antigravity variant
+        if "llm_model" in provided and request.llm_model is not None:
+            from src.dalton.llm.thread_model_dalton import apply_antigravity_effort_clear
+
+            await apply_antigravity_effort_clear(x_user_id, request.llm_model, updates)
+        # DALTON-HOOK(model-picker-races): forward optional expected-value CAS guards for background auto-saves
+        cas_guards: dict = {}
+        if "expected_llm_model" in provided:
+            cas_guards["expected_llm_model"] = request.expected_llm_model
+        if "expected_reasoning_effort" in provided:
+            cas_guards["expected_reasoning_effort"] = request.expected_reasoning_effort
+        if "expected_fast_mode" in provided:
+            cas_guards["expected_fast_mode"] = request.expected_fast_mode
+        if cas_guards and "reasoning_effort" in updates:
+            from src.dalton.llm.thread_model_dalton import (
+                enforce_conditional_effort_clear_guard,
+            )
+
+            enforce_conditional_effort_clear_guard(updates, cas_guards)
         if not updates and member_pin is None:
             raise HTTPException(
                 status_code=400, detail="No updatable fields provided"
             )
         if member_pin is not None:
             await set_member_pin(thread_id, x_user_id, member_pin)
-        updated_thread = await update_thread_fields(thread_id, **updates) if updates else None
+        updated_thread = await update_thread_fields(thread_id, **updates, **cas_guards) if updates else None
         if access.is_shared and (updated_thread or not updates):
             updated_thread = await get_thread_for_viewer(thread_id, x_user_id)
         if not updated_thread:
+            # DALTON-HOOK(model-picker-races): distinguish CAS mismatch (409) from missing thread (404)
+            if cas_guards and await get_thread_auth_meta(thread_id) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "type": "thread_setting_conflict",
+                        "message": "Thread settings changed since this update was prepared.",
+                    },
+                )
             raise HTTPException(
                 status_code=404, detail=f"Thread not found: {thread_id}"
             )
@@ -874,6 +903,14 @@ async def update_thread_endpoint(
                 thread_id=thread_id,
                 workspace_id=str(updated_thread["workspace_id"]),
                 allowed=updated_thread["subagents_allowed"],
+            )
+        # DALTON-HOOK(model-picker-races): broadcast llm_model changes to other open tabs
+        if "llm_model" in updates:
+            await publish_thread_model(
+                user_id=x_user_id,
+                thread_id=thread_id,
+                workspace_id=str(updated_thread["workspace_id"]),
+                llm_model=updated_thread.get("llm_model"),
             )
         if "reasoning_effort" in updates or "fast_mode" in updates:
             await publish_thread_tuning(

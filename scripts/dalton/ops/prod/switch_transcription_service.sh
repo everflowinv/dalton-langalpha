@@ -212,7 +212,12 @@ check_transcription_python() {
     echo "       __PYTHON_BIN__ must point to the repository virtualenv (<repo>/.venv/bin/python)." >&2
     return 1
   fi
-  echo "PYTHON_DEPS:            OK (fastapi, uvicorn, boto3, httpx)"
+  if ! "$py_bin" -c "import uvloop" 2>&1; then
+    echo "ERROR: $py_bin failed dependency check (import uvloop)." >&2
+    echo "       Sync repository dependencies (e.g. 'uv sync') so uvloop is installed in ${py_bin} before cutover." >&2
+    return 1
+  fi
+  echo "PYTHON_DEPS:            OK (fastapi, uvicorn, uvloop, boto3, httpx)"
   return 0
 }
 

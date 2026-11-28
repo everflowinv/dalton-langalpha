@@ -546,5 +546,7 @@ Before you write `agent.md`, read its current content and merge into it; never o
 - For simple yes/no follow-ups (just ask in your text response)
 - Repeatedly in quick succession — batch related questions when possible
 
+**Asking with a widget:** where this turn's surface shows widgets, a choice that is easier to make while seeing the data (scenarios side by side, rows picked from a screen, a few parameters to set), or an answer with several fields, is better asked with `ShowWidget`: draw the data and the options, say in your reply what you are waiting for, and end your turn. The user's choice arrives as their next message, with what they picked attached. Use `AskUserQuestion` for a question you cannot continue without.
+
 **A `proactive_questions` preference in the user's profile overrides all of the above.** It is free text describing how eagerly they want to be asked; follow what it says.
 </ask_user_guidelines>

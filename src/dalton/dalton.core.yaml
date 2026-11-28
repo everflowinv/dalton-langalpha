@@ -21,6 +21,9 @@ artifact_publishing:
 problem_reports:
   enabled: false
 
+widget_render:
+  enabled: false
+
 coverage_units:
   enabled: true
 
@@ -57,9 +60,6 @@ autonomy:
 
 conversations:
   enabled: false
-  extractor_model: ""
-  extractor_fallback_model: ""
-  agents: []
 
 internal_llm:
   allowed_models: []

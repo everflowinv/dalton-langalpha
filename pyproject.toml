@@ -64,6 +64,9 @@ dependencies = [
     "fastapi>=0.115.0",
     "anyio>=4.0.0",
     "uvicorn>=0.27.1",
+    # uvicorn runs each worker on uvloop when it can import it; asyncio's own
+    # loop spends more CPU handing work between a turn's tasks. No Windows build.
+    "uvloop>=0.22.1; sys_platform != 'win32'",
     # The preview proxy subclasses the asyncio client to refuse redirects.
     "websockets>=15.0",
     # The public suffix list, for the preview base's separate-site check.
@@ -135,7 +138,6 @@ dependencies = [
     # RE2 matches in linear time, so no pattern can hold a worker's loop.
     "google-re2>=1.1.20251105",
     # DALTON-HOOK(data-jobs): runtime Python dependencies for OC-1 container data tasks
-    "cos-python-sdk-v5",
     "akshare==1.19.1",
     "xlrd>=2.0",
     "opencc-python-reimplemented",

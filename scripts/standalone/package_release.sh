@@ -409,7 +409,11 @@ elif [[ -f "${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; t
 fi
 CHECKER_RC=0
 if [[ -n "$OUT_OF_PKG_CHECKER" ]]; then
-  python3 "$OUT_OF_PKG_CHECKER" --export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT" > "$SCAN_OUTPUT" 2>&1 || CHECKER_RC=$?
+  CHECKER_ARGS=(--export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT")
+  if [[ "$INCLUDE_CI" -eq 1 ]]; then
+    CHECKER_ARGS+=(--include-ci)
+  fi
+  python3 "$OUT_OF_PKG_CHECKER" "${CHECKER_ARGS[@]}" > "$SCAN_OUTPUT" 2>&1 || CHECKER_RC=$?
 else
   {
     echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
@@ -455,7 +459,11 @@ if [[ -n "$TAR_PATH" ]]; then
   TAR_STAGE_DIR="${STAGE_DIR}/${RELEASE_TOP_DIR}"
   mv "$EXPORT_ROOT" "$TAR_STAGE_DIR"
   tar ${TAR_CREATE_FLAGS[@]+"${TAR_CREATE_FLAGS[@]}"} -czf "$TAR_PATH" -C "$STAGE_DIR" "$RELEASE_TOP_DIR"
-  if ! python3 "${SCRIPT_DIR}/verify_release_tarball.py" --expected-top-dir "$RELEASE_TOP_DIR" "$TAR_PATH"; then
+  VERIFY_ARGS=(--expected-top-dir "$RELEASE_TOP_DIR")
+  if [[ "$INCLUDE_CI" -eq 1 ]]; then
+    VERIFY_ARGS+=(--include-ci)
+  fi
+  if ! python3 "${SCRIPT_DIR}/verify_release_tarball.py" "${VERIFY_ARGS[@]}" "$TAR_PATH"; then
     rm -f "$TAR_PATH"
     exit 1
   fi

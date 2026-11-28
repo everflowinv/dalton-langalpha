@@ -322,3 +322,54 @@ describe('useClearPreferences', () => {
     });
   });
 });
+
+// DALTON-HOOK(model-picker-races): Report Low #7 — broadcast cross-tab refresh once the last in-flight preference write succeeds
+describe('useUpdatePreferences cross-tab broadcast', () => {
+  beforeEach(() => {
+    mockUpdate.mockReset();
+    mockAnnounce.mockReset();
+  });
+
+  it('broadcasts preferences changed once after the last in-flight preference write succeeds', async () => {
+    let landFirst!: (row: unknown) => void;
+    let landSecond!: (row: unknown) => void;
+    mockUpdate
+      .mockImplementationOnce(() => new Promise((resolve) => { landFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { landSecond = resolve; }));
+    const queryClient = seeded({ model_preference: { reasoning_effort: 'medium' } });
+    const { result } = renderHookWithProviders(() => useUpdatePreferences(), { queryClient });
+
+    let p1!: Promise<unknown>;
+    let p2!: Promise<unknown>;
+    await act(async () => {
+      p1 = result.current.mutateAsync({ model_preference: { reasoning_effort: 'high' } });
+      p2 = result.current.mutateAsync({ model_preference: { reasoning_effort: 'low' } });
+    });
+
+    await act(async () => {
+      landFirst({ model_preference: { reasoning_effort: 'high' } });
+      await p1;
+    });
+    // Still one write in flight — must not broadcast prematurely.
+    expect(mockAnnounce).not.toHaveBeenCalled();
+
+    await act(async () => {
+      landSecond({ model_preference: { reasoning_effort: 'low' } });
+      await p2;
+    });
+    expect(mockAnnounce).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not broadcast when the preference write fails', async () => {
+    mockUpdate.mockRejectedValueOnce(new Error('500'));
+    const queryClient = seeded({ model_preference: { reasoning_effort: 'medium' } });
+    const { result } = renderHookWithProviders(() => useUpdatePreferences(), { queryClient });
+
+    await act(async () => {
+      await result.current
+        .mutateAsync({ model_preference: { reasoning_effort: 'low' } })
+        .catch(() => {});
+    });
+    expect(mockAnnounce).not.toHaveBeenCalled();
+  });
+});

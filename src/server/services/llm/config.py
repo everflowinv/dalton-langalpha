@@ -49,6 +49,7 @@ from .availability import (
     raise_byok_key_required,
     raise_model_not_on_plan,
     raise_model_removed,
+    raise_model_required,
 )
 
 from . import logger
@@ -454,6 +455,52 @@ async def default_to_first_allowed(
     raise_no_model_allowed(policy, default)
 
 
+async def require_runnable_default(
+    config, user_id: str, model_pref: dict, slot: str, request_model: str | None,
+    *, saved_pref: dict, policy: Policy, permits: PlanTier, is_byok: bool,
+) -> None:
+    """Refuse a standalone turn that would run the deployment's default when
+    nothing the user or the server holds runs it.
+
+    Standalone, the default is a name in the server's config (a bundled build
+    ships one whether or not anyone holds its key), so a user who never chose
+    a model has none: the turn asks for one rather than failing on a missing
+    key. Only a primary turn that names no model and whose user saved none
+    (``saved_pref``, read before a rule, the plan or a Claude Code default
+    held for Home set theirs aside, since they do have one); in platform mode
+    the plan serves the default.
+    """
+    from src.config.settings import HOST_MODE
+
+    if (
+        HOST_MODE != "oss"
+        or slot != "primary"
+        or request_model
+        or config.llm is None
+        or saved_default_model(saved_pref, slot)
+    ):
+        return
+    from .clients import DeploymentRoute, credential_route
+
+    default = slot_model(config.llm, slot)
+    byok_cache: dict[str, dict | None] = {}
+    route = await credential_route(
+        user_id, default, is_byok=is_byok, policy=policy,
+        _pref_cache=model_pref, _byok_cache=byok_cache,
+    )
+    # Only a catalog model nothing of the user's serves. A sign-in or Claude
+    # Code default has refusals of its own that say what to reconnect or set
+    # up, and an unknown name is the deployment's misconfiguration.
+    if not isinstance(route, DeploymentRoute):
+        return
+    if not await _serves(
+        user_id, default, model_pref,
+        policy=policy, permits=permits, is_byok=is_byok, byok_cache=byok_cache,
+    ):
+        logger.info(f"[CHAT] No runnable default for user={user_id}: {default} has no key or server")
+        raise_model_required(default)
+
+
 def apply_policy_to_roles(
     config, model_pref: dict, selection: ModelSelection, slot: str, *, policy: Policy,
 ) -> None:
@@ -683,6 +730,8 @@ async def resolve_llm_config(
     role: AgentRole = "analyst",
     # DALTON-HOOK(workspace-dedup): ignore user custom models/providers so built-in catalog entries win.
     ignore_custom_models: bool = False,
+    # DALTON-HOOK(model-picker-races): keep an explicitly requested built-in Antigravity variant instead of remapping it with raw reasoning_effort
+    preserve_antigravity_variant: bool = False,
 ):
     """Resolve the final LLM config for one turn: which model runs, how it is
     tuned, what it is allowed to reach, and every client it can call.
@@ -789,6 +838,11 @@ async def resolve_llm_config(
             config, user_id, model_pref, slot, request_model,
             policy=policy, permits=permits, is_byok=is_byok,
         )
+        if user_facing:
+            await require_runnable_default(
+                config, user_id, model_pref, slot, request_model,
+                saved_pref=saved_pref, policy=policy, permits=permits, is_byok=is_byok,
+            )
         selection = select_model(config, model_pref, slot, request_model)
         apply_policy_to_roles(config, model_pref, selection, slot, policy=policy)
         # DALTON-HOOK(antigravity-series): map an explicit turn reasoning_effort
@@ -809,11 +863,16 @@ async def resolve_llm_config(
                 else None
             )
             if isinstance(_ag_entry, dict) and _ag_entry.get("provider") == ANTIGRAVITY_PROVIDER:
-                _ag_mapped = resolve_antigravity_effort_model(
-                    selection.effective_model,
-                    reasoning_effort,
-                    model_config=_ag_mc,
-                    allowed_filter=lambda m: policy_refuses(policy, model_pref, m) is None,
+                # DALTON-HOOK(model-picker-races): when a user/web request resolves to a built-in Antigravity variant (explicitly selected or inherited from the thread/default), preserve that variant's tier instead of remapping it with raw reasoning_effort
+                _ag_mapped = (
+                    None
+                    if preserve_antigravity_variant
+                    else resolve_antigravity_effort_model(
+                        selection.effective_model,
+                        reasoning_effort,
+                        model_config=_ag_mc,
+                        allowed_filter=lambda m: policy_refuses(policy, model_pref, m) is None,
+                    )
                 )
                 if _ag_mapped is not None:
                     _ag_target = _ag_mapped[0]

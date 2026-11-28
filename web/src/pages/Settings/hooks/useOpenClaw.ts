@@ -10,8 +10,6 @@ import {
   retireNativeModels,
   syncNativeModels,
   fetchDaltonSystemJobs,
-  runDaltonSystemJobNow,
-  toggleDaltonSystemJob,
   updateDaltonBudget,
   upsertDaltonTaskCap,
 } from '../utils/daltonApi';
@@ -136,30 +134,5 @@ export function useDaltonSystemJobs(enabled = true) {
     queryFn: fetchDaltonSystemJobs,
     enabled,
     staleTime: 15_000,
-  });
-}
-
-export function useToggleDaltonSystemJob() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (params: { key: string; enabled: boolean }) =>
-      toggleDaltonSystemJob(params.key, params.enabled),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.systemJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all });
-    },
-  });
-}
-
-export function useRunDaltonSystemJobNow() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (key: string) => runDaltonSystemJobNow(key),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.systemJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
-    },
   });
 }

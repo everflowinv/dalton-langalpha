@@ -166,7 +166,7 @@ vi.mock('@/api/search', () => ({
 }));
 
 vi.mock('@/lib/dalton/searchApi', () => ({
-  fetchGlobalSearch: vi.fn(async () => ({ conversations: [], documents: [] })),
+  fetchGlobalSearch: vi.fn(async () => ({ documents: [] })),
 }));
 
 vi.mock('@/hooks/useAllWorkspaces', () => ({

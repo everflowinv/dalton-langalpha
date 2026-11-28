@@ -24,11 +24,6 @@ _DEFAULT_CODE_ROOT = Path(__file__).resolve().parent.parent
 def _resolve_research_roots(default_code_root: Path = _DEFAULT_CODE_ROOT) -> tuple[Path, Path]:
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    # Legacy compat: when new vars are unset and DALTON_OCW_ROOT is set, keep old single-root layout.
-    if raw_ocw and not raw_code and not raw_home:
-        ocw = Path(raw_ocw).expanduser().resolve()
-        return ocw, ocw
     code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code_root.resolve()
     home_root = (
         Path(raw_home).expanduser().resolve()
@@ -145,10 +140,6 @@ CALLBACK_TITLE = re.compile(r"call\s?back|回访|闭门会", re.I)
 
 def _resolve_route_skill_path(route):
     skill = route.get("skill")
-    if route.get("id") == "agent-reach":
-        override = os.environ.get("DALTON_AGENT_REACH_SKILL_MD", "").strip()
-        if override:
-            return Path(override).expanduser()
     if not skill:
         return None
     p = Path(skill).expanduser()
@@ -159,11 +150,6 @@ def catalog(include_hidden=False):
     registry=json.loads(REGISTRY.read_text())
     if not include_hidden:
         registry['routes']=[r for r in registry['routes'] if not r.get('hidden',False)]
-    override = os.environ.get("DALTON_AGENT_REACH_SKILL_MD", "").strip()
-    if override:
-        for r in registry.get("routes", []):
-            if isinstance(r, dict) and r.get("id") == "agent-reach":
-                r["skill"] = str(Path(override).expanduser())
     return registry
 
 

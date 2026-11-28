@@ -52,6 +52,8 @@ import {
   type ManageTask,
 } from './utils/taskKind';
 import { AUTOMATION_TEMPLATES, type TemplateId, applyTemplate } from './utils/templates';
+import type { Automation } from '@/types/automation';
+import { usePageTabLeaveGuard } from '@/components/PageTabs/usePageTabLeaveGuard';
 import './Automations.css';
 
 const VIEW_STORAGE_KEY = 'automations:view';
@@ -499,6 +501,8 @@ export default function Automations() {
     },
     [form, draftDirty],
   );
+  // A page tab switched or closed asks the same, since it unmounts the form.
+  usePageTabLeaveGuard(form && draftDirty ? leaveForm : null);
 
   const scopeDenied = requestedScope === 'company' && !callerTierPending && (companyHiddenByTier || companyForbidden);
   const activeScope: ScopeName | null = scopeDenied ? 'personal' : requestedScope;

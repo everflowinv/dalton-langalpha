@@ -31,7 +31,6 @@ DALTON_SINGLE_MODEL_KEYS: tuple[str, ...] = (
     "dalton_audit_model",
     "dalton_language_model",
     "dalton_assist_model",
-    "dalton_extract_model",
 )
 
 DALTON_MODEL_LIST_KEYS: tuple[str, ...] = (
@@ -246,9 +245,6 @@ def dalton_model_default(key: str) -> Any:
     if key == "dalton_reviewer_models":
         items = _dedup_str_list(settings.publish.reviewer_models or [])
         return items or None
-    if key == "dalton_extract_model":
-        val = (settings.conversations.extractor_model or "").strip()
-        return val or None
     return None
 
 
@@ -279,7 +275,6 @@ def get_dalton_system_defaults() -> dict[str, Any]:
         "dalton_reviewer_models": list(
             dalton_model_default("dalton_reviewer_models") or []
         ),
-        "dalton_extract_model": dalton_model_default("dalton_extract_model") or "",
     }
 
 
@@ -482,18 +477,6 @@ async def resolve_dalton_reviewer_models(user_id: str | None = None) -> list[str
     return list(val) if isinstance(val, list) else []
 
 
-async def resolve_dalton_extract_model(user_id: str | None = None) -> str:
-    """Resolve the conversation archive extraction model for ``user_id``."""
-    val = await dalton_model_pref(user_id, "dalton_extract_model")
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    if is_core_profile():
-        from src.dalton.llm.role_policy import resolve_effective_role_model
-
-        return await resolve_effective_role_model(role="extract", user_id=user_id)
-    return ""
-
-
 async def _read_user_preferences(
     uid: str,
     *,
@@ -652,7 +635,6 @@ resolve_audit_model = resolve_dalton_audit_model
 resolve_audit_fallback_models = resolve_dalton_audit_fallback_models
 resolve_audit_timeout_s = resolve_dalton_audit_timeout_s
 resolve_reviewer_models = resolve_dalton_reviewer_models
-resolve_extract_model = resolve_dalton_extract_model
 resolve_notify_enabled = resolve_dalton_notify_enabled
 resolve_notify_targets = resolve_dalton_notify_targets
 resolve_notify_overrides = resolve_dalton_notify_overrides
@@ -1458,11 +1440,16 @@ async def _validate_report_automation_route_entries(
     )
     from src.server.database import automation as auto_db
 
+    from src.dalton.notify.delivery_mutex import check_route_held_delivery_conflict
+
     validated_changes: list[tuple[Any, dict[str, Any]]] = []
     for aid, targets, old_targets in changed_entries:
         auto = await auto_db.get_automation(aid, cleaned_uid)
         if not auto:
             continue
+        delivery_conflict = check_route_held_delivery_conflict(auto, targets)
+        if delivery_conflict:
+            raise HTTPException(status_code=409, detail=delivery_conflict)
         if not (
             automation_has_validated_report_profile(auto)
             or instruction_uses_report_skill(auto.get("instruction"))
@@ -1536,6 +1523,91 @@ async def _validate_report_automation_route_entries(
     return validated_changes
 
 
+async def _assert_no_route_held_delivery_conflicts_in_tx(
+    user_id: str | None,
+    submitted_routes: Mapping[str, Any] | None,
+    stored_routes: Mapping[str, Any] | None,
+    *,
+    conn: Any,
+) -> None:
+    """Re-verify ``automation:<uuid>`` route vs ``delivery_config.methods`` inside the preference lock tx.
+
+    Acquires ``FOR SHARE`` on matching ``automations`` rows in deterministic ID order
+    after ``lock_user_preferences``, matching the lock order used by automation updates
+    and recycle-bin restore.
+    """
+    from unittest.mock import NonCallableMock
+
+    from fastapi import HTTPException
+    from psycopg.rows import dict_row
+
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.notify.delivery_mutex import check_route_held_delivery_conflict
+
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return
+    cleaned_uid = str(user_id or "").strip()
+    if (
+        not cleaned_uid
+        or not isinstance(submitted_routes, Mapping)
+        or conn is None
+        or not hasattr(conn, "cursor")
+        or isinstance(conn, NonCallableMock)
+    ):
+        return
+
+    targets_by_aid: dict[str, list[str]] = {}
+    for raw_k, raw_v in submitted_routes.items():
+        if not isinstance(raw_k, str):
+            continue
+        rk = raw_k.strip()
+        if not rk.startswith("automation:"):
+            continue
+        aid = rk[len("automation:") :].strip()
+        if not _UUID_STR_RE.fullmatch(aid):
+            continue
+        if not isinstance(raw_v, list) or not raw_v:
+            continue
+        new_targets = _dedup_str_list(raw_v)
+        if not new_targets:
+            continue
+        old_raw = stored_routes.get(rk) if isinstance(stored_routes, Mapping) else None
+        old_targets = _dedup_str_list(old_raw) if isinstance(old_raw, list) else []
+        if new_targets == old_targets:
+            continue
+        targets_by_aid[aid.lower()] = new_targets
+
+    if not targets_by_aid:
+        return
+
+    sorted_aids = sorted(targets_by_aid)
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT automation_id::text AS automation_id, delivery_config
+            FROM automations
+            WHERE automation_id = ANY(%s::uuid[])
+              AND user_id = %s
+              AND deleted_at IS NULL
+            ORDER BY automation_id ASC
+            FOR SHARE
+            """,
+            (sorted_aids, cleaned_uid),
+        )
+        rows = await cur.fetchall()
+
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        aid = str(row.get("automation_id") or "").strip().lower()
+        targets = targets_by_aid.get(aid)
+        if not targets:
+            continue
+        conflict = check_route_held_delivery_conflict(row, targets)
+        if conflict:
+            raise HTTPException(status_code=409, detail=conflict)
+
+
 async def validate_dalton_notify_routes_for_user(
     user_id: str | None,
     submitted_routes: Mapping[str, Any] | None,
@@ -1546,6 +1618,7 @@ async def validate_dalton_notify_routes_for_user(
     | None = None,
     expected_stored_routes: Mapping[str, list[str]] | None = None,
     via_rest: bool = False,
+    conn: Any = None,
 ) -> None:
     """Enforce the group-target rules inside the preference lock without making
     any network call.
@@ -1563,6 +1636,13 @@ async def validate_dalton_notify_routes_for_user(
         and _snapshot_routes_for_prefetch(stored_routes) != dict(expected_stored_routes)
     ):
         raise FeishuGroupsPrefetchRequired(stored_routes)
+
+    await _assert_no_route_held_delivery_conflicts_in_tx(
+        user_id,
+        submitted_routes,
+        stored_routes,
+        conn=conn,
+    )
 
     if via_rest:
         await _enforce_rest_group_target_restriction(
@@ -1903,6 +1983,7 @@ async def apply_dalton_notify_preference_patch(
                 stored_routes,
                 discovered_groups=prefetched_groups,
                 expected_stored_routes=expected_stored_routes,
+                conn=db_conn,
             )
 
         updated_row = await upsert_user_preferences(

@@ -596,18 +596,28 @@ class SharedWorkspacesConfig(BaseModel):
 
 
 class DriveHistoryConfig(BaseModel):
-    """Which old versions of a file the Drive keeps. Text held in the database
-    keeps every version; other bytes are kept for a while, and a copy too
-    large to keep is not a version once a save replaces it."""
+    """What an ordinary Drive file keeps of its history: the copy from before
+    its last save, for a while, as a one-step undo. A memo keeps every
+    version, whatever its size."""
 
     max_bytes: int | None = Field(
         default=100 * 1024 * 1024,
         ge=1,
         description=(
-            "A replaced copy this size or larger is not kept as a version; "
+            "A replaced copy this size or larger is not kept as an undo copy; "
             "null keeps every size"
         ),
     )
+    undo_days: int = Field(
+        default=7,
+        ge=1,
+        description=(
+            "Days the copy from before a file's last save is kept. The agent's "
+            "instructions, its Drive doc page and the CLI state the defaults, "
+            "7 days and 100 MB"
+        ),
+    )
+    # DALTON-HOOK(drive-long-history): retain pre-#890 long history bounds for ordinary Drive files
     keep_days: int | None = Field(
         default=30,
         ge=1,

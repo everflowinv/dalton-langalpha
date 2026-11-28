@@ -68,6 +68,7 @@ vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', () => ({
 
 vi.mock('@/components/nav/useNavItems', () => ({
   useNavItems: () => [],
+  useDesktopNavItems: () => [],
 }));
 
 vi.mock('@/components/nav/useNavActive', () => ({
@@ -89,17 +90,18 @@ function setNavigatorPlatform(platform: string) {
   });
 }
 
-function renderShell(collapsed = false) {
+function renderShell(hidden = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={['/dashboard']}>
         <CommandPaletteProvider>
           <AppSidebar
-            collapsed={collapsed}
-            onToggleCollapse={vi.fn()}
+            hidden={hidden}
             width={260}
             onWidthChange={vi.fn()}
+            peek={{ open: false }}
+            panelRef={null}
           />
           <BottomTabBar />
           <div className="monaco-editor">
@@ -132,7 +134,6 @@ describe('CommandPaletteProvider shortcuts and entry points', () => {
     const view = renderShell();
     const sidebar = view.container.querySelector('aside.sidebar') as HTMLElement;
 
-    expect(within(sidebar).getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ })).toBeInTheDocument();
     const paletteBtn = within(sidebar).getByRole('button', { name: /Commands & jump|命令与跳转/ });
     expect(paletteBtn).toHaveAttribute('aria-keyshortcuts', 'Meta+K');
     expect(paletteBtn).toHaveTextContent('⌘K');
@@ -174,10 +175,10 @@ describe('CommandPaletteProvider shortcuts and entry points', () => {
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
   });
 
-  it('opens CommandPalette from expanded sidebar button, collapsed rail button, and BottomTabBar', async () => {
+  it('opens CommandPalette from sidebar button and BottomTabBar', async () => {
     const expanded = renderShell(false);
 
-    fireEvent.click(screen.getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Commands & jump|命令与跳转/ }));
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Close palette' }));
     expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
@@ -187,13 +188,6 @@ describe('CommandPaletteProvider shortcuts and entry points', () => {
     const bottomBar = expanded.container.querySelector('.bottom-tab-bar') as HTMLElement;
     await user.click(within(bottomBar).getByTestId('bottom-tab-more'));
     await user.click(await screen.findByRole('menuitem', { name: /Commands & jump|命令与跳转/ }));
-    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
-
-    expanded.unmount();
-
-    // Collapsed sidebar rail search button opens CommandPalette
-    renderShell(true);
-    fireEvent.click(screen.getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ }));
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
   });
 });

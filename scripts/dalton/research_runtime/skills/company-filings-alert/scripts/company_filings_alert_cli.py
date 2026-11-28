@@ -25,31 +25,22 @@ except ImportError:  # enrichment is optional; the scan still reports form/date
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
-def _resolve_research_roots(default_code_root: Path) -> tuple[Path, Path, bool]:
+def _resolve_research_roots(default_code_root: Path) -> tuple[Path, Path]:
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    # Legacy compat: when new vars are unset and DALTON_OCW_ROOT is set, keep old single-root layout.
-    if raw_ocw and not raw_code and not raw_home:
-        ocw = Path(raw_ocw).expanduser().resolve()
-        return ocw, ocw, True
     code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code_root.resolve()
     home_root = (
         Path(raw_home).expanduser().resolve()
         if raw_home
         else (Path.home() / "Library" / "Application Support" / "Everflow" / "research")
     )
-    return code_root, home_root, False
+    return code_root, home_root
 
 
-CODE_ROOT, DATA_ROOT, LEGACY_MODE = _resolve_research_roots(SKILL_DIR.parent.parent)
+CODE_ROOT, DATA_ROOT = _resolve_research_roots(SKILL_DIR.parent.parent)
 FINDATA_SKILL = CODE_ROOT / "skills" / "findata-analyst"
 CN_HK_SKILL = CODE_ROOT / "skills" / "cn-hk-findata"
-STATE_DIR = (
-    (DATA_ROOT / "skills" / "company-filings-alert" / "state")
-    if LEGACY_MODE
-    else (DATA_ROOT / "state" / "company-filings-alert")
-)
+STATE_DIR = DATA_ROOT / "state" / "company-filings-alert"
 STATE_FILE = STATE_DIR / "last_check.json"
 # Structured dump of detected filings for downstream consumers (ai-chain event
 # ingestion). Distinct from last_check.json, which only holds per-ticker bookmarks.
@@ -399,11 +390,7 @@ def check_cn_announcements(stock_code: str, stock_name: str, days: int = 1) -> d
 
     try:
         # Use cn-hk-findata venv's AkShare
-        cn_hk_venv = (
-            (DATA_ROOT / "skills" / "cn-hk-findata" / "venv")
-            if LEGACY_MODE
-            else (DATA_ROOT / "venvs" / "cn-hk-findata")
-        )
+        cn_hk_venv = DATA_ROOT / "venvs" / "cn-hk-findata"
         venv_python = cn_hk_venv / "bin" / "python3"
         if not venv_python.exists():
             venv_python = cn_hk_venv / "bin" / "python"

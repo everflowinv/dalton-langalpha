@@ -266,7 +266,9 @@ SELECT automation_execution_id::text AS automation_execution_id,
        conversation_thread_id::text AS conversation_thread_id,
        conversation_response_id::text AS conversation_response_id,
        coverage_unit_id::text AS coverage_unit_id,
-       coverage_unit_version
+       coverage_unit_version,
+       delivery AS execution_delivery,
+       delivery_result AS execution_delivery_result
 FROM automation_executions
 WHERE automation_execution_id = %s::uuid
   AND automation_id = %s::uuid
@@ -280,7 +282,9 @@ SELECT automation_execution_id::text AS automation_execution_id,
        conversation_thread_id::text AS conversation_thread_id,
        conversation_response_id::text AS conversation_response_id,
        coverage_unit_id::text AS coverage_unit_id,
-       coverage_unit_version
+       coverage_unit_version,
+       delivery AS execution_delivery,
+       delivery_result AS execution_delivery_result
 FROM automation_executions
 WHERE automation_execution_id = %s::uuid
   AND automation_id = %s::uuid
@@ -1058,7 +1062,14 @@ async def submit_automation_report(
                             "execution_batch_conflict",
                             "This execution already has a different report batch.",
                         )
-                    if held_delivery_configured(row.get("delivery_config")):
+                    from src.dalton.notify.delivery_mutex import (
+                        execution_has_upstream_delivery,
+                    )
+
+                    if execution_has_upstream_delivery(
+                        row.get("execution_delivery"),
+                        row.get("execution_delivery_result"),
+                    ) or held_delivery_configured(row.get("delivery_config")):
                         return _error(
                             action,
                             "held_delivery_configured",
@@ -1685,6 +1696,16 @@ async def lock_report_execution(
         "name": automation.get("name"),
         "metadata": automation.get("metadata"),
         "delivery_config": automation.get("delivery_config"),
+        "execution_delivery": (
+            execution.get("execution_delivery")
+            if "execution_delivery" in execution
+            else execution.get("delivery")
+        ),
+        "execution_delivery_result": (
+            execution.get("execution_delivery_result")
+            if "execution_delivery_result" in execution
+            else execution.get("delivery_result")
+        ),
         "coverage_unit_id": execution.get("coverage_unit_id"),
         "coverage_unit_version": execution.get("coverage_unit_version"),
     }

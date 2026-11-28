@@ -11,8 +11,8 @@ Verifies on a running Standalone Core (`auth: oss`) deployment:
 2. Backend Docker image manifest layers (and optional `EXPORT_DIR`) contain
    zero `plugins/dalton_data/` files and zero `Proprietary` plugin manifests,
    while shipping `plugins/dalton_sec/`.
-3. `GET /api/v1/dalton/capabilities` reports `profile == "core"` with zero
-   enabled optional capabilities, `GET /api/v1/dalton/system-jobs` lists zero
+3. `GET /api/v1/dalton/capabilities` reports `profile == "core"` with only the
+   default Core capability set (`["company_wiki"]`), `GET /api/v1/dalton/system-jobs` lists zero
    host `ops-*` or `data-*` jobs, `PATCH /api/v1/plugins/dalton-data/enabled`
    returns 404, disabled capability routes return 404/403, and backend logs
    show zero outbound attempts to `:8960` / `:8962`.
@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -47,6 +48,7 @@ DEFAULT_USER_ID = "local-dev-user"
 HTTP_TIMEOUT_S = 30.0
 DOCKER_TIMEOUT_S = 120.0
 REQUIRED_DALTON_REVISIONS = ("d045", "d047")
+EXPECTED_CORE_DEFAULT_CAPABILITIES: list[str] = ["company_wiki"]
 _DALTON_REV_RE = re.compile(r"\b(d\d+)\b")
 
 
@@ -208,22 +210,154 @@ def _check_image_layers_and_export(ctx: _lib.ComposeContext | None = None) -> No
         )
 
 
-def _check_capabilities_and_disabled_routes(base_url: str) -> None:
+def _acquire_auth_session(
+    ctx: _lib.ComposeContext,
+    base_url: str,
+) -> tuple[dict[str, str], str]:
+    """Obtain request auth headers and caller user_id via the deployment's normal auth flow.
+
+    - In ``local`` auth mode (``GET /api/v1/dalton/bootstrap/status`` returns 200):
+      verifies unauthenticated ``GET /api/v1/dalton/capabilities`` returns 401, then
+      acquires a Bearer session via ``STANDALONE_ACCESS_TOKEN``, first-admin bootstrap
+      (``POST /api/v1/dalton/bootstrap/admin``), or local login
+      (``POST /api/v1/dalton/auth/local/login``).
+      注意：local 分支会消耗一次性自举，仅供手动排查；请勿在 ``local`` 组中早于
+      ``b4_local_auth`` 运行 ``b2``。
+    - In ``oss`` auth mode (``bootstrap/status`` returns 404): resolves
+      ``X-LangAlpha-Owner`` via ``_lib.oss_owner_headers(ctx)``.
+    """
+    boot_resp = _lib.http_request(
+        "GET", f"{base_url}/api/v1/dalton/bootstrap/status", timeout=HTTP_TIMEOUT_S
+    )
+    if boot_resp.status == 200:
+        unauth_cap = _lib.http_request(
+            "GET", f"{base_url}/api/v1/dalton/capabilities", timeout=HTTP_TIMEOUT_S
+        )
+        assert unauth_cap.status == 401, (
+            f"Expected 401 for unauthenticated GET /dalton/capabilities in local auth mode, "
+            f"got status={unauth_cap.status}"
+        )
+
+        preset_token = os.environ.get("STANDALONE_ACCESS_TOKEN", "").strip()
+        if preset_token:
+            _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", preset_token)
+            headers = {"Authorization": f"Bearer {preset_token}"}
+            me_resp = _lib.http_request(
+                "GET", f"{base_url}/api/v1/users/me", headers=headers, timeout=HTTP_TIMEOUT_S
+            )
+            assert me_resp.status == 200, (
+                f"GET /api/v1/users/me with STANDALONE_ACCESS_TOKEN failed: "
+                f"status={me_resp.status}, fields={_lib.response_fields(me_resp)}"
+            )
+            me_data = me_resp.json()
+            uid = str((me_data.get("user") or {}).get("user_id") or "").strip()
+            assert uid, (
+                f"GET /api/v1/users/me returned no user_id "
+                f"(status={me_resp.status}, fields={_lib.response_field_names(me_data)})"
+            )
+            return headers, uid
+
+        needs_bootstrap = bool(boot_resp.json().get("needs_bootstrap"))
+        if needs_bootstrap:
+            bootstrap_token = (
+                ctx.env.get("BOOTSTRAP_SETUP_TOKEN")
+                or os.environ.get("BOOTSTRAP_SETUP_TOKEN")
+                or ""
+            ).strip()
+            assert bootstrap_token, (
+                "BOOTSTRAP_SETUP_TOKEN is required to bootstrap local auth session in b2"
+            )
+            boot_password = f"B2AdminPass!{secrets.token_hex(6)}"
+            _lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", boot_password)
+            boot_post = _lib.http_request(
+                "POST",
+                f"{base_url}/api/v1/dalton/bootstrap/admin",
+                json_body={
+                    "bootstrap_token": bootstrap_token,
+                    "email": f"b2-admin-{secrets.token_hex(4)}@core.local",
+                    "username": f"b2_admin_{secrets.token_hex(3)}",
+                    "name": "B2 Capabilities Admin",
+                    "password": boot_password,
+                },
+                timeout=HTTP_TIMEOUT_S,
+            )
+            assert boot_post.status == 201, (
+                f"POST /api/v1/dalton/bootstrap/admin failed: "
+                f"status={boot_post.status}, fields={_lib.response_fields(boot_post)}"
+            )
+            boot_data = boot_post.json()
+            access_token = str(boot_data.get("access_token") or "").strip()
+            _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", access_token)
+            admin_uid = str((boot_data.get("user") or {}).get("user_id") or "").strip()
+            assert access_token and admin_uid, (
+                f"Bootstrap response missing access_token/user_id "
+                f"(status={boot_post.status}, fields={_lib.response_field_names(boot_data)})"
+            )
+            return {"Authorization": f"Bearer {access_token}"}, admin_uid
+
+        identifier = (
+            os.environ.get("STANDALONE_ADMIN_IDENTIFIER")
+            or os.environ.get("STANDALONE_ADMIN_EMAIL")
+            or ""
+        ).strip()
+        password = os.environ.get("STANDALONE_ADMIN_PASSWORD", "")
+        assert identifier and password, (
+            "Local auth instance is already bootstrapped; set STANDALONE_ACCESS_TOKEN or "
+            "STANDALONE_ADMIN_IDENTIFIER + STANDALONE_ADMIN_PASSWORD to run b2"
+        )
+        _lib.record_runtime_secret("LOCAL_ADMIN_PASSWORD", password)
+        login_resp = _lib.http_request(
+            "POST",
+            f"{base_url}/api/v1/dalton/auth/local/login",
+            json_body={"identifier": identifier, "password": password},
+            timeout=HTTP_TIMEOUT_S,
+        )
+        assert login_resp.status == 200, (
+            f"POST /api/v1/dalton/auth/local/login failed: "
+            f"status={login_resp.status}, fields={_lib.response_fields(login_resp)}"
+        )
+        login_data = login_resp.json()
+        access_token = str(login_data.get("access_token") or "").strip()
+        _lib.record_runtime_secret("LOCAL_ACCESS_TOKEN", access_token)
+        uid = str((login_data.get("user") or {}).get("user_id") or "").strip()
+        assert access_token and uid, (
+            f"Login response missing access_token/user_id "
+            f"(status={login_resp.status}, fields={_lib.response_field_names(login_data)})"
+        )
+        return {"Authorization": f"Bearer {access_token}"}, uid
+
+    headers = _lib.oss_owner_headers(ctx)
+    user_id = os.environ.get("TEST_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    return headers, user_id
+
+
+def _check_capabilities_and_disabled_routes(
+    base_url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     log("3/5 Checking /dalton/capabilities, /dalton/system-jobs, and disabled capability routes...")
     cap_resp = _lib.http_request(
-        "GET", f"{base_url}/api/v1/dalton/capabilities", timeout=HTTP_TIMEOUT_S
+        "GET",
+        f"{base_url}/api/v1/dalton/capabilities",
+        headers=headers,
+        timeout=HTTP_TIMEOUT_S,
     )
     assert cap_resp.status == 200, (
         f"GET /dalton/capabilities failed: {cap_resp.status} {cap_resp.text}"
     )
     cap_body = cap_resp.json()
     assert cap_body.get("profile") == "core", f"Expected profile='core', got {cap_body!r}"
-    assert cap_body.get("capabilities") == [], (
-        f"Expected zero optional capabilities in Core, got {cap_body!r}"
+    assert cap_body.get("capabilities") == EXPECTED_CORE_DEFAULT_CAPABILITIES, (
+        f"Expected Core default capabilities {EXPECTED_CORE_DEFAULT_CAPABILITIES!r}, "
+        f"got {cap_body!r}"
     )
 
     jobs_resp = _lib.http_request(
-        "GET", f"{base_url}/api/v1/dalton/system-jobs", timeout=HTTP_TIMEOUT_S
+        "GET",
+        f"{base_url}/api/v1/dalton/system-jobs",
+        headers=headers,
+        timeout=HTTP_TIMEOUT_S,
     )
     assert jobs_resp.status == 200, (
         f"GET /dalton/system-jobs failed: {jobs_resp.status} {jobs_resp.text}"
@@ -243,6 +377,7 @@ def _check_capabilities_and_disabled_routes(base_url: str) -> None:
         toggle_resp = _lib.http_request(
             "PATCH",
             f"{base_url}/api/v1/plugins/dalton-data/enabled",
+            headers=headers,
             json_body={"enabled": enabled_flag},
             timeout=HTTP_TIMEOUT_S,
         )
@@ -265,6 +400,7 @@ def _check_capabilities_and_disabled_routes(base_url: str) -> None:
         resp = _lib.http_request(
             method,
             f"{base_url}{path}",
+            headers=headers,
             json_body=payload,
             timeout=HTTP_TIMEOUT_S,
         )
@@ -272,13 +408,18 @@ def _check_capabilities_and_disabled_routes(base_url: str) -> None:
             f"Disabled capability route {method} {path} returned {resp.status} "
             f"(expected 403/404): {resp.text}"
         )
-    log("3/5 OK (capabilities='core' [], 0 ops/data jobs, dalton-data toggle 404, disabled routes 403/404).")
+    log(
+        f"3/5 OK (capabilities='core' {EXPECTED_CORE_DEFAULT_CAPABILITIES}, "
+        "0 ops/data jobs, dalton-data toggle 404, disabled routes 403/404)."
+    )
 
 
 def _check_dalton_sec_plugin_toggle_closure(
     ctx: _lib.ComposeContext,
     base_url: str,
     user_id: str,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> None:
     log("4/5 Verifying three-way dalton-sec plugin toggle closure (plugins / builtins / workspace MCP)...")
     quoted_uid = _sql_quote(user_id)
@@ -291,13 +432,15 @@ def _check_dalton_sec_plugin_toggle_closure(
     )
 
     def _plugin_map() -> dict[str, dict[str, Any]]:
-        resp = _lib.http_request("GET", f"{base_url}/api/v1/plugins", timeout=HTTP_TIMEOUT_S)
+        resp = _lib.http_request(
+            "GET", f"{base_url}/api/v1/plugins", headers=headers, timeout=HTTP_TIMEOUT_S
+        )
         assert resp.status == 200, f"GET /api/v1/plugins failed: {resp.status} {resp.text}"
         return {p["name"]: p for p in resp.json()["plugins"]}
 
     def _builtin_map() -> dict[str, dict[str, Any]]:
         resp = _lib.http_request(
-            "GET", f"{base_url}/api/v1/mcp/builtin-servers", timeout=HTTP_TIMEOUT_S
+            "GET", f"{base_url}/api/v1/mcp/builtin-servers", headers=headers, timeout=HTTP_TIMEOUT_S
         )
         assert resp.status == 200, (
             f"GET /api/v1/mcp/builtin-servers failed: {resp.status} {resp.text}"
@@ -321,6 +464,7 @@ def _check_dalton_sec_plugin_toggle_closure(
         resp = _lib.http_request(
             "GET",
             f"{base_url}/api/v1/workspaces/{ws_id}/mcp/servers",
+            headers=headers,
             timeout=HTTP_TIMEOUT_S,
         )
         assert resp.status == 200, (
@@ -364,6 +508,7 @@ def _check_dalton_sec_plugin_toggle_closure(
         ws_resp = _lib.http_request(
             "POST",
             f"{base_url}/api/v1/workspaces",
+            headers=headers,
             json_body={"name": "b2-plugin-check"},
             timeout=HTTP_TIMEOUT_S,
         )
@@ -407,6 +552,7 @@ def _check_dalton_sec_plugin_toggle_closure(
         patch_on = _lib.http_request(
             "PATCH",
             f"{base_url}/api/v1/plugins/dalton-sec/enabled",
+            headers=headers,
             json_body={"enabled": True},
             timeout=HTTP_TIMEOUT_S,
         )
@@ -435,6 +581,7 @@ def _check_dalton_sec_plugin_toggle_closure(
         patch_off = _lib.http_request(
             "PATCH",
             f"{base_url}/api/v1/plugins/dalton-sec/enabled",
+            headers=headers,
             json_body={"enabled": False},
             timeout=HTTP_TIMEOUT_S,
         )
@@ -472,7 +619,10 @@ def _check_dalton_sec_plugin_toggle_closure(
         _reset_state()
         if ws_id:
             _lib.http_request(
-                "DELETE", f"{base_url}/api/v1/workspaces/{ws_id}", timeout=HTTP_TIMEOUT_S
+                "DELETE",
+                f"{base_url}/api/v1/workspaces/{ws_id}",
+                headers=headers,
+                timeout=HTTP_TIMEOUT_S,
             )
 
 
@@ -510,13 +660,13 @@ def run_checks() -> None:
     t0 = time.monotonic()
     ctx = _lib.ComposeContext.from_environment()
     base_url = (os.environ.get("STANDALONE_BASE_URL") or ctx.edge_url).rstrip("/")
-    user_id = os.environ.get("TEST_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
 
-    _lib.wait_for_http_ready(f"{base_url}/api/v1/dalton/capabilities", timeout=60.0)
+    _lib.wait_for_http_ready(f"{base_url}/api/v1/auth/cli", timeout=60.0)
+    auth_headers, user_id = _acquire_auth_session(ctx, base_url)
     _check_migrations_at_head(ctx)
     _check_image_layers_and_export(ctx)
-    _check_capabilities_and_disabled_routes(base_url)
-    _check_dalton_sec_plugin_toggle_closure(ctx, base_url, user_id)
+    _check_capabilities_and_disabled_routes(base_url, headers=auth_headers)
+    _check_dalton_sec_plugin_toggle_closure(ctx, base_url, user_id, headers=auth_headers)
     _check_no_bridge_or_gateway_calls_in_logs(ctx)
 
     elapsed = time.monotonic() - t0

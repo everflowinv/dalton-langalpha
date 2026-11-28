@@ -359,7 +359,12 @@ describe('Mobile P2 reading, table, HEIC, and WeChat details', () => {
 
     // Widget mode downloadHtml & exportPdf in WeChat
     const widgetHook = renderHook(() =>
-      useHtmlActions({ mode: 'widget', srcDoc: '<html><body>chart</body></html>', fileName: 'chart.html' }),
+      useHtmlActions({
+        mode: 'widget',
+        srcDoc: '<html><body>chart</body></html>',
+        exportDoc: () => '<html><body>chart</body></html>',
+        fileName: 'chart.html',
+      }),
     );
     widgetHook.result.current.downloadHtml();
     expect(toastMock).toHaveBeenCalledTimes(1);

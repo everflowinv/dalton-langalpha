@@ -2926,3 +2926,42 @@ def test_switch_script_drain_requires_ready_for_handoff_and_bounds_curl_max_time
     for entry in calls_2:
         assert entry["max_time"] is not None
         assert 1 <= int(entry["max_time"]) <= 4
+
+
+def test_switch_script_aborts_before_disabling_bridge_when_uvloop_missing(
+    tmp_path: Path,
+) -> None:
+    """--switch must check `import uvloop` on the target interpreter before draining or touching the legacy bridge."""
+    h = _build_switch_script_harness(
+        tmp_path / "missing_uvloop",
+        stub_config={},
+    )
+    fake_py = tmp_path / "fake_py_no_uvloop"
+    fake_py.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "import uvloop" ]; then
+  echo "ModuleNotFoundError: No module named 'uvloop'" >&2
+  exit 1
+fi
+exec {sys.executable} "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_py.chmod(0o755)
+    env = dict(h["env"])
+    env["DALTON_TRANSCRIPTION_PYTHON_BIN"] = str(fake_py)
+
+    proc = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "import uvloop" in proc.stderr
+    assert "uv sync" in proc.stderr
+    # Must abort during preflight: no drain HTTP call, no launchctl call, bridge env untouched.
+    assert _read_jsonl_log(h["curl_log"]) == []
+    assert _read_jsonl_log(h["launchctl_log"]) == []
+    assert "DALTON_BRIDGE_ASR_DISABLED=true" not in h["bridge_env_file"].read_text(encoding="utf-8")

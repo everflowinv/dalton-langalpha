@@ -208,6 +208,8 @@ async def _load_delivery_row(cur: Any, delivery_id: str) -> dict[str, Any] | Non
         SELECT d.delivery_id, d.execution_id, d.automation_id, d.user_id, d.channel, d.target,
                d.status, d.attempt_count, d.error_code, d.payload_json,
                ae.conversation_thread_id::text AS conversation_thread_id,
+               ae.delivery AS execution_delivery,
+               ae.delivery_result AS execution_delivery_result,
                a.workspace_id::text AS workspace_id
         FROM dalton_notify_deliveries d
         LEFT JOIN automation_executions ae
@@ -440,6 +442,8 @@ async def _eligibility(
         target=target,
         include_chat_targets=gate_include_chats,
         allow_personal_dm_redirect=allow_personal_dm_redirect,
+        execution_delivery=row.get("execution_delivery"),
+        execution_delivery_result=row.get("execution_delivery_result"),
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,

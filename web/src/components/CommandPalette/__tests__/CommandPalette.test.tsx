@@ -33,7 +33,7 @@ let mockHomeWorkspaceId: string | undefined = 'home';
 vi.mock('@/lib/dalton/searchApi', () => ({
   fetchGlobalSearch: vi.fn<
     (q: string, limit?: number, signal?: AbortSignal, options?: GlobalSearchOptions) => Promise<GlobalSearchResponse>
-  >(async () => ({ conversations: [], documents: [] })),
+  >(async () => ({ documents: [] })),
 }));
 vi.mock('@/hooks/useAllWorkspaces', () => ({
   useAllWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws1', name: 'Semis', status: 'running', is_home: false }] } }),
@@ -492,7 +492,7 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
 
   beforeEach(() => {
     mockHomeWorkspaceId = 'home';
-    vi.mocked(fetchGlobalSearch).mockResolvedValue({ conversations: [], documents: [] });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({ documents: [] });
   });
 
   it('uses includeContent=false in root view, shows Memos and Search file content row, and enters File content with includeContent=true + deduplication', async () => {
@@ -506,7 +506,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         {
           kind: 'memo',
@@ -551,7 +550,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
 
     await screen.findByText('Wafer Thesis Memo');
     expect(fetchGlobalSearch).toHaveBeenCalledWith('margin', 20, expect.anything(), {
-      includeConversations: false,
       workspaceId: undefined,
       includeContent: false,
     });
@@ -574,7 +572,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
     await screen.findByRole('option', { name: /body_hit\.md/ });
     expect(screen.getByRole('listbox')).toHaveAccessibleName('File content');
     expect(fetchGlobalSearch).toHaveBeenLastCalledWith('margin', 20, expect.anything(), {
-      includeConversations: false,
       workspaceId: undefined,
       includeContent: true,
     });
@@ -601,7 +598,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         {
           kind: 'workspace_file',
@@ -646,7 +642,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
 
     expect(fetchGlobalSearch).toHaveBeenCalledTimes(1);
     expect(fetchGlobalSearch).toHaveBeenCalledWith('wafer', 20, expect.anything(), {
-      includeConversations: false,
       workspaceId: undefined,
       includeContent: true,
     });
@@ -655,7 +650,7 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
   });
 
   it('never sends the content scan for words typed before switching into the files view', async () => {
-    vi.mocked(fetchGlobalSearch).mockResolvedValue({ conversations: [], documents: [] });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({ documents: [] });
 
     renderDocShell();
     shortcut();
@@ -687,7 +682,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         {
           kind: 'memo',
@@ -739,7 +733,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
 
     await screen.findByText('Personal Memo');
     expect(fetchGlobalSearch).toHaveBeenCalledWith('NVDA', 20, expect.anything(), {
-      includeConversations: false,
       workspaceId: 'ws1',
       includeContent: false,
     });
@@ -748,7 +741,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
     await screen.findByRole('option', { name: /ws1\.md/ });
     expect(screen.queryByRole('option', { name: /ws2\.md/ })).not.toBeInTheDocument();
     expect(fetchGlobalSearch).toHaveBeenLastCalledWith('NVDA', 20, expect.anything(), {
-      includeConversations: false,
       workspaceId: 'ws1',
       includeContent: true,
     });
@@ -778,7 +770,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         {
           kind: 'memo',
@@ -842,7 +833,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
     vi.mocked(fetchGlobalSearch).mockImplementation(async (_q, _limit, _signal, options) => {
       if (options?.workspaceId === 'ws1') {
         return {
-          conversations: [],
           documents: [
             {
               kind: 'workspace_file',
@@ -859,7 +849,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
         };
       }
       return {
-        conversations: [],
         documents: Array.from({ length: 20 }, (_, i) => ({
           kind: 'workspace_file' as const,
           memo_key: null,
@@ -900,7 +889,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         ...Array.from({ length: 6 }, (_, i) => ({
           kind: 'memo' as const,
@@ -987,7 +975,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       }
       if (options?.includeContent && q === 'timeout') {
         return {
-          conversations: [],
           content_timed_out: true,
           documents: [
             {
@@ -1004,7 +991,7 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
           ],
         };
       }
-      return { conversations: [], documents: [] };
+      return { documents: [] };
     });
 
     renderDocShell();
@@ -1047,7 +1034,6 @@ describe('Dalton memo and file-content search in CommandPalette', () => {
       failed: [],
     });
     vi.mocked(fetchGlobalSearch).mockResolvedValue({
-      conversations: [],
       documents: [
         {
           kind: 'memo',

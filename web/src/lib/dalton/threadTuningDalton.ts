@@ -1,15 +1,109 @@
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { isDaltonBuild } from '@/config/brand';
+import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
 
 export type ClearLocalHandle = (() => void) & { confirm: () => void };
 
 export type NullHandleBinder = (createdId: string) => void;
 
+export interface DeferredTuningPick<V> {
+  threadId: string;
+  value: V;
+  expected?: V;
+  hasExpected?: boolean;
+}
+
+export interface CreatedThreadTuning {
+  threadId: string;
+  reasoningEffort: string | null;
+  fastMode: boolean | null;
+}
+
+export type CreatedRowTuningDecision<V> =
+  | { action: 'repatch'; expected: V }
+  | { action: 'follow_server' }
+  | { action: 'keep_local' };
+
+/**
+ * Resolves whether a newly created thread's held tuning pick may issue a
+ * conditional background PATCH once the new row first loads (applies in both
+ * Dalton and Core builds):
+ * - When `createdTuning` confirms what the create request stored for
+ *   `liveThreadId`:
+ *   - If `rowValue === expected`: `'repatch'` with `expected` as CAS guard.
+ *   - If `rowValue !== expected`: another writer already changed the row ->
+ *     `'follow_server'` (abandon PATCH and follow `rowValue`).
+ * - When `createdTuning` is absent or does not match `liveThreadId`, the old
+ *   value cannot be confirmed -> `'keep_local'` (no unconditional PATCH; keep
+ *   the user's pick locally).
+ */
+export function resolveCreatedRowTuningAction<V>(
+  field: 'reasoning_effort' | 'fast_mode',
+  rowValue: V,
+  createdTuning: CreatedThreadTuning | null | undefined,
+  liveThreadId: string,
+): CreatedRowTuningDecision<V> {
+  if (!createdTuning || createdTuning.threadId !== liveThreadId) {
+    return { action: 'keep_local' };
+  }
+  const expected = (field === 'reasoning_effort' ? createdTuning.reasoningEffort : createdTuning.fastMode) as V;
+  if (rowValue !== expected) {
+    return { action: 'follow_server' };
+  }
+  return { action: 'repatch', expected };
+}
+
+/**
+ * Builds the CAS guard field for a post-create background tuning repatch.
+ */
+export function buildCreatedRowTuningConditions<V>(
+  field: 'reasoning_effort' | 'fast_mode',
+  expected: V,
+): ThreadFieldSaveConditions {
+  if (field === 'reasoning_effort') {
+    return { expected_reasoning_effort: (expected ?? null) as string | null };
+  }
+  return { expected_fast_mode: (expected ?? null) as boolean | null };
+}
+
+/**
+ * True when an unresolved-permission deferred tuning pick is still eligible to
+ * flush:
+ * - If the thread detail had not loaded when the pick was staged
+ *   (`!pick.hasExpected`), cancels automatic flush so we never issue an
+ *   unconditional PATCH over a newer write from another tab.
+ * - Also returns false if the cached thread row already moved away from the
+ *   value observed when the deferred pick was staged.
+ */
+export function shouldFlushDeferredTuningPick<V>(
+  pick: DeferredTuningPick<V>,
+  rowValue: V | undefined,
+): boolean {
+  if (!pick.hasExpected) return false;
+  if (rowValue === undefined) return true;
+  return rowValue === pick.expected;
+}
+
+/**
+ * Builds the optional CAS guard field sent on a deferred tuning flush.
+ */
+export function buildDeferredTuningConditions<V>(
+  field: 'reasoning_effort' | 'fast_mode',
+  pick: DeferredTuningPick<V>,
+): ThreadFieldSaveConditions | undefined {
+  if (!pick.hasExpected) return undefined;
+  if (field === 'reasoning_effort') {
+    return { expected_reasoning_effort: (pick.expected ?? null) as string | null };
+  }
+  return { expected_fast_mode: (pick.expected ?? null) as boolean | null };
+}
+
 export type DaltonTuningHold<V> = {
   value: V;
+  preservedTransient?: boolean;
   clearToken?: symbol;
   restoreHeld?: DaltonTuningHold<V>;
-  restoreDeferred?: { threadId: string; value: V } | null;
+  restoreDeferred?: DeferredTuningPick<V> | null;
 } | null;
 
 export interface TuningClearSession<V> {
@@ -17,10 +111,10 @@ export interface TuningClearSession<V> {
   sessionEpochRef: MutableRefObject<number>;
   createdRef: MutableRefObject<string | null>;
   heldRef: MutableRefObject<DaltonTuningHold<V>>;
-  deferredPickRef: MutableRefObject<{ threadId: string; value: V } | null>;
+  deferredPickRef: MutableRefObject<DeferredTuningPick<V> | null>;
   boundNullHandlesRef: MutableRefObject<Set<NullHandleBinder>>;
   setHeld: Dispatch<SetStateAction<DaltonTuningHold<V>>>;
-  setDeferredPick: Dispatch<SetStateAction<{ threadId: string; value: V } | null>>;
+  setDeferredPick: Dispatch<SetStateAction<DeferredTuningPick<V> | null>>;
 }
 
 /**
@@ -73,6 +167,15 @@ export function isCreatedThreadTransition(
  */
 export function createdThreadIdFromSend(prevThreadId: string, nextThreadId: string): string | null {
   if (!isDaltonBuild) return null;
+  if (prevThreadId && prevThreadId !== '__default__') return null;
+  return nextThreadId && nextThreadId !== '__default__' ? nextThreadId : null;
+}
+
+/**
+ * Same as `createdThreadIdFromSend`, without the `isDaltonBuild` gate, so
+ * post-create tuning CAS guards work in Core builds (`VITE_DALTON_UI=false`) too.
+ */
+export function createdThreadIdForTuning(prevThreadId: string, nextThreadId: string): string | null {
   if (prevThreadId && prevThreadId !== '__default__') return null;
   return nextThreadId && nextThreadId !== '__default__' ? nextThreadId : null;
 }

@@ -55,6 +55,7 @@ import {
   deliverTurnChartsAndWidgets,
   isDmTargetAddress,
   parseChartSnapshotsList,
+  resolveHtmlWidgetDeepLinkId,
 } from "./chart-snapshots.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 
@@ -11298,12 +11299,7 @@ export class ChannelGatewayOrchestrator {
     }
 
     if (artifactType === "html_widget") {
-      const artifactId =
-        typeof rawPayload.artifact_id === "string"
-          ? rawPayload.artifact_id.trim()
-          : typeof inner.artifact_id === "string"
-            ? inner.artifact_id.trim()
-            : "";
+      const artifactId = resolveHtmlWidgetDeepLinkId(rawPayload, inner);
       if (!artifactId) return;
       const title =
         typeof inner.title === "string" && inner.title.trim()

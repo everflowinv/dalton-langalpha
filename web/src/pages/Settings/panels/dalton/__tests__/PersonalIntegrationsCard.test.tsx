@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/client';
@@ -14,11 +14,20 @@ import { PersonalIntegrationsCard } from '../PersonalIntegrationsCard';
 const h = vi.hoisted(() => ({
   profile: 'everflow' as 'everflow' | 'core',
   capabilities: new Set<CapabilityId>(['google_calendar', 'feishu_calendar']),
+  desktopShell: false,
   apiGet: vi.fn(),
   apiPost: vi.fn(),
   apiDelete: vi.fn(),
   apiPatch: vi.fn(),
 }));
+
+vi.mock('@/lib/desktop', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/desktop')>();
+  return {
+    ...actual,
+    isDesktopShell: () => h.desktopShell,
+  };
+});
 
 vi.mock('@/hooks/useLocale', () => ({
   useLocale: () => 'zh-CN',
@@ -139,10 +148,12 @@ describe('PersonalIntegrationsCard', () => {
     vi.clearAllMocks();
     h.profile = 'everflow';
     h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.desktopShell = false;
     window.history.replaceState(null, '', '/settings?tab=integrations');
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     window.history.replaceState(null, '', '/settings?tab=integrations');
   });
 
@@ -899,6 +910,413 @@ describe('PersonalIntegrationsCard', () => {
     );
     expect(screen.getByTestId('personal-integrations-banner')).not.toHaveTextContent(
       '暂未收到 Google 远端撤销的明确确认结果',
+    );
+  });
+
+  it('keeps connect buttons disabled during redirect and re-enables them on bfcache pageshow restore', async () => {
+    h.capabilities = new Set<CapabilityId>([
+      'google_calendar',
+      'feishu_calendar',
+      'feishu_mail',
+      'google_gmail',
+    ]);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [
+          makeConnector('google', 'calendar'),
+          makeConnector('feishu', 'calendar'),
+          makeConnector('feishu', 'mail'),
+          makeConnector('google', 'mail'),
+        ],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+
+    let resolveAuthorize!: (val: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAuthorize = resolve;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    expect(connectButtons).toHaveLength(4);
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+
+    // Clicking one connect button disables all four while request is in flight
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    // Non-persisted pageshow must not reset busy state
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: false }));
+    });
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Resolving with authorize_url triggers navigation and keeps buttons disabled until leaving
+    act(() => {
+      resolveAuthorize({
+        data: {
+          authorize_url: '#oauth-redirect-test',
+          provider: 'google',
+          service: 'calendar',
+          intent: 'connect',
+          expires_in: 600,
+        },
+      });
+    });
+    await waitFor(() => expect(window.location.hash).toBe('#oauth-redirect-test'));
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Restoring the page from bfcache (pageshow persisted=true) resets mutation state and refetches
+    const getsBeforeRestore = h.apiGet.mock.calls.length;
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+    await waitFor(() => expect(h.apiGet.mock.calls.length).toBeGreaterThan(getsBeforeRestore));
+  });
+
+  it('ignores stale authorize completion after bfcache pageshow restore', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    let resolveStale!: (val: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+
+    // Old in-flight authorize request finally resolves after bfcache restore:
+    // must neither re-disable buttons nor trigger a stale redirect.
+    await act(async () => {
+      resolveStale({
+        data: {
+          authorize_url: '#stale-oauth-redirect',
+          provider: 'google',
+          service: 'calendar',
+          intent: 'connect',
+          expires_in: 600,
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).not.toBe('#stale-oauth-redirect');
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('ignores stale authorize error after bfcache pageshow restore', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    let rejectStale!: (err: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectStale = reject;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+
+    await act(async () => {
+      rejectStale(new Error('network abort'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('personal-integrations-banner')).not.toBeInTheDocument();
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('re-enables connect buttons after grace timeout if browser navigation does not leave the page', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    h.apiPost.mockResolvedValueOnce({
+      data: {
+        authorize_url: '#cancelled-redirect',
+        provider: 'google',
+        service: 'calendar',
+        intent: 'connect',
+        expires_in: 600,
+      },
+    });
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    vi.useFakeTimers();
+
+    await act(async () => {
+      fireEvent.click(connectButtons[0]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#cancelled-redirect');
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Still within grace period -> stays disabled
+    act(() => {
+      vi.advanceTimersByTime(4_999);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    // Grace period elapses with no pagehide -> buttons recover so user can retry
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('keeps connect buttons disabled past grace timeout once pagehide confirms navigation started', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    h.apiPost.mockResolvedValueOnce({
+      data: {
+        authorize_url: '#leaving-redirect',
+        provider: 'google',
+        service: 'calendar',
+        intent: 'connect',
+        expires_in: 600,
+      },
+    });
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    vi.useFakeTimers();
+
+    await act(async () => {
+      fireEvent.click(connectButtons[0]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#leaving-redirect');
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+      vi.advanceTimersByTime(10_000);
+    });
+    for (const btn of connectButtons) {
+      expect(btn).toBeDisabled();
+    }
+
+    act(() => {
+      window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    });
+    for (const btn of connectButtons) {
+      expect(btn).not.toBeDisabled();
+    }
+  });
+
+  it('releases redirect lock immediately in desktop shell where external OAuth opens in system browser', async () => {
+    h.desktopShell = true;
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'feishu_calendar']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+    let resolveAuthorize!: (val: unknown) => void;
+    h.apiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAuthorize = resolve;
+        }),
+    );
+
+    renderCard();
+
+    const connectButtons = await screen.findAllByRole('button', { name: '连接' });
+    fireEvent.click(connectButtons[0]);
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).toBeDisabled();
+      }
+    });
+
+    act(() => {
+      resolveAuthorize({
+        data: {
+          authorize_url: '#desktop-oauth-redirect',
+          provider: 'google',
+          service: 'calendar',
+          intent: 'connect',
+          expires_in: 600,
+        },
+      });
+    });
+
+    await waitFor(() => expect(window.location.hash).toBe('#desktop-oauth-redirect'));
+    await waitFor(() => {
+      for (const btn of connectButtons) {
+        expect(btn).not.toBeDisabled();
+      }
+    });
+  });
+
+  it('aligns action button classes and row typography with Settings page conventions', async () => {
+    h.capabilities = new Set<CapabilityId>([
+      'google_calendar',
+      'feishu_calendar',
+      'google_gmail',
+    ]);
+    const purge: PersonalIntegrationPurgeLedger = {
+      purge_id: 'purge-style-1',
+      provider: 'google',
+      service: 'calendar',
+      provider_account_id: 'old-sub',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'completed',
+      remote_revoke_status: 'failed_retryable',
+      retry_count: 1,
+      next_retry_at: null,
+      last_remote_error: '503',
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: '2026-11-27T10:01:00Z',
+      remote_completed_at: null,
+    };
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [
+          makeConnector('google', 'calendar'),
+          makeConnector('feishu', 'calendar'),
+          makeConnector('google', 'mail'),
+        ],
+        connections: [
+          makeConnection('google', 'calendar', { status: 'connected' }),
+          makeConnection('google', 'mail', {
+            status: 'needs_reauth',
+            last_error_code: 'token_expired',
+          }),
+        ],
+        active_purges: [purge],
+        has_personal_integrations: true,
+      },
+    });
+
+    renderCard();
+
+    const connectBtn = await screen.findByRole('button', { name: '连接' });
+    const reauthBtn = screen.getByRole('button', { name: '重新授权' });
+    const switchBtn = screen.getByRole('button', { name: '换账号' });
+    const disconnectBtns = screen.getAllByRole('button', { name: '断开连接' });
+    const retryRevokeBtn = screen.getByRole('button', { name: /重试远端撤销/ });
+
+    for (const btn of [connectBtn, reauthBtn, switchBtn, ...disconnectBtns]) {
+      expect(btn).toHaveClass('h-8', 'px-2', 'text-xs');
+      expect(btn).not.toHaveClass('h-9');
+      expect(btn).not.toHaveClass('text-sm');
+    }
+
+    expect(retryRevokeBtn).toHaveClass('h-8', 'gap-1', 'text-xs');
+    expect(retryRevokeBtn).not.toHaveClass('h-9');
+    expect(retryRevokeBtn).not.toHaveClass('text-sm');
+
+    const googleRow = screen.getByTestId('personal-integration-row-google-calendar');
+    expect(googleRow.querySelector('.settings-row-label')).toHaveTextContent('Google 日历');
+    expect(googleRow.querySelector('.settings-row-desc')).toHaveTextContent(
+      '在私密对话中查看日程和空闲时间。',
     );
   });
 });

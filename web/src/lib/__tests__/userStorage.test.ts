@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mode = vi.hoisted(() => ({ platform: true, authEnv: true }));
+const mode = vi.hoisted(() => ({ platform: true, authEnv: true, daltonAuth: false }));
 vi.mock('@/config/hostMode', () => ({
   get isPlatformMode() { return mode.platform; },
 }));
@@ -8,8 +8,11 @@ vi.mock('@/config/localUser', () => ({
   LOCAL_USER_ID: 'local-user',
   get hasAuthEnv() { return mode.authEnv; },
 }));
+vi.mock('@/config/daltonAuth', () => ({
+  get isDaltonAuth() { return mode.daltonAuth; },
+}));
 
-import { setStorageUser, userLocalStorage } from '../userStorage';
+import { setStorageUser, storageUser, userLocalStorage } from '../userStorage';
 
 const KEY = 'workspace_thread_id_ws-1';
 
@@ -17,6 +20,7 @@ beforeEach(() => {
   localStorage.clear();
   mode.platform = true;
   mode.authEnv = true;
+  mode.daltonAuth = false;
 });
 afterEach(() => setStorageUser(null));
 
@@ -115,5 +119,33 @@ describe('userLocalStorage', () => {
     expect(userLocalStorage.getItem('marketview_thread_id_ws-2_AAPL')).toBe('a3');
     setStorageUser('user-b');
     expect(userLocalStorage.getItem('marketview_thread_id_ws-1_AAPL')).toBe('b');
+  });
+
+  it('scopes storage by actual account ID in standalone core local-auth mode without Supabase env', () => {
+    mode.platform = false;
+    mode.authEnv = false;
+    mode.daltonAuth = true;
+
+    // Signed out: nothing is read or stored.
+    setStorageUser(null);
+    expect(storageUser()).toBeNull();
+    expect(userLocalStorage.setItem(KEY, 'leaked')).toBe(false);
+    expect(userLocalStorage.getItem(KEY)).toBeNull();
+
+    // Account A signs in and writes state.
+    setStorageUser('local-acct-a');
+    expect(storageUser()).toBe('local-acct-a');
+    expect(userLocalStorage.setItem(KEY, 'secret-thread-a')).toBe(true);
+    expect(localStorage.getItem(`user:local-user:${KEY}`)).toBeNull();
+
+    // Switch to Account B: Account A's state is isolated and invisible.
+    setStorageUser('local-acct-b');
+    expect(storageUser()).toBe('local-acct-b');
+    expect(userLocalStorage.getItem(KEY)).toBeNull();
+    expect(userLocalStorage.setItem(KEY, 'secret-thread-b')).toBe(true);
+
+    // Switch back to Account A: restores Account A's own state.
+    setStorageUser('local-acct-a');
+    expect(userLocalStorage.getItem(KEY)).toBe('secret-thread-a');
   });
 });

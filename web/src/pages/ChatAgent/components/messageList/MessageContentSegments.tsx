@@ -21,11 +21,13 @@ import AnalystHandoffRun, { type AnalystHandoffMember } from './AnalystHandoffRu
 import { ArtifactCommentReplyLines, type CommentReplyMember } from '../artifactComments/ArtifactCommentReplyLine';
 import { WORKFLOW_TASK_TYPE } from '../../session/subagents/workflowRunState';
 import { SubagentStopNotices } from '../SubagentStopNotice';
-import type { CreditPauseState, PendingToolCallChunk, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
+import type { CreditPauseState, PendingToolCallChunk, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState, WidgetDraft } from '@/types/chat';
 import TextMessageContent from '../TextMessageContent';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
-import InlineWidget from '../viewers/InlineWidget';
+import WidgetBlock from '../viewers/WidgetBlock';
+import { widgetSegmentId } from '../../session/stream/widgetIds'; // DALTON-HOOK(channel-deep-links)
+import type { HtmlWidgetData } from '../../hooks/utils/types';
 import { renderNotification } from './notices';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
@@ -70,6 +72,8 @@ interface MessageContentSegmentsProps {
   workspaceProposals?: Record<string, Record<string, unknown>>;
   questionProposals?: Record<string, Record<string, unknown>>;
   pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
+  /** Landed ShowWidget calls still drawing their preview (`AssistantMessage.widgetDrafts`). */
+  widgetDrafts?: Record<string, WidgetDraft>;
   isStreaming?: boolean;
   /** How much of the turn this bubble draws; `unfolded` is the full transcript. */
   fold?: FoldState;
@@ -89,7 +93,7 @@ interface MessageContentSegmentsProps {
   watchlistProposals?: Record<string, Record<string, unknown>>;
   creditPauses?: Record<string, CreditPauseState>;
   toolApprovals?: Record<string, ToolApprovalState>;
-  htmlWidgetProcesses?: Record<string, Record<string, unknown>>;
+  htmlWidgetProcesses?: Record<string, HtmlWidgetData>;
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
   /** The message these are, under which its prose reports its typing. */
   messageId?: string;
@@ -178,7 +182,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return block.segment.capturedImages ? <CapturedImagesContext.Provider value={block.segment.capturedImages}>{body}</CapturedImagesContext.Provider> : body;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId, taskThreadId = null }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, widgetDrafts = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId, taskThreadId = null }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const motionSafe = useMotionSafe();
   const {
@@ -191,7 +195,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     onApproveWatchlistAction, onRejectWatchlistAction, // DALTON-HOOK(watchlist)
     onResumeCreditPause,
     onApproveToolCall, onRejectToolCall,
-    onWidgetSendPrompt,
+    widgetPrompts,
     widgetExports, // DALTON-HOOK(shared-widgets): export actions this surface offers
   } = useMessageActions();
   const onOpenSubagentTask = useMemo(
@@ -230,11 +234,11 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     const skip = contentProjection?.skipSegments ?? 0;
     const next = projectContent({
       segments: skip ? segments.slice(skip) : segments,
-      reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root,
+      reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, widgetDrafts, now, root,
       cardedCharts: contentProjection?.cardedCharts,
     }, contentProjection);
     return (next.skipSegments ?? 0) === skip ? next : { ...next, skipSegments: skip };
-  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root]);
+  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, widgetDrafts, now, root]);
   const { blocks: renderBlocks, preparingToolCall, nextExpiry } = projection;
 
   useEffect(() => {
@@ -456,27 +460,29 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
         }
 
         if (block.type === 'html_widget') {
-          const widgetSeg = (block as HtmlWidgetRenderBlock).segment;
-          // DALTON-HOOK(share-redaction): preserve redacted flag on widgetData so redacted placeholders never mount an iframe
-          const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string>; redacted?: boolean }> | undefined)?.[widgetSeg.widgetId!];
-          if (!widgetData) return null;
-          // DALTON-HOOK(channel-deep-links): strip internal 'widget-' segment prefix so data-widget-id matches ShowWidget's persistent artifact_id
-          const deepLinkWidgetId = widgetSeg.widgetId?.startsWith('widget-')
-            ? widgetSeg.widgetId.slice('widget-'.length)
-            : widgetSeg.widgetId;
+          const { widgetId, preview } = block as HtmlWidgetRenderBlock;
+          const widget = htmlWidgetProcesses[widgetId];
+          if (!widget && !preview) return null;
+          // DALTON-HOOK(channel-deep-links): preview matching uses call-based segment widgetId,
+          // while deep links and browser storage uniformly use ShowWidget's persistent widget_id.
+          const persistedId = widget?.widget_id?.trim() || null;
+          const deepLinkWidgetId = persistedId
+            ?? (widgetId.startsWith('widget-') ? widgetId.slice('widget-'.length) : widgetId);
+          const storageWidgetId = persistedId ? widgetSegmentId(persistedId) : widgetId;
           return (
             // Keep the widget's own margins inside a stable transcript block.
             // Otherwise the list's gap overrides them until the preceding fold hides,
             // then restores them in one frame at the end of the animation.
+            // One element from the first streamed argument to the finished
+            // widget: the block keeps its key, so the preview hands over in place.
             // DALTON-HOOK(channel-deep-links): expose stable data-widget-id for ?widget= deep link scroll/highlight
             <div key={block.key} className="flow-root" data-widget-id={deepLinkWidgetId}>
-              <InlineWidget
-                html={widgetData.html}
-                title={widgetData.title}
-                onSendPrompt={onWidgetSendPrompt}
+              <WidgetBlock
+                widget={widget}
+                preview={preview}
+                widgetId={storageWidgetId}
+                prompts={widgetPrompts}
                 exports={widgetExports} // DALTON-HOOK(shared-widgets)
-                data={widgetData.data}
-                redacted={widgetData.redacted} // DALTON-HOOK(share-redaction)
               />
             </div>
           );

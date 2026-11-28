@@ -229,22 +229,38 @@ async def resolve_with_subscription_fallback(
     model_resolves_fn: Callable[[dict[str, Any], str], bool] = model_resolves,
     failed_subject: str | None = None,
     ignore_custom_models: bool = False,
+    unattended_gate: bool = False,
+    payer_user_id: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Try each usable fallback model not on *failed_provider*.
 
     Uses the user's saved ``prefs['fallback_models']`` when present (an explicit
-    empty list ``[]`` disables fallback). When the user has never saved
-    ``fallback_models`` (missing key or ``None``), falls back to the merged
-    deployment default ``llm.fallback``.
+    empty list ``[]`` disables fallback when ``unattended_gate`` is False). When
+    ``unattended_gate`` is True, candidate selection and live admission go through
+    the unified admin-whitelisted ``$0`` OAuth subscription pool and
+    ``acquire_fallback_candidate_live``.
 
     Raises *exc_to_raise* if no fallback candidate can serve the turn.
     """
-    saved_candidates = prefs.get("fallback_models")
-    if saved_candidates is None:
-        llm_cfg = deployment_llm()
-        candidates = list(llm_cfg.fallback) if llm_cfg and llm_cfg.fallback else []
+    if unattended_gate:
+        from src.dalton.llm.unattended_fallback import (
+            acquire_fallback_candidate_live,
+            resolve_unattended_fallback_chain,
+            route_fingerprint_to_dict,
+        )
+
+        candidates = resolve_unattended_fallback_chain(
+            primary_model=original_model,
+            user_id=user_id,
+            ignore_custom_models=True,
+        )
     else:
-        candidates = saved_candidates
+        saved_candidates = prefs.get("fallback_models")
+        if saved_candidates is None:
+            llm_cfg = deployment_llm()
+            candidates = list(llm_cfg.fallback) if llm_cfg and llm_cfg.fallback else []
+        else:
+            candidates = saved_candidates
     if not isinstance(candidates, list) or not candidates:
         raise exc_to_raise
 
@@ -280,6 +296,23 @@ async def resolve_with_subscription_fallback(
                 **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
             if cand_provider == failed_provider:
+                continue
+
+        admission = None
+        if unattended_gate:
+            admission = await acquire_fallback_candidate_live(
+                subject_user_id=user_id,
+                payer_user_id=payer_user_id or user_id,
+                candidate_model=candidate,
+                ignore_custom_models=True,
+                model_pref=filter_prefs,
+            )
+            if not admission.admitted:
+                logger.debug(
+                    "[AUTOMATION_SUB_FALLBACK] Candidate %r rejected by live admission (%s)",
+                    candidate,
+                    admission.reason,
+                )
                 continue
 
         try:
@@ -351,6 +384,34 @@ async def resolve_with_subscription_fallback(
                 continue
 
         chosen_model = getattr(getattr(config, "llm", None), "name", None) or candidate
+        final_admission = admission
+        if unattended_gate and chosen_model != candidate:
+            if original_model and chosen_model == original_model:
+                continue
+            if failed_provider:
+                chosen_provider = await _subscription_provider_for_model(
+                    user_id,
+                    chosen_model,
+                    filter_prefs,
+                    ignore_custom_models=True,
+                )
+                if chosen_provider == failed_provider:
+                    continue
+            final_admission = await acquire_fallback_candidate_live(
+                subject_user_id=user_id,
+                payer_user_id=payer_user_id or user_id,
+                candidate_model=chosen_model,
+                ignore_custom_models=True,
+                model_pref=filter_prefs,
+            )
+            if not final_admission.admitted:
+                logger.debug(
+                    "[AUTOMATION_SUB_FALLBACK] Resolved variant %r (from %r) rejected by live admission (%s)",
+                    chosen_model,
+                    candidate,
+                    final_admission.reason,
+                )
+                continue
         orig_label = (
             failed_subject
             or original_model
@@ -362,6 +423,8 @@ async def resolve_with_subscription_fallback(
             provider=failed_provider,
             reason=reason,
         )
+        if final_admission is not None and final_admission.route is not None:
+            record["selected_route"] = route_fingerprint_to_dict(final_admission.route)
         logger.warning(
             "[AUTOMATION_SUB_FALLBACK] user=%s primary=%r (%s provider=%s) -> fallback=%r",
             user_id,
@@ -389,9 +452,27 @@ async def resolve_automation_turn_llm_config(
     identity: Any = None,
     role: Any = "analyst",
     ignore_custom_models: bool = False,
+    payer_user_id: str | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve an automation first turn's LLM config with subscription fallback."""
-    async def _resolve(model_name: str | None) -> Any:
+    from src.dalton.llm.unattended_fallback import (
+        acquire_fallback_candidate_live,
+        format_unattended_quota_notice,
+        inspect_subscription_availability,
+        is_terminal_auth_http_error,
+        resolve_unattended_fallback_chain,
+        route_fingerprint_to_dict,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    unattended_on = is_unattended_quota_fallback_enabled()
+    eff_payer_id = (
+        payer_user_id
+        or (getattr(identity, "recorded_as", None) if identity is not None else None)
+        or user_id
+    )
+
+    async def _resolve(model_name: str | None, *, force_system_only: bool = False) -> Any:
         return await resolve_llm_config(
             base_config,
             user_id,
@@ -404,14 +485,105 @@ async def resolve_automation_turn_llm_config(
             workspace_id=workspace_id,
             identity=identity,
             role=role,
-            ignore_custom_models=ignore_custom_models,
+            ignore_custom_models=ignore_custom_models or force_system_only,
         )
+
+    async def _resolve_fallback_candidate(model_name: str) -> Any:
+        return await _resolve(model_name, force_system_only=unattended_on)
+
+    # Pre-dispatch structured cooldown check when unattended quota fallback is enabled.
+    if unattended_on:
+        try:
+            pre_prefs = await user_models.get_model_preference(user_id)
+        except Exception:
+            pre_prefs = {}
+        default_pre_prefs = (
+            _strip_custom_models(pre_prefs) if ignore_custom_models else pre_prefs
+        )
+        probe_model = request_model or thread_model.effective_default_model(
+            default_pre_prefs
+        )
+        if probe_model:
+            avail = await inspect_subscription_availability(
+                user_id,
+                probe_model,
+                prefs=default_pre_prefs,
+                ignore_custom_models=ignore_custom_models,
+            )
+            if not avail.available:
+                cands = resolve_unattended_fallback_chain(
+                    primary_model=probe_model,
+                    skip_cooldown_keys=[avail.cooldown_key] if avail.cooldown_key else (),
+                    user_id=user_id,
+                    ignore_custom_models=True,
+                )
+                for cand in cands:
+                    admission = await acquire_fallback_candidate_live(
+                        subject_user_id=user_id,
+                        payer_user_id=eff_payer_id,
+                        candidate_model=cand,
+                        ignore_custom_models=True,
+                        model_pref=default_pre_prefs,
+                    )
+                    if not admission.admitted:
+                        continue
+                    try:
+                        cfg = await _resolve_fallback_candidate(cand)
+                    except Exception:
+                        continue
+                    chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
+                    final_admission = admission
+                    if chosen != cand:
+                        if chosen == probe_model:
+                            continue
+                        final_admission = await acquire_fallback_candidate_live(
+                            subject_user_id=user_id,
+                            payer_user_id=eff_payer_id,
+                            candidate_model=chosen,
+                            ignore_custom_models=True,
+                            model_pref=default_pre_prefs,
+                        )
+                        if not final_admission.admitted:
+                            logger.debug(
+                                "[AUTOMATION_SUB_FALLBACK] Resolved variant %r (from %r) rejected by live admission (%s)",
+                                chosen,
+                                cand,
+                                final_admission.reason,
+                            )
+                            continue
+                    kind = (
+                        "oauth_auth_unavailable"
+                        if avail.kind == "auth_unavailable"
+                        else "subscription_quota_exhausted"
+                    )
+                    record: dict[str, Any] = {
+                        "original_model": probe_model,
+                        "fallback_model": chosen,
+                        "provider": avail.provider,
+                        "reason": avail.refusal_code or kind,
+                        "notice": format_unattended_quota_notice(
+                            kind,
+                            model_name=probe_model,
+                            reset_at=avail.reset_at,
+                            fallback_model=chosen,
+                        ),
+                    }
+                    if final_admission.route is not None:
+                        record["selected_route"] = route_fingerprint_to_dict(
+                            final_admission.route
+                        )
+                    return cfg, record
 
     with capture_resolved_effective_model() as captured_model:
         try:
             return await _resolve(request_model), None
         except HTTPException as exc:
-            if not is_subscription_unavailable_error(exc):
+            eligible_auth_exc = (
+                is_terminal_auth_http_error(exc)
+                if unattended_on
+                else is_subscription_unavailable_error(exc)
+            )
+            if not eligible_auth_exc:
                 raise
             prefs = await load_fallback_prefs_or_reraise(
                 user_id, exc, context=f"user={user_id}"
@@ -430,9 +602,11 @@ async def resolve_automation_turn_llm_config(
                 original_model=original_model,
                 failed_provider=detail.get("provider"),
                 reason=detail.get("type"),
-                resolve_candidate=_resolve,
+                resolve_candidate=_resolve_fallback_candidate,
                 exc_to_raise=exc,
                 ignore_custom_models=ignore_custom_models,
+                unattended_gate=unattended_on,
+                payer_user_id=eff_payer_id,
             )
 
 
@@ -450,7 +624,14 @@ async def resolve_ptc_turn_llm_config(
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve LLM config for ``ptc_run`` with automation subscription fallback when eligible."""
     ignore_custom = bool(getattr(request, "llm_model_system_only", False))
-    if is_automation_executor_turn(request, run_metadata):
+    from src.dalton.llm.unattended_fallback import is_unattended_turn
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    unattended_eligible = is_automation_executor_turn(request, run_metadata) or (
+        is_unattended_quota_fallback_enabled()
+        and is_unattended_turn(request, run_metadata=run_metadata)
+    )
+    if unattended_eligible:
         config, fallback_record = await resolve_automation_turn_llm_config(
             base_config,
             user_id,
@@ -464,6 +645,7 @@ async def resolve_ptc_turn_llm_config(
             identity=identity,
             role=role,
             ignore_custom_models=ignore_custom,
+            payer_user_id=(getattr(identity, "recorded_as", None) if identity is not None else None),
         )
         if fallback_record is not None:
             run_metadata = {

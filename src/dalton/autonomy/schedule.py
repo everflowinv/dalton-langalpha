@@ -2009,6 +2009,8 @@ async def schedule_dalton_automation_helper(
                 err_code = "invalid_llm_model"
             elif exc.field == "workspace_id":
                 err_code = "workspace_changed"
+            elif exc.field == "delivery_config":
+                err_code = "conflict"
             else:
                 err_code = "invalid_reasoning_effort"
             return {
@@ -2352,6 +2354,51 @@ async def schedule_dalton_automation_helper(
                     auth_on=auth_on,
                 )
 
+                from src.dalton.company_identity import is_company_system_user
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+                from src.dalton.services.report_delivery import _is_valid_uuid
+
+                locked_aid = str(
+                    locked_row.get("automation_id") or existing.get("automation_id") or ""
+                ).strip()
+                final_delivery = (
+                    effective_kwargs["delivery_config"]
+                    if "delivery_config" in effective_kwargs
+                    else locked_row.get("delivery_config")
+                )
+                locked_is_company = (
+                    str(
+                        effective_kwargs.get("scope") or locked_row.get("scope") or ""
+                    ).strip()
+                    == "company"
+                    or is_company_system_user(task_owner)
+                )
+                mutex_kwargs: dict[str, Any] = {
+                    "user_id": task_owner,
+                    "automation": {
+                        "automation_id": locked_aid,
+                        "name": locked_name,
+                        "metadata": final_meta,
+                    },
+                    "delivery_config": final_delivery,
+                    "metadata": final_meta,
+                    "model_pref": pref_for_effort,
+                    "conn": locked_conn,
+                }
+                if (
+                    report_profile_change is not None
+                    and not locked_is_company
+                    and _is_valid_uuid(locked_aid)
+                ):
+                    mutex_kwargs["notify_routes"] = (
+                        list(report_profile_change.route_targets)
+                        if report_profile_change.profile is not None
+                        else []
+                    )
+                await assert_no_automation_delivery_notify_conflict(**mutex_kwargs)
+
                 locked_classified: tuple[str, dict[str, Any]] | None = None
                 if model_in_spec and final_model is not None:
                     locked_classified = await _check_managed_automation_model(
@@ -2638,6 +2685,25 @@ async def schedule_dalton_automation_helper(
                     is_create=True,
                     model_pref=pref_for_effort,
                     classified=create_classified,
+                )
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+
+                create_post_routes = (
+                    list(create_report_change.route_targets)
+                    if create_report_change is not None
+                    and create_report_change.profile is not None
+                    else []
+                )
+                await assert_no_automation_delivery_notify_conflict(
+                    user_id=task_owner,
+                    automation={"name": resolved_name, "metadata": create_meta},
+                    delivery_config=merged_spec.get("delivery_config"),
+                    metadata=create_meta,
+                    notify_routes=create_post_routes,
+                    model_pref=pref_for_effort,
+                    conn=active_conn,
                 )
             except AutomationRefusal as exc:
                 return _handle_schedule_refusal(

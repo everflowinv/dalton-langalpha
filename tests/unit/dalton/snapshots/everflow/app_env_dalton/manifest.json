@@ -90,32 +90,12 @@
     },
     "configured_pm_user_ids": [],
     "conversations": {
-      "agents": [
-        "main",
-        "chem",
-        "marco"
-      ],
-      "cursors_file": "var/dalton/conversations/cursors.json",
-      "default_backfill_days": 14,
       "embedding_dimensions": 3072,
       "embedding_model": "gemini-embedding-2-preview",
       "embedding_model_preferred": "gemini-embedding-2-preview",
       "enabled": true,
-      "export_cursors_file": "var/dalton/conversations/export_cursors.json",
-      "extract_concurrency": 1,
-      "extractor_fallback_model": "gemini-4-argon-medium-oauth",
-      "extractor_model": "deepseek-flash",
-      "hourly_token_budget": 5000000,
-      "inbox_dir": "var/dalton/conversations/inbox",
-      "max_segment_chars": 6000,
-      "max_segment_events": 25,
-      "max_segment_gap_minutes": 30,
-      "prompt_version": "conv_card_v2_3",
-      "rate_limit_initial_backoff_seconds": 30.0,
-      "rate_limit_max_backoff_seconds": 900.0,
       "recency_floor": 0.7,
-      "recency_half_life_days": 180.0,
-      "segment_deadline_s": 600.0
+      "recency_half_life_days": 180.0
     },
     "coverage_units": {
       "enabled": true
@@ -217,6 +197,9 @@
     "weixin": {
       "allow_external": true,
       "max_concurrent_accounts": 200
+    },
+    "widget_render": {
+      "enabled": false
     }
   },
   "dalton_skills_visibility": {

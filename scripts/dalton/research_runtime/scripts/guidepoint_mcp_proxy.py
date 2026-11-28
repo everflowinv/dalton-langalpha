@@ -72,9 +72,6 @@ def resolve_research_home() -> Path:
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
     if raw_home:
         return Path(raw_home).expanduser().resolve()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    if raw_ocw:
-        return Path(raw_ocw).expanduser().resolve()
     return (Path.home() / "Library" / "Application Support" / "Everflow" / "research").resolve()
 
 

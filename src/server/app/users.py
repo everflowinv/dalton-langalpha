@@ -931,6 +931,7 @@ async def update_preferences(
                     discovered_groups=prefetched_feishu_groups,
                     expected_stored_routes=expected_stored_routes,
                     via_rest=True,
+                    conn=conn,  # DALTON-HOOK(dalton-notify): recheck delivery_config mutex inside preference lock tx
                 )
             if sets_structured:
                 # Every value outside its vocabulary, in any column, in one
@@ -1028,61 +1029,29 @@ async def update_preferences(
 @router.delete("/users/me/preferences", status_code=200)
 @handle_api_exceptions("delete preferences", logger)
 async def delete_preferences(user_id: CurrentUserId):
-    """Delete all user preferences and reset onboarding_completed to false.
-    A feature the server granted (``granted_override_keys``) stays granted: the
-    user never set it, and a grant lost here could not be given back. The
-    account setup stamp stays for the same reason (``delete_user_preferences``)."""
+    """Clear the user's investing answers and agent settings, and reset
+    onboarding_completed to false. Model settings stay: the reset belongs to
+    the investing profile, not to the models turns run on. A feature the server
+    granted (``granted_override_keys``) stays granted: the user never set it,
+    and a grant lost here could not be given back. The account setup stamp
+    stays for the same reason (``delete_user_preferences``)."""
     user = await db_get_user(user_id)
     if not user:
         raise_not_found("User")
 
-    # DALTON-HOOK(data-jobs): when the primary admin resets their
-    # preferences, preserve all `dalton_notify*` keys in place (without
-    # writing an audit entry or bumping `config_version`) and perform the
-    # check + write/delete in a single transaction and profile lock.
+    # DALTON-HOOK(data-jobs): both primary-admin and regular preference resets share
+    # `db_delete_user_preferences`, preserving model settings, grants, account setup,
+    # and (for the primary admin) all `dalton_notify*` keys in a single transaction
+    # and profile lock without writing an audit entry or bumping `config_version`.
     # DALTON-HOOK(standalone-core): resolve primary admin through access_tiers (reads dalton_credential_holder / dalton_user_roles in local mode)
     from src.dalton.access_tiers import get_primary_admin_user_id
 
     primary_admin = await get_primary_admin_user_id()
     uid_clean = str(user_id or "").strip()
-    keep_overrides = granted_override_keys()
+    reset_kwargs: Dict[str, Any] = {"keep_overrides": granted_override_keys()}
     if primary_admin and uid_clean == primary_admin:
-        async with get_db_connection() as conn, conn.transaction():
-            locked = await db_lock_user_preferences(user_id, conn=conn)
-            locked_model_pref = (locked or {}).get("model_preference") or {}
-            locked_other_pref = (locked or {}).get("other_preference") or {}
-            preserved_notify_prefs: dict[str, object] = {}
-            preserved_other_pref: dict[str, object] = {}
-            if isinstance(locked_other_pref, dict):
-                for k, v in locked_other_pref.items():
-                    if isinstance(k, str) and k.strip().startswith("dalton_notify"):
-                        preserved_notify_prefs[k.strip()] = v
-                overrides = locked_other_pref.get("feature_overrides")
-                if isinstance(overrides, dict):
-                    kept = {k: v for k, v in overrides.items() if k in keep_overrides}
-                    if kept:
-                        preserved_other_pref["feature_overrides"] = kept
-            if isinstance(locked_model_pref, dict):
-                for k, v in locked_model_pref.items():
-                    if isinstance(k, str) and k.strip().startswith("dalton_notify"):
-                        preserved_notify_prefs[k.strip()] = v
-            if preserved_notify_prefs:
-                await upsert_user_preferences(
-                    user_id=user_id,
-                    risk_preference={},
-                    investment_preference={},
-                    agent_preference={},
-                    other_preference=preserved_other_pref,
-                    model_preference=preserved_notify_prefs,
-                    replace=True,
-                    conn=conn,
-                )
-            else:
-                await db_delete_user_preferences(
-                    user_id, conn=conn, keep_overrides=keep_overrides
-                )
-    else:
-        await db_delete_user_preferences(user_id, keep_overrides=keep_overrides)
+        reset_kwargs["preserve_dalton_notify"] = True
+    await db_delete_user_preferences(user_id, **reset_kwargs)
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
     await db_update_user(user_id=user_id, onboarding_completed=False)

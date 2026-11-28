@@ -10,7 +10,6 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from src.dalton.settings import get_dalton_broker_token
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -30,9 +29,6 @@ def sanitize_error_text(text: str | BaseException | None, max_len: int = 200) ->
     if text is None:
         return ""
     raw = f"{text.__class__.__name__}: {text}" if isinstance(text, BaseException) else str(text)
-    broker_tok = get_dalton_broker_token()
-    if broker_tok and broker_tok in raw:
-        raw = raw.replace(broker_tok, "***")
     scrubbed = _SECRET_PATTERN.sub("[REDACTED]", raw)
     return scrubbed[:max_len]
 

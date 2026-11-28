@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -87,6 +88,16 @@ UPSTREAM_STOPWORDS = {
     "test", "text", "tool", "toolkit", "tools", "ts", "ui", "use", "v1", "v2", "vector",
     "video",
     "vision", "voice", "web", "workflow",
+    # Address parts and generic words that grouped unrelated repos (11-28 report:
+    # com, org, github, software, community, design, daily, pro ...).
+    "com", "org", "www", "http", "https", "github", "gitlab", "html",
+    "and", "for", "from", "the", "with", "your", "scratch",
+    "rust", "cpp", "java", "typescript", "golang", "swift", "kotlin",
+    "windows", "linux", "macos", "android", "ios",
+    "anything", "best", "build", "builder", "community", "control",
+    "daily", "design", "downloader", "easy", "engineer", "engineering", "guide",
+    "learn", "manager", "modern", "online", "pro", "protocol", "simple", "software",
+    "source", "suite", "super", "ultimate", "victory",
 }
 UPSTREAM_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{2,}")
 UPSTREAM_WINDOW_HOURS = 48.0
@@ -159,6 +170,32 @@ def name_tokens(item: dict[str, Any]) -> set[str]:
     return _tokens(str(item.get("full_name") or "").replace("/", " "))
 
 
+HOSTING_SUFFIXES = (
+    "github.io", "gitlab.io", "vercel.app", "netlify.app", "pages.dev", "web.app",
+    "readthedocs.io", "hf.space", "huggingface.co", "streamlit.app", "fly.dev",
+)
+
+
+def _homepage_name(url: str) -> str:
+    """The project's own labels in a homepage host: no top-level domain, no hosting service.
+
+    `foo.net` -> `foo`; `foo.vercel.app` -> `foo` (otherwise `vercel` would group a
+    hosted page with the owner `vercel-labs`).
+    """
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:  # malformed address (e.g. unbalanced brackets): no tokens, no crash
+        return ""
+    # The path keeps project names such as huggingface.co/Qwen/... or github.com/deepseek-ai/...
+    path = parsed.path.replace("/", " ")
+    for suffix in HOSTING_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return f"{host[: -len(suffix)].strip('.').replace('.', ' ')} {path}".strip()
+    labels = [label for label in host.split(".") if label]
+    return f"{' '.join(labels[:-1] if len(labels) > 1 else labels)} {path}".strip()
+
+
 def mention_tokens(item: dict[str, Any]) -> set[str]:
     """Tokens from name, description, topics and homepage host."""
     parts = [
@@ -166,7 +203,7 @@ def mention_tokens(item: dict[str, Any]) -> set[str]:
         str(item.get("description") or ""),
         " ".join(str(tag) for tag in item.get("trendshift_tags") or []),
         " ".join(str(tag) for tag in (item.get("github") or {}).get("topics") or []),
-        str((item.get("github") or {}).get("homepage") or ""),
+        _homepage_name(str((item.get("github") or {}).get("homepage") or "")),
     ]
     return _tokens(" ".join(parts))
 
@@ -199,8 +236,9 @@ def recent_repo_tokens(
             )
             # Snapshots written before token storage existed still yield name tokens.
             fallback = _tokens(str(full_name).replace("/", " "))
-            entry["name_tokens"] |= set(meta.get("name_tokens") or fallback)
-            entry["mention_tokens"] |= set(meta.get("mention_tokens") or fallback)
+            # Keep stored tokens in line with the current stopwords (easier to inspect).
+            entry["name_tokens"] |= set(meta.get("name_tokens") or fallback) - UPSTREAM_STOPWORDS
+            entry["mention_tokens"] |= set(meta.get("mention_tokens") or fallback) - UPSTREAM_STOPWORDS
     return seen
 
 

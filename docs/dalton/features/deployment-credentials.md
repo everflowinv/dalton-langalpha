@@ -137,6 +137,7 @@
 | `DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE` | `.env.core.example`, `src/dalton/chat_upload_storage.py` | S3 寻址风格（MinIO 使用 `path`，云厂商常用 `virtual`） | `src/dalton/chat_upload_storage.py` | 启动 / 客户端构造时 | 重建 `backend` 容器 | 是（默认 `path`） |
 | `DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX` | `.env.core.example`, `src/dalton/chat_upload_storage.py` | 聊天上传对象键名前缀 | `src/dalton/chat_upload_storage.py` | 每次生成对象键时读取 | 重建 `backend` 容器 | 是（默认 `chat-uploads`） |
 | `DALTON_CHAT_UPLOAD_CLEANUP_ENABLED` | `src/dalton/settings.py` | 是否启用后台过期聊天上传对象回收任务 | `src/dalton/settings.py`, `src/dalton/services/chat_uploads.py` | 启动一次 | 重建 `backend` 容器 | 选填（默认开启） |
+| `DALTON_WIDGET_SSR_ENABLED` | `src/dalton/settings.py` | 是否在服务端用 Chromium 预先渲染校验对话里的可视化小组件（默认关闭，与 `widget_render.enabled` 配置等效） | `src/dalton/settings.py:is_widget_ssr_enabled` | 每次渲染校验时读取 | 重建 `backend` 容器 | 选填（默认关闭） |
 | `DALTON_CHAT_UPLOAD_PART_IDLE_TIMEOUT_S` | `src/dalton/settings.py` | 单分片流式转发空闲超时秒数 | `src/dalton/settings.py` | 每次上传分片读取 | 重建 `backend` 容器 | 选填 |
 | `DALTON_CHAT_UPLOAD_PART_TOTAL_TIMEOUT_S` | `src/dalton/settings.py` | 单分片上传总耗时上限秒数 | `src/dalton/settings.py` | 每次上传分片读取 | 重建 `backend` 容器 | 选填 |
 | `AWS_ACCESS_KEY_ID` | `.env.example`, `src/utils/storage/s3_client.py` | 通用 AWS S3 对象存储访问密钥 ID（`STORAGE_ACCESS_KEY_ID` 的兼容回退） | `src/utils/storage/s3_client.py` | 启动导入一次 | 重建 `backend` 容器 | 选填（核心版默认用内置 MinIO） |
@@ -454,7 +455,7 @@
 
 > **治理准则**：C 类变量绑定在 Everflow 单机宿主机 `researchdata_bridge.py`、私有商业数据授权、Supabase 托管认证准入、宿主机 `launchd`（macOS 系统守护进程管理器）运维脚本或上游 Ginlix 多租户云平台上。核心安装（`DALTON_PROFILE=core`）通过 `src.dalton.profile` 与 `src.dalton.capabilities` 默认关闭并隐去，这些变量继续留在 Everflow 生产 `.env` 与 `~/.config/dalton/*.env`。
 
-#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（40 项）
+#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（37 项；11-28 停用代码清理删去 3 项）
 
 | 变量名 | 来源 | 用途 | 谁读取 | 读取时机 | 改动后生效方式 | 核心安装是否需要 |
 |---|---|---|---|---|---|---|
@@ -476,9 +477,6 @@
 | `DALTON_BRIDGE_PORT` | `src/dalton/settings.py`, `researchdata_bridge.py` | 宿主机研究桥监听端口（默认 `8960`） | `src/dalton/settings.py`, `researchdata_bridge.py` | 桥接进程启动一次 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_TOKEN` | `src/dalton/settings.py`, `plugins/dalton_data/mcp.json` | 后端与沙箱访问宿主机研究桥的 Bearer 鉴权令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 桥接启动加载 + 后端每次读取 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_ADMIN_TOKEN` | `src/dalton/settings.py`, `researchdata_bridge.py` | 研究桥高权限管理与运维接口专用令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 同上 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
-| `DALTON_BRIDGE_EMBED_URL` | `src/dalton/settings.py` | 经宿主机研究桥本机模型生成向量嵌入的接口地址 | `src/dalton/settings.py`, `embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_EMBED_VIA_BRIDGE` | `src/dalton/embeddings/config.py` | 控制向量嵌入是否走宿主机研究桥本机推理 | `src/dalton/embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_BROKER_TOKEN` | `src/dalton/settings.py` | 宿主机内部券商/研究代理令牌 | `src/dalton/settings.py`, `scripts/dalton/` | 每次内部任务调用时 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_DATA_JOBS_ENABLED` | `src/dalton/settings.py` | 内部数据采集调度器旧版兼容开关 | `src/dalton/settings.py`, `data_jobs/scheduler.py` | 启动一次 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_DATA_TASK_MIN_FREE_MEM_MB` | `src/dalton/settings.py` | 触发宿主机数据任务前的最小可用内存保护阈值 | `src/dalton/settings.py` | 每次调度前检查 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_COVERAGE_UNITS_ENABLED` | `src/dalton/settings.py`, `docker-compose.dalton.yml` | 内部研究员行业覆盖组管理开关 | `src/dalton/settings.py` | 每次请求读取 | 修改 `.env` 后重建 `backend` 容器 | 否 |

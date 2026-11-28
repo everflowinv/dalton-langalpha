@@ -164,6 +164,7 @@ function renderWiredHooks(queryClient = createTestQueryClient()) {
         threadId: chat.threadId,
         workspaceId: 'ws-personal',
         createdThreadId: chat.createdThreadId,
+        createdTuning: chat.createdThreadTuning,
       });
       return { chat, model, tuning };
     },
@@ -264,10 +265,13 @@ describe('createdThreadId transition across real useChatMessages + useThreadMode
     });
     expect(result.current.tuning.tuning.reasoningEffort).toBe('low');
 
-    // Once the created thread detail loads, createdRef persists the in-flight effort pick to the new row.
+    // Once the created thread detail loads, createdRef persists the in-flight effort pick to the new row with CAS guard.
     await waitFor(() => expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(NEW_ID))).toBeDefined());
     await waitFor(() =>
-      expect(mocks.updateThread).toHaveBeenCalledWith(NEW_ID, { reasoning_effort: 'low' }),
+      expect(mocks.updateThread).toHaveBeenCalledWith(NEW_ID, {
+        reasoning_effort: 'low',
+        expected_reasoning_effort: 'high',
+      }),
     );
 
     await act(async () => {
@@ -348,7 +352,10 @@ describe('createdThreadId transition across real useChatMessages + useThreadMode
 
     await waitFor(() => expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(LEGACY_ID))).toBeDefined());
     await waitFor(() =>
-      expect(mocks.updateThread).toHaveBeenCalledWith(LEGACY_ID, { reasoning_effort: 'low' }),
+      expect(mocks.updateThread).toHaveBeenCalledWith(LEGACY_ID, {
+        reasoning_effort: 'low',
+        expected_reasoning_effort: null,
+      }),
     );
 
     await act(async () => {

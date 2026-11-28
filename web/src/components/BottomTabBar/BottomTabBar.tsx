@@ -10,6 +10,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import type { NavItem } from '../nav/navItems';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
 import { useMobileBottomNavItems } from '@/lib/dalton/mobileBottomNav'; // DALTON-HOOK(mobile-web)
@@ -30,9 +31,9 @@ export default function BottomTabBar() {
   const hasMoreMenu = overflowItems.length > 0 || Boolean(palette);
   const moreActive = overflowItems.some((item) => isActive(item));
 
-  const handleItemClick = (path: string) => {
-    if (location.pathname === path) return;
-    navigate(path);
+  const handleItemClick = (item: NavItem) => {
+    if (location.pathname === item.key) return;
+    navigate(item.key, { state: item.state });
   };
 
   return (
@@ -46,7 +47,7 @@ export default function BottomTabBar() {
             <button
               key={item.key}
               className={`bottom-tab-item ${active ? 'active' : ''}`}
-              onClick={() => handleItemClick(item.key)}
+              onClick={() => handleItemClick(item)}
               aria-label={t(item.labelKey)}
               aria-current={active ? 'page' : undefined}
             >
@@ -94,7 +95,7 @@ export default function BottomTabBar() {
                       color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
                       fontWeight: active ? 600 : 400,
                     }}
-                    onSelect={() => handleItemClick(item.key)}
+                    onSelect={() => handleItemClick(item)}
                     aria-current={active ? 'page' : undefined}
                   >
                     <Icon className="h-4 w-4 shrink-0" />

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { type Flags, parse } from "../src/args.js";
 import { bind, parseFor, select } from "../src/commands/command.js";
 import { sshTarget } from "../src/commands/computers.js";
-import { COMMANDS } from "../src/commands/index.js";
+import { availableCommands, COMMANDS } from "../src/commands/index.js";
 
 const FLAGS: Flags = {
   workspace: { type: "string", short: "w" },
@@ -101,5 +101,32 @@ describe("the name hints use", () => {
     expect(await load("langalpha")).toBe("langalpha");
     expect(await load(undefined)).toBe("langalpha");
     vi.unstubAllEnvs();
+  });
+});
+
+describe("availableCommands", () => {
+  const wordsOf = (cmds: readonly { words: readonly string[] }[]) => cmds.map((c) => c.words.join(" "));
+
+  it("exposes all commands when capability flags are unset", () => {
+    expect(availableCommands({})).toBe(COMMANDS);
+  });
+
+  it("hides drive and memo commands when LANGALPHA_DRIVE_ENABLED=0", () => {
+    const names = wordsOf(availableCommands({ LANGALPHA_DRIVE_ENABLED: "0" }));
+    expect(names.some((n) => n.startsWith("drive "))).toBe(false);
+    expect(names).toContain("threads list");
+  });
+
+  it("hides only memo commands when Drive is enabled but LANGALPHA_DRIVE_MEMOS_ENABLED=0", () => {
+    const names = wordsOf(availableCommands({
+      LANGALPHA_DRIVE_ENABLED: "1",
+      LANGALPHA_DRIVE_MEMOS_ENABLED: "0",
+    }));
+    expect(names).toContain("drive ls");
+    expect(names).toContain("drive history");
+    expect(names).toContain("drive restore");
+    expect(names).not.toContain("drive memos");
+    expect(names).not.toContain("drive memo mark");
+    expect(names).not.toContain("drive checkout");
   });
 });

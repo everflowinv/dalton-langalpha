@@ -205,7 +205,6 @@ export function useDaltonDocumentSearch(
     queryKey: queryKeys.threads.daltonDocuments(queryRested, limit, scope, includeContent),
     queryFn: async ({ signal }): Promise<DaltonDocumentsAnswered> => {
       const res = await fetchGlobalSearch(queryRested, limit, signal, {
-        includeConversations: false,
         workspaceId: workspaceId || undefined,
         includeContent,
       });

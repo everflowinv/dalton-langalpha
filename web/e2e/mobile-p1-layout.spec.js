@@ -125,7 +125,7 @@ function capabilityMocks(enabled) {
     },
     'GET /dalton/notify/feishu-groups': {
       ok: true,
-      groups: [{ chat_id: 'oc_1234567890abcdef123456', name: 'TMT 研究周会群' }],
+      groups: [{ chat_id: 'oc_test_group_001', name: 'TMT 研究周会群' }],
     },
     'GET /dalton/notify/feishu-bot': {
       ok: true,

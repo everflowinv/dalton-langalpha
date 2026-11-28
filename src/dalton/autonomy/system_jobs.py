@@ -221,18 +221,6 @@ def _summarize_last_execution(
     return ts_str, st or None
 
 
-def _conversations_readonly_config() -> dict[str, Any]:
-    """Read-only conversation archive extraction parameters from ``src/dalton/dalton.yaml``."""
-    cfg = get_dalton_config().conversations
-    return {
-        "extractor_model": cfg.extractor_model,
-        "model": cfg.extractor_model,
-        "prompt_version": cfg.prompt_version,
-        "extract_concurrency": cfg.extract_concurrency,
-        "concurrency": cfg.extract_concurrency,
-    }
-
-
 async def _call_host_bridge(
     method: str,
     path: str,
@@ -1237,7 +1225,6 @@ def _build_data_job_entry(
         if isinstance(def_row, Mapping) and "notify_enabled" in def_row
         else bool(manifest_entry.notify_enabled)
     )
-    cos_mode = str((def_row or {}).get("cos_mode") or manifest_entry.cos_mode)
     consecutive_failures = int((def_row or {}).get("consecutive_failures") or 0)
     config_version = int((def_row or {}).get("config_version") or 1)
     active_version = int((def_row or {}).get("active_version") or 1)
@@ -1291,7 +1278,6 @@ def _build_data_job_entry(
         "enabled": enabled,
         "paused_by_user": paused_by_user,
         "notify_enabled": notify_enabled,
-        "cos_mode": cos_mode,
         "consecutive_failures": consecutive_failures,
         "config_version": config_version,
         "active_version": active_version,
@@ -1372,7 +1358,7 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
                     SELECT
                         job_key, task_code, title, batch_no, runner,
                         cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
-                        cos_mode, notify_enabled, enabled, paused_by_user,
+                        notify_enabled, enabled, paused_by_user,
                         consecutive_failures, config_version, active_version,
                         updated_by, audit_history, updated_at,
                         notify_storage_mode, notify_routes
@@ -1487,7 +1473,7 @@ async def _fetch_single_data_system_job(
                 SELECT
                     job_key, task_code, title, batch_no, runner,
                     cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
-                    cos_mode, notify_enabled, enabled, paused_by_user,
+                    notify_enabled, enabled, paused_by_user,
                     consecutive_failures, config_version, active_version,
                     updated_by, audit_history, updated_at,
                     notify_storage_mode, notify_routes, deleted_at
@@ -1570,7 +1556,7 @@ async def _ensure_and_lock_data_task_def_row(
         SELECT
             job_key, task_code, title, batch_no, runner,
             cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
-            cos_mode, notify_enabled, enabled, paused_by_user,
+            notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version,
             updated_by, audit_history, updated_at, deleted_at,
             notify_storage_mode, notify_routes
@@ -1595,7 +1581,7 @@ async def _ensure_and_lock_data_task_def_row(
             job_key, task_code, title, batch_no, runner,
             cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
             command_argv, workdir, required_secrets,
-            cos_mode, notify_enabled, enabled, paused_by_user,
+            notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version,
             audit_history, updated_at
         )
@@ -1603,7 +1589,7 @@ async def _ensure_and_lock_data_task_def_row(
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s, %s,
-            %s, %s, %s, FALSE,
+            %s, %s, FALSE,
             0, 1, 1,
             %s, NOW()
         )
@@ -1622,7 +1608,6 @@ async def _ensure_and_lock_data_task_def_row(
             Jsonb(list(manifest_entry.command_argv)),
             manifest_entry.workdir,
             Jsonb(list(manifest_entry.required_secrets)),
-            manifest_entry.cos_mode,
             manifest_entry.notify_enabled,
             manifest_entry.enabled,
             Jsonb(seed_audit),
@@ -1633,7 +1618,7 @@ async def _ensure_and_lock_data_task_def_row(
         SELECT
             job_key, task_code, title, batch_no, runner,
             cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
-            cos_mode, notify_enabled, enabled, paused_by_user,
+            notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version,
             updated_by, audit_history, updated_at, deleted_at,
             notify_storage_mode, notify_routes

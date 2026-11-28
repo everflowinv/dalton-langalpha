@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 from typing import Any
@@ -299,13 +298,13 @@ def test_check_runtime_status_and_cli_json_offline(
 
 def test_run_sh_scripts_do_not_source_shell_profiles_and_pin_python_versions() -> None:
     expected_pins = {
-        RESEARCH_RUNTIME / "skills" / "findata-analyst" / "run.sh": ("3.12", "venvs/findata-analyst", "skills/findata-analyst/venv"),
-        RESEARCH_RUNTIME / "skills" / "cn-hk-findata" / "run.sh": ("3.12", "venvs/cn-hk-findata", "skills/cn-hk-findata/venv"),
-        RESEARCH_RUNTIME / "skills" / "company-wiki" / "run.sh": ("3.14", "venvs/company-wiki", "skills/company-wiki/venv"),
-        RESEARCH_RUNTIME / "skills" / "market-digest" / "run.sh": ("3.13", "venvs/market-digest", "skills/market-digest/venv"),
-        RESEARCH_RUNTIME / "skills" / "employee-reviews" / "scripts" / "run.sh": ("3.14", "venvs/employee-reviews", "skills/employee-reviews/venv"),
+        RESEARCH_RUNTIME / "skills" / "findata-analyst" / "run.sh": ("3.12", "venvs/findata-analyst"),
+        RESEARCH_RUNTIME / "skills" / "cn-hk-findata" / "run.sh": ("3.12", "venvs/cn-hk-findata"),
+        RESEARCH_RUNTIME / "skills" / "company-wiki" / "run.sh": ("3.14", "venvs/company-wiki"),
+        RESEARCH_RUNTIME / "skills" / "market-digest" / "run.sh": ("3.13", "venvs/market-digest"),
+        RESEARCH_RUNTIME / "skills" / "employee-reviews" / "scripts" / "run.sh": ("3.14", "venvs/employee-reviews"),
     }
-    for path, (ver, venv_sub, legacy_sub) in expected_pins.items():
+    for path, (ver, venv_sub) in expected_pins.items():
         text = path.read_text(encoding="utf-8")
         assert ".zshrc" not in text
         assert ".bash_profile" not in text
@@ -314,43 +313,11 @@ def test_run_sh_scripts_do_not_source_shell_profiles_and_pin_python_versions() -
         assert "sort -V" not in text
         assert ver in text
         assert venv_sub in text
-        assert legacy_sub in text
 
     ce_text = (RESEARCH_RUNTIME / "scripts" / "consensus_estimates.sh").read_text(encoding="utf-8")
     assert "pyvenv.cfg" in ce_text
     assert "python3" in ce_text
     assert "python3.14 is required" not in ce_text
-
-
-def test_research_runtime_migrate_plan_prints_without_modifying_files(tmp_path: Path) -> None:
-    src = tmp_path / "src_ocw"
-    dst = tmp_path / "dst_research"
-    (src / "wiki").mkdir(parents=True)
-    (src / "wiki" / "vectors.db").write_bytes(b"sqlite")
-    res = subprocess.run(
-        [
-            "bash",
-            str(SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"),
-            "--plan",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(RESEARCH_RUNTIME),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res.returncode == 0, res.stderr
-    assert "sqlite3" in res.stdout
-    assert ".backup" in res.stdout
-    assert "市场晚报" in res.stdout
-    assert "wiki/vectors.db" in res.stdout
-    assert "skills/market-digest/vectors.db" in res.stdout
-    assert not dst.exists()
 
 
 @pytest.mark.asyncio
@@ -569,372 +536,6 @@ def test_research_image_ingest_tmtb_no_unbound_local_and_download_dir_compat(
         ingest_mod.discover({"key": "k_tmtb_2", "kind": "tmtb", "doc_key": "alphaengine:doc456"}, store)
 
 
-def test_research_runtime_migrate_apply_safety_queue_rewrite_and_switch(
-    tmp_path: Path,
-) -> None:
-    import sqlite3
-
-    migrate_sh = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
-    src = tmp_path / "src_ocw"
-    dst = tmp_path / "dst_research"
-    code = RESEARCH_RUNTIME
-    home_dir = tmp_path / "user_home"
-    cfg_dir = home_dir / ".config" / "dalton"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg_dir.chmod(0o700)
-
-    # Populate source workspace
-    for rel in (
-        "wiki/companies",
-        "wiki/sectors",
-        "skills/market-digest/output",
-        "state/sales-notes",
-        "state/funda-ai",
-        "state/research-images/queue",
-        "state/research-images/extracted/job1",
-        "state/tmtb-alphaengine",
-        "state/venvs/consensus-estimates",
-        "market-memory",
-    ):
-        (src / rel).mkdir(parents=True, exist_ok=True)
-    (src / "state" / "sales-notes" / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
-    (src / "skills" / "market-digest").mkdir(parents=True, exist_ok=True)
-    (src / "skills" / "market-digest" / "config.json").write_text(
-        json.dumps({"newsletter_email": "digest@example.invalid"}),
-        encoding="utf-8",
-    )
-    (src / "config").mkdir(parents=True, exist_ok=True)
-    (src / "config" / "eve_tracking_mirror.json").write_text(
-        json.dumps({"enabled": False, "source_chat_id": "oc_test_chat", "target": "user:123"}),
-        encoding="utf-8",
-    )
-    (src / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg").write_text(
-        f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
-        encoding="utf-8",
-    )
-
-    for db_rel in (
-        "wiki/vectors.db",
-        "skills/market-digest/vectors.db",
-        "state/funda-ai/index.sqlite",
-        "state/research-images/index.sqlite",
-    ):
-        db_p = src / db_rel
-        conn = sqlite3.connect(db_p)
-        conn.execute("CREATE TABLE t (x INTEGER)")
-        conn.execute("INSERT INTO t VALUES (1)")
-        conn.commit()
-        conn.close()
-
-    extracted_img = src / "state" / "research-images" / "extracted" / "job1" / "a.bin"
-    extracted_img.write_bytes(b"imgbytes")
-    orig_doc = src / "wiki" / "companies" / "NVDA.md"
-    orig_doc.write_text("# NVDA\n", encoding="utf-8")
-    queue_file = src / "state" / "research-images" / "queue" / "q1.json"
-    queue_file.write_text(
-        json.dumps(
-            {
-                "key": "job1",
-                "source": "company-wiki",
-                "doc_key": "wiki:1",
-                "kind": "file",
-                "status": "pending",
-                "payload": {"path": str(orig_doc)},
-                "items": [{"kind": "file", "path": str(extracted_img), "locator": "p1"}],
-                "results": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    # 1. --apply without --i-have-paused-writers must refuse
-    res_no_confirm = subprocess.run(
-        ["/bin/bash", str(migrate_sh), "--apply", "--src", str(src), "--dst", str(dst), "--code", str(code)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res_no_confirm.returncode != 0
-    assert "--i-have-paused-writers" in res_no_confirm.stderr
-    assert not dst.exists()
-
-    # 2. Active launchd service detected -> refuse
-    launchctl_busy = tmp_path / "launchctl_busy"
-    launchctl_busy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    launchctl_busy.chmod(0o755)
-    res_busy = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-        ],
-        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl_busy)},
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res_busy.returncode != 0
-    assert "active writers" in res_busy.stderr
-
-    # 3. Insufficient disk space -> refuse
-    launchctl_idle = tmp_path / "launchctl_idle"
-    launchctl_idle.write_text("#!/bin/sh\ncase \"$1\" in print) exit 1 ;; *) exit 0 ;; esac\n", encoding="utf-8")
-    launchctl_idle.chmod(0o755)
-    res_disk = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-        ],
-        env={
-            **os.environ,
-            "LAUNCHCTL_BIN": str(launchctl_idle),
-            "DALTON_MIGRATE_MIN_FREE_KB": "999999999999",
-        },
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res_disk.returncode != 0
-    assert "insufficient disk space" in res_disk.stderr
-
-    # 4. Existing target + mid-migration sqlite failure -> rollback/preserve existing dst & clean staging
-    dst.mkdir(parents=True, exist_ok=True)
-    sentinel = dst / "keep_me.txt"
-    sentinel.write_text("original", encoding="utf-8")
-    fake_sqlite_dir = tmp_path / "fake_sqlite_bin"
-    fake_sqlite_dir.mkdir()
-    real_sqlite = subprocess.check_output(["which", "sqlite3"], text=True).strip()
-    (fake_sqlite_dir / "sqlite3").write_text(
-        "#!/bin/sh\n"
-        "case \"$*\" in\n"
-        "  *funda-ai*) echo 'simulated backup failure' >&2; exit 1 ;;\n"
-        "esac\n"
-        f"exec \"{real_sqlite}\" \"$@\"\n",
-        encoding="utf-8",
-    )
-    (fake_sqlite_dir / "sqlite3").chmod(0o755)
-    res_fail = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-        ],
-        env={
-            **os.environ,
-            "PATH": f"{fake_sqlite_dir}:{os.environ.get('PATH', '')}",
-            "LAUNCHCTL_BIN": str(launchctl_idle),
-        },
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert res_fail.returncode != 0
-    assert sentinel.read_text(encoding="utf-8") == "original"
-    assert not list(tmp_path.glob(".research_migrate_stage.*"))
-
-    # 5. Successful --apply rewrites queue JSON paths, swaps atomically, and preserves recoverable backup
-    res_ok = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-        ],
-        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl_idle)},
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert res_ok.returncode == 0, res_ok.stderr
-    assert not sentinel.exists()
-    backups = list(tmp_path.glob("dst_research.pre-migrate.*"))
-    assert len(backups) == 1
-    assert (backups[0] / "keep_me.txt").read_text(encoding="utf-8") == "original"
-    migrated_q = json.loads((dst / "state" / "research-images" / "queue" / "q1.json").read_text(encoding="utf-8"))
-    assert migrated_q["payload"]["path"] == str(dst / "wiki" / "companies" / "NVDA.md")
-    assert migrated_q["items"][0]["path"] == str(dst / "state" / "research-images" / "extracted" / "job1" / "a.bin")
-    assert (dst / "config" / "config.json").stat().st_mode & 0o777 == 0o600
-    assert (dst / "config" / "eve_tracking_mirror.json").stat().st_mode & 0o777 == 0o600
-
-    # Populate synthetic venvs for --switch pre-check
-    for skill, expected_ver in (
-        ("findata-analyst", "3.12.9"),
-        ("cn-hk-findata", "3.12.9"),
-        ("company-wiki", "3.14.6"),
-        ("market-digest", "3.13.5"),
-        ("employee-reviews", "3.14.6"),
-        ("consensus-estimates", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"),
-    ):
-        vdir = dst / "venvs" / skill
-        py = vdir / "bin" / "python"
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.symlink_to(sys.executable)
-        (vdir / "pyvenv.cfg").write_text(f"version = {expected_ver}\n", encoding="utf-8")
-
-    # 6. --switch without EDGAR_IDENTITY must fail printing only variable name (never secret values)
-    bridge_env = cfg_dir / "researchdata-bridge.env"
-    bridge_env.write_text(
-        "DALTON_BRIDGE_TOKEN=tok_switch_secret\n"
-        "DALTON_BRIDGE_ADMIN_TOKEN=adm_switch_secret\n"
-        f"DALTON_OCW_ROOT={src}\n"
-        f"DALTON_OCW_PYTHON={sys.executable}\n",
-        encoding="utf-8",
-    )
-    bridge_env.chmod(0o600)
-    prepare_cfg = cfg_dir / "market-digest-prepare.json"
-    output_cfg = cfg_dir / "market-digest-output.json"
-    prepare_cfg.write_text(
-        json.dumps(
-            {
-                "state_root": str(tmp_path / "md_state"),
-                "skill_dir": str(src / "skills" / "market-digest"),
-                "tmtb_script": str(src / "scripts" / "tmtb_alphaengine_sync.py"),
-                "python": str(src / "skills" / "market-digest" / "venv" / "bin" / "python"),
-                "repo_root": str(REPO_ROOT),
-                "digest_output_dir": str(src / "skills" / "market-digest" / "output"),
-                "tmtb_output_dir": str(src / "state" / "tmtb-alphaengine"),
-            }
-        ),
-        encoding="utf-8",
-    )
-    output_cfg.write_text(
-        json.dumps(
-            {
-                "input_state_root": str(tmp_path / "md_state"),
-                "body_state_root": str(tmp_path / "md_body"),
-                "market_memory_dir": str(src / "market-memory"),
-                "index_db_path": str(src / "skills" / "market-digest" / "vectors.db"),
-                "embedding_model": "gemini-embedding-2-preview",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    curl_stub = tmp_path / "curl_stub"
-    curl_stub.write_text("#!/bin/sh\necho '{\"ok\": true}'\nexit 0\n", encoding="utf-8")
-    curl_stub.chmod(0o755)
-    repo_env = tmp_path / "repo.env"
-    switch_env = {
-        **os.environ,
-        "HOME": str(home_dir),
-        "DALTON_BRIDGE_ENV_FILE": str(bridge_env),
-        "DALTON_REPO_ENV_FILE": str(repo_env),
-        "DALTON_LAUNCH_AGENTS_DIR": str(home_dir / "Library" / "LaunchAgents"),
-        "DALTON_BRIDGE_LOGS_DIR": str(home_dir / "Library" / "Logs"),
-        "DALTON_OCW_PYTHON": sys.executable,
-        "LAUNCHCTL_BIN": str(launchctl_idle),
-        "CURL_BIN": str(curl_stub),
-        "DALTON_BRIDGE_HEALTH_RETRIES": "2",
-        "DALTON_BRIDGE_HEALTH_SLEEP_S": "0",
-    }
-
-    res_no_edgar = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(prepare_cfg),
-            "--output-config",
-            str(output_cfg),
-        ],
-        env=switch_env,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res_no_edgar.returncode != 0
-    assert "EDGAR_IDENTITY" in res_no_edgar.stderr
-    assert "tok_switch_secret" not in (res_no_edgar.stdout + res_no_edgar.stderr)
-
-    # 7. --switch with EDGAR_IDENTITY backs up & rewrites prepare/output JSONs and switches bridge
-    bridge_env.write_text(
-        bridge_env.read_text(encoding="utf-8") + "EDGAR_IDENTITY=Dalton Test <test@example.com>\n",
-        encoding="utf-8",
-    )
-    res_switch = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(code),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(prepare_cfg),
-            "--output-config",
-            str(output_cfg),
-        ],
-        env=switch_env,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert res_switch.returncode == 0, res_switch.stderr
-    assert len(list(cfg_dir.glob("market-digest-prepare.json.bak.*"))) == 1
-    assert len(list(cfg_dir.glob("market-digest-output.json.bak.*"))) == 1
-    prep_new = json.loads(prepare_cfg.read_text(encoding="utf-8"))
-    out_new = json.loads(output_cfg.read_text(encoding="utf-8"))
-    assert prep_new["skill_dir"] == str(code / "skills" / "market-digest")
-    assert prep_new["tmtb_script"] == str(code / "scripts" / "tmtb_alphaengine_sync.py")
-    assert prep_new["python"] == str(dst / "venvs" / "market-digest" / "bin" / "python")
-    assert prep_new["digest_output_dir"] == str(dst / "skills" / "market-digest" / "output")
-    assert prep_new["tmtb_output_dir"] == str(dst / "state" / "tmtb-alphaengine")
-    assert out_new["market_memory_dir"] == str(dst / "market-memory")
-    assert out_new["index_db_path"] == str(dst / "skills" / "market-digest" / "vectors.db")
-    _, switched_env = bse.parse_env_file_strict(bridge_env)
-    assert switched_env["DALTON_RESEARCH_CODE"] == str(code)
-    assert switched_env["DALTON_RESEARCH_HOME"] == str(dst)
-
-
 def test_eve_tracking_mirror_and_feishu_import_error_reporting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1068,8 +669,7 @@ def test_consensus_estimates_reads_legacy_pyvenv_cfg_and_falls_back_to_python3(
     assert json.loads(res.stdout)["argv"] == ["--ticker", "NVDA"]
 
 
-def test_data_sources_agent_reach_configurable_and_dead_openclaw_tools_disabled(
-    tmp_path: Path,
+def test_data_sources_agent_reach_removed_and_dead_openclaw_tools_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for k in ("DALTON_OCW_ROOT", "DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME"):
@@ -1077,9 +677,9 @@ def test_data_sources_agent_reach_configurable_and_dead_openclaw_tools_disabled(
     ds = json.loads((RESEARCH_RUNTIME / "config" / "data_sources.json").read_text(encoding="utf-8"))
     by_id = {r["id"]: r for r in ds["routes"]}
 
-    # agent-reach uses relative path inside runtime & file exists
-    assert by_id["agent-reach"]["skill"] == "skills/agent-reach/SKILL.md"
-    assert (RESEARCH_RUNTIME / by_id["agent-reach"]["skill"]).is_file()
+    # agent-reach route & retired skill removed
+    assert "agent-reach" not in by_id
+    assert not (RESEARCH_RUNTIME / "skills" / "agent-reach").exists()
 
     # Dead openclaw__* routes are marked disabled & hidden with tool=None
     for rid in ("web-news", "web-page", "x-search"):
@@ -1087,18 +687,9 @@ def test_data_sources_agent_reach_configurable_and_dead_openclaw_tools_disabled(
         assert by_id[rid]["disabled"] is True
         assert by_id[rid]["hidden"] is True
 
-    # data_gateway self-test reports agent-reach ok and supports DALTON_AGENT_REACH_SKILL_MD override
     gw_mod = _load_module("test_data_gateway_mod", RESEARCH_RUNTIME / "scripts" / "data_gateway.py")
     reg_self = gw_mod.catalog(include_hidden=True)
-    ar_route = next(r for r in reg_self["routes"] if r["id"] == "agent-reach")
-    assert gw_mod._resolve_route_skill_path(ar_route).is_file()
-    custom_md = tmp_path / "custom_agent_reach_SKILL.md"
-    custom_md.write_text("# custom\n", encoding="utf-8")
-    monkeypatch.setenv("DALTON_AGENT_REACH_SKILL_MD", str(custom_md))
-    reg = gw_mod.catalog()
-    ar = next(r for r in reg["routes"] if r["id"] == "agent-reach")
-    assert ar["skill"] == str(custom_md)
-    assert gw_mod._resolve_route_skill_path(ar) == custom_md
+    assert all(r["id"] != "agent-reach" for r in reg_self["routes"])
 
 
 def test_build_research_runtime_subprocess_env_enforces_allowlists() -> None:
@@ -1128,212 +719,6 @@ def test_build_research_runtime_subprocess_env_enforces_allowlists() -> None:
     assert "FEISHU_APP_SECRET" not in env
     assert "DALTON_BRIDGE_TOKEN" not in env
     assert "BASH_ENV" not in env
-
-
-def test_switch_rollback_on_invalid_second_json_and_bridge_install_failure(
-    tmp_path: Path,
-) -> None:
-    migrate_sh = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
-    src = tmp_path / "src_ocw"
-    dst = tmp_path / "dst_research"
-    cfg_dir = tmp_path / "cfg"
-    home_dir = tmp_path / "home"
-    (cfg_dir).mkdir(parents=True, exist_ok=True)
-    (home_dir / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
-    (home_dir / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
-
-    # Minimal valid target home so --check-runtime succeeds inside --switch
-    for skill, expected_ver in (
-        ("findata-analyst", "3.12.9"),
-        ("cn-hk-findata", "3.12.9"),
-        ("company-wiki", "3.14.6"),
-        ("market-digest", "3.13.5"),
-        ("employee-reviews", "3.14.6"),
-        ("consensus-estimates", "3.14.6"),
-    ):
-        py = dst / "venvs" / skill / "bin" / "python"
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.symlink_to(sys.executable)
-        (dst / "venvs" / skill / "pyvenv.cfg").write_text(f"version = {expected_ver}\n", encoding="utf-8")
-    for rel_file in (
-        "wiki/vectors.db",
-        "skills/market-digest/vectors.db",
-        "state/sales-notes/manifest.jsonl",
-        "state/funda-ai/index.sqlite",
-        "state/research-images/index.sqlite",
-        "config/config.json",
-        "config/eve_tracking_mirror.json",
-    ):
-        p = dst / rel_file
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('{"enabled": false}\n', encoding="utf-8")
-    for rel_dir in (
-        "wiki/companies",
-        "wiki/sectors",
-        "skills/market-digest/output",
-        "state/tmtb-alphaengine",
-        "market-memory",
-    ):
-        (dst / rel_dir).mkdir(parents=True, exist_ok=True)
-
-    bridge_env = cfg_dir / "researchdata-bridge.env"
-    bridge_env.write_text(
-        "DALTON_BRIDGE_TOKEN=tok_rb_secret\n"
-        "DALTON_BRIDGE_ADMIN_TOKEN=adm_rb_secret\n"
-        f"DALTON_OCW_ROOT={src}\n"
-        f"DALTON_OCW_PYTHON={sys.executable}\n"
-        "EDGAR_IDENTITY=Dalton Rollback <rb@example.invalid>\n",
-        encoding="utf-8",
-    )
-    bridge_env.chmod(0o600)
-    repo_env = tmp_path / "repo.env"
-
-    prepare_cfg = cfg_dir / "market-digest-prepare.json"
-    output_cfg = cfg_dir / "market-digest-output.json"
-    orig_prepare = json.dumps({"skill_dir": str(src / "skills" / "market-digest"), "x": 1}, indent=2) + "\n"
-    prepare_cfg.write_text(orig_prepare, encoding="utf-8")
-    output_cfg.write_text("{not valid json", encoding="utf-8")
-
-    launchctl_idle = tmp_path / "launchctl_idle"
-    launchctl_idle.write_text("#!/bin/sh\nif [ \"$1\" = \"print\" ]; then exit 1; fi\nexit 0\n", encoding="utf-8")
-    launchctl_idle.chmod(0o755)
-    plist_path = home_dir / "Library" / "LaunchAgents" / "com.dalton.researchdata-bridge.plist"
-    curl_fail_new = tmp_path / "curl_fail_new"
-    curl_fail_new.write_text(
-        "#!/bin/sh\n"
-        f"if grep -q DALTON_RESEARCH_CODE \"{plist_path}\" 2>/dev/null; then\n"
-        "  exit 1\n"
-        "fi\n"
-        "echo '{\"ok\": true}'\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    curl_fail_new.chmod(0o755)
-
-    env = {
-        **os.environ,
-        "HOME": str(home_dir),
-        "DALTON_BRIDGE_ENV_FILE": str(bridge_env),
-        "DALTON_REPO_ENV_FILE": str(repo_env),
-        "DALTON_LAUNCH_AGENTS_DIR": str(home_dir / "Library" / "LaunchAgents"),
-        "DALTON_BRIDGE_LOGS_DIR": str(home_dir / "Library" / "Logs"),
-        "DALTON_OCW_PYTHON": sys.executable,
-        "LAUNCHCTL_BIN": str(launchctl_idle),
-        "CURL_BIN": str(curl_fail_new),
-        "DALTON_BRIDGE_HEALTH_RETRIES": "1",
-        "DALTON_BRIDGE_HEALTH_SLEEP_S": "0",
-    }
-
-    # Case 1: invalid 2nd JSON aborts before creating backups or touching 1st JSON
-    res_bad_json = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(RESEARCH_RUNTIME),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(prepare_cfg),
-            "--output-config",
-            str(output_cfg),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert res_bad_json.returncode != 0
-    assert prepare_cfg.read_text(encoding="utf-8") == orig_prepare
-    assert output_cfg.read_text(encoding="utf-8") == "{not valid json"
-    assert not list(cfg_dir.glob("*.bak.*"))
-
-    # Case 2: valid JSONs, but install_bridge.sh --research-runtime=new fails -> both JSONs & bridge rolled back
-    orig_output = json.dumps({"market_memory_dir": str(src / "market-memory")}, indent=2) + "\n"
-    output_cfg.write_text(orig_output, encoding="utf-8")
-    res_fail_bridge = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(RESEARCH_RUNTIME),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(prepare_cfg),
-            "--output-config",
-            str(output_cfg),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=25,
-        check=False,
-    )
-    assert res_fail_bridge.returncode != 0
-    assert "restored" in res_fail_bridge.stderr.lower()
-    assert prepare_cfg.read_text(encoding="utf-8") == orig_prepare
-    assert output_cfg.read_text(encoding="utf-8") == orig_output
-    assert bridge_env.read_bytes() is not None
-
-    # Case 3: the old root lives only in the existing plist (env file lacks DALTON_OCW_ROOT).
-    # A failed install must restore the env file and plist byte-for-byte.
-    for leftover in cfg_dir.glob("*.bak.*"):
-        leftover.unlink()
-    env_bytes = (
-        "DALTON_BRIDGE_TOKEN=tok_rb_secret\n"
-        "DALTON_BRIDGE_ADMIN_TOKEN=adm_rb_secret\n"
-        "EDGAR_IDENTITY=Dalton Rollback <rb@example.invalid>\n"
-    ).encode()
-    bridge_env.write_bytes(env_bytes)
-    bridge_env.chmod(0o600)
-    plist_bytes = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
-        f"<key>EnvironmentVariables</key><dict><key>DALTON_OCW_ROOT</key><string>{src}</string></dict>"
-        "</dict></plist>\n"
-    ).encode()
-    plist_path.write_bytes(plist_bytes)
-    res_plist_only = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(RESEARCH_RUNTIME),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(prepare_cfg),
-            "--output-config",
-            str(output_cfg),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=25,
-        check=False,
-    )
-    assert res_plist_only.returncode != 0
-    assert "pre-switch contents" in res_plist_only.stderr
-    assert bridge_env.read_bytes() == env_bytes
-    assert plist_path.read_bytes() == plist_bytes
-    assert prepare_cfg.read_text(encoding="utf-8") == orig_prepare
-    assert output_cfg.read_text(encoding="utf-8") == orig_output
 
 
 def test_legacy_mode_is_rejected_and_strips_ocw_root(
@@ -1458,28 +843,6 @@ def test_company_filings_alert_guidepoint_and_catalog_routes(
     assert res_new.returncode == 0
     assert "new_mode_ok" in res_new.stdout
 
-    legacy_ocw = tmp_path / "legacy_ocw"
-    leg_py = legacy_ocw / "skills" / "company-filings-alert" / "venv" / "bin" / "python"
-    leg_py.parent.mkdir(parents=True)
-    leg_py.write_text("#!/bin/sh\necho legacy_mode_ok\n", encoding="utf-8")
-    leg_py.chmod(0o755)
-    (legacy_ocw / "skills" / "company-filings-alert" / "venv" / ".requirements.sha256").write_text(
-        req_sha + "\n", encoding="utf-8"
-    )
-    res_legacy = subprocess.run(
-        ["/bin/bash", str(run_sh), "--help"],
-        env={
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "DALTON_OCW_ROOT": str(legacy_ocw),
-        },
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert res_legacy.returncode == 0
-    assert "legacy_mode_ok" in res_legacy.stdout
-
     gw_res = subprocess.run(
         [sys.executable, str(RESEARCH_RUNTIME / "scripts" / "data_gateway.py"), "self-test"],
         env={**os.environ, "DALTON_RESEARCH_CODE": str(RESEARCH_RUNTIME)},
@@ -1493,73 +856,10 @@ def test_company_filings_alert_guidepoint_and_catalog_routes(
     assert st["ok"] is True
 
 
-def test_sqlite_backup_handles_quotes_and_spaces_in_dst_path(
-    tmp_path: Path,
-) -> None:
-    migrate_sh = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
-    src = tmp_path / "src_ws"
-    (src / "wiki").mkdir(parents=True)
-    src_db = src / "wiki" / "vectors.db"
-    conn = sqlite3.connect(src_db)
-    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
-    conn.execute("INSERT INTO docs (body) VALUES ('alpha')")
-    conn.commit()
-    conn.close()
-
-    quoted_parent = tmp_path / "dir with 'single quotes' and spaces"
-    dst = quoted_parent / "dst_research"
-    launchctl_idle = tmp_path / "launchctl_idle"
-    launchctl_idle.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    launchctl_idle.chmod(0o755)
-
-    res = subprocess.run(
-        [
-            "/bin/bash",
-            str(migrate_sh),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--code",
-            str(RESEARCH_RUNTIME),
-        ],
-        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl_idle)},
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert res.returncode == 0, res.stderr
-    copied_db = dst / "wiki" / "vectors.db"
-    assert copied_db.is_file()
-    chk_conn = sqlite3.connect(copied_db)
-    try:
-        chk = chk_conn.execute("PRAGMA integrity_check").fetchone()
-        rows = chk_conn.execute("SELECT body FROM docs").fetchall()
-    finally:
-        chk_conn.close()
-    assert chk == ("ok",)
-    assert rows == [("alpha",)]
-
-
-def test_personal_configs_runtime_resolution_new_vs_legacy(
+def test_personal_configs_runtime_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    legacy_root = tmp_path / "legacy_ws"
-    (legacy_root / "skills" / "market-digest").mkdir(parents=True)
-    (legacy_root / "config").mkdir(parents=True)
-    (legacy_root / "skills" / "market-digest" / "config.json").write_text(
-        json.dumps({"newsletter_email": "legacy@example.invalid", "senders": []}),
-        encoding="utf-8",
-    )
-    (legacy_root / "config" / "eve_tracking_mirror.json").write_text(
-        json.dumps({"enabled": True, "source_chat_id": "oc_legacy", "target": "user:1"}),
-        encoding="utf-8",
-    )
-
     home_root = tmp_path / "new_home"
     (home_root / "config").mkdir(parents=True)
     (home_root / "config" / "config.json").write_text(
@@ -1571,29 +871,9 @@ def test_personal_configs_runtime_resolution_new_vs_legacy(
         encoding="utf-8",
     )
 
-    # Legacy mode (only DALTON_OCW_ROOT)
-    monkeypatch.setenv("DALTON_OCW_ROOT", str(legacy_root))
-    monkeypatch.delenv("DALTON_RESEARCH_CODE", raising=False)
-    monkeypatch.delenv("DALTON_RESEARCH_HOME", raising=False)
-    md_legacy = _load_module("test_md_cfg_legacy", RESEARCH_RUNTIME / "skills" / "market-digest" / "scripts" / "market_digest_cli.py")
-    mirror_legacy = _load_module("test_mirror_cfg_legacy", RESEARCH_RUNTIME / "scripts" / "eve_tracking_mirror.py")
-    assert md_legacy.load_config()["newsletter_email"] == "legacy@example.invalid"
-    assert mirror_legacy.load_config()["source_chat_id"] == "oc_legacy"
-
-    # New mode (DALTON_RESEARCH_CODE + DALTON_RESEARCH_HOME)
     monkeypatch.setenv("DALTON_RESEARCH_CODE", str(RESEARCH_RUNTIME))
     monkeypatch.setenv("DALTON_RESEARCH_HOME", str(home_root))
     md_new = _load_module("test_md_cfg_new", RESEARCH_RUNTIME / "skills" / "market-digest" / "scripts" / "market_digest_cli.py")
     mirror_new = _load_module("test_mirror_cfg_new", RESEARCH_RUNTIME / "scripts" / "eve_tracking_mirror.py")
     assert md_new.load_config()["newsletter_email"] == "new@example.invalid"
     assert mirror_new.load_config()["source_chat_id"] == "oc_new"
-
-
-@pytest.fixture(autouse=True)
-def _no_host_writer_processes(tmp_path_factory, monkeypatch):
-    """research_runtime_migrate.sh refuses --apply while a real writer runs on this
-    machine; tests must not depend on what the host happens to be running."""
-    stub = tmp_path_factory.mktemp("psstub") / "ps"
-    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    stub.chmod(0o755)
-    monkeypatch.setenv("DALTON_MIGRATE_PS_BIN", str(stub))

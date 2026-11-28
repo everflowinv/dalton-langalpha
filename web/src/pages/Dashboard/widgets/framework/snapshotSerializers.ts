@@ -11,6 +11,19 @@ import { tickerImpactRows, type NewsSentiment } from '../../utils/tickerImpact';
 // DALTON-HOOK(extended-hours-quotes): Share roundQuote2 and formatSignedPct2 from deriveQuoteDisplay so exports match screen formatting.
 import { formatSignedPct2, roundQuote2 } from '@/lib/dalton/quotes/deriveQuoteDisplay';
 
+/**
+ * An attribute value that stays one: a title or symbol can come from data the
+ * user or an agent wrote, and a `>` in it would end the tag early.
+ */
+function attrValue(v: string): string {
+  return v
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 /** Wrap a body in a <widget-context> envelope with type and arbitrary key/value attributes. */
 export function wrapWidgetContext(
   type: string,
@@ -19,9 +32,9 @@ export function wrapWidgetContext(
 ): string {
   const attrStr = Object.entries(attrs)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
-    .map(([k, v]) => `${k}='${String(v).replace(/'/g, '&#39;')}'`)
+    .map(([k, v]) => `${k}='${attrValue(String(v))}'`)
     .join(' ');
-  const head = attrStr ? `<widget-context type='${type}' ${attrStr}>` : `<widget-context type='${type}'>`;
+  const head = attrStr ? `<widget-context type='${attrValue(type)}' ${attrStr}>` : `<widget-context type='${attrValue(type)}'>`;
   return `${head}\n${body}\n</widget-context>`;
 }
 

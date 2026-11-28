@@ -1210,6 +1210,7 @@ async def resolve_turn_config_with_automation_inheritance(
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
     retry_source_execution_id: str | None = None,
+    payer_user_id: str | None = None,
     resolve: Callable[..., Awaitable[Any]],
     flagged_subscription: tuple[Any, str | None] | None = None,
     on_fallback: Callable[[dict[str, Any]], None] | None = None,
@@ -1296,9 +1297,8 @@ async def resolve_turn_config_with_automation_inheritance(
         and effort_configured
         and _accepts_effort_override(resolve)
     )
-    apply_system_only_override = (
-        inherited_system_only and _accepts_ignore_custom_models_override(resolve)
-    )
+    can_override_system_only = _accepts_ignore_custom_models_override(resolve)
+    apply_system_only_override = inherited_system_only and can_override_system_only
     if apply_effort_override or apply_system_only_override:
         async def _effective_resolve(model_name: str | None) -> Any:
             extra_kw: dict[str, Any] = {}
@@ -1309,6 +1309,36 @@ async def resolve_turn_config_with_automation_inheritance(
             return await resolve(model_name, **extra_kw)
     else:
         _effective_resolve = resolve
+
+    async def _resolve_unattended_candidate(model_name: str) -> Any:
+        if can_override_system_only and not apply_system_only_override:
+            extra_kw: dict[str, Any] = {"ignore_custom_models_override": True}
+            if apply_effort_override:
+                extra_kw["reasoning_effort_override"] = inherited_effort
+            return await resolve(model_name, **extra_kw)
+        return await _effective_resolve(model_name)
+
+    from src.dalton.llm.unattended_fallback import (
+        acquire_fallback_candidate_live,
+        format_unattended_quota_notice,
+        inspect_subscription_availability,
+        is_terminal_auth_http_error,
+        is_unattended_turn,
+        resolve_unattended_fallback_chain,
+        route_fingerprint_to_dict,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    eff_payer_id = payer_user_id or user_id
+    unattended_quota_on = (
+        is_unattended_quota_fallback_enabled()
+        and not retry_of_run_id
+        and not getattr(request, "hitl_response", None)
+        and is_unattended_turn(
+            request,
+            from_service=from_service,
+        )
+    )
 
     # Once a continuation is linked to an automation execution, its model and
     # reasoning effort come solely from the execution snapshot — ignoring
@@ -1327,6 +1357,105 @@ async def resolve_turn_config_with_automation_inheritance(
         )
         else held_model
     )
+
+    # Pre-dispatch structured cooldown check when unattended quota fallback is enabled.
+    if unattended_quota_on and flagged_subscription is None:
+        pref_for_probe = (
+            prefs
+            if prefs is not None
+            else await user_models.get_model_preference(user_id)
+        )
+        default_pref_for_probe = (
+            {
+                k: v
+                for k, v in pref_for_probe.items()
+                if k not in ("custom_models", "custom_providers")
+            }
+            if inherited_system_only
+            else pref_for_probe
+        )
+        primary_probe_model = (
+            inherited_model
+            or effective_requested_model
+            or effective_held_model
+            or thread_model.effective_default_model(default_pref_for_probe)
+        )
+        if primary_probe_model:
+            primary_avail = await inspect_subscription_availability(
+                user_id,
+                primary_probe_model,
+                prefs=default_pref_for_probe,
+                ignore_custom_models=inherited_system_only,
+            )
+            if not primary_avail.available:
+                cands = resolve_unattended_fallback_chain(
+                    primary_model=primary_probe_model,
+                    skip_cooldown_keys=[primary_avail.cooldown_key]
+                    if primary_avail.cooldown_key
+                    else (),
+                    user_id=user_id,
+                    ignore_custom_models=True,
+                )
+                for cand in cands:
+                    admission = await acquire_fallback_candidate_live(
+                        subject_user_id=user_id,
+                        payer_user_id=eff_payer_id,
+                        candidate_model=cand,
+                        ignore_custom_models=True,
+                        model_pref=default_pref_for_probe,
+                    )
+                    if not admission.admitted:
+                        continue
+                    try:
+                        cfg = await _resolve_unattended_candidate(cand)
+                    except Exception:
+                        continue
+                    chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
+                    final_admission = admission
+                    if chosen != cand:
+                        if chosen == primary_probe_model:
+                            continue
+                        final_admission = await acquire_fallback_candidate_live(
+                            subject_user_id=user_id,
+                            payer_user_id=eff_payer_id,
+                            candidate_model=chosen,
+                            ignore_custom_models=True,
+                            model_pref=default_pref_for_probe,
+                        )
+                        if not final_admission.admitted:
+                            logger.debug(
+                                "[AUTOMATION_THREAD_MODEL] Resolved variant %r (from %r) rejected by live admission (%s)",
+                                chosen,
+                                cand,
+                                final_admission.reason,
+                            )
+                            continue
+                    kind = (
+                        "oauth_auth_unavailable"
+                        if primary_avail.kind == "auth_unavailable"
+                        else "subscription_quota_exhausted"
+                    )
+                    record: dict[str, Any] = {
+                        "original_model": primary_probe_model,
+                        "fallback_model": chosen,
+                        "provider": primary_avail.provider,
+                        "reason": primary_avail.refusal_code or kind,
+                        "notice": format_unattended_quota_notice(
+                            kind,
+                            model_name=primary_probe_model,
+                            reset_at=primary_avail.reset_at,
+                            fallback_model=chosen,
+                        ),
+                    }
+                    if final_admission.route is not None:
+                        record["selected_route"] = route_fingerprint_to_dict(
+                            final_admission.route
+                        )
+                    if target_exec and target_exec.get("automation_execution_id"):
+                        record["execution_id"] = str(target_exec["automation_execution_id"])
+                    if on_fallback is not None:
+                        on_fallback(record)
+                    return cfg
 
     async def _try_subscription_fallback(
         *,
@@ -1365,11 +1494,15 @@ async def resolve_turn_config_with_automation_inheritance(
             original_model=orig,
             failed_provider=failed_provider,
             reason=reason,
-            resolve_candidate=_effective_resolve,
+            resolve_candidate=(
+                _resolve_unattended_candidate if unattended_quota_on else _effective_resolve
+            ),
             exc_to_raise=exc_to_raise,
             model_resolves_fn=model_resolves,
             failed_subject=failed_subject,
             ignore_custom_models=inherited_system_only,
+            unattended_gate=unattended_quota_on,
+            payer_user_id=eff_payer_id,
         )
         if target_exec and target_exec.get("automation_execution_id"):
             record = {
@@ -1380,10 +1513,17 @@ async def resolve_turn_config_with_automation_inheritance(
             on_fallback(record)
         return cfg
 
+    effective_fallback_eligible = fallback_eligible or unattended_quota_on
+
+    def _is_sub_unavailable_for_turn(exc: HTTPException) -> bool:
+        if unattended_quota_on:
+            return is_terminal_auth_http_error(exc)
+        return is_subscription_unavailable_error(exc)
+
     if flagged_subscription is not None:
         subscription, error_code = flagged_subscription
         flagged_exc = build_flagged_subscription_error(subscription, error_code)
-        if not fallback_eligible:
+        if not effective_fallback_eligible:
             raise flagged_exc
         sub_name = getattr(subscription, "account_name", None) or getattr(
             subscription, "id", None
@@ -1412,7 +1552,7 @@ async def resolve_turn_config_with_automation_inheritance(
             and not effective_held_model
         ):
             raise _automation_model_unreadable()
-        if not fallback_eligible:
+        if not effective_fallback_eligible:
             return await thread_model.resolve_turn_config(
                 user_id,
                 thread_id,
@@ -1432,7 +1572,42 @@ async def resolve_turn_config_with_automation_inheritance(
                     resolve=_tracked_resolve,
                 )
             except HTTPException as exc:
-                if not is_subscription_unavailable_error(exc):
+                if not _is_sub_unavailable_for_turn(exc):
+                    attempted_model = attempted_models[-1] if attempted_models else None
+                    if (
+                        not fallback_eligible
+                        and from_service
+                        and thread_model._runs_default_instead(
+                            exc,
+                            named=effective_requested_model,
+                            model=attempted_model,
+                        )
+                    ):
+                        logger.info(
+                            f"[CHAT] Thread {thread_id}'s model {attempted_model!r} cannot run "
+                            f"({exc.detail.get('type')}); this turn runs the account default"
+                        )
+                        with capture_resolved_effective_model() as default_captured:
+                            try:
+                                return await _effective_resolve(None)
+                            except HTTPException as default_exc:
+                                if not _is_sub_unavailable_for_turn(default_exc):
+                                    raise
+                                default_detail = (
+                                    default_exc.detail
+                                    if isinstance(default_exc.detail, dict)
+                                    else {}
+                                )
+                                default_rejected = (
+                                    (default_captured[-1] if default_captured else None)
+                                    or extract_rejected_model_from_exc(default_exc)
+                                )
+                                return await _try_subscription_fallback(
+                                    original_model=default_rejected,
+                                    failed_provider=default_detail.get("provider"),
+                                    reason=default_detail.get("type"),
+                                    exc_to_raise=default_exc,
+                                )
                     raise
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_model = (
@@ -1454,12 +1629,12 @@ async def resolve_turn_config_with_automation_inheritance(
                 thread_id,
                 named=inherited_model,
                 held=effective_held_model,
-                fall_back=False if fallback_eligible else from_service,
+                fall_back=False if effective_fallback_eligible else from_service,
                 resolve=_tracked_resolve,
             )
     except HTTPException as exc:
-        if is_subscription_unavailable_error(exc):
-            if fallback_eligible:
+        if _is_sub_unavailable_for_turn(exc):
+            if effective_fallback_eligible:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_model = (
                     (captured_model[-1] if captured_model else None)

@@ -1,5 +1,6 @@
-import { Blocks, ChartCandlestick, HardDrive, LayoutDashboard, LibraryBig, MessagesSquare, Monitor, Settings, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
+import { Blocks, ChartCandlestick, HardDrive, LayoutDashboard, LibraryBig, MessagesSquare, Monitor, Settings, SquarePen, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
 import type { LucideIcon } from 'lucide-react';
+import { RESUME_CHAT } from '@/pages/ChatAgent/hooks/utils/chatSessionRestore';
 
 export interface NavItem {
   /** Route path. */
@@ -7,8 +8,10 @@ export interface NavItem {
   icon: LucideIcon;
   /** i18n key resolved via t(). */
   labelKey: string;
-  /** Active-state strategy: 'prefix' = pathname.startsWith(key); 'exact-or-sub' = exact match or key + '/' sub-path. */
-  match: 'prefix' | 'exact-or-sub';
+  /** Active-state strategy: 'prefix' = pathname.startsWith(key); 'exact-or-sub' = exact match or key + '/' sub-path; 'never' = an action, not a place. */
+  match: 'prefix' | 'exact-or-sub' | 'never';
+  /** Route state the item arrives with. */
+  state?: Record<string, unknown>;
   /**
    * What has to be true before the item is drawn at all; absent = always.
    * Declared here rather than in a nav surface because three of them draw this
@@ -22,7 +25,7 @@ export interface NavItem {
 // Single source of truth for primary navigation (rail + mobile tab bar).
 export const NAV_ITEMS: NavItem[] = [
   { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub', requires: 'dashboard' }, // DALTON-HOOK(dalton-nav)
-  { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix' },
+  { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix', state: RESUME_CHAT },
   { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
   { key: '/monitors', icon: Monitor, labelKey: 'sidebar.monitors', match: 'exact-or-sub' }, // DALTON-HOOK(monitors)
@@ -38,4 +41,13 @@ export const SETTINGS_ITEM: NavItem = {
   icon: Settings,
   labelKey: 'sidebar.settings',
   match: 'exact-or-sub',
+};
+
+// Where the desktop's lists put the chat item: an action that starts one,
+// never marked as the page you are on.
+export const NEW_CHAT_ITEM: NavItem = {
+  key: '/chat',
+  icon: SquarePen,
+  labelKey: 'sidebar.newChat',
+  match: 'never',
 };

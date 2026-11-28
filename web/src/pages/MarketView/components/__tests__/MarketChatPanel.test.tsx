@@ -341,8 +341,10 @@ import { useThreadModel } from '@/pages/ChatAgent/hooks/useThreadModel';
 import { queryKeys } from '@/lib/queryKeys';
 import { useThreadTuning } from '@/pages/ChatAgent/hooks/useThreadTuning';
 import { userLocalStorage } from '@/lib/userStorage';
+import { setMarketThreadId } from '../../utils/threadPersistence';
 import type { ComposerSend } from '@/components/ui/chat-input.types';
 import type { ComposerNotices } from '@/components/ui/chat-input.notices';
+import type { WidgetPrompts } from '@/pages/ChatAgent/utils/widgetPrompt';
 
 type OnSend = (send: ComposerSend) => void;
 
@@ -853,7 +855,7 @@ describe('MarketChatPanel', () => {
 
     const a = ml.actions!;
     act(() => (ci.props!.onSend as OnSend)(composed('hi')));
-    (a.onWidgetSendPrompt as (text: string) => void)('from a widget');
+    (a.widgetPrompts as WidgetPrompts).sendPrompt!('from a widget');
     (a.onEditMessage as (id: string, c: string) => void)('m1', 'edited');
     (a.onRegenerate as (id: string) => void)('m1');
     (a.onRetry as () => void)();
@@ -861,6 +863,46 @@ describe('MarketChatPanel', () => {
     expect(h.handleEditMessage).toHaveBeenCalledWith('m1', 'edited', undefined, true);
     expect(h.handleRegenerate).toHaveBeenCalledWith('m1', undefined, true);
     expect(h.handleRetry).toHaveBeenCalledWith(undefined, true);
+  });
+
+  it("answers a widget's startThread with a new chat in the panel, its first message the text with the chart's skill", () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      renderPanel();
+      const sent = { data: { scenario: 'bear' }, widgetId: 'widget-call_w', title: 'Scenarios' };
+      const before = ml.actions!;
+      act(() => (before.widgetPrompts as WidgetPrompts).startThread!('Explore the bear case', sent));
+      // A new chat: the transcript's actions are a new body's.
+      expect(ml.actions).not.toBe(before);
+      act(() => vi.advanceTimersByTime(100));
+      expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
+      const [text, contexts] = h.handleSendMessage.mock.calls[0] as [string, Array<Record<string, unknown>>];
+      expect(text).toBe('Explore the bear case');
+      expect(contexts).toEqual([
+        expect.objectContaining({ type: 'skills', name: 'chart-annotation' }),
+        expect.objectContaining({ type: 'widget', widget_id: 'widget-call_w' }),
+      ]);
+      // Sent once, not again by a later render.
+      act(() => vi.advanceTimersByTime(1000));
+      expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends a widget's new-thread message nowhere once the chat moves on before it goes", () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      setMarketThreadId('ws-1', 'MSFT', 'thread-msft');
+      const { rerender } = renderPanel();
+      act(() => (ml.actions!.widgetPrompts as WidgetPrompts).startThread!('Explore', undefined));
+      // A symbol switch inside the first send's wait reopens that symbol's thread.
+      rerender({ symbol: 'MSFT' });
+      act(() => vi.advanceTimersByTime(1000));
+      expect(h.handleSendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('takes what an offload leaves as the next summary, and clears it after a summary', async () => {
@@ -1430,13 +1472,13 @@ describe('MarketChatPanel', () => {
       await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
       await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('home-ws'));
 
-      // Switch Home thread to Antigravity before thread detail arrives -> waits for detail confirmation.
+      // Switch Home thread to Antigravity before thread detail arrives -> permissions are unresolved and detail is unread.
       await act(async () => {
         await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
       });
       expect(api.updateThread).not.toHaveBeenCalled();
 
-      // Thread detail arrives with a saved reasoning_effort -> flushes one PATCH carrying reasoning_effort: null.
+      // DALTON-HOOK(model-picker-races): Codex-H2 — thread detail arrives late with server values; because server values were unknown at pick time, cancel automatic flush instead of unconditionally overwriting the arrived row.
       await act(async () => {
         resolveThread({
           thread_id: 'thread-xyz',
@@ -1448,6 +1490,16 @@ describe('MarketChatPanel', () => {
         });
       });
 
+      await vi.waitFor(() => {
+        expect(ci.props!.model).toBe('claude-sonnet-4');
+      });
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // Once detail and permissions are resolved, a direct manual pick unconditionally sends PATCH with reasoning_effort: null.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
       await vi.waitFor(() => {
         expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
           llm_model: 'gemini-4-neon-medium-oauth',
@@ -1530,7 +1582,8 @@ describe('MarketChatPanel', () => {
         reasoning_effort: 'high',
         fast_mode: null,
       });
-      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('500'), { response: { status: 500 } }));
+      // DALTON-HOOK(model-picker-races): permanent 400 refusal on deferred flush restores pre-switch model & effort (transient 5xx preserves the unsent pick)
+      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('400'), { response: { status: 400 } }));
 
       const deferredView = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
       await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'high', fastMode: null }));
@@ -1809,13 +1862,17 @@ describe('MarketChatPanel', () => {
       agSeriesMock.featuresPromise = null;
       agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
 
-      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', { llm_model: 'gpt-5' }));
+      // DALTON-HOOK(model-picker-races): deferred unresolved flush carries expected_llm_model CAS guard
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+        llm_model: 'gpt-5',
+        expected_llm_model: 'claude-sonnet-4',
+      }));
       expect(ci.props!.model).toBe('gpt-5');
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
     });
 
-    // DALTON-HOOK(antigravity-series): Q2a — widget prompt turns forward ONLY model and modelPickSeq in Dalton builds (no composer effort, fast mode, or subagents) and {} in non-Dalton builds
-    it('forwards only model and modelPickSeq (excluding composer effort, fast mode, and subagent settings) when sending a widget prompt', async () => {
+    // DALTON-HOOK(antigravity-series): widget prompt turns via upstream #893 widgetPrompts.sendPrompt attach modelPickSeq via readComposerOptions in Dalton builds and omit it in non-Dalton builds
+    it('attaches modelPickSeq on widget prompt sends in Dalton builds and omits it in non-Dalton builds', async () => {
       agSeriesMock.enabled = true;
       agSeriesMock.isDaltonBuild = true;
       agSeriesMock.useCustomPermissions = true;
@@ -1850,31 +1907,29 @@ describe('MarketChatPanel', () => {
         });
 
         act(() => {
-          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('from a widget');
+          const wp = ml.actions!.widgetPrompts as { sendPrompt: (text: string) => void };
+          wp.sendPrompt('from a widget');
         });
 
         expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
         const sendOpts = h.handleSendMessage.mock.calls[0][3] as Record<string, unknown>;
-        expect(sendOpts).toEqual({
+        expect(sendOpts).toEqual(expect.objectContaining({
           model: 'gemini-4-neon-high-oauth',
           modelPickSeq: expect.any(Number),
-        });
-        expect(sendOpts).not.toHaveProperty('reasoningEffort');
-        expect(sendOpts).not.toHaveProperty('fastMode');
-        expect(sendOpts).not.toHaveProperty('subagentsAllowed');
-        expect(sendOpts).not.toHaveProperty('marketWatch');
+        }));
 
-        // Non-Dalton build sends {} without forwarding composer options.
+        // Non-Dalton build does not attach modelPickSeq.
         view.unmount();
         h.handleSendMessage.mockClear();
         agSeriesMock.isDaltonBuild = false;
         renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
-        await vi.waitFor(() => expect(ml.actions?.onWidgetSendPrompt).toBeTypeOf('function'));
+        await vi.waitFor(() => expect((ml.actions?.widgetPrompts as { sendPrompt?: unknown } | undefined)?.sendPrompt).toBeTypeOf('function'));
         act(() => {
-          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('non-dalton widget');
+          const wp = ml.actions!.widgetPrompts as { sendPrompt: (text: string) => void };
+          wp.sendPrompt('non-dalton widget');
         });
         expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
-        expect(h.handleSendMessage.mock.calls[0][3]).toEqual({});
+        expect(h.handleSendMessage.mock.calls[0][3]).not.toHaveProperty('modelPickSeq');
       } finally {
         ci.getModelOptions = null;
       }

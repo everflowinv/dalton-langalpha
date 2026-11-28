@@ -1515,18 +1515,40 @@ def test_snapshot_republish_registration_id_and_reaped_failed_guard(
     asyncio.run(_run())
 
 
-def test_show_widget_persists_widget_id_and_projector_preserves_it_on_replay() -> None:
-    """ShowWidget persists widget_id inside checkpointed artifact and projector reuses it on replay."""
+def test_show_widget_persists_widget_id_and_projector_preserves_it_on_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live push and checkpoint replay both match preview by tool_call_id and carry the same persistent widget_id."""
+    from unittest.mock import create_autospec
+
+    import langgraph.config
     from langchain_core.messages import AIMessage, ToolMessage
 
     from ptc_agent.agent.tools.show_widget import create_show_widget_tool
 
+    emitted: list[dict[str, Any]] = []
+
+    def _stream_writer_sig(chunk: Any) -> None:
+        emitted.append(chunk)
+
+    writer_spy = create_autospec(_stream_writer_sig, side_effect=emitted.append)
+    get_writer_spy = create_autospec(langgraph.config.get_stream_writer, return_value=writer_spy)
+    monkeypatch.setattr(langgraph.config, "get_stream_writer", get_writer_spy)
+
     tool = create_show_widget_tool(backend=None)  # type: ignore[arg-type]
     _content, artifact = asyncio.run(
-        tool.coroutine(html="<div>NVDA valuation</div>", title="NVDA Table")
+        tool.coroutine(html="<div>NVDA valuation</div>", title="NVDA Table", tool_call_id="call_widget_99")
     )
     persisted_id = artifact.get("widget_id")
     assert isinstance(persisted_id, str) and persisted_id.startswith("widget_")
+
+    # Live push event uses tool_call_id as artifact_id (for preview matching)
+    # and carries persisted widget_id in payload (for deep link & browser storage).
+    assert len(emitted) == 1
+    live_ev = emitted[0]
+    assert live_ev["artifact_type"] == "html_widget"
+    assert live_ev["artifact_id"] == "call_widget_99"
+    assert live_ev["payload"]["widget_id"] == persisted_id
 
     msgs = [
         AIMessage(
@@ -1543,11 +1565,12 @@ def test_show_widget_persists_widget_id_and_projector_preserves_it_on_replay() -
         ),
     ]
     events = messages_to_history_events(msgs)
-    widget_ev = next(
+    replay_ev = next(
         e for e in events if e.kind == "artifact" and e.data.get("artifact_type") == "html_widget"
     )
-    assert widget_ev.data["artifact_id"] == persisted_id
-    assert widget_ev.data["artifact_id"] != "call_widget_99"
+    # Checkpoint replay matches live push identically on both call ID and persistent widget_id.
+    assert replay_ev.data["artifact_id"] == live_ev["artifact_id"] == "call_widget_99"
+    assert replay_ev.data["payload"]["widget_id"] == live_ev["payload"]["widget_id"] == persisted_id
 
 
 def test_replay_resolves_command_report_linked_snapshots() -> None:

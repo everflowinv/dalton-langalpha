@@ -10,7 +10,7 @@
  */
 import { createRef } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent, screen } from '@testing-library/react';
+import { act, render, fireEvent, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import ChatInput, { type ChatInputHandle } from '../chat-input';
@@ -20,10 +20,19 @@ import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 // DALTON-HOOK(automation-effort): Antigravity series catalog fixture for retry effort-variant tests
 import { buildSelectableAntigravitySeries, buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { queryKeys } from '@/lib/queryKeys';
+import type { Thread } from '@/types/api';
+import { useThreadTuning } from '@/pages/ChatAgent/hooks/useThreadTuning';
+
+const apiMocks = vi.hoisted(() => ({
+  getThread: vi.fn(),
+  updateThread: vi.fn(),
+}));
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
   getModelMetadata: vi.fn().mockResolvedValue({}),
+  getThread: apiMocks.getThread,
+  updateThread: apiMocks.updateThread,
 }));
 
 const mocks = vi.hoisted(() => ({
@@ -551,5 +560,95 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     } finally {
       mocks.isDaltonBuild = false;
     }
+  });
+
+  // DALTON-HOOK(model-picker-races): R4 Codex #3 — real ChatInput + real useThreadTuning preserves reasoningEffort & fastMode on the actual next send after a delayed 503/network failure of post-create repatch
+  it('R4 Codex #3: real ChatInput + useThreadTuning sends preserved reasoningEffort and fastMode after delayed 503/network failure', async () => {
+    apiMocks.getThread.mockReset();
+    apiMocks.updateThread.mockReset();
+
+    let rejectEffort!: (err: unknown) => void;
+    let rejectFast!: (err: unknown) => void;
+    apiMocks.updateThread
+      .mockReturnValueOnce(new Promise<Thread>((_res, rej) => { rejectEffort = rej; }))
+      .mockReturnValueOnce(new Promise<Thread>((_res, rej) => { rejectFast = rej; }));
+    const serverRow = { thread_id: 't-delayed', reasoning_effort: null, fast_mode: null } as unknown as Thread;
+    apiMocks.getThread.mockResolvedValue(serverRow);
+
+    const onSend = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mocks.preferences = {
+      agent_preference: { reasoning_effort: 'medium', fast_mode: false },
+    };
+    queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
+
+    function Harness({ threadId, createdTuning }: {
+      threadId: string;
+      createdTuning?: { threadId: string; reasoningEffort: string | null; fastMode: boolean | null } | null;
+    }) {
+      const { tuning, setReasoningEffort, setFastMode } = useThreadTuning({ threadId, createdTuning });
+      return (
+        <ChatInput
+          ref={inputRef}
+          onSend={onSend}
+          model="model-default"
+          tuning={tuning}
+          onPickReasoningEffort={setReasoningEffort}
+          onPickFastMode={setFastMode}
+        />
+      );
+    }
+
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <Harness threadId="__default__" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // User picks effort='high' and fastMode=true while thread is still being created.
+    fireEvent.click(screen.getByText('pick-high'));
+    fireEvent.click(screen.getByText('pick-fast'));
+    expect(screen.getByText('effort:high')).toBeInTheDocument();
+    expect(screen.getByText('fast:true')).toBeInTheDocument();
+
+    // Thread ID arrives with creation baseline null/null -> post-create repatch fires and writes optimistic values to cache.
+    const baseline = { threadId: 't-delayed', reasoningEffort: null, fastMode: null };
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <Harness threadId="t-delayed" createdTuning={baseline} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(apiMocks.updateThread).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      const cached = queryClient.getQueryData<Thread>(queryKeys.threads.detail('t-delayed'));
+      expect(cached?.reasoning_effort).toBe('high');
+      expect(cached?.fast_mode).toBe(true);
+    });
+
+    // Reject both delayed PATCHes with 503 + network error -> cache rolls back to null/null.
+    await act(async () => {
+      rejectEffort(Object.assign(new Error('503'), { response: { status: 503 } }));
+      rejectFast(new TypeError('Failed to fetch'));
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      const cached = queryClient.getQueryData<Thread>(queryKeys.threads.detail('t-delayed'));
+      expect(cached?.reasoning_effort).toBeNull();
+      expect(cached?.fast_mode).toBeNull();
+    });
+
+    // UI and the ACTUAL sent message must still carry reasoningEffort='high' and fastMode=true!
+    expect(screen.getByText('effort:high')).toBeInTheDocument();
+    expect(screen.getByText('fast:true')).toBeInTheDocument();
+    send('after delayed 503');
+    expect(sentOptions(onSend)).toMatchObject({
+      reasoningEffort: 'high',
+      fastMode: true,
+    });
   });
 });

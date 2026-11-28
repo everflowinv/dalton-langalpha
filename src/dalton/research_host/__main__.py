@@ -15,6 +15,7 @@ import uvicorn
 from src.dalton.capabilities import load_deployment_capability_env
 from src.dalton.config_env import parse_and_resolve_dotenv
 from src.dalton.research_host.app import ResearchHostConfig, create_app
+from src.dalton.uvicorn_runtime import configure_uv_threadpool_size, default_uvicorn_loop
 
 logger = logging.getLogger("dalton-research-host")
 
@@ -136,8 +137,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.port:
         cfg.port = int(args.port)
 
+    configure_uv_threadpool_size()
     app = create_app(cfg)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+    uvicorn.run(
+        app,
+        host=cfg.host,
+        port=cfg.port,
+        log_level="info",
+        loop=default_uvicorn_loop(),
+    )
     return 0
 
 

@@ -323,10 +323,13 @@ def check_users_and_edge_header_stripping(ctx: _lib.ComposeContext) -> None:
     edge_me = _lib.http_request(
         "GET",
         f"{ctx.edge_url}/api/v1/users/me",
-        headers={
-            "X-Service-Token": token,
-            "X-User-Id": PROBE_EDGE_USER,
-        },
+        headers=_lib.oss_owner_headers(
+            ctx,
+            extra={
+                "X-Service-Token": token,
+                "X-User-Id": PROBE_EDGE_USER,
+            },
+        ),
     )
     assert edge_me.status == 200, f"Edge /api/v1/users/me failed: {edge_me.status} {edge_me.text}"
     edge_user_id = edge_me.json()["user"]["user_id"]
@@ -370,10 +373,13 @@ def check_users_and_edge_header_stripping(ctx: _lib.ComposeContext) -> None:
     edge_replay = _lib.http_request(
         "GET",
         f"{ctx.edge_url}/api/v1/threads/{probe_tid}/messages/replay",
-        headers={
-            "X-Service-Token": token,
-            "X-User-Id": PROBE_EDGE_USER,
-        },
+        headers=_lib.oss_owner_headers(
+            ctx,
+            extra={
+                "X-Service-Token": token,
+                "X-User-Id": PROBE_EDGE_USER,
+            },
+        ),
     )
     assert edge_replay.status in (403, 404), (
         f"Edge @history_replay honored forged headers! Expected 403/404, got {edge_replay.status}"
@@ -406,6 +412,7 @@ def configure_fake_model_and_workspace(ctx: _lib.ComposeContext) -> str:
     ws_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/workspaces",
+        headers=_lib.oss_owner_headers(ctx),
         json_body={"name": "b1-ci-workspace"},
     )
     assert ws_resp.status == 201, f"Failed to create workspace: {ws_resp.status} {ws_resp.text}"
@@ -436,7 +443,13 @@ def _send_turn_and_collect(
         body["additional_context"] = additional_context
 
     events: list[_lib.SSEEvent] = []
-    with _lib.open_sse_stream("POST", url, json_body=body, timeout=180.0) as (
+    with _lib.open_sse_stream(
+        "POST",
+        url,
+        headers=_lib.oss_owner_headers(ctx),
+        json_body=body,
+        timeout=180.0,
+    ) as (
         status,
         _headers,
         stream,
@@ -488,6 +501,7 @@ def check_fake_model_four_flows_and_usage(
     with _lib.open_sse_stream(
         "POST",
         f"{ctx.edge_url}/api/v1/threads/{thread_id}/messages",
+        headers=_lib.oss_owner_headers(ctx),
         json_body={
             "workspace_id": workspace_id,
             "llm_model": FAKE_MODEL_NAME,
@@ -529,7 +543,12 @@ def check_fake_model_four_flows_and_usage(
         reconnect_url += f"&run_id={run_id}"
 
     reconnected_events: list[_lib.SSEEvent] = []
-    with _lib.open_sse_stream("GET", reconnect_url, timeout=180.0) as (
+    with _lib.open_sse_stream(
+        "GET",
+        reconnect_url,
+        headers=_lib.oss_owner_headers(ctx),
+        timeout=180.0,
+    ) as (
         rstatus,
         _rheaders,
         rstream,
@@ -562,6 +581,7 @@ def check_fake_model_four_flows_and_usage(
     with _lib.open_sse_stream(
         "GET",
         f"{ctx.edge_url}/api/v1/threads/{thread_id}/messages/replay",
+        headers=_lib.oss_owner_headers(ctx),
         timeout=60.0,
     ) as (pstatus, _pheaders, pstream):
         assert pstatus == 200, f"Replay GET returned HTTP {pstatus}"
@@ -724,6 +744,7 @@ def check_upload_relay_livefs_and_network_isolation(
     init_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads",
+        headers=_lib.oss_owner_headers(ctx),
         json_body={
             "workspace_id": workspace_id,
             "filename": "b1_probe_multipart.bin",
@@ -746,10 +767,13 @@ def check_upload_relay_livefs_and_network_isolation(
         part_resp = _lib.http_request(
             "PUT",
             f"{ctx.edge_url}/api/v1/dalton/chat-uploads/{upload_id}/parts/{part_no}",
-            headers={
-                "Content-Type": "application/octet-stream",
-                "X-Part-Sha256": part_sha,
-            },
+            headers=_lib.oss_owner_headers(
+                ctx,
+                extra={
+                    "Content-Type": "application/octet-stream",
+                    "X-Part-Sha256": part_sha,
+                },
+            ),
             data=chunk,
             timeout=60.0,
         )
@@ -760,6 +784,7 @@ def check_upload_relay_livefs_and_network_isolation(
     comp_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads/{upload_id}/complete",
+        headers=_lib.oss_owner_headers(ctx),
         json_body={"sha256": expected_sha},
     )
     assert comp_resp.status == 200, (
@@ -942,6 +967,7 @@ def check_loopback_preview(ctx: _lib.ComposeContext, workspace_id: str) -> None:
     preview_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/workspaces/{workspace_id}/sandbox/preview-url",
+        headers=_lib.oss_owner_headers(ctx),
         json_body={
             "port": 8765,
             "command": "python3 -m http.server 8765 --bind 0.0.0.0",

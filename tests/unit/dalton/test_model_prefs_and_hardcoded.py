@@ -46,6 +46,9 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
         "Validates the migrated signal store's fixed 768-dimensional embedding format; "
         "does not select the conversation model."
     ),
+    ("llm/unattended_fallback.py", "muse-api-key"): (
+        "Prefix of Muse's sentinel account_id; the cooldown key mirrors oauth_refresh.py and skips it"
+    ),
     ("llm/oauth_refresh.py", "muse-api-key"): (
         "Prefix of Muse's sentinel account_id (MUSE_API_KEY_ACCOUNT_ID, providers/muse/oauth.py); "
         "an API-key row has no account identity, so quota cooldown keys skip it. Not a model name."
@@ -195,7 +198,6 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "gpt-6.2-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     # Default model field on ChatAntigravity LangChain wrapper
     ("llm/providers/antigravity/client.py", "gemini-4-argon-medium"): "Default model attribute on ChatAntigravity LangChain wrapper",
-    ("settings.py", "gemini-4-argon-medium-oauth"): "Default extractor_fallback_model on DaltonConversationsConfig",
 }
 
 
@@ -230,8 +232,6 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert empty_cfg.publish.audit_concurrency == 4
     assert empty_cfg.publish.audit_total_timeout_s == 1800.0
     assert empty_cfg.publish.reviewer_models == []
-    assert empty_cfg.conversations.extractor_model == ""
-    assert empty_cfg.conversations.prompt_version == "conv_card_v2_3"
     assert empty_cfg.conversations.embedding_model == ""
     assert empty_cfg.conversations.embedding_model_preferred == ""
     assert empty_cfg.internal_llm.allowed_models == []
@@ -260,8 +260,8 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
         "gemini-4-argon-medium-oauth",
         "gpt-6.2-sol-oauth",
     ]
-    assert real_settings.conversations.extractor_model == "deepseek-flash"
     assert not hasattr(real_settings.publish, "extract_model")
+    assert not hasattr(real_settings.conversations, "extractor_model")
 
     sys_defaults = mp_mod.get_dalton_system_defaults()
     assert sys_defaults["dalton_audit_model"] == "gemini-4-neon-medium-oauth"
@@ -270,7 +270,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
         "claude-opus-5-5-oauth",
     ]
     assert sys_defaults["dalton_audit_timeout_s"] == 300
-    assert sys_defaults["dalton_extract_model"] == "deepseek-flash"
+    assert "dalton_extract_model" not in sys_defaults
 
 
 @pytest.mark.asyncio
@@ -324,39 +324,6 @@ async def test_dalton_model_pref_precedence_user_then_holder_then_config(
         "gpt-6.2-sol-oauth",
     ]
 
-    # 3. Neither member nor PM holder set dalton_extract_model -> uses conversations.extractor_model (not models.assist_model)
-    real_cfg = settings_mod.get_dalton_settings()
-    expected_extract = real_cfg.conversations.extractor_model
-    assert expected_extract == "deepseek-flash"
-    assert expected_extract != real_cfg.models.assist_model
-    assert (
-        await mp_mod.dalton_model_pref("user-member", "dalton_extract_model")
-        == "deepseek-flash"
-    )
-    assert (
-        await assist_mod.resolve_assist_model(role="extract", user_id="user-member")
-        == "deepseek-flash"
-    )
-
-    # When conversations.extractor_model is empty in config, it does NOT fall back to models.assist_model
-    cfg_without_extract = real_cfg.model_copy(
-        update={
-            "conversations": real_cfg.conversations.model_copy(
-                update={"extractor_model": ""}
-            )
-        }
-    )
-    monkeypatch.setattr(
-        mp_mod,
-        "get_dalton_settings",
-        create_autospec(mp_mod.get_dalton_settings, return_value=cfg_without_extract),
-    )
-    assert await mp_mod.dalton_model_pref("user-member", "dalton_extract_model") is None
-    assert (
-        await assist_mod.resolve_assist_model(role="extract", user_id="user-member")
-        == ""
-    )
-
 
 @pytest.mark.asyncio
 async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_unconfigured(
@@ -368,7 +335,6 @@ async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_u
             "model_preference": {
                 "dalton_assist_model": "gpt-6.2-sol-oauth",
                 "dalton_assist_fallback_models": ["grok-4.7-oauth"],
-                "dalton_extract_model": "claude-sonnet-5-5-oauth",
                 "dalton_audit_model": "claude-opus-5-5-oauth",
                 "dalton_audit_fallback_models": ["grok-4.7-oauth", "gpt-6.2-sol-oauth"],
                 "dalton_reviewer_models": ["grok-4.7-oauth", "claude-opus-5-5-oauth"],
@@ -387,10 +353,6 @@ async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_u
     assert (
         await assist_mod.resolve_assist_model(user_id="user-custom")
         == "gpt-6.2-sol-oauth"
-    )
-    assert (
-        await assist_mod.resolve_assist_model(role="extract", user_id="user-custom")
-        == "claude-sonnet-5-5-oauth"
     )
     assert (
         await assist_mod.resolve_assist_model(role="audit", user_id="user-custom")
@@ -862,85 +824,6 @@ async def test_yaml_audit_timeout_s_preserves_positive_float_without_user_range_
         ),
     )
     assert await mp_mod.resolve_dalton_audit_timeout_s("user-1") == 300.5
-
-
-@pytest.mark.asyncio
-async def test_extract_segment_cards_uses_resolved_extract_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify conversation card extraction resolves model via resolve_dalton_extract_model (explicit -> user -> PM -> yaml)."""
-    from src.dalton.conversations import extractor as extractor_mod
-
-    prefs_by_user: dict[str, dict[str, Any]] = {
-        "user-owner": {
-            "model_preference": {
-                "dalton_extract_model": "gpt-6.2-sol-oauth",
-            }
-        }
-    }
-
-    monkeypatch.setattr(
-        mp_mod,
-        "get_user_preferences",
-        create_autospec(
-            mp_mod.get_user_preferences, side_effect=lambda uid: prefs_by_user.get(uid)
-        ),
-    )
-    monkeypatch.setattr(
-        mp_mod,
-        "get_team_credential_holder_id",
-        create_autospec(mp_mod.get_team_credential_holder_id, return_value="user-owner"),
-    )
-
-    seen_models: list[str | None] = []
-
-    async def _stub_assist(*args: Any, **kwargs: Any) -> assist_mod.AssistResult:
-        m = kwargs.get("model")
-        seen_models.append(m)
-        return assist_mod.AssistResult(
-            ok=True,
-            status="ok",
-            data={"category": "private", "topic_label": "t", "cards": []},
-            model=str(m or ""),
-            usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
-        )
-
-    monkeypatch.setattr(
-        extractor_mod,
-        "assist_json",
-        create_autospec(assist_mod.assist_json, side_effect=_stub_assist),
-    )
-
-    seg = [
-        {
-            "agent": "main",
-            "session_id": "s1",
-            "event_id": "e1",
-            "seq": 1,
-            "ts": "2026-10-23T10:00:00+00:00",
-            "speaker": {"role": "owner", "is_owner": True},
-            "text": "test",
-        }
-    ]
-
-    # 1. User set dalton_extract_model -> extract_segment_cards uses user's model
-    out_user = await extractor_mod.extract_segment_cards(seg, user_id="user-owner")
-    assert out_user.ok is True
-    assert out_user.model_used == "gpt-6.2-sol-oauth"
-    assert seen_models[-1] == "gpt-6.2-sol-oauth"
-
-    # 2. Explicit extractor_model has highest priority over user setting
-    out_explicit = await extractor_mod.extract_segment_cards(
-        seg, user_id="user-owner", extractor_model="claude-sonnet-5-5-oauth"
-    )
-    assert out_explicit.model_used == "claude-sonnet-5-5-oauth"
-    assert seen_models[-1] == "claude-sonnet-5-5-oauth"
-
-    # 3. When user and PM have no setting -> falls back to yaml default ('deepseek-flash')
-    prefs_by_user.clear()
-    out_default = await extractor_mod.extract_segment_cards(seg, user_id="user-owner")
-    assert out_default.model_used == "deepseek-flash"
-    assert seen_models[-1] == "deepseek-flash"
 
 
 @pytest.mark.asyncio

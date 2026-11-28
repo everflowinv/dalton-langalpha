@@ -1,10 +1,17 @@
-import type { MutableRefObject } from 'react';
+import { useCallback, type MutableRefObject } from 'react';
 import { isDaltonBuild } from '@/config/brand';
+import { useAllModels } from '@/hooks/useAllModels';
+import { useCapabilities } from '@/hooks/useCapabilities';
+import { inspectSavedAntigravityModel, type InspectAntigravityOptions } from '@/lib/antigravitySeries';
+import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
+import type { ClearLocalHandle } from '@/lib/dalton/threadTuningDalton';
 import type { Thread } from '@/types/api';
 
 export interface ManualModelPick {
   model: string;
   seq: number;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
 }
 
 export interface DeferredSharedPick {
@@ -12,7 +19,18 @@ export interface DeferredSharedPick {
   picked: string;
   before: string | null;
   seq: number;
+  expectedModel?: string | null;
+  hasExpectedModel?: boolean;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
   onSettled?: (saved: boolean) => void;
+}
+
+export interface RepatchExpectedModel {
+  known: boolean;
+  model: string | null;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
 }
 
 export interface TrackedTurnPick {
@@ -189,11 +207,66 @@ export interface TurnPickRecordingRefs {
   pendingRef: MutableRefObject<string | null>;
   deferredSharedPickRef: MutableRefObject<DeferredSharedPick | null>;
   preservedUnsentSeqRef: MutableRefObject<number | null>;
+  repatchExpectedRef?: MutableRefObject<RepatchExpectedModel>;
 }
 
 /**
- * Thin-hook helper for `useThreadModel.ts`: computes consumed turn pick and
- * records unsent-pick protection in `preservedUnsentSeqRef`.
+ * Computes the server `llm_model` value that the ending turn itself is expected
+ * to have left on the thread row when an unsent newer pick is being protected.
+ * Only when the ending turn explicitly carried a known model (`turnModel.model !== null`
+ * and `!turnModel.modelUnknown`) can we confirm that the old turn wrote it;
+ * otherwise returns `{ known: false, model: null }` so another tab's write is
+ * never mistaken for the old turn's write.
+ */
+export function resolveRepatchExpectedModel(
+  turnModel: ActiveTurnModelInfo | null,
+  effortBaseline?: { hasExpectedEffort: boolean; expectedEffort: string | null },
+): RepatchExpectedModel {
+  if (!turnModel || turnModel.modelUnknown || turnModel.model === null) {
+    return { known: false, model: null };
+  }
+  return {
+    known: true,
+    model: turnModel.model,
+    ...(effortBaseline?.hasExpectedEffort
+      ? { hasExpectedEffort: true, expectedEffort: effortBaseline.expectedEffort }
+      : {}),
+  };
+}
+
+/**
+ * Resolves the server `reasoning_effort` baseline last confirmed on this page
+ * before a turn-end reread, so an Antigravity background repatch (which clears
+ * `reasoning_effort` to `null`) never echoes a concurrent writer's newly reread
+ * effort as `expected_reasoning_effort`.
+ */
+export function resolveRepatchExpectedEffort(params: {
+  threadId: string;
+  createdTuning?: { threadId: string; reasoningEffort: string | null } | null;
+  pick?: ManualModelPick | null;
+  repatchExpected?: RepatchExpectedModel | null;
+  preRereadThread?: Thread | undefined;
+}): string | null {
+  const { threadId, createdTuning, pick, repatchExpected, preRereadThread } = params;
+  if (createdTuning && createdTuning.threadId === threadId) {
+    return createdTuning.reasoningEffort ?? null;
+  }
+  if (pick?.hasExpectedEffort) {
+    return pick.expectedEffort ?? null;
+  }
+  if (repatchExpected?.hasExpectedEffort) {
+    return repatchExpected.expectedEffort ?? null;
+  }
+  if (preRereadThread !== undefined) {
+    return preRereadThread.reasoning_effort ?? null;
+  }
+  return null;
+}
+
+/**
+ * Thin-hook helper for `useThreadModel.ts`: computes consumed turn pick,
+ * records unsent-pick protection in `preservedUnsentSeqRef`, and records the
+ * expected old-turn model for conditional repatching.
  */
 export function recordDaltonTurnPick(
   turnModel: ActiveTurnModelInfo | null,
@@ -210,8 +283,423 @@ export function recordDaltonTurnPick(
     hasDeferredShared: refs.deferredSharedPickRef.current !== null,
     snapshot,
   });
-  if (preserveUnsentSeq !== null) refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
+  if (preserveUnsentSeq !== null) {
+    refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
+    if (refs.repatchExpectedRef) {
+      const currentPick = refs.manualPickRef.current;
+      const effortBaseline = currentPick?.hasExpectedEffort
+        ? { hasExpectedEffort: true, expectedEffort: currentPick.expectedEffort ?? null }
+        : snapshot.thread !== undefined
+          ? { hasExpectedEffort: true, expectedEffort: snapshot.thread.reasoning_effort ?? null }
+          : undefined;
+      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(turnModel, effortBaseline);
+    }
+  }
   return consumedPick;
+}
+
+/**
+ * True when `model` is a built-in Antigravity variant whose server-side PATCH
+ * will atomically clear `reasoning_effort = null`, so conditional background
+ * saves must guard `expected_reasoning_effort` (including explicit `null`).
+ */
+export function isAntigravityVariantForClear(
+  model: string | null | undefined,
+  seriesOpts: InspectAntigravityOptions,
+): boolean {
+  if (!model) return false;
+  if (inspectSavedAntigravityModel(model, seriesOpts)) return true;
+  const hasLoadedSeries = Boolean(seriesOpts.seriesCatalog && seriesOpts.seriesCatalog.series.length > 0);
+  if (hasLoadedSeries) return false;
+  if (seriesOpts.customModels?.some((cm) => cm.name === model)) return false;
+  return fallbackAntigravitySeriesId(model) !== null;
+}
+
+/**
+ * True only when the reread row still matches the model written by the old turn
+ * that just finished. If another tab or `switch_thread_model` moved the thread
+ * to a different model, returns false so the client abandons repatching.
+ */
+export function shouldRepatchPreservedPick(
+  freshModel: string | null,
+  repatchExpected: RepatchExpectedModel | null | undefined,
+): boolean {
+  if (!repatchExpected?.known) return false;
+  return freshModel === repatchExpected.model;
+}
+
+export type FirstTurnRepatchAction = 'repatch' | 'keep_local' | 'follow_server';
+
+/**
+ * Decides what first-turn reread should do with a pre-id model pick made while
+ * the new thread was being created (applies in both Dalton and Core builds):
+ * - `turnAdmitted === true`: the first send ran `keep_named_model(firstSendModel)`,
+ *   so repatch only while `freshModel === firstSendModel`; otherwise another tab
+ *   changed it -> `'follow_server'`.
+ * - `turnAdmitted === false`: the first send failed before admission (e.g. 503),
+ *   so the row still holds `null` (or `firstSendModel` if the server admitted
+ *   before disconnect). Repatch with `expected_llm_model: freshModel` when
+ *   `freshModel === null || freshModel === firstSendModel`; otherwise another
+ *   tab wrote a different model -> `'follow_server'`.
+ * - `turnAdmitted === null` (indeterminate): repatch if `freshModel === firstSendModel`,
+ *   keep the user's unsent pick locally without PATCH when `freshModel === null`
+ *   (cannot distinguish pre-admission failure from another tab resetting to null),
+ *   and follow server when `freshModel` is a different non-null model.
+ */
+export function resolveFirstTurnRepatchAction(
+  freshModel: string | null,
+  firstSendModel: string | null,
+  turnAdmitted: boolean | null,
+): FirstTurnRepatchAction {
+  if (turnAdmitted === true) {
+    return freshModel === firstSendModel ? 'repatch' : 'follow_server';
+  }
+  if (turnAdmitted === false) {
+    return freshModel === null || freshModel === firstSendModel ? 'repatch' : 'follow_server';
+  }
+  if (freshModel === firstSendModel) return 'repatch';
+  if (freshModel === null && firstSendModel !== null) return 'keep_local';
+  return 'follow_server';
+}
+
+/**
+ * True when a pre-id pick made during a new thread's first turn may still
+ * background-repatch on first-turn reread.
+ */
+export function shouldRepatchFirstTurnPick(
+  freshModel: string | null,
+  firstSendModel: string | null,
+): boolean {
+  return resolveFirstTurnRepatchAction(freshModel, firstSendModel, true) === 'repatch';
+}
+
+/**
+ * True when an unresolved-permission deferred model pick is still eligible to
+ * flush:
+ * - If the thread detail had not loaded when the pick was staged
+ *   (`!pick.hasExpectedModel`, or `willClearEffort && !pick.hasExpectedEffort`),
+ *   cancels automatic flush so we never issue an unconditional PATCH over a
+ *   newer write from another tab.
+ * - Also returns false if the cached thread row already moved away from the
+ *   model (or reasoning_effort when the write clears effort) observed when the
+ *   deferred pick was staged.
+ */
+export function shouldFlushDeferredModelPick(
+  pick: DeferredSharedPick,
+  thread: Thread | undefined,
+  willClearEffort = false,
+): boolean {
+  if (!pick.hasExpectedModel) return false;
+  if (willClearEffort && !pick.hasExpectedEffort) return false;
+  if (thread === undefined) return true;
+  if ((thread.llm_model ?? null) !== (pick.expectedModel ?? null)) return false;
+  if (willClearEffort && (thread.reasoning_effort ?? null) !== (pick.expectedEffort ?? null)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Builds the optional CAS guard fields sent on a deferred model flush.
+ * Whenever `willClearEffort` is true (including built-in Antigravity variants
+ * where `expectedEffort` is `null`), explicitly attaches
+ * `expected_reasoning_effort` (including `null`).
+ */
+export function buildDeferredModelConditions(
+  pick: DeferredSharedPick,
+  willClearEffort: boolean,
+): ThreadFieldSaveConditions | undefined {
+  const conditions: ThreadFieldSaveConditions = {};
+  if (pick.hasExpectedModel) {
+    conditions.expected_llm_model = pick.expectedModel ?? null;
+  }
+  if (willClearEffort && pick.hasExpectedEffort) {
+    conditions.expected_reasoning_effort = pick.expectedEffort ?? null;
+  }
+  return Object.keys(conditions).length > 0 ? conditions : undefined;
+}
+
+const ANTIGRAVITY_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+function fallbackAntigravitySeriesId(modelKey: string | null | undefined): string | null {
+  if (!modelKey || !modelKey.endsWith('-oauth')) return null;
+  const stem = modelKey.slice(0, -'-oauth'.length);
+  if (!stem) return null;
+  for (const effort of ANTIGRAVITY_EFFORT_LEVELS) {
+    const suffix = `-${effort}`;
+    if (stem.endsWith(suffix) && stem.length > suffix.length) {
+      return `antigravity-oauth:${stem.slice(0, -suffix.length)}`;
+    }
+  }
+  return null;
+}
+
+export interface QueuedTuningOptions {
+  model?: string | null;
+  modelPickSeq?: number | null;
+  displayModel?: string | null;
+  antigravitySeriesId?: string | null;
+  reasoningEffort?: string | null;
+  fastMode?: boolean | null;
+}
+
+function resolveQueuedModelAndSeries(
+  opts: QueuedTuningOptions,
+  antigravityEnabled: boolean,
+): { effectiveModel: string | null; seriesId: string | null } {
+  const effectiveModel = opts.displayModel ?? opts.model ?? null;
+  if (!antigravityEnabled) {
+    return { effectiveModel, seriesId: null };
+  }
+  if (opts.antigravitySeriesId !== undefined) {
+    return { effectiveModel, seriesId: opts.antigravitySeriesId };
+  }
+  return { effectiveModel, seriesId: fallbackAntigravitySeriesId(effectiveModel) };
+}
+
+/**
+ * Refreshes a queued message's tuning (and intra-series Antigravity variant)
+ * from the live composer at flush time instead of sending the stale snapshot
+ * captured when it was queued.
+ *
+ * - Disabled when `isDaltonBuild` (`VITE_DALTON_UI`) is false: returns
+ *   `queuedOptions` unchanged.
+ * - Compares displayed models (`displayModel ?? model`) and Antigravity series:
+ *   - Same Antigravity series (e.g. `…-high-oauth` -> `…-low-oauth`): adopts
+ *     the live composer's current variant (`model`, `modelPickSeq`, `displayModel`,
+ *     `antigravitySeriesId`), always clears standard `reasoningEffort` to `null`,
+ *     and adopts live `fastMode`.
+ *   - Different Antigravity series or Antigravity <-> standard: preserves the
+ *     queued message's model snapshot and always clears standard `reasoningEffort`
+ *     to `null` when the queued message targets an Antigravity variant.
+ *   - Different standard models: preserves the queued message's snapshot.
+ *   - Same standard model: adopts live `reasoningEffort` and `fastMode`.
+ * - When no composer reader is mounted (headless caller), clears the stale
+ *   enqueue-time snapshot so the server reads the thread row's latest tuning.
+ */
+export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
+  queuedOptions: T,
+  latestComposerOptions: QueuedTuningOptions | undefined,
+  { antigravityEnabled = true }: { antigravityEnabled?: boolean } = {},
+): T {
+  if (!isDaltonBuild) return queuedOptions;
+  const hasExplicitModel = typeof queuedOptions.model === 'string' && queuedOptions.model.length > 0;
+  const queued = resolveQueuedModelAndSeries(queuedOptions, antigravityEnabled);
+
+  if (latestComposerOptions !== undefined) {
+    const latest = resolveQueuedModelAndSeries(latestComposerOptions, antigravityEnabled);
+
+    // 1) Queued message follows the thread's model (`model` is null/omitted):
+    //    when the flushed request omits `llm_model`, also omit `reasoningEffort`
+    //    so the server resolves the thread row's current model and effort
+    //    together and a stale tab never sends an old model's effort onto a
+    //    newly switched model (such as Antigravity Neon Low).
+    if (!hasExplicitModel) {
+      if (queued.seriesId !== null && latest.seriesId !== null && latest.seriesId === queued.seriesId) {
+        const nextModel = latestComposerOptions.model !== undefined
+          ? latestComposerOptions.model
+          : queuedOptions.model;
+        const nextPickSeq = latestComposerOptions.modelPickSeq !== undefined
+          ? latestComposerOptions.modelPickSeq
+          : (nextModel === queuedOptions.model ? queuedOptions.modelPickSeq : undefined);
+        return {
+          ...queuedOptions,
+          model: nextModel,
+          modelPickSeq: nextPickSeq,
+          ...(latestComposerOptions.displayModel !== undefined
+            ? { displayModel: latestComposerOptions.displayModel }
+            : {}),
+          ...(latestComposerOptions.antigravitySeriesId !== undefined
+            ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+            : {}),
+          reasoningEffort: null,
+          ...(latestComposerOptions.fastMode !== undefined
+            ? { fastMode: latestComposerOptions.fastMode }
+            : {}),
+        };
+      }
+      return {
+        ...queuedOptions,
+        ...(latestComposerOptions.displayModel !== undefined
+          ? { displayModel: latestComposerOptions.displayModel }
+          : {}),
+        ...(latestComposerOptions.antigravitySeriesId !== undefined
+          ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+          : {}),
+        reasoningEffort: null,
+        ...(latestComposerOptions.fastMode !== undefined
+          ? { fastMode: latestComposerOptions.fastMode }
+          : {}),
+      };
+    }
+
+    // 2) Queued message carries an explicit `model`:
+    if (queued.seriesId !== null) {
+      if (latest.seriesId !== null && latest.seriesId === queued.seriesId) {
+        const nextModel = latestComposerOptions.model
+          ?? (latestComposerOptions.displayModel && latest.seriesId === queued.seriesId
+            ? latestComposerOptions.displayModel
+            : queuedOptions.model);
+        const nextPickSeq = latestComposerOptions.modelPickSeq !== undefined
+          ? latestComposerOptions.modelPickSeq
+          : (nextModel === queuedOptions.model ? queuedOptions.modelPickSeq : undefined);
+        return {
+          ...queuedOptions,
+          model: nextModel,
+          modelPickSeq: nextPickSeq,
+          ...(latestComposerOptions.displayModel !== undefined
+            ? { displayModel: latestComposerOptions.displayModel }
+            : {}),
+          ...(latestComposerOptions.antigravitySeriesId !== undefined
+            ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+            : {}),
+          reasoningEffort: null,
+          ...(latestComposerOptions.fastMode !== undefined
+            ? { fastMode: latestComposerOptions.fastMode }
+            : {}),
+        };
+      }
+      return {
+        ...queuedOptions,
+        reasoningEffort: null,
+      };
+    }
+
+    if (latest.seriesId !== null) {
+      return queuedOptions;
+    }
+
+    if (
+      queued.effectiveModel
+      && latest.effectiveModel
+      && queued.effectiveModel !== latest.effectiveModel
+    ) {
+      return queuedOptions;
+    }
+
+    return {
+      ...queuedOptions,
+      reasoningEffort: latestComposerOptions.reasoningEffort ?? null,
+      ...(latestComposerOptions.fastMode !== undefined
+        ? { fastMode: latestComposerOptions.fastMode }
+        : {}),
+    };
+  }
+
+  if (hasExplicitModel) {
+    return {
+      ...queuedOptions,
+      ...(queued.seriesId !== null ? { reasoningEffort: null } : {}),
+    };
+  }
+
+  return {
+    ...queuedOptions,
+    reasoningEffort: undefined,
+    fastMode: undefined,
+  };
+}
+
+/**
+ * Strips standard `reasoningEffort` when assembling a send payload targeting a
+ * built-in Antigravity variant (whose effort is encoded in the model key).
+ */
+export function sanitizeDaltonSendEffort(
+  options: {
+    model?: string | null;
+    displayModel?: string | null;
+    antigravitySeriesId?: string | null;
+    reasoningEffort?: string | null;
+  },
+  { antigravityEnabled = true }: { antigravityEnabled?: boolean } = {},
+): string | null {
+  const effort = options.reasoningEffort || null;
+  if (!isDaltonBuild || !antigravityEnabled || effort === null) return effort;
+  const effectiveModel = options.model ?? options.displayModel ?? null;
+  const seriesId = options.antigravitySeriesId !== undefined
+    ? options.antigravitySeriesId
+    : fallbackAntigravitySeriesId(effectiveModel);
+  if (seriesId !== null) return null;
+  return effort;
+}
+
+/**
+ * Dalton hook for `useChatMessages`: reads `native_oauth_sync` via
+ * `useCapabilities()` and exposes queued-send tuning merger + send effort
+ * sanitizer so upstream `useChatMessages.ts` only carries thin hook calls.
+ */
+export function useDaltonQueuedSendTuning() {
+  const { hasCapability } = useCapabilities({ enabled: isDaltonBuild });
+  const antigravityEnabled = hasCapability('native_oauth_sync');
+
+  const resolveQueuedOptions = useCallback(
+    <T extends QueuedTuningOptions>(
+      queuedOptions: T,
+      latestComposerOptions: QueuedTuningOptions | undefined,
+    ): T => mergeLatestQueuedTuning(queuedOptions, latestComposerOptions, { antigravityEnabled }),
+    [antigravityEnabled],
+  );
+
+  const sanitizeSendEffort = useCallback(
+    (options: {
+      model?: string | null;
+      displayModel?: string | null;
+      antigravitySeriesId?: string | null;
+      reasoningEffort?: string | null;
+    }): string | null => sanitizeDaltonSendEffort(options, { antigravityEnabled }),
+    [antigravityEnabled],
+  );
+
+  return { resolveQueuedOptions, sanitizeSendEffort };
+}
+
+/**
+ * Attaches displayed-model & Antigravity series metadata to composer options
+ * in Dalton builds so queued-send flushes can compare displayed models & series
+ * even when `sendModel` is `null` (following the thread row).
+ */
+export function withDaltonComposerMeta<T extends object>(
+  options: T,
+  meta: { displayModel: string | null; antigravitySeriesId: string | null },
+): T & { displayModel?: string | null; antigravitySeriesId?: string | null } {
+  if (!isDaltonBuild) return options;
+  return {
+    ...options,
+    displayModel: meta.displayModel,
+    antigravitySeriesId: meta.antigravitySeriesId,
+  };
+}
+
+/**
+ * Dalton hook wrapping `pickModel` + `clearLocalEffort` for surfaces like
+ * `MarketView` mobile FAB so switching to an Antigravity variant atomically
+ * clears local standard reasoning effort and rolls back on failure.
+ */
+export function useDaltonModelPickerWithEffortClear(
+  pickModel: (model: string, options?: { onSettled?: (saved: boolean) => void }) => Promise<boolean>,
+  clearLocalEffort: () => ClearLocalHandle,
+): (nextModel: string) => Promise<boolean> {
+  const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  return useCallback((nextModel: string) => {
+    const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
+    const isAntigravity = Boolean(
+      inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels }),
+    );
+    if (!isDaltonBuild) {
+      if (isAntigravity) clearLocalEffort();
+      return pickModel(nextModel);
+    }
+    const effortClear = isAntigravity ? clearLocalEffort() : null;
+    return pickModel(nextModel, effortClear ? {
+      onSettled: (saved) => {
+        if (saved) effortClear.confirm();
+        else effortClear();
+      },
+    } : undefined).catch((err: unknown) => {
+      effortClear?.();
+      throw err;
+    });
+  }, [clearLocalEffort, customModels, modelMetadata, pickModel, rawApiResponse, seriesCatalog]);
 }
 
 /**

@@ -862,21 +862,36 @@ async def restore_automation(
             current = int(row.get("config_version") or 1)
             if expected_config_version != current:
                 _version_conflict(expected_config_version, current)
+            restore_pref_bag = (
+                prefs.get("model_preference")
+                if isinstance(prefs, Mapping)
+                and isinstance(prefs.get("model_preference"), Mapping)
+                else {}
+            )
             if row.get("llm_model"):
-                restore_pref_bag = (
-                    prefs.get("model_preference")
-                    if isinstance(prefs, Mapping)
-                    and isinstance(prefs.get("model_preference"), Mapping)
-                    else None
-                )
                 await assert_model_not_retired_under_lock(
                     db,
                     row.get("llm_model"),
                     field="llm_model",
                     user_id=str(row.get("user_id") or pref_owner) if not company else None,
-                    model_pref=restore_pref_bag,
+                    model_pref=restore_pref_bag or None,
                     allow_custom=(not company),
                 )
+            if not company:
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+                from src.server.services.automations.lifecycle import AutomationRefusal
+
+                try:
+                    await assert_no_automation_delivery_notify_conflict(
+                        user_id=str(row.get("user_id") or pref_owner),
+                        automation=row,
+                        delivery_config=row.get("delivery_config"),
+                        model_pref=restore_pref_bag,
+                    )
+                except AutomationRefusal as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
             desired = str(row.get("pre_delete_desired_status") or "paused")
             if desired not in ("active", "paused"):
                 desired = "paused"
@@ -1153,6 +1168,31 @@ async def rollback_automation(
             desired = str(snapshot["desired_status"])
             preview = dict(row)
             preview.update({name: snapshot.get(name) for name in _SNAPSHOT_COLUMNS})
+            post_notify = (
+                bool(snapshot.get("notify_enabled")),
+                [
+                    str(item)
+                    for item in snapshot.get("notify_routes") or []
+                    if isinstance(item, str)
+                ],
+            )
+            if not company:
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+                from src.server.services.automations.lifecycle import AutomationRefusal
+
+                try:
+                    await assert_no_automation_delivery_notify_conflict(
+                        user_id=str(row.get("user_id") or pref_owner),
+                        automation=preview,
+                        delivery_config=dict(snapshot.get("delivery_config") or {}),
+                        metadata=row.get("metadata"),
+                        notify_routes=list(post_notify[1]),
+                        model_pref=pref_bag,
+                    )
+                except AutomationRefusal as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
             status, next_run = await _effective_for_row(
                 row,
                 desired=desired,
@@ -1178,14 +1218,6 @@ async def rollback_automation(
                         automation=row,
                         unfinished=unfinished,
                     )
-            post_notify = (
-                bool(snapshot.get("notify_enabled")),
-                [
-                    str(item)
-                    for item in snapshot.get("notify_routes") or []
-                    if isinstance(item, str)
-                ],
-            )
             target_prev = target.get("prev_version") if target else None
             if isinstance(target_prev, bool) or (
                 target_prev is not None and not isinstance(target_prev, int)

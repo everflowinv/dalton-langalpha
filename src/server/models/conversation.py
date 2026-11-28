@@ -495,6 +495,23 @@ class ThreadUpdateRequest(BaseModel):
         description="The thread's fast mode from its next turn. null returns "
         "the thread to the user's Settings.",
     )
+    # DALTON-HOOK(model-picker-races): optional expected-value CAS guards for background auto-saves (repatch / deferred flush); omitted on direct user clicks
+    expected_llm_model: Optional[str] = Field(
+        None,
+        max_length=255,
+        description="Optional compare-and-swap guard on conversation_threads.llm_model "
+        "(IS NOT DISTINCT FROM). Used by background auto-writes; mismatch returns 409.",
+    )
+    expected_reasoning_effort: Optional[ReasoningLevel] = Field(
+        None,
+        description="Optional compare-and-swap guard on conversation_threads.reasoning_effort "
+        "(IS NOT DISTINCT FROM). Used by background auto-writes; mismatch returns 409.",
+    )
+    expected_fast_mode: Optional[bool] = Field(
+        None,
+        description="Optional compare-and-swap guard on conversation_threads.fast_mode "
+        "(IS NOT DISTINCT FROM). Used by background auto-writes; mismatch returns 409.",
+    )
 
     model_config = ConfigDict(json_schema_extra={
         "example": {"title": "Tesla Stock Analysis"},

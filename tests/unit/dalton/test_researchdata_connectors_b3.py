@@ -1228,43 +1228,6 @@ def test_provenance_allows_all_batch3_servers_and_data_map_renders_core_wiki(
 
 
 # ---------------------------------------------------------------------------
-# 6. Separation fix (Item 5): bridge_subprocess_env uses src.dalton.profile.resolve_profile
-# ---------------------------------------------------------------------------
-
-
-def test_bridge_subprocess_env_uses_resolve_profile_and_reports_conflicts() -> None:
-    scripts_dir = str(REPO_ROOT / "scripts" / "dalton")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import bridge_subprocess_env as bse
-
-    # Core via APP_ENV=core defaults to openai
-    issues_core = bse._validate_direct_embedding_env({"APP_ENV": "core", "OPENAI_API_KEY": "sk-test"})
-    assert issues_core == []
-
-    # Core via DALTON_PROFILE=core defaults to openai
-    issues_core_prof = bse._validate_direct_embedding_env({"DALTON_PROFILE": "core", "OPENAI_API_KEY": "sk-test"})
-    assert issues_core_prof == []
-
-    # Everflow defaults to gemini
-    issues_ef = bse._validate_direct_embedding_env({"APP_ENV": "dalton", "GEMINI_API_KEY": "gem-test"})
-    assert issues_ef == []
-
-    # Conflicting APP_ENV=dalton + DALTON_PROFILE=core reports clear config issue instead of crashing
-    issues_conflict = bse._validate_direct_embedding_env(
-        {"APP_ENV": "dalton", "DALTON_PROFILE": "core", "OPENAI_API_KEY": "sk-test"}
-    )
-    assert any("invalid deployment profile configuration" in msg for msg in issues_conflict)
-    assert any("Conflicting profile" in msg for msg in issues_conflict)
-
-    # Invalid DALTON_PROFILE value reports clear config issue
-    issues_invalid = bse._validate_direct_embedding_env(
-        {"DALTON_PROFILE": "bogus", "OPENAI_API_KEY": "sk-test"}
-    )
-    assert any("invalid deployment profile configuration" in msg for msg in issues_invalid)
-
-
-# ---------------------------------------------------------------------------
 # 7. Packaging, docker-compose.core.yml, transport, workflow.js, host scripts, switch script
 # ---------------------------------------------------------------------------
 

@@ -134,11 +134,10 @@ vi.mock('@/hooks/useHomeWorkspace', () => ({
 }));
 vi.mock('@/lib/dalton/searchApi', () => ({
   fetchGlobalSearch: vi.fn<
-    (q: string, limit?: number, signal?: AbortSignal, options?: { includeConversations?: boolean }) => Promise<{
-      conversations: never[];
+    (q: string, limit?: number, signal?: AbortSignal, options?: { workspaceId?: string; includeContent?: boolean }) => Promise<{
       documents: never[];
     }>
-  >(async () => ({ conversations: [], documents: [] })),
+  >(async () => ({ documents: [] })),
 }));
 vi.mock('@/hooks/useSkills', () => ({
   useSkills: () => ({

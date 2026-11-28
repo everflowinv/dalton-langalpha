@@ -155,7 +155,6 @@ async def test_scheduler_host_run_resolves_vault_sends_secrets_and_scrubs_db_log
         timeout_seconds=10800,
         no_output_timeout_seconds=3600,
         required_secrets=list(PIPELINE_SECRETS),
-        cos_mode="skip",
         notify_enabled=False,
         scheduled_slot_utc=now,
         deadline_utc=now + timedelta(hours=3),

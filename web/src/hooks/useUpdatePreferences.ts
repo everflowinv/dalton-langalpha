@@ -143,6 +143,8 @@ export function useUpdatePreferences() {
       // Inside onSettled this mutation is still counted, so 1 means it is last.
       if (queryClient.isMutating({ mutationKey: PREFERENCE_MUTATION_KEY }) === 1) {
         queryClient.invalidateQueries({ queryKey: key });
+        // DALTON-HOOK(model-picker-races): broadcast cross-tab preference refresh once the last in-flight write succeeds
+        if (!error) announcePreferencesChanged();
       }
     },
     onError: (_error, _patch, context) => {

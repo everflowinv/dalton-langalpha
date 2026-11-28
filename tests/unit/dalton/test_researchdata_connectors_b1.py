@@ -7,7 +7,7 @@
 3. Backend embeddings module (``src/dalton/embeddings/``): dual-profile config,
    ``gemini-embedding-2-preview`` -> ``gemini-embedding-2`` alias mapping, per-text
    ``Content(parts=[Part(text=t)])`` batching, Gemini/OpenAI retry & backoff,
-   ``DALTON_EMBED_VIA_BRIDGE=true`` rollback switch, and 1536/3072-d HNSW search.
+   and 1536/3072-d HNSW search.
 4. ``/jobs/ops`` status fileization (``export_ops_status.py``, launchd plist template,
    ``system_jobs.py`` freshness/staleness rejection and ``DALTON_OPS_JOBS_VIA_BRIDGE``
    rollback) plus ``ops_jobs_enabled`` prompt gating and ``DALTON-HOOK`` markers.
@@ -66,11 +66,9 @@ from src.dalton.embeddings import (
     embed_query_direct,
     embed_texts_direct,
     ensure_conversation_embedding_schema,
-    is_embed_via_bridge_enabled,
     resolve_api_model_name,
     resolve_embedding_config,
     upsert_embedding_metadata,
-    validate_bridge_embedding_match,
     validate_embedding_metadata_match,
 )
 from src.dalton.embeddings import client as emb_client
@@ -108,7 +106,6 @@ def _clear_b1_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "DALTON_PROFILE",
         "DALTON_ENABLED",
         "DALTON_HOST_PLATFORM",
-        "DALTON_EMBED_VIA_BRIDGE",
         "DALTON_EMBEDDING_PROVIDER",
         "DALTON_EMBEDDING_MODEL",
         "DALTON_EMBEDDING_API_MODEL",
@@ -320,83 +317,7 @@ def test_init_sh_detect_and_validate_host_platform(tmp_path: Path) -> None:
         assert res.stdout.strip() == expected
 
 
-def test_bridge_subprocess_env_render_direct_vs_bridge_and_host_platform(tmp_path: Path) -> None:
-    base_render_env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "LANG": "en_US.UTF-8",
-        "TZ": "America/New_York",
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "5432",
-        "DB_NAME": "postgres",
-        "DB_USER": "postgres",
-        "DB_PASSWORD": "secret",
-        "AUTH_USER_ID": "u-1",
-        "DALTON_PM_USER_IDS": "u-1",
-        "DALTON_ENABLED": "1",
-    }
-
-    # Direct mode (default): missing GEMINI_API_KEY / DALTON_EMBEDDING_API_KEY fails without asking for bridge token.
-    with pytest.raises(bse.ArchiveEnvValidationError) as exc_missing:
-        bse.validate_reextract_required_env(base_render_env, "render")
-    assert any("direct embedding credential" in item for item in exc_missing.value.issues)
-    assert not any("DALTON_BRIDGE_ADMIN_TOKEN" in item for item in exc_missing.value.issues)
-
-    # Direct mode succeeds with GEMINI_API_KEY and valid DALTON_HOST_PLATFORM (no bridge URL or admin token needed).
-    bse.validate_reextract_required_env(
-        {
-            **base_render_env,
-            "GEMINI_API_KEY": "gk-test",
-            "DALTON_HOST_PLATFORM": "macos",
-        },
-        "render",
-    )
-
-    # Core direct mode accepts OPENAI_API_KEY.
-    bse.validate_reextract_required_env(
-        {
-            **base_render_env,
-            "APP_ENV": "core",
-            "OPENAI_API_KEY": "sk-test",
-            "DALTON_HOST_PLATFORM": "linux",
-        },
-        "render",
-    )
-
-    # Invalid DALTON_HOST_PLATFORM fails validation.
-    with pytest.raises(bse.ArchiveEnvValidationError, match="DALTON_HOST_PLATFORM"):
-        bse.validate_reextract_required_env(
-            {
-                **base_render_env,
-                "GEMINI_API_KEY": "gk-test",
-                "DALTON_HOST_PLATFORM": "solaris",
-            },
-            "render",
-        )
-
-    # Rollback mode (`DALTON_EMBED_VIA_BRIDGE=true`): enforces bridge admin token + 127.0.0.1:8960 URL.
-    with pytest.raises(bse.ArchiveEnvValidationError) as exc_bridge:
-        bse.validate_reextract_required_env(
-            {
-                **base_render_env,
-                "DALTON_EMBED_VIA_BRIDGE": "true",
-            },
-            "render",
-        )
-    assert any("DALTON_BRIDGE_ADMIN_TOKEN" in item for item in exc_bridge.value.issues)
-    assert any("DALTON_BRIDGE_EMBED_URL" in item for item in exc_bridge.value.issues)
-
-    bse.validate_reextract_required_env(
-        {
-            **base_render_env,
-            "DALTON_EMBED_VIA_BRIDGE": "true",
-            "DALTON_BRIDGE_ADMIN_TOKEN": "adm-tok",
-            "DALTON_BRIDGE_EMBED_URL": "http://127.0.0.1:8960/embed",
-            "no_proxy": "localhost,127.0.0.1",
-        },
-        "render",
-    )
-
+def test_bridge_subprocess_env_host_platform(tmp_path: Path) -> None:
     # merge_bridge_and_repo_env_files writes DALTON_HOST_PLATFORM=macos by default and rejects bad values.
     bridge_env = tmp_path / "bridge.env"
     repo_env = tmp_path / "repo.env"
@@ -664,34 +585,21 @@ async def test_embedding_retry_backoff_gemini_and_openai_and_permanent_errors(
 
 
 @pytest.mark.asyncio
-async def test_embedder_direct_default_and_bridge_rollback_switch(
+async def test_embedder_uses_direct_backend_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_b1_env(monkeypatch)
-    assert is_embed_via_bridge_enabled() is False
 
     direct_mock = create_autospec(
         conv_embedder.embed_texts_direct,
         return_value=([[0.1, 0.2, 0.3, 0.4]], "gemini-embedding-2-preview"),
     )
-    bridge_mock = create_autospec(
-        conv_embedder.embed_texts_via_bridge,
-        return_value=([[0.9, 0.8, 0.7, 0.6]], "gemini-embedding-2-preview"),
-    )
     monkeypatch.setattr(conv_embedder, "embed_texts_direct", direct_mock)
-    monkeypatch.setattr(conv_embedder, "embed_texts_via_bridge", bridge_mock)
 
     vecs_direct, model_direct = await conv_embedder.embed_texts(["doc"])
     assert vecs_direct == [[0.1, 0.2, 0.3, 0.4]]
     assert model_direct == "gemini-embedding-2-preview"
     assert direct_mock.call_count == 1
-    assert bridge_mock.call_count == 0
-
-    monkeypatch.setenv("DALTON_EMBED_VIA_BRIDGE", "true")
-    assert is_embed_via_bridge_enabled() is True
-    vecs_bridge, _ = await conv_embedder.embed_texts(["doc"])
-    assert vecs_bridge == [[0.9, 0.8, 0.7, 0.6]]
-    assert bridge_mock.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -921,67 +829,6 @@ async def test_embed_texts_and_insert_cards_batch_ensure_schema_on_real_paths(
     assert ensure_spy.call_count == 1
     assert ensure_spy.call_args.args[0].dimensions == 1536
 
-    # insert_cards_batch(conn=None) invokes ensure_conversation_embedding_schema before writing.
-    ensure_meta_spy = create_autospec(
-        emb_meta.ensure_conversation_embedding_schema,
-        return_value=meta_1536,
-    )
-    monkeypatch.setattr(emb_meta, "ensure_conversation_embedding_schema", ensure_meta_spy)
-
-    fake_cur = create_autospec(psycopg.AsyncCursor, instance=True)
-    fake_cur.fetchall.return_value = []
-    fake_cur.fetchone.return_value = {"card_id": "cc_core_1"}
-    fake_tx = create_autospec(psycopg.AsyncTransaction, instance=True)
-    fake_tx.__aenter__.return_value = fake_tx
-    fake_tx.__aexit__.return_value = False
-    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
-
-    @asynccontextmanager
-    async def _cur_ctx(*args: Any, **kwargs: Any):
-        yield fake_cur
-
-    fake_conn.cursor.side_effect = _cur_ctx
-    fake_conn.transaction.return_value = fake_tx
-
-    @asynccontextmanager
-    async def _fake_get_db_conn(conn: Any = None):
-        yield fake_conn
-
-    monkeypatch.setattr(db_conv, "get_db_connection", _fake_get_db_conn)
-
-    sample_card = {
-        "card_id": "cc_core_1",
-        "agent": "main",
-        "session_id": "sess-core",
-        "type": "fact",
-        "claim": "Core archive test",
-        "tickers": [],
-        "figures": [],
-        "quote": "Core archive test",
-        "quote_event_id": "ev-1",
-        "extractor_model": "gpt-test",
-        "prompt_version": "conv_card_v1",
-        "content_hash": "hash_core_1",
-        "ts": "2026-11-25T10:00:00+00:00",
-        "date_et": "2026-11-25",
-    }
-    ins_cnt, _, _ = await db_conv.insert_cards_batch(
-        [sample_card],
-        embeddings=[[0.2] * 1536],
-        conn=None,
-    )
-    assert ins_cnt == 1
-    assert ensure_meta_spy.call_count == 1
-    assert ensure_meta_spy.call_args.args[0].dimensions == 1536
-
-    # Mismatched vector length vs configured Core 1536-d is rejected before write.
-    with pytest.raises(EmbeddingDimensionMismatchError):
-        await db_conv.insert_cards_batch(
-            [sample_card],
-            embeddings=[[0.2] * 3072],
-            conn=None,
-        )
-
 
 @pytest.mark.asyncio
 async def test_conversation_search_and_hybrid_search_reject_same_dim_different_model_without_conn(
@@ -1048,60 +895,6 @@ async def test_conversation_search_and_hybrid_search_reject_same_dim_different_m
     assert get_meta_spy.call_count == 2
     assert direct_q_spy.call_count == 0
     assert dense_db_spy.call_count == 0
-
-
-@pytest.mark.asyncio
-async def test_bridge_rollback_query_and_batch_validate_returned_model_against_locked_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_b1_env(monkeypatch)
-    monkeypatch.setenv("APP_ENV", "dalton")
-    monkeypatch.setenv("DALTON_EMBED_VIA_BRIDGE", "true")
-
-    locked_gemini = EmbeddingMetadata(
-        scope="conversation_archive",
-        provider="gemini",
-        model_label="gemini-embedding-2-preview",
-        api_model_name="gemini-embedding-2",
-        dimensions=3072,
-    )
-    monkeypatch.setattr(
-        conv_embedder,
-        "get_embedding_metadata",
-        create_autospec(conv_embedder.get_embedding_metadata, return_value=locked_gemini),
-    )
-
-    # Bridge returns 3072-d vector but from a different model -> must fail closed on query & batch.
-    orig_bridge_embed = conv_embedder.embed_texts_via_bridge
-    monkeypatch.setattr(
-        conv_embedder,
-        "embed_texts_via_bridge",
-        create_autospec(
-            orig_bridge_embed,
-            return_value=([[0.01] * 3072], "gemini-embedding-001"),
-        ),
-    )
-    dense_spy = create_autospec(db_conv.search_cards_dense, return_value=[])
-    monkeypatch.setattr(db_conv, "search_cards_dense", dense_spy)
-
-    with pytest.raises(EmbeddingMetadataMismatchError, match="gemini-embedding-001"):
-        await conv_search.hybrid_search_conversations("NVDA", conn=None)
-    assert dense_spy.call_count == 0
-
-    with pytest.raises(EmbeddingMetadataMismatchError, match="gemini-embedding-001"):
-        await conv_embedder.embed_texts(["doc"], conn=None)
-
-    # Matching GA alias (`gemini-embedding-2`) + 3072-d succeeds.
-    monkeypatch.setattr(
-        conv_embedder,
-        "embed_texts_via_bridge",
-        create_autospec(
-            orig_bridge_embed,
-            return_value=([[0.02] * 3072], "gemini-embedding-2"),
-        ),
-    )
-    vec = await conv_embedder.embed_query("NVDA", conn=None)
-    assert vec is not None and len(vec) == 3072
 
 
 @pytest.mark.asyncio
@@ -1681,92 +1474,6 @@ async def test_configured_and_invalid_gemini_task_types_enforced_end_to_end(
     # 4) Direct client also rejects unsupported task types instead of silent fallback.
     with pytest.raises(EmbeddingConfigError, match="Unsupported Gemini embedding task_type"):
         await embed_texts_direct(["hello"], task_type="UNSUPPORTED_TYPE", config=cfg, api_key="gk-test")
-
-
-@pytest.mark.asyncio
-async def test_bridge_rollback_rejects_non_retrieval_task_types_before_calling_bridge(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_b1_env(monkeypatch)
-    monkeypatch.setenv("APP_ENV", "dalton")
-    monkeypatch.setenv("DALTON_EMBED_VIA_BRIDGE", "true")
-
-    locked_sem = EmbeddingMetadata(
-        scope="conversation_archive",
-        provider="gemini",
-        model_label="gemini-embedding-2-preview",
-        api_model_name="gemini-embedding-2",
-        dimensions=3072,
-        task_type_doc="SEMANTIC_SIMILARITY",
-        task_type_query="SEMANTIC_SIMILARITY",
-    )
-    orig_get_meta = conv_embedder.get_embedding_metadata
-    monkeypatch.setattr(
-        conv_embedder,
-        "get_embedding_metadata",
-        create_autospec(orig_get_meta, return_value=locked_sem),
-    )
-
-    bridge_spy = create_autospec(
-        conv_embedder.embed_texts_via_bridge,
-        return_value=([[0.01] * 3072], "gemini-embedding-2-preview"),
-    )
-    monkeypatch.setattr(conv_embedder, "embed_texts_via_bridge", bridge_spy)
-    dense_spy = create_autospec(db_conv.search_cards_dense, return_value=[])
-    monkeypatch.setattr(db_conv, "search_cards_dense", dense_spy)
-
-    # 1) Locked SEMANTIC_SIMILARITY: query and document paths both refuse before calling bridge.
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_embedder.embed_query("NVDA", conn=None)
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_search.hybrid_search_conversations("NVDA", conn=None)
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_embedder.embed_texts(["archive note"], conn=None)
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_embedder.embed_texts(
-            ["archive note"], task_type="RETRIEVAL_DOCUMENT", conn=None
-        )
-    assert bridge_spy.call_count == 0
-    assert dense_spy.call_count == 0
-
-    # 2) validate_bridge_embedding_match directly rejects locked non-retrieval task types.
-    with pytest.raises(EmbeddingMetadataMismatchError, match="task_type_doc"):
-        validate_bridge_embedding_match("gemini-embedding-2", 3072, locked_sem)
-
-    # 3) Single-sided query lock (QUESTION_ANSWERING) also blocks bridge on query & write.
-    locked_qa = EmbeddingMetadata(
-        scope="conversation_archive",
-        provider="gemini",
-        model_label="gemini-embedding-2-preview",
-        api_model_name="gemini-embedding-2",
-        dimensions=3072,
-        task_type_doc="RETRIEVAL_DOCUMENT",
-        task_type_query="QUESTION_ANSWERING",
-    )
-    monkeypatch.setattr(
-        conv_embedder,
-        "get_embedding_metadata",
-        create_autospec(orig_get_meta, return_value=locked_qa),
-    )
-    with pytest.raises(EmbeddingMetadataMismatchError, match="QUESTION_ANSWERING"):
-        await conv_embedder.embed_query("NVDA", conn=None)
-    with pytest.raises(EmbeddingMetadataMismatchError, match="QUESTION_ANSWERING"):
-        await conv_embedder.embed_texts(["archive note"], conn=None)
-    assert bridge_spy.call_count == 0
-
-    # 4) Unlocked metadata with effective SEMANTIC_SIMILARITY env config also refuses bridge.
-    monkeypatch.setattr(
-        conv_embedder,
-        "get_embedding_metadata",
-        create_autospec(orig_get_meta, return_value=None),
-    )
-    monkeypatch.setenv("DALTON_EMBEDDING_TASK_TYPE_DOC", "SEMANTIC_SIMILARITY")
-    monkeypatch.setenv("DALTON_EMBEDDING_TASK_TYPE_QUERY", "SEMANTIC_SIMILARITY")
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_embedder.embed_query("NVDA", conn=None)
-    with pytest.raises(EmbeddingMetadataMismatchError, match="SEMANTIC_SIMILARITY"):
-        await conv_embedder.embed_texts(["archive note"], conn=None)
-    assert bridge_spy.call_count == 0
 
 
 def test_d052_downgrade_requires_legacy_gemini_model_and_task_types_when_vectors_exist(

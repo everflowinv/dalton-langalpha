@@ -4,13 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_CODE:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]]; then
-    VENV_DIR="${DALTON_OCW_ROOT}/skills/company-filings-alert/venv"
-    RESEARCH_HOME=""
-else
-    RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-    VENV_DIR="${RESEARCH_HOME}/venvs/company-filings-alert"
-fi
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+VENV_DIR="${RESEARCH_HOME}/venvs/company-filings-alert"
 REQ_FILE="${SCRIPT_DIR}/requirements.txt"
 REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 SCRIPT_FILE="${SCRIPT_DIR}/scripts/company_filings_alert_cli.py"
@@ -41,7 +36,6 @@ _read_legacy_pyvenv_mm() {
     for cfg in \
         "${DALTON_FILINGS_LEGACY_PYVENV_CFG:-}" \
         "${RESEARCH_HOME:+${RESEARCH_HOME}/state/venvs/company-filings-alert.python_version}" \
-        "${DALTON_OCW_ROOT:+${DALTON_OCW_ROOT}/skills/company-filings-alert/venv/pyvenv.cfg}" \
         "${HOME}/.openclaw/workspace/skills/company-filings-alert/venv/pyvenv.cfg"; do # 兼容读取旧 venv Python 版本
         if [[ -n "${cfg}" && -f "${cfg}" ]]; then
             local ver=""

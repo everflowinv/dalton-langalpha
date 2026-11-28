@@ -41,33 +41,6 @@ def _seed_env() -> dict[str, str]:
 
 
 class SeedOpenClawDataTests(unittest.TestCase):
-    def test_python_launcher_replaces_link_without_changing_interpreter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "target"
-            interpreter = root / "interpreter"
-            interpreter.write_text("preserve existing interpreter\n")
-            launcher = target / "state/sentiment-dashboard/cos-venv/bin/python"
-            launcher.parent.mkdir(parents=True)
-            launcher.symlink_to(interpreter)
-            _write_preflight_config(target)
-
-            for _ in range(2):
-                result = subprocess.run(
-                    ["bash", str(SCRIPT), "--apply", "--target", str(target)],
-                    env=_seed_env(),
-                    capture_output=True, text=True, check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse(launcher.is_symlink())
-                self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
-                self.assertEqual(
-                    launcher.read_text(), '#!/bin/sh\nexec /app/.venv/bin/python "$@"\n'
-                )
-                self.assertEqual(interpreter.read_text(), "preserve existing interpreter\n")
-                self.assertEqual(list(launcher.parent.glob("python.*")), [])
-                self.assertTrue((target / "state/a-share-volume-watch").is_dir())
-
     def test_preview_preserves_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -79,16 +52,6 @@ class SeedOpenClawDataTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Mode: DRY-RUN", result.stdout)
             self.assertFalse(target.exists())
-
-    def test_legacy_source_flag_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            result = subprocess.run(
-                ["bash", str(SCRIPT), "--dry-run", "--source", str(root), "--target", str(root / "target")],
-                capture_output=True, text=True, check=False,
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("--source sync from OpenClaw workspace has been removed", result.stderr)
 
     def test_applies_digest_and_kweb_data_assets_to_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -231,3 +194,80 @@ class SeedOpenClawDataTests(unittest.TestCase):
             # Verify seed_openclaw_data.sh uses the exact same shared helper
             script_text = SCRIPT.read_text(encoding="utf-8")
             self.assertIn("build_antigravity_series_from_overlays", script_text)
+
+    def test_cleanup_retired_cos_subcommand_dry_run_apply_and_containment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "openclaw-data"
+            outside = root / "outside"
+            outside.mkdir()
+            outside_keep = outside / "do_not_delete.txt"
+            outside_keep.write_text("precious\n", encoding="utf-8")
+
+            sent_cos = target / "scripts/sentiment_dashboard_cos_upload.py"
+            kweb_cos = target / "skills/kweb-dashboard/scripts/kweb_cos_upload.py"
+            kweb_cli = target / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py"
+            cos_venv = target / "state/sentiment-dashboard/cos-venv"
+            cos_venv_py = cos_venv / "bin/python"
+            keep_state = target / "state/sentiment-dashboard/latest.json"
+
+            sent_cos.parent.mkdir(parents=True)
+            kweb_cos.parent.mkdir(parents=True)
+            cos_venv_py.parent.mkdir(parents=True)
+
+            sent_cos.write_text("# old cos upload\n", encoding="utf-8")
+            kweb_cos.write_text("# old kweb cos upload\n", encoding="utf-8")
+            kweb_cli.write_text("# stale kweb cli\n", encoding="utf-8")
+            cos_venv_py.write_text("#!/bin/sh\n", encoding="utf-8")
+            keep_state.write_text('{"ok": true}\n', encoding="utf-8")
+
+            # 1. Default (no --apply) is dry-run: prints target paths, deletes/writes nothing.
+            dry = subprocess.run(
+                ["bash", str(SCRIPT), "cleanup-retired-cos", "--target", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+            self.assertIn("DRY-RUN", dry.stdout)
+            self.assertIn("sentiment_dashboard_cos_upload.py", dry.stdout)
+            self.assertIn("kweb_cos_upload.py", dry.stdout)
+            self.assertIn("cos-venv", dry.stdout)
+            self.assertIn("kweb_dashboard_cli.py", dry.stdout)
+            self.assertTrue(sent_cos.is_file())
+            self.assertTrue(kweb_cos.is_file())
+            self.assertTrue(cos_venv.is_dir())
+            self.assertEqual(kweb_cli.read_text(encoding="utf-8"), "# stale kweb cli\n")
+
+            # 2. --apply removes ONLY the three retired COS items and syncs kweb_dashboard_cli.py.
+            applied = subprocess.run(
+                ["bash", str(SCRIPT), "cleanup-retired-cos", "--apply", "--target", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+            self.assertFalse(sent_cos.exists())
+            self.assertFalse(kweb_cos.exists())
+            self.assertFalse(cos_venv.exists())
+            self.assertTrue(keep_state.is_file())
+            self.assertEqual(
+                kweb_cli.read_text(encoding="utf-8"),
+                (DATA_ASSETS_DIR / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+            # 3. Path containment guard refuses symlinked ancestor pointing outside target.
+            escape_target = root / "escape-target"
+            escape_target.mkdir()
+            (escape_target / "scripts").symlink_to(outside)
+            escaped = subprocess.run(
+                ["bash", str(SCRIPT), "cleanup-retired-cos", "--apply", "--target", str(escape_target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(escaped.returncode, 0)
+            self.assertIn("outside target", escaped.stderr)
+            self.assertTrue(outside_keep.is_file())

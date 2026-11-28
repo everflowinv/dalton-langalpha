@@ -50,6 +50,8 @@ import http.client
 import importlib
 import json
 import os
+import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -306,13 +308,20 @@ def _tls_ctx(ctx: _lib.ComposeContext) -> _lib.ComposeContext:
     )
 
 
+_INIT_STAGE_SCRIPTS: tuple[str, ...] = (
+    "init.sh",
+    "env_tokens.sh",
+    "_compose_env.sh",
+)
+
+
 def _stage_init_dir(src_work_dir: Path, dst_dir: Path) -> Path:
     script_dir = dst_dir / "scripts" / "standalone"
     script_dir.mkdir(parents=True, exist_ok=True)
-    init_dst = script_dir / "init.sh"
-    shutil.copy2(src_work_dir / "scripts" / "standalone" / "init.sh", init_dst)
+    for rel_script in _INIT_STAGE_SCRIPTS:
+        shutil.copy2(src_work_dir / "scripts" / "standalone" / rel_script, script_dir / rel_script)
     shutil.copy2(src_work_dir / ".env.core.example", dst_dir / ".env.core.example")
-    return init_dst
+    return script_dir / "init.sh"
 
 
 def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
@@ -323,6 +332,8 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             ["--domain", "localhost"],
             {
                 "DOMAIN": "localhost",
+                "DALTON_AUTH_MODE": "local",
+                "VITE_DALTON_AUTH": "local",
                 "DALTON_TLS_MODE": "loopback",
                 "DALTON_EDGE_TLS_BIND": "127.0.0.1",
                 "DALTON_CORE_INTERNAL_SUBNET": "172.31.250.0/24",
@@ -336,6 +347,8 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             ["--domain", "localhost", "--tls-mode", "internal"],
             {
                 "DOMAIN": "localhost",
+                "DALTON_AUTH_MODE": "local",
+                "VITE_DALTON_AUTH": "local",
                 "DALTON_TLS_MODE": "internal",
                 "DALTON_EDGE_TLS_BIND": "127.0.0.1",
                 "DALTON_EDGE_HTTP_PORT": "18080",
@@ -350,6 +363,8 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             ["--domain", "::1", "--tls-mode", "internal"],
             {
                 "DOMAIN": "::1",
+                "DALTON_AUTH_MODE": "local",
+                "VITE_DALTON_AUTH": "local",
                 "DALTON_TLS_MODE": "internal",
                 "DALTON_EDGE_TLS_BIND": "[::1]",
                 "DALTON_CADDY_HOST": "[::1]",
@@ -364,6 +379,8 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             ["--domain", "localhost", "--tls-mode", "auto"],
             {
                 "DOMAIN": "localhost",
+                "DALTON_AUTH_MODE": "local",
+                "VITE_DALTON_AUTH": "local",
                 "DALTON_TLS_MODE": "auto",
                 "DALTON_EDGE_TLS_BIND": "127.0.0.1",
                 "DALTON_EDGE_HTTP_PORT": "18080",
@@ -393,6 +410,9 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             parsed = _lib.load_env_file(env_path)
             assert "DALTON_TRUSTED_PROXIES" not in parsed, (
                 "init.sh must not hardcode DALTON_TRUSTED_PROXIES (derived from DALTON_CORE_INTERNAL_SUBNET in compose)"
+            )
+            assert not parsed.get("DALTON_ALLOW_DEV_OSS_AUTH"), (
+                f"init.sh {extra_args}: fresh install defaults to local auth and must not set DALTON_ALLOW_DEV_OSS_AUTH"
             )
             for key, want in expected.items():
                 got = parsed.get(key)
@@ -566,6 +586,25 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
         assert "apps" in adapted and "http" in adapted["apps"], (
             f"caddy adapt output for mode={mode} missing apps.http"
         )
+        default_enc = (
+            ((adapted.get("logging") or {}).get("logs") or {})
+            .get("default", {})
+            .get("encoder")
+            or {}
+        )
+        assert default_enc.get("format") == "filter", (
+            f"caddy adapt output for mode={mode} missing filter encoder on default/error log"
+        )
+        default_fields = default_enc.get("fields") or {}
+        for req_field in (
+            "request>headers>X-Langalpha-Owner",
+            "request>headers>X-LangAlpha-Owner",
+            "request>headers>Authorization",
+            "request>headers>Cookie",
+        ):
+            assert (default_fields.get(req_field) or {}).get("filter") == "delete", (
+                f"caddy adapt default/error log for mode={mode} missing delete filter on {req_field}"
+            )
         if mode == "auto" and https_port == "18443":
             assert ":18443" in proc.stdout, (
                 "Loopback auto mode HTTP->HTTPS redirect must include host port :18443"
@@ -658,34 +697,56 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
             ctx.compose("up", "-d", "--no-deps", "--force-recreate", "edge")
             _lib.wait_for_http_ready(f"{ctx.edge_url}/__probe/health", timeout=60.0)
 
-    # 2d. Edge startup guard: with .env set to DALTON_AUTH_MODE=oss (+ DALTON_ALLOW_DEV_OSS_AUTH=1)
-    #     and host shell exporting DALTON_EDGE_TLS_BIND=0.0.0.0, recreating ONLY `edge` with the TLS
-    #     overlay must exit non-zero and log the refusal reason without starting Caddy.
+    # 2d. Edge startup guard: init.sh --domain localhost defaults .env to DALTON_AUTH_MODE=local
+    #     (with DALTON_ALLOW_DEV_OSS_AUTH unset). To test the oss non-loopback bind refusal,
+    #     explicitly rewrite .env to DALTON_AUTH_MODE=oss (+ DALTON_ALLOW_DEV_OSS_AUTH=1 and
+    #     LANGALPHA_OWNER_SECRET) inside try/finally and export DALTON_EDGE_TLS_BIND=0.0.0.0;
+    #     recreating ONLY `edge` with the TLS overlay must exit non-zero and log the refusal
+    #     reason without starting Caddy.
     cur_env_map = _lib.load_env_file(env_file)
-    assert cur_env_map.get("DALTON_AUTH_MODE") == "oss", (
-        f"Expected .env DALTON_AUTH_MODE=oss before edge guard check, got {cur_env_map.get('DALTON_AUTH_MODE')!r}"
+    assert cur_env_map.get("DALTON_AUTH_MODE") == "local", (
+        f"Expected .env DALTON_AUTH_MODE=local from init.sh --domain localhost default, "
+        f"got {cur_env_map.get('DALTON_AUTH_MODE')!r}"
     )
-    assert cur_env_map.get("DALTON_ALLOW_DEV_OSS_AUTH") == "1", (
-        f"Expected .env DALTON_ALLOW_DEV_OSS_AUTH=1 before edge guard check, got {cur_env_map.get('DALTON_ALLOW_DEV_OSS_AUTH')!r}"
+    assert not cur_env_map.get("DALTON_ALLOW_DEV_OSS_AUTH"), (
+        f"Expected .env to omit DALTON_ALLOW_DEV_OSS_AUTH under init.sh default, "
+        f"got {cur_env_map.get('DALTON_ALLOW_DEV_OSS_AUTH')!r}"
     )
+    guard_owner_secret = (
+        _lib.oss_owner_headers(ctx).get(_lib.OWNER_HEADER_NAME)
+        or secrets.token_hex(32)
+    )
+    guard_redact_env = {**ctx.env, _lib.OWNER_SECRET_ENV_KEY: guard_owner_secret}
     guard_shell_env = os.environ.copy()
     guard_shell_env["DALTON_EDGE_TLS_BIND"] = "0.0.0.0"
     guard_shell_env.pop("DALTON_AUTH_MODE", None)
     guard_shell_env.pop("DALTON_PROFILE", None)
     guard_shell_env.pop("APP_ENV", None)
+    guard_shell_env.pop(_lib.OWNER_SECRET_ENV_KEY, None)
     try:
+        oss_guard_env_text = _rewrite_env_keys(
+            saved_env_bytes.decode("utf-8"),
+            {
+                "DALTON_AUTH_MODE": "oss",
+                "DALTON_ALLOW_DEV_OSS_AUTH": "1",
+                "HOST_MODE": "oss",
+                _lib.OWNER_SECRET_ENV_KEY: guard_owner_secret,
+            },
+        )
+        env_file.write_text(oss_guard_env_text, encoding="utf-8")
+        os.chmod(env_file, 0o600)
         _run_cmd(
             tls_context.compose_cmd("up", "-d", "--no-deps", "--force-recreate", "edge"),
             cwd=ctx.work_dir,
             env=guard_shell_env,
-            redact_env=ctx.env,
+            redact_env=guard_redact_env,
             timeout=60,
         )
         edge_cid_proc = _run_cmd(
             tls_context.compose_cmd("ps", "-a", "-q", "edge"),
             cwd=ctx.work_dir,
             env=guard_shell_env,
-            redact_env=ctx.env,
+            redact_env=guard_redact_env,
             timeout=30,
         )
         edge_cids = [ln.strip() for ln in edge_cid_proc.stdout.splitlines() if ln.strip()]
@@ -709,7 +770,7 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
                 ["docker", "logs", bad_edge_cid],
                 cwd=ctx.work_dir,
                 check=False,
-                redact_env=ctx.env,
+                redact_env=guard_redact_env,
                 timeout=15,
             )
             logs_text = (logs_proc.stdout or "") + "\n" + (logs_proc.stderr or "")
@@ -754,11 +815,13 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
         """
     )
     # Configure the CI fake Responses API provider/model via HTTP API (self-contained & idempotent).
-    _lib.configure_fake_llm_model(ctx, model_name=FAKE_MODEL_NAME)
+    owner_headers = _lib.oss_owner_headers(ctx)
+    _lib.configure_fake_llm_model(ctx, model_name=FAKE_MODEL_NAME, headers=owner_headers)
 
     ws_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/workspaces",
+        headers=owner_headers,
         json_body={"name": SENTINEL_WORKSPACE_NAME},
     )
     assert ws_resp.status == 201, f"Create sentinel workspace failed: {ws_resp.status} {ws_resp.text}"
@@ -769,6 +832,7 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     with _lib.open_sse_stream(
         "POST",
         f"{ctx.edge_url}/api/v1/threads/messages",
+        headers=owner_headers,
         json_body={
             "workspace_id": workspace_id,
             "llm_model": FAKE_MODEL_NAME,
@@ -792,6 +856,7 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     with _lib.open_sse_stream(
         "GET",
         f"{ctx.edge_url}/api/v1/threads/{thread_id}/messages/replay",
+        headers=owner_headers,
         timeout=60.0,
     ) as (rstatus, _rheaders, rstream):
         assert rstatus == 200, f"Baseline replay GET failed: HTTP {rstatus}"
@@ -805,6 +870,7 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     init_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads",
+        headers=owner_headers,
         json_body={
             "workspace_id": workspace_id,
             "filename": SENTINEL_UPLOAD_FILENAME,
@@ -819,10 +885,13 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     part_resp = _lib.http_request(
         "PUT",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads/{upload_id}/parts/1",
-        headers={
-            "Content-Type": "text/plain",
-            "X-Part-Sha256": payload_sha,
-        },
+        headers=_lib.oss_owner_headers(
+            ctx,
+            extra={
+                "Content-Type": "text/plain",
+                "X-Part-Sha256": payload_sha,
+            },
+        ),
         data=SENTINEL_UPLOAD_PAYLOAD,
     )
     assert part_resp.status == 200, f"Upload sentinel part failed: {part_resp.status} {part_resp.text}"
@@ -830,6 +899,7 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     comp_resp = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads/{upload_id}/complete",
+        headers=owner_headers,
         json_body={"sha256": payload_sha},
     )
     assert comp_resp.status == 200, f"Complete sentinel upload failed: {comp_resp.status} {comp_resp.text}"
@@ -845,6 +915,7 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     uploading_init = _lib.http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/dalton/chat-uploads",
+        headers=owner_headers,
         json_body={
             "workspace_id": workspace_id,
             "filename": "b6-in-progress-upload.txt",
@@ -961,10 +1032,13 @@ def check_internal_ca_https_and_boundaries(
             https_port,
             "/api/v1/users/me",
             context=ssl_ctx,
-            headers={
-                "X-Service-Token": token,
-                "X-User-Id": PROBE_EDGE_USER,
-            },
+            headers=_lib.oss_owner_headers(
+                ctx,
+                extra={
+                    "X-Service-Token": token,
+                    "X-User-Id": PROBE_EDGE_USER,
+                },
+            ),
         )
         assert me_resp.status == 200, f"HTTPS /api/v1/users/me failed: {me_resp.status} {me_resp.text}"
         assert me_resp.json()["user"]["user_id"] == LOCAL_DEV_USER, (
@@ -1434,21 +1508,83 @@ def check_backup_script(
     return latest_backup
 
 
-def _prepare_clean_restore_dir(src_work_dir: Path, dst_dir: Path) -> None:
-    """Copy only the deployment skeleton (no .env, no backups, no ci-artifacts) for empty-host restore."""
+_RESTORE_STAGE_FILES: tuple[str, ...] = (
+    "docker-compose.yml",
+    "docker-compose.core.yml",
+    "Dockerfile.sandbox",
+    "agent_config.yaml",
+    "agent_config.core.yaml",
+    "config.yaml",
+    "config.core.yaml",
+    ".env.example",
+    ".env.core.example",
+    ".release_git_sha",
+    "src/__init__.py",
+    "src/dalton/__init__.py",
+    "src/dalton/pg_config.py",
+    "scripts/dalton/sql/personal_integrations_restore_reset.sql",
+)
+
+_RESTORE_STAGE_DIRS: tuple[str, ...] = (
+    "deploy/standalone",
+    "scripts/standalone",
+)
+
+
+def _extract_release_tar_into(release_tar: Path, dst_dir: Path) -> None:
+    """Extract a packaged release tarball into ``dst_dir`` (matching customer empty-host restore)."""
+    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="b6-release-stage-", dir=str(dst_dir.parent)) as stage:
+        stage_path = Path(stage)
+        _run_cmd(
+            ["tar", "-xzf", str(release_tar), "-C", str(stage_path)],
+            cwd=stage_path,
+            timeout=120,
+        )
+        if (stage_path / "docker-compose.core.yml").is_file():
+            release_src = stage_path
+        else:
+            top_dirs = [p for p in stage_path.iterdir() if p.is_dir()]
+            assert len(top_dirs) == 1 and (top_dirs[0] / "docker-compose.core.yml").is_file(), (
+                f"Invalid release tarball {release_tar}: docker-compose.core.yml not found at archive root"
+            )
+            release_src = top_dirs[0]
+        if release_src == stage_path:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for item in stage_path.iterdir():
+                shutil.move(str(item), str(dst_dir / item.name))
+        else:
+            if dst_dir.exists():
+                shutil.rmtree(dst_dir)
+            shutil.move(str(release_src), str(dst_dir))
+
+
+def _prepare_clean_restore_dir(
+    src_work_dir: Path,
+    dst_dir: Path,
+    *,
+    release_tar: Path | None = None,
+) -> None:
+    """Prepare a clean empty-host deployment directory (no .env, no backups, no ci-artifacts).
+
+    Customers restore on a clean host by unpacking the full release tarball
+    (``STANDALONE-DEPLOY.md`` §6.2). When ``release_tar`` is provided, unpack it directly
+    into ``dst_dir``; otherwise copy the release files/directories required by
+    ``restore.sh`` (including ``src/dalton/pg_config.py`` and
+    ``scripts/dalton/sql/personal_integrations_restore_reset.sql``) from ``src_work_dir``.
+    """
+    if release_tar is not None:
+        _extract_release_tar_into(release_tar, dst_dir)
+        return
+
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for rel_file in (
-        "docker-compose.yml",
-        "docker-compose.core.yml",
-        "Dockerfile.sandbox",
-        "agent_config.yaml",
-        "agent_config.core.yaml",
-        "config.core.yaml",
-    ):
+    for rel_file in _RESTORE_STAGE_FILES:
         src = src_work_dir / rel_file
         if src.is_file():
-            shutil.copy2(src, dst_dir / rel_file)
-    for rel_dir in ("deploy/standalone", "scripts/standalone"):
+            target = dst_dir / rel_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+    for rel_dir in _RESTORE_STAGE_DIRS:
         src = src_work_dir / rel_dir
         dst = dst_dir / rel_dir
         if src.is_dir():
@@ -1616,6 +1752,8 @@ def _verify_restored_data(
     orig_thread_row: str,
     orig_minio_count: int,
     sentinel: dict[str, str],
+    *,
+    auth_headers: dict[str, str] | None = None,
 ) -> None:
     """Assert restored DB row counts, known thread + SSE replay, and MinIO object SHA-256."""
     restored_counts = _snapshot_table_counts(
@@ -1632,7 +1770,12 @@ def _verify_restored_data(
     )
 
     ws_resp = _https_request(
-        "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
+        "GET",
+        "localhost",
+        restore_https_port,
+        "/api/v1/workspaces",
+        context=ssl_ctx,
+        headers=auth_headers,
     )
     assert ws_resp.status == 200, f"Restored GET /workspaces failed: {ws_resp.status}"
     ws_payload = ws_resp.json()
@@ -1648,6 +1791,7 @@ def _verify_restored_data(
         restore_https_port,
         f"/api/v1/threads/{sentinel['thread_id']}/messages/replay",
         context=ssl_ctx,
+        headers=auth_headers,
     )
     assert replay_resp.status == 200, (
         f"Restored thread replay failed: {replay_resp.status} {replay_resp.text[:300]}"
@@ -1709,9 +1853,19 @@ def check_restore_on_clean_stack(
         tmp_root = Path(tmpdir)
         restore_dir = tmp_root / "stack"
         restore_backup_dir = tmp_root / "backup-isolated"
-        _prepare_clean_restore_dir(ctx.work_dir, restore_dir)
+        env_release_tar = os.environ.get("STANDALONE_RELEASE_TAR", "").strip()
+        release_tar = Path(env_release_tar) if env_release_tar else None
+        if release_tar is not None:
+            assert release_tar.is_file(), f"STANDALONE_RELEASE_TAR does not exist: {release_tar}"
+        _prepare_clean_restore_dir(ctx.work_dir, restore_dir, release_tar=release_tar)
         assert not (restore_dir / ".env").exists(), "Restore target dir should start without .env"
 
+        restore_owner_secret = (
+            _lib.oss_owner_headers(ctx).get(_lib.OWNER_HEADER_NAME)
+            or secrets.token_hex(32)
+        )
+        restore_auth_headers = _lib.oss_owner_headers(owner_secret=restore_owner_secret)
+        restore_redact_env = {**ctx.env, _lib.OWNER_SECRET_ENV_KEY: restore_owner_secret}
         isolated_overrides = {
             "COMPOSE_PROJECT_NAME": restore_project,
             "SANDBOX_DOCKER_NETWORK": f"{restore_project}_sandbox",
@@ -1722,6 +1876,7 @@ def check_restore_on_clean_stack(
             "DALTON_AUTH_MODE": "oss",
             "DALTON_ALLOW_DEV_OSS_AUTH": "1",
             "HOST_MODE": "oss",
+            _lib.OWNER_SECRET_ENV_KEY: restore_owner_secret,
         }
         _make_isolated_restore_backup(
             backup_dir,
@@ -1737,10 +1892,15 @@ def check_restore_on_clean_stack(
             f"{restore_dir / 'deploy' / 'standalone' / 'docker-compose.tls.yml'}"
         )
         # Environment for our direct `docker compose` assertions on the restored stack
+        # (omit LANGALPHA_OWNER_SECRET from shell env; backend reads it from decrypted .env).
         restore_env = os.environ.copy()
-        restore_env.update(isolated_overrides)
+        restore_env.pop(_lib.OWNER_SECRET_ENV_KEY, None)
+        restore_env.update(
+            {k: v for k, v in isolated_overrides.items() if k != _lib.OWNER_SECRET_ENV_KEY}
+        )
         # Poisoned shell env passed to `restore.sh` to verify `env -u` isolates `.env` from shell exports
         restore_sh_env = os.environ.copy()
+        restore_sh_env.pop(_lib.OWNER_SECRET_ENV_KEY, None)
         restore_sh_env.update(
             {
                 "COMPOSE_PROJECT_NAME": "wrong_shell_project_must_be_ignored",
@@ -1766,7 +1926,8 @@ def check_restore_on_clean_stack(
         try:
             # 5a. Restore onto the brand-new empty stack (decrypting env.enc atomically);
             #     an in-progress 'uploading' record is present in the snapshot and MUST be
-            #     skipped with the skipped count reported while restore still succeeds.
+            #     converged to 'aborted' by reconcile-restored-inflight-states before
+            #     object verification and service startup.
             restore_5a_proc = _run_cmd(
                 [
                     "bash",
@@ -1787,8 +1948,10 @@ def check_restore_on_clean_stack(
                 timeout=360,
             )
             restore_5a_stdout = restore_5a_proc.stdout or ""
-            assert "skipped 1" in restore_5a_stdout.lower() and "uploading" in restore_5a_stdout.lower(), (
-                f"Expected restore.sh to report skipping 1 'uploading' record, got stdout:\n{restore_5a_stdout[-1200:]}"
+            assert re.search(r'"chat_uploads_aborted"\s*:\s*1\b', restore_5a_stdout), (
+                "Expected restore.sh (reconcile-restored-inflight-states) to converge 1 "
+                "in-progress 'uploading' chat upload record (chat_uploads_aborted=1), "
+                f"got stdout:\n{restore_5a_stdout[-1200:]}"
             )
             restored_env_file = restore_dir / ".env"
             assert restored_env_file.is_file(), "restore.sh did not write .env"
@@ -1797,6 +1960,31 @@ def check_restore_on_clean_stack(
             )
             assert not list(restore_dir.glob(".env.tmp-*")), (
                 "restore.sh left behind temporary .env.tmp-* file(s)"
+            )
+            uploading_restored_state = subprocess.check_output(
+                [
+                    *restore_compose_cmd,
+                    "--env-file",
+                    str(restored_env_file),
+                    "exec",
+                    "-T",
+                    "postgres",
+                    "psql",
+                    "-U",
+                    ctx.db_user,
+                    "-d",
+                    ctx.db_name,
+                    "-Atqc",
+                    f"SELECT state FROM dalton_chat_file_uploads WHERE upload_id = '{sentinel['uploading_id']}';",
+                ],
+                cwd=str(restore_dir),
+                env=restore_env,
+                text=True,
+                timeout=30,
+            ).strip()
+            assert uploading_restored_state == "aborted", (
+                f"Expected in-progress upload {sentinel['uploading_id']} to be converged to 'aborted' "
+                f"after restore, got {uploading_restored_state!r}"
             )
             restored_bucket = _lib.load_env_file(restored_env_file).get(
                 "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", ""
@@ -1857,6 +2045,7 @@ def check_restore_on_clean_stack(
                     orig_thread_row,
                     orig_minio_count,
                     sentinel,
+                    auth_headers=restore_auth_headers,
                 )
                 log("5a OK (clean empty-instance restore verified: row counts, known thread replay, MinIO SHA-256, Caddy CA).")
 
@@ -1879,7 +2068,7 @@ def check_restore_on_clean_stack(
                     cwd=restore_dir,
                     env=restore_sh_env,
                     check=False,
-                    redact_env=ctx.env,
+                    redact_env=restore_redact_env,
                     timeout=120,
                 )
                 assert guard_proc.returncode != 0, (
@@ -1899,7 +2088,12 @@ def check_restore_on_clean_stack(
                     f"Restored instance stopped serving after refused restore: HTTP {still_live.status}"
                 )
                 still_ws = _https_request(
-                    "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
+                    "GET",
+                    "localhost",
+                    restore_https_port,
+                    "/api/v1/workspaces",
+                    context=ssl_ctx,
+                    headers=restore_auth_headers,
                 )
                 assert still_ws.status == 200, (
                     f"Restored instance /workspaces failed after refused restore: HTTP {still_ws.status}"
@@ -1966,6 +2160,7 @@ def check_restore_on_clean_stack(
                     restore_https_port,
                     "/api/v1/workspaces",
                     context=ssl_ctx,
+                    headers=restore_auth_headers,
                     json_body={"name": "b6-pre-down-v-ws"},
                 )
                 assert extra_ws.status == 201, f"Failed to create extra workspace before down -v: {extra_ws.status}"
@@ -2404,6 +2599,7 @@ def check_restore_on_clean_stack(
                     orig_thread_row,
                     orig_minio_count,
                     sentinel,
+                    auth_headers=restore_auth_headers,
                 )
                 log("5f OK (manual down -v followed by restore.sh succeeded with identical data).")
             finally:
@@ -2452,8 +2648,33 @@ def check_upgrade_same_version(
 
     snapshot_root = ctx.work_dir / ".upgrade-backup"
     existing_snaps = set(snapshot_root.iterdir()) if snapshot_root.is_dir() else set()
+    env_file = ctx.work_dir / ".env"
+    pre_upgrade_env_bytes = env_file.read_bytes()
+    upgrade_owner_secret = (
+        _lib.oss_owner_headers(ctx).get(_lib.OWNER_HEADER_NAME)
+        or secrets.token_hex(32)
+    )
+    upgrade_auth_headers = _lib.oss_owner_headers(owner_secret=upgrade_owner_secret)
+    upgrade_redact_env = {**ctx.env, _lib.OWNER_SECRET_ENV_KEY: upgrade_owner_secret}
 
     try:
+        # upgrade.sh isolates .env via `env -u` before every compose call. Explicitly set
+        # oss auth + owner secret in .env (keeping VITE_DALTON_AUTH intact) so the upgraded
+        # oss-group stack stays in oss mode and accepts X-LangAlpha-Owner.
+        env_file.write_text(
+            _rewrite_env_keys(
+                pre_upgrade_env_bytes.decode("utf-8"),
+                {
+                    "DALTON_AUTH_MODE": "oss",
+                    "DALTON_ALLOW_DEV_OSS_AUTH": "1",
+                    "HOST_MODE": "oss",
+                    _lib.OWNER_SECRET_ENV_KEY: upgrade_owner_secret,
+                },
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(env_file, 0o600)
+
         with tempfile.TemporaryDirectory(prefix="b6-upgrade-") as tmpdir:
             tmp_path = Path(tmpdir)
             upgrade_backups = tmp_path / "upgrade-backups"
@@ -2478,7 +2699,7 @@ def check_upgrade_same_version(
             _run_cmd(
                 upgrade_cmd,
                 cwd=ctx.work_dir,
-                redact_env=ctx.env,
+                redact_env=upgrade_redact_env,
                 timeout=600,
             )
 
@@ -2522,7 +2743,14 @@ def check_upgrade_same_version(
             ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
             _wait_for_https_ready("localhost", https_port, "/__probe/health", context=ssl_ctx, timeout=90.0)
-            me_resp = _https_request("GET", "localhost", https_port, "/api/v1/users/me", context=ssl_ctx)
+            me_resp = _https_request(
+                "GET",
+                "localhost",
+                https_port,
+                "/api/v1/users/me",
+                context=ssl_ctx,
+                headers=upgrade_auth_headers,
+            )
             assert me_resp.status == 200 and me_resp.json()["user"]["user_id"] == LOCAL_DEV_USER, (
                 f"Post-upgrade /users/me check failed: {me_resp.status} {me_resp.text}"
             )
@@ -2532,6 +2760,7 @@ def check_upgrade_same_version(
                 https_port,
                 f"/api/v1/threads/{sentinel['thread_id']}/messages/replay",
                 context=ssl_ctx,
+                headers=upgrade_auth_headers,
             )
             assert replay_resp.status == 200, (
                 f"Post-upgrade known thread replay failed: {replay_resp.status}"
@@ -2543,6 +2772,8 @@ def check_upgrade_same_version(
         finally:
             ca_path.unlink(missing_ok=True)
     finally:
+        env_file.write_bytes(pre_upgrade_env_bytes)
+        os.chmod(env_file, 0o600)
         # Clean up CI-created .upgrade-backup snapshots
         if snapshot_root.is_dir():
             for snap in list(snapshot_root.iterdir()):

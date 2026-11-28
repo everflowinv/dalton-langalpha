@@ -1056,7 +1056,6 @@ def test_package_release_core_strict_scan_and_end_to_end_core_seed(tmp_path: Pat
         assert not (core_var_target / entry).exists()
     assert not (core_var_target / "skills").exists()
     assert (core_var_target / "state" / "a-share-volume-watch").is_dir()
-    assert (core_var_target / "state" / "sentiment-dashboard" / "cos-venv" / "bin" / "python").is_file()
 
 
 def test_seed_openclaw_data_respects_profile_for_everflow_only(tmp_path: Path) -> None:

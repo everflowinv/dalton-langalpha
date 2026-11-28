@@ -1,4 +1,4 @@
-"""Unit tests for AlphaEngine/prod watchdogs, host_services_switch.sh, research_runtime_migrate.sh batch 3 coordination, and bridge host_services check."""
+"""Unit tests for AlphaEngine/prod watchdogs, host_services_switch.sh, and bridge host_services check."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from pathlib import Path
 import plistlib
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import time
@@ -24,7 +23,6 @@ WATCHDOG_SH = (
 )
 PROD_WATCHDOG_SH = SCRIPTS_DALTON / "ops" / "prod" / "watchdog.sh"
 SWITCH_SH = SCRIPTS_DALTON / "ops" / "host_services_switch.sh"
-MIGRATE_SH = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
 
 if str(SCRIPTS_DALTON) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DALTON))
@@ -647,207 +645,6 @@ exit 7
     assert not list(launch_agents.glob("*.tmp.*"))
 
 
-def test_research_runtime_migrate_batch3_copy_list_and_rerender_coordination(
-    tmp_path: Path,
-) -> None:
-    src = tmp_path / "src_ocw"
-    dst = tmp_path / "dst_research"
-    (src / "config").mkdir(parents=True)
-    (src / "state").mkdir(parents=True)
-    (src / "temp" / "alphaengine-mcp-downloads").mkdir(parents=True)
-    (src / "wiki" / "companies").mkdir(parents=True)
-    (src / "wiki" / "sectors").mkdir(parents=True)
-    (src / "skills" / "market-digest" / "output").mkdir(parents=True)
-    (src / "state" / "sales-notes").mkdir(parents=True)
-    (src / "state" / "funda-ai").mkdir(parents=True)
-    (src / "state" / "research-images").mkdir(parents=True)
-    (src / "state" / "tmtb-alphaengine").mkdir(parents=True)
-    (src / "skills" / "company-filings-alert" / "state").mkdir(parents=True)
-    (src / "market-memory").mkdir(parents=True)
-
-    (src / "config" / "guidepoint_mcp.env").write_text(
-        "GUIDEPOINT_CLIENT_ID=id_never_print\nGUIDEPOINT_CLIENT_SECRET=sec_never_print\n",
-        encoding="utf-8",
-    )
-    (src / "config" / "guidepoint_mcp_tokens.json").write_text(
-        '{"access_token":"tok_never_print","refresh_token":"ref_never_print"}\n',
-        encoding="utf-8",
-    )
-    (src / "state" / "alphaengine-desktop-watchdog.json").write_text(
-        '{"checked_at":"2026-11-17T00:00:00Z","status":"ready"}\n',
-        encoding="utf-8",
-    )
-    (src / "state" / "alphaengine-desktop-watchdog.last-notified").write_text("1700000000\n", encoding="utf-8")
-    (src / "temp" / "alphaengine-mcp-downloads" / "temp.pdf").write_bytes(b"temp download")
-
-    plan_res = subprocess.run(
-        ["/bin/bash", str(MIGRATE_SH), "--plan", "--src", str(src), "--dst", str(dst)],
-        capture_output=True,
-        text=True,
-    )
-    assert plan_res.returncode == 0, plan_res.stderr
-    assert "temp/alphaengine-mcp-downloads" in plan_res.stdout
-    assert "不复制" in plan_res.stdout
-    assert "config/guidepoint_mcp.env" in plan_res.stdout
-    assert "config/guidepoint_mcp_tokens.json" in plan_res.stdout
-
-    # Stub launchctl showing no active bridge/writers during --apply
-    launchctl_idle = _make_stub(tmp_path / "launchctl_idle", "exit 113\n")
-    apply_res = subprocess.run(
-        [
-            "/bin/bash",
-            str(MIGRATE_SH),
-            "--apply",
-            "--i-have-paused-writers",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-        ],
-        env={**dict(), "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(tmp_path), "LAUNCHCTL_BIN": str(launchctl_idle)},
-        capture_output=True,
-        text=True,
-    )
-    assert apply_res.returncode == 0, apply_res.stderr + apply_res.stdout
-    assert "sec_never_print" not in apply_res.stdout
-    assert "tok_never_print" not in apply_res.stdout
-    assert stat.S_IMODE((dst / "config" / "guidepoint_mcp.env").stat().st_mode) == 0o600
-    assert stat.S_IMODE((dst / "config" / "guidepoint_mcp_tokens.json").stat().st_mode) == 0o600
-    assert (dst / "state" / "alphaengine-desktop-watchdog.json").is_file()
-    assert (dst / "state" / "alphaengine-desktop-watchdog.last-notified").is_file()
-    assert not (dst / "temp" / "alphaengine-mcp-downloads").exists()
-
-
-def test_research_runtime_migrate_switch_rerenders_loaded_host_services(
-    tmp_path: Path,
-) -> None:
-    ctx = _setup_switch_env(tmp_path, mode="legacy", preloaded_new=True)
-    dst = ctx["research_home"]
-    src = ctx["ocw_root"]
-    launch_agents: Path = ctx["launch_agents"]
-    cfg_dir = tmp_path / "cfg"
-    cfg_dir.mkdir(parents=True)
-
-    # Populate minimal valid target home so --check-runtime passes
-    for skill, expected_ver in (
-        ("findata-analyst", "3.12.9"),
-        ("cn-hk-findata", "3.12.9"),
-        ("company-wiki", "3.14.6"),
-        ("market-digest", "3.13.5"),
-        ("employee-reviews", "3.14.6"),
-        ("consensus-estimates", "3.14.6"),
-    ):
-        py = dst / "venvs" / skill / "bin" / "python"
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.symlink_to(sys.executable)
-        (dst / "venvs" / skill / "pyvenv.cfg").write_text(f"version = {expected_ver}\n", encoding="utf-8")
-    for rel_file in (
-        "wiki/vectors.db",
-        "skills/market-digest/vectors.db",
-        "state/sales-notes/manifest.jsonl",
-        "state/funda-ai/index.sqlite",
-        "state/research-images/index.sqlite",
-        "config/config.json",
-        "config/eve_tracking_mirror.json",
-    ):
-        p = dst / rel_file
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('{"enabled": false}\n', encoding="utf-8")
-    for rel_dir in (
-        "wiki/companies",
-        "wiki/sectors",
-        "skills/market-digest/output",
-        "state/tmtb-alphaengine",
-        "market-memory",
-    ):
-        (dst / rel_dir).mkdir(parents=True, exist_ok=True)
-
-    bridge_env = cfg_dir / "researchdata-bridge.env"
-    bridge_env.write_text(
-        f"DALTON_BRIDGE_TOKEN=tok_s\nDALTON_BRIDGE_ADMIN_TOKEN=adm_s\nEDGAR_IDENTITY=Test <t@example.com>\nDALTON_RESEARCH_HOME={src}\n",
-        encoding="utf-8",
-    )
-    (tmp_path / ".env").write_text("DALTON_BRIDGE_TOKEN=tok_s\n", encoding="utf-8")
-
-    # Seed legacy plists for com.dalton.* pointing to ocw_root
-    for lbl in (
-        "com.dalton.alphaengine-mcp",
-        "com.dalton.alphaengine-desktop-watchdog",
-        "com.dalton.guidepoint-mcp-proxy",
-    ):
-        (launch_agents / f"{lbl}.plist").write_text(
-            f'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>{lbl}</string></dict></plist>\n',
-            encoding="utf-8",
-        )
-
-    # Extend curl stub so bridge /healthz also passes during install_bridge.sh
-    curl_with_bridge = _make_stub(
-        tmp_path / "curl_with_bridge",
-        """
-url="${@: -1}"
-if [[ "$url" == *":8960/healthz" ]]; then
-  printf '{"ok":true}'
-  exit 0
-fi
-if [[ "$url" == *":8943/mcp" ]]; then
-  printf '405'
-  exit 0
-fi
-if [[ "$url" == *":8950/health" ]]; then
-  printf '{"ok":true}'
-  exit 0
-fi
-exit 7
-""",
-    )
-
-    migrate_env = {
-        **ctx["env"],
-        # ctx["env"] is built without os.environ; carry the autouse ps stub over.
-        "DALTON_MIGRATE_PS_BIN": os.environ["DALTON_MIGRATE_PS_BIN"],
-        "DALTON_BRIDGE_ENV_FILE": str(bridge_env),
-        "DALTON_REPO_ENV_FILE": str(tmp_path / ".env"),
-        "DALTON_BRIDGE_LOGS_DIR": str(tmp_path / "Logs"),
-        "DALTON_OCW_PYTHON": sys.executable,
-        "DALTON_BRIDGE_HEALTH_RETRIES": "2",
-        "DALTON_BRIDGE_HEALTH_SLEEP_S": "0.1",
-        "CURL_BIN": str(curl_with_bridge),
-    }
-
-    sw_res = subprocess.run(
-        [
-            "/bin/bash",
-            str(MIGRATE_SH),
-            "--switch",
-            "--src",
-            str(src),
-            "--dst",
-            str(dst),
-            "--bridge-env",
-            str(bridge_env),
-            "--prepare-config",
-            str(cfg_dir / "prepare.json"),
-            "--output-config",
-            str(cfg_dir / "output.json"),
-        ],
-        env=migrate_env,
-        capture_output=True,
-        text=True,
-    )
-    assert sw_res.returncode == 0, sw_res.stderr + sw_res.stdout
-    assert "host_services_switch.sh --apply --rerender-only" in sw_res.stdout
-
-    # Verify all 3 com.dalton.* plists were rerendered onto dst (new mode)
-    for lbl in (
-        "com.dalton.alphaengine-mcp",
-        "com.dalton.alphaengine-desktop-watchdog",
-        "com.dalton.guidepoint-mcp-proxy",
-    ):
-        env_vars = plistlib.loads((launch_agents / f"{lbl}.plist").read_bytes())["EnvironmentVariables"]
-        assert env_vars["DALTON_RESEARCH_HOME"] == str(dst.resolve())
-        assert "DALTON_OCW_ROOT" not in env_vars
-
-
 def test_check_runtime_host_services_reports_ports_and_launchd_labels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -857,7 +654,7 @@ def test_check_runtime_host_services_reports_ports_and_launchd_labels(
         """
 target="${2:-}"
 case "$target" in
-  */com.dalton.alphaengine-mcp|*/com.dalton.alphaengine-desktop-watchdog|*/ai.openclaw.guidepoint-mcp-proxy)
+  */com.dalton.alphaengine-mcp|*/com.dalton.alphaengine-desktop-watchdog)
     exit 0
     ;;
   *)
@@ -884,8 +681,8 @@ esac
     assert hs["alphaengine_mcp"]["active_label"] == "com.dalton.alphaengine-mcp"
     assert hs["alphaengine_desktop_watchdog"]["label_kind"] == "new"
     assert hs["guidepoint_mcp_proxy"]["reachable"] is False
-    assert hs["guidepoint_mcp_proxy"]["label_kind"] == "old"
-    assert hs["guidepoint_mcp_proxy"]["active_label"] == "ai.openclaw.guidepoint-mcp-proxy"
+    assert hs["guidepoint_mcp_proxy"]["label_kind"] == "unknown"
+    assert hs["guidepoint_mcp_proxy"]["active_label"] == "unknown"
 
     monkeypatch.setenv("LAUNCHCTL_BIN", str(tmp_path / "nonexistent_launchctl"))
     hs_unknown = rb._check_host_services_status()
@@ -1094,13 +891,3 @@ def test_rerender_only_restores_earlier_services_when_a_later_template_fails_to_
     for label, text in sentinels.items():
         assert (launch_agents / f"{label}.plist").read_text(encoding="utf-8") == text
     assert not list(launch_agents.glob("*.tmp.*"))
-
-
-@pytest.fixture(autouse=True)
-def _no_host_writer_processes(tmp_path_factory, monkeypatch):
-    """research_runtime_migrate.sh refuses --apply while a real writer runs on this
-    machine; tests must not depend on what the host happens to be running."""
-    stub = tmp_path_factory.mktemp("psstub") / "ps"
-    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    stub.chmod(0o755)
-    monkeypatch.setenv("DALTON_MIGRATE_PS_BIN", str(stub))

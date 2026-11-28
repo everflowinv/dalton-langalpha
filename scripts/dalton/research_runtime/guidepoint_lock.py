@@ -176,11 +176,8 @@ def resolve_guidepoint_tokens_file(
         base = Path(data_root).expanduser().resolve()
     else:
         raw_home = str(env.get("DALTON_RESEARCH_HOME") or "").strip()
-        raw_ocw = str(env.get("DALTON_OCW_ROOT") or "").strip()
         if raw_home:
             base = Path(raw_home).expanduser().resolve()
-        elif raw_ocw:
-            base = Path(raw_ocw).expanduser().resolve()
         else:
             base = (Path.home() / "Library" / "Application Support" / "Everflow" / "research").resolve()
     return base / "config" / "guidepoint_mcp_tokens.json"

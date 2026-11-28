@@ -95,7 +95,6 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "notify_enabled": False,
         "notify_routes": None,
         "notify_storage_mode": "legacy",
-        "cos_mode": "skip",
         "config_version": 1,
         "active_version": 1,
         "updated_by": "seed",
@@ -323,7 +322,7 @@ async def test_schedule_change_appends_history_and_cancels_only_queued_cron(
     }
     assert history[1]["snapshot"]["notify_routes"] is None
     assert history[1]["snapshot"]["notify_storage_mode"] == "legacy"
-    assert history[1]["snapshot"]["cos_mode"] == "skip"
+    assert "cos_mode" not in history[1]["snapshot"]
     assert "command_argv" not in history[1]["snapshot"]
     cancel = writes["cancel"].await_args.kwargs
     assert cancel["failure_reason"] == "schedule_changed_before_start"

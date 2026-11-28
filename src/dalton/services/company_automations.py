@@ -48,6 +48,7 @@ class AutomationHistoryContext:
     ) = None
     prelocked_pref_row: dict[str, Any] | None = None
     report_delivery_audit: dict[str, Any] | None = None
+    post_save_notify_routes: Mapping[str, Sequence[str]] | None = None
 
     @property
     def has_explicit_actor(self) -> bool:
@@ -102,6 +103,7 @@ def automation_history_context(
     ) = None,
     prelocked_pref_row: dict[str, Any] | None = None,
     report_delivery_audit: dict[str, Any] | None = None,
+    post_save_notify_routes: Mapping[str, Sequence[str]] | None = None,
 ) -> Iterator[AutomationHistoryContext]:
     """Bind history recording parameters for the enclosed automation write call."""
     parent = _HISTORY_CTX_VAR.get()
@@ -135,6 +137,11 @@ def automation_history_context(
         if report_delivery_audit is not None
         else (parent.report_delivery_audit if parent is not None else None)
     )
+    eff_post_save_routes = (
+        post_save_notify_routes
+        if post_save_notify_routes is not None
+        else (parent.post_save_notify_routes if parent is not None else None)
+    )
     parent_reconciler = parent.locked_row_reconciler if parent is not None else None
     if parent_reconciler is not None and locked_row_reconciler is not None:
         inner_reconciler = locked_row_reconciler
@@ -165,6 +172,7 @@ def automation_history_context(
         locked_row_reconciler=eff_reconciler,
         prelocked_pref_row=eff_prelocked_pref,
         report_delivery_audit=eff_report_audit,
+        post_save_notify_routes=eff_post_save_routes,
     )
     token = _HISTORY_CTX_VAR.set(ctx)
     try:

@@ -101,6 +101,8 @@ class DaltonCompleteResult:
     attempt: int = 1
     error_kind: str | None = None
     error: str | None = None
+    refusal_reason: str | None = None
+    quota_or_auth_trigger: bool = False
     stream_started: bool = False
     chunks_received: int = 0
 
@@ -869,6 +871,14 @@ def _classify_exception(
         - `('failed', 'http_4xx')` on explicit 400/401/403/404 rejection without charge
         - `('indeterminate', ...)` on timeout, 429, 5xx, stream cut, or unknown mid-flight error
     """
+    from src.dalton.llm.oauth_refresh import get_transient_oauth_refresh_error
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    # Only the unattended fallback reads this kind; with it off, a 401 keeps its
+    # original classification so ``assist_json`` still takes its existing fallback.
+    if is_unattended_quota_fallback_enabled() and get_transient_oauth_refresh_error(exc) is not None:
+        return "failed", "oauth_refresh_unavailable"
+
     if isinstance(exc, DeadlineBeforeSendError):
         return "failed", "deadline"
     if isinstance(exc, ( asyncio.TimeoutError, TimeoutError)):
@@ -1224,6 +1234,85 @@ def _finish(result: DaltonCompleteResult, *, raise_on_error: bool) -> DaltonComp
 _UNSET = object()
 
 
+def _resolve_completion_scope_and_invocation(
+    *,
+    purpose: str,
+    model_key: str,
+    user_prompt: str,
+    system_prompt: str | None = None,
+    response_schema: Type[BaseModel] | dict[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    slot: Literal["background", "primary"] = "background",
+    scope_ref: str | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
+    invocation_id: str | None = None,
+) -> tuple[str, str, str]:
+    """Compute ``(eff_scope, inv_id, request_hash)`` identically for journal probe and send."""
+    if scope_ref:
+        eff_scope = scope_ref
+    else:
+        eff_scope = (
+            f"{purpose}:"
+            + hashlib.sha256(f"{system_prompt or ''}\n{user_prompt}".encode("utf-8")).hexdigest()[:24]
+        )
+        if workspace_id and str(workspace_id) not in eff_scope:
+            eff_scope = f"{eff_scope}@ws:{workspace_id}"
+        if thread_id and str(thread_id) not in eff_scope:
+            eff_scope = f"{eff_scope}@th:{thread_id}"
+    computed_inv_id, request_hash = compute_invocation_id_and_hash(
+        scope_ref=eff_scope,
+        purpose=purpose,
+        model_key=model_key,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        response_schema=response_schema,
+        reasoning_effort=reasoning_effort,
+        slot=slot,
+    )
+    return eff_scope, (invocation_id or computed_inv_id), request_hash
+
+
+async def inspect_existing_completion_journal(
+    *,
+    purpose: str,
+    model_key: str,
+    user_prompt: str,
+    system_prompt: str | None = None,
+    response_schema: Type[BaseModel] | dict[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    slot: Literal["background", "primary"] = "background",
+    scope_ref: str | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
+    invocation_id: str | None = None,
+    stale_after_s: int = 900,
+    resend_indeterminate: bool = False,
+    resend_max_attempts: int | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Inspect existing journal state for a completion request before switching models."""
+    _, inv_id, request_hash = _resolve_completion_scope_and_invocation(
+        purpose=purpose,
+        model_key=model_key,
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        response_schema=response_schema,
+        reasoning_effort=reasoning_effort,
+        slot=slot,
+        scope_ref=scope_ref,
+        workspace_id=workspace_id,
+        thread_id=thread_id,
+        invocation_id=invocation_id,
+    )
+    return await inspect_journal_state(
+        inv_id,
+        request_hash=request_hash,
+        stale_after_s=stale_after_s,
+        resend_indeterminate=resend_indeterminate,
+        resend_max_attempts=resend_max_attempts,
+    )
+
+
 async def dalton_complete(
     llm_service: Any = None,
     *,
@@ -1385,28 +1474,19 @@ async def _dalton_complete_impl(
             ignore_custom_models=ignore_custom_models,
         )
     )
-    if scope_ref:
-        eff_scope = scope_ref
-    else:
-        eff_scope = (
-            f"{purpose}:"
-            + hashlib.sha256(f"{system_prompt or ''}\n{user_prompt}".encode("utf-8")).hexdigest()[:24]
-        )
-        if workspace_id and str(workspace_id) not in eff_scope:
-            eff_scope = f"{eff_scope}@ws:{workspace_id}"
-        if thread_id and str(thread_id) not in eff_scope:
-            eff_scope = f"{eff_scope}@th:{thread_id}"
-    computed_inv_id, request_hash = compute_invocation_id_and_hash(
-        scope_ref=eff_scope,
+    eff_scope, inv_id, request_hash = _resolve_completion_scope_and_invocation(
         purpose=purpose,
         model_key=effective_model,
-        system_prompt=system_prompt,
         user_prompt=user_prompt,
+        system_prompt=system_prompt,
         response_schema=response_schema,
         reasoning_effort=reasoning_effort,
         slot=slot,
+        scope_ref=scope_ref,
+        workspace_id=workspace_id,
+        thread_id=thread_id,
+        invocation_id=invocation_id,
     )
-    inv_id = invocation_id or computed_inv_id
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.
@@ -2212,6 +2292,17 @@ async def _dalton_complete_impl(
         if target_state == "indeterminate" or final_attempt_unknown:
             result_usage["usage_known"] = not final_attempt_unknown
             result_usage["unknown_usage_calls"] = attempt_unknown_calls
+        from src.dalton.llm.oauth_refresh import get_transient_oauth_refresh_error
+        from src.dalton.llm.unattended_fallback import is_quota_or_auth_switch_trigger
+        from src.llms.provider_errors import read_refusal
+
+        if get_transient_oauth_refresh_error(exc) is not None:
+            exc_refusal_reason = None
+            exc_quota_or_auth = False
+        else:
+            exc_refusal = read_refusal(exc)
+            exc_refusal_reason = exc_refusal.reason if exc_refusal is not None else None
+            exc_quota_or_auth = is_quota_or_auth_switch_trigger(exc)
         return _finish(
             DaltonCompleteResult(
                 ok=False,
@@ -2226,6 +2317,8 @@ async def _dalton_complete_impl(
                 attempt=attempt,
                 error_kind=error_kind,
                 error=err_summary,
+                refusal_reason=exc_refusal_reason,
+                quota_or_auth_trigger=exc_quota_or_auth,
                 stream_started=stream_started,
                 chunks_received=chunks_received,
             ),
