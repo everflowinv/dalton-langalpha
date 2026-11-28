@@ -1114,6 +1114,31 @@ async def rollback_automation(
             desired = str(snapshot["desired_status"])
             preview = dict(row)
             preview.update({name: snapshot.get(name) for name in _SNAPSHOT_COLUMNS})
+            post_notify = (
+                bool(snapshot.get("notify_enabled")),
+                [
+                    str(item)
+                    for item in snapshot.get("notify_routes") or []
+                    if isinstance(item, str)
+                ],
+            )
+            if not company:
+                from src.dalton.notify.delivery_mutex import (
+                    assert_no_automation_delivery_notify_conflict,
+                )
+                from src.server.services.automations.lifecycle import AutomationRefusal
+
+                try:
+                    await assert_no_automation_delivery_notify_conflict(
+                        user_id=str(row.get("user_id") or pref_owner),
+                        automation=preview,
+                        delivery_config=dict(snapshot.get("delivery_config") or {}),
+                        metadata=row.get("metadata"),
+                        notify_routes=list(post_notify[1]),
+                        model_pref=pref_bag,
+                    )
+                except AutomationRefusal as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
             status, next_run = await _effective_for_row(
                 row,
                 desired=desired,
@@ -1131,14 +1156,6 @@ async def rollback_automation(
                     skip_reason="paused",
                     conn=db,
                 )
-            post_notify = (
-                bool(snapshot.get("notify_enabled")),
-                [
-                    str(item)
-                    for item in snapshot.get("notify_routes") or []
-                    if isinstance(item, str)
-                ],
-            )
             target_prev = target.get("prev_version") if target else None
             if isinstance(target_prev, bool) or (
                 target_prev is not None and not isinstance(target_prev, int)

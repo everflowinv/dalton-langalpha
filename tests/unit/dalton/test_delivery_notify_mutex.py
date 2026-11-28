@@ -1377,3 +1377,813 @@ async def test_report_submit_uses_locked_execution_record_on_mid_run_switch_and_
     # and exec_2's saved report batch is confirmed on the Dalton report path.
     assert spies["gateway_request"].await_count == 1
     assert any(call.args == (exec_2,) for call in read_confirmed_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_put_dalton_automation_create_refuses_builtin_with_web_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PUT /api/v1/dalton/automations/{name} rejects creating a built-in task with delivery_config.methods."""
+    from src.dalton.app import router as dalton_router
+    from src.dalton.autonomy import schedule as schedule_mod
+    from src.dalton.database import company_automations as ca_db
+    from src.dalton.notify.delivery_mutex import BUILTIN_DELIVERY_CONFLICT_MSG
+    from src.dalton.services.team_model_catalog import service as catalog_svc
+    from src.dalton.watchlist import pause_guards
+
+    ws_id = "44444444-4444-4444-8444-444444444444"
+    owner_uid = "user-alice"
+
+    @asynccontextmanager
+    async def _fake_lock_ctx(user_id: str, *, conn: Any = None, prelock_ws: Any = None):
+        _ = user_id, conn, prelock_ws
+        yield None
+
+    monkeypatch.setattr(
+        dalton_router,
+        "_require_dalton_enabled",
+        create_autospec(dalton_router._require_dalton_enabled, return_value=None),
+    )
+    monkeypatch.setattr(
+        dalton_router,
+        "_verify_workspace_access",
+        create_autospec(dalton_router._verify_workspace_access, return_value=None),
+    )
+    import src.dalton.settings as dalton_settings_mod
+
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_coverage_units_enabled",
+        create_autospec(dalton_settings_mod.is_coverage_units_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_auth_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_local_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_local_auth_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "verify_workspace_access",
+        create_autospec(
+            schedule_mod.verify_workspace_access,
+            return_value={"workspace_id": ws_id, "user_id": owner_uid, "name": "NVDA"},
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_user_automations_lock_for_write",
+        _fake_lock_ctx,
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "list_all_user_automations",
+        create_autospec(schedule_mod.list_all_user_automations, return_value=[]),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_read_workspace_computer_snapshot",
+        create_autospec(
+            schedule_mod._read_workspace_computer_snapshot,
+            return_value=(None, False),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_lock_and_verify_workspace_placement",
+        create_autospec(
+            schedule_mod._lock_and_verify_workspace_placement,
+            return_value=(None, schedule_mod._UNSET_RESOLVED_COMPUTER),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_recheck_operator_authorization_in_tx",
+        create_autospec(schedule_mod._recheck_operator_authorization_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        pause_guards,
+        "validate_earnings_stage_allowed_for_user",
+        create_autospec(pause_guards.validate_earnings_stage_allowed_for_user, return_value=None),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "_safe_model_pref",
+        create_autospec(lifecycle_mod._safe_model_pref, return_value={}),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, return_value=None),
+    )
+    monkeypatch.setattr(
+        catalog_svc,
+        "assert_model_not_retired_under_lock",
+        create_autospec(catalog_svc.assert_model_not_retired_under_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        ca_db,
+        "resolve_automation_scope_for_write",
+        create_autospec(ca_db.resolve_automation_scope_for_write, return_value="personal"),
+    )
+    create_auto_mock = create_autospec(auto_db.create_automation, return_value={})
+    monkeypatch.setattr(auto_db, "create_automation", create_auto_mock)
+
+    body = dalton_router.DaltonAutomationWriteRequest(
+        workspace_id=ws_id,
+        spec={
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "instruction": "Run NVDA earnings preview",
+            "delivery_config": {"methods": ["feishu"]},
+            "metadata": {"ticker": "NVDA", "dalton_kind": "earnings_t0"},
+        },
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await dalton_router.put_dalton_automation_endpoint(
+            name="dalton-nvda-earn-2026q3-t0",
+            body=body,
+            user_id=owner_uid,
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == BUILTIN_DELIVERY_CONFLICT_MSG
+    create_auto_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_put_dalton_automation_update_refuses_adding_report_profile_under_row_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PUT /api/v1/dalton/automations/{name} update rejects adding report_profile when the locked row has web channels."""
+    from src.dalton.app import router as dalton_router
+    from src.dalton.autonomy import schedule as schedule_mod
+    from src.dalton.database import company_automations as ca_db
+    from src.dalton.notify.delivery_mutex import REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    from src.dalton.services import report_delivery as rd_svc
+    from src.dalton.watchlist import pause_guards
+
+    auto_id = "77777777-7777-4777-8777-777777777777"
+    ws_id = "44444444-4444-4444-8444-444444444444"
+    owner_uid = "user-alice"
+    task_name = "dalton-nvda-earn-2026q3-t0"
+
+    existing_pre_lock = {
+        "automation_id": auto_id,
+        "user_id": owner_uid,
+        "workspace_id": ws_id,
+        "name": task_name,
+        "instruction": "Run market-digest-am report",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "status": "active",
+        "scope": "personal",
+        "config_version": 1,
+        "active_version": 1,
+        "delivery_config": {},
+        "metadata": {"ticker": "NVDA"},
+        "audit_history": [],
+    }
+    # Locked row under FOR UPDATE holds web delivery_config.methods (simulates both existing and TOCTOU race)
+    locked_db_row = {
+        **existing_pre_lock,
+        "delivery_config": {"methods": ["feishu"]},
+    }
+    executed_sqls: list[str] = []
+
+    class _ScheduleLockCur:
+        def __init__(self) -> None:
+            self._sql = ""
+
+        async def __aenter__(self) -> "_ScheduleLockCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            _ = params
+            self._sql = " ".join(sql.split())
+            executed_sqls.append(self._sql)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            if "FROM automations" in self._sql and "FOR UPDATE" in self._sql:
+                return dict(locked_db_row)
+            return None
+
+    class _ScheduleLockTx:
+        async def __aenter__(self) -> "_ScheduleLockTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _ScheduleLockConn:
+        def transaction(self) -> _ScheduleLockTx:
+            return _ScheduleLockTx()
+
+        def cursor(self, **kwargs: Any) -> _ScheduleLockCur:
+            _ = kwargs
+            return _ScheduleLockCur()
+
+    fake_conn = _ScheduleLockConn()
+
+    @asynccontextmanager
+    async def _fake_lock_ctx(user_id: str, *, conn: Any = None, prelock_ws: Any = None):
+        _ = user_id, conn, prelock_ws
+        yield fake_conn
+
+    monkeypatch.setattr(
+        dalton_router,
+        "_require_dalton_enabled",
+        create_autospec(dalton_router._require_dalton_enabled, return_value=None),
+    )
+    monkeypatch.setattr(
+        dalton_router,
+        "_verify_workspace_access",
+        create_autospec(dalton_router._verify_workspace_access, return_value=None),
+    )
+    import src.dalton.settings as dalton_settings_mod
+
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_coverage_units_enabled",
+        create_autospec(dalton_settings_mod.is_coverage_units_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_auth_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_local_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_local_auth_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "verify_workspace_access",
+        create_autospec(
+            schedule_mod.verify_workspace_access,
+            return_value={"workspace_id": ws_id, "user_id": owner_uid, "name": "NVDA"},
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_user_automations_lock_for_write",
+        _fake_lock_ctx,
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "list_all_user_automations",
+        create_autospec(schedule_mod.list_all_user_automations, return_value=[existing_pre_lock]),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_read_workspace_computer_snapshot",
+        create_autospec(
+            schedule_mod._read_workspace_computer_snapshot,
+            return_value=(None, False),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_lock_and_verify_workspace_placement",
+        create_autospec(
+            schedule_mod._lock_and_verify_workspace_placement,
+            return_value=(None, schedule_mod._UNSET_RESOLVED_COMPUTER),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "_recheck_operator_authorization_in_tx",
+        create_autospec(schedule_mod._recheck_operator_authorization_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        ca_db,
+        "resolve_automation_scope_for_write",
+        create_autospec(ca_db.resolve_automation_scope_for_write, return_value="personal"),
+    )
+    sync_tx_mock = create_autospec(
+        schedule_mod._sync_report_profile_in_schedule_tx,
+        return_value=None,
+    )
+    monkeypatch.setattr(schedule_mod, "_sync_report_profile_in_schedule_tx", sync_tx_mock)
+    monkeypatch.setattr(
+        pause_guards,
+        "validate_earnings_stage_allowed_for_user",
+        create_autospec(pause_guards.validate_earnings_stage_allowed_for_user, return_value=None),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "_safe_model_pref",
+        create_autospec(lifecycle_mod._safe_model_pref, return_value={}),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, return_value=None),
+    )
+    monkeypatch.setattr(
+        ca_db,
+        "lock_and_fetch_user_preferences_for_snapshot",
+        create_autospec(
+            ca_db.lock_and_fetch_user_preferences_for_snapshot,
+            return_value={"model_preference": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "get_user_tier",
+        create_autospec(rd_svc.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "list_authorized_group_bindings",
+        create_autospec(rd_svc.list_authorized_group_bindings, return_value=[]),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "list_caller_dm_identities",
+        create_autospec(
+            rd_svc.list_caller_dm_identities,
+            return_value=[
+                {
+                    "platform": "feishu",
+                    "platform_user_id": "ou_alice",
+                    "target": "feishu:user:ou_alice",
+                    "supports_report_cards": True,
+                    "supports_text_targets": True,
+                },
+                {
+                    "platform": "discord",
+                    "platform_user_id": "424242424242424242",
+                    "target": "discord:user:424242424242424242",
+                    "supports_report_cards": False,
+                    "supports_failure_targets": True,
+                },
+            ],
+        ),
+    )
+
+    body = dalton_router.DaltonAutomationWriteRequest(
+        workspace_id=ws_id,
+        spec={
+            "instruction": "Run market-digest-am report",
+            "metadata": {
+                "ticker": "NVDA",
+                "report_profile": {
+                    "profile": "market-digest-am",
+                    "report_targets": ["feishu:user:ou_alice"],
+                    "failure_targets": ["discord:user:424242424242424242"],
+                },
+            },
+        },
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await dalton_router.put_dalton_automation_endpoint(
+            name=task_name,
+            body=body,
+            user_id=owner_uid,
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    assert any("FOR UPDATE" in s and "FROM automations" in s for s in executed_sqls)
+    assert not any("UPDATE automations" in s for s in executed_sqls)
+    sync_tx_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rollback_automation_refuses_restoring_web_delivery_when_report_profile_retained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rolling back to a web-delivery snapshot is refused (409) while current metadata retains report_profile."""
+    from src.dalton.notify.delivery_mutex import REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    from src.dalton.services.company_automations import build_automation_config_snapshot
+
+    auto_id = "66666666-6666-4666-8666-666666666667"
+    ws_id = "44444444-4444-4444-8444-444444444444"
+    owner_uid = "user-alice"
+
+    v1_row = {
+        "automation_id": auto_id,
+        "user_id": owner_uid,
+        "workspace_id": ws_id,
+        "name": "Market Digest AM",
+        "description": "Morning brief",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "instruction": "Run market-digest-am report",
+        "llm_model": None,
+        "reasoning_effort": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "max_failures": 3,
+        "trigger_config": {},
+        "delivery_config": {"methods": ["feishu"]},
+        "status": "active",
+    }
+    v1_snapshot = build_automation_config_snapshot(
+        v1_row,
+        desired_status="active",
+        once_run_at=None,
+        notify_enabled=False,
+        notify_routes=[],
+    )
+    v2_row = {
+        **v1_row,
+        "delivery_config": {},
+        "metadata": {
+            "report_profile": {
+                "profile": "market-digest-am",
+                "report_targets": ["feishu:user:ou_alice"],
+                "failure_targets": ["discord:user:424242424242424242"],
+            }
+        },
+        "scope": "personal",
+        "notify_storage_mode": "legacy",
+        "deleted_at": None,
+        "config_version": 2,
+        "active_version": 2,
+        "audit_history": [
+            {
+                "version": 1,
+                "prev_version": None,
+                "restored_from_version": None,
+                "actor_user_id": owner_uid,
+                "changed_at": "2026-11-27T00:00:00+00:00",
+                "action": "create",
+                "changes": {},
+                "snapshot": v1_snapshot,
+            },
+            {
+                "version": 2,
+                "prev_version": 1,
+                "restored_from_version": None,
+                "actor_user_id": owner_uid,
+                "changed_at": "2026-11-28T00:00:00+00:00",
+                "action": "update",
+                "changes": {},
+                "snapshot": build_automation_config_snapshot(
+                    {**v1_row, "delivery_config": {}},
+                    desired_status="active",
+                    once_run_at=None,
+                    notify_enabled=True,
+                    notify_routes=["feishu:user:ou_alice"],
+                ),
+            },
+        ],
+    }
+
+    class _FakeTx:
+        async def __aenter__(self) -> "_FakeTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _FakeDb:
+        def transaction(self) -> _FakeTx:
+            return _FakeTx()
+
+    @asynccontextmanager
+    async def _fake_conn(conn: Any = None):
+        _ = conn
+        yield _FakeDb()
+
+    prepare_prefs_mock = create_autospec(
+        recycle_svc._prepare_prefs,
+        return_value={
+            "model_preference": {
+                "dalton_notify_routes": {f"automation:{auto_id}": ["feishu:user:ou_alice"]}
+            }
+        },
+    )
+    lock_recycle_mock = create_autospec(
+        recycle_db.lock_automation_for_recycle,
+        return_value=v2_row,
+    )
+    update_recycle_mock = create_autospec(
+        recycle_db.update_automation_recycle,
+        return_value=True,
+    )
+    write_legacy_mock = create_autospec(
+        recycle_svc._write_legacy_rollback_notify,
+        return_value=({}, owner_uid),
+    )
+    skip_execs_mock = create_autospec(
+        recycle_db.skip_unstarted_executions,
+        return_value=0,
+    )
+    import src.dalton.settings as dalton_settings_mod
+
+    monkeypatch.setattr(recycle_svc, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(recycle_svc, "_prepare_prefs", prepare_prefs_mock)
+    monkeypatch.setattr(recycle_db, "lock_automation_for_recycle", lock_recycle_mock)
+    monkeypatch.setattr(recycle_db, "update_automation_recycle", update_recycle_mock)
+    monkeypatch.setattr(recycle_svc, "_write_legacy_rollback_notify", write_legacy_mock)
+    monkeypatch.setattr(recycle_db, "skip_unstarted_executions", skip_execs_mock)
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_coverage_units_enabled",
+        create_autospec(dalton_settings_mod.is_coverage_units_enabled, return_value=False),
+    )
+
+    with pytest.raises(HTTPException) as rb_exc:
+        await recycle_svc.rollback_automation(
+            auto_id,
+            actor_user_id=owner_uid,
+            expected_config_version=2,
+            target_version=1,
+            owner_user_id=owner_uid,
+            company=False,
+        )
+    assert rb_exc.value.status_code == 409
+    assert rb_exc.value.detail == REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    update_recycle_mock.assert_not_awaited()
+    write_legacy_mock.assert_not_awaited()
+    skip_execs_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_one_shot_clear_report_profile_and_set_web_delivery_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One PATCH clearing report_profile and setting delivery_config.methods succeeds while keeping in-lock re-verification."""
+    from src.dalton.database import company_automations as ca_db
+    from src.dalton.notify.delivery_mutex import BUILTIN_DELIVERY_CONFLICT_MSG
+    from src.dalton.services import report_delivery as rd_svc
+    from src.server.services.automations.lifecycle import AutomationRefusal
+
+    auto_id = "55555555-5555-4555-8555-555555555556"
+    ws_id = "44444444-4444-4444-8444-444444444444"
+    owner_uid = "user-alice"
+    old_meta = {
+        "report_profile": {
+            "profile": "market-digest-am",
+            "report_targets": ["feishu:user:ou_alice"],
+            "failure_targets": ["discord:user:424242424242424242"],
+        }
+    }
+    stored_row: dict[str, Any] = {
+        "automation_id": auto_id,
+        "user_id": owner_uid,
+        "workspace_id": ws_id,
+        "name": "Market Digest AM",
+        "description": "Morning brief",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "instruction": "Run market-digest-am report",
+        "llm_model": None,
+        "reasoning_effort": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "max_failures": 3,
+        "trigger_config": {},
+        "delivery_config": {},
+        "metadata": dict(old_meta),
+        "status": "active",
+        "scope": "personal",
+        "notify_storage_mode": "legacy",
+        "config_version": 1,
+        "active_version": 1,
+        "audit_history": [],
+    }
+    # Old report route is STILL in DB when mutate_fn runs (cleared later in same tx by sync_report_profile_after_write_in_tx)
+    stored_prefs_row = {
+        "model_preference": {
+            "dalton_notify_routes": {
+                f"automation:{auto_id}": [
+                    "feishu:user:ou_alice",
+                    "discord:user:424242424242424242",
+                ]
+            }
+        }
+    }
+    locked_name_override: dict[str, str | None] = {"name": None}
+    executed_sqls: list[str] = []
+    updated_snapshot: dict[str, Any] = {}
+
+    class _SwitchCur:
+        def __init__(self) -> None:
+            self._sql = ""
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self) -> "_SwitchCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            self._sql = norm
+            self._one = None
+            executed_sqls.append(norm)
+            if "FROM user_preferences" in norm:
+                self._one = dict(stored_prefs_row)
+            elif "FROM automations" in norm and "FOR UPDATE" in norm:
+                row_copy = dict(stored_row)
+                if locked_name_override["name"] is not None:
+                    row_copy["name"] = locked_name_override["name"]
+                self._one = row_copy
+            elif "FROM automations" in norm:
+                self._one = dict(stored_row)
+            elif "UPDATE automations SET" in norm:
+                updated_snapshot["sql"] = norm
+                updated_snapshot["params"] = params
+                row_after = {
+                    **stored_row,
+                    "delivery_config": {"methods": ["feishu"]},
+                    "metadata": {},
+                    "config_version": 2,
+                    "active_version": 2,
+                }
+                self._one = row_after
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+    class _SwitchTx:
+        async def __aenter__(self) -> "_SwitchTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _SwitchConn:
+        def transaction(self) -> _SwitchTx:
+            return _SwitchTx()
+
+        def cursor(self, **kwargs: Any) -> _SwitchCur:
+            _ = kwargs
+            return _SwitchCur()
+
+    @asynccontextmanager
+    async def _fake_switch_conn(conn: Any = None):
+        yield conn if conn is not None else _SwitchConn()
+
+    monkeypatch.setattr(rd_svc, "_use_conn", _fake_switch_conn)
+    monkeypatch.setattr(auto_db, "get_db_connection", _fake_switch_conn)
+    monkeypatch.setattr(pool_mod, "get_db_connection", _fake_switch_conn)
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_delivery",
+        create_autospec(lifecycle_mod.check_delivery, return_value=["feishu"]),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, return_value=None),
+    )
+    monkeypatch.setattr(
+        ca_db,
+        "lock_and_fetch_user_preferences_for_snapshot",
+        create_autospec(
+            ca_db.lock_and_fetch_user_preferences_for_snapshot,
+            return_value=dict(stored_prefs_row),
+        ),
+    )
+    monkeypatch.setattr(
+        ca_db,
+        "resolve_automation_scope_for_write",
+        create_autospec(ca_db.resolve_automation_scope_for_write, return_value="personal"),
+    )
+    import src.dalton.settings as dalton_settings_mod
+
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_coverage_units_enabled",
+        create_autospec(dalton_settings_mod.is_coverage_units_enabled, return_value=False),
+    )
+    sync_routes_mock = create_autospec(
+        rd_svc.sync_report_delivery_routes_in_tx,
+        return_value={"model_preference": {"dalton_notify_routes": {}}},
+    )
+    refresh_audit_mock = create_autospec(
+        rd_svc.refresh_report_audit_snapshot_in_tx,
+        return_value=None,
+    )
+    monkeypatch.setattr(rd_svc, "sync_report_delivery_routes_in_tx", sync_routes_mock)
+    monkeypatch.setattr(rd_svc, "refresh_report_audit_snapshot_in_tx", refresh_audit_mock)
+    monkeypatch.setattr(
+        rd_svc,
+        "invalidate_user_prefs_cache",
+        create_autospec(rd_svc.invalidate_user_prefs_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "invalidate_user_profile_cache",
+        create_autospec(rd_svc.invalidate_user_profile_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "evaluate_route_warning_best_effort",
+        create_autospec(rd_svc.evaluate_route_warning_best_effort, return_value=None),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "get_user_tier",
+        create_autospec(rd_svc.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "list_authorized_group_bindings",
+        create_autospec(rd_svc.list_authorized_group_bindings, return_value=[]),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "resolve_dalton_notify_routes",
+        create_autospec(
+            model_prefs_mod.resolve_dalton_notify_routes,
+            return_value=dict(stored_prefs_row["model_preference"]["dalton_notify_routes"]),
+        ),
+    )
+
+    clear_change = await rd_svc.validate_report_profile_change(
+        owner_uid,
+        stored_row,
+        None,
+        via_rest=True,
+        confirmed=False,
+        action="update",
+        after_metadata={},
+    )
+    assert clear_change.profile is None
+    assert clear_change.after_metadata == {}
+
+    # 1. One-shot PATCH clearing report_profile and setting web delivery succeeds atomically
+    saved_row, route_warning = await rd_svc.execute_report_profile_rest_mutation(
+        change=clear_change,
+        actor_user_id=owner_uid,
+        expected_config_version=1,
+        mutate_fn=lambda db_conn: lifecycle_mod.update_automation(
+            automation_id=auto_id,
+            user_id=owner_uid,
+            fields={
+                "metadata": clear_change.after_metadata,
+                "delivery_config": {"methods": ["feishu"]},
+            },
+            conn=db_conn,
+        ),
+    )
+    assert saved_row is not None
+    assert saved_row["delivery_config"] == {"methods": ["feishu"]}
+    assert saved_row["metadata"] == {}
+    assert route_warning is None
+    assert any("FOR UPDATE" in s and "FROM automations" in s for s in executed_sqls)
+    assert any("UPDATE automations SET" in s for s in executed_sqls)
+    assert any(
+        getattr(p, "obj", p) == {"methods": ["feishu"]}
+        for p in (updated_snapshot.get("params") or ())
+    )
+    assert any(
+        getattr(p, "obj", p) == {}
+        for p in (updated_snapshot.get("params") or ())
+    )
+    sync_routes_mock.assert_awaited_once()
+    assert sync_routes_mock.await_args.kwargs["change"].profile is None
+
+    # 2. In-lock re-verification is preserved: if the FOR UPDATE row was concurrently renamed
+    #    to a built-in dalton-* task, the same one-shot switch is still refused under row lock.
+    executed_sqls.clear()
+    sync_routes_mock.reset_mock()
+    locked_name_override["name"] = "dalton-nvda-earn-2026q3-t0"
+
+    clear_change_2 = await rd_svc.validate_report_profile_change(
+        owner_uid,
+        stored_row,
+        None,
+        via_rest=True,
+        confirmed=False,
+        action="update",
+        after_metadata={},
+    )
+    with pytest.raises(AutomationRefusal) as lock_exc:
+        await rd_svc.execute_report_profile_rest_mutation(
+            change=clear_change_2,
+            actor_user_id=owner_uid,
+            expected_config_version=1,
+            mutate_fn=lambda db_conn: lifecycle_mod.update_automation(
+                automation_id=auto_id,
+                user_id=owner_uid,
+                fields={
+                    "metadata": clear_change_2.after_metadata,
+                    "delivery_config": {"methods": ["feishu"]},
+                },
+                conn=db_conn,
+            ),
+        )
+    assert str(lock_exc.value) == BUILTIN_DELIVERY_CONFLICT_MSG
+    assert any("FOR UPDATE" in s and "FROM automations" in s for s in executed_sqls)
+    assert not any("UPDATE automations SET" in s for s in executed_sqls)
+    sync_routes_mock.assert_not_awaited()

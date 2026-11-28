@@ -29,7 +29,6 @@ from src.dalton.bullbear_tickers import (
 from src.dalton.database.automation_reports import (
     REPORT_PROFILES,
     automation_has_validated_report_profile,
-    held_delivery_configured,
     parse_report_profile,
 )
 from src.dalton.database.channel_gateway import (
@@ -47,7 +46,9 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_routes,
     resolve_dalton_notify_targets,
 )
-from src.dalton.notify.delivery_mutex import REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+from src.dalton.notify.delivery_mutex import (
+    assert_no_automation_delivery_notify_conflict,
+)
 from src.dalton.notify.dispatch import (
     evaluate_user_notify_eligibility,
     send_dalton_gateway_notice,
@@ -3593,11 +3594,23 @@ async def execute_report_profile_rest_mutation(
                     failure_targets=list(prof.get("failure_targets") or []),
                     conn=db_conn,
                 )
+            change_aid = str(change.automation_id or "").strip()
+            owner_is_company = is_company or is_company_system_user(change.owner_user_id)
+            post_save_notify_routes: dict[str, list[str]] | None = None
+            if not owner_is_company and _is_valid_uuid(change_aid):
+                post_save_notify_routes = {
+                    f"automation:{change_aid}": (
+                        list(change.route_targets)
+                        if change.profile is not None
+                        else []
+                    )
+                }
             with automation_history_context(
                 actor_user_id=actor_user_id,
                 action=change.action if change.action in {"create", "update"} else "update",
                 expected_config_version=expected_config_version,
                 report_delivery_audit=audit_entry,
+                post_save_notify_routes=post_save_notify_routes,
             ):
                 saved_row = await mutate_fn(db_conn)
             if saved_row is None:
@@ -3650,12 +3663,6 @@ async def precheck_report_delivery_set(
             code="forbidden",
         )
 
-    if held_delivery_configured(auto.get("delivery_config")):
-        raise ReportDeliveryError(
-            REPORT_PROFILE_DELIVERY_CONFLICT_MSG,
-            code="conflict",
-        )
-
     old_meta = copy.deepcopy(dict(auto.get("metadata") or {}))
     resolved_profile = resolve_report_profile_id(
         auto.get("instruction"),
@@ -3689,6 +3696,20 @@ async def precheck_report_delivery_set(
     }
     if norm_text is not None:
         candidate_profile["text_targets"] = norm_text
+
+    from src.server.services.automations.lifecycle import AutomationRefusal
+
+    try:
+        await assert_no_automation_delivery_notify_conflict(
+            user_id=owner_user_id,
+            automation=auto,
+            delivery_config=auto.get("delivery_config"),
+            metadata={**old_meta, "report_profile": candidate_profile},
+            notify_routes=[*norm_report, *(norm_text or []), *norm_failure],
+            conn=conn,
+        )
+    except AutomationRefusal as exc:
+        raise ReportDeliveryError(str(exc), code="conflict") from None
 
     return await precheck_report_profile_change(
         caller_user_id,
@@ -3735,12 +3756,6 @@ async def set_report_delivery_config(
             code="conflict",
         )
 
-    if held_delivery_configured(auto.get("delivery_config")):
-        raise ReportDeliveryError(
-            REPORT_PROFILE_DELIVERY_CONFLICT_MSG,
-            code="conflict",
-        )
-
     old_meta = copy.deepcopy(dict(auto.get("metadata") or {}))
     resolved_profile = resolve_report_profile_id(
         auto.get("instruction"),
@@ -3780,6 +3795,20 @@ async def set_report_delivery_config(
     if norm_text is not None:
         candidate_profile["text_targets"] = norm_text
 
+    from src.server.services.automations.lifecycle import AutomationRefusal
+
+    try:
+        await assert_no_automation_delivery_notify_conflict(
+            user_id=owner_user_id,
+            automation=auto,
+            delivery_config=auto.get("delivery_config"),
+            metadata={**old_meta, "report_profile": candidate_profile},
+            notify_routes=[*norm_report, *(norm_text or []), *norm_failure],
+            conn=conn,
+        )
+    except AutomationRefusal as exc:
+        raise ReportDeliveryError(str(exc), code="conflict") from None
+
     validated = await validate_report_profile_change(
         caller_user_id,
         auto,
@@ -3797,17 +3826,33 @@ async def set_report_delivery_config(
     write_expected_cv = (
         expected_config_version if expected_config_version is not None else auto.get("config_version")
     )
+
     async def _reconcile_locked_report_delivery_set(
         locked_row: Mapping[str, Any],
         effective_kwargs: dict[str, Any],
         locked_conn: Any,
     ) -> None:
-        _ = effective_kwargs, locked_conn
-        if held_delivery_configured(locked_row.get("delivery_config")):
-            raise ReportDeliveryError(
-                REPORT_PROFILE_DELIVERY_CONFLICT_MSG,
-                code="conflict",
+        final_delivery = (
+            effective_kwargs["delivery_config"]
+            if "delivery_config" in effective_kwargs
+            else locked_row.get("delivery_config")
+        )
+        final_meta = (
+            effective_kwargs["metadata"]
+            if "metadata" in effective_kwargs
+            else locked_row.get("metadata")
+        )
+        try:
+            await assert_no_automation_delivery_notify_conflict(
+                user_id=owner_user_id,
+                automation=locked_row,
+                delivery_config=final_delivery,
+                metadata=final_meta,
+                notify_routes=list(validated.route_targets),
+                conn=locked_conn,
             )
+        except AutomationRefusal as exc:
+            raise ReportDeliveryError(str(exc), code="conflict") from None
 
     async with _use_conn(conn) as db_conn:
         async with db_conn.transaction():

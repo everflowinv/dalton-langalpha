@@ -153,15 +153,30 @@ async def _load_dalton_notify_routes_in_tx(
     return dict(normalized) if isinstance(normalized, Mapping) else {}
 
 
+_UNSET_ROUTES = object()
+
+
 async def assert_no_automation_delivery_notify_conflict(
     *,
     user_id: str,
     automation: Mapping[str, Any],
     delivery_config: Any,
+    metadata: Mapping[str, Any] | None = None,
+    notify_routes: Any = _UNSET_ROUTES,
     model_pref: Mapping[str, Any] | None = None,
     conn: Any = None,
 ) -> None:
-    """Raise ``AutomationRefusal`` if ``delivery_config.methods`` conflicts with Dalton notify."""
+    """Single mutex check on an automation's post-save final state.
+
+    Validates the state that will exist once the enclosing save transaction commits:
+    - ``delivery_config``: post-save channel delivery config;
+    - ``metadata``: post-save metadata (defaults to ``automation.get("metadata")``);
+    - ``notify_routes``: post-save Dalton notify targets for this automation
+      (``Sequence[str]``), a full ``dalton_notify_routes`` mapping, ``None`` when
+      cleared in the same transaction, or omitted to consult any
+      ``post_save_notify_routes`` bound on ``automation_history_context`` before
+      falling back to stored routes via ``conn`` / ``model_pref``.
+    """
     if not held_delivery_configured(delivery_config):
         return
 
@@ -175,7 +190,13 @@ async def assert_no_automation_delivery_notify_conflict(
     )
     from src.server.services.automations.lifecycle import AutomationRefusal
 
-    if automation_has_validated_report_profile(automation):
+    final_automation: Mapping[str, Any] = (
+        {**automation, "metadata": metadata}
+        if metadata is not None
+        else automation
+    )
+
+    if automation_has_validated_report_profile(final_automation):
         raise AutomationRefusal(
             REPORT_PROFILE_DELIVERY_CONFLICT_MSG,
             field="delivery_config",
@@ -185,33 +206,64 @@ async def assert_no_automation_delivery_notify_conflict(
         return
 
     if (
-        not is_excluded_automation_for_notify(automation)
-        and classify_automation_for_notify(automation) is not None
+        not is_excluded_automation_for_notify(final_automation)
+        and classify_automation_for_notify(final_automation) is not None
     ):
         raise AutomationRefusal(
             BUILTIN_DELIVERY_CONFLICT_MSG,
             field="delivery_config",
         )
 
-    auto_id = str(automation.get("automation_id") or "").strip()
-    if not auto_id:
-        return
+    auto_id = str(final_automation.get("automation_id") or "").strip()
+    route_key = f"automation:{auto_id}" if auto_id else ""
 
-    routes: Mapping[str, Any] | None = None
-    if (
-        conn is not None
-        and hasattr(conn, "cursor")
-        and not isinstance(conn, NonCallableMock)
-    ):
-        routes = await _load_dalton_notify_routes_in_tx(user_id, conn=conn)
-    if routes is None:
-        if isinstance(model_pref, Mapping):
-            raw_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
-            routes = raw_routes if isinstance(raw_routes, Mapping) else {}
+    has_route = False
+    if notify_routes is not _UNSET_ROUTES:
+        if notify_routes is None:
+            has_route = False
+        elif isinstance(notify_routes, Mapping):
+            has_route = has_active_dalton_notify_route(final_automation, notify_routes)
         else:
-            routes = await resolve_dalton_notify_routes(user_id)
+            has_route = _has_non_empty_targets(notify_routes)
+    else:
+        from src.dalton.services.company_automations import (
+            get_current_history_context,
+        )
 
-    if has_active_dalton_notify_route(automation, routes):
+        hist_ctx = get_current_history_context()
+        pending_routes = (
+            hist_ctx.post_save_notify_routes
+            if hist_ctx is not None
+            and isinstance(hist_ctx.post_save_notify_routes, Mapping)
+            else None
+        )
+        matched_pending = False
+        if pending_routes is not None and route_key:
+            if route_key in pending_routes:
+                has_route = _has_non_empty_targets(pending_routes.get(route_key))
+                matched_pending = True
+            elif route_key.lower() in pending_routes:
+                has_route = _has_non_empty_targets(
+                    pending_routes.get(route_key.lower())
+                )
+                matched_pending = True
+        if not matched_pending and auto_id:
+            routes: Mapping[str, Any] | None = None
+            if (
+                conn is not None
+                and hasattr(conn, "cursor")
+                and not isinstance(conn, NonCallableMock)
+            ):
+                routes = await _load_dalton_notify_routes_in_tx(user_id, conn=conn)
+            if routes is None:
+                if isinstance(model_pref, Mapping):
+                    raw_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+                    routes = raw_routes if isinstance(raw_routes, Mapping) else {}
+                else:
+                    routes = await resolve_dalton_notify_routes(user_id)
+            has_route = has_active_dalton_notify_route(final_automation, routes)
+
+    if has_route:
         raise AutomationRefusal(
             NOTIFY_ROUTE_DELIVERY_CONFLICT_MSG,
             field="delivery_config",
