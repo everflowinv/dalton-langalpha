@@ -771,16 +771,20 @@ class AutomationExecutor:
                 f"execution_id={execution_id}"
             )
             return
+        # DALTON-HOOK(automation-capacity-retry): hydrate persisted delivery registration across retries so edits re-resolve and clears revoke
+        from src.dalton.automations.capacity_retry import (
+            delivery_id_for_start,
+            hydrate_delivery_state_for_firing,
+            sync_delivery_state_after_start,
+        )
+
+        await hydrate_delivery_state_for_firing(execution_id, firing)
         entries = automation_delivery.entries_of(firing.automation)
         if firing.delivery_starts and entries == firing.delivery_entries:
             return
         firing.delivery_starts += 1
         firing.delivery_entries = entries
-        delivery_id = (
-            execution_id
-            if firing.delivery_starts == 1
-            else f"{execution_id}.{firing.delivery_starts}"
-        )
+        delivery_id = delivery_id_for_start(execution_id, firing.delivery_starts)
         if firing.delivery_starts > 1:
             logger.info(
                 f"[AUTOMATION_EXEC] Delivery changed during the wait, starting it "
@@ -793,6 +797,15 @@ class AutomationExecutor:
         )
         if firing.delivery is not None or kept is not None:
             await _keep_delivery(execution_id, firing.delivery)
+        # DALTON-HOOK(automation-capacity-retry): persist delivery_meta and revoke cleared unstarted channel registration
+        await sync_delivery_state_after_start(
+            execution_id,
+            automation=firing.automation,
+            entries=entries,
+            delivery=firing.delivery,
+            delivery_starts=firing.delivery_starts,
+            had_prior_registration=kept is not None,
+        )
 
     async def _start_delivery_unstarted(
         self, execution_id: str, firing: _Firing
@@ -1491,10 +1504,7 @@ class AutomationExecutor:
                 _exec_span.set_attribute("status", "handed_to_run")
                 return
             # DALTON-HOOK(automation-capacity-retry): defer and retry capacity failures in Postgres before settling
-            from src.dalton.automations.capacity_retry import (
-                reset_thread_status_after_prestart_exit,
-                try_park_for_capacity,
-            )
+            from src.dalton.automations.capacity_retry import try_park_for_capacity
 
             if await try_park_for_capacity(
                 e,
@@ -1534,17 +1544,14 @@ class AutomationExecutor:
                     exc_info=True,
                 )
                 excerpt = None
+            # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically in the settlement transaction
             settled = await settle(
                 firing.automation, execution_id, outcome,
                 thread_id=firing.thread_id,
                 workspace_id=firing.workspace_id or automation.get("workspace_id"),
                 error=error_msg, delivery=firing.delivery, excerpt=excerpt,
                 release_pre_start_signals=True,
-            )
-            # DALTON-HOOK(automation-capacity-retry): reset thread current_status when pre-START exit never ran finalize_run
-            await reset_thread_status_after_prestart_exit(
-                firing.thread_id,
-                outcome=outcome,
+                reset_prestart_thread_status=True,
             )
             _exec_span.set_attribute(
                 "status",
@@ -1561,20 +1568,13 @@ class AutomationExecutor:
             try:
                 if not await self._hand_to_run(execution_id, firing):
                     # DALTON-HOOK(preflight): fall back to automation["workspace_id"] before route bind
+                    # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically on cancellation
                     await settle(
                         firing.automation, execution_id, Outcome.INTERRUPTED,
                         thread_id=firing.thread_id,
                         workspace_id=firing.workspace_id or automation.get("workspace_id"),
                         delivery=firing.delivery,
-                    )
-                    # DALTON-HOOK(automation-capacity-retry): reset thread current_status on pre-START cancellation
-                    from src.dalton.automations.capacity_retry import (
-                        reset_thread_status_after_prestart_exit,
-                    )
-
-                    await reset_thread_status_after_prestart_exit(
-                        firing.thread_id,
-                        outcome=Outcome.INTERRUPTED,
+                        reset_prestart_thread_status=True,
                     )
             except Exception as e:
                 # The sweep settles it once the heartbeat stops.

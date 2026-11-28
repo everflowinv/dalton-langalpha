@@ -899,19 +899,24 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
         async with conn.cursor() as cur:
             if stamp is not None:
                 # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
-                # DALTON-HOOK(automation-capacity-retry): preserve capacity_retry state across delivery re-stamps
+                # DALTON-HOOK(automation-capacity-retry): preserve capacity_retry and delivery_meta state across delivery re-stamps
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'capacity_retry' THEN
-                            %s::jsonb || jsonb_build_object(
-                                'subscription_fallback', delivery->'subscription_fallback',
-                                'capacity_retry', delivery->'capacity_retry'
+                        WHEN delivery ? 'subscription_fallback' AND (delivery ? 'capacity_retry' OR delivery ? 'delivery_meta') THEN
+                            %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback') || (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('capacity_retry', 'delivery_meta')
                             )
                         WHEN delivery ? 'subscription_fallback' THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
-                        WHEN delivery ? 'capacity_retry' THEN
-                            %s::jsonb || jsonb_build_object('capacity_retry', delivery->'capacity_retry')
+                        WHEN delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
+                            %s::jsonb || (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('capacity_retry', 'delivery_meta')
+                            )
                         ELSE %s::jsonb
                     END
                     WHERE automation_execution_id = %s
@@ -919,19 +924,16 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
                 """, (Json(stamp), Json(stamp), Json(stamp), Json(stamp), execution_id))
             else:
                 # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
-                # DALTON-HOOK(automation-capacity-retry): keep capacity_retry state even when clearing delivery targets
+                # DALTON-HOOK(automation-capacity-retry): keep capacity_retry and delivery_meta state even when clearing delivery targets
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'capacity_retry' THEN
-                            jsonb_build_object(
-                                'subscription_fallback', delivery->'subscription_fallback',
-                                'capacity_retry', delivery->'capacity_retry'
+                        WHEN delivery ? 'subscription_fallback' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
+                            (
+                                SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
+                                FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
+                                WHERE k IN ('subscription_fallback', 'capacity_retry', 'delivery_meta')
                             )
-                        WHEN delivery ? 'subscription_fallback' THEN
-                            jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
-                        WHEN delivery ? 'capacity_retry' THEN
-                            jsonb_build_object('capacity_retry', delivery->'capacity_retry')
                         ELSE NULL
                     END
                     WHERE automation_execution_id = %s
@@ -1664,9 +1666,9 @@ _PARKED = (
     "({e}.status = 'waiting'"
     " AND {e}.wait_reason IS NOT DISTINCT FROM 'computer_unreachable')"
 )
-# DALTON-HOOK(automation-capacity-retry): capacity-backoff waits are owned by the DB sweep, not an in-process loop
+# DALTON-HOOK(automation-capacity-retry): capacity-backoff waits (and leased pending re-dispatches) are owned by the capacity sweep
 _CAPACITY_PARKED = (
-    "({e}.status = 'waiting'"
+    "({e}.status IN ('waiting', 'pending')"
     " AND {e}.wait_reason IS NOT DISTINCT FROM 'capacity_limit')"
 )
 

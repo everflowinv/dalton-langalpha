@@ -174,6 +174,14 @@ async def settle(
     release_pre_start_signals: bool = False,
     # DALTON-HOOK(coverage-units): allow caller to narrow/specify source statuses without relaxing policy defaults
     from_statuses: Optional[tuple[ExecutionStatus, ...]] = None,
+    # DALTON-HOOK(automation-capacity-retry): atomically reset pre-START thread status in-tx and run winner-only failure delivery init
+    reset_prestart_thread_status: bool = False,
+    prepare_delivery_after_settle: Optional[
+        Callable[
+            [Dict[str, Any], Optional[str], Optional[automation_delivery.Delivery]],
+            Awaitable[Optional[automation_delivery.Delivery]],
+        ]
+    ] = None,
 ) -> bool:
     """End a firing as ``outcome``; False when it was no longer in a state
     that outcome can end, because someone else settled it first.
@@ -204,7 +212,20 @@ async def settle(
             settled, final_text,
         )
         # DALTON-HOOK(automation-subscription-fallback): release signals only when executor's synchronous pre-START path settles 'failed'
-        if release_pre_start_signals and policy.status == "failed":
+        # DALTON-HOOK(automation-capacity-retry): also release pre-START claimed signals when a waiting execution is skipped
+        settled_thread_id = thread_id or (
+            str(settled["conversation_thread_id"])
+            if isinstance(settled, dict) and settled.get("conversation_thread_id")
+            else None
+        )
+        settled_run_id = run_id or (
+            str(settled["conversation_response_id"])
+            if isinstance(settled, dict) and settled.get("conversation_response_id")
+            else None
+        )
+        if (release_pre_start_signals and policy.status == "failed") or (
+            outcome is Outcome.SKIPPED
+        ):
             from src.dalton.services.automation_subscription_fallback import (
                 release_claimed_signals_on_executor_failed_settle,
             )
@@ -213,10 +234,20 @@ async def settle(
                 conn,
                 automation=automation,
                 execution_id=execution_id,
-                thread_id=thread_id
-                or (settled.get("conversation_thread_id") if isinstance(settled, dict) else None),
+                thread_id=settled_thread_id,
                 run_id=run_id,
                 settled_row=settled,
+            )
+        # DALTON-HOOK(automation-capacity-retry): reset pre-START stuck thread status in the same settlement transaction
+        if reset_prestart_thread_status and settled_run_id is None and settled_thread_id:
+            from src.dalton.automations.capacity_retry import (
+                reset_thread_status_after_prestart_exit,
+            )
+
+            await reset_thread_status_after_prestart_exit(
+                settled_thread_id,
+                outcome=outcome,
+                conn=conn,
             )
 
     extra_settle_kwargs: Dict[str, Any] = {}
@@ -262,7 +293,8 @@ async def settle(
     tail = _hold(asyncio.create_task(
         _after_settling(outcome, automation, execution_id, row,
                         thread_id, run_id, workspace_id, error,
-                        delivery, final_text, finish_left),
+                        delivery, final_text, finish_left,
+                        prepare_delivery_after_settle=prepare_delivery_after_settle),  # DALTON-HOOK(automation-capacity-retry)
         name=f"settle_tail_{execution_id}",
     ))
     await asyncio.shield(tail)
@@ -335,6 +367,13 @@ async def _after_settling(
     delivery: Optional[automation_delivery.Delivery],
     final_text: Optional[str],
     finish_left: bool,
+    # DALTON-HOOK(automation-capacity-retry): optional winner-only failure delivery init/reconciliation callback
+    prepare_delivery_after_settle: Optional[
+        Callable[
+            [Dict[str, Any], Optional[str], Optional[automation_delivery.Delivery]],
+            Awaitable[Optional[automation_delivery.Delivery]],
+        ]
+    ] = None,
 ) -> None:
     """The delivery, the chat's wait line and the metric a settle sets off.
 
@@ -353,6 +392,9 @@ async def _after_settling(
         and policy.webhook
         and not _repeats_a_refusal(policy.failure_reason, run_id, row)
     ):
+        # DALTON-HOOK(automation-capacity-retry): run failure delivery init/reconciliation exclusively on the winning settler
+        if prepare_delivery_after_settle is not None and not finish_left:
+            delivery = await prepare_delivery_after_settle(row, thread_id, delivery)
         if delivery is not None and delivery.held and policy.finish is not None:
             if finish_left:
                 _nudge_drainer()

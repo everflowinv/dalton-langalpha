@@ -11057,7 +11057,7 @@ async def authorize_and_claim_delivery(
     cleaned_platform = str(platform or "").strip().lower() or None
     cleaned_target = str(target).strip() if target is not None and str(target).strip() else None
     cleaned_inbound_mid = str(inbound_message_id or "").strip() or None
-    eff_exec_id = normalize_uuid(automation_execution_id or execution_id)
+    eff_exec_id = _normalize_automation_run_uuid(automation_execution_id or execution_id)
     norm_tid = normalize_uuid(thread_id)
     cleaned_rid = str(run_id or "").strip() or None
     eff_source_scope = str(source_scope_key or "").strip() or None
@@ -18373,6 +18373,20 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_automation_run_uuid(raw_id: str | None) -> str | None:
+    """Normalize an automation delivery execution ID (UUID or ``<uuid>.<n>``)."""
+    if not raw_id:
+        return None
+    norm = normalize_uuid(raw_id)
+    if norm:
+        return norm
+    text = str(raw_id).strip()
+    base, sep, suffix = text.rpartition(".")
+    if sep and suffix.isdigit() and int(suffix) >= 2:
+        return normalize_uuid(base)
+    return None
+
+
 async def register_automation_run(
     *,
     execution_id: str,
@@ -18384,7 +18398,7 @@ async def register_automation_run(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-8 (1): Idempotently register automation run and resolve `entries` into `targets`."""
-    norm_exec_id = normalize_uuid(execution_id)
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
     if not norm_exec_id:
         raise HTTPException(status_code=400, detail="Valid execution_id UUID is required")
     cleaned_uid = str(user_id or "").strip()
@@ -18400,14 +18414,64 @@ async def register_automation_run(
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT targets FROM dalton_channel_automation_runs
+                    SELECT user_id, workspace_id, thread_id, automation_name,
+                           entries, status, targets
+                    FROM dalton_channel_automation_runs
                     WHERE execution_id = %s
+                    FOR UPDATE
                     """,
                     (norm_exec_id,),
                 )
                 existing = await cur.fetchone()
+                incoming_entries = [
+                    str(raw_entry or "").strip()
+                    for raw_entry in (entries or [])
+                    if str(raw_entry or "").strip()
+                ]
+                update_existing_unstarted = False
                 if existing:
-                    return {"targets": list(existing.get("targets") or [])}
+                    existing_status = str(existing.get("status") or "")
+                    existing_targets = list(existing.get("targets") or [])
+                    existing_entries = [
+                        str(e or "").strip()
+                        for e in (existing.get("entries") or [])
+                        if str(e or "").strip()
+                    ]
+                    existing_ws = (
+                        str(existing["workspace_id"])
+                        if existing.get("workspace_id")
+                        else None
+                    )
+                    any_reached = any(
+                        isinstance(t, dict)
+                        and (t.get("reached") is True or bool(t.get("via")))
+                        for t in existing_targets
+                    )
+                    can_re_resolve = (
+                        existing_status == "registered"
+                        and not any_reached
+                        and str(existing.get("user_id") or "") == cleaned_uid
+                    )
+                    if not can_re_resolve or (
+                        existing_entries == incoming_entries
+                        and existing_ws == norm_ws_id
+                    ):
+                        if (
+                            can_re_resolve
+                            and norm_tid is not None
+                            and not existing.get("thread_id")
+                        ):
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_automation_runs
+                                SET thread_id = %s, updated_at = NOW()
+                                WHERE execution_id = %s
+                                  AND status = 'registered'
+                                """,
+                                (norm_tid, norm_exec_id),
+                            )
+                        return {"targets": existing_targets}
+                    update_existing_unstarted = True
 
                 await cur.execute(
                     """
@@ -18533,6 +18597,33 @@ async def register_automation_run(
                         }
                     )
 
+                if update_existing_unstarted:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_automation_runs
+                        SET workspace_id = %s,
+                            thread_id = COALESCE(%s, thread_id),
+                            automation_name = %s,
+                            entries = %s,
+                            targets = %s,
+                            updated_at = NOW()
+                        WHERE execution_id = %s
+                          AND status = 'registered'
+                        RETURNING targets
+                        """,
+                        (
+                            norm_ws_id,
+                            norm_tid,
+                            str(automation_name or ""),
+                            Jsonb(list(entries or [])),
+                            Jsonb(targets),
+                            norm_exec_id,
+                        ),
+                    )
+                    ins = await cur.fetchone()
+                    if ins:
+                        return {"targets": list(ins.get("targets") or [])}
+
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_automation_runs (
@@ -18562,6 +18653,42 @@ async def register_automation_run(
                     )
                     ins = await cur.fetchone()
                 return {"targets": list((ins or {}).get("targets") or [])}
+
+
+async def revoke_unstarted_automation_run(
+    execution_id: str,
+    *,
+    user_id: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Delete an unstarted ``dalton_channel_automation_runs`` registration.
+
+    Only deletes rows still in ``status = 'registered'`` with zero reached/sent
+    targets so cleared delivery recipients can never receive a later finish post.
+    """
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
+    if not norm_exec_id:
+        return False
+    cleaned_uid = str(user_id or "").strip() or None
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM dalton_channel_automation_runs
+                    WHERE execution_id = %s
+                      AND status = 'registered'
+                      AND (%s::varchar IS NULL OR user_id = %s)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(COALESCE(targets, '[]'::jsonb)) AS t
+                          WHERE (t->>'reached') = 'true'
+                             OR NULLIF(t->>'via', '') IS NOT NULL
+                      )
+                    """,
+                    (norm_exec_id, cleaned_uid, cleaned_uid),
+                )
+                return bool(cur.rowcount)
 
 
 async def _resolve_verified_automation_run_id(
@@ -18657,7 +18784,7 @@ async def finish_automation_run(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-8 (2): Claim/update or finalize `dalton_channel_automation_runs` for `/finish` (§1.2.7)."""
-    norm_exec_id = normalize_uuid(execution_id)
+    norm_exec_id = _normalize_automation_run_uuid(execution_id)
     if not norm_exec_id:
         raise HTTPException(status_code=404, detail="Unknown execution_id")
     norm_tid = normalize_uuid(thread_id) if thread_id else None
