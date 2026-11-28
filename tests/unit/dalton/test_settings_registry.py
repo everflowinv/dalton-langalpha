@@ -126,7 +126,14 @@ _DALTON_ROUTE_PROTOCOL_FIELDS: dict[tuple[str, str], frozenset[str]] = {
     ("PUT", "/api/v1/dalton/team-models/curated"): frozenset(
         {"expected_revision", "comment"}
     ),
+    ("PUT", "/api/v1/dalton/deployment-settings"): frozenset({"expected_revision"}),
 }
+
+# Compare-and-set tokens on ThreadUpdateRequest: the client sends the value it last
+# saw so a background autosave cannot overwrite a newer pick; they are not settings.
+_THREAD_NON_SETTING_FIELDS: frozenset[str] = frozenset(
+    {"expected_llm_model", "expected_reasoning_effort", "expected_fast_mode"}
+)
 
 # Virtual JSON/Markdown file prefixes editable by Chief of Staff through file tools.
 _ALLOWED_VIRTUAL_FILE_PREFIXES: tuple[str, ...] = (
@@ -2850,7 +2857,11 @@ def test_thread_writable_fields_are_registered():
         ThreadVisibilityRequest,
     )
 
-    discovered = {f"thread.{f}" for f in ThreadUpdateRequest.model_fields}
+    discovered = {
+        f"thread.{f}"
+        for f in ThreadUpdateRequest.model_fields
+        if f not in _THREAD_NON_SETTING_FIELDS
+    }
     for f in ThreadVisibilityRequest.model_fields:
         discovered.add(f"thread.{f}")
 

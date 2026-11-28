@@ -1478,3 +1478,59 @@ settings:
     web_entry: 设置 → 通用与外观 → 启动 → 关闭窗口后保留在托盘运行（仅桌面端）
     cos: excluded:桌面端本机托盘常驻偏好，仅保存在当前设备，由用户在当前设备管理
     profiles: [everflow, core]
+
+  # ===========================================================================
+  # 部署级集成凭据（deployment_settings 表，src/dalton/deployment_credentials/catalog.py）
+  # ===========================================================================
+  - key: deployment_settings.DALTON_GOOGLE_OAUTH_CLIENT_ID
+    stored_in: deployment_settings（name = 'DALTON_GOOGLE_OAUTH_CLIENT_ID'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → Google 授权客户端 ID
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/deployment-settings
+    route_fields:
+      - values
+
+  - key: deployment_settings.DALTON_GOOGLE_OAUTH_CLIENT_SECRET
+    stored_in: deployment_settings（name = 'DALTON_GOOGLE_OAUTH_CLIENT_SECRET'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → Google 授权客户端密钥
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+
+  - key: deployment_settings.DALTON_FEISHU_APP_ID
+    stored_in: deployment_settings（name = 'DALTON_FEISHU_APP_ID'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → 飞书应用 App ID
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+
+  - key: deployment_settings.DALTON_FEISHU_APP_SECRET
+    stored_in: deployment_settings（name = 'DALTON_FEISHU_APP_SECRET'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → 飞书应用 App Secret
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+
+  - key: deployment_settings.DALTON_FEISHU_ENCRYPT_KEY
+    stored_in: deployment_settings（name = 'DALTON_FEISHU_ENCRYPT_KEY'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → 飞书事件加密密钥
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+
+  - key: deployment_settings.DALTON_FEISHU_VERIFICATION_TOKEN
+    stored_in: deployment_settings（name = 'DALTON_FEISHU_VERIFICATION_TOKEN'，pgcrypto 加密）
+    web_entry: 设置 → 部署设置 → 集成凭据 → 飞书事件校验令牌
+    cos: excluded:部署级集成凭据，由管理员在部署设置页配置
+    profiles: [everflow, core]
+
+  - key: integration.preferences
+    stored_in: dalton_user_integrations（primary_calendar_id / tracker_calendar_id / allow_create_draft / allow_send_mail）
+    web_entry: 设置 → 个人连接 → Google 日历 / 邮箱 → 偏好
+    cos: excluded:个人连接授权范围与日历选择，由本人在设置页管理
+    profiles: [everflow, core]
+    routes:
+      - PATCH /api/v1/dalton/integrations/{provider}/{service}
+    route_fields:
+      - primary_calendar_id
+      - tracker_calendar_id
+      - allow_create_draft
+      - allow_send_mail

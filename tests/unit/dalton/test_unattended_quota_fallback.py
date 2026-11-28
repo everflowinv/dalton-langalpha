@@ -121,7 +121,8 @@ def test_unattended_switch_defaults_false_and_single_head_d061(
     alembic_cfg = AlembicConfig(str(REPO_ROOT / "src" / "dalton" / "alembic.ini"))
     alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "src" / "dalton" / "migrations"))
     script = ScriptDirectory.from_config(alembic_cfg)
-    assert script.get_heads() == ["d061"]
+    # This lane adds no migration; the chain must still have exactly one head.
+    assert len(script.get_heads()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +466,9 @@ async def test_pre_dispatch_wakeup_real_chain_selects_second_pool_model_and_writ
                     "metadata": dict(captured_start_metadata),
                     "created_at": now,
                 }
+            elif "AS NEXT_TURN" in sql_u:
+                # Checked before the thread lookup: the turn query also reads conversation_threads.
+                self._row = {"next_turn": 1}
             elif "FROM CONVERSATION_THREADS" in sql_u:
                 self._row = {
                     "conversation_thread_id": thread_id,
@@ -472,9 +476,9 @@ async def test_pre_dispatch_wakeup_real_chain_selects_second_pool_model_and_writ
                     "user_id": user_id,
                     "current_status": "idle",
                     "active_run_id": None,
+                    "personal_purge_in_progress": False,
                 }
-            elif "AS NEXT_TURN" in sql_u:
-                self._row = {"next_turn": 1}
+
             else:
                 self._row = None
 

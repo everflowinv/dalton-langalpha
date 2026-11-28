@@ -137,6 +137,7 @@
 | `DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE` | `.env.core.example`, `src/dalton/chat_upload_storage.py` | S3 寻址风格（MinIO 使用 `path`，云厂商常用 `virtual`） | `src/dalton/chat_upload_storage.py` | 启动 / 客户端构造时 | 重建 `backend` 容器 | 是（默认 `path`） |
 | `DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX` | `.env.core.example`, `src/dalton/chat_upload_storage.py` | 聊天上传对象键名前缀 | `src/dalton/chat_upload_storage.py` | 每次生成对象键时读取 | 重建 `backend` 容器 | 是（默认 `chat-uploads`） |
 | `DALTON_CHAT_UPLOAD_CLEANUP_ENABLED` | `src/dalton/settings.py` | 是否启用后台过期聊天上传对象回收任务 | `src/dalton/settings.py`, `src/dalton/services/chat_uploads.py` | 启动一次 | 重建 `backend` 容器 | 选填（默认开启） |
+| `DALTON_WIDGET_SSR_ENABLED` | `src/dalton/settings.py` | 是否在服务端用 Chromium 预先渲染校验对话里的可视化小组件（默认关闭，与 `widget_render.enabled` 配置等效） | `src/dalton/settings.py:is_widget_ssr_enabled` | 每次渲染校验时读取 | 重建 `backend` 容器 | 选填（默认关闭） |
 | `DALTON_CHAT_UPLOAD_PART_IDLE_TIMEOUT_S` | `src/dalton/settings.py` | 单分片流式转发空闲超时秒数 | `src/dalton/settings.py` | 每次上传分片读取 | 重建 `backend` 容器 | 选填 |
 | `DALTON_CHAT_UPLOAD_PART_TOTAL_TIMEOUT_S` | `src/dalton/settings.py` | 单分片上传总耗时上限秒数 | `src/dalton/settings.py` | 每次上传分片读取 | 重建 `backend` 容器 | 选填 |
 | `AWS_ACCESS_KEY_ID` | `.env.example`, `src/utils/storage/s3_client.py` | 通用 AWS S3 对象存储访问密钥 ID（`STORAGE_ACCESS_KEY_ID` 的兼容回退） | `src/utils/storage/s3_client.py` | 启动导入一次 | 重建 `backend` 容器 | 选填（核心版默认用内置 MinIO） |

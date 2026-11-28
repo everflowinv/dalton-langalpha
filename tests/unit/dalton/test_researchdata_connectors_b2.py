@@ -2964,4 +2964,4 @@ exec {sys.executable} "$@"
     # Must abort during preflight: no drain HTTP call, no launchctl call, bridge env untouched.
     assert _read_jsonl_log(h["curl_log"]) == []
     assert _read_jsonl_log(h["launchctl_log"]) == []
-    assert "DALTON_BRIDGE_ASR_DISABLED=true" not in h["bridge_env"].read_text(encoding="utf-8")
+    assert "DALTON_BRIDGE_ASR_DISABLED=true" not in h["bridge_env_file"].read_text(encoding="utf-8")
