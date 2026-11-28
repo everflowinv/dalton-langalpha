@@ -2343,3 +2343,17 @@ def get_monitor_multi_binding_publish_mode() -> Literal["per_panel", "all_or_not
             return val  # type: ignore[return-value]
     return "per_panel"
 
+
+def is_failure_notice_enabled() -> bool:
+    """Switch for durable failure-notice receipt ledger and dispatch (``DALTON_FAILURE_NOTICE_ENABLED``).
+
+    Defaults to ``False``; enable via ``DALTON_FAILURE_NOTICE_ENABLED=1`` or YAML
+    ``notify.failure_notice_enabled: true``.
+    """
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_FAILURE_NOTICE_ENABLED",
+        "notify",
+        "failure_notice_enabled",
+        default=False,
+    )
+

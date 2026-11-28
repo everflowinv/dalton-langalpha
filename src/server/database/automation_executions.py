@@ -899,23 +899,39 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
         async with conn.cursor() as cur:
             if stamp is not None:
                 # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
+                # DALTON-HOOK(dalton-notify): preserve pending_settlement marker across delivery re-stamps
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'pending_settlement' THEN
+                            %s::jsonb || jsonb_build_object(
+                                'subscription_fallback', delivery->'subscription_fallback',
+                                'pending_settlement', delivery->'pending_settlement'
+                            )
                         WHEN delivery ? 'subscription_fallback' THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'pending_settlement' THEN
+                            %s::jsonb || jsonb_build_object('pending_settlement', delivery->'pending_settlement')
                         ELSE %s::jsonb
                     END
                     WHERE automation_execution_id = %s
                       AND status IN {UNSETTLED_STATUSES}
-                """, (Json(stamp), Json(stamp), execution_id))
+                """, (Json(stamp), Json(stamp), Json(stamp), Json(stamp), execution_id))
             else:
                 # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
+                # DALTON-HOOK(dalton-notify): keep pending_settlement marker when clearing delivery targets
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'pending_settlement' THEN
+                            jsonb_build_object(
+                                'subscription_fallback', delivery->'subscription_fallback',
+                                'pending_settlement', delivery->'pending_settlement'
+                            )
                         WHEN delivery ? 'subscription_fallback' THEN
                             jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'pending_settlement' THEN
+                            jsonb_build_object('pending_settlement', delivery->'pending_settlement')
                         ELSE NULL
                     END
                     WHERE automation_execution_id = %s

@@ -494,13 +494,34 @@ async def resolve_dalton_extract_model(user_id: str | None = None) -> str:
     return ""
 
 
-async def resolve_dalton_notify_enabled(user_id: str | None = None) -> bool:
+async def _read_user_preferences(
+    uid: str,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> Mapping[str, Any] | None:
+    if conn is None and cached is True:
+        return await get_user_preferences(uid)
+    kwargs: dict[str, Any] = {}
+    if not cached:
+        kwargs["cached"] = False
+    if conn is not None:
+        kwargs["conn"] = conn
+    return await get_user_preferences(uid, **kwargs)
+
+
+async def resolve_dalton_notify_enabled(
+    user_id: str | None = None,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> bool:
     """Resolve per-user Feishu/Discord notification master switch (default ``False``, isolated per user)."""
     uid = (user_id or "").strip()
     if not uid:
         return False
     try:
-        row = await get_user_preferences(uid)
+        row = await _read_user_preferences(uid, conn=conn, cached=cached)
     except RuntimeError as exc:
         if "pool is not open" in str(exc):
             return False
@@ -517,13 +538,18 @@ async def resolve_dalton_notify_enabled(user_id: str | None = None) -> bool:
     return False
 
 
-async def resolve_dalton_notify_targets(user_id: str | None = None) -> list[str]:
+async def resolve_dalton_notify_targets(
+    user_id: str | None = None,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> list[str]:
     """Resolve per-user notification targets for ``user_id`` (isolated per user, never inherited)."""
     uid = (user_id or "").strip()
     if not uid:
         return []
     try:
-        row = await get_user_preferences(uid)
+        row = await _read_user_preferences(uid, conn=conn, cached=cached)
     except RuntimeError as exc:
         if "pool is not open" in str(exc):
             return []
@@ -540,24 +566,51 @@ async def resolve_dalton_notify_targets(user_id: str | None = None) -> list[str]
     return []
 
 
-async def resolve_dalton_notify_overrides(user_id: str | None = None) -> dict[str, bool]:
+async def resolve_dalton_notify_overrides(
+    user_id: str | None = None,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> dict[str, bool]:
     """Resolve per-user automation notification overrides ``{automation_name_or_category: bool}``."""
     return await _resolve_notify_pref_map(
         user_id,
         DALTON_NOTIFY_OVERRIDES_KEY,
         # Pre-migration rows keep their copy under other_preference.
         bags=("model_preference", "other_preference"),
+        conn=conn,
+        cached=cached,
     )
 
 
-async def resolve_dalton_notify_target_labels(user_id: str | None = None) -> dict[str, str]:
+async def resolve_dalton_notify_target_labels(
+    user_id: str | None = None,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> dict[str, str]:
     """Resolve per-user notify target labels ``{target: label}``."""
-    return await _resolve_notify_pref_map(user_id, DALTON_NOTIFY_TARGET_LABELS_KEY)
+    return await _resolve_notify_pref_map(
+        user_id,
+        DALTON_NOTIFY_TARGET_LABELS_KEY,
+        conn=conn,
+        cached=cached,
+    )
 
 
-async def resolve_dalton_notify_routes(user_id: str | None = None) -> dict[str, list[str]]:
+async def resolve_dalton_notify_routes(
+    user_id: str | None = None,
+    *,
+    conn: Any = None,
+    cached: bool = True,
+) -> dict[str, list[str]]:
     """Resolve per-task notify routes ``{automation_name_or_category: [target, ...]}``."""
-    return await _resolve_notify_pref_map(user_id, DALTON_NOTIFY_ROUTES_KEY)
+    return await _resolve_notify_pref_map(
+        user_id,
+        DALTON_NOTIFY_ROUTES_KEY,
+        conn=conn,
+        cached=cached,
+    )
 
 
 async def _resolve_notify_pref_map(
@@ -565,6 +618,8 @@ async def _resolve_notify_pref_map(
     key: str,
     *,
     bags: tuple[str, ...] = ("model_preference",),
+    conn: Any = None,
+    cached: bool = True,
 ) -> dict[str, Any]:
     """Read a notify mapping preference for ``user_id`` from the given bags (never inherited).
 
@@ -578,7 +633,7 @@ async def _resolve_notify_pref_map(
     if not uid:
         return empty
     try:
-        row = await get_user_preferences(uid)
+        row = await _read_user_preferences(uid, conn=conn, cached=cached)
     except RuntimeError as exc:
         if "pool is not open" in str(exc):
             return empty

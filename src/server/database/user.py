@@ -547,7 +547,13 @@ def _user_prefs_cache_key(user_id: str) -> str:
     return f"user_prefs:v{_USER_PREFS_SHAPE}:{user_id}"
 
 
-async def get_user_preferences(user_id: str, *, cached: bool = True) -> Optional[Dict[str, Any]]:
+# DALTON-HOOK(dalton-notify): allow callers holding a DB connection to reuse it without nested pool checkout
+async def get_user_preferences(
+    user_id: str,
+    *,
+    cached: bool = True,
+    conn: Any = None,
+) -> Optional[Dict[str, Any]]:
     """
     Get user preferences (cached in Redis).
 
@@ -560,6 +566,8 @@ async def get_user_preferences(user_id: str, *, cached: bool = True) -> Optional
         cached: False reads the row itself and leaves the cache alone, for a
             read that must see the latest write: a read that misses the cache
             as a write commits can put the old value back for the TTL.
+        conn: Optional already-acquired DB connection to reuse instead of
+            checking out a second connection from the pool.
 
     Returns:
         Preferences dict or None if not found
@@ -578,8 +586,9 @@ async def get_user_preferences(user_id: str, *, cached: bool = True) -> Optional
         except Exception:
             pass  # Redis down — fall through to DB
 
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    # DALTON-HOOK(dalton-notify): reuse caller's connection when provided
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
                 SELECT
                     user_preference_id, user_id,

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 DATA_TASK_GATEWAY_PATH = "/internal/data-task-notifications"
 AUTOMATION_GATEWAY_PATH = "/internal/automation-notifications"
+FAILURE_NOTICE_GATEWAY_PATH = "/internal/failure-notices"
 
 # Shared preflight-retry budget contract (§3.1 / weixin-gateway-contract.md):
 # Gateway retries transient Weixin preflight `roster_lookup_error` (HTTP 503)
@@ -657,3 +658,182 @@ async def post_automation_gateway_notify(
         status_code=resp.status_code,
         error_message=safe_message,
     )
+
+
+async def post_failure_notice_gateway_notify(
+    target_receipt_id: str,
+    claim_token: str,
+    *,
+    target: str,
+    gateway_url: str | None = None,
+    service_token: str | None = None,
+    timeout_s: float | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """POST ``{"target_receipt_id": ..., "claim_token": ...}`` to ``/internal/failure-notices``.
+
+    Never logs ``claim_token`` or ``service_token``. Preserves ``partial`` so the receipt
+    state machine converges partial sends without re-sending already-delivered chunks.
+    """
+    cleaned_target = str(target or "").strip()
+    try:
+        cleaned_id = str(UUID(str(target_receipt_id or "").strip()))
+        cleaned_token = str(UUID(str(claim_token or "").strip()))
+    except (ValueError, AttributeError, TypeError):
+        cleaned_id = ""
+        cleaned_token = ""
+    if not cleaned_id or not cleaned_token or not cleaned_target:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="invalid_request",
+            status_code=400,
+        )
+
+    from src.dalton.capabilities import is_channel_target_enabled
+
+    if not is_channel_target_enabled(cleaned_target):
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="capability_disabled",
+            status_code=503,
+        )
+
+    eff_token = (
+        service_token if service_token is not None else get_internal_service_token()
+    ).strip()
+    if not eff_token:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="service_token_unconfigured",
+            status_code=503,
+        )
+
+    eff_base = (
+        gateway_url if gateway_url is not None else get_dalton_channel_gateway_url()
+    ).strip().rstrip("/")
+    if not eff_base:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="gateway_url_unconfigured",
+            status_code=503,
+        )
+
+    eff_timeout_s = resolve_gateway_delivery_read_timeout_s(timeout_s)
+    req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
+    endpoint = f"{eff_base}{FAILURE_NOTICE_GATEWAY_PATH}"
+    headers = {
+        "X-Service-Token": eff_token,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "target_receipt_id": cleaned_id,
+        "claim_token": cleaned_token,
+    }
+
+    owns_client = http_client is None
+    client = http_client if http_client is not None else _build_ephemeral_client()
+    try:
+        resp = await client.post(
+            endpoint,
+            headers=headers,
+            json=body,
+            timeout=req_timeout,
+        )
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.UnsupportedProtocol,
+        httpx.InvalidURL,
+    ) as conn_exc:
+        code = type(conn_exc).__name__
+        logger.warning(
+            "Failure-notice gateway unreachable before send: target_receipt_id=%s error_type=%s",
+            cleaned_id,
+            code,
+        )
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code=code,
+            status_code=0,
+        )
+    except (httpx.TimeoutException, httpx.TransportError):
+        logger.warning(
+            "Failure-notice gateway response lost after request start (uncertain): target_receipt_id=%s",
+            cleaned_id,
+        )
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="delivery_uncertain",
+            status_code=0,
+            uncertain=True,
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    try:
+        parsed = resp.json()
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, Mapping):
+        parsed = {}
+
+    gw_status = str(parsed.get("status") or "").strip().lower()
+    raw_code = str(parsed.get("code") or parsed.get("error_code") or "").strip()
+    safe_code = redact_managed_tokens(raw_code)[:96] if raw_code else ""
+    raw_message = str(parsed.get("message") or parsed.get("error") or "").strip()
+    items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
+    if not raw_message:
+        for item in items:
+            if isinstance(item, Mapping):
+                item_msg = str(item.get("message") or item.get("error") or "").strip()
+                if item_msg:
+                    raw_message = item_msg
+                    break
+    safe_message = redact_managed_tokens(raw_message)[:256] if raw_message else ""
+
+    if resp.status_code == 200 and gw_status in ("sent", "partial"):
+        return {
+            "ok": True,
+            "status": gw_status,
+            "uncertain": False,
+            "status_code": resp.status_code,
+            "items_sent": parsed.get("items_sent"),
+            "items_total": parsed.get("items_total"),
+            "items": items,
+            "results": [
+                {
+                    "target": cleaned_target,
+                    "ok": True,
+                    "status": gw_status,
+                    "items_sent": parsed.get("items_sent"),
+                    "items_total": parsed.get("items_total"),
+                }
+            ],
+        }
+
+    if gw_status in ("unknown", "in_flight") or (
+        is_uncertain_notify_error_code(safe_code) and safe_code != "partial"
+    ):
+        uncertain_code = (
+            safe_code if is_uncertain_notify_error_code(safe_code) else "delivery_uncertain"
+        )
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code=uncertain_code,
+            status_code=resp.status_code,
+            uncertain=True,
+        )
+
+    fail_code = safe_code or f"http_{resp.status_code}"
+    out = _automation_transport_failure(
+        target=cleaned_target,
+        error_code=fail_code,
+        status_code=resp.status_code,
+        error_message=safe_message,
+    )
+    if parsed.get("items_sent") is not None:
+        out["items_sent"] = parsed.get("items_sent")
+    if items:
+        out["items"] = items
+    return out

@@ -102,6 +102,26 @@ async def sync_terminal_undelivered_execution(
     from src.server.database import automation_executions as exec_db
 
     try:
+        # Guard entry: never touch delivery_result or result_excerpt on non-completed executions
+        async with get_db_connection(conn) as owned:
+            async with owned.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT status
+                    FROM automation_executions
+                    WHERE automation_execution_id = %s::uuid
+                    """,
+                    (exec_id,),
+                )
+                exec_row = await cur.fetchone()
+        exec_status = (
+            str(exec_row.get("status") or "").strip().lower()
+            if isinstance(exec_row, Mapping)
+            else ""
+        )
+        if exec_status != "completed":
+            return False
+
         loaded_rows: list[Mapping[str, Any]]
         if rows is not None:
             loaded_rows = [r for r in rows if isinstance(r, Mapping)]
@@ -190,6 +210,7 @@ async def sync_terminal_undelivered_execution(
                         ELSE result_excerpt || E'\n\n' || %s
                     END
                     WHERE automation_execution_id = %s::uuid
+                      AND status = 'completed'
                     """,
                     (excerpt_note, excerpt_note, exec_id),
                 )
@@ -2633,6 +2654,8 @@ def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
 
 async def resolve_active_dalton_weixin_targets(
     user_id: str | None,
+    *,
+    conn: Any = None,
 ) -> set[str]:
     """Return the caller's currently active ``weixin:user:<id>`` targets (empty set on DB error)."""
     cleaned_uid = str(user_id or "").strip()
@@ -2644,7 +2667,7 @@ async def resolve_active_dalton_weixin_targets(
     if not has_capability(CapabilityId.CHANNEL_WEIXIN):
         return set()
     try:
-        async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with get_db_connection(conn) as db_conn, db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT ilink_user_id
@@ -2737,10 +2760,14 @@ def _is_chat_target(target: str) -> bool:
     return is_dalton_chat_target(target) or is_dalton_discord_channel_target(target)
 
 
-async def _default_notify_admin(user_id: str | None) -> bool:
+async def _default_notify_admin(user_id: str | None, *, conn: Any = None) -> bool:
     from src.dalton.access_tiers import is_internal_or_admin
 
-    return await is_internal_or_admin(user_id)
+    return (
+        await is_internal_or_admin(user_id, conn=conn)
+        if conn is not None
+        else await is_internal_or_admin(user_id)
+    )
 
 
 async def evaluate_user_notify_eligibility(
@@ -2749,14 +2776,24 @@ async def evaluate_user_notify_eligibility(
     *,
     target: str | None = None,
     include_chat_targets: bool | None = None,
+<<<<<<< HEAD
     allow_personal_dm_redirect: bool = False,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
     resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
     is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+=======
+    conn: Any = None,
+    cached: bool = True,
+    resolve_enabled_fn: Callable[..., Awaitable[bool]] = resolve_dalton_notify_enabled,
+    resolve_overrides_fn: Callable[..., Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
+    resolve_targets_fn: Callable[..., Awaitable[list[str]]] = resolve_dalton_notify_targets,
+    resolve_routes_fn: Callable[..., Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
+    is_admin_fn: Callable[..., Awaitable[bool]] | None = None,
+>>>>>>> refs/lane/105
     resolve_active_weixin_targets_fn: Callable[
-        [str | None], Awaitable[AbstractSet[str] | None]
+        ..., Awaitable[AbstractSet[str] | None]
     ]
     | None = None,
 ) -> tuple[bool, str | None, list[str]]:
@@ -2776,7 +2813,17 @@ async def evaluate_user_notify_eligibility(
     if is_excluded_automation_for_notify(automation):
         return (False, "toggle_off", [])
 
-    if not await resolve_enabled_fn(cleaned_uid):
+    pref_kwargs: dict[str, Any] = {}
+    if conn is not None:
+        pref_kwargs["conn"] = conn
+    if not cached:
+        pref_kwargs["cached"] = False
+
+    if pref_kwargs and resolve_enabled_fn is resolve_dalton_notify_enabled:
+        enabled = await resolve_enabled_fn(cleaned_uid, **pref_kwargs)
+    else:
+        enabled = await resolve_enabled_fn(cleaned_uid)
+    if not enabled:
         return (False, "toggle_off", [])
 
     classification = (
@@ -2784,8 +2831,14 @@ async def evaluate_user_notify_eligibility(
         if isinstance(automation, Mapping)
         else None
     )
-    overrides = await resolve_overrides_fn(cleaned_uid)
-    routes = await resolve_routes_fn(cleaned_uid)
+    if pref_kwargs and resolve_overrides_fn is resolve_dalton_notify_overrides:
+        overrides = await resolve_overrides_fn(cleaned_uid, **pref_kwargs)
+    else:
+        overrides = await resolve_overrides_fn(cleaned_uid)
+    if pref_kwargs and resolve_routes_fn is resolve_dalton_notify_routes:
+        routes = await resolve_routes_fn(cleaned_uid, **pref_kwargs)
+    else:
+        routes = await resolve_routes_fn(cleaned_uid)
     if isinstance(automation, Mapping):
         if classification is not None and not is_automation_notify_enabled(
             automation, overrides, routes
@@ -2798,7 +2851,10 @@ async def evaluate_user_notify_eligibility(
             if isinstance(overrides, Mapping) and overrides.get(custom_key) is False:
                 return (False, "toggle_off", [])
 
-    targets = await resolve_targets_fn(cleaned_uid)
+    if pref_kwargs and resolve_targets_fn is resolve_dalton_notify_targets:
+        targets = await resolve_targets_fn(cleaned_uid, **pref_kwargs)
+    else:
+        targets = await resolve_targets_fn(cleaned_uid)
     normalized_targets = [
         _split_target_channel(t)[1] for t in targets if str(t).strip()
     ]
@@ -2818,13 +2874,15 @@ async def evaluate_user_notify_eligibility(
     )
     active_weixin_targets: AbstractSet[str] | None = None
     if has_weixin_candidate:
-        active_wx_fn = (
-            resolve_active_weixin_targets_fn
-            if resolve_active_weixin_targets_fn is not None
-            else resolve_active_dalton_weixin_targets
-        )
         try:
-            resolved_wx = await active_wx_fn(cleaned_uid)
+            if resolve_active_weixin_targets_fn is not None:
+                resolved_wx = await resolve_active_weixin_targets_fn(cleaned_uid)
+            elif conn is not None:
+                resolved_wx = await resolve_active_dalton_weixin_targets(
+                    cleaned_uid, conn=conn
+                )
+            else:
+                resolved_wx = await resolve_active_dalton_weixin_targets(cleaned_uid)
         except Exception:
             resolved_wx = set()
         active_weixin_targets = set() if resolved_wx is None else resolved_wx
@@ -2836,9 +2894,12 @@ async def evaluate_user_notify_eligibility(
 
     if include_chat_targets is not None:
         include_chats = bool(include_chat_targets)
+    elif is_admin_fn is not None:
+        include_chats = await is_admin_fn(cleaned_uid)
+    elif conn is not None:
+        include_chats = await _default_notify_admin(cleaned_uid, conn=conn)
     else:
-        admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
-        include_chats = await admin_check(cleaned_uid)
+        include_chats = await _default_notify_admin(cleaned_uid)
     routed = resolve_notify_route_targets(
         automation,
         routes,
@@ -5826,6 +5887,16 @@ async def retry_failed_notify_deliveries(
             limit=limit,
             uncertain_codes=uncertain_codes_list,
         )
+        from src.dalton.settings import is_failure_notice_enabled
+
+        if is_failure_notice_enabled() and time.monotonic() - started_at < max_duration_s:
+            from src.dalton.notify.failure_receipts import process_due_failure_notices
+
+            fn_stats = await process_due_failure_notices(
+                limit=limit,
+                max_duration_s=max(1.0, max_duration_s - (time.monotonic() - started_at)),
+            )
+            sent_count += int(fn_stats.get("sent") or 0)
     except Exception as scan_exc:
         logger.warning(
             "[DALTON_NOTIFY] Retry scan failed: error_type=%s",

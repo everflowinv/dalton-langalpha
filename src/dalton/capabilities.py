@@ -1821,6 +1821,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
+        ("channels_router.py", "internal_failure_notice_plan_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         # --- automation_notifications_router.py ---
         ("automation_notifications_router.py", "internal_automation_notification_plan_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         # --- data_task_notifications_router.py ---

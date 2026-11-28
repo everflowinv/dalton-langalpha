@@ -177,6 +177,7 @@ export type MockBackend = BackendClient &
       | "setOnStaleGatewayEpoch"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
+      | "authorizeFailureNoticePlan"
       | "downloadDataTaskRunArtifact"
     >
   > & {
@@ -1126,6 +1127,13 @@ export function createMockBackend(): MockBackend {
       status: "failed" as const,
       code: "delivery_not_found",
       message: "Delivery not configured in mock backend",
+    })),
+
+    authorizeFailureNoticePlan: vi.fn(async () => ({
+      authorized: false,
+      status: "failed" as const,
+      code: "claim_expired_or_superseded",
+      message: "Failure notice plan not configured in mock backend",
     })),
 
     downloadDataTaskRunArtifact: vi.fn(async () => ({

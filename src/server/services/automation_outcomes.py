@@ -8,6 +8,7 @@ on it.
 """
 
 import logging
+from collections.abc import Mapping  # DALTON-HOOK(dalton-notify)
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Dict, Literal, Optional
@@ -267,7 +268,35 @@ SUSPENSION_ENDS = frozenset({
 })
 
 
-def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
+# DALTON-HOOK(dalton-notify): resolve persisted pre-run settlement outcome on recovery after rollback
+def outcome_from_pending_settlement(
+    pending: Optional[Mapping[str, Any]],
+) -> Optional[Outcome]:
+    """Recover the original ``Outcome`` from a persisted ``pending_settlement`` record."""
+    if not isinstance(pending, Mapping):
+        return None
+    raw_outcome = str(pending.get("outcome") or "").strip().lower()
+    if raw_outcome:
+        try:
+            return Outcome(raw_outcome)
+        except ValueError:
+            pass
+    raw_reason = str(pending.get("failure_reason") or "").strip().lower()
+    if raw_reason:
+        for candidate, policy in POLICIES.items():
+            if policy.failure_reason == raw_reason:
+                return candidate
+    if pending.get("is_quota_limit") is True:
+        return Outcome.LIMITED
+    return None
+
+
+def ledger_outcome(
+    run: Optional[Dict[str, Any]],
+    *,
+    # DALTON-HOOK(dalton-notify): honor persisted pre-run failure parameters when no run row exists
+    pending_settlement: Optional[Mapping[str, Any]] = None,
+) -> Optional[Outcome]:
     """How a firing ended, by its admitted run's ledger row; None while the
     run is still going.
 
@@ -286,6 +315,10 @@ def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
     question counts as a failure, as it does when the executor reads it.
     """
     if run is None:
+        # DALTON-HOOK(dalton-notify): recover persisted pre-run failure outcome if settle rolled back
+        recovered = outcome_from_pending_settlement(pending_settlement)
+        if recovered is not None:
+            return recovered
         return Outcome.INTERRUPTED
     status = run["status"]
     if status == "in_progress":

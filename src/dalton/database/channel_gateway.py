@@ -11073,6 +11073,7 @@ async def authorize_and_claim_delivery(
     reclaim_stale_source_attempt_id: str | None = None,
     retry_dedup_by_target: bool = False,
     payload_digest: str | None = None,
+    claim_token: str | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -11107,6 +11108,22 @@ async def authorize_and_claim_delivery(
 
         return await authorize_and_claim_automation_notify_delivery(
             delivery_key=cleaned_key,
+            run_id=run_id,
+            target=target,
+            has_non_empty_text=has_non_empty_text,
+            total_chunks=total_chunks,
+            gateway_epoch=gateway_epoch,
+            require_gateway_epoch=require_gateway_epoch,
+            conn=conn,
+        )
+    if cleaned_kind == "failure_notice":
+        from src.dalton.database.failure_notice_claims import (
+            authorize_and_claim_failure_notice,
+        )
+
+        return await authorize_and_claim_failure_notice(
+            delivery_key=cleaned_key,
+            claim_token=claim_token,
             run_id=run_id,
             target=target,
             has_non_empty_text=has_non_empty_text,
@@ -18466,8 +18483,16 @@ async def _recover_channel_state_once(
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
 <<<<<<< HEAD
+<<<<<<< HEAD
                     from src.dalton.settings import is_strict_deliverable_text_enabled
+=======
+                    from src.dalton.settings import (
+                        is_failure_notice_enabled,
+                        is_strict_deliverable_text_enabled,
+                    )
+>>>>>>> refs/lane/105
                     auto_row["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
+                    auto_row["failure_notice_enabled"] = is_failure_notice_enabled()
 
                 (
                     bt2_link_recoveries,
@@ -18478,6 +18503,7 @@ async def _recover_channel_state_once(
                     cur, enabled_platforms=enabled_platforms
                 )
 
+<<<<<<< HEAD
                 from src.dalton.settings import is_strict_deliverable_text_enabled
 =======
                     auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
@@ -18485,10 +18511,17 @@ async def _recover_channel_state_once(
                     )
                     auto_row["has_personal_integration_data"] = bool(auto_is_priv)
 >>>>>>> refs/lane/82
+=======
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
+>>>>>>> refs/lane/105
 
                 return {
                     "mode": "startup",
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+                    "failure_notice_enabled": is_failure_notice_enabled(),
                     "inbound_events": _json_safe_rows(inbound_events),
                     "background_runs": _json_safe_rows(background_runs),
                     "thread_watches": _json_safe_rows(thread_watches),
@@ -19146,7 +19179,10 @@ async def finish_automation_run(
                             norm_exec_id,
                             exc_info=True,
                         )
-                from src.dalton.settings import is_strict_deliverable_text_enabled
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
 
                 return {
                     "execution_id": norm_exec_id,
@@ -19172,9 +19208,13 @@ async def finish_automation_run(
                     "targets": enriched_targets,
 <<<<<<< HEAD
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+<<<<<<< HEAD
 =======
                     "has_personal_integration_data": bool(auto_is_priv),
 >>>>>>> refs/lane/82
+=======
+                    "failure_notice_enabled": is_failure_notice_enabled(),
+>>>>>>> refs/lane/105
                 }
 
 

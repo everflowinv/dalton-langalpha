@@ -542,7 +542,11 @@ export interface AgentAutomationRunFinishRequest {
   thread_id?: string | null;
   run_id?: string | null;
   final_text?: string | null;
+<<<<<<< HEAD
   has_personal_integration_data?: boolean;
+=======
+  final_attempt?: boolean;
+>>>>>>> refs/lane/105
 }
 
 export interface AgentAutomationRunFinishTargetRow {

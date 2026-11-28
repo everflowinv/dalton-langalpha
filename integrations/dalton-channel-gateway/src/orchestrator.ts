@@ -9745,6 +9745,7 @@ export class ChannelGatewayOrchestrator {
         this.recoverSingleAutomationRun(
           autoRun,
           recovery.strict_deliverable_text_enabled,
+          recovery.failure_notice_enabled,
         ),
       ),
     ]);
@@ -10740,6 +10741,7 @@ export class ChannelGatewayOrchestrator {
   private async recoverSingleAutomationRun(
     autoRun: RecoverAutomationRunRow,
     recoveryStrictDeliverableTextEnabled?: boolean,
+    recoveryFailureNoticeEnabled?: boolean,
   ): Promise<void> {
     if (autoRun.status !== "finishing") return;
     await this.agentRoutes.executeAutomationRunFinish({
@@ -10756,6 +10758,8 @@ export class ChannelGatewayOrchestrator {
       strictDeliverableTextEnabled:
         autoRun.strict_deliverable_text_enabled ??
         recoveryStrictDeliverableTextEnabled,
+      failureNoticeEnabled:
+        autoRun.failure_notice_enabled ?? recoveryFailureNoticeEnabled,
       targets: autoRun.targets ?? [],
     });
   }
