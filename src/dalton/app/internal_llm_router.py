@@ -16,7 +16,10 @@ from pydantic import BaseModel, Field, create_model
 
 from src.dalton.app.channels_router import require_channel_service_token
 from src.dalton.capabilities import CapabilityId, require_capability_dep
-from src.dalton.llm.complete import dalton_complete
+from src.dalton.llm.complete import (
+    dalton_complete,
+    inspect_existing_completion_journal,
+)
 from src.dalton.settings import get_dalton_config
 
 logger = logging.getLogger(__name__)
@@ -192,23 +195,44 @@ async def internal_llm_complete(
             primary_admin_id, requested_model, ignore_custom_models=True
         )
         if not primary_avail.available:
-            skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
-            pre_candidates = resolve_unattended_fallback_chain(
-                primary_model=requested_model,
-                allowed_pool=configured_order,
-                skip_cooldown_keys=skip_keys,
-                user_id=primary_admin_id,
-                ignore_custom_models=True,
-            )
-            for cand_model in pre_candidates:
-                if not is_verified_system_subscription_model(cand_model):
-                    continue
-                cand_avail = await inspect_subscription_availability(
-                    primary_admin_id, cand_model, ignore_custom_models=True
+            existing_action = "proceed"
+            try:
+                existing_action, _ = await inspect_existing_completion_journal(
+                    purpose=payload.purpose,
+                    model_key=requested_model,
+                    system_prompt=payload.system_prompt,
+                    user_prompt=payload.user_prompt,
+                    response_schema=schema_model,
+                    slot="background",
                 )
-                if cand_avail.available:
-                    active_model = cand_model
-                    break
+            except Exception as exc:
+                logger.warning(
+                    "[InternalLLM] Failed inspecting original journal state for %s (%s); keeping requested model",
+                    requested_model,
+                    type(exc).__name__,
+                )
+                existing_action = "error"
+            if existing_action == "proceed":
+                skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+                pre_candidates = resolve_unattended_fallback_chain(
+                    primary_model=requested_model,
+                    allowed_pool=configured_order,
+                    skip_cooldown_keys=skip_keys,
+                    user_id=primary_admin_id,
+                    ignore_custom_models=True,
+                )
+                for cand_model in pre_candidates:
+                    if not is_verified_system_subscription_model(cand_model):
+                        continue
+                    cand_avail = await inspect_subscription_availability(
+                        primary_admin_id,
+                        cand_model,
+                        ignore_custom_models=True,
+                        include_any_cooldown=True,
+                    )
+                    if cand_avail.available:
+                        active_model = cand_model
+                        break
 
     result = await dalton_complete(
         user_id=primary_admin_id,
@@ -241,7 +265,10 @@ async def internal_llm_complete(
             if not is_verified_system_subscription_model(cand_model):
                 continue
             cand_avail = await inspect_subscription_availability(
-                primary_admin_id, cand_model, ignore_custom_models=True
+                primary_admin_id,
+                cand_model,
+                ignore_custom_models=True,
+                include_any_cooldown=True,
             )
             if not cand_avail.available:
                 continue

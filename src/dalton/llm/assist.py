@@ -446,6 +446,7 @@ async def assist_json(
         def _past_deadline() -> bool:
             return deadline is not None and time.monotonic() >= deadline
 
+        used_fallback_system_only = False
         if fb_list and _should_fall_back(comp, resolved_model):
             primary_model = resolved_model
             allowed_sub_pool = (
@@ -463,7 +464,10 @@ async def assist_json(
                     if not is_verified_system_subscription_model(fb_cand):
                         continue
                     cand_avail = await inspect_subscription_availability(
-                        user_id, fb_cand, ignore_custom_models=True
+                        user_id,
+                        fb_cand,
+                        ignore_custom_models=True,
+                        include_any_cooldown=True,
                     )
                     if not cand_avail.available:
                         continue
@@ -508,6 +512,7 @@ async def assist_json(
                 )
                 comp = comp_fb
                 resolved_model = fb_cand
+                used_fallback_system_only = bool(unattended_assist_fallback)
                 if comp_fb.ok or not _should_fall_back(comp_fb, fb_cand):
                     break
 
@@ -585,6 +590,7 @@ async def assist_json(
                     raise_on_error=False,
                     persist_raw=persist_raw,
                     skip_journal=skip_journal,
+                    **({"ignore_custom_models": True} if used_fallback_system_only else {}),
                 )
             except Exception as repair_call_exc:
                 logger.warning(

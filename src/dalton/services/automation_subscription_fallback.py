@@ -384,6 +384,34 @@ async def resolve_with_subscription_fallback(
                 continue
 
         chosen_model = getattr(getattr(config, "llm", None), "name", None) or candidate
+        final_admission = admission
+        if unattended_gate and chosen_model != candidate:
+            if original_model and chosen_model == original_model:
+                continue
+            if failed_provider:
+                chosen_provider = await _subscription_provider_for_model(
+                    user_id,
+                    chosen_model,
+                    filter_prefs,
+                    ignore_custom_models=True,
+                )
+                if chosen_provider == failed_provider:
+                    continue
+            final_admission = await acquire_fallback_candidate_live(
+                subject_user_id=user_id,
+                payer_user_id=payer_user_id or user_id,
+                candidate_model=chosen_model,
+                ignore_custom_models=True,
+                model_pref=filter_prefs,
+            )
+            if not final_admission.admitted:
+                logger.debug(
+                    "[AUTOMATION_SUB_FALLBACK] Resolved variant %r (from %r) rejected by live admission (%s)",
+                    chosen_model,
+                    candidate,
+                    final_admission.reason,
+                )
+                continue
         orig_label = (
             failed_subject
             or original_model
@@ -395,8 +423,8 @@ async def resolve_with_subscription_fallback(
             provider=failed_provider,
             reason=reason,
         )
-        if admission is not None and admission.route is not None:
-            record["selected_route"] = route_fingerprint_to_dict(admission.route)
+        if final_admission is not None and final_admission.route is not None:
+            record["selected_route"] = route_fingerprint_to_dict(final_admission.route)
         logger.warning(
             "[AUTOMATION_SUB_FALLBACK] user=%s primary=%r (%s provider=%s) -> fallback=%r",
             user_id,
@@ -504,6 +532,25 @@ async def resolve_automation_turn_llm_config(
                     except Exception:
                         continue
                     chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
+                    final_admission = admission
+                    if chosen != cand:
+                        if chosen == probe_model:
+                            continue
+                        final_admission = await acquire_fallback_candidate_live(
+                            subject_user_id=user_id,
+                            payer_user_id=eff_payer_id,
+                            candidate_model=chosen,
+                            ignore_custom_models=True,
+                            model_pref=default_pre_prefs,
+                        )
+                        if not final_admission.admitted:
+                            logger.debug(
+                                "[AUTOMATION_SUB_FALLBACK] Resolved variant %r (from %r) rejected by live admission (%s)",
+                                chosen,
+                                cand,
+                                final_admission.reason,
+                            )
+                            continue
                     kind = (
                         "oauth_auth_unavailable"
                         if avail.kind == "auth_unavailable"
@@ -521,8 +568,10 @@ async def resolve_automation_turn_llm_config(
                             fallback_model=chosen,
                         ),
                     }
-                    if admission.route is not None:
-                        record["selected_route"] = route_fingerprint_to_dict(admission.route)
+                    if final_admission.route is not None:
+                        record["selected_route"] = route_fingerprint_to_dict(
+                            final_admission.route
+                        )
                     return cfg, record
 
     with capture_resolved_effective_model() as captured_model:

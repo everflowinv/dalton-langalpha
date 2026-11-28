@@ -1411,6 +1411,25 @@ async def resolve_turn_config_with_automation_inheritance(
                     except Exception:
                         continue
                     chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
+                    final_admission = admission
+                    if chosen != cand:
+                        if chosen == primary_probe_model:
+                            continue
+                        final_admission = await acquire_fallback_candidate_live(
+                            subject_user_id=user_id,
+                            payer_user_id=eff_payer_id,
+                            candidate_model=chosen,
+                            ignore_custom_models=True,
+                            model_pref=default_pref_for_probe,
+                        )
+                        if not final_admission.admitted:
+                            logger.debug(
+                                "[AUTOMATION_THREAD_MODEL] Resolved variant %r (from %r) rejected by live admission (%s)",
+                                chosen,
+                                cand,
+                                final_admission.reason,
+                            )
+                            continue
                     kind = (
                         "oauth_auth_unavailable"
                         if primary_avail.kind == "auth_unavailable"
@@ -1428,8 +1447,10 @@ async def resolve_turn_config_with_automation_inheritance(
                             fallback_model=chosen,
                         ),
                     }
-                    if admission.route is not None:
-                        record["selected_route"] = route_fingerprint_to_dict(admission.route)
+                    if final_admission.route is not None:
+                        record["selected_route"] = route_fingerprint_to_dict(
+                            final_admission.route
+                        )
                     if target_exec and target_exec.get("automation_execution_id"):
                         record["execution_id"] = str(target_exec["automation_execution_id"])
                     if on_fallback is not None:
@@ -1552,6 +1573,41 @@ async def resolve_turn_config_with_automation_inheritance(
                 )
             except HTTPException as exc:
                 if not _is_sub_unavailable_for_turn(exc):
+                    attempted_model = attempted_models[-1] if attempted_models else None
+                    if (
+                        not fallback_eligible
+                        and from_service
+                        and thread_model._runs_default_instead(
+                            exc,
+                            named=effective_requested_model,
+                            model=attempted_model,
+                        )
+                    ):
+                        logger.info(
+                            f"[CHAT] Thread {thread_id}'s model {attempted_model!r} cannot run "
+                            f"({exc.detail.get('type')}); this turn runs the account default"
+                        )
+                        with capture_resolved_effective_model() as default_captured:
+                            try:
+                                return await _effective_resolve(None)
+                            except HTTPException as default_exc:
+                                if not _is_sub_unavailable_for_turn(default_exc):
+                                    raise
+                                default_detail = (
+                                    default_exc.detail
+                                    if isinstance(default_exc.detail, dict)
+                                    else {}
+                                )
+                                default_rejected = (
+                                    (default_captured[-1] if default_captured else None)
+                                    or extract_rejected_model_from_exc(default_exc)
+                                )
+                                return await _try_subscription_fallback(
+                                    original_model=default_rejected,
+                                    failed_provider=default_detail.get("provider"),
+                                    reason=default_detail.get("type"),
+                                    exc_to_raise=default_exc,
+                                )
                     raise
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_model = (

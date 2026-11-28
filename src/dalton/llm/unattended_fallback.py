@@ -66,7 +66,7 @@ class SubscriptionAvailability:
     """Structured availability status for a subscription model."""
 
     available: bool
-    kind: Literal["auth_unavailable", "quota_cooldown"] | None = None
+    kind: Literal["auth_unavailable", "quota_cooldown", "rate_limit_cooldown"] | None = None
     refusal_code: str | None = None
     provider: str | None = None
     reset_at: datetime | None = None
@@ -277,13 +277,17 @@ async def inspect_subscription_availability(
     client: Any = None,
     prefs: Mapping[str, Any] | None = None,
     ignore_custom_models: bool = False,
+    include_any_cooldown: bool = False,
     now: datetime | None = None,
 ) -> SubscriptionAvailability:
-    """Probe OAuth authorization health and structured Redis quota cooldown for ``(user_id, model_name)``.
+    """Probe OAuth authorization health and Redis cooldown state for ``(user_id, model_name)``.
 
     Non-subscription models always return ``available=True``.
-    Plain 429 / ``rate_limited`` / unstructured Redis entries return ``available=True``
-    (matching ``is_quota_or_auth_switch_trigger``).
+    When ``include_any_cooldown=False`` (default, used for primary switch-trigger checks),
+    plain 429 / ``rate_limited`` / unstructured Redis entries return ``available=True``
+    (matching ``is_quota_or_auth_switch_trigger``). When ``include_any_cooldown=True``
+    (used when evaluating fallback candidates), any active cooldown record marks the
+    candidate unavailable so cooled-down models are skipped.
     """
     now_dt = now or datetime.now(timezone.utc)
     now_ts = now_dt.timestamp()
@@ -423,9 +427,21 @@ async def inspect_subscription_availability(
         elif refusal_code == "plan_limit":
             reset_at = None
 
-    # Strictly require a structured terminal quota/auth refusal reason (same judgment as
-    # is_quota_or_auth_switch_trigger): plain 429 / rate_limited / unstructured records do not switch.
+    # Primary switch-trigger checks strictly require a structured terminal quota/auth refusal
+    # reason (same judgment as is_quota_or_auth_switch_trigger): plain 429 / rate_limited /
+    # unstructured records do not trigger switching. Candidate checks (include_any_cooldown=True)
+    # treat any active cooldown record as unavailable so cooled-down candidates are skipped.
     if refusal_code not in QUOTA_OR_AUTH_REASONS:
+        if include_any_cooldown:
+            return SubscriptionAvailability(
+                available=False,
+                kind="rate_limit_cooldown",
+                refusal_code=refusal_code or "rate_limited",
+                provider=provider,
+                reset_at=reset_at,
+                cooldown_key=cooldown_key,
+                model_name=mk,
+            )
         return SubscriptionAvailability(
             available=True,
             provider=provider,
@@ -582,6 +598,7 @@ def is_quota_or_auth_switch_trigger(exc: BaseException | None) -> bool:
     if exc is None:
         return False
 
+    from src.dalton.llm.oauth_refresh import get_transient_oauth_refresh_error
     from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhaustedError
     from src.server.services.oauth_health import OAuthReauthRequired, OAuthRefreshUnavailable
     from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
@@ -595,6 +612,8 @@ def is_quota_or_auth_switch_trigger(exc: BaseException | None) -> bool:
             return False
         if dtype in TERMINAL_AUTH_HTTP_TYPES:
             return True
+    if get_transient_oauth_refresh_error(exc) is not None:
+        return False
 
     if isinstance(exc, _RemoteQuotaExhaustedError):
         refusal = read_refusal(exc)
@@ -836,13 +855,14 @@ async def acquire_fallback_candidate_live(
             route=live_route,
         )
 
-    # Gate 4: Live OAuth subscription availability probe
+    # Gate 4: Live OAuth subscription availability probe (skip candidates in any active cooldown)
     _avail_fn = availability_fn or inspect_subscription_availability
     avail = await _avail_fn(
         subj,
         mk,
         prefs=prefs or None,
         ignore_custom_models=True,
+        include_any_cooldown=True,
     )
     if not avail.available:
         return FallbackAdmissionResult(

@@ -687,10 +687,11 @@ async def test_pre_dispatch_all_cooled_down_plain_429_refresh_unavailable_and_sw
             False,
         ),
     )
+    orig_require_policy = account_svc.require_policy
     monkeypatch.setattr(
         account_svc,
         "require_policy",
-        create_autospec(account_svc.require_policy, instance=False, return_value=ALLOW_ALL),
+        create_autospec(orig_require_policy, instance=False, return_value=ALLOW_ALL),
     )
     monkeypatch.setattr(
         user_models,
@@ -1206,3 +1207,764 @@ async def test_assist_json_explicit_and_default_fallbacks_enforced_when_on_and_u
     assert res_off.ok is True
     assert res_off.model == "deepseek-flash"
     assert "ignore_custom_models" not in calls_off[1]
+
+
+# ---------------------------------------------------------------------------
+# 9. Round 5 fixes: candidate cooldown, effort re-verify, assist repair,
+#    transient OAuth refresh, internal_llm journal dedup, wakeup default fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_candidate_skipped_for_next_available_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opus exhausted (plan_limit), Gemini in plain rate_limited cooldown, Codex available -> selects Codex.
+
+    Plain rate_limited still does NOT trigger switching when it is the primary model,
+    but DOES mark a fallback candidate unavailable during candidate selection.
+    """
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    user_id = "user-r5-rl"
+    pool = [
+        "claude-opus-5-5-oauth",
+        "gemini-4-hydrogen-high-oauth",
+        "gpt-6.2-sol-oauth",
+    ]
+    monkeypatch.setattr(
+        dalton_settings_mod, "get_dalton_config", lambda: _make_dalton_config_with_pool(pool)
+    )
+
+    catalog_entries = {
+        "claude-opus-5-5-oauth": {"provider": "claude-oauth", "model_id": "claude-opus-5-5"},
+        "gemini-4-hydrogen-high-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-hydrogen-high",
+        },
+        "gpt-6.2-sol-oauth": {"provider": "codex-oauth", "model_id": "gpt-6.2-sol"},
+    }
+    fake_mc = _make_fake_model_config(catalog_entries)
+    from src.llms.llm import LLM as LLMFactory
+
+    monkeypatch.setattr(LLMFactory, "get_model_config", classmethod(lambda cls: fake_mc))
+    monkeypatch.setattr(
+        complete_mod,
+        "resolve_model_billing_and_provider",
+        lambda m: ("oauth", catalog_entries[m]["provider"]),
+    )
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda m, **_kw: (
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["model_id"],
+            False,
+        ),
+    )
+
+    now = datetime.now(timezone.utc)
+    conn_row = {
+        "account_id": "acct-r5",
+        "email": "r5@everflow.test",
+        "plan_type": "pro",
+        "expires_at": now + timedelta(hours=2),
+        "updated_at": now,
+        "needs_reauth_at": None,
+        "last_error_code": None,
+        "is_live": True,
+    }
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_connection",
+        create_autospec(oauth_tokens_db.get_oauth_connection, instance=False, return_value=conn_row),
+    )
+    cred_id = uf.resolve_oauth_credential_id_from_row(conn_row)
+    opus_key = uf.build_quota_cooldown_key(
+        user_id=user_id,
+        model_name="claude-opus-5-5-oauth",
+        provider="claude-oauth",
+        credential_id=cred_id,
+    )
+    gemini_key = uf.build_quota_cooldown_key(
+        user_id=user_id,
+        model_name="gemini-4-hydrogen-high-oauth",
+        provider="antigravity-oauth",
+        credential_id=cred_id,
+    )
+    assert opus_key and gemini_key
+
+    redis_store: dict[str, Any] = {
+        opus_key: {
+            "expires_at": (now + timedelta(minutes=40)).timestamp(),
+            "refusal": {
+                "reason": "plan_limit",
+                "until": (now + timedelta(minutes=40)).isoformat(),
+            },
+        },
+        gemini_key: {
+            "expires_at": (now + timedelta(minutes=5)).timestamp(),
+            "refusal": {"reason": "rate_limited"},
+        },
+    }
+
+    class _FakeRedis:
+        async def get(self, key: str) -> Any:
+            return redis_store.get(key)
+
+    from src.utils.cache import redis_cache as redis_cache_mod
+
+    monkeypatch.setattr(redis_cache_mod, "get_cache_client", lambda: _FakeRedis())
+    orig_require_policy = account_svc.require_policy
+    monkeypatch.setattr(
+        account_svc,
+        "require_policy",
+        create_autospec(orig_require_policy, instance=False, return_value=ALLOW_ALL),
+    )
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, instance=False, return_value={}),
+    )
+
+    # Primary check on Gemini (rate_limited) still does NOT trigger switching
+    gemini_primary_avail = await uf.inspect_subscription_availability(
+        user_id, "gemini-4-hydrogen-high-oauth", now=now
+    )
+    assert gemini_primary_avail.available is True
+
+    # Candidate check on Gemini (include_any_cooldown=True) marks it unavailable
+    gemini_cand_avail = await uf.inspect_subscription_availability(
+        user_id, "gemini-4-hydrogen-high-oauth", include_any_cooldown=True, now=now
+    )
+    assert gemini_cand_avail.available is False
+    assert gemini_cand_avail.kind == "rate_limit_cooldown"
+    assert gemini_cand_avail.refusal_code == "rate_limited"
+
+    # Full pre-dispatch selection: Opus exhausted, Gemini rate_limited, Codex available -> selects Codex
+    async def _fake_resolve_llm(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(llm=SimpleNamespace(name=args[2], fallback=[]))
+
+    monkeypatch.setattr(
+        auto_fb_mod,
+        "resolve_llm_config",
+        create_autospec(llm_config_mod.resolve_llm_config, instance=False, side_effect=_fake_resolve_llm),
+    )
+
+    cfg, rec = await auto_fb_mod.resolve_automation_turn_llm_config(
+        SimpleNamespace(),
+        user_id,
+        "claude-opus-5-5-oauth",
+        payer_user_id=user_id,
+    )
+    assert cfg.llm.name == "gpt-6.2-sol-oauth"
+    assert rec is not None
+    assert rec["original_model"] == "claude-opus-5-5-oauth"
+    assert rec["fallback_model"] == "gpt-6.2-sol-oauth"
+    assert rec["selected_route"]["model_key"] == "gpt-6.2-sol-oauth"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_rewritten_variant_reverified_against_whitelist_policy_and_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When reasoning_effort rewrites a candidate to another variant, the final model must be
+    re-verified against whitelist + policy_refuses and recorded accurately in selected_route."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    user_id = "user-r5-effort"
+    catalog_entries = {
+        "claude-opus-5-5-oauth": {"provider": "claude-oauth", "model_id": "claude-opus-5-5"},
+        "gemini-4-hydrogen-high-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-hydrogen-high",
+        },
+        "gemini-4-hydrogen-low-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-hydrogen-low",
+        },
+        "gpt-6.2-sol-oauth": {"provider": "codex-oauth", "model_id": "gpt-6.2-sol"},
+    }
+    fake_mc = _make_fake_model_config(catalog_entries)
+    from src.llms.llm import LLM as LLMFactory
+
+    monkeypatch.setattr(LLMFactory, "get_model_config", classmethod(lambda cls: fake_mc))
+    monkeypatch.setattr(
+        complete_mod,
+        "resolve_model_billing_and_provider",
+        lambda m: ("oauth", catalog_entries[m]["provider"]),
+    )
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda m, **_kw: (
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["model_id"],
+            False,
+        ),
+    )
+
+    now = datetime.now(timezone.utc)
+
+    async def _avail(uid: str, mk: str, **_kw: Any) -> uf.SubscriptionAvailability:
+        if mk == "claude-opus-5-5-oauth":
+            return uf.SubscriptionAvailability(
+                available=False,
+                kind="quota_cooldown",
+                refusal_code="plan_limit",
+                provider="claude-oauth",
+                reset_at=now + timedelta(minutes=20),
+                cooldown_key="quota:u:claude-oauth:model:opus",
+                model_name=mk,
+            )
+        return uf.SubscriptionAvailability(
+            available=True, provider=catalog_entries[mk]["provider"], model_name=mk
+        )
+
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(uf.inspect_subscription_availability, instance=False, side_effect=_avail),
+    )
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, instance=False, return_value={}),
+    )
+
+    async def _resolve_rewriting_high_to_low(*args: Any, **kwargs: Any) -> Any:
+        requested = args[2]
+        effort = kwargs.get("reasoning_effort")
+        final_name = (
+            "gemini-4-hydrogen-low-oauth"
+            if requested == "gemini-4-hydrogen-high-oauth" and effort == "low"
+            else requested
+        )
+        return SimpleNamespace(llm=SimpleNamespace(name=final_name, fallback=[]), llm_client=object())
+
+    monkeypatch.setattr(
+        auto_fb_mod,
+        "resolve_llm_config",
+        create_autospec(
+            llm_config_mod.resolve_llm_config,
+            instance=False,
+            side_effect=_resolve_rewriting_high_to_low,
+        ),
+    )
+    orig_require_policy = account_svc.require_policy
+    monkeypatch.setattr(
+        account_svc,
+        "require_policy",
+        create_autospec(orig_require_policy, instance=False, return_value=ALLOW_ALL),
+    )
+
+    # Case A: low variant is NOT in whitelist -> rejected after effort rewrite, skips to gpt-6.2-sol-oauth
+    pool_without_low = [
+        "claude-opus-5-5-oauth",
+        "gemini-4-hydrogen-high-oauth",
+        "gpt-6.2-sol-oauth",
+    ]
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "get_dalton_config",
+        lambda: _make_dalton_config_with_pool(pool_without_low),
+    )
+    cfg_a, rec_a = await auto_fb_mod.resolve_automation_turn_llm_config(
+        SimpleNamespace(),
+        user_id,
+        "claude-opus-5-5-oauth",
+        reasoning_effort="low",
+        payer_user_id=user_id,
+    )
+    assert cfg_a.llm.name == "gpt-6.2-sol-oauth"
+    assert rec_a is not None
+    assert rec_a["fallback_model"] == "gpt-6.2-sol-oauth"
+    assert rec_a["selected_route"]["model_key"] == "gpt-6.2-sol-oauth"
+
+    # Case B: low variant IS in whitelist & allowed by policy -> accepted, selected_route records actual low model
+    pool_with_low = [
+        "claude-opus-5-5-oauth",
+        "gemini-4-hydrogen-high-oauth",
+        "gemini-4-hydrogen-low-oauth",
+        "gpt-6.2-sol-oauth",
+    ]
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "get_dalton_config",
+        lambda: _make_dalton_config_with_pool(pool_with_low),
+    )
+    cfg_b, rec_b = await auto_fb_mod.resolve_automation_turn_llm_config(
+        SimpleNamespace(),
+        user_id,
+        "claude-opus-5-5-oauth",
+        reasoning_effort="low",
+        payer_user_id=user_id,
+    )
+    assert cfg_b.llm.name == "gemini-4-hydrogen-low-oauth"
+    assert rec_b is not None
+    assert rec_b["fallback_model"] == "gemini-4-hydrogen-low-oauth"
+    assert rec_b["selected_route"]["model_key"] == "gemini-4-hydrogen-low-oauth"
+
+    # Case C: low variant IS in whitelist, but org policy_refuses denies low -> skips to gpt-6.2-sol-oauth
+    policy_denies_low: Policy = merge_policy(
+        PolicyLayer(),
+        PolicyLayer(
+            models=ModelsPolicy(
+                allowed=[
+                    "claude-opus-5-5-oauth",
+                    "gemini-4-hydrogen-high-oauth",
+                    "gpt-6.2-sol-oauth",
+                ]
+            ),
+            own_model_access=OwnModelAccessPolicy(subscriptions=True),
+        ),
+    )
+    monkeypatch.setattr(
+        account_svc,
+        "require_policy",
+        create_autospec(orig_require_policy, instance=False, return_value=policy_denies_low),
+    )
+    cfg_c, rec_c = await auto_fb_mod.resolve_automation_turn_llm_config(
+        SimpleNamespace(),
+        user_id,
+        "claude-opus-5-5-oauth",
+        reasoning_effort="low",
+        payer_user_id=user_id,
+    )
+    assert cfg_c.llm.name == "gpt-6.2-sol-oauth"
+    assert rec_c is not None
+    assert rec_c["fallback_model"] == "gpt-6.2-sol-oauth"
+    assert rec_c["selected_route"]["model_key"] == "gpt-6.2-sol-oauth"
+
+
+@pytest.mark.asyncio
+async def test_assist_json_parse_repair_preserves_fallback_model_and_ignore_custom_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When assist_json falls back to a whitelisted subscription model and its JSON needs repair,
+    the repair request keeps the selected fallback model and ignore_custom_models=True."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    pool = ["gemini-4-hydrogen-high-oauth", "gpt-6.2-sol-oauth"]
+    monkeypatch.setattr(
+        dalton_settings_mod, "get_dalton_config", lambda: _make_dalton_config_with_pool(pool)
+    )
+    catalog_entries = {
+        "gemini-4-hydrogen-high-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-hydrogen-high",
+        },
+        "gpt-6.2-sol-oauth": {"provider": "codex-oauth", "model_id": "gpt-6.2-sol"},
+    }
+    fake_mc = _make_fake_model_config(catalog_entries)
+    from src.llms.llm import LLM as LLMFactory
+
+    monkeypatch.setattr(LLMFactory, "get_model_config", classmethod(lambda cls: fake_mc))
+    monkeypatch.setattr(
+        complete_mod,
+        "resolve_model_billing_and_provider",
+        lambda m: ("oauth", catalog_entries[m]["provider"]),
+    )
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(
+            uf.inspect_subscription_availability,
+            instance=False,
+            side_effect=lambda uid, mk, **_kw: uf.SubscriptionAvailability(available=True, model_name=mk),
+        ),
+    )
+    monkeypatch.setattr(
+        assist_mod,
+        "resolve_assist_model",
+        create_autospec(
+            assist_mod.resolve_assist_model,
+            instance=False,
+            side_effect=lambda role="assist", explicit_model=None, **_kw: explicit_model
+            or "gemini-4-hydrogen-high-oauth",
+        ),
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    async def _complete_with_repair(**kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        calls.append(kwargs)
+        if kwargs["request_model"] == "gemini-4-hydrogen-high-oauth":
+            return complete_mod.DaltonCompleteResult(
+                ok=False,
+                status="failed",
+                model=kwargs["request_model"],
+                error="plan limit reached",
+                refusal_reason="plan_limit",
+                quota_or_auth_trigger=True,
+            )
+        if not str(kwargs.get("scope_ref") or "").endswith(":parse_repair"):
+            return complete_mod.DaltonCompleteResult(
+                ok=True,
+                status="done",
+                model="gpt-6.2-sol-oauth",
+                text="not valid json at all",
+            )
+        return complete_mod.DaltonCompleteResult(
+            ok=True,
+            status="done",
+            model="gpt-6.2-sol-oauth",
+            data={"verdict": "supported"},
+            text='{"verdict": "supported"}',
+        )
+
+    monkeypatch.setattr(
+        assist_mod,
+        "dalton_complete",
+        create_autospec(complete_mod.dalton_complete, instance=False, side_effect=_complete_with_repair),
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+    }
+    res = await assist_mod.assist_json(
+        task="audit.judge",
+        instructions="judge",
+        payload={"x": 1},
+        schema=schema,
+        user_id="u-repair-1",
+        model="gemini-4-hydrogen-high-oauth",
+        fallback_models=["gpt-6.2-sol-oauth"],
+    )
+    assert res.ok is True
+    assert res.model == "gpt-6.2-sol-oauth"
+    assert len(calls) == 3
+    assert calls[1]["request_model"] == "gpt-6.2-sol-oauth"
+    assert calls[1]["ignore_custom_models"] is True
+    assert calls[2]["request_model"] == "gpt-6.2-sol-oauth"
+    assert calls[2]["ignore_custom_models"] is True
+
+
+@pytest.mark.asyncio
+async def test_transient_oauth_refresh_failure_on_401_does_not_trigger_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a 401 triggers OAuth refresh and refresh hits a transient failure (503 / timeout /
+    OAuthRefreshUnavailable), the re-raised 401 must NOT be classified as a switch trigger."""
+    from src.server.services.llm import clients as llm_clients
+
+    class _Fake401(Exception):
+        def __init__(self) -> None:
+            super().__init__("Error code: 401 - invalid_api_key")
+            self.status_code = 401
+
+    def _tagged_client() -> Any:
+        return oauth_refresh_mod.tag_oauth_client(
+            _FakeModel("gpt-6.2-sol-oauth"),
+            oauth_refresh_mod.OAuthRebuildSpec(
+                user_id="u-1",
+                model_name="gpt-6.2-sol-oauth",
+                provider="codex-oauth",
+                token_digest=oauth_refresh_mod.token_digest("t0"),
+            ),
+        )
+
+    async def _fn_401(_client: Any) -> Any:
+        raise _Fake401()
+
+    orig_resolve_oauth = llm_clients.resolve_oauth_llm_client
+
+    # 1) Transient refresh failures (HTTP 503 oauth_refresh_unavailable, TimeoutError, OAuthRefreshUnavailable)
+    for transient_err in (
+        HTTPException(status_code=503, detail={"type": "oauth_refresh_unavailable"}),
+        TimeoutError("oauth refresh lock wait timeout"),
+        OAuthRefreshUnavailable("codex-oauth", "refresh_failed"),
+    ):
+        monkeypatch.setattr(
+            llm_clients,
+            "resolve_oauth_llm_client",
+            create_autospec(
+                orig_resolve_oauth,
+                instance=False,
+                side_effect=transient_err,
+            ),
+        )
+        with pytest.raises(_Fake401) as exc_info:
+            await oauth_refresh_mod.call_with_oauth_refresh(_tagged_client(), _fn_401)
+        assert oauth_refresh_mod.get_transient_oauth_refresh_error(exc_info.value) is transient_err
+        assert uf.is_quota_or_auth_switch_trigger(exc_info.value) is False
+        assert complete_mod._classify_exception(exc_info.value, provider="codex-oauth") == (
+            "failed",
+            "oauth_refresh_unavailable",
+        )
+
+    # 2) Confirmed terminal refresh failure (OAuthReauthRequired) STILL triggers fallback
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_oauth_llm_client",
+        create_autospec(
+            orig_resolve_oauth,
+            instance=False,
+            side_effect=OAuthReauthRequired("codex-oauth", "invalid_grant"),
+        ),
+    )
+    with pytest.raises(_Fake401) as term_exc:
+        await oauth_refresh_mod.call_with_oauth_refresh(_tagged_client(), _fn_401)
+    assert oauth_refresh_mod.get_transient_oauth_refresh_error(term_exc.value) is None
+    assert uf.is_quota_or_auth_switch_trigger(term_exc.value) is True
+
+
+@pytest.mark.asyncio
+async def test_internal_llm_complete_checks_original_journal_before_switching_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate /internal/llm/complete requests must inspect the original model's journal
+    state before pre-dispatch model switching so done/in_flight calls are not duplicated."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    pool = ["gemini-4-hydrogen-high-oauth", "gpt-6.2-sol-oauth"]
+    monkeypatch.setattr(
+        dalton_settings_mod, "get_dalton_config", lambda: _make_dalton_config_with_pool(pool)
+    )
+    monkeypatch.setattr(
+        internal_llm_router, "get_allowed_host_oauth_models", lambda: frozenset(pool)
+    )
+    catalog_entries = {
+        "gemini-4-hydrogen-high-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-hydrogen-high",
+        },
+        "gpt-6.2-sol-oauth": {"provider": "codex-oauth", "model_id": "gpt-6.2-sol"},
+    }
+    fake_mc = _make_fake_model_config(catalog_entries)
+    from src.llms.llm import LLM as LLMFactory
+
+    monkeypatch.setattr(LLMFactory, "get_model_config", classmethod(lambda cls: fake_mc))
+    monkeypatch.setattr(
+        complete_mod,
+        "resolve_model_billing_and_provider",
+        lambda m: ("oauth", catalog_entries[m]["provider"]),
+    )
+    monkeypatch.setattr(
+        uf,
+        "_resolve_model_subscription_info",
+        lambda m, **_kw: (
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["provider"],
+            catalog_entries[m]["model_id"],
+            False,
+        ),
+    )
+    from src.dalton import access_tiers
+
+    monkeypatch.setattr(
+        access_tiers,
+        "get_primary_admin_user_id",
+        create_autospec(access_tiers.get_primary_admin_user_id, instance=False, return_value="admin-1"),
+    )
+
+    now = datetime.now(timezone.utc)
+
+    async def _avail_primary_cooled(uid: str, mk: str, **_kw: Any) -> uf.SubscriptionAvailability:
+        if mk == "gemini-4-hydrogen-high-oauth":
+            return uf.SubscriptionAvailability(
+                available=False,
+                kind="quota_cooldown",
+                refusal_code="plan_limit",
+                provider="antigravity-oauth",
+                reset_at=now + timedelta(minutes=20),
+                cooldown_key="quota:admin-1:antigravity-oauth:vendor:google",
+                model_name=mk,
+            )
+        return uf.SubscriptionAvailability(available=True, provider="codex-oauth", model_name=mk)
+
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(
+            uf.inspect_subscription_availability,
+            instance=False,
+            side_effect=_avail_primary_cooled,
+        ),
+    )
+
+    req = internal_llm_router.InternalLLMCompleteRequest(
+        model="gemini-4-hydrogen-high-oauth",
+        user_prompt="repeat-me",
+        purpose="host_dedup_test",
+    )
+
+    # Case A: Original request already DONE -> must replay requested_model, never switch
+    monkeypatch.setattr(
+        internal_llm_router,
+        "inspect_existing_completion_journal",
+        create_autospec(
+            complete_mod.inspect_existing_completion_journal,
+            instance=False,
+            return_value=("done", {"state": "done"}),
+        ),
+    )
+    done_calls: list[dict[str, Any]] = []
+
+    async def _complete_done(**kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        done_calls.append(kwargs)
+        return complete_mod.DaltonCompleteResult(
+            ok=True,
+            status="done",
+            model=kwargs["model"],
+            text="cached-answer",
+            replayed=True,
+            cached=True,
+        )
+
+    monkeypatch.setattr(
+        internal_llm_router,
+        "dalton_complete",
+        create_autospec(complete_mod.dalton_complete, instance=False, side_effect=_complete_done),
+    )
+    resp_done = await internal_llm_router.internal_llm_complete(req)
+    assert resp_done.ok is True
+    assert resp_done.model == "gemini-4-hydrogen-high-oauth"
+    assert [c["model"] for c in done_calls] == ["gemini-4-hydrogen-high-oauth"]
+
+    # Case B: Original request IN_FLIGHT -> must keep requested_model and return in_flight
+    monkeypatch.setattr(
+        internal_llm_router,
+        "inspect_existing_completion_journal",
+        create_autospec(
+            complete_mod.inspect_existing_completion_journal,
+            instance=False,
+            return_value=("in_flight", {"state": "pending"}),
+        ),
+    )
+    inflight_calls: list[dict[str, Any]] = []
+
+    async def _complete_inflight(**kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        inflight_calls.append(kwargs)
+        return complete_mod.DaltonCompleteResult(
+            ok=False,
+            status="in_flight",
+            model=kwargs["model"],
+            error_kind="in_flight",
+            error="in flight",
+        )
+
+    monkeypatch.setattr(
+        internal_llm_router,
+        "dalton_complete",
+        create_autospec(complete_mod.dalton_complete, instance=False, side_effect=_complete_inflight),
+    )
+    resp_inflight = await internal_llm_router.internal_llm_complete(req)
+    assert resp_inflight.ok is False
+    assert resp_inflight.status == "in_flight"
+    assert [c["model"] for c in inflight_calls] == ["gemini-4-hydrogen-high-oauth"]
+
+    # Case C: Original request has no active record ("proceed") -> switches to Codex
+    monkeypatch.setattr(
+        internal_llm_router,
+        "inspect_existing_completion_journal",
+        create_autospec(
+            complete_mod.inspect_existing_completion_journal,
+            instance=False,
+            return_value=("proceed", None),
+        ),
+    )
+    proceed_calls: list[dict[str, Any]] = []
+
+    async def _complete_proceed(**kwargs: Any) -> complete_mod.DaltonCompleteResult:
+        proceed_calls.append(kwargs)
+        return complete_mod.DaltonCompleteResult(
+            ok=True,
+            status="done",
+            model=kwargs["model"],
+            text="fresh-from-codex",
+        )
+
+    monkeypatch.setattr(
+        internal_llm_router,
+        "dalton_complete",
+        create_autospec(complete_mod.dalton_complete, instance=False, side_effect=_complete_proceed),
+    )
+    resp_proceed = await internal_llm_router.internal_llm_complete(req)
+    assert resp_proceed.ok is True
+    assert resp_proceed.model == "gpt-6.2-sol-oauth"
+    assert [c["model"] for c in proceed_calls] == ["gpt-6.2-sol-oauth"]
+
+
+@pytest.mark.asyncio
+async def test_wakeup_non_subscription_held_model_error_keeps_account_default_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When switch is ON, an ordinary wakeup whose thread holds a custom model missing a BYOK
+    key must still fall back to the account default model instead of failing."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    user_id = "user-r5-wakeup-byok"
+    thread_id = str(uuid4())
+
+    prefs = {
+        "preferred_model": "gpt-6.2-sol-oauth",
+        "custom_models": [
+            {"name": "my-custom-byok", "provider": "openai", "model_id": "gpt-custom"}
+        ],
+    }
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, instance=False, return_value=prefs),
+    )
+    monkeypatch.setattr(
+        auto_tm_mod,
+        "_resolve_automation_notification_context",
+        create_autospec(
+            auto_tm_mod._resolve_automation_notification_context,
+            instance=False,
+            return_value=(None, None, prefs, False, False, None),
+        ),
+    )
+    monkeypatch.setattr(
+        uf,
+        "inspect_subscription_availability",
+        create_autospec(
+            uf.inspect_subscription_availability,
+            instance=False,
+            side_effect=lambda uid, mk, **_kw: uf.SubscriptionAvailability(available=True, model_name=mk),
+        ),
+    )
+
+    from src.server.services.llm import thread_model as tm_mod
+
+    monkeypatch.setattr(
+        tm_mod,
+        "turn_model",
+        create_autospec(tm_mod.turn_model, instance=False, return_value="my-custom-byok"),
+    )
+
+    resolved_calls: list[str | None] = []
+
+    async def _resolve_impl(model_name: str | None) -> Any:
+        resolved_calls.append(model_name)
+        if model_name == "my-custom-byok":
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "byok_key_required", "message": "Missing BYOK API key"},
+            )
+        return SimpleNamespace(llm=SimpleNamespace(name="gpt-6.2-sol-oauth"))
+
+    resolve_mock = create_autospec(_resolve_impl, side_effect=_resolve_impl)
+    fallback_records: list[dict[str, Any]] = []
+    wakeup_req = SimpleNamespace(
+        query_type="wakeup",
+        platform=None,
+        hitl_response=None,
+        wakeup={"v": 1, "notices": [{"wakeup_id": "w-byok"}]},
+    )
+
+    cfg = await auto_tm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=user_id,
+        thread_id=thread_id,
+        request=wakeup_req,
+        requested_model=None,
+        held_model="my-custom-byok",
+        from_service=True,
+        payer_user_id=user_id,
+        resolve=resolve_mock,
+        on_fallback=fallback_records.append,
+    )
+    assert cfg.llm.name == "gpt-6.2-sol-oauth"
+    assert resolved_calls == ["my-custom-byok", None]
+    assert fallback_records == []
