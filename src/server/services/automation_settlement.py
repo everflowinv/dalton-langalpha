@@ -174,6 +174,8 @@ async def settle(
     release_pre_start_signals: bool = False,
     # DALTON-HOOK(coverage-units): allow caller to narrow/specify source statuses without relaxing policy defaults
     from_statuses: Optional[tuple[ExecutionStatus, ...]] = None,
+    # DALTON-HOOK(dalton-notify): honor persisted one-shot schedule action during rollback recovery
+    schedule_override: Optional[exec_db.ScheduleAction] = None,
 ) -> bool:
     """End a firing as ``outcome``; False when it was no longer in a state
     that outcome can end, because someone else settled it first.
@@ -242,7 +244,11 @@ async def settle(
         from_statuses=from_statuses or policy.from_statuses,
         to=policy.status,
         strike=policy.strike,
-        schedule=schedule_action(policy, automation, outcome=outcome, excerpt=excerpt),  # DALTON-HOOK(precheck-outcome)
+        schedule=(
+            schedule_override
+            if schedule_override is not None
+            else schedule_action(policy, automation, outcome=outcome, excerpt=excerpt)
+        ),  # DALTON-HOOK(precheck-outcome) DALTON-HOOK(dalton-notify)
         quiet_for=quiet_for,
         parked=parked,
         in_transaction=leave_finish,
@@ -838,7 +844,11 @@ async def settle_by_run(
     finalize job, while it has attempts left) a failed read raises before
     anything is settled, for the job to run again.
     """
-    outcome = ledger_outcome(run)
+    # DALTON-HOOK(dalton-notify): recover persisted pre-run failure settlement params after rollback
+    from src.dalton.notify.failure_receipts import read_pending_settlement
+
+    pending_settlement = read_pending_settlement(exec_row) if run is None else None
+    outcome = ledger_outcome(run, pending_settlement=pending_settlement)
     if outcome is None:
         logger.debug(
             f"[AUTOMATION_SETTLE] Run still going, not settling: "
@@ -849,7 +859,28 @@ async def settle_by_run(
     outcome = await _as_suspended(outcome, owner)
     delivery = automation_delivery.delivery_of_run(run, execution_id)
     error = excerpt = final_text = None
-    if outcome in RUN_FAILURES:
+    extra_from_pending: Dict[str, Any] = {}
+    if run is None and pending_settlement is not None:
+        if delivery is None and isinstance(exec_row, Mapping):
+            delivery = automation_delivery.read_stamp(exec_row.get("delivery"), execution_id)
+        if pending_settlement.get("error") is not None:
+            error = str(pending_settlement["error"])
+        if pending_settlement.get("excerpt") is not None:
+            excerpt = str(pending_settlement["excerpt"])
+        if not workspace_id and pending_settlement.get("workspace_id"):
+            workspace_id = str(pending_settlement["workspace_id"])
+        if not thread_id and pending_settlement.get("thread_id"):
+            thread_id = str(pending_settlement["thread_id"])
+        if pending_settlement.get("release_pre_start_signals") is True:
+            extra_from_pending["release_pre_start_signals"] = True
+        saved_sched = pending_settlement.get("schedule_action")
+        if (
+            isinstance(saved_sched, str)
+            and saved_sched in exec_db._SCHEDULE_SQL
+            and outcome is not Outcome.SUSPENDED
+        ):
+            extra_from_pending["schedule_override"] = saved_sched
+    elif outcome in RUN_FAILURES and run is not None:
         error = run_failure_message(run)
         if outcome is Outcome.PLAN_LIMITED:
             error = await plan_message(run["metadata"]["claude_plan"], owner) or error
@@ -893,7 +924,7 @@ async def settle_by_run(
         execution_id, thread_id=thread_id, run=run, exec_row=exec_row,
         excerpt=excerpt, text=final_text, include_text=(outcome is Outcome.COMPLETED),
     )
-    settle_kwargs: Dict[str, Any] = {}
+    settle_kwargs: Dict[str, Any] = dict(extra_from_pending)
     if expected_run_id is not exec_db.UNSET_RUN_ID:
         settle_kwargs["expected_run_id"] = expected_run_id
     if check_run_state_in_lock is not None:
@@ -1034,6 +1065,22 @@ async def _resolve_execution_settlement(
             retry_read=retry_read,
             expected_run_id=expected_run_id,
             check_run_state_in_lock="terminal",
+            exec_row=exec_row,
+        )
+    # DALTON-HOOK(dalton-notify): persisted pre-run failure parameters take precedence over timeout
+    from src.dalton.notify.failure_receipts import read_pending_settlement
+
+    if read_pending_settlement(exec_row) is not None:
+        return await settle_by_run(
+            automation,
+            execution_id,
+            run_id,
+            None,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            quiet_for=None if timed_out else quiet_for,
+            retry_read=retry_read,
+            expected_run_id=expected_run_id,
             exec_row=exec_row,
         )
     if timed_out:

@@ -61,6 +61,7 @@ class _InMemoryFailureNoticeDB:
         self.data_task_defs: dict[str, dict[str, Any]] = {}
         self.data_task_runs: dict[str, dict[str, Any]] = {}
         self.sql_log: list[str] = []
+        self.on_sql: Any = None
 
     def add_identity(self, user_id: str, platform: str, platform_user_id: str) -> None:
         if platform == "weixin":
@@ -102,7 +103,16 @@ class _InMemoryFailureNoticeDB:
 
         @asynccontextmanager
         async def _tx():
-            yield
+            snap_targets = {k: dict(v) for k, v in db.targets.items()}
+            snap_deliveries = {k: dict(v) for k, v in db.channel_deliveries.items()}
+            try:
+                yield
+            except BaseException:
+                db.targets.clear()
+                db.targets.update(snap_targets)
+                db.channel_deliveries.clear()
+                db.channel_deliveries.update(snap_deliveries)
+                raise
 
         @asynccontextmanager
         async def _cursor(*_args: Any, **_kwargs: Any):
@@ -113,9 +123,21 @@ class _InMemoryFailureNoticeDB:
                 nonlocal last_rows
                 s = " ".join(str(sql).split())
                 db.sql_log.append(s)
+                if db.on_sql is not None:
+                    db.on_sql(s, params)
                 p = params or ()
                 last_rows = []
                 cur.rowcount = 0
+
+                if "UPDATE automation_executions SET delivery = jsonb_set" in s and "pending_settlement" in s:
+                    pjson, eid = p[0], str(p[1])
+                    rec = db.automation_executions.get(eid)
+                    if rec and rec.get("status") in ("pending", "waiting", "running"):
+                        existing_del = dict(rec.get("delivery") or {}) if isinstance(rec.get("delivery"), dict) else {}
+                        existing_del["pending_settlement"] = json.loads(pjson) if isinstance(pjson, str) else dict(pjson)
+                        rec["delivery"] = existing_del
+                        cur.rowcount = 1
+                    return
 
                 if "FROM dalton_data_task_defs" in s:
                     jk = str(p[0])
@@ -283,6 +305,10 @@ class _InMemoryFailureNoticeDB:
                             and (t["next_retry_at"] is None or t["next_retry_at"] <= db.now)
                             and t["attempt_count"] < t["max_attempts"]
                         ):
+                            prior_status = t["status"]
+                            prior_next_retry_at = t["next_retry_at"]
+                            prior_error_code = t["error_code"]
+                            prior_error_message = t["error_message"]
                             t["status"] = "sending"
                             t["attempt_count"] += 1
                             t["claim_token"] = str(uuid4())
@@ -291,9 +317,32 @@ class _InMemoryFailureNoticeDB:
                             t["error_code"] = None
                             t["error_message"] = None
                             t["updated_at"] = db.now
-                            claimed.append(dict(t))
+                            claimed.append(
+                                {
+                                    **dict(t),
+                                    "prior_status": prior_status,
+                                    "prior_next_retry_at": prior_next_retry_at,
+                                    "prior_error_code": prior_error_code,
+                                    "prior_error_message": prior_error_message,
+                                }
+                            )
                     last_rows = claimed
                     cur.rowcount = len(claimed)
+                    return
+
+                if "UPDATE dalton_failure_notice_targets SET status = CASE WHEN %s IS NOT NULL" in s:
+                    restored_st, _restored_st2, prior_nra, prior_ec, prior_em, tr_id, tok = p
+                    t = db.targets.get(str(tr_id))
+                    if t and t["status"] == "sending" and t["claim_token"] == str(tok):
+                        t["status"] = restored_st if restored_st is not None else ("pending" if t["attempt_count"] <= 1 else "retryable_failed")
+                        t["attempt_count"] = max(int(t["attempt_count"]) - 1, 0)
+                        t["claim_token"] = None
+                        t["claim_expires_at"] = None
+                        t["next_retry_at"] = prior_nra if prior_nra is not None else db.now
+                        t["error_code"] = prior_ec
+                        t["error_message"] = prior_em
+                        t["updated_at"] = db.now
+                        cur.rowcount = 1
                     return
 
                 if "FROM dalton_failure_notice_targets t JOIN dalton_failure_notices n" in s:
@@ -316,15 +365,38 @@ class _InMemoryFailureNoticeDB:
                         ]
                     return
 
+                if "clock_timestamp()) AS lease_valid FROM dalton_failure_notice_targets WHERE target_receipt_id = %s::uuid" in s:
+                    tr_id = str(p[0])
+                    t = db.targets.get(tr_id)
+                    if t:
+                        exp = t["claim_expires_at"]
+                        last_rows = [
+                            {
+                                "status": t["status"],
+                                "claim_token": t["claim_token"],
+                                "claim_expires_at": exp,
+                                "lease_valid": bool(exp is not None and exp > db.now),
+                            }
+                        ]
+                    return
+
                 if "SELECT target_receipt_id::text AS target_receipt_id FROM dalton_failure_notice_targets WHERE (status = 'sending'" in s:
-                    ref_now, _ref_now2, lim = p[0], p[1], int(p[2])
-                    out = []
+                    ref_now, _ref_now2, ref_now3, lim = p[0], p[1], p[2], int(p[3])
+                    matched_targets = []
                     for t in db.targets.values():
                         if (t["status"] == "sending" and t["claim_expires_at"] is not None and t["claim_expires_at"] <= ref_now) or (
-                            t["status"] == "uncertain" and (t["claim_expires_at"] is None or t["claim_expires_at"] <= ref_now)
+                            t["status"] == "uncertain"
+                            and (t["claim_expires_at"] is None or t["claim_expires_at"] <= ref_now)
+                            and (t["next_retry_at"] is None or t["next_retry_at"] <= ref_now3)
                         ):
-                            out.append({"target_receipt_id": t["target_receipt_id"]})
-                    last_rows = out[:lim]
+                            matched_targets.append(t)
+                    matched_targets.sort(
+                        key=lambda r: (
+                            r["next_retry_at"] or r["claim_expires_at"] or r["uncertain_since"] or r["updated_at"],
+                            r["created_at"],
+                        )
+                    )
+                    last_rows = [{"target_receipt_id": t["target_receipt_id"]} for t in matched_targets[:lim]]
                     return
 
                 if "FROM dalton_failure_notice_targets WHERE target_receipt_id = %s::uuid FOR UPDATE" in s:
@@ -387,11 +459,12 @@ class _InMemoryFailureNoticeDB:
                     return
 
                 if "UPDATE dalton_failure_notice_targets SET status = 'uncertain', claim_token = NULL" in s:
-                    us, ec, tr_id = p
+                    nra, us, ec, tr_id = p
                     t = db.targets[str(tr_id)]
                     t["status"] = "uncertain"
                     t["claim_token"] = None
                     t["claim_expires_at"] = None
+                    t["next_retry_at"] = nra
                     t["uncertain_since"] = us
                     t["error_code"] = ec
                     t["updated_at"] = db.now
@@ -2243,5 +2316,610 @@ async def test_finish_held_run_passes_final_attempt_on_last_outbox_try_only_when
     early_job = {**job_base, "attempts": 1}
     await settle_mod._finish_held_run(early_job)
     assert "final_attempt" not in captured_kwargs[-1]
+
+
+# ---------------------------------------------------------------------------
+# Round 3 audit fixes (Items 1, 2, 4, 5, 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pre_run_quota_settle_rollback_persists_params_and_recovery_keeps_reason_single_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 1: When pre-run quota-limit settlement rolls back due to transient enqueue SQL error,
+    original failure_reason, quota flag, and one-shot price alert policy are persisted so
+    abandoned-firing recovery retries with the exact same parameters and creates strictly 1 receipt."""
+    from fastapi import HTTPException
+    from src.dalton.database import automation_recycle as recycle_mod
+    from src.server.services import account as account_mod
+    from src.server.services import automation_executor as executor_mod
+    from src.server.services import automation_outcomes as outcomes_mod
+    from src.server.services import automation_settlement as settle_mod
+    from src.server.services import webhook_client as wh_mod
+    from src.server.services.turn_runtime import TurnRoute
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    user_id = "user-r3-item1"
+    auto_id = str(uuid4())
+    exec_id = str(uuid4())
+    db.add_identity(user_id, "feishu", "ou_r3_item1")
+    db.automation_executions[exec_id] = {
+        "automation_execution_id": exec_id,
+        "automation_id": auto_id,
+        "status": "pending",
+        "conversation_thread_id": None,
+        "conversation_response_id": None,
+        "started_at": NOW,
+        "created_at": NOW,
+        "delivery": None,
+        "user_id": user_id,
+        "workspace_id": None,
+    }
+    one_shot_price_automation = {
+        "automation_id": auto_id,
+        "user_id": user_id,
+        "name": "NVDA Price Alert",
+        "trigger_type": "price",
+        "trigger_config": {
+            "symbol": "NVDA",
+            "market": "stock",
+            "conditions": [{"type": "price_above", "value": 150.0}],
+            "retrigger": {"mode": "one_shot"},
+        },
+        "instruction": "Alert me",
+        "thread_strategy": "new",
+        "workspace_id": None,
+        "delivery_config": None,
+        "metadata": None,
+    }
+
+    @asynccontextmanager
+    async def _conn_ctx(existing: Any = None):
+        yield existing if existing is not None else conn
+
+    monkeypatch.setattr(fr_mod, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(recycle_mod, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(
+        fr_mod,
+        "wake_failure_notice_dispatcher",
+        create_autospec(fr_mod.wake_failure_notice_dispatcher, return_value=None),
+    )
+
+    settle_calls: list[dict[str, Any]] = []
+    real_enqueue = fr_mod.enqueue_failure_notice_in_tx
+    fail_once = {"done": False}
+
+    async def _flaky_enqueue(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        if not fail_once["done"]:
+            fail_once["done"] = True
+            raise psycopg.OperationalError("simulated transient lock timeout on enqueue")
+        return await real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fr_mod,
+        "enqueue_failure_notice_in_tx",
+        create_autospec(real_enqueue, side_effect=_flaky_enqueue),
+    )
+
+    async def _fake_begin(eid: str, *, started_at: Any) -> dict[str, Any]:
+        rec = db.automation_executions[eid]
+        rec["status"] = "running"
+        rec["started_at"] = started_at
+        return {
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+            "scheduled_at": NOW,
+            "wait_reason": None,
+            "awaits_computer": False,
+            "checked_computer_id": None,
+            "llm_model": None,
+            "reasoning_effort": None,
+            "llm_model_system_only": False,
+            "snapshot_taken": True,
+        }
+
+    async def _fake_settle_execution(
+        eid: str,
+        *,
+        automation_id: str,
+        from_statuses: Any,
+        to: str,
+        strike: Any = None,
+        schedule: Any = None,
+        in_transaction: Any = None,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        rec = db.automation_executions[eid]
+        if rec["status"] not in from_statuses:
+            return None
+        snap_rec = dict(rec)
+        snap_notices = dict(db.notices)
+        snap_targets = dict(db.targets)
+        try:
+            rec["status"] = to
+            rec["failure_reason"] = fields.get("failure_reason")
+            rec["error_message"] = fields.get("error_message")
+            settled_row = {
+                **rec,
+                "settled_from": snap_rec["status"],
+                "previous_failure_reason": None,
+                "previous_delivery_result": None,
+            }
+            if in_transaction is not None:
+                await in_transaction(conn, settled_row)
+            settle_calls.append(
+                {
+                    "to": to,
+                    "strike": strike,
+                    "schedule": schedule,
+                    "failure_reason": fields.get("failure_reason"),
+                    "error_message": fields.get("error_message"),
+                }
+            )
+            return settled_row
+        except BaseException:
+            db.automation_executions[eid] = snap_rec
+            db.notices.clear()
+            db.notices.update(snap_notices)
+            db.targets.clear()
+            db.targets.update(snap_targets)
+            raise
+
+    monkeypatch.setattr(
+        exec_db,
+        "begin_execution_if_not_deleted",
+        create_autospec(exec_db.begin_execution_if_not_deleted, side_effect=_fake_begin),
+    )
+    monkeypatch.setattr(
+        exec_db,
+        "touch_execution",
+        create_autospec(exec_db.touch_execution, return_value=None),
+    )
+    monkeypatch.setattr(
+        exec_db,
+        "settle_execution",
+        create_autospec(exec_db.settle_execution, side_effect=_fake_settle_execution),
+    )
+    monkeypatch.setattr(
+        exec_db,
+        "get_execution_for_settlement",
+        create_autospec(
+            exec_db.get_execution_for_settlement,
+            side_effect=lambda eid: db.automation_executions.get(eid),
+        ),
+    )
+    wh_double = create_autospec(wh_mod.WebhookClient, instance=True)
+    wh_double.fire_event.return_value = None
+    monkeypatch.setattr(settle_mod, "WebhookClient", lambda: wh_double)
+    standing = create_autospec(account_mod.Standing, instance=True)
+    standing.suspended = False
+    standing.refuse_if_suspended.return_value = None
+    monkeypatch.setattr(
+        account_mod,
+        "read_standing",
+        create_autospec(account_mod.read_standing, return_value=standing),
+    )
+    monkeypatch.setattr(
+        settle_mod,
+        "read_standing",
+        create_autospec(settle_mod.read_standing, return_value=standing),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "_turn_place",
+        create_autospec(
+            executor_mod._turn_place,
+            return_value=executor_mod._Place(workspace=None, thread_id=None),
+        ),
+    )
+    route_double = create_autospec(TurnRoute, instance=True)
+    route_double.workspace_id = None
+    monkeypatch.setattr(
+        executor_mod,
+        "turn_route",
+        create_autospec(executor_mod.turn_route, return_value=route_double),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "park_for_computer",
+        create_autospec(executor_mod.park_for_computer, return_value=False),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "_credentials",
+        create_autospec(executor_mod._credentials, return_value=(False, False)),
+    )
+    quota_exc = HTTPException(
+        status_code=429,
+        detail={"type": "credit_limit_exceeded", "message": "Monthly usage limit reached"},
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "enforce_credit_limit",
+        create_autospec(executor_mod.enforce_credit_limit, side_effect=quota_exc),
+    )
+
+    # Exercise real AutomationExecutor.execute: credit gate raises 429 before run creation,
+    # settle rolls back on enqueue SQL error, and automation_executor persists pending_settlement.
+    executor = executor_mod.AutomationExecutor()
+    with pytest.raises(psycopg.OperationalError, match="simulated transient lock timeout"):
+        await executor.execute(one_shot_price_automation, exec_id)
+
+    # Rollback left execution running, zero notices, and persisted pending_settlement parameters
+    assert db.automation_executions[exec_id]["status"] == "running"
+    assert len(db.notices) == 0
+    saved = fr_mod.read_pending_settlement(db.automation_executions[exec_id])
+    assert saved is not None
+    assert saved["failure_reason"] == "usage_limit"
+    assert saved["is_quota_limit"] is True
+    assert saved["schedule_action"] == "close_price"
+
+    # Recovery scan (settle_abandoned) runs with conversation_response_id=None
+    recovered_outcome = await settle_mod.settle_abandoned(
+        one_shot_price_automation,
+        db.automation_executions[exec_id],
+        quiet_for=300,
+    )
+    assert recovered_outcome is outcomes_mod.Outcome.LIMITED
+    assert len(settle_calls) == 1
+    assert settle_calls[0]["to"] == "failed"
+    assert settle_calls[0]["failure_reason"] == "usage_limit"
+    assert settle_calls[0]["strike"] is None
+    assert settle_calls[0]["schedule"] == "close_price"
+    assert settle_calls[0]["error_message"] == "Monthly usage limit reached"
+    assert len(db.notices) == 1
+    only_notice = next(iter(db.notices.values()))
+    assert only_notice["failure_reason"] == "usage_limit"
+    assert only_notice["subject_id"] == exec_id
+
+    # Second recovery scan is a no-op -> strictly 1 receipt
+    second_outcome = await settle_mod.settle_abandoned(
+        one_shot_price_automation,
+        db.automation_executions[exec_id],
+        quiet_for=300,
+    )
+    assert second_outcome is None
+    assert len(db.notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_pool_limit_one_enqueue_and_claim_no_deadlock_and_claim_reads_fresh_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2: With DB pool max_size=1, data-task enqueue and gateway claim never request a
+    second connection, and claim reads current DB preferences bypassing stale Redis cache."""
+    import asyncio
+    from src.dalton import access_tiers as tiers_mod
+    from src.server.database import pool as pool_mod
+    from src.server.database import user as user_db
+    from src.utils.cache import redis_cache as redis_mod
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    single_conn = db.make_conn()
+
+    user_id = "admin-pool1"
+    open_id = "ou_pool1"
+    job_key = "pm-market-state"
+    run_id = str(uuid4())
+    db.add_identity(user_id, "feishu", open_id)
+    db.data_task_defs[job_key] = {"enabled": True, "notify_enabled": True}
+    db.data_task_runs[run_id] = {"notify_status": "skipped"}
+    db.user_prefs[user_id] = {
+        "user_preference_id": str(uuid4()),
+        "user_id": user_id,
+        "risk_preference": None,
+        "investment_preference": None,
+        "agent_preference": None,
+        "other_preference": None,
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": [f"feishu:user:{open_id}"],
+            "dalton_notify_overrides": {},
+            "dalton_notify_routes": {},
+        },
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+
+    # Strict max_size=1 pool simulator: fails immediately if a nested checkout is attempted!
+    pool_sem = asyncio.Semaphore(1)
+
+    @asynccontextmanager
+    async def _strict_pool_one(existing: Any = None):
+        if existing is not None:
+            yield existing
+            return
+        if pool_sem.locked():
+            raise AssertionError("Nested DB connection requested while pool max_size=1 is exhausted")
+        async with pool_sem:
+            yield single_conn
+
+    for mod in (pool_mod, user_db, fr_mod, claims_mod, dispatch_mod):
+        monkeypatch.setattr(mod, "get_db_connection", _strict_pool_one)
+    monkeypatch.setattr(
+        tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(tiers_mod.is_internal_or_admin, return_value=True),
+    )
+
+    # Stale Redis cache always reports dalton_notify_enabled=True
+    stale_payload = json.dumps(db.user_prefs[user_id], default=str).encode()
+    redis_client = create_autospec(redis_mod.RedisCacheClient, instance=True)
+    redis_client.enabled = True
+
+    class _FakeAsyncRedis:
+        async def get(self, _key: str) -> bytes:
+            return stale_payload
+
+        async def set(self, *_a: Any, **_kw: Any) -> None:
+            return None
+
+    redis_client.client = _FakeAsyncRedis()
+    monkeypatch.setattr(redis_mod, "get_cache_client", lambda: redis_client)
+
+    # 1. Enqueue while holding the single pool connection -> must NOT deadlock or open conn #2
+    async with _strict_pool_one() as held_conn:
+        enq = await fr_mod.enqueue_failure_notice_in_tx(
+            held_conn,
+            subject_kind="data_task",
+            subject_id=run_id,
+            source_key=job_key,
+            recipient_user_id=user_id,
+            failure_reason="subscription_quota_exhausted",
+        )
+    assert enq is not None and enq["aggregate_status"] == "retrying"
+    tr_id = enq["target_receipt_ids"][0]
+
+    claimed = await fr_mod.claim_due_failure_notice_targets(limit=5)
+    tok = claimed[0]["claim_token"]
+
+    # 2. User disables notifications in DB while stale Redis cache still says enabled=True
+    db.user_prefs[user_id]["model_preference"]["dalton_notify_enabled"] = False
+
+    # Plan & I-6 claim under pool max_size=1 must NOT deadlock AND must see DB toggle_off
+    plan = await claims_mod.authorize_failure_notice_plan(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+    )
+    assert plan["authorized"] is False
+    assert plan["code"] == "toggle_off"
+
+    claim_res = await claims_mod.authorize_and_claim_failure_notice(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+    )
+    assert claim_res["claim_status"] == "denied"
+    assert claim_res["code"] == "toggle_off"
+
+
+@pytest.mark.asyncio
+async def test_authorize_and_claim_rechecks_lease_after_locks_before_writing_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: If lease was valid when FOR UPDATE OF t began, but expired while waiting on
+    subsequent locks before inserting in_flight, PG clock_timestamp() re-check denies the claim."""
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    user_id = "user-r3-item4"
+    open_id = "ou_r3_item4"
+    db.add_identity(user_id, "feishu", open_id)
+    enq = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id=user_id,
+        failure_reason="plan_limit",
+        targets=[f"feishu:user:{open_id}"],
+    )
+    assert enq is not None
+    tr_id = enq["target_receipt_ids"][0]
+    claimed = await fr_mod.claim_due_failure_notice_targets(limit=5, conn=conn)
+    tok = claimed[0]["claim_token"]
+
+    # Advance DB clock past the 60s lease WHILE locking dalton_channel_deliveries FOR UPDATE
+    def _advance_clock_on_delivery_lock(sql: str, _params: Any) -> None:
+        if "FROM dalton_channel_deliveries WHERE delivery_key = %s FOR UPDATE" in sql:
+            db.now = NOW + timedelta(seconds=65)
+
+    db.on_sql = _advance_clock_on_delivery_lock
+
+    res = await claims_mod.authorize_and_claim_failure_notice(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+        conn=conn,
+    )
+    assert res["claim_status"] == "denied"
+    assert res["code"] == claims_mod.CLAIM_EXPIRED_OR_SUPERSEDED
+    assert fr_mod.failure_notice_delivery_key(tr_id) not in db.channel_deliveries
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backs_off_still_uncertain_targets_so_newer_targets_are_not_starved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 5: 10 older still-uncertain targets get a future next_retry_at so the next
+    reconcile batch immediately progresses newer already-sent and expired retryable targets."""
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    user_id = "user-r3-item5"
+    open_id = "ou_r3_item5"
+    db.add_identity(user_id, "feishu", open_id)
+
+    older_ids: list[str] = []
+    for idx in range(10):
+        db.now = NOW + timedelta(seconds=idx)
+        enq = await fr_mod.enqueue_failure_notice_in_tx(
+            conn,
+            subject_kind="personal_automation",
+            subject_id=str(uuid4()),
+            source_key=str(uuid4()),
+            recipient_user_id=user_id,
+            failure_reason="usage_limit",
+            targets=[f"feishu:user:{open_id}"],
+        )
+        assert enq is not None
+        tr_id = enq["target_receipt_ids"][0]
+        older_ids.append(tr_id)
+        cl = await fr_mod.claim_due_failure_notice_targets(limit=1, conn=conn)
+        await fr_mod.settle_failure_notice_target_attempt(
+            target_receipt_id=tr_id,
+            claim_token=cl[0]["claim_token"],
+            transport_res={"status": "unknown", "uncertain": True, "error_code": "unknown"},
+            conn=conn,
+        )
+        db.channel_deliveries[fr_mod.failure_notice_delivery_key(tr_id)] = {
+            "delivery_key": fr_mod.failure_notice_delivery_key(tr_id),
+            "status": "unknown",
+            "sent_chunks": 0,
+            "platform_message_ids": [],
+            "error_code": "unknown",
+            "error_message": None,
+        }
+
+    # Target 11: newer uncertain target whose channel delivery actually succeeded ('sent')
+    db.now = NOW + timedelta(seconds=20)
+    enq_sent = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id=user_id,
+        failure_reason="usage_limit",
+        targets=[f"feishu:user:{open_id}"],
+    )
+    assert enq_sent is not None
+    tr_sent = enq_sent["target_receipt_ids"][0]
+    cl_sent = await fr_mod.claim_due_failure_notice_targets(limit=1, conn=conn)
+    await fr_mod.settle_failure_notice_target_attempt(
+        target_receipt_id=tr_sent,
+        claim_token=cl_sent[0]["claim_token"],
+        transport_res={"status": "unknown", "uncertain": True, "error_code": "unknown"},
+        conn=conn,
+    )
+    db.channel_deliveries[fr_mod.failure_notice_delivery_key(tr_sent)] = {
+        "delivery_key": fr_mod.failure_notice_delivery_key(tr_sent),
+        "status": "sent",
+        "sent_chunks": 1,
+        "platform_message_ids": ["msg_newer_11"],
+        "error_code": None,
+        "error_message": None,
+    }
+
+    # Target 12: newer expired 'sending' target with no channel delivery row -> retryable_failed
+    db.now = NOW + timedelta(seconds=25)
+    enq_exp = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id=user_id,
+        failure_reason="usage_limit",
+        targets=[f"feishu:user:{open_id}"],
+    )
+    assert enq_exp is not None
+    tr_exp = enq_exp["target_receipt_ids"][0]
+    await fr_mod.claim_due_failure_notice_targets(limit=1, conn=conn)
+
+    # Round 1 at +120s with limit=10: reconciles the 10 older still-unknown targets and backs them off
+    db.now = NOW + timedelta(seconds=120)
+    st1 = await fr_mod.reconcile_uncertain_failure_notice_targets(limit=10, now=db.now, conn=conn)
+    assert st1["still_uncertain"] == 10
+    for oid in older_ids:
+        assert db.targets[oid]["status"] == "uncertain"
+        assert db.targets[oid]["next_retry_at"] is not None
+        assert db.targets[oid]["next_retry_at"] > db.now
+
+    # Round 2 at +130s with limit=10: older 10 are backed off, so target 11 & 12 reconcile immediately!
+    db.now = NOW + timedelta(seconds=130)
+    st2 = await fr_mod.reconcile_uncertain_failure_notice_targets(limit=10, now=db.now, conn=conn)
+    assert st2["sent"] == 1
+    assert st2["retryable_failed"] == 1
+    assert st2["still_uncertain"] == 0
+    assert db.targets[tr_sent]["status"] == "sent"
+    assert db.targets[tr_exp]["status"] == "retryable_failed"
+
+
+@pytest.mark.asyncio
+async def test_process_due_failure_notices_rechecks_deadline_after_claim_and_releases_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 7: When claiming crosses the cycle deadline, do not start sending, release the lease,
+    and preserve original status and attempt_count."""
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    user_id = "user-r3-item7"
+    open_id = "ou_r3_item7"
+    db.add_identity(user_id, "feishu", open_id)
+    enq = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id=user_id,
+        failure_reason="usage_limit",
+        targets=[f"feishu:user:{open_id}"],
+    )
+    assert enq is not None
+    tr_id = enq["target_receipt_ids"][0]
+
+    # Case A: Clock crosses deadline during claim SQL -> transaction rolls back inside claim_due
+    clock = {"now": 100.0}
+    monkeypatch.setattr(fr_mod.time, "monotonic", lambda: clock["now"])
+
+    def _stall_during_claim(sql: str, _params: Any) -> None:
+        if "WITH due AS (" in sql:
+            clock["now"] += 10.0  # exceeds max_duration_s=5.0
+
+    db.on_sql = _stall_during_claim
+    post_spy = create_autospec(fr_mod.post_failure_notice_gateway_notify)
+    stats_a = await fr_mod.process_due_failure_notices(
+        limit=5, max_duration_s=5.0, post_fn=post_spy, conn=conn
+    )
+    assert stats_a["claimed"] == 0
+    post_spy.assert_not_awaited()
+    assert db.targets[tr_id]["status"] == "pending"
+    assert db.targets[tr_id]["attempt_count"] == 0
+    assert db.targets[tr_id]["claim_token"] is None
+
+    # Case B: Clock crosses deadline right after claim_due returns -> release_unstarted restores row
+    db.on_sql = None
+    db.targets[tr_id]["status"] = "retryable_failed"
+    db.targets[tr_id]["attempt_count"] = 1
+    db.targets[tr_id]["next_retry_at"] = NOW
+
+    clock["now"] = 200.0
+    real_claim = fr_mod.claim_due_failure_notice_targets
+
+    async def _claim_then_expire(**kwargs: Any) -> list[dict[str, Any]]:
+        rows = await real_claim(limit=kwargs.get("limit", 1), conn=kwargs.get("conn"))
+        clock["now"] += 10.0  # cross deadline AFTER claim committed
+        return rows
+
+    monkeypatch.setattr(
+        fr_mod,
+        "claim_due_failure_notice_targets",
+        create_autospec(real_claim, side_effect=_claim_then_expire),
+    )
+    stats_b = await fr_mod.process_due_failure_notices(
+        limit=5, max_duration_s=5.0, post_fn=post_spy, conn=conn
+    )
+    assert stats_b["claimed"] == 0
+    post_spy.assert_not_awaited()
+    assert db.targets[tr_id]["status"] == "retryable_failed"
+    assert db.targets[tr_id]["attempt_count"] == 1
+    assert db.targets[tr_id]["claim_token"] is None
+    assert db.targets[tr_id]["claim_expires_at"] is None
 
 

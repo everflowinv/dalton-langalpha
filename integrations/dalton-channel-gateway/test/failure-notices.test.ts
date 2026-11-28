@@ -526,4 +526,150 @@ describe("failure notice gateway route & automation finish 503", () => {
     expect(finishSpy).toHaveBeenCalledTimes(2);
     expect(finishSpy.mock.calls[1]?.[1]?.mark_finished).toBe(true);
   });
+
+  it("returns 503 retryable and retains pending finalization recovery when mark_finished=true fails transiently", async () => {
+    const backend = createMockBackend();
+    const execId = "99999999-1111-4222-8333-444444444444";
+    const claimRow = {
+      status: 200,
+      data: {
+        execution_id: execId,
+        user_id: "user-1",
+        workspace_id: null,
+        thread_id: "thread-1",
+        automation_name: "Daily Brief",
+        status: "finishing" as const,
+        previous_status: "registered" as const,
+        finish_status: "failed" as const,
+        final_text: null,
+        failure_notice_enabled: true,
+        targets: [
+          {
+            entry: "feishu:@me",
+            address: "feishu:@me",
+            name: "Alice DM",
+            ok: true,
+            message: null,
+          },
+        ],
+      },
+    };
+    const finishedRow = {
+      status: 200,
+      data: {
+        ...claimRow.data,
+        status: "finished" as const,
+        previous_status: "finishing" as const,
+        targets: [],
+      },
+    };
+    const { BackendHttpError } = await import("../src/backend-client.js");
+    const finishSpy = vi
+      .spyOn(backend, "finishAutomationRun")
+      // Attempt 1: mark_finished=false succeeds, mark_finished=true hits transient 503
+      .mockResolvedValueOnce(claimRow)
+      .mockRejectedValueOnce(new BackendHttpError("db timeout on mark_finished", 503, null))
+      // Recovery via retryPendingFinalization succeeds
+      .mockResolvedValueOnce(finishedRow);
+
+    const feishu = new FakeChannelAdapter("feishu");
+    const sendSpy = vi.spyOn(feishu, "sendTextChunk");
+    const app = makeApp(backend, new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]));
+
+    try {
+      const res1 = await fetchGatewayServer(
+        app,
+        `http://127.0.0.1/agent/automation-runs/${execId}/finish`,
+        {
+          method: "POST",
+          headers: {
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+            "X-User-Id": "user-1",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            status: "failed",
+            thread_id: "thread-1",
+            final_text: null,
+          }),
+        },
+      );
+      // Must return 503 retryable (not 500) so backend automation_delivery retries normally
+      expect(res1.status).toBe(503);
+      const body1 = (await res1.json()) as { retryable?: boolean; targets?: unknown[] };
+      expect(body1.retryable).toBe(true);
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      // Unfinished mark_finished=true write is retained for recovery
+      expect(app.agentRoutes.pendingFinalizations.has(execId)).toBe(true);
+
+      // Recovery entry completes mark_finished=true without resending notice
+      const recovered = await app.agentRoutes.retryPendingFinalization(execId);
+      expect(recovered).toBe(true);
+      expect(app.agentRoutes.pendingFinalizations.has(execId)).toBe(false);
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(finishSpy).toHaveBeenCalledTimes(3);
+      expect(finishSpy.mock.calls[2]?.[1]?.mark_finished).toBe(true);
+    } finally {
+      app.agentRoutes.dispose();
+    }
+  });
+
+  it("startup recovery executeAutomationRunFinish retries transient mark_finished=true failure and keeps recovery entry if still failing", async () => {
+    const backend = createMockBackend();
+    const execId = "88888888-1111-4222-8333-444444444444";
+    const { BackendHttpError } = await import("../src/backend-client.js");
+    const finishSpy = vi
+      .spyOn(backend, "finishAutomationRun")
+      .mockRejectedValueOnce(new BackendHttpError("transient db error 1", 503, null))
+      .mockRejectedValueOnce(new BackendHttpError("transient db error 2", 503, null))
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          execution_id: execId,
+          user_id: "user-1",
+          workspace_id: null,
+          thread_id: "thread-1",
+          automation_name: "Daily Brief",
+          status: "finished",
+          previous_status: "finishing",
+          finish_status: "failed",
+          final_text: null,
+          targets: [],
+        },
+      });
+
+    const feishu = new FakeChannelAdapter("feishu");
+    const app = makeApp(backend, new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]));
+    try {
+      await app.agentRoutes.executeAutomationRunFinish({
+        executionId: execId,
+        userId: "user-1",
+        threadId: "thread-1",
+        automationName: "Daily Brief",
+        finishStatus: "failed",
+        finalText: null,
+        failureNoticeEnabled: true,
+        recoveryRetryDelayMs: 0,
+        targets: [
+          {
+            entry: "feishu:@me",
+            address: "feishu:@me",
+            name: "Alice DM",
+            ok: true,
+            message: null,
+          },
+        ],
+      });
+      // Tried twice during recovery, still retained in pendingFinalizations for subsequent flush
+      expect(finishSpy).toHaveBeenCalledTimes(2);
+      expect(app.agentRoutes.pendingFinalizations.has(execId)).toBe(true);
+
+      const flushed = await app.agentRoutes.flushPendingFinalizations();
+      expect(flushed).toBe(1);
+      expect(app.agentRoutes.pendingFinalizations.has(execId)).toBe(false);
+      expect(finishSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      app.agentRoutes.dispose();
+    }
+  });
 });

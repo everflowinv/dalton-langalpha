@@ -141,7 +141,7 @@ def _is_lease_valid(
     stored_token = _normalize_uuid(row.get("claim_token"))
     if stored_token is None or stored_token != claim_token:
         return False
-    if "lease_valid" in row and row["lease_valid"] is not None:
+    if now is None and "lease_valid" in row and row["lease_valid"] is not None:
         return bool(row["lease_valid"])
     exp = row.get("claim_expires_at")
     if not isinstance(exp, datetime):
@@ -154,6 +154,32 @@ def _is_lease_valid(
     return exp > ref_now
 
 
+async def _recheck_lease_in_tx(
+    cur: Any,
+    *,
+    target_receipt_id: str,
+    claim_token: str,
+    now: datetime | None = None,
+) -> bool:
+    """Re-verify lease validity against live PostgreSQL ``clock_timestamp()`` under held locks."""
+    await cur.execute(
+        """
+        SELECT
+            status,
+            claim_token::text AS claim_token,
+            claim_expires_at,
+            (claim_expires_at IS NOT NULL AND claim_expires_at > clock_timestamp()) AS lease_valid
+        FROM dalton_failure_notice_targets
+        WHERE target_receipt_id = %s::uuid
+        """,
+        (target_receipt_id,),
+    )
+    fresh = await cur.fetchone()
+    if not isinstance(fresh, Mapping):
+        return False
+    return _is_lease_valid(fresh, claim_token=claim_token, now=now)
+
+
 async def _verify_data_task_push_permission_in_tx(
     cur: Any,
     *,
@@ -162,6 +188,7 @@ async def _verify_data_task_push_permission_in_tx(
     recipient_user_id: str,
     stored_target: str,
     platform: str,
+    conn: Any = None,
 ) -> tuple[bool, str, str]:
     """Re-verify data-task push settings, target routing, and ``notify_on_failure`` overlap at claim time."""
     await cur.execute(
@@ -187,6 +214,8 @@ async def _verify_data_task_push_permission_in_tx(
     allowed, skip_reason, effective_targets = await evaluate_user_notify_eligibility(
         recipient_user_id,
         automation,
+        conn=conn,
+        cached=False,
     )
     if not allowed:
         return (
@@ -297,7 +326,7 @@ async def authorize_failure_notice_plan(
                     t.status,
                     t.claim_token::text AS claim_token,
                     t.claim_expires_at,
-                    (t.claim_expires_at IS NOT NULL AND t.claim_expires_at > NOW()) AS lease_valid,
+                    (t.claim_expires_at IS NOT NULL AND t.claim_expires_at > clock_timestamp()) AS lease_valid,
                     t.payload_json,
                     n.subject_kind,
                     n.subject_id,
@@ -375,6 +404,7 @@ async def authorize_failure_notice_plan(
                     recipient_user_id=recipient_user_id,
                     stored_target=target,
                     platform=parsed["platform"],
+                    conn=owned,
                 )
                 if not dt_ok:
                     return _deny_plan(
@@ -515,7 +545,7 @@ async def authorize_and_claim_failure_notice(
                         t.status,
                         t.claim_token::text AS claim_token,
                         t.claim_expires_at,
-                        (t.claim_expires_at IS NOT NULL AND t.claim_expires_at > NOW()) AS lease_valid,
+                        (t.claim_expires_at IS NOT NULL AND t.claim_expires_at > clock_timestamp()) AS lease_valid,
                         t.payload_json,
                         n.subject_kind,
                         n.subject_id,
@@ -636,8 +666,14 @@ async def authorize_and_claim_failure_notice(
                             "is_current": False,
                         }
 
-                # Enforce claim_token + claim_expires_at lease fence
-                if not _is_lease_valid(row, claim_token=tok, now=now):
+                # Re-validate claim_token + claim_expires_at against live PostgreSQL clock_timestamp()
+                # AFTER acquiring target, Weixin account, and delivery row locks.
+                if not await _recheck_lease_in_tx(
+                    cur,
+                    target_receipt_id=tr_id,
+                    claim_token=tok,
+                    now=now,
+                ):
                     return _deny_claim(
                         "failed",
                         CLAIM_EXPIRED_OR_SUPERSEDED,
@@ -700,6 +736,7 @@ async def authorize_and_claim_failure_notice(
                         recipient_user_id=recipient_user_id,
                         stored_target=stored_target,
                         platform=parsed["platform"],
+                        conn=owned,
                     )
                     if not dt_ok:
                         return _deny_claim("failed", dt_code, dt_msg)
@@ -777,6 +814,19 @@ async def authorize_and_claim_failure_notice(
                             "dm_binding_missing",
                             "Recipient does not hold a matching active DM binding for this target.",
                         )
+
+                # Final live clock_timestamp() lease check immediately before writing in_flight.
+                if not await _recheck_lease_in_tx(
+                    cur,
+                    target_receipt_id=tr_id,
+                    claim_token=tok,
+                    now=now,
+                ):
+                    return _deny_claim(
+                        "failed",
+                        CLAIM_EXPIRED_OR_SUPERSEDED,
+                        "Failure notice claim lease expired or was superseded.",
+                    )
 
                 exec_uuid = _normalize_uuid(row.get("subject_id"))
                 if parsed["platform"] == "weixin":

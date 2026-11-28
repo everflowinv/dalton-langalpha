@@ -855,6 +855,7 @@ export function createGatewayApp(options: {
     async stop(): Promise<void> {
       stopInProgress = true;
       leaseReady = false;
+      agentRoutes.dispose();
       deliveryService.setStartupBlocked(true);
       dataTaskNotifications.setStartupBlocked(true);
       if (config.mode !== "outgoing") {

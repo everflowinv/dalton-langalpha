@@ -1,7 +1,8 @@
-import type {
-  BackendClient,
-  ChartSnapshotItem,
-  I4StateResponse,
+import {
+  BackendHttpError,
+  type BackendClient,
+  type ChartSnapshotItem,
+  type I4StateResponse,
 } from "./backend-client.js";
 import { canViewPlatformChat, type ChannelAdapter } from "./channels/adapter.js";
 import { AUTOMATION_EMPTY_AFTER_TOOLS_SUMMARY } from "./shared/deliverable-text.js";
@@ -19,7 +20,10 @@ import type {
   DataTaskNotificationService,
   ExecutionStateTracker,
 } from "./data-task-notifications.js";
-import { isStaleGatewayEpochError } from "./gateway-lease.js";
+import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "./gateway-lease.js";
 import { createSequentialQueue, type SequentialQueue } from "./shared/keyed-queue.js";
 import {
   type AgentAutomationOutputPutRequest,
@@ -51,6 +55,34 @@ import {
   personalChannelBindingsUrl,
 } from "./commands.js";
 
+export interface PendingAutomationFinalizeRecord {
+  executionId: string;
+  userId: string;
+  status: AgentAutomationRunFinishRequest["status"];
+  threadId: string | null;
+  finalText: string | null;
+  targets: AutomationRunTargetRecord[];
+  attempts: number;
+}
+
+const MAX_PENDING_FINALIZE_RETRIES = 3;
+const PENDING_FINALIZE_RETRY_DELAYS_MS = [1_500, 5_000, 15_000] as const;
+
+function isTransientFinishBackendError(err: unknown): boolean {
+  if (isLeaseSafetyMarginPauseError(err) || isStaleGatewayEpochError(err)) {
+    return false;
+  }
+  if (err instanceof BackendHttpError) {
+    return (
+      err.status === 0 ||
+      err.status === 408 ||
+      err.status === 429 ||
+      err.status >= 500
+    );
+  }
+  return true;
+}
+
 export class AgentRoutesHandler {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -58,6 +90,7 @@ export class AgentRoutesHandler {
   private readonly dataTaskNotifications?: DataTaskNotificationService;
   private readonly failureNoticeQueue: SequentialQueue;
   private readonly webBaseUrl: string;
+  private disposed = false;
 
   /**
    * Process-local set of `execution_id`s currently executing `/finish` (§1.2.7).
@@ -75,6 +108,17 @@ export class AgentRoutesHandler {
     PendingChartDeliveryReceipt
   >();
 
+  /**
+   * Process-local pending I-8 `mark_finished=true` writes that failed transiently
+   * after target delivery, retained so background recovery or subsequent retries
+   * can finish sealing the run instead of leaving it stuck in `finishing`.
+   */
+  readonly pendingFinalizations = new Map<string, PendingAutomationFinalizeRecord>();
+  private readonly pendingFinalizeTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+
   constructor(options: {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -88,6 +132,127 @@ export class AgentRoutesHandler {
     this.dataTaskNotifications = options.dataTaskNotifications;
     this.failureNoticeQueue = createSequentialQueue({ taskTimeoutMs: 180_000 });
     this.webBaseUrl = options.webBaseUrl.replace(/\/+$/, "");
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    for (const timer of this.pendingFinalizeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFinalizeTimers.clear();
+  }
+
+  private clearPendingFinalization(executionId: string): void {
+    this.pendingFinalizations.delete(executionId);
+    const timer = this.pendingFinalizeTimers.get(executionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingFinalizeTimers.delete(executionId);
+    }
+  }
+
+  private recordPendingFinalization(
+    record: Omit<PendingAutomationFinalizeRecord, "attempts">,
+    scheduleAutoRetry = true,
+  ): void {
+    const prev = this.pendingFinalizations.get(record.executionId);
+    const next: PendingAutomationFinalizeRecord = {
+      ...record,
+      attempts: (prev?.attempts ?? 0) + 1,
+    };
+    this.pendingFinalizations.set(record.executionId, next);
+    if (!scheduleAutoRetry || this.disposed) {
+      return;
+    }
+    if (next.attempts > MAX_PENDING_FINALIZE_RETRIES) {
+      return;
+    }
+    const existingTimer = this.pendingFinalizeTimers.get(record.executionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    const delayIdx = Math.min(
+      Math.max(0, next.attempts - 1),
+      PENDING_FINALIZE_RETRY_DELAYS_MS.length - 1,
+    );
+    const delayMs = PENDING_FINALIZE_RETRY_DELAYS_MS[delayIdx]!;
+    const timer = setTimeout(() => {
+      this.pendingFinalizeTimers.delete(record.executionId);
+      if (this.disposed) return;
+      void this.retryPendingFinalization(record.executionId).catch(() => {
+        // Entry stays in pendingFinalizations for subsequent recovery attempts.
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.pendingFinalizeTimers.set(record.executionId, timer);
+  }
+
+  /**
+   * Recovery entry point for an unfinished I-8 `mark_finished=true` write.
+   * Returns true if the run is now finalized (or no longer exists), false if still pending.
+   */
+  async retryPendingFinalization(executionId: string): Promise<boolean> {
+    const rec = this.pendingFinalizations.get(executionId);
+    if (!rec) {
+      return true;
+    }
+    if (this.activeFinishExecutors.has(executionId)) {
+      return false;
+    }
+    this.activeFinishExecutors.add(executionId);
+    try {
+      const finalized = await this.backend.finishAutomationRun(
+        rec.executionId,
+        {
+          status: rec.status,
+          thread_id: rec.threadId,
+          final_text: rec.finalText,
+          targets: rec.targets,
+          mark_finished: true,
+        },
+        rec.userId,
+      );
+      if (
+        finalized.status === 404 ||
+        (finalized.status === 200 && finalized.data?.status === "finished")
+      ) {
+        this.clearPendingFinalization(executionId);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      if (isTransientFinishBackendError(err)) {
+        this.recordPendingFinalization(
+          {
+            executionId: rec.executionId,
+            userId: rec.userId,
+            status: rec.status,
+            threadId: rec.threadId,
+            finalText: rec.finalText,
+            targets: rec.targets,
+          },
+          true,
+        );
+        return false;
+      }
+      throw err;
+    } finally {
+      this.activeFinishExecutors.delete(executionId);
+    }
+  }
+
+  async flushPendingFinalizations(): Promise<number> {
+    let settled = 0;
+    for (const executionId of [...this.pendingFinalizations.keys()]) {
+      try {
+        if (await this.retryPendingFinalization(executionId)) {
+          settled += 1;
+        }
+      } catch {
+        // Keep iterating remaining pending entries.
+      }
+    }
+    return settled;
   }
 
   // -------------------------------------------------------------------------
@@ -768,17 +933,32 @@ export class AgentRoutesHandler {
     // never enter execution or write `finished`; return a retryable response while in flight
     // (or Shape C if the first caller already transitioned the row to `finished`).
     if (this.activeFinishExecutors.has(executionId)) {
-      const current = await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: body.status,
-          thread_id: body.thread_id ?? null,
-          run_id: body.run_id ?? null,
-          final_text: body.final_text ?? null,
-          mark_finished: false,
-        },
-        userId,
-      );
+      let current: Awaited<ReturnType<BackendClient["finishAutomationRun"]>>;
+      try {
+        current = await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: body.status,
+            thread_id: body.thread_id ?? null,
+            run_id: body.run_id ?? null,
+            final_text: body.final_text ?? null,
+            mark_finished: false,
+          },
+          userId,
+        );
+      } catch (err) {
+        if (isTransientFinishBackendError(err)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Backend temporarily unavailable while checking automation run finish; retry finish to settle.",
+              retryable: true,
+            },
+          };
+        }
+        throw err;
+      }
       if (current.status === 404 || !current.data) {
         return { status: 404, data: { detail: "Unknown execution_id" } };
       }
@@ -847,19 +1027,35 @@ export class AgentRoutesHandler {
     // active check before I-8 returns.
     this.activeFinishExecutors.add(executionId);
     try {
-      const claimed = await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: body.status,
-          thread_id: body.thread_id ?? null,
-          run_id: body.run_id ?? null,
-          final_text: body.final_text ?? null,
-          mark_finished: false,
-        },
-        userId,
-      );
+      let claimed: Awaited<ReturnType<BackendClient["finishAutomationRun"]>>;
+      try {
+        claimed = await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: body.status,
+            thread_id: body.thread_id ?? null,
+            run_id: body.run_id ?? null,
+            final_text: body.final_text ?? null,
+            mark_finished: false,
+          },
+          userId,
+        );
+      } catch (err) {
+        if (isTransientFinishBackendError(err)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Backend temporarily unavailable while claiming automation run finish; retry finish to settle.",
+              retryable: true,
+            },
+          };
+        }
+        throw err;
+      }
 
       if (claimed.status === 404 || !claimed.data) {
+        this.clearPendingFinalization(executionId);
         return { status: 404, data: { detail: "Unknown execution_id" } };
       }
 
@@ -868,6 +1064,7 @@ export class AgentRoutesHandler {
         claimed.data.status === "finished" &&
         claimed.data.previous_status === "finished"
       ) {
+        this.clearPendingFinalization(executionId);
         const finishedRows: AgentAutomationRunFinishTargetRow[] = (
           claimed.data.targets ?? []
         ).map((t) => ({
@@ -905,15 +1102,22 @@ export class AgentRoutesHandler {
         { callerHoldsExecutionLock: true },
       );
 
-      if (detailed.replayPending || detailed.chartsInFlight || detailed.noticeRetryable) {
+      if (
+        detailed.replayPending ||
+        detailed.chartsInFlight ||
+        detailed.noticeRetryable ||
+        detailed.finalizeRetryable
+      ) {
         return {
           status: 503,
           data: {
-            detail: detailed.noticeRetryable
-              ? "Automation status notice delivery encountered a transient error; retry finish to settle."
-              : detailed.chartsInFlight
-                ? "Automation charts or widgets are still being delivered; retry finish to settle."
-                : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            detail: detailed.finalizeRetryable
+              ? "Finalizing automation run state encountered a transient error; retry finish to settle."
+              : detailed.noticeRetryable
+                ? "Automation status notice delivery encountered a transient error; retry finish to settle."
+                : detailed.chartsInFlight
+                  ? "Automation charts or widgets are still being delivered; retry finish to settle."
+                  : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
             retryable: true,
             targets: detailed.targets,
           },
@@ -976,6 +1180,16 @@ export class AgentRoutesHandler {
         forceSealNoticeFailure: true,
       });
     }
+    if (detailed.finalizeRetryable) {
+      const delayMs =
+        typeof params.recoveryRetryDelayMs === "number" && params.recoveryRetryDelayMs >= 0
+          ? params.recoveryRetryDelayMs
+          : 500;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      await this.retryPendingFinalization(params.executionId);
+    }
     return detailed.targets;
   }
 
@@ -1002,6 +1216,7 @@ export class AgentRoutesHandler {
     replayPending: boolean;
     chartsInFlight: boolean;
     noticeRetryable: boolean;
+    finalizeRetryable: boolean;
     replayRetryable: boolean;
     replayHttpStatus: number | null;
   }> {
@@ -1109,6 +1324,7 @@ export class AgentRoutesHandler {
 
       let chartsInFlight = false;
       let noticeRetryable = false;
+      let finalizeRetryable = false;
 
       const deliverAutomationChartsForTarget = async (
         t: AutomationRunTargetRecord,
@@ -1313,25 +1529,46 @@ export class AgentRoutesHandler {
       }
 
       if (!replayTargetMissing && !chartsInFlight && !noticeRetryable) {
-        const finalized = await this.backend.finishAutomationRun(
-          executionId,
-          {
-            status: finishStatus,
-            thread_id: threadId,
-            final_text: finalText,
-            targets: results,
-            mark_finished: true,
-          },
-          userId,
-        );
-        // If backend DB refused to mark finished (e.g. concurrent finisher still has
-        // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
-        if (
-          finalized.status === 200 &&
-          finalized.data &&
-          finalized.data.status !== "finished"
-        ) {
-          chartsInFlight = true;
+        try {
+          const finalized = await this.backend.finishAutomationRun(
+            executionId,
+            {
+              status: finishStatus,
+              thread_id: threadId,
+              final_text: finalText,
+              targets: results,
+              mark_finished: true,
+            },
+            userId,
+          );
+          // If backend DB refused to mark finished (e.g. concurrent finisher still has
+          // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
+          if (
+            finalized.status === 200 &&
+            finalized.data &&
+            finalized.data.status !== "finished"
+          ) {
+            chartsInFlight = true;
+          } else {
+            this.clearPendingFinalization(executionId);
+          }
+        } catch (err) {
+          if (isTransientFinishBackendError(err)) {
+            finalizeRetryable = true;
+            this.recordPendingFinalization(
+              {
+                executionId,
+                userId,
+                status: finishStatus,
+                threadId,
+                finalText,
+                targets: results,
+              },
+              !params.isRecovery,
+            );
+          } else {
+            throw err;
+          }
         }
       }
 
@@ -1347,6 +1584,7 @@ export class AgentRoutesHandler {
         replayPending: replayTargetMissing,
         chartsInFlight,
         noticeRetryable,
+        finalizeRetryable,
         replayRetryable,
         replayHttpStatus,
       };

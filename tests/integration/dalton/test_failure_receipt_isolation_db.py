@@ -74,6 +74,14 @@ def cleanup_dalton_tables():
     yield
 
 
+@pytest.fixture(autouse=True)
+def test_byok_encryption_key(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Provide a deterministic test-only BYOK encryption key without reading the host env."""
+    key = "test-only-fnr-integration-encryption-key-not-for-prod"
+    monkeypatch.setenv("BYOK_ENCRYPTION_KEY", key)
+    return key
+
+
 def _to_sa_url(dsn: str) -> str:
     if dsn.startswith("postgresql+psycopg://"):
         return dsn

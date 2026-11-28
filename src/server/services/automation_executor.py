@@ -1514,13 +1514,44 @@ class AutomationExecutor:
                     exc_info=True,
                 )
                 excerpt = None
-            settled = await settle(
-                firing.automation, execution_id, outcome,
-                thread_id=firing.thread_id,
-                workspace_id=firing.workspace_id or automation.get("workspace_id"),
-                error=error_msg, delivery=firing.delivery, excerpt=excerpt,
-                release_pre_start_signals=True,
-            )
+            # DALTON-HOOK(dalton-notify): persist original settlement parameters if settle rolls back
+            # (e.g. transient failure-notice enqueue SQL error) so abandoned-firing recovery retries
+            # with the exact same outcome, failure_reason, quota flag, and one-shot schedule policy.
+            eff_workspace_id = firing.workspace_id or automation.get("workspace_id")
+            try:
+                settled = await settle(
+                    firing.automation, execution_id, outcome,
+                    thread_id=firing.thread_id,
+                    workspace_id=eff_workspace_id,
+                    error=error_msg, delivery=firing.delivery, excerpt=excerpt,
+                    release_pre_start_signals=True,
+                )
+            except Exception:
+                from src.dalton.notify.failure_receipts import (
+                    build_pending_settlement_record,
+                    persist_pending_settlement,
+                )
+                from src.server.services.automation_outcomes import POLICIES, schedule_action
+
+                policy = POLICIES[outcome]
+                await persist_pending_settlement(
+                    execution_id,
+                    build_pending_settlement_record(
+                        outcome=outcome.value,
+                        failure_reason=policy.failure_reason,
+                        is_quota_limit=(outcome in LIMITS),
+                        schedule_policy=policy.schedule,
+                        schedule_action=schedule_action(
+                            policy, firing.automation, outcome=outcome, excerpt=excerpt
+                        ),
+                        error=error_msg,
+                        excerpt=excerpt,
+                        workspace_id=eff_workspace_id,
+                        thread_id=firing.thread_id,
+                        release_pre_start_signals=True,
+                    ),
+                )
+                raise
             _exec_span.set_attribute(
                 "status",
                 "settled_elsewhere" if not settled

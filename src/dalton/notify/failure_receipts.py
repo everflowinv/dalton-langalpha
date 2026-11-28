@@ -108,9 +108,12 @@ FAILURE_NOTICE_TERMINAL_ERROR_CODES: frozenset[str] = frozenset(
 
 FAILURE_NOTICE_CLAIM_TTL_SECONDS = 60
 FAILURE_NOTICE_UNKNOWN_TIMEOUT_MINUTES = 15
+FAILURE_NOTICE_UNCERTAIN_RECONCILE_BACKOFF_SECONDS = 60
 FAILURE_NOTICE_MAX_ATTEMPTS = 3
 FAILURE_NOTICE_RETRY_BACKOFF_SECONDS: tuple[int, ...] = (60, 300)
 FAILURE_NOTICE_SWEEP_INTERVAL_SECONDS = 30.0
+
+PENDING_SETTLEMENT_KEY = "pending_settlement"
 
 _STABLE_CODE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SAFE_SEGMENT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -152,6 +155,101 @@ _SUBJECT_LABELS_ZH: dict[str, str] = {
 
 # Process-local wakeup task (execution nudge only — durable truth lives in PostgreSQL).
 _dispatch_wake_task: asyncio.Task[Any] | None = None
+
+
+def build_pending_settlement_record(
+    *,
+    outcome: str,
+    failure_reason: str | None,
+    is_quota_limit: bool,
+    schedule_policy: str | None,
+    schedule_action: str | None,
+    error: str | None = None,
+    excerpt: str | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
+    release_pre_start_signals: bool = False,
+) -> dict[str, Any]:
+    """Build durable JSON payload preserving pre-run failure settlement parameters."""
+    rec: dict[str, Any] = {
+        "outcome": str(outcome or "").strip().lower(),
+        "failure_reason": str(failure_reason).strip().lower() if failure_reason else None,
+        "is_quota_limit": bool(is_quota_limit),
+        "schedule_policy": str(schedule_policy).strip() if schedule_policy else None,
+        "schedule_action": str(schedule_action).strip() if schedule_action else None,
+        "release_pre_start_signals": bool(release_pre_start_signals),
+    }
+    if error is not None:
+        rec["error"] = str(error)
+    if excerpt is not None:
+        rec["excerpt"] = str(excerpt)
+    if workspace_id is not None and str(workspace_id).strip():
+        rec["workspace_id"] = str(workspace_id).strip()
+    if thread_id is not None and str(thread_id).strip():
+        rec["thread_id"] = str(thread_id).strip()
+    return rec
+
+
+def read_pending_settlement(exec_row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Read a persisted ``pending_settlement`` record from ``automation_executions.delivery``."""
+    if not isinstance(exec_row, Mapping):
+        return None
+    delivery = exec_row.get("delivery")
+    if isinstance(delivery, str) and delivery.strip():
+        try:
+            delivery = json.loads(delivery)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(delivery, Mapping):
+        return None
+    raw = delivery.get(PENDING_SETTLEMENT_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    if not (raw.get("outcome") or raw.get("failure_reason") or raw.get("is_quota_limit") is True):
+        return None
+    return dict(raw)
+
+
+async def persist_pending_settlement(
+    execution_id: str,
+    record: Mapping[str, Any],
+    *,
+    conn: Any = None,
+) -> bool:
+    """Persist ``pending_settlement`` into ``automation_executions.delivery`` on rollback.
+
+    Best-effort: logs and returns False on DB error so it never masks the caller's
+    original settlement rollback exception.
+    """
+    exec_uuid = _normalize_uuid(execution_id)
+    if exec_uuid is None or not isinstance(record, Mapping):
+        return False
+    payload_json = json.dumps(dict(record), ensure_ascii=False)
+    try:
+        async with get_db_connection(conn) as owned:
+            async with owned.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE automation_executions
+                    SET delivery = jsonb_set(
+                        COALESCE(delivery, '{}'::jsonb),
+                        '{pending_settlement}',
+                        %s::jsonb,
+                        true
+                    )
+                    WHERE automation_execution_id = %s::uuid
+                      AND status IN ('pending', 'waiting', 'running')
+                    """,
+                    (payload_json, exec_uuid),
+                )
+                return cur.rowcount > 0
+    except Exception as exc:
+        logger.warning(
+            "[FAILURE_NOTICE] Failed to persist pending_settlement for execution_id=%s (%s)",
+            exec_uuid,
+            type(exc).__name__,
+        )
+        return False
 
 
 def failure_notice_delivery_key(target_receipt_id: str) -> str:
@@ -404,9 +502,18 @@ async def evaluate_data_task_failure_notice_eligibility(
     from src.dalton.data_jobs.scheduler import build_data_task_notify_automation
     from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
 
-    eval_fn = evaluate_eligibility_fn or evaluate_user_notify_eligibility
     automation = build_data_task_notify_automation(cleaned_job_key)
-    allowed, skip_reason, effective_targets = await eval_fn(cleaned_uid, automation)
+    if evaluate_eligibility_fn is not None:
+        allowed, skip_reason, effective_targets = await evaluate_eligibility_fn(
+            cleaned_uid, automation
+        )
+    else:
+        allowed, skip_reason, effective_targets = await evaluate_user_notify_eligibility(
+            cleaned_uid,
+            automation,
+            conn=conn,
+            cached=False,
+        )
     if not allowed:
         return (False, skip_reason or "toggle_off", [], set())
 
@@ -1108,57 +1215,136 @@ async def recompute_failure_notice_aggregate_in_tx(
     return new_agg
 
 
+class _ClaimDeadlineExceeded(Exception):
+    """Internal sentinel used to roll back a claim transaction if deadline passed."""
+
+
 async def claim_due_failure_notice_targets(
     *,
     limit: int = 10,
     claim_ttl_seconds: int = FAILURE_NOTICE_CLAIM_TTL_SECONDS,
+    deadline_monotonic: float | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Atomically claim due ``pending`` / ``retryable_failed`` targets with fresh ``claim_token``."""
+    """Atomically claim due ``pending`` / ``retryable_failed`` targets with fresh ``claim_token``.
+
+    When ``deadline_monotonic`` is supplied and has already been reached before or
+    during the claim transaction, the transaction is rolled back so no target loses
+    an attempt or holds an unstarted lease.
+    """
     eff_limit = max(1, int(limit or 10))
     eff_ttl = max(5, int(claim_ttl_seconds or FAILURE_NOTICE_CLAIM_TTL_SECONDS))
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        return []
+    try:
+        async with get_db_connection(conn) as owned:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return []
+            async with owned.transaction():
+                async with owned.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        WITH due AS (
+                            SELECT t.target_receipt_id,
+                                   t.status AS prior_status,
+                                   t.next_retry_at AS prior_next_retry_at,
+                                   t.error_code AS prior_error_code,
+                                   t.error_message AS prior_error_message
+                            FROM dalton_failure_notice_targets t
+                            WHERE t.status IN ('pending', 'retryable_failed')
+                              AND (t.next_retry_at IS NULL OR t.next_retry_at <= NOW())
+                              AND t.attempt_count < t.max_attempts
+                            ORDER BY COALESCE(t.next_retry_at, t.created_at) ASC, t.created_at ASC
+                            FOR UPDATE OF t SKIP LOCKED
+                            LIMIT %s
+                        )
+                        UPDATE dalton_failure_notice_targets t
+                        SET status = 'sending',
+                            attempt_count = t.attempt_count + 1,
+                            claim_token = gen_random_uuid(),
+                            claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                            next_retry_at = NULL,
+                            error_code = NULL,
+                            error_message = NULL,
+                            updated_at = NOW()
+                        FROM due
+                        WHERE t.target_receipt_id = due.target_receipt_id
+                        RETURNING
+                            t.target_receipt_id::text AS target_receipt_id,
+                            t.notice_id::text AS notice_id,
+                            t.channel,
+                            t.target,
+                            t.status,
+                            t.attempt_count,
+                            t.max_attempts,
+                            t.claim_token::text AS claim_token,
+                            t.claim_expires_at,
+                            t.payload_json,
+                            due.prior_status,
+                            due.prior_next_retry_at,
+                            due.prior_error_code,
+                            due.prior_error_message
+                        """,
+                        (eff_limit, eff_ttl),
+                    )
+                    rows = list(await cur.fetchall() or [])
+                if rows and deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    raise _ClaimDeadlineExceeded()
+    except _ClaimDeadlineExceeded:
+        return []
+    return [dict(r) for r in rows]
+
+
+async def release_unstarted_failure_notice_claim(
+    *,
+    target_receipt_id: str,
+    claim_token: str,
+    prior_status: str | None = None,
+    prior_next_retry_at: datetime | None = None,
+    prior_error_code: str | None = None,
+    prior_error_message: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Return an unstarted ``sending`` lease without consuming an attempt."""
+    tr_id = _normalize_uuid(target_receipt_id)
+    tok = _normalize_uuid(claim_token)
+    if tr_id is None or tok is None:
+        return False
+    norm_prior = str(prior_status or "").strip().lower()
+    restored_status = norm_prior if norm_prior in ("pending", "retryable_failed") else None
     async with get_db_connection(conn) as owned:
         async with owned.transaction():
-            async with owned.cursor(row_factory=dict_row) as cur:
+            async with owned.cursor() as cur:
                 await cur.execute(
                     """
-                    WITH due AS (
-                        SELECT t.target_receipt_id
-                        FROM dalton_failure_notice_targets t
-                        WHERE t.status IN ('pending', 'retryable_failed')
-                          AND (t.next_retry_at IS NULL OR t.next_retry_at <= NOW())
-                          AND t.attempt_count < t.max_attempts
-                        ORDER BY COALESCE(t.next_retry_at, t.created_at) ASC, t.created_at ASC
-                        FOR UPDATE OF t SKIP LOCKED
-                        LIMIT %s
-                    )
-                    UPDATE dalton_failure_notice_targets t
-                    SET status = 'sending',
-                        attempt_count = t.attempt_count + 1,
-                        claim_token = gen_random_uuid(),
-                        claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
-                        next_retry_at = NULL,
-                        error_code = NULL,
-                        error_message = NULL,
+                    UPDATE dalton_failure_notice_targets
+                    SET status = CASE
+                            WHEN %s IS NOT NULL THEN %s
+                            WHEN attempt_count <= 1 THEN 'pending'
+                            ELSE 'retryable_failed'
+                        END,
+                        attempt_count = GREATEST(attempt_count - 1, 0),
+                        claim_token = NULL,
+                        claim_expires_at = NULL,
+                        next_retry_at = COALESCE(%s, NOW()),
+                        error_code = %s,
+                        error_message = %s,
                         updated_at = NOW()
-                    FROM due
-                    WHERE t.target_receipt_id = due.target_receipt_id
-                    RETURNING
-                        t.target_receipt_id::text AS target_receipt_id,
-                        t.notice_id::text AS notice_id,
-                        t.channel,
-                        t.target,
-                        t.status,
-                        t.attempt_count,
-                        t.max_attempts,
-                        t.claim_token::text AS claim_token,
-                        t.claim_expires_at,
-                        t.payload_json
+                    WHERE target_receipt_id = %s::uuid
+                      AND status = 'sending'
+                      AND claim_token = %s::uuid
                     """,
-                    (eff_limit, eff_ttl),
+                    (
+                        restored_status,
+                        restored_status,
+                        prior_next_retry_at,
+                        prior_error_code,
+                        prior_error_message,
+                        tr_id,
+                        tok,
+                    ),
                 )
-                rows = list(await cur.fetchall() or [])
-    return [dict(r) for r in rows]
+                return cur.rowcount > 0
 
 
 async def settle_failure_notice_target_attempt(
@@ -1331,6 +1517,7 @@ async def reconcile_uncertain_failure_notice_targets(
     *,
     limit: int = 20,
     unknown_timeout_minutes: int = FAILURE_NOTICE_UNKNOWN_TIMEOUT_MINUTES,
+    reconcile_backoff_seconds: int = FAILURE_NOTICE_UNCERTAIN_RECONCILE_BACKOFF_SECONDS,
     now: datetime | None = None,
     conn: Any = None,
 ) -> dict[str, int]:
@@ -1348,11 +1535,15 @@ async def reconcile_uncertain_failure_notice_targets(
        - ``failed`` + ``sent_chunks > 0`` -> ``terminal_failed`` (stop resending)
        - missing row (``c IS NULL``) -> confirmed unreached after lease expiry + token fence ->
          ``retryable_failed`` if ``attempt_count < max_attempts`` else ``terminal_failed``
-       - ``in_flight`` / ``unknown`` -> stay ``uncertain``; after ``unknown_timeout_minutes`` (15m),
+       - ``in_flight`` / ``unknown`` -> stay ``uncertain`` with ``next_retry_at`` backed off so
+         older unsettled rows do not starve newer targets; after ``unknown_timeout_minutes`` (15m),
          seal as ``terminal_failed`` with ``error_code = 'delivery_outcome_unknown_timeout'``.
     """
     eff_limit = max(1, int(limit or 20))
     eff_timeout_m = max(1, int(unknown_timeout_minutes or FAILURE_NOTICE_UNKNOWN_TIMEOUT_MINUTES))
+    eff_reconcile_backoff_s = max(
+        1, int(reconcile_backoff_seconds or FAILURE_NOTICE_UNCERTAIN_RECONCILE_BACKOFF_SECONDS)
+    )
     ref_now = now or datetime.now(timezone.utc)
     if ref_now.tzinfo is None:
         ref_now = ref_now.replace(tzinfo=timezone.utc)
@@ -1372,11 +1563,16 @@ async def reconcile_uncertain_failure_notice_targets(
                 SELECT target_receipt_id::text AS target_receipt_id
                 FROM dalton_failure_notice_targets
                 WHERE (status = 'sending' AND claim_expires_at <= %s)
-                   OR (status = 'uncertain' AND (claim_expires_at IS NULL OR claim_expires_at <= %s))
-                ORDER BY COALESCE(uncertain_since, claim_expires_at, updated_at) ASC
+                   OR (
+                       status = 'uncertain'
+                       AND (claim_expires_at IS NULL OR claim_expires_at <= %s)
+                       AND (next_retry_at IS NULL OR next_retry_at <= %s)
+                   )
+                ORDER BY COALESCE(next_retry_at, claim_expires_at, uncertain_since, updated_at) ASC,
+                         created_at ASC
                 LIMIT %s
                 """,
-                (ref_now, ref_now, eff_limit),
+                (ref_now, ref_now, ref_now, eff_limit),
             )
             candidate_ids = [
                 str(r["target_receipt_id"])
@@ -1395,6 +1591,7 @@ async def reconcile_uncertain_failure_notice_targets(
                                status, attempt_count, max_attempts,
                                claim_token::text AS claim_token,
                                claim_expires_at,
+                               next_retry_at,
                                uncertain_since,
                                error_code, error_message,
                                payload_json
@@ -1411,11 +1608,16 @@ async def reconcile_uncertain_failure_notice_targets(
                     exp_at = row.get("claim_expires_at")
                     if isinstance(exp_at, datetime) and exp_at.tzinfo is None:
                         exp_at = exp_at.replace(tzinfo=timezone.utc)
+                    next_reconcile_at = row.get("next_retry_at")
+                    if isinstance(next_reconcile_at, datetime) and next_reconcile_at.tzinfo is None:
+                        next_reconcile_at = next_reconcile_at.replace(tzinfo=timezone.utc)
                     if cur_status == "sending":
                         if exp_at is None or exp_at > ref_now:
                             continue
                     elif cur_status == "uncertain":
-                        if exp_at is not None and exp_at > ref_now:
+                        if (exp_at is not None and exp_at > ref_now) or (
+                            next_reconcile_at is not None and next_reconcile_at > ref_now
+                        ):
                             continue
                     else:
                         continue
@@ -1589,18 +1791,24 @@ async def reconcile_uncertain_failure_notice_targets(
                         await recompute_failure_notice_aggregate_in_tx(cur, notice_id)
                         counts["terminal_failed"] += 1
                     else:
+                        deadline_at = uncertain_since + timedelta(minutes=eff_timeout_m)
+                        next_check_at = min(
+                            ref_now + timedelta(seconds=eff_reconcile_backoff_s),
+                            deadline_at,
+                        )
                         await cur.execute(
                             """
                             UPDATE dalton_failure_notice_targets
                             SET status = 'uncertain',
                                 claim_token = NULL,
                                 claim_expires_at = NULL,
+                                next_retry_at = %s,
                                 uncertain_since = %s,
                                 error_code = %s,
                                 updated_at = NOW()
                             WHERE target_receipt_id = %s::uuid
                             """,
-                            (uncertain_since, ch_status or "unknown", tr_id),
+                            (next_check_at, uncertain_since, ch_status or "unknown", tr_id),
                         )
                         await recompute_failure_notice_aggregate_in_tx(cur, notice_id)
                         counts["still_uncertain"] += 1
@@ -1630,6 +1838,7 @@ async def process_due_failure_notices(
 
     eff_limit = max(1, int(limit or 10))
     started = time.monotonic()
+    deadline = started + max_duration_s
     reconcile_stats = await reconcile_uncertain_failure_notice_targets(limit=eff_limit, conn=conn)
     summary = {
         "reconciled": reconcile_stats["reconciled"],
@@ -1641,18 +1850,42 @@ async def process_due_failure_notices(
 
     seen_ids: set[str] = set()
     for _ in range(eff_limit):
-        if time.monotonic() - started >= max_duration_s:
+        if time.monotonic() >= deadline:
             break
-        claimed_rows = await claim_due_failure_notice_targets(limit=1, conn=conn)
+        claimed_rows = await claim_due_failure_notice_targets(
+            limit=1,
+            deadline_monotonic=deadline,
+            conn=conn,
+        )
         if not claimed_rows:
             break
         row = claimed_rows[0]
         tr_id = str(row["target_receipt_id"])
+        claim_tok = str(row["claim_token"])
+        if time.monotonic() >= deadline:
+            await release_unstarted_failure_notice_claim(
+                target_receipt_id=tr_id,
+                claim_token=claim_tok,
+                prior_status=row.get("prior_status"),
+                prior_next_retry_at=row.get("prior_next_retry_at"),
+                prior_error_code=row.get("prior_error_code"),
+                prior_error_message=row.get("prior_error_message"),
+                conn=conn,
+            )
+            break
         if tr_id in seen_ids:
+            await release_unstarted_failure_notice_claim(
+                target_receipt_id=tr_id,
+                claim_token=claim_tok,
+                prior_status=row.get("prior_status"),
+                prior_next_retry_at=row.get("prior_next_retry_at"),
+                prior_error_code=row.get("prior_error_code"),
+                prior_error_message=row.get("prior_error_message"),
+                conn=conn,
+            )
             break
         seen_ids.add(tr_id)
         summary["claimed"] += 1
-        claim_tok = str(row["claim_token"])
         target = str(row["target"])
         try:
             res = await post_fn(
