@@ -1239,7 +1239,7 @@ describe('DeliveryPicker for built-in dalton-* tasks', () => {
     expect(trigger).toBeDisabled();
 
     // Existing delivery chip remains removable so the user can clear the conflict
-    const removeLabel = label('automation:deliveryRemove', { name: '#research' });
+    const removeLabel = label('automation:deliveryRemove', { name: '#demo' });
     const removeBtn = await screen.findByRole('button', { name: removeLabel });
     expect(removeBtn).not.toBeDisabled();
     fireEvent.click(removeBtn);

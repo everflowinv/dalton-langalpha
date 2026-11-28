@@ -931,3 +931,449 @@ async def test_notify_route_save_entries_reject_tasks_with_delivery_config_metho
     assert locked_patch_exc.value.status_code == 409
     assert "delivery_config.methods" in str(locked_patch_exc.value.detail)
     upsert_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dalton_report_delivery_set_refuses_when_web_channels_configured_including_in_tx_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dalton_report_delivery(action='set') rejects web delivery_config both on precheck and inside the FOR UPDATE tx."""
+    import json
+
+    from src.dalton.database import company_automations as ca_db
+    from src.dalton.notify.delivery_mutex import REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    from src.dalton.services import report_delivery as rd_svc
+    from src.dalton.tools import report_delivery_tools as rd_tools
+
+    auto_id = "88888888-8888-4888-8888-888888888888"
+    owner_uid = "user-alice"
+    base_auto: dict[str, Any] = {
+        "automation_id": auto_id,
+        "user_id": owner_uid,
+        "workspace_id": "ws-1",
+        "name": "Market Digest AM",
+        "instruction": "Run market-digest-am report",
+        "trigger_type": "cron",
+        "status": "active",
+        "config_version": 1,
+        "active_version": 1,
+        "delivery_config": {"methods": ["feishu"]},
+        "metadata": {},
+        "audit_history": [],
+    }
+
+    monkeypatch.setattr(
+        rd_svc,
+        "get_user_tier",
+        create_autospec(rd_svc.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "list_caller_dm_identities",
+        create_autospec(
+            rd_svc.list_caller_dm_identities,
+            return_value=[
+                {
+                    "platform": "feishu",
+                    "platform_user_id": "ou_alice",
+                    "target": "feishu:user:ou_alice",
+                    "supports_report_cards": True,
+                    "supports_text_targets": True,
+                },
+                {
+                    "platform": "discord",
+                    "platform_user_id": "424242424242424242",
+                    "target": "discord:user:424242424242424242",
+                    "supports_report_cards": False,
+                    "supports_failure_targets": True,
+                },
+            ],
+        ),
+    )
+    load_auto_mock = create_autospec(
+        rd_svc._load_automation_for_actor,
+        return_value=dict(base_auto),
+    )
+    monkeypatch.setattr(rd_svc, "_load_automation_for_actor", load_auto_mock)
+
+    # 1. Precheck rejects immediately with the exact save-entrypoint conflict message
+    with pytest.raises(rd_svc.ReportDeliveryError) as pre_exc:
+        await rd_svc.precheck_report_delivery_set(
+            caller_user_id=owner_uid,
+            automation_id=auto_id,
+            profile="market-digest-am",
+            report_targets=["feishu:user:ou_alice"],
+            failure_targets=["discord:user:424242424242424242"],
+        )
+    assert pre_exc.value.code == "conflict"
+    assert pre_exc.value.message == REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+
+    # 2. Tool entrypoint surfaces the same readable refusal
+    monkeypatch.setattr(
+        rd_tools,
+        "load_report_delivery_hitl_snapshot",
+        create_autospec(rd_tools.load_report_delivery_hitl_snapshot, return_value=None),
+    )
+    tools = rd_tools.create_report_delivery_tools()
+    tool_fn = tools[0]
+    cmd = await tool_fn.ainvoke(
+        {
+            "name": "dalton_report_delivery",
+            "id": "tc-rd-mutex-1",
+            "type": "tool_call",
+            "args": {
+                "action": "set",
+                "automation_id": auto_id,
+                "profile": "market-digest-am",
+                "report_targets": ["feishu:user:ou_alice"],
+                "failure_targets": ["discord:user:424242424242424242"],
+            },
+        },
+        config={
+            "configurable": {
+                "user_id": owner_uid,
+                "thread_id": "th-rd-mutex",
+            }
+        },
+    )
+    tool_msg = cmd.update["messages"][0]
+    payload = json.loads(tool_msg.content)
+    assert payload["ok"] is False
+    assert payload["error"] == "conflict"
+    assert payload["message"] == REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+
+    # 3. TOCTOU race: pre-tx read sees empty delivery_config, while FOR UPDATE locked row has delivery_config.methods
+    load_auto_mock.return_value = {**base_auto, "delivery_config": {}}
+    executed_sqls: list[str] = []
+
+    class _RaceCur:
+        async def __aenter__(self) -> "_RaceCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            _ = params
+            executed_sqls.append(" ".join(sql.split()))
+            self._sql = sql
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            if "FROM automations" in getattr(self, "_sql", "") and "FOR UPDATE" in getattr(self, "_sql", ""):
+                return {**base_auto, "delivery_config": {"methods": ["feishu"]}}
+            return None
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return []
+
+    class _RaceTx:
+        async def __aenter__(self) -> "_RaceTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _RaceConn:
+        def transaction(self) -> _RaceTx:
+            return _RaceTx()
+
+        def cursor(self, **kwargs: Any) -> _RaceCur:
+            _ = kwargs
+            return _RaceCur()
+
+    @asynccontextmanager
+    async def _fake_rd_conn(conn: Any = None):
+        _ = conn
+        yield _RaceConn()
+
+    monkeypatch.setattr(rd_svc, "_use_conn", _fake_rd_conn)
+    monkeypatch.setattr(
+        ca_db,
+        "lock_and_fetch_user_preferences_for_snapshot",
+        create_autospec(
+            ca_db.lock_and_fetch_user_preferences_for_snapshot,
+            return_value={"model_preference": {}},
+        ),
+    )
+    sync_routes_mock = create_autospec(rd_svc.sync_report_delivery_routes_in_tx, return_value=None)
+    monkeypatch.setattr(rd_svc, "sync_report_delivery_routes_in_tx", sync_routes_mock)
+
+    with pytest.raises(rd_svc.ReportDeliveryError) as race_exc:
+        await rd_svc.set_report_delivery_config(
+            caller_user_id=owner_uid,
+            automation_id=auto_id,
+            profile="market-digest-am",
+            report_targets=["feishu:user:ou_alice"],
+            failure_targets=["discord:user:424242424242424242"],
+            hitl_confirmed=True,
+            expected_config_version=1,
+        )
+    assert race_exc.value.code == "conflict"
+    assert race_exc.value.message == REPORT_PROFILE_DELIVERY_CONFLICT_MSG
+    assert any("FOR UPDATE" in s and "FROM automations" in s for s in executed_sqls)
+    assert not any(s.startswith("UPDATE automations") for s in executed_sqls)
+    sync_routes_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_report_submit_uses_locked_execution_record_on_mid_run_switch_and_allows_next_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-run switch from web channels to report_profile blocks current run's report submit (no double send) and allows next run."""
+    import json
+
+    from src.dalton.database import automation_reports as reports_db
+    from src.dalton.services import report_delivery as rd_svc
+
+    auto_id = "99999999-9999-4999-8999-999999999999"
+    ws_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    th_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    exec_1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    exec_2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    run_1 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    run_2 = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    owner_uid = "user-alice"
+
+    report_profile_meta: dict[str, Any] = {
+        "report_profile": {
+            "profile": "market-digest-am",
+            "report_targets": ["feishu:user:ou_alice"],
+            "failure_targets": ["discord:user:424242424242424242"],
+        }
+    }
+    # Current task row AFTER user cleared web channels and enabled report_profile mid-run
+    automation_row: dict[str, Any] = {
+        "automation_id": auto_id,
+        "user_id": owner_uid,
+        "workspace_id": ws_id,
+        "name": "Market Digest AM",
+        "trigger_type": "cron",
+        "delivery_config": {},
+        "metadata": report_profile_meta,
+    }
+    exec_1_held = _held_delivery(exec_1)
+    executions_by_id: dict[str, dict[str, Any]] = {
+        exec_1: {
+            "automation_execution_id": exec_1,
+            "automation_id": auto_id,
+            "status": "running",
+            "conversation_thread_id": th_id,
+            "conversation_response_id": run_1,
+            "coverage_unit_id": None,
+            "coverage_unit_version": None,
+            "execution_delivery": automation_delivery.stamp(exec_1_held),
+            "execution_delivery_result": None,
+        },
+        exec_2: {
+            "automation_execution_id": exec_2,
+            "automation_id": auto_id,
+            "status": "running",
+            "conversation_thread_id": th_id,
+            "conversation_response_id": run_2,
+            "coverage_unit_id": None,
+            "coverage_unit_version": None,
+            "execution_delivery": None,
+            "execution_delivery_result": None,
+        },
+    }
+    stored_report_rows: list[dict[str, Any]] = []
+
+    class _ReportFakeCur:
+        def __init__(self) -> None:
+            self._one: dict[str, Any] | None = None
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self) -> "_ReportFakeCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            self._one = None
+            self._rows = []
+            if norm.startswith("SELECT pg_advisory_xact_lock"):
+                return
+            if "FROM automation_executions" in norm and "FOR UPDATE" not in norm and "FOR SHARE" not in norm:
+                eid = str(params[0])
+                rec = executions_by_id.get(eid)
+                self._one = {"automation_id": rec["automation_id"]} if rec else None
+            elif "FROM automations" in norm and ("FOR UPDATE" in norm or "FOR SHARE" in norm):
+                self._one = dict(automation_row)
+            elif "FROM automation_executions" in norm and ("FOR UPDATE" in norm or "FOR SHARE" in norm):
+                eid = str(params[0])
+                rec = executions_by_id.get(eid)
+                self._one = dict(rec) if rec else None
+            elif "INSERT INTO dalton_notify_deliveries" in norm:
+                did, eid, aid, uid, ch, tgt, pjson = params
+                stored_report_rows.append(
+                    {
+                        "delivery_id": str(did),
+                        "execution_id": str(eid),
+                        "automation_id": str(aid),
+                        "user_id": str(uid),
+                        "channel": str(ch),
+                        "target": str(tgt),
+                        "status": "pending",
+                        "attempt_count": 0,
+                        "error_code": None,
+                        "payload_json": json.loads(pjson),
+                    }
+                )
+            elif "FROM dalton_notify_deliveries" in norm and "<> %s" in norm:
+                self._one = None
+            elif "FROM dalton_notify_deliveries" in norm:
+                run_token = str(params[2])
+                self._rows = [
+                    r
+                    for r in stored_report_rows
+                    if str((r.get("payload_json") or {}).get("report_run_id") or "") == run_token
+                ]
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _ReportFakeConn:
+        def cursor(self, **kwargs: Any) -> _ReportFakeCur:
+            _ = kwargs
+            return _ReportFakeCur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_reports_conn(conn: Any = None):
+        _ = conn
+        yield _ReportFakeConn()
+
+    monkeypatch.setattr(reports_db, "get_db_connection", _fake_reports_conn)
+    monkeypatch.setattr(
+        reports_db,
+        "_authorize_all_targets",
+        create_autospec(
+            reports_db._authorize_all_targets,
+            return_value=(["feishu:user:ou_alice"], None),
+        ),
+    )
+    monkeypatch.setattr(
+        rd_svc,
+        "finalize_missing_report_profile_notice",
+        create_autospec(rd_svc.finalize_missing_report_profile_notice, return_value=None),
+    )
+
+    sample_card = {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": "Market Digest AM"}},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "S&P 500 closed higher. Source https://example.com/am"}
+            ]
+        },
+    }
+
+    # 1. Execution #1 (started with web delivery stamped, cleared mid-run + report_profile enabled):
+    #    submit_automation_report uses the locked execution record and refuses to create a Dalton report batch.
+    res_1 = await reports_db.submit_automation_report(
+        user_id=owner_uid,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=run_1,
+        automation_id=auto_id,
+        execution_id=exec_1,
+        report_run_id="market-digest:AM:2026-11-28-r1",
+        material="yes",
+        cards=[sample_card],
+    )
+    assert res_1["ok"] is False
+    assert res_1["code"] == "held_delivery_configured"
+    assert stored_report_rows == []
+
+    # Execution #1 settles: upstream delivers once via its held target; Dalton sends nothing (no double send)
+    spies = _wire_real_settlement_send_spies(
+        monkeypatch,
+        user_routes={f"automation:{auto_id}": ["feishu:user:ou_alice"]},
+    )
+    read_confirmed_mock = create_autospec(
+        reports_db.read_execution_report_confirmed,
+        side_effect=lambda eid: any(r["execution_id"] == eid for r in stored_report_rows),
+    )
+    ensure_alert_mock = create_autospec(
+        reports_db.ensure_report_failure_alert,
+        return_value={"ok": False, "status": "not_found"},
+    )
+    sync_terminal_mock = create_autospec(
+        notify_dispatch.sync_terminal_undelivered_execution,
+        return_value=None,
+    )
+    monkeypatch.setattr(reports_db, "read_execution_report_confirmed", read_confirmed_mock)
+    monkeypatch.setattr(reports_db, "ensure_report_failure_alert", ensure_alert_mock)
+    monkeypatch.setattr(notify_dispatch, "sync_terminal_undelivered_execution", sync_terminal_mock)
+
+    await settlement_mod._after_settling(
+        settlement_mod.Outcome.COMPLETED,
+        automation_row,
+        exec_1,
+        {
+            "settled_from": "running",
+            "result_excerpt": "Morning brief ready.",
+            "delivery": automation_delivery.stamp(exec_1_held),
+        },
+        thread_id=th_id,
+        workspace_id=ws_id,
+        error=None,
+        final_text="Morning brief ready.",
+        run_id=run_1,
+        delivery=exec_1_held,
+        finish_left=False,
+    )
+    assert spies["gateway_request"].await_count == 1
+    assert spies["dalton_gateway_send"].await_count == 0
+    assert spies["dalton_bridge_send"].await_count == 0
+    assert spies["webhook_fire"].await_count == 0
+
+    # 2. Execution #2 (next run after clearing web channels and enabling report_profile):
+    #    no upstream delivery is stamped on exec_2, so report submission succeeds normally.
+    res_2 = await reports_db.submit_automation_report(
+        user_id=owner_uid,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=run_2,
+        automation_id=auto_id,
+        execution_id=exec_2,
+        report_run_id="market-digest:AM:2026-11-29-r2",
+        material="yes",
+        cards=[sample_card],
+    )
+    assert res_2["ok"] is True
+    assert res_2["created"] is True
+    assert len(stored_report_rows) == 1
+    assert stored_report_rows[0]["execution_id"] == exec_2
+    assert stored_report_rows[0]["target"] == "feishu:user:ou_alice"
+
+    # Execution #2 settles: upstream sends nothing, Dalton report path confirms exec_2
+    await settlement_mod._after_settling(
+        settlement_mod.Outcome.COMPLETED,
+        automation_row,
+        exec_2,
+        {
+            "settled_from": "running",
+            "result_excerpt": "Next morning brief ready.",
+            "delivery": None,
+        },
+        thread_id=th_id,
+        workspace_id=ws_id,
+        error=None,
+        final_text="Next morning brief ready.",
+        run_id=run_2,
+        delivery=None,
+        finish_left=False,
+    )
+    # Upstream gateway_request count remains 1 (not called again for exec_2),
+    # and exec_2's saved report batch is confirmed on the Dalton report path.
+    assert spies["gateway_request"].await_count == 1
+    assert any(call.args == (exec_2,) for call in read_confirmed_mock.await_args_list)
