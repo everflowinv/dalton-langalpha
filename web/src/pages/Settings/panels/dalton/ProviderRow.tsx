@@ -23,7 +23,6 @@ const ROLE_LABELS: Record<string, string> = {
   assist: 'dalton.providers.roles.assist',
   audit: 'dalton.providers.roles.audit',
   reviewer: 'dalton.providers.roles.reviewer',
-  extract: 'dalton.providers.roles.extract',
 };
 
 function billingLabel(

@@ -1467,7 +1467,7 @@ def test_reference_source_dalton_settings_walks_model_fields(monkeypatch, tmp_pa
     config = DaltonConfig()
     config.models.assist_model = "gemini-3.8-flash-low-oauth"
     config.models.assist_fallback_model = ["gpt-6.1-sol-oauth", "grok-4.3-oauth"]
-    config.conversations.extractor_model = "claude-opus-5-5-oauth"
+    config.publish.audit_model = "claude-opus-5-5-oauth"
 
     monkeypatch.setattr(
         settings_mod,
@@ -1493,12 +1493,9 @@ def test_reference_source_dalton_settings_walks_model_fields(monkeypatch, tmp_pa
     assert "models.assist_model" in refs["gemini-3.8-flash-low-oauth"]
     assert "models.assist_fallback_model" in refs["gpt-6.1-sol-oauth"]
     assert "models.assist_fallback_model" in refs["grok-4.3-oauth"]
-    assert "conversations.extractor_model" in refs["claude-opus-5-5-oauth"]
+    assert "publish.audit_model" in refs["claude-opus-5-5-oauth"]
     for reviewer in config.publish.reviewer_models:
         assert "publish.reviewer_models" in refs.get(reviewer, [])
-    assert "conversations.extractor_model" in refs.get(
-        config.conversations.extractor_model, []
-    )
     # A valid dalton.yaml with no llm section contributes nothing.
     assert not any(v.startswith("dalton.llm.") for vs in refs.values() for v in vs)
 

@@ -534,7 +534,6 @@ async def _configure_scripts(pool: AsyncConnectionPool) -> None:
                 "cron_expr": "15 8 * * 1-5",
                 "timezone": "Asia/Hong_Kong",
                 "notify_enabled": True,
-                "cos_mode": "skip",
                 "notify_storage_mode": "task_row",
                 "command_argv": ["echo", PLANTED],
                 "required_secrets": [PLANTED],

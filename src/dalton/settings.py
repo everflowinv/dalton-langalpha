@@ -181,30 +181,14 @@ class DaltonAutonomyConfig(BaseModel):
 
 
 class DaltonConversationsConfig(BaseModel):
-    """OpenClaw conversation archive settings (MVP Phase 1)."""
+    """Read-only conversation archive retrieval settings."""
 
     enabled: bool = True
-    extractor_model: str = ""
-    extractor_fallback_model: str = "gemini-4-argon-medium-oauth"
-    segment_deadline_s: float = Field(default=600.0, gt=0)
-    prompt_version: str = "conv_card_v2_3"
     embedding_model: str = ""
     embedding_model_preferred: str = ""
     embedding_dimensions: int = Field(default=3072, gt=0)
-    hourly_token_budget: int = Field(default=120_000, gt=0)
-    extract_concurrency: int = Field(default=1, ge=1)
-    default_backfill_days: int = Field(default=14, gt=0)
-    max_segment_gap_minutes: int = Field(default=30, gt=0)
-    max_segment_chars: int = Field(default=6000, gt=0)
-    max_segment_events: int = Field(default=25, gt=0)
-    rate_limit_initial_backoff_seconds: float = Field(default=30.0, gt=0)
-    rate_limit_max_backoff_seconds: float = Field(default=900.0, gt=0)
     recency_half_life_days: float = Field(default=180.0, gt=0)
     recency_floor: float = Field(default=0.7, ge=0.0, le=1.0)
-    inbox_dir: str = "var/dalton/conversations/inbox"
-    cursors_file: str = "var/dalton/conversations/cursors.json"
-    export_cursors_file: str = "var/dalton/conversations/export_cursors.json"
-    agents: list[str] = Field(default_factory=lambda: ["main", "chem", "marco"])
 
 
 class DaltonCredentialsConfig(BaseModel):
@@ -1064,16 +1048,6 @@ def log_dalton_startup_warnings() -> None:
             "(or EDGAR_IDENTITY) as '<Organization> <contact_email>' for SEC EDGAR fair-access compliance.",
             sec_identity,
         )
-
-
-def get_dalton_broker_token() -> str:
-    """Return ``DALTON_BROKER_TOKEN`` from the environment (empty string if unset).
-
-    ``provider_events.sanitize_error_text`` uses this helper to redact the token.
-    The x_search bridge reads ``DALTON_BROKER_TOKEN`` and ``DALTON_BROKER_URL``
-    from the environment itself and does not call a settings helper.
-    """
-    return os.getenv("DALTON_BROKER_TOKEN", "").strip()
 
 
 XAI_OAUTH_CLIENT_ID: str = os.getenv("DALTON_XAI_OAUTH_CLIENT_ID", "")
@@ -1960,27 +1934,6 @@ def get_dalton_public_app_url() -> str:
         if val.startswith(("http://", "https://")):
             return val
     return ""
-
-
-def get_dalton_bridge_embed_url(host: str | None = None) -> str:
-    """Return the host bridge `/embed` URL, or ``""`` when bridge capability is off."""
-    from src.dalton.capabilities import CapabilityId, has_capability
-
-    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
-        return ""
-    resolved_host = host or HOST_IP or "host.docker.internal"
-    explicit = os.getenv("DALTON_BRIDGE_EMBED_URL", "").strip()
-    if explicit:
-        url = explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
-        if "/embed/" in url:
-            url = url.split("/embed/", 1)[0] + "/embed"
-        return url
-    rd_url = get_dalton_researchdata_url()
-    origin = _extract_bridge_origin_from_url(rd_url, host_override=host)
-    if origin:
-        return f"{origin}/embed"
-    port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
-    return f"http://{resolved_host}:{port}/embed"
 
 
 def get_sec_user_agent() -> str:

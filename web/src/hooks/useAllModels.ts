@@ -43,7 +43,6 @@ export interface SystemDefaults {
   dalton_assist_model?: string;
   dalton_assist_fallback_models?: string[];
   dalton_reviewer_models?: string[];
-  dalton_extract_model?: string;
 }
 
 export interface CompactionProfilePreset {

@@ -57,9 +57,6 @@ autonomy:
 
 conversations:
   enabled: false
-  extractor_model: ""
-  extractor_fallback_model: ""
-  agents: []
 
 internal_llm:
   allowed_models: []

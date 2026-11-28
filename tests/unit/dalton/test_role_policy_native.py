@@ -180,9 +180,8 @@ def test_default_role_config_has_zero_warnings():
     assert check_roles(default_cfg) == []
 
 
-def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
-    """Verify glm-5.3-plan and glm-5.3-flash-plan are allowed for conversations.extractor_model
-    and follow existing tool_calling rules for main/subagent roles."""
+def test_glm_coding_role_policy_main_roles() -> None:
+    """Verify glm-5.3-plan and glm-5.3-flash-plan follow tool_calling rules for main/subagent roles."""
     from src.dalton.llm.role_policy import is_text_only
 
     for model_key in ("glm-5.3-plan", "glm-5.3-flash-plan"):
@@ -195,9 +194,6 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
                 "name": "claude-opus-5-5-oauth",
                 "background": model_key,
                 "assist": "gemini-4-hydrogen-low-oauth",
-            },
-            "conversations": {
-                "extractor_model": model_key,
             },
             "subagents": {
                 "definitions": {
@@ -216,17 +212,5 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
                 model_key,
             },
         ) == []
-
-    # Contributor model assigned to conversations.extractor_model is rejected
-    bad_ext_cfg = {
-        "llm": {"name": "claude-opus-5-5-oauth"},
-        "conversations": {"extractor_model": "muse-spark-1.3-contributor-oauth"},
-    }
-    ext_warnings = check_roles(bad_ext_cfg)
-    assert any(
-        w["code"] == "role_forbidden_model"
-        and w["role"] == "conversations.extractor_model"
-        for w in ext_warnings
-    )
 
 

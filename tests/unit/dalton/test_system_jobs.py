@@ -1007,7 +1007,6 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     """
     import httpx
 
-    import src.dalton.conversations.embedder as embedder_mod
     import src.dalton.settings as settings_mod
 
     env_file = tmp_path / "researchdata-bridge.env"
@@ -1150,20 +1149,11 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     )
     assert code_mcp_still_ok == 200
 
-    # 5. Backend callers (`embedder.py` and `system_jobs.py`) use `get_dalton_bridge_admin_token()`, while `data_map/health.py` uses `get_dalton_bridge_token()`
+    # 5. Backend caller (`system_jobs.py`) uses `get_dalton_bridge_admin_token()`, while `data_map/health.py` uses `get_dalton_bridge_token()`
     monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "mcp-token-val")
     monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "admin-token-val")
     assert settings_mod.get_dalton_bridge_token() == "mcp-token-val"
     assert settings_mod.get_dalton_bridge_admin_token() == "admin-token-val"
-
-    mock_post_embed = create_autospec(
-        embedder_mod._post_embed_sync,
-        return_value={"ok": True, "embeddings": [[0.5, 0.25]], "model": "gemini-embedding-001"},
-    )
-    monkeypatch.setattr(embedder_mod, "_post_embed_sync", mock_post_embed)
-    vecs, _ = await embedder_mod.embed_texts_via_bridge(["doc text"])
-    assert vecs == [[0.5, 0.25]]
-    assert mock_post_embed.call_args.args[1] == "admin-token-val"
 
     captured_headers: dict[str, str] = {}
     mock_resp = create_autospec(httpx.Response, instance=True)
@@ -1837,7 +1827,7 @@ class _InMemoryDataTaskStore:
                 if "INSERT INTO dalton_data_task_defs" in q:
                     jk = str(p[0])
                     if jk not in self.defs:
-                        audit_raw = getattr(p[15], "obj", p[15])
+                        audit_raw = getattr(p[14], "obj", p[14])
                         self.defs[jk] = {
                             "job_key": jk,
                             "task_code": p[1],
@@ -1851,9 +1841,8 @@ class _InMemoryDataTaskStore:
                             "command_argv": getattr(p[9], "obj", p[9]),
                             "workdir": p[10],
                             "required_secrets": getattr(p[11], "obj", p[11]),
-                            "cos_mode": p[12],
-                            "notify_enabled": bool(p[13]),
-                            "enabled": bool(p[14]),
+                            "notify_enabled": bool(p[12]),
+                            "enabled": bool(p[13]),
                             "paused_by_user": False,
                             "consecutive_failures": 0,
                             "config_version": 1,

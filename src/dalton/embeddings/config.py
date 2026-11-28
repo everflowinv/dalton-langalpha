@@ -47,8 +47,6 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 #: pgvector ``halfvec`` HNSW indexes support up to 4000 dimensions.
 MAX_EMBEDDING_DIMENSIONS = 4000
 
-_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
-
 
 class EmbeddingConfigError(ValueError):
     """Raised when embedding configuration or credentials are invalid or missing."""
@@ -89,13 +87,6 @@ def validate_embedding_task_type(
             f"expected one of: {', '.join(sorted(SUPPORTED_GEMINI_TASK_TYPES))}"
         )
     return norm
-
-
-def is_embed_via_bridge_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """Return True when the ``DALTON_EMBED_VIA_BRIDGE`` emergency rollback switch is enabled."""
-    env = os.environ if environ is None else environ
-    raw = str(env.get("DALTON_EMBED_VIA_BRIDGE") or "").strip().lower()
-    return raw in _TRUTHY_VALUES
 
 
 def _parse_positive_dimensions(raw: str, *, source: str) -> int:

@@ -25,7 +25,6 @@ const FIELD_KEYS: Record<string, string> = {
   delivery_config: 'automation:fieldDelivery',
   enabled: 'automation:fieldEnabled',
   paused_by_user: 'automation:fieldPaused',
-  cos_mode: 'automation:fieldCosMode',
   notify_storage_mode: 'automation:fieldNotifyStorage',
   status: 'automation:fieldStatus',
 };

@@ -160,7 +160,6 @@ _DEF_READ_COLUMNS = """
     notify_enabled,
     notify_routes,
     notify_storage_mode,
-    cos_mode,
     config_version,
     active_version,
     updated_by,

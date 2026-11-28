@@ -34,11 +34,8 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
 def _resolve_state_dir(default_code_root: Path) -> Path:
-    raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
+    _ = default_code_root
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    if raw_ocw and not raw_code and not raw_home:
-        return Path(raw_ocw).expanduser().resolve() / "skills" / "company-filings-alert" / "state"
     home_root = (
         Path(raw_home).expanduser().resolve()
         if raw_home

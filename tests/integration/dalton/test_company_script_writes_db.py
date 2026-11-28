@@ -148,7 +148,7 @@ async def _read_def(pool: AsyncConnectionPool, job_key: str = JOB) -> dict[str, 
             await cur.execute(
                 """
                 SELECT cron_expr, timezone, enabled, paused_by_user,
-                       notify_enabled, notify_routes, notify_storage_mode, cos_mode,
+                       notify_enabled, notify_routes, notify_storage_mode,
                        config_version, active_version, updated_by, audit_history,
                        migration_state, deleted_at, updated_at, command_argv,
                        required_secrets
@@ -324,7 +324,6 @@ async def test_schedule_pause_resume_actor_history_and_reads(
         pool,
         required_secrets=[SENTINEL],
         command_argv=["echo", SENTINEL],
-        cos_mode="prod",
         notify_enabled=True,
         notify_routes=None,
         notify_storage_mode="legacy",
@@ -376,7 +375,6 @@ async def test_schedule_pause_resume_actor_history_and_reads(
     assert paused_row["notify_routes"] is None
     assert paused_row["notify_storage_mode"] == "legacy"
     assert paused_row["notify_enabled"] is True
-    assert paused_row["cos_mode"] == "prod"
     assert paused_row["migration_state"]["note"] == "keep-me"
     assert paused_row["required_secrets"] == [SENTINEL]
     assert paused_row["audit_history"][0] == before["audit_history"][0]
@@ -451,7 +449,6 @@ async def test_task_row_notify_columns_stay_on_the_definition(
         notify_storage_mode="task_row",
         notify_routes=[TASK_ROUTE],
         notify_enabled=False,
-        cos_mode="skip",
     )
     async with pool.connection() as conn:
         await conn.execute(
@@ -473,7 +470,6 @@ async def test_task_row_notify_columns_stay_on_the_definition(
     assert row["notify_storage_mode"] == "task_row"
     assert row["notify_routes"] == [TASK_ROUTE]
     assert row["notify_enabled"] is False
-    assert row["cos_mode"] == "skip"
     assert row["timezone"] == "Asia/Hong_Kong"
     snapshot = row["audit_history"][-1]["snapshot"]
     assert snapshot["notify_routes"] == [TASK_ROUTE]

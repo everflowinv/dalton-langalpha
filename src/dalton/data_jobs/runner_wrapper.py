@@ -3,7 +3,7 @@
 Responsibilities:
 - Load injected Vault secrets from ``/run/dalton-secrets`` (plus Dalton managed tokens) into an
   in-memory redaction table;
-- Export ``DALTON_NO_DIRECT_SEND=1``, ``DALTON_NOTIFY_DRY_RUN=1|0``, ``DALTON_COS_UPLOAD_MODE``,
+- Export ``DALTON_NO_DIRECT_SEND=1``, ``DALTON_NOTIFY_DRY_RUN=1|0``,
   ``DALTON_OUTBOX_FILE`` (pointing to container-internal ``tmpfs`` at ``/run/dalton-outbox/outbox.json``),
   ``HOME`` (``DEFAULT_CONTAINER_HOME``), ``TZ=America/New_York``, and ``PATH`` while stripping ``/app`` from
   ``PYTHONPATH`` for the business child process;
@@ -282,7 +282,6 @@ def build_child_env(
     run_id: str,
     job_key: str = "",
     notify_dry_run: bool = True,
-    cos_mode: str = "skip",
     secret_env: Mapping[str, str] | None = None,
     outbox_file: Path | str | None = None,
     outbox_tmp_dir: Path | str = DEFAULT_TMPFS_OUTBOX_DIR,
@@ -329,7 +328,6 @@ def build_child_env(
     env["DALTON_PYTHON_BIN"] = CONTAINER_PYTHON_BIN
     env["DALTON_NO_DIRECT_SEND"] = "1"
     env["DALTON_NOTIFY_DRY_RUN"] = "1" if notify_dry_run else "0"
-    env["DALTON_COS_UPLOAD_MODE"] = str(cos_mode or "skip")
     env["DALTON_OUTBOX_FILE"] = resolved_outbox
     env["DALTON_RUN_ID"] = str(run_id)
     if job_key:
@@ -564,7 +562,6 @@ async def run_wrapped_command(
     outbox_tmp_dir: Path | str | None = None,
     extra_secrets: Sequence[str] = (),
     notify_dry_run: bool = True,
-    cos_mode: str = "skip",
     timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
     no_output_timeout_seconds: float | None = None,
     poll_interval_seconds: float = 0.05,
@@ -607,7 +604,6 @@ async def run_wrapped_command(
         run_id=run_id,
         job_key=job_key,
         notify_dry_run=notify_dry_run,
-        cos_mode=cos_mode,
         secret_env=secret_env,
         outbox_file=staging_outbox_path,
         outbox_tmp_dir=staging_dir,
@@ -763,7 +759,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="1",
         help="1 in shadow-run mode, 0 after cutover",
     )
-    parser.add_argument("--cos-mode", choices=("skip", "prod"), default="skip")
     parser.add_argument(
         "command_argv",
         nargs=argparse.REMAINDER,
@@ -814,7 +809,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             secrets_dir=args.secrets_dir,
             outbox_tmp_dir=args.outbox_tmp_dir,
             notify_dry_run=(args.notify_dry_run == "1"),
-            cos_mode=args.cos_mode,
             timeout_seconds=args.timeout_seconds,
             no_output_timeout_seconds=args.no_output_timeout_seconds,
         )

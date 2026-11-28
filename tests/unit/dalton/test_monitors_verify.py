@@ -1379,7 +1379,6 @@ async def test_frozen_dir_required_no_enqueue_on_freeze_fail_and_disabled_alert(
         timeout_seconds=300,
         no_output_timeout_seconds=120,
         required_secrets=[],
-        cos_mode="none",
         notify_enabled=False,
         scheduled_slot_utc=NOW,
         deadline_utc=NOW + timedelta(minutes=30),

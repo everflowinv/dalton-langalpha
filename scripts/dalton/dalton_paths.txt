@@ -227,11 +227,9 @@ integrations/dalton-channel-gateway/test/weixin.test.ts
 integrations/dalton-channel-gateway/test/weixin-real-backend.integration.test.ts
 tests/integration/dalton/weixin_live_backend_harness.py
 tests/integration/dalton/test_weixin_full_stack.py
-web/src/pages/Settings/panels/dalton/DaltonWeixinChannelCard.tsx
 web/src/pages/Settings/panels/dalton/__tests__/DaltonWeixinChannelCard.test.tsx
 
 scripts/dalton/data_assets/skills/sentiment-dashboard/scripts/run.sh
-scripts/dalton/data_assets/scripts/sentiment_dashboard_cos_upload.py
 scripts/dalton/data_assets/scripts/sentiment_dashboard_digest.sh
 scripts/dalton/data_assets/skills/kweb-dashboard/SKILL.md
 scripts/dalton/data_assets/skills/kweb-dashboard/scripts/kweb_dashboard_cli.py
@@ -483,9 +481,8 @@ web/src/components/Sidebar/__tests__/AccountMenu.dalton.test.tsx
 web/src/pages/Settings/panels/modelAccess/__tests__/ClaudeCodeSheet.dalton.test.tsx
 web/src/pages/Plugins/__tests__/DesktopDownloadLink.dalton.test.tsx
 
-# OpenClaw decoupling batch 2a: host research_runtime code, bridge runtime checks, and data migration script.
+# OpenClaw decoupling batch 2a: host research_runtime code and bridge runtime checks.
 scripts/dalton/research_runtime/
-scripts/dalton/ops/research_runtime_migrate.sh
 tests/unit/dalton/test_research_runtime_decoupling.py
 
 # OpenClaw decoupling batch 3: AlphaEngine & Guidepoint host launchd services, watchdog ops alerts, switch script, and tests.

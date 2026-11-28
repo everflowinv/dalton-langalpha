@@ -915,25 +915,8 @@ async def test_search_index_turns_closed_range_guard_and_expected_gen():
 
 
 @pytest.mark.asyncio
-async def test_archive_extractor_and_memory_skip_personal_integration_threads():
-    from src.dalton.conversations import extractor as ext_mod
-
+async def test_memory_skips_personal_integration_threads():
     tid = str(uuid.uuid4())
-    assist_mock = create_autospec(ext_mod.assist_json)
-    with (
-        patch.object(purge_fence, "is_personal_integration_thread", autospec=True, return_value=True),
-        patch.object(ext_mod, "assist_json", assist_mock),
-    ):
-        outcome = await ext_mod.extract_segment_cards(
-            [{"agent": "main", "session_id": tid, "session_key": tid, "seq": 1, "text": "my calendar"}],
-            extractor_model="test-model",
-        )
-    assert outcome.ok is True
-    assert outcome.category == "private"
-    assert outcome.discarded_segment is True
-    assert outcome.cards == []
-    assist_mock.assert_not_awaited()
-
     with patch.object(purge_fence, "is_personal_integration_thread", autospec=True, return_value=True):
         assert await should_skip_memory_extraction_for_thread(tid) is True
 

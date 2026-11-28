@@ -1373,7 +1373,6 @@ async def test_scheduler_forwards_host_argv_only_for_non_bbg_jobs(
             timeout_seconds=60,
             no_output_timeout_seconds=30,
             required_secrets=[],
-            cos_mode="skip",
             notify_enabled=False,
             scheduled_slot_utc=now,
             deadline_utc=now + timedelta(minutes=10),

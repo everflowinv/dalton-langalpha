@@ -84,7 +84,6 @@ async def resolve_assist_model(
     2. If ``deployment_only=True``: ``dalton_model_default(<pref_key>)`` (``dalton.yaml`` only, ignoring user/holder prefs)
     3. Otherwise ``dalton_model_pref(user_id, <pref_key>)`` (user -> team PM holder -> ``dalton.yaml`` default:
        - ``assist`` -> ``dalton_assist_model`` (default ``models.assist_model``)
-       - ``extract`` / ``conversation_extract`` -> ``dalton_extract_model`` (default ``conversations.extractor_model``)
        - ``audit`` -> ``dalton_audit_model`` (default ``publish.audit_model``)
        - ``language`` -> ``dalton_language_model`` (default ``publish.language_model`` / ``publish.audit_model``))
     4. In Standalone Core profile (``is_core_profile()``), falls back to the customer's
@@ -324,11 +323,7 @@ async def assist_json(
             unconfigured_msg = (
                 "数字核验模型（dalton_audit_model / publish.audit_model）未配置"
                 if role == "audit"
-                else (
-                    "抽取任务模型（dalton_extract_model / conversations.extractor_model）未配置"
-                    if role in ("extract", "conversation_extract")
-                    else "辅助任务模型（dalton_assist_model / models.assist_model）未配置"
-                )
+                else "辅助任务模型（dalton_assist_model / models.assist_model）未配置"
             )
             return AssistResult(
                 ok=False,

@@ -454,7 +454,7 @@
 
 > **治理准则**：C 类变量绑定在 Everflow 单机宿主机 `researchdata_bridge.py`、私有商业数据授权、Supabase 托管认证准入、宿主机 `launchd`（macOS 系统守护进程管理器）运维脚本或上游 Ginlix 多租户云平台上。核心安装（`DALTON_PROFILE=core`）通过 `src.dalton.profile` 与 `src.dalton.capabilities` 默认关闭并隐去，这些变量继续留在 Everflow 生产 `.env` 与 `~/.config/dalton/*.env`。
 
-#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（40 项）
+#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（37 项；11-28 停用代码清理删去 3 项）
 
 | 变量名 | 来源 | 用途 | 谁读取 | 读取时机 | 改动后生效方式 | 核心安装是否需要 |
 |---|---|---|---|---|---|---|
@@ -476,9 +476,6 @@
 | `DALTON_BRIDGE_PORT` | `src/dalton/settings.py`, `researchdata_bridge.py` | 宿主机研究桥监听端口（默认 `8960`） | `src/dalton/settings.py`, `researchdata_bridge.py` | 桥接进程启动一次 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_TOKEN` | `src/dalton/settings.py`, `plugins/dalton_data/mcp.json` | 后端与沙箱访问宿主机研究桥的 Bearer 鉴权令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 桥接启动加载 + 后端每次读取 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_ADMIN_TOKEN` | `src/dalton/settings.py`, `researchdata_bridge.py` | 研究桥高权限管理与运维接口专用令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 同上 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
-| `DALTON_BRIDGE_EMBED_URL` | `src/dalton/settings.py` | 经宿主机研究桥本机模型生成向量嵌入的接口地址 | `src/dalton/settings.py`, `embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_EMBED_VIA_BRIDGE` | `src/dalton/embeddings/config.py` | 控制向量嵌入是否走宿主机研究桥本机推理 | `src/dalton/embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_BROKER_TOKEN` | `src/dalton/settings.py` | 宿主机内部券商/研究代理令牌 | `src/dalton/settings.py`, `scripts/dalton/` | 每次内部任务调用时 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_DATA_JOBS_ENABLED` | `src/dalton/settings.py` | 内部数据采集调度器旧版兼容开关 | `src/dalton/settings.py`, `data_jobs/scheduler.py` | 启动一次 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_DATA_TASK_MIN_FREE_MEM_MB` | `src/dalton/settings.py` | 触发宿主机数据任务前的最小可用内存保护阈值 | `src/dalton/settings.py` | 每次调度前检查 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_COVERAGE_UNITS_ENABLED` | `src/dalton/settings.py`, `docker-compose.dalton.yml` | 内部研究员行业覆盖组管理开关 | `src/dalton/settings.py` | 每次请求读取 | 修改 `.env` 后重建 `backend` 容器 | 否 |

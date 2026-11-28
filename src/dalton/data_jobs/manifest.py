@@ -60,7 +60,6 @@ class DataTaskManifestEntry(BaseModel):
     secret_names: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)  # DALTON-HOOK(host-job-secrets): plain task env (e.g. URLs)
     freeze_paths: list[str] = Field(default_factory=list)
-    cos_mode: Literal["skip", "prod"] = "skip"
     notify_enabled: bool = False
     enabled: bool = False
 
@@ -138,7 +137,7 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
     Newly inserted rows initialize ``cron_expr``, ``timezone``, ``enabled``, ``notify_enabled``,
     and ``audit_history`` (``version = 1`` baseline snapshot) from ``manifest.yaml`` (excluding
     ``cutover_cron`` / ``cutover_timezone``). Existing rows keep their versioned/runtime state
-    (``cron_expr``, ``timezone``, ``enabled``, ``notify_enabled``, ``cos_mode``, ``paused_by_user``,
+    (``cron_expr``, ``timezone``, ``enabled``, ``notify_enabled``, ``paused_by_user``,
     ``consecutive_failures``, ``config_version``, ``active_version``, ``updated_by``, ``audit_history``)
     while static execution fields (``task_code``, ``title``, ``batch_no``, ``runner``,
     ``timeout_seconds``, ``no_output_timeout_seconds``, ``command_argv``, ``workdir``,
@@ -180,7 +179,6 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
                     command_argv,
                     workdir,
                     required_secrets,
-                    cos_mode,
                     notify_enabled,
                     enabled,
                     paused_by_user,
@@ -203,7 +201,6 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
                     %(command_argv)s::jsonb,
                     %(workdir)s,
                     %(required_secrets)s::jsonb,
-                    %(cos_mode)s,
                     %(notify_enabled)s,
                     %(enabled)s,
                     FALSE,
@@ -239,7 +236,6 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
                     "command_argv": json.dumps(entry.resolved_command_argv(), ensure_ascii=False),
                     "workdir": entry.workdir,
                     "required_secrets": json.dumps(entry.secret_names, ensure_ascii=False),
-                    "cos_mode": entry.cos_mode,
                     "notify_enabled": entry.notify_enabled,
                     "enabled": entry.enabled,
                     "audit_history": json.dumps(initial_audit, ensure_ascii=False),

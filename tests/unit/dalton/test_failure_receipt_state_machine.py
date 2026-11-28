@@ -1564,7 +1564,6 @@ async def test_data_job_finalize_task_run_enqueues_failure_notice_and_bumps_epoc
         timeout_seconds=300,
         no_output_timeout_seconds=120,
         required_secrets=[],
-        cos_mode="disabled",
         notify_enabled=True,
         scheduled_slot_utc=NOW,
         deadline_utc=NOW + timedelta(minutes=10),

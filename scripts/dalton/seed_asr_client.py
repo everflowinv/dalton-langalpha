@@ -317,7 +317,6 @@ def redact_asr_secrets(
         "LARK_APP_SECRET",
         "OPENCLAW_GATEWAY_TOKEN",
         "DALTON_OPENCLAW_GATEWAY_TOKEN",
-        "DALTON_BROKER_TOKEN",
         "DALTON_WEB_SEARCH_BRIDGE_TOKEN",
     ):
         val = str(env.get(key) or "").strip()

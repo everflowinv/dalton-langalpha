@@ -62,7 +62,6 @@ from src.dalton.profile import DeploymentProfile
 from src.dalton.services import transcriptions as svc_transcriptions
 from src.dalton.settings import (
     get_dalton_bridge_base_url,
-    get_dalton_bridge_embed_url,
     get_dalton_channel_gateway_url,
     get_dalton_config,
     get_dalton_researchdata_url,
@@ -146,7 +145,6 @@ _CLEAR_CAP_ENV_VARS: tuple[str, ...] = (
     "DALTON_PROFILE",
     "DALTON_HOST_PLATFORM",
     "DALTON_ENABLED",
-    "DALTON_EMBED_VIA_BRIDGE",
     "DALTON_OPS_JOBS_VIA_BRIDGE",
     "DALTON_OPS_STATUS_FILE",
     "DALTON_RESEARCHDATA_URL",
@@ -1931,7 +1929,6 @@ class TestBackendCapabilityPruning:
         _clean_cap_env(monkeypatch, app_env="core")
         assert get_dalton_researchdata_url() == ""
         assert get_dalton_bridge_base_url() == ""
-        assert get_dalton_bridge_embed_url() == ""
         assert get_dalton_channel_gateway_url() == ""
         assert notify_via_gateway_enabled() is False
         assert cnhk_mod._resolve_bridge_url() == ""
@@ -1944,7 +1941,6 @@ class TestBackendCapabilityPruning:
 
         _clean_cap_env(monkeypatch, app_env="dalton")
         assert ":8960" in get_dalton_bridge_base_url()
-        assert ":8960/embed" in get_dalton_bridge_embed_url()
         assert ":8962" in get_dalton_channel_gateway_url()
         ef_url, _, _ = health_mod.resolve_researchdata_endpoint_and_token()
         assert ":8960/mcp" in ef_url

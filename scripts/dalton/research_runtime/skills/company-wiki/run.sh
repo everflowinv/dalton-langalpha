@@ -32,8 +32,6 @@ elif [[ -n "${DALTON_SKILL_DIR:-}" ]]; then
     SKILL_DIR="${DALTON_SKILL_DIR}"
 elif [[ -n "${DALTON_RESEARCH_CODE:-}" ]] && _resolve_cli_in_dir "${DALTON_RESEARCH_CODE}/skills/company-wiki" >/dev/null; then
     SKILL_DIR="${DALTON_RESEARCH_CODE}/skills/company-wiki"
-elif [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]] && _resolve_cli_in_dir "${DALTON_OCW_ROOT}/skills/company-wiki" >/dev/null; then
-    SKILL_DIR="${DALTON_OCW_ROOT}/skills/company-wiki"
 elif _resolve_cli_in_dir "${SCRIPT_DIR}" >/dev/null; then
     SKILL_DIR="${SCRIPT_DIR}"
 else
@@ -41,12 +39,8 @@ else
     exit 1
 fi
 
-if [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_CODE:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]]; then
-    VENV_DIR="${DALTON_OCW_ROOT}/skills/company-wiki/venv"
-else
-    RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-    VENV_DIR="${RESEARCH_HOME}/venvs/company-wiki"
-fi
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+VENV_DIR="${RESEARCH_HOME}/venvs/company-wiki"
 REQ_FILE="${SKILL_DIR}/requirements.txt"
 REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 SCRIPT_FILE="$(_resolve_cli_in_dir "${SKILL_DIR}")"
@@ -131,7 +125,7 @@ unset DALTON_ASR_STORAGE_ENDPOINT_URL DALTON_ASR_STORAGE_BUCKET_NAME DALTON_ASR_
 unset FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_DEFAULT_GRANT_CHAT_ID
 unset DALTON_FEISHU_APP_ID DALTON_FEISHU_APP_SECRET DALTON_FEISHU_DEFAULT_GRANT_CHAT_ID
 unset OPENCLAW_FEISHU_APP_ID OPENCLAW_FEISHU_APP_SECRET LARK_APP_ID LARK_APP_SECRET
-unset OPENCLAW_GATEWAY_TOKEN DALTON_OPENCLAW_GATEWAY_TOKEN DALTON_BROKER_TOKEN DALTON_BROKER_TOKEN_PATH DALTON_WEB_SEARCH_BRIDGE_TOKEN
+unset OPENCLAW_GATEWAY_TOKEN DALTON_OPENCLAW_GATEWAY_TOKEN DALTON_WEB_SEARCH_BRIDGE_TOKEN
 unset DALTON_BRIDGE_ADMIN_TOKEN DALTON_BRIDGE_TOKEN
 
 while IFS='=' read -r _env_name _; do

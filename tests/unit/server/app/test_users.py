@@ -1966,7 +1966,6 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
                         "claude-opus-5-5-oauth",
                         "gpt-6.2-sol-oauth",
                     ],
-                    "dalton_extract_model": "",
                 }
             },
         )
@@ -1983,7 +1982,6 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
         "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
     ]
-    assert saved_mp["dalton_extract_model"] is None
 
 
 @pytest.mark.parametrize(

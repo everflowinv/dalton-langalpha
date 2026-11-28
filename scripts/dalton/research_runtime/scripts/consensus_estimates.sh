@@ -4,15 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CODE="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-if [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_CODE:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]]; then
-    CODE_ROOT="${DALTON_OCW_ROOT}"
-    RESEARCH_HOME=""
-    VENV="${DALTON_OCW_ROOT}/state/venvs/consensus-estimates"
-else
-    CODE_ROOT="${DALTON_RESEARCH_CODE:-${DEFAULT_CODE}}"
-    RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-    VENV="${RESEARCH_HOME}/venvs/consensus-estimates"
-fi
+CODE_ROOT="${DALTON_RESEARCH_CODE:-${DEFAULT_CODE}}"
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+VENV="${RESEARCH_HOME}/venvs/consensus-estimates"
 REQ="${CODE_ROOT}/scripts/consensus_estimates_requirements.txt"
 
 _find_pinned_python() {
@@ -41,7 +35,6 @@ _read_legacy_pyvenv_mm() {
     for cfg in \
         "${DALTON_CONSENSUS_LEGACY_PYVENV_CFG:-}" \
         "${RESEARCH_HOME:+${RESEARCH_HOME}/state/venvs/consensus-estimates.python_version}" \
-        "${DALTON_OCW_ROOT:+${DALTON_OCW_ROOT}/state/venvs/consensus-estimates/pyvenv.cfg}" \
         "${HOME}/.openclaw/workspace/state/venvs/consensus-estimates/pyvenv.cfg"; do # 兼容读取旧 venv Python 版本
         if [[ -n "${cfg}" && -f "${cfg}" ]]; then
             local ver=""

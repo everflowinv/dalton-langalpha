@@ -31,7 +31,6 @@ DALTON_SINGLE_MODEL_KEYS: tuple[str, ...] = (
     "dalton_audit_model",
     "dalton_language_model",
     "dalton_assist_model",
-    "dalton_extract_model",
 )
 
 DALTON_MODEL_LIST_KEYS: tuple[str, ...] = (
@@ -246,9 +245,6 @@ def dalton_model_default(key: str) -> Any:
     if key == "dalton_reviewer_models":
         items = _dedup_str_list(settings.publish.reviewer_models or [])
         return items or None
-    if key == "dalton_extract_model":
-        val = (settings.conversations.extractor_model or "").strip()
-        return val or None
     return None
 
 
@@ -279,7 +275,6 @@ def get_dalton_system_defaults() -> dict[str, Any]:
         "dalton_reviewer_models": list(
             dalton_model_default("dalton_reviewer_models") or []
         ),
-        "dalton_extract_model": dalton_model_default("dalton_extract_model") or "",
     }
 
 
@@ -482,18 +477,6 @@ async def resolve_dalton_reviewer_models(user_id: str | None = None) -> list[str
     return list(val) if isinstance(val, list) else []
 
 
-async def resolve_dalton_extract_model(user_id: str | None = None) -> str:
-    """Resolve the conversation archive extraction model for ``user_id``."""
-    val = await dalton_model_pref(user_id, "dalton_extract_model")
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    if is_core_profile():
-        from src.dalton.llm.role_policy import resolve_effective_role_model
-
-        return await resolve_effective_role_model(role="extract", user_id=user_id)
-    return ""
-
-
 async def _read_user_preferences(
     uid: str,
     *,
@@ -652,7 +635,6 @@ resolve_audit_model = resolve_dalton_audit_model
 resolve_audit_fallback_models = resolve_dalton_audit_fallback_models
 resolve_audit_timeout_s = resolve_dalton_audit_timeout_s
 resolve_reviewer_models = resolve_dalton_reviewer_models
-resolve_extract_model = resolve_dalton_extract_model
 resolve_notify_enabled = resolve_dalton_notify_enabled
 resolve_notify_targets = resolve_dalton_notify_targets
 resolve_notify_overrides = resolve_dalton_notify_overrides

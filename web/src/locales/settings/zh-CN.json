@@ -360,9 +360,7 @@
     "daltonAssistFallbackModelsDesc": "当轻量后台任务主模型失败或超时时，按顺序尝试的备用模型。",
     "daltonReviewerModels": "独立复核候选模型",
     "daltonReviewerModelsDesc": "自动跳过写稿所使用的同系列模型，从列表中选用第一个可用的异构模型参与独立复核。",
-    "daltonExtractModel": "研究记忆整理模型",
-    "daltonExtractModelDesc": "对话归档时，用于自动提炼研究结论与长期记忆。",
-    "daltonRoutingDesc": "以下模型用于后台自动巡检、报告发布前数字与文字核验及团队记忆整理；留空则沿用团队默认配置。",
+    "daltonRoutingDesc": "以下模型用于后台自动巡检与报告发布前数字与文字核验；留空则沿用团队默认配置。",
     "daltonAuditTimeoutError": "请填写 60 到 1800 之间的整数（1 到 30 分钟）",
     "expandGroup": "展开",
     "collapseGroup": "收起"
