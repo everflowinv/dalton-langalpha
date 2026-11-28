@@ -3364,17 +3364,20 @@ async def enumerate_snapshot_refs(
                         else {}
                     )
                     upload_completed = upload_meta.get("completed") is True
+                    submit_attempted = (
+                        isinstance(usage, dict) and usage.get("submit_attempted") is True
+                    )
 
                     if st_s in TERMINAL_ASR_ARCHIVE_STATUSES:
                         inv.terminal_asr_job_ids.append(jid_s)
                     if st_s == "succeeded":
                         inv.succeeded_asr_job_ids.append(jid_s)
 
-                    if st_s == "awaiting_upload" and not upload_completed:
+                    if st_s == "awaiting_upload" and not (upload_completed or submit_attempted):
                         pending_asr += 1
                         continue
                     if st_s in ACTIVE_OR_SUBMITTED_ASR_STATUSES or (
-                        st_s == "awaiting_upload" and upload_completed
+                        st_s == "awaiting_upload" and (upload_completed or submit_attempted)
                     ):
                         inv.references.append(
                             ObjectReference(

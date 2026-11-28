@@ -740,8 +740,22 @@ if (( ${#STALE_ENV_TMPS[@]} > 0 )); then
   rm -f "${STALE_ENV_TMPS[@]}"
 fi
 
-# External PostgreSQL guard using strictly the candidate .env file
-CFG_DB_HOST="$(read_env_file_var "$CANDIDATE_ENV" "DB_HOST" "postgres")"
+# Unified PostgreSQL configuration guard using strictly CANDIDATE_ENV via stdlib resolver
+# (same DB_* > DATABASE_URL rule and conflict check as backend and backup).
+if ! RESTORE_PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config \
+    --env-file "$CANDIDATE_ENV" \
+    --default-host postgres \
+    --check-conflict \
+    --caller restore)"; then
+  exit 1
+fi
+RESTORE_PG_LINES="$(printf '%s' "$RESTORE_PG_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "user", "password", "dbname"):
+    print(d.get(k, ""))
+')"
+CFG_DB_HOST="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '1p')"
 if [[ "$CFG_DB_HOST" != "postgres" ]]; then
   err "External PostgreSQL detected (DB_HOST='${CFG_DB_HOST}'; expected Compose-managed 'postgres')."
   err "restore.sh only manages the Compose-managed PostgreSQL container. For external databases, restore directly with pg_restore."
@@ -761,9 +775,11 @@ validate_db_identifiers() {
 }
 
 # Read all target configuration strictly from CANDIDATE_ENV (never shell environment)
-CFG_DB_USER="$(read_env_file_var "$CANDIDATE_ENV" "DB_USER" "postgres")"
-CFG_DB_PASSWORD="$(read_env_file_var "$CANDIDATE_ENV" "DB_PASSWORD" "postgres")"
-CFG_DB_NAME="$(read_env_file_var "$CANDIDATE_ENV" "DB_NAME" "postgres")"
+CFG_DB_USER="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '2p')"
+CFG_DB_PASSWORD="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '3p')"
+CFG_DB_NAME="$(printf '%s\n' "$RESTORE_PG_LINES" | sed -n '4p')"
+CFG_DB_USER="${CFG_DB_USER:-postgres}"
+CFG_DB_NAME="${CFG_DB_NAME:-postgres}"
 CFG_DOMAIN="$(read_env_file_var "$CANDIDATE_ENV" "DOMAIN" "localhost")"
 CFG_TLS_MODE="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_TLS_MODE" "loopback")"
 CFG_EDGE_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_PORT" "8088")"
@@ -825,6 +841,7 @@ for key in (
     "DB_USER",
     "DB_PASSWORD",
     "DB_NAME",
+    "DATABASE_URL",
     "DALTON_RESEARCH_HOST_TOKEN",
     "DALTON_RESEARCH_ADMIN_TOKEN",
 ):
@@ -931,6 +948,35 @@ if [[ "$COMPOSE_CFG_RC" -ne 0 ]]; then
   err "  $(cat "${COMPOSE_CFG_TMP}.err")"
   exit 1
 fi
+
+# Re-resolve effective backend PostgreSQL config after Compose interpolation so backup,
+# backend, and restore agree on one exact DB target and reject any DB_* vs DATABASE_URL conflict.
+if ! RESTORE_COMPOSE_PG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config \
+    --env-file "$ENV_FILE" \
+    --compose-config-json "$COMPOSE_CFG_TMP" \
+    --service backend \
+    --default-host postgres \
+    --check-conflict \
+    --caller restore)"; then
+  exit 1
+fi
+RESTORE_COMPOSE_PG_LINES="$(printf '%s' "$RESTORE_COMPOSE_PG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "user", "password", "dbname"):
+    print(d.get(k, ""))
+')"
+CFG_DB_HOST="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '1p')"
+if [[ "$CFG_DB_HOST" != "postgres" && "$CFG_DB_HOST" != "127.0.0.1" && "$CFG_DB_HOST" != "localhost" ]]; then
+  err "External PostgreSQL detected in effective backend Compose config (host='${CFG_DB_HOST}'; expected Compose-managed 'postgres')."
+  exit 1
+fi
+CFG_DB_USER="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '2p')"
+CFG_DB_PASSWORD="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '3p')"
+CFG_DB_NAME="$(printf '%s\n' "$RESTORE_COMPOSE_PG_LINES" | sed -n '4p')"
+CFG_DB_USER="${CFG_DB_USER:-postgres}"
+CFG_DB_NAME="${CFG_DB_NAME:-postgres}"
+validate_db_identifiers "$CFG_DB_USER" "$CFG_DB_NAME"
 
 STORAGE_CHECK_ARGS=(
   python3 "${SCRIPT_DIR}/storage_config.py" check-env
@@ -1124,9 +1170,13 @@ if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
   MINIO_PREFLIGHT_PY='
 from __future__ import annotations
 import os, sys, time
+from pathlib import Path
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+
+sys.path.insert(0, str(Path("/app")))
+from scripts.standalone.storage_config import configured_minio_init_buckets
 
 def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     for key in (primary, *fallbacks):
@@ -1136,7 +1186,7 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "DALTON_ASR_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
-minio_init_bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "DALTON_ASR_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", "S3_BUCKET_NAME", default="chat-uploads")
+allowed_init_buckets = set(configured_minio_init_buckets(os.environ))
 access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "DALTON_ASR_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID")
 secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY")
 region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "DALTON_ASR_STORAGE_REGION", "STORAGE_REGION", "S3_REGION", default="us-east-1")
@@ -1175,7 +1225,7 @@ if resp is None:
     sys.exit(1)
 
 existing_buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
-unexpected_buckets = [b for b in existing_buckets if b != minio_init_bucket]
+unexpected_buckets = [b for b in existing_buckets if b not in allowed_init_buckets]
 non_empty: list[tuple[str, int]] = []
 for bucket in existing_buckets:
     count = 0
@@ -1401,7 +1451,13 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as tf:
         if bucket not in source_buckets:
             print(f"ERROR: Archive contains object for undeclared bucket {bucket!r}", file=sys.stderr)
             sys.exit(1)
-        meta = manifest_by_pair.get((bucket, key)) or {}
+        if (bucket, key) not in manifest_by_pair:
+            print(f"ERROR: Archive contains undeclared object {(bucket, key)!r} not present in manifest", file=sys.stderr)
+            sys.exit(1)
+        if (bucket, key) in uploaded_pairs:
+            print(f"ERROR: Archive contains duplicate object {(bucket, key)!r}", file=sys.stderr)
+            sys.exit(1)
+        meta = manifest_by_pair[(bucket, key)]
         content_type = (
             str(meta.get("content_type") or "").strip()
             or str((member.pax_headers or {}).get("DALTON.content_type") or "").strip()
@@ -1410,8 +1466,35 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as tf:
         upload_streaming(bucket, key, fp, member.size, content_type)
         uploaded_pairs.add((bucket, key))
 
-if len(uploaded_pairs) != len(expected_objects):
-    print(f"ERROR: Restored {len(uploaded_pairs)} objects, expected {len(expected_objects)}", file=sys.stderr)
+expected_pairs = set(manifest_by_pair.keys())
+if uploaded_pairs != expected_pairs:
+    missing_up = sorted(expected_pairs - uploaded_pairs)[:10]
+    extra_up = sorted(uploaded_pairs - expected_pairs)[:10]
+    print(
+        f"ERROR: Restored key set mismatch: uploaded={len(uploaded_pairs)}, expected={len(expected_pairs)} "
+        f"(missing_sample={missing_up}, extra_sample={extra_up})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# Post-import bucket listing check: actual key set across all restored buckets must match manifest exactly.
+actual_pairs: set[tuple[str, str]] = set()
+for b in sorted(source_buckets):
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=b):
+        for entry in page.get("Contents") or []:
+            k = str(entry.get("Key") or "")
+            if k and k != RESTORE_MARKER_KEY:
+                actual_pairs.add((b, k))
+
+if actual_pairs != expected_pairs:
+    missing_live = sorted(expected_pairs - actual_pairs)[:10]
+    extra_live = sorted(actual_pairs - expected_pairs)[:10]
+    print(
+        f"ERROR: Post-import object key set mismatch against manifest: "
+        f"actual={len(actual_pairs)}, expected={len(expected_pairs)} "
+        f"(missing_sample={missing_live}, extra_sample={extra_live})",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # Read-back verification: size, SHA-256, and ContentType
@@ -1534,7 +1617,7 @@ print(str(vol.get("name") or ""))
   if [[ -f "${BACKUP_DIR}/asr-jobs.tar.gz" ]]; then
     info "Restoring terminal ASR jobs archive into /var/lib/dalton/asr_jobs..."
     if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
-        -c 'mkdir -p /var/lib/dalton/asr_jobs && rm -rf /var/lib/dalton/asr_jobs/* /var/lib/dalton/asr_jobs/.[!.]* /var/lib/dalton/asr_jobs/..?* 2>/dev/null || true; tar -xzf - -C /var/lib/dalton/asr_jobs' \
+        -c 'set -e; mkdir -p /var/lib/dalton/asr_jobs; find /var/lib/dalton/asr_jobs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; if [ -n "$(ls -A /var/lib/dalton/asr_jobs)" ]; then echo "ERROR: /var/lib/dalton/asr_jobs is not empty after clearing" >&2; exit 1; fi; tar -xzf - -C /var/lib/dalton/asr_jobs' \
         < "${BACKUP_DIR}/asr-jobs.tar.gz"; then
       err "Failed to clear and extract terminal ASR jobs from ${BACKUP_DIR}/asr-jobs.tar.gz; refusing to start services."
       exit 1
@@ -1543,7 +1626,7 @@ print(str(vol.get("name") or ""))
   else
     info "Clearing /var/lib/dalton/asr_jobs volume (no asr-jobs.tar.gz in backup)..."
     if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
-        -c 'mkdir -p /var/lib/dalton/asr_jobs && rm -rf /var/lib/dalton/asr_jobs/* /var/lib/dalton/asr_jobs/.[!.]* /var/lib/dalton/asr_jobs/..?* 2>/dev/null || true'; then
+        -c 'set -e; mkdir -p /var/lib/dalton/asr_jobs; find /var/lib/dalton/asr_jobs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; if [ -n "$(ls -A /var/lib/dalton/asr_jobs)" ]; then echo "ERROR: /var/lib/dalton/asr_jobs is not empty after clearing" >&2; exit 1; fi'; then
       err "Failed to clear /var/lib/dalton/asr_jobs volume before service start; refusing to start services."
       exit 1
     fi

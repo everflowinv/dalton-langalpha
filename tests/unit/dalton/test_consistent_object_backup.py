@@ -789,6 +789,7 @@ def test_backup_lib_preflight_disk_space_and_verify_mount_layout(tmp_path: Path)
         external_mount_root=ext_mount,
         internal_root=internal_root,
         colima_dir=colima_link,
+        colima_profile="default",
         is_mount_fn=lambda p: p == ext_mount,
         disk_usage_fn=_usage(200, 20),
         colima_docker_free_bytes_fn=lambda: 80 * gb,
@@ -803,6 +804,7 @@ def test_backup_lib_preflight_disk_space_and_verify_mount_layout(tmp_path: Path)
         external_mount_root=ext_mount,
         internal_root=internal_root,
         colima_dir=colima_internal,
+        colima_profile="default",
         is_mount_fn=lambda p: p == ext_mount,
         disk_usage_fn=_usage(200, 20),
         colima_docker_free_bytes_fn=lambda: 80 * gb,
@@ -815,6 +817,7 @@ def test_backup_lib_preflight_disk_space_and_verify_mount_layout(tmp_path: Path)
         external_mount_root=ext_mount,
         internal_root=internal_root,
         colima_dir=colima_link,
+        colima_profile="default",
         is_mount_fn=lambda p: p == ext_mount,
         disk_usage_fn=_usage(149, 9),
         colima_docker_free_bytes_fn=lambda: 54 * gb,
@@ -1670,7 +1673,8 @@ def test_hold_lock_timeout_and_early_snapshot_commit_terminates_pg_dump(tmp_path
     assert dump_out.read_bytes() == b"PGDMP-hdr-tail"
     assert events.index("lock") < events.index("commit") < events.index("unlock") < events.index("mirror_get")
 
-    # Case 2: hanging pg_dump hits snapshot_import_timeout_s -> terminates child, ROLLBACKs, unlocks!
+    # Case 2: hanging pg_dump hits snapshot_import_timeout_s -> closes DB session FIRST
+    # (dropping locks & aborting snapshot txn without waiting for ROLLBACK) and kills child!
     events.clear()
     spawned: list[consistent_backup.PgDumpProcess] = []
 
@@ -1699,8 +1703,8 @@ def test_hold_lock_timeout_and_early_snapshot_commit_terminates_pg_dump(tmp_path
             )
         )
     assert spawned and spawned[0].popen.poll() is not None
-    assert "rollback" in events
-    assert "unlock" in events
+    assert conn2.closed is True
+    assert "rollback" not in events
 
 
 def test_response_images_private_media_and_percent_encoded_attachments_reconcile() -> None:
@@ -2479,6 +2483,7 @@ def test_preflight_and_verify_mount_check_device_ids_and_colima_disk_files(tmp_p
         external_mount_root=ext_mount,
         internal_root=internal_disk,
         colima_dir=colima_ext,
+        colima_profile="default",
         is_mount_fn=lambda p: p == ext_mount,
         disk_usage_fn=lambda _p: type("U", (), {"free": 300 * 1024**3})(),
         colima_docker_free_bytes_fn=lambda: 80 * 1024**3,
@@ -2796,23 +2801,20 @@ def test_standalone_compose_backup_unified_dsn_asr_bundle_timeouts_and_restore_o
     """Lead #2 (Codex #2,#3,#4 + Grok #1,#2,#3): unified DATABASE_URL config on compose-backup,
     LOCK_TIMEOUT_S for SNAPSHOT_READY vs 120s for import, ASR volume mount + bundle, completing
     uploads allowed in backup, restore clears/extracts asr-jobs + reconciles BEFORE compose up -d."""
-    # 1. resolve-pg-config resolves DATABASE_URL over DB_USER/DB_NAME and rewrites host for postgres container
+    # 1. resolve-pg-config resolves DATABASE_URL when DB_* are unset and rewrites host for postgres container
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "DB_HOST=postgres\n"
-        "DB_USER=postgres\n"
-        "DB_PASSWORD=oldpass\n"
-        "DB_NAME=postgres\n"
         "DATABASE_URL=postgresql://app_owner:s3cr3t@postgres:5432/custom_core_db?sslmode=disable\n",
         encoding="utf-8",
     )
     res_cfg = subprocess.run(
         [
             sys.executable,
-            str(REPO_ROOT / "scripts/standalone/consistent_backup.py"),
+            str(REPO_ROOT / "scripts/standalone/storage_config.py"),
             "resolve-pg-config",
             "--env-file",
             str(env_file),
+            "--check-conflict",
         ],
         capture_output=True,
         text=True,
@@ -2944,11 +2946,11 @@ def test_standalone_compose_backup_unified_dsn_asr_bundle_timeouts_and_restore_o
     # 4. backup.sh & restore.sh wiring checks
     backup_sh = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
     assert 'LOCK_TIMEOUT_S="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"' in backup_sh
-    assert 'SNAP_READY_DEADLINE=$(( $(date +%s) + LOCK_TIMEOUT_S ))' in backup_sh
+    assert 'SNAP_READY_DEADLINE=$(( LOCK_START_TS + LOCK_TIMEOUT_S ))' in backup_sh
     assert 'IMPORT_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))' in backup_sh
     assert "--asr-jobs-dir /var/lib/dalton/asr_jobs" in backup_sh
     assert "-v \"${ASR_JOBS_VOLUME}:/var/lib/dalton/asr_jobs:ro\"" in backup_sh
-    assert "consistent_backup.py\" resolve-pg-config" in backup_sh
+    assert 'storage_config.py" resolve-pg-config' in backup_sh
     assert "DALTON_PG_DUMP_DSN" in backup_sh
     assert "verify-backup-refs" not in backup_sh
 
@@ -3349,7 +3351,7 @@ def test_workspace_file_uploads_pulling_snapshot_refs_and_restore_convergence(
             ]
         if s.startswith("SELECT upload_id FROM workspace_file_uploads WHERE upload_id = %s"):
             return (params[0],)
-        if "UPDATE workspace_file_uploads SET lease_until = NULL, placing_inode = NULL, error = NULL" in s:
+        if "UPDATE workspace_file_uploads SET lease_until = NULL, placing_inode = NULL, attempts = 0, error = NULL" in s:
             requeued_ids.append(params[0])
             return 1
         if "UPDATE workspace_file_uploads SET state = 'aborted'" in s:
@@ -3401,7 +3403,24 @@ def test_colima_resolution_respects_colima_home_active_profile_and_requires_disk
     seen_cmds: list[tuple[list[str], str]] = []
 
     def _fake_colima_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        seen_cmds.append((list(cmd), str((kwargs.get("env") or {}).get("COLIMA_HOME") or "")))
+        chome = str((kwargs.get("env") or {}).get("COLIMA_HOME") or "")
+        seen_cmds.append((list(cmd), chome))
+        if cmd[:3] == ["docker", "context", "inspect"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Name": "colima-prod",
+                            "Endpoints": {
+                                "docker": {"Host": f"unix://{chome}/prod/docker.sock"}
+                            },
+                        }
+                    ]
+                ),
+                stderr="",
+            )
         if cmd[:3] == ["colima", "list", "--json"]:
             return subprocess.CompletedProcess(
                 cmd,
@@ -3552,9 +3571,17 @@ exit 0
 
     # Now the tracked backup completes and writes its terminal ok line with set=<tracked_id>
     running_flag.unlink()
+    bak_root = tmp_path / "dep-resume-backups"
+    (bak_root / "pg").mkdir(parents=True)
+    (bak_root / "sets").mkdir(parents=True)
+    real_dump = bak_root / "pg" / f"dalton-pg-{tracked_id}.dump"
+    real_dump.write_bytes(b"PGDMP-verified")
+    (bak_root / "sets" / f"backup-set-{tracked_id}.json").write_text(
+        json.dumps({"backup_set_id": tracked_id, "reconcile_ok": True}), encoding="utf-8"
+    )
     now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with Path(ctx["backup_log"]).open("a", encoding="utf-8") as lf:
-        lf.write(f"{now_str} ok  16G /backups/dalton-pg-{tracked_id}.dump set={tracked_id}\n")
+        lf.write(f"{now_str} ok  16G {real_dump} set={tracked_id}\n")
 
     # Retry migrating deploy: MUST resume the completed tracked backup without starting a new one!
     res2 = _run_deploy(
@@ -3570,3 +3597,1115 @@ exit 0
     ]
     assert len(kickstarts_after_2) == 1, f"Retry must NOT trigger a second backup: {kickstarts_after_2}"
     assert not state_file.exists(), "State file should be cleared once completed backup is resumed"
+
+
+# ---------------------------------------------------------------------------
+# Round 4 review regression tests (every High, Medium & Low finding from Codex + Grok)
+# ---------------------------------------------------------------------------
+
+
+def test_r4_standalone_host_pg_config_stdlib_only_and_unified_db_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex High #1 & #3 / Lead #6: host-side PG config resolution uses stdlib only
+    (works without psycopg/yaml/boto3), and backend/backup/restore share identical
+    DB_* > DATABASE_URL priority plus conflict rejection before snapshot export."""
+    from src.server.database import pool as db_pool
+
+    # 1. Block all third-party packages via a custom sitecustomize.py in PYTHONPATH,
+    #    simulating a Standalone Core host with bare system Python (no psycopg/yaml/boto3).
+    blocker_dir = tmp_path / "stdlib_only_guard"
+    blocker_dir.mkdir()
+    (blocker_dir / "sitecustomize.py").write_text(
+        """
+import sys
+from importlib.abc import MetaPathFinder
+
+BLOCKED = frozenset({"psycopg", "psycopg_pool", "yaml", "boto3", "botocore", "pydantic", "fastapi"})
+
+class _BlockThirdParty(MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        root = fullname.split(".", 1)[0]
+        if root in BLOCKED:
+            raise ModuleNotFoundError(f"Blocked third-party import on host: {fullname}", name=fullname)
+        return None
+
+sys.meta_path.insert(0, _BlockThirdParty())
+""",
+        encoding="utf-8",
+    )
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DB_HOST=postgres\nDB_PORT=5432\nDB_USER=core_u\nDB_PASSWORD=core_p\nDB_NAME=core_db\n",
+        encoding="utf-8",
+    )
+    isolated_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONPATH": str(blocker_dir),
+    }
+
+    for script_rel in (
+        "scripts/standalone/storage_config.py",
+        "scripts/standalone/consistent_backup.py",
+    ):
+        res = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / script_rel),
+                "resolve-pg-config",
+                "--env-file",
+                str(env_file),
+                "--check-conflict",
+            ],
+            env=isolated_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 0, f"{script_rel} failed under stdlib-only Python: {res.stderr}"
+        parsed = json.loads(res.stdout)
+        assert parsed["source"] == "db_vars"
+        assert parsed["dbname"] == "core_db"
+        assert parsed["user"] == "core_u"
+        assert parsed["container_dsn"].startswith("postgresql://core_u:core_p@127.0.0.1:5432/core_db")
+
+    # 2. Verify backend (pool.py), backup (consistent_backup.py + storage_config.py), and
+    #    restore (storage_config.py) agree identically across all 3 env combinations.
+    #    (a) DB_* only
+    for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE", "DATABASE_URL", "DALTON_BACKUP_PG_DSN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DB_HOST", "postgres")
+    monkeypatch.setenv("DB_PORT", "5432")
+    monkeypatch.setenv("DB_NAME", "app_main")
+    monkeypatch.setenv("DB_USER", "app_user")
+    monkeypatch.setenv("DB_PASSWORD", "app_pass")
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    backend_a = db_pool.get_db_connection_string()
+    backup_a = standalone_cb.resolve_standalone_pg_dsn()
+    restore_a = standalone_cb.resolve_standalone_pg_config()["dsn"]
+    assert backend_a == backup_a == restore_a == "postgresql://app_user:app_pass@postgres:5432/app_main?sslmode=prefer"
+
+    #    (b) DATABASE_URL only (no DB_*)
+    for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://url_u:url_p@postgres:5432/url_db?sslmode=disable")
+    backend_b = db_pool.get_db_connection_string()
+    backup_b = standalone_cb.resolve_standalone_pg_dsn()
+    restore_b = standalone_cb.resolve_standalone_pg_config()["dsn"]
+    assert backend_b == backup_b == restore_b == "postgresql://url_u:url_p@postgres:5432/url_db?sslmode=disable"
+
+    #    (c) Both DB_* and conflicting DATABASE_URL:
+    #        - All three prioritize DB_* identically (never silently diverge!)
+    #        - Backup/restore --check-conflict exits non-zero BEFORE snapshot export!
+    monkeypatch.setenv("DB_HOST", "postgres")
+    monkeypatch.setenv("DB_NAME", "real_app_db")
+    monkeypatch.setenv("DB_USER", "real_user")
+    monkeypatch.setenv("DB_PASSWORD", "real_pw")
+    backend_c = db_pool.get_db_connection_string()
+    backup_c = standalone_cb.resolve_standalone_pg_dsn()
+    assert backend_c == backup_c
+    assert "/real_app_db?" in backend_c
+
+    conflict_env = tmp_path / "conflict.env"
+    conflict_env.write_text(
+        "DB_HOST=postgres\nDB_USER=real_user\nDB_PASSWORD=real_pw\nDB_NAME=real_app_db\n"
+        "DATABASE_URL=postgresql://other_u:other_p@postgres:5432/other_db?sslmode=prefer\n",
+        encoding="utf-8",
+    )
+    res_conflict = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/standalone/storage_config.py"),
+            "resolve-pg-config",
+            "--env-file",
+            str(conflict_env),
+            "--check-conflict",
+        ],
+        env=isolated_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_conflict.returncode != 0
+    assert "Conflicting PostgreSQL configuration" in res_conflict.stderr
+
+
+def test_r4_standalone_backup_follows_backend_storage_config_without_inventing_dalton_storage() -> None:
+    """Codex High #2 / Lead #6: standalone backup follows running backend effective storage
+    config (apply_core_defaults=False) and does NOT invent/probe 'dalton-storage' when unset."""
+    from src.dalton import storage_config as runtime_sc
+
+    base_core_env = {
+        "APP_ENV": "core",
+        "DALTON_PROFILE": "core",
+        "MINIO_ROOT_USER": "minioadmin",
+        "MINIO_ROOT_PASSWORD": "miniopassword",
+        "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://minio:9000",
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+        "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "minioadmin",
+        "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "miniopassword",
+    }
+    # Backend effective main-storage config has empty bucket -> disabled
+    backend_cfg = runtime_sc.resolve(env=base_core_env, apply_core_defaults=False)
+    assert backend_cfg.is_storage_enabled is False
+    assert backend_cfg.bucket_name == ""
+
+    # Standalone backup must resolve ONLY chat-uploads (never invent dalton-storage!)
+    probed: list[dict[str, Any]] = []
+
+    def _factory(**kw: Any) -> Any:
+        probed.append(kw)
+        return _FakeS3Client()
+
+    specs = standalone_cb.resolve_standalone_bucket_specs(
+        env=base_core_env, client_factory=_factory
+    )
+    assert [s.bucket for s in specs] == ["chat-uploads"]
+    assert all(s.bucket != "dalton-storage" for s in specs)
+
+    # When main bucket IS explicitly configured, BOTH backend and backup include it
+    with_main_env = {
+        **base_core_env,
+        "STORAGE_PROVIDER": "s3",
+        "STORAGE_BUCKET_NAME": "core-main-files",
+        "STORAGE_ENDPOINT_URL": "http://minio:9000",
+    }
+    backend_cfg_on = runtime_sc.resolve(env=with_main_env, apply_core_defaults=False)
+    assert backend_cfg_on.is_storage_enabled is True
+    assert backend_cfg_on.bucket_name == "core-main-files"
+
+    specs_with_main = standalone_cb.resolve_standalone_bucket_specs(
+        env=with_main_env, client_factory=_factory
+    )
+    assert sorted(s.bucket for s in specs_with_main) == ["chat-uploads", "core-main-files"]
+
+
+def test_r4_asr_archive_subprocess_large_output_exceeding_pipe_buffer_never_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex High #4 / Lead #1: archive-asr-jobs subprocess never deadlocks even when
+    summary JSON and stdout/stderr output exceed OS pipe buffer capacity (>128 KiB)."""
+    import time
+
+    # 1. Real archive-asr-jobs subprocess with 2,500 terminal job IDs (>128 KiB summary JSON)
+    asr_dir = tmp_path / "asr_many"
+    asr_dir.mkdir()
+    (asr_dir / "asr_usage.jsonl").write_text('{"job_id":"j0"}\n', encoding="utf-8")
+    many_ids = [f"asr-job-terminal-{i:05d}-" + ("a" * 32) for i in range(2500)]
+    for jid in many_ids:
+        jd = asr_dir / jid
+        jd.mkdir()
+        (jd / "state.json").write_text(
+            json.dumps({"job_id": jid, "status": "succeeded"}), encoding="utf-8"
+        )
+    out_tar = tmp_path / "asr-many.tar.gz"
+    proc = consistent_backup.start_asr_archive_process(asr_dir, many_ids, out_tar)
+    t0 = time.monotonic()
+    summary = asyncio.run(
+        consistent_backup.wait_asr_archive_finished(proc, deadline=time.monotonic() + 30.0)
+    )
+    assert time.monotonic() - t0 < 25.0
+    assert len(summary.included_job_ids) == 2500
+    assert summary.included_usage_ledger is True
+    assert out_tar.is_file()
+
+    # 2. Direct stdout + stderr >128 KiB (without --summary-out) drained continuously without deadlock
+    big_ids = [f"stdout-big-job-{i:05d}-" + ("b" * 40) for i in range(2600)]
+    big_payload = json.dumps(
+        {
+            "archive_path": str(out_tar),
+            "size_bytes": 123,
+            "sha256": "0" * 64,
+            "included_job_ids": big_ids,
+            "included_usage_ledger": True,
+        }
+    )
+    assert len(big_payload.encode("utf-8")) > 128 * 1024
+    payload_file = tmp_path / "big_stdout.json"
+    payload_file.write_text(big_payload, encoding="utf-8")
+
+    def _noisy_cmd(_d: Path, _ids: Path, _out: Path) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                f"sys.stderr.write('W' * 140000); sys.stderr.flush(); "
+                f"sys.stdout.write(Path({str(payload_file)!r}).read_text(encoding='utf-8')); sys.stdout.flush()"
+            ),
+        ]
+
+    monkeypatch.setattr(consistent_backup, "_build_asr_archive_cmd", _noisy_cmd)
+    proc2 = consistent_backup.start_asr_archive_process(asr_dir, [], tmp_path / "unused.tar.gz")
+    t1 = time.monotonic()
+    summary2 = asyncio.run(
+        consistent_backup.wait_asr_archive_finished(proc2, deadline=time.monotonic() + 10.0)
+    )
+    assert time.monotonic() - t1 < 5.0
+    assert len(summary2.included_job_ids) == 2600
+
+
+def test_r4_watchdog_closes_db_before_processes_and_blocking_stream_close_and_exception_skips_rollback(
+    tmp_path: Path,
+) -> None:
+    """Codex High #5 / Lead #2:
+    1) On watchdog timeout with a blocking stream.close(), DB session closes FIRST, then
+       child process groups terminate, then stream.close() runs isolated without stalling timeout.
+    2) On exception during lock phase when DB ROLLBACK stalls, exception branch closes DB
+       session immediately without waiting for ROLLBACK."""
+    import threading
+    import time
+
+    # Part 1: Watchdog timeout with a blocking stream.close()
+    order: list[str] = []
+    unblock_read = threading.Event()
+    unblock_close = threading.Event()
+    close_entered = threading.Event()
+
+    class _BlockingCloseStream:
+        def read(self, _n: int = -1) -> bytes:
+            unblock_read.wait(timeout=30.0)
+            return b""
+
+        def close(self) -> None:
+            order.append("stream_close")
+            close_entered.set()
+            unblock_close.wait(timeout=30.0)
+
+    class _TrackedAsyncConn(_FakeAsyncConn):
+        def force_close(self) -> None:
+            if not self.closed:
+                order.append("db_close")
+                self.closed = True
+
+    def _empty_db(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT pg_export_snapshot"):
+            return ("00000051-00000001-1",)
+        if s.startswith("SELECT pg_advisory_lock") or s.startswith("SELECT pg_advisory_unlock"):
+            return (True, True)
+        if s.startswith("SELECT to_regclass"):
+            return (None,)
+        return []
+
+    s3_block = _FakeS3Client(versioning_by_bucket={"dalton-unver": False})
+    s3_block.seed_object("dalton-unver", "blobs/u1/k1", b"initial")
+    s3_block.get_object = lambda **_kw: {  # type: ignore[method-assign]
+        "Body": _BlockingCloseStream(),
+        "ContentType": "application/octet-stream",
+    }
+
+    conn1 = _TrackedAsyncConn(_empty_db)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(consistent_backup.BackupTimeoutError):
+            asyncio.run(
+                consistent_backup.run_consistent_backup(
+                    conn=conn1,
+                    pg_dump_path=tmp_path / "wd-order.dump",
+                    pg_dump_fn=lambda _s, _p: "handle-1",
+                    wait_pg_dump_imported_fn=lambda _h: None,
+                    wait_pg_dump_finished_fn=lambda _h: None,
+                    terminate_pg_dump_fn=lambda _h: order.append("dump_term"),
+                    bucket_specs=[
+                        consistent_backup.BucketArchiveSpec(
+                            bucket="dalton-unver",
+                            roles=("main",),
+                            s3_client=s3_block,
+                            versioning_enabled=False,
+                        )
+                    ],
+                    object_sink=consistent_backup.MirrorPoolSink(tmp_path / "m-order"),
+                    lock_phase_timeout_s=0.25,
+                )
+            )
+        elapsed1 = time.monotonic() - t0
+    finally:
+        unblock_read.set()
+        unblock_close.set()
+
+    assert elapsed1 < 3.0, f"Blocking stream.close() stalled watchdog teardown ({elapsed1:.2f}s)"
+    assert conn1.closed is True
+    assert close_entered.wait(timeout=1.0)
+    assert order.index("db_close") < order.index("stream_close")
+
+    # Also verify db_close < dump_term when dump is still running at watchdog timeout
+    order2: list[str] = []
+    conn2 = _TrackedAsyncConn(_empty_db)
+
+    async def _hang_dump_finish(_h: Any) -> None:
+        await asyncio.sleep(30.0)
+
+    def _rec_dump_term(_h: Any) -> None:
+        order2.append("dump_term")
+
+    conn2.force_close = lambda: (  # type: ignore[method-assign]
+        order2.append("db_close"),
+        setattr(conn2, "closed", True),
+    )
+    t1 = time.monotonic()
+    with pytest.raises(consistent_backup.BackupTimeoutError):
+        asyncio.run(
+            consistent_backup.run_consistent_backup(
+                conn=conn2,
+                pg_dump_path=tmp_path / "wd-order2.dump",
+                pg_dump_fn=lambda _s, _p: "handle-2",
+                wait_pg_dump_imported_fn=lambda _h: None,
+                wait_pg_dump_finished_fn=_hang_dump_finish,
+                terminate_pg_dump_fn=_rec_dump_term,
+                bucket_specs=[],
+                object_sink=consistent_backup.MirrorPoolSink(tmp_path / "m-order2"),
+                lock_phase_timeout_s=0.25,
+                pg_dump_timeout_s=30.0,
+            )
+        )
+    assert time.monotonic() - t1 < 3.0
+    assert conn2.closed is True
+    assert order2.index("db_close") < order2.index("dump_term")
+
+    # Part 2: Exception branch with a stalled ROLLBACK closes DB session FIRST without waiting
+    rollback_called = False
+    exc_order: list[str] = []
+
+    class _StallingRollbackCursor(_FakeAsyncCursor):
+        async def execute(self, sql: str, params: Any = None) -> None:
+            nonlocal rollback_called
+            if sql.strip().upper() == "ROLLBACK":
+                rollback_called = True
+                await asyncio.sleep(30.0)
+            await super().execute(sql, params)
+
+    class _StallingRollbackConn(_FakeAsyncConn):
+        def cursor(self) -> Any:
+            return _StallingRollbackCursor(self)
+
+        def force_close(self) -> None:
+            if not self.closed:
+                exc_order.append("db_close")
+                self.closed = True
+
+    conn3 = _StallingRollbackConn(_empty_db)
+
+    def _boom_import(_h: Any) -> None:
+        raise RuntimeError("boom during snapshot import")
+
+    t2 = time.monotonic()
+    with pytest.raises(RuntimeError, match="boom during snapshot import"):
+        asyncio.run(
+            consistent_backup.run_consistent_backup(
+                conn=conn3,
+                pg_dump_path=tmp_path / "exc-fast.dump",
+                pg_dump_fn=lambda _s, _p: "handle-3",
+                wait_pg_dump_imported_fn=_boom_import,
+                terminate_pg_dump_fn=lambda _h: exc_order.append("dump_term"),
+                bucket_specs=[],
+                object_sink=consistent_backup.MirrorPoolSink(tmp_path / "m-exc"),
+                lock_phase_timeout_s=5.0,
+            )
+        )
+    assert time.monotonic() - t2 < 3.0
+    assert conn3.closed is True
+    assert rollback_called is False
+    assert exc_order.index("db_close") < exc_order.index("dump_term")
+
+
+def test_r4_standalone_compose_backup_watchdog_terminates_in_container_pg_dump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex High #6 / Lead #6: compose-backup watchdog emits TERMINATE_PG_DUMP on expiry,
+    and standalone backup.sh kills the actual in-container pg_dump PID immediately."""
+    import threading
+    import time
+
+    # 1. _cmd_compose_backup wires terminate_pg_dump_fn -> watchdog closes DB, emits
+    #    TERMINATE_PG_DUMP, and exits promptly even while stdin is blocked.
+    def _db_handler(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT pg_export_snapshot"):
+            return ("00000066-00000001-1",)
+        if s.startswith("SELECT pg_advisory_lock") or s.startswith("SELECT pg_advisory_unlock"):
+            return (True, True)
+        if s.startswith("SELECT to_regclass"):
+            return (None,)
+        return []
+
+    conn = _FakeAsyncConn(_db_handler)
+
+    async def _fake_open(_dsn: str) -> Any:
+        return conn
+
+    unblock_stdin = threading.Event()
+
+    class _BlockingStdin:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def readline(self) -> str:
+            self._calls += 1
+            if self._calls == 1:
+                return "SNAPSHOT_IMPORTED\n"
+            unblock_stdin.wait(timeout=30.0)
+            return ""
+
+    ctl_err = io.StringIO()
+    bundle_buf = io.BytesIO()
+    fake_stdout = type("FakeStdout", (), {"buffer": bundle_buf})()
+    monkeypatch.setenv("DALTON_BACKUP_PG_DSN", "postgresql://postgres:pw@postgres:5432/postgres")
+    monkeypatch.setattr(sys, "stdin", _BlockingStdin())
+    monkeypatch.setattr(sys, "stderr", ctl_err)
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    term_snaps: list[str] = []
+    args = standalone_cb.build_arg_parser().parse_args(
+        [
+            "compose-backup",
+            "--stream-bundle",
+            "--lock-timeout-s",
+            "0.25",
+            "--pg-dump-timeout-s",
+            "60",
+            "--snapshot-import-timeout-s",
+            "5",
+        ]
+    )
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(consistent_backup.BackupTimeoutError):
+            standalone_cb._cmd_compose_backup(
+                args,
+                conn_opener=_fake_open,
+                bucket_resolver=lambda _env: [],
+                terminate_pg_dump_hook=term_snaps.append,
+            )
+        elapsed = time.monotonic() - t0
+    finally:
+        unblock_stdin.set()
+
+    assert elapsed < 3.0, f"compose-backup watchdog stalled ({elapsed:.2f}s)"
+    assert conn.closed is True
+    assert "@@DALTON_CTL@@ TERMINATE_PG_DUMP 00000066-00000001-1" in ctl_err.getvalue()
+    assert term_snaps == ["00000066-00000001-1"]
+
+    # 2. End-to-end backup.sh supervision check: fake docker runs a real background child
+    #    process simulating in-container pg_dump writing its PID to the container pidfile.
+    #    When compose-backup emits TERMINATE_PG_DUMP (with PG_DUMP_TIMEOUT_S=3600),
+    #    backup.sh kills the actual in-container PID and exits promptly!
+    work = tmp_path / "core_work"
+    work.mkdir()
+    (work / "docker-compose.yml").write_text("services:\n  backend: {}\n", encoding="utf-8")
+    (work / "docker-compose.core.yml").write_text("services:\n  backend: {}\n", encoding="utf-8")
+    (work / ".env").write_text(
+        "COMPOSE_PROJECT_NAME=testcore\n"
+        "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pw\nDB_NAME=postgres\n"
+        "MINIO_ROOT_USER=u\nMINIO_ROOT_PASSWORD=p\n",
+        encoding="utf-8",
+    )
+    pid_record = tmp_path / "recorded_container_pg_dump.pid"
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    (fake_bin / "docker").write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+# Skip compose prefix args until subcommand
+args=("$@")
+cmd=""
+for ((i=0; i<${{#args[@]}}; i++)); do
+  case "${{args[$i]}}" in
+    compose) ;;
+    -p|-f|--env-file|--project-directory|--profile) i=$((i+1)) ;;
+    ps|config|run|exec) cmd="${{args[$i]}}"; rest=("${{args[@]:$((i+1))}}"); break ;;
+  esac
+done
+case "$cmd" in
+  ps)
+    printf 'postgres\\nminio\\n'
+    exit 0
+    ;;
+  config)
+    if [[ "$*" == *"--services"* ]]; then
+      printf 'postgres\\nminio\\nbackend\\n'
+    else
+      printf '{{"services":{{"backend":{{"environment":{{"DB_HOST":"postgres","DB_USER":"postgres","DB_PASSWORD":"pw","DB_NAME":"postgres"}}}}}},"volumes":{{}}}}\\n'
+    fi
+    exit 0
+    ;;
+  run)
+    # Simulated compose-backup supervisor: emit SNAPSHOT_READY, wait for SNAPSHOT_IMPORTED,
+    # then fire watchdog TERMINATE_PG_DUMP immediately!
+    printf '@@DALTON_CTL@@ SNAPSHOT_READY 00000077-00000001-1\\n' >&2
+    IFS= read -r _tok || true
+    sleep 0.2
+    printf '@@DALTON_CTL@@ TERMINATE_PG_DUMP 00000077-00000001-1\\n' >&2
+    exit 1
+    ;;
+  exec)
+    if [[ "$*" == *"pg_dump"* ]]; then
+      # Extract pidfile (last arg) and spawn a real detached child simulating in-container pg_dump
+      pidfile="${{args[${{#args[@]}}-1]}}"
+      python3 -c '
+import os, sys, time
+pidfile = sys.argv[1]
+record = sys.argv[2]
+with open(pidfile, "w") as fh:
+    fh.write(str(os.getpid()) + "\\n")
+with open(record, "w") as fh:
+    fh.write(str(os.getpid()) + "\\n")
+sys.stdout.buffer.write(b"PGDMP-started")
+sys.stdout.buffer.flush()
+time.sleep(60)
+' "$pidfile" "{pid_record}"
+      exit $?
+    fi
+    if [[ "$*" == *"kill -TERM"* ]]; then
+      # Execute the exact container cleanup shell snippet locally against the simulated container PID
+      for ((j=0; j<${{#rest[@]}}; j++)); do
+        if [[ "${{rest[$j]}}" == "sh" && "${{rest[$((j+1))]}}" == "-c" ]]; then
+          sh -c "${{rest[$((j+2))]}}" "${{rest[@]:$((j+3))}}"
+          exit $?
+        fi
+      done
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (fake_bin / "docker").chmod(0o755)
+
+    t1 = time.monotonic()
+    res_sh = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts/standalone/backup.sh"),
+            "--work-dir",
+            str(work),
+            "--output-dir",
+            str(tmp_path / "backups_out"),
+            "--no-verify",
+        ],
+        env={
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "HOME": str(tmp_path),
+            "DALTON_BACKUP_LOCK_TIMEOUT_S": "30",
+            "DALTON_BACKUP_PG_DUMP_TIMEOUT_S": "3600",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    elapsed_sh = time.monotonic() - t1
+    assert res_sh.returncode != 0, res_sh.stdout + res_sh.stderr
+    assert elapsed_sh < 10.0, f"backup.sh waited on PG_DUMP_TIMEOUT_S instead of watchdog ({elapsed_sh:.2f}s)"
+    assert pid_record.is_file(), f"Simulated container pg_dump never started: {res_sh.stdout}\n{res_sh.stderr}"
+    container_pid = int(pid_record.read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(container_pid, 0)
+
+
+def test_r4_transcription_submit_intent_persisted_and_restored_forces_resubmit_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex High #7 / Lead #3: submit_transcription_job persists usage.submit_attempted=True
+    BEFORE calling the transcription service; restore marks such awaiting_upload rows failed
+    with restored_no_resume=True so normal submit & /retry return 409 and only /resubmit works."""
+    from fastapi import HTTPException
+
+    audio_bytes = b"audio-submit-intent-test"
+    audio_sha = _sha(audio_bytes)
+    call_order: list[str] = []
+
+    row_store: dict[str, dict[str, Any]] = {
+        "tr-intent-1": {
+            "job_id": "tr-intent-1",
+            "created_by_user_id": "user-1",
+            "workspace_id": "ws-1",
+            "thread_id": "th-1",
+            "status": "awaiting_upload",
+            "stage": "awaiting_upload",
+            "version": 1,
+            "source_object_key": "transcriptions/ws-1/tr-intent-1/src.m4a",
+            "source_size_bytes": len(audio_bytes),
+            "source_sha256": audio_sha,
+            "idempotency_key": "idem-intent-1",
+            "language": "zh",
+            "hotwords": [],
+            "error_category": None,
+            "error_message": None,
+            "usage": {"upload": {"completed": True}},
+        }
+    }
+
+    async def _fake_get_job(jid: str) -> dict[str, Any] | None:
+        r = row_store.get(jid)
+        return dict(r) if r is not None else None
+
+    async def _fake_update_versioned(
+        jid: str,
+        *,
+        expected_version: int,
+        status: Any,
+        stage: str,
+        usage: dict[str, Any] | None = None,
+        **_kw: Any,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        cur = row_store[jid]
+        if int(cur["version"]) != int(expected_version):
+            return False, dict(cur)
+        updated = dict(cur)
+        updated["status"] = status.value if hasattr(status, "value") else str(status)
+        updated["stage"] = stage
+        if usage is not None:
+            updated["usage"] = dict(usage)
+        updated["version"] = int(cur["version"]) + 1
+        row_store[jid] = updated
+        if isinstance(usage, dict) and usage.get("submit_attempted") is True:
+            call_order.append("persist_submit_intent")
+        return True, dict(updated)
+
+    async def _fake_bridge_submit_drops_response(
+        _payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        call_order.append("bridge_submit")
+        # Simulate bridge accepted job, then connection dropped before DB synced!
+        raise RuntimeError("connection reset after bridge accepted job")
+
+    orig_bridge_submit = tr_svc.call_bridge_submit_transcription
+    monkeypatch.setattr(tr_svc, "require_internal_transcription_caller", create_autospec(tr_svc.require_internal_transcription_caller, side_effect=lambda u: u))
+    monkeypatch.setattr(tr_svc, "authorize_job_access", create_autospec(tr_svc.authorize_job_access, return_value=None))
+    monkeypatch.setattr(tr_db, "get_transcription_job", create_autospec(tr_db.get_transcription_job, side_effect=_fake_get_job))
+    monkeypatch.setattr(tr_db, "update_transcription_job_versioned", create_autospec(tr_db.update_transcription_job_versioned, side_effect=_fake_update_versioned))
+    monkeypatch.setattr(tr_svc, "is_transcription_storage_configured", create_autospec(tr_svc.is_transcription_storage_configured, return_value=True))
+    monkeypatch.setattr(tr_svc, "object_size", create_autospec(tr_svc.object_size, return_value=len(audio_bytes)))
+    monkeypatch.setattr(tr_svc, "call_bridge_submit_transcription", create_autospec(orig_bridge_submit, side_effect=_fake_bridge_submit_drops_response))
+
+    with pytest.raises(HTTPException) as exc_drop:
+        asyncio.run(tr_svc.submit_transcription_job(caller_user_id="user-1", job_id="tr-intent-1"))
+    assert exc_drop.value.status_code == 502
+    assert call_order == ["persist_submit_intent", "bridge_submit"]
+    # DB snapshot now has awaiting_upload + usage.submit_attempted == True
+    assert row_store["tr-intent-1"]["status"] == "awaiting_upload"
+    assert row_store["tr-intent-1"]["usage"]["submit_attempted"] is True
+
+    # Verify reconcile_restored_inflight_states SQL covers awaiting_upload + submit_attempted
+    sql_log: list[str] = []
+
+    def _rec_handler(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        sql_log.append(s)
+        if s.startswith("SELECT to_regclass"):
+            return (params[0],) if params and params[0] == "public.dalton_transcription_jobs" else (None,)
+        if "SET status = 'failed'" in s and "submit_attempted" in s:
+            # Apply to our in-memory row!
+            r = row_store["tr-intent-1"]
+            if r["status"] == "awaiting_upload" and r["usage"].get("submit_attempted") is True:
+                r["status"] = "failed"
+                r["stage"] = "failed"
+                r["error_category"] = "restored_inflight"
+                r["error_message"] = consistent_backup.RESTORED_INFLIGHT_ERROR_MESSAGE
+                r["usage"] = {**r["usage"], "restored_no_resume": True}
+                return 1
+            return 0
+        if "SET status = 'cancelled'" in s:
+            return 0
+        return []
+
+    summary = asyncio.run(consistent_backup.reconcile_restored_inflight_states(_FakeAsyncConn(_rec_handler)))
+    assert summary.transcriptions_failed == 1
+    assert any("SET status = 'failed'" in s and "submit_attempted" in s for s in sql_log)
+    assert any("SET status = 'cancelled'" in s and "submit_attempted" in s for s in sql_log)
+
+    # After restore reconcile: normal submit AND /retry are rejected with 409; /resubmit succeeds!
+    bridge_submit_spy = create_autospec(
+        orig_bridge_submit,
+        return_value=(200, {"ok": True, "job": {"status": "queued", "stage": "queued"}}),
+    )
+    bridge_action_spy = create_autospec(tr_svc.call_bridge_action_transcription)
+    monkeypatch.setattr(tr_svc, "call_bridge_submit_transcription", bridge_submit_spy)
+    monkeypatch.setattr(tr_svc, "call_bridge_action_transcription", bridge_action_spy)
+
+    with pytest.raises(HTTPException) as exc_sub:
+        asyncio.run(tr_svc.submit_transcription_job(caller_user_id="user-1", job_id="tr-intent-1"))
+    assert exc_sub.value.status_code == 409
+    with pytest.raises(HTTPException) as exc_ret:
+        asyncio.run(tr_svc.retry_transcription_job(job_id="tr-intent-1", caller_user_id="user-1"))
+    assert exc_ret.value.status_code == 409
+    assert bridge_submit_spy.call_count == 0
+    assert bridge_action_spy.call_count == 0
+
+    async def _fake_create_job(**kw: Any) -> dict[str, Any]:
+        jid = str(kw["job_id"])
+        row = {
+            "job_id": jid,
+            "created_by_user_id": kw["created_by_user_id"],
+            "workspace_id": kw["workspace_id"],
+            "thread_id": kw.get("thread_id") or "",
+            "source_object_key": kw["source_object_key"],
+            "source_size_bytes": kw["source_size_bytes"],
+            "source_sha256": kw["source_sha256"],
+            "idempotency_key": kw["idempotency_key"],
+            "language": kw.get("language"),
+            "hotwords": kw.get("hotwords") or [],
+            "status": "awaiting_upload",
+            "stage": "awaiting_upload",
+            "version": 1,
+            "usage": {},
+        }
+        row_store[jid] = row
+        return dict(row)
+
+    monkeypatch.setattr(tr_db, "create_transcription_job", create_autospec(tr_db.create_transcription_job, side_effect=_fake_create_job))
+    resub = asyncio.run(tr_svc.resubmit_transcription_job(job_id="tr-intent-1", caller_user_id="user-1"))
+    assert resub["ok"] is True
+    assert resub["resubmitted_from_job_id"] == "tr-intent-1"
+    assert resub["job"]["job_id"] != "tr-intent-1"
+    assert bridge_submit_spy.call_count == 1
+
+
+def test_r4_standalone_restore_multi_bucket_preflight_strict_asr_clear_and_post_import_keyset(
+    tmp_path: Path,
+) -> None:
+    """Codex Medium #8 / Lead #6: restore accepts all configured empty pre-initialized buckets,
+    fails immediately on ASR volume clear errors (no `|| true`), and verifies actual post-import
+    key sets against the manifest."""
+    from scripts.standalone import storage_config as standalone_sc
+
+    # 1. Multi-bucket pre-init resolution: chat-uploads + distinct STORAGE_BUCKET_NAME + ASR bucket
+    multi_env = {
+        "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://minio:9000",
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+        "STORAGE_ENDPOINT_URL": "http://minio:9000",
+        "STORAGE_BUCKET_NAME": "dalton-main",
+        "DALTON_ASR_STORAGE_ENDPOINT_URL": "http://minio:9000",
+        "DALTON_ASR_STORAGE_BUCKET_NAME": "dalton-asr",
+    }
+    allowed = standalone_sc.configured_minio_init_buckets(multi_env)
+    assert allowed == ["chat-uploads", "dalton-asr", "dalton-main"]
+
+    # Bucket on a different endpoint is NOT included in MinIO init buckets
+    diff_ep_env = {
+        **multi_env,
+        "STORAGE_ENDPOINT_URL": "https://s3.external.example.com",
+    }
+    assert standalone_sc.configured_minio_init_buckets(diff_ep_env) == ["chat-uploads", "dalton-asr"]
+
+    restore_sh = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+    assert "configured_minio_init_buckets" in restore_sh
+    assert "unexpected_buckets = [b for b in existing_buckets if b not in allowed_init_buckets]" in restore_sh
+
+    # 2. ASR volume clear has NO `|| true` and fails loudly if clearing fails
+    asr_clear_idx = restore_sh.index("Restoring terminal ASR jobs archive into /var/lib/dalton/asr_jobs")
+    asr_clear_block = restore_sh[asr_clear_idx : asr_clear_idx + 1400]
+    assert "|| true" not in asr_clear_block
+    assert "find /var/lib/dalton/asr_jobs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +" in asr_clear_block
+
+    # Actually execute the clear command against an unremovable directory (read-only parent) -> must fail!
+    ro_parent = tmp_path / "asr_ro"
+    ro_parent.mkdir()
+    stuck_child = ro_parent / "stuck_job"
+    stuck_child.mkdir()
+    (stuck_child / "state.json").write_text("{}", encoding="utf-8")
+    ro_parent.chmod(0o500)
+    try:
+        res_clear = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                f'set -e; find "{ro_parent}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; '
+                f'if [ -n "$(ls -A "{ro_parent}")" ]; then exit 1; fi',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_clear.returncode != 0
+    finally:
+        ro_parent.chmod(0o700)
+
+    # 3. Post-import keyset comparison in MINIO_RESTORE_PY verifies exact key set equality
+    assert "if uploaded_pairs != expected_pairs:" in restore_sh
+    assert "if actual_pairs != expected_pairs:" in restore_sh
+    assert "Post-import object key set mismatch against manifest" in restore_sh
+
+
+def test_r4_restored_pulling_upload_resets_attempts_to_zero_and_survives_sweeper() -> None:
+    """Codex Medium #9 & Grok Low #2 / Lead #4: re-queued pulling upload resets attempts=0
+    so actual workspace_file_uploads sweeper logic (fail_exhausted_pulls + claim_lapsed)
+    claims it for retry instead of immediately marking it failed."""
+    from src.server.database import workspace_file_uploads as wfu_db
+
+    # Confirm the actual sweeper SQL in workspace_file_uploads.py uses the exact formula we test
+    wfu_src = Path(wfu_db.__file__).read_text(encoding="utf-8")
+    assert "attempts >= %(max_attempts)s + (placing_inode IS NOT NULL)::int" in wfu_src
+    assert "u.attempts < %(max_attempts)s + (u.placing_inode IS NOT NULL)::int" in wfu_src
+
+    pull_bytes = b"recovered-workspace-upload"
+    pull_sha = _sha(pull_bytes)
+    row = {
+        "upload_id": "up-max-attempt-1",
+        "object_key": "workspace-uploads/ws1/up-max-attempt-1",
+        "size": len(pull_bytes),
+        "sha256": pull_sha,
+        "state": "pulling",
+        "attempts": 5,  # Snapshot landed during 5th (last allowed) placing attempt
+        "placing_inode": 987654,
+        "lease_until": "2026-11-27T00:00:00Z",
+        "cleaned_at": None,
+        "error": None,
+    }
+
+    def _rec_db(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT to_regclass"):
+            return (params[0],) if params and params[0] == "public.workspace_file_uploads" else (None,)
+        if s.startswith("SELECT upload_id, object_key, size, sha256 FROM workspace_file_uploads"):
+            return [(row["upload_id"], row["object_key"], row["size"], row["sha256"])]
+        if s.startswith("SELECT upload_id FROM workspace_file_uploads WHERE upload_id = %s"):
+            return (row["upload_id"],)
+        if "UPDATE workspace_file_uploads SET lease_until = NULL, placing_inode = NULL, attempts = 0, error = NULL" in s:
+            row["lease_until"] = None
+            row["placing_inode"] = None
+            row["attempts"] = 0
+            row["error"] = None
+            return 1
+        if "UPDATE workspace_file_uploads SET state = 'aborted'" in s:
+            return 0
+        return []
+
+    summary = asyncio.run(
+        consistent_backup.reconcile_restored_inflight_states(
+            _FakeAsyncConn(_rec_db),
+            inspect_workspace_upload_object_fn=lambda _k: (len(pull_bytes), pull_sha),
+        )
+    )
+    assert summary.workspace_uploads_requeued == 1
+    assert row["state"] == "pulling"
+    assert row["placing_inode"] is None
+    assert row["lease_until"] is None
+    assert row["attempts"] == 0
+
+    # Evaluate exact fail_exhausted_pulls & claim_lapsed predicates with max_attempts = 5:
+    max_attempts = 5
+    would_fail_exhausted = (
+        row["cleaned_at"] is None
+        and row["state"] == "pulling"
+        and row["attempts"] >= max_attempts + int(row["placing_inode"] is not None)
+    )
+    would_claim_lapsed = (
+        row["cleaned_at"] is None
+        and row["state"] == "pulling"
+        and row["attempts"] < max_attempts + int(row["placing_inode"] is not None)
+    )
+    assert would_fail_exhausted is False
+    assert would_claim_lapsed is True
+
+
+def test_r4_colima_preflight_resolves_active_docker_context_and_fails_closed_when_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """Codex Medium #10 / Lead #5: production preflight resolves actual Docker context
+    (not just DOCKER_HOST / default profile), checks the context's real Colima disk, and
+    fails closed when Docker context -> Colima mapping cannot be determined."""
+    ext_mount = tmp_path / "EveSSD"
+    internal_root = tmp_path / "internal_root"
+    ext_mount.mkdir()
+    internal_root.mkdir()
+    gb = 1024 * 1024 * 1024
+
+    # Default Colima profile lives on external SSD (plenty of space),
+    # while active Docker context `colima-prod` lives on INTERNAL disk!
+    ext_colima = ext_mount / "colima-default"
+    (ext_colima / "_lima" / "colima").mkdir(parents=True)
+    (ext_colima / "_lima" / "colima" / "diffdisk").write_bytes(b"ext-disk")
+
+    int_colima = internal_root / "colima-prod-home"
+    (int_colima / "_lima" / "colima-prod").mkdir(parents=True)
+    (int_colima / "_lima" / "colima-prod" / "diffdisk").write_bytes(b"int-disk")
+
+    def _split_dev_stat(p: Path) -> Any:
+        is_ext = str(p.resolve(strict=False)).startswith(str(ext_mount.resolve()))
+        return type("Stat", (), {"st_dev": 200 if is_ext else 100})()
+
+    # 1. DOCKER_HOST unset; `docker context inspect` points to `colima-prod` on internal disk
+    seen_docker_cmds: list[list[str]] = []
+
+    def _run_prod_ctx(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["docker", "context", "inspect"]:
+            seen_docker_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Name": "colima-prod",
+                            "Endpoints": {
+                                "docker": {"Host": f"unix://{int_colima}/prod/docker.sock"}
+                            },
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        if cmd[:3] == ["colima", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"name":"default","status":"Running"}\n{"name":"prod","status":"Running"}\n',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 300000000 100000000 83886080 28% /var/lib/docker\n",
+            stderr="",
+        )
+
+    rep_ctx_internal = backup_lib.preflight_disk_space(
+        external_mount_root=ext_mount,
+        internal_root=internal_root,
+        env={"COLIMA_HOME": str(ext_colima), "DOCKER_CONTEXT": "colima-prod"},
+        is_mount_fn=lambda p: p == ext_mount,
+        disk_usage_fn=lambda _p: shutil._ntuple_diskusage(500 * gb, 100 * gb, 300 * gb),
+        stat_fn=_split_dev_stat,
+        colima_run_fn=create_autospec(subprocess.run, side_effect=_run_prod_ctx),
+    )
+    assert rep_ctx_internal.ok is False
+    loc_chk = next(c for c in rep_ctx_internal.checks if c.name == "colima_location")
+    assert loc_chk.ok is False
+    assert "prod" in loc_chk.detail
+    assert seen_docker_cmds == [["docker", "context", "inspect", "colima-prod"]]
+
+    # 2. Active Docker context points to non-Colima endpoint (Docker Desktop) -> FAILS CLOSED
+    def _run_desktop_ctx(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["docker", "context", "inspect"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Name": "desktop-linux",
+                            "Endpoints": {
+                                "docker": {"Host": "unix:///Users/me/.docker/run/docker.sock"}
+                            },
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unexpected")
+
+    rep_non_colima = backup_lib.preflight_disk_space(
+        external_mount_root=ext_mount,
+        internal_root=internal_root,
+        env={"COLIMA_HOME": str(ext_colima)},
+        is_mount_fn=lambda p: p == ext_mount,
+        disk_usage_fn=lambda _p: shutil._ntuple_diskusage(500 * gb, 100 * gb, 300 * gb),
+        stat_fn=_split_dev_stat,
+        colima_run_fn=create_autospec(subprocess.run, side_effect=_run_desktop_ctx),
+    )
+    assert rep_non_colima.ok is False
+    assert next(c for c in rep_non_colima.checks if c.name == "colima_location").ok is False
+
+    # 3. `docker context inspect` fails -> FAILS CLOSED (never guesses default)
+    def _run_docker_fail(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="docker daemon unreachable")
+
+    with pytest.raises(backup_lib.ColimaConfigResolutionError):
+        backup_lib.resolve_active_colima_config(
+            env={"COLIMA_HOME": str(ext_colima)},
+            run_fn=create_autospec(subprocess.run, side_effect=_run_docker_fail),
+        )
+
+
+def test_r4_deploy_main_wait_rejects_mismatched_tail_ok_line_and_missing_backup_artifact(
+    tmp_path: Path,
+) -> None:
+    """Codex Medium #11 & Grok Low #1 / Lead #7: when _find_completed_backup_for_wait fails,
+    deploy_main.sh aborts immediately (never accepts raw tail -1 ok line from another set=id),
+    and rejects a matched set=id whose dump artifact is missing/unavailable on disk."""
+    from tests.unit.dalton.test_deploy_main_reuse_backup import _run_deploy, _setup_deploy_env
+
+    # Case 1: Waited-on backup leaves NO matching terminal record, while another backup wrote
+    #         `ok ... set=other-unrelated-id` as the last line of the log -> MUST ABORT!
+    ctx1 = _setup_deploy_env(tmp_path / "dep-other-tail")
+    seed1 = Path(ctx1["seed"])
+    (seed1 / "src/dalton/migrations/versions/d041_next.py").write_text(
+        "revision = 'd041'\ndown_revision = 'd040'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(seed1), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed1), "commit", "-q", "-m", "add d041"], check=True)
+    subprocess.run(["git", "-C", str(seed1), "push", "-q", "origin", "dalton/main"], check=True)
+
+    other_dump = tmp_path / "other.dump"
+    other_dump.write_bytes(b"PGDMP-other")
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (Path(ctx1["fake_bin"]) / "launchctl").write_text(
+        f"""#!/bin/bash
+if [ "$1" = "kickstart" ]; then
+  echo "{now_str} ok  16G {other_dump} set=other-unrelated-id" >> "{ctx1['backup_log']}"
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (Path(ctx1["fake_bin"]) / "launchctl").chmod(0o755)
+
+    res1 = _run_deploy(
+        ctx1,
+        tmp_path / "dep-other-tail",
+        extra_setup=(
+            f'DALTON_DEPLOY_BACKUP_WAIT_S=1; DALTON_DEPLOY_BACKUP_POLL_S=1; '
+            f'DALTON_DEPLOY_BACKUP_WAIT_STATE_FILE="{tmp_path}/w1.state"; '
+            f'DALTON_PG_BACKUP_NEXT_ID_FILE="{tmp_path}/n1.id"'
+        ),
+    )
+    assert res1.returncode == 1, res1.stdout + res1.stderr
+    assert "no matching terminal record found" in res1.stdout
+
+    # Case 2: Matching set=<id> ok line appears, but the referenced dump file is missing on disk -> MUST ABORT!
+    ctx2 = _setup_deploy_env(tmp_path / "dep-missing-art")
+    seed2 = Path(ctx2["seed"])
+    (seed2 / "src/dalton/migrations/versions/d041_next.py").write_text(
+        "revision = 'd041'\ndown_revision = 'd040'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(seed2), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed2), "commit", "-q", "-m", "add d041"], check=True)
+    subprocess.run(["git", "-C", str(seed2), "push", "-q", "origin", "dalton/main"], check=True)
+
+    next_id_2 = tmp_path / "n2.id"
+    missing_dump = tmp_path / "gone-backup.dump"
+    (Path(ctx2["fake_bin"]) / "launchctl").write_text(
+        f"""#!/bin/bash
+if [ "$1" = "kickstart" ]; then
+  wid="$(tr -d '[:space:]' < "{next_id_2}")"
+  echo "{now_str} ok  16G {missing_dump} set=${{wid}}" >> "{ctx2['backup_log']}"
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (Path(ctx2["fake_bin"]) / "launchctl").chmod(0o755)
+
+    res2 = _run_deploy(
+        ctx2,
+        tmp_path / "dep-missing-art",
+        extra_setup=(
+            f'DALTON_DEPLOY_BACKUP_WAIT_S=1; DALTON_DEPLOY_BACKUP_POLL_S=1; '
+            f'DALTON_DEPLOY_BACKUP_WAIT_STATE_FILE="{tmp_path}/w2.state"; '
+            f'DALTON_PG_BACKUP_NEXT_ID_FILE="{next_id_2}"'
+        ),
+    )
+    assert res2.returncode == 1, res2.stdout + res2.stderr
+    assert "backup artifact unavailable" in res2.stdout

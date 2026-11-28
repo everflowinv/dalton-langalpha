@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Mapping
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -1901,6 +1902,68 @@ def _is_restored_no_resume_job(job: dict[str, Any]) -> bool:
     return False
 
 
+async def _persist_transcription_submit_intent(
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist ``usage.submit_attempted = true`` BEFORE calling the transcription service.
+
+    If a backup snapshot lands between the transcription service accepting the job and
+    ``_sync_job_from_bridge_state`` updating the DB row (or if the bridge response is
+    lost), post-restore convergence uses this durable marker to mark the ``awaiting_upload``
+    row ``failed`` + ``restored_no_resume = true`` so normal submit is rejected and only
+    ``/resubmit`` can start a fresh replacement attempt.
+    """
+    current = job
+    for _ in range(3):
+        cur_status = str(current.get("status") or "")
+        if cur_status == TranscriptionJobStatus.CANCELLED.value:
+            raise HTTPException(
+                status_code=409,
+                detail="Cancelled transcription job cannot be submitted",
+            )
+        if _is_restored_no_resume_job(current):
+            raise HTTPException(
+                status_code=409,
+                detail="Restored transcription job cannot be submitted directly; use /resubmit instead",
+            )
+        if cur_status != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+            return current
+
+        cur_usage = (
+            dict(current.get("usage")) if isinstance(current.get("usage"), dict) else {}
+        )
+        if cur_usage.get("submit_attempted") is True:
+            return current
+
+        cur_usage["submit_attempted"] = True
+        cur_usage["submit_attempted_at"] = datetime.now(timezone.utc).isoformat()
+        updated, latest = await db.update_transcription_job_versioned(
+            str(current["job_id"]),
+            expected_version=int(current["version"]),
+            status=TranscriptionJobStatus.AWAITING_UPLOAD,
+            stage=str(current.get("stage") or TranscriptionJobStatus.AWAITING_UPLOAD.value),
+            usage=cur_usage,
+        )
+        if updated:
+            return (
+                latest
+                if latest is not None
+                else {
+                    **current,
+                    "usage": cur_usage,
+                    "version": int(current["version"]) + 1,
+                }
+            )
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Transcription job not found")
+        current = latest
+
+    raise HTTPException(
+        status_code=409,
+        detail="Concurrent modification conflict while persisting transcription submit intent",
+    )
+
+
 async def submit_transcription_job(
     *,
     caller_user_id: str,
@@ -2024,6 +2087,10 @@ async def submit_transcription_job(
         if hotwords is not None
         else list(job.get("hotwords") or [])
     )
+
+    # Persist submit intent in PostgreSQL BEFORE invoking the transcription service so
+    # snapshots taken across the submit window converge to restored_no_resume (/resubmit only).
+    job = await _persist_transcription_submit_intent(job)
 
     bridge_payload: dict[str, Any] = {
         "job_id": str(job["job_id"]),
@@ -2405,7 +2472,7 @@ async def resubmit_transcription_job(
         if isinstance(existing_new_usage.get("upload"), dict)
         else {}
     )
-    if existing_upload.get("completed") is not True:
+    if existing_upload.get("completed") is not True or existing_new_usage.get("submit_attempted") is not True:
         resubmit_usage: dict[str, Any] = {
             **existing_new_usage,
             "upload": {
@@ -2415,6 +2482,11 @@ async def resubmit_transcription_job(
                 "verified_size_bytes": actual_obj_size,
                 "reused_from_job_id": old_job_id,
             },
+            "submit_attempted": True,
+            "submit_attempted_at": str(
+                existing_new_usage.get("submit_attempted_at")
+                or datetime.now(timezone.utc).isoformat()
+            ),
             "resubmitted_from_job_id": old_job_id,
             "resubmit_attempt_id": attempt_id,
         }
@@ -2435,6 +2507,7 @@ async def resubmit_transcription_job(
                     "job": new_job,
                     "resubmitted_from_job_id": old_job_id,
                 }
+        new_job = await _persist_transcription_submit_intent(new_job)
 
     bridge_payload: dict[str, Any] = {
         "job_id": str(new_job["job_id"]),

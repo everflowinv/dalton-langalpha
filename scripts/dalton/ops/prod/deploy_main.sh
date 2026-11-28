@@ -3950,6 +3950,45 @@ _find_completed_backup_for_wait() {
   return 0
 }
 
+# Verify that a completed consistent backup-set log line ("... ok <size> <dump_path> set=<id>")
+# still has its dump file (and set metadata when a sets/ directory exists alongside it) on disk.
+# Legacy mock lines without "set=<id>" pass unless DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE=1.
+_verify_completed_backup_artifact() {
+  local line="$1"
+  [ -n "$line" ] || return 1
+  local set_id="" dump_path=""
+  case "$line" in
+    *" set="*)
+      set_id="${line##* set=}"
+      set_id="${set_id%%[[:space:]]*}"
+      ;;
+  esac
+  # Log format: YYYY-mm-dd HH:MM:SS ok <size> <dump_path> [set=<id>]
+  dump_path="$(printf '%s\n' "$line" | awk '{print $5}')"
+  if [ -n "$set_id" ]; then
+    if [ -z "$dump_path" ] || [ ! -s "$dump_path" ]; then
+      echo "backup: verified dump file missing or empty for set=${set_id} (path=${dump_path:-<empty>})" >&2
+      return 1
+    fi
+    local parent_dir="" backups_root="" set_json=""
+    parent_dir="$(dirname "$dump_path")"
+    backups_root="$(dirname "$parent_dir")"
+    if [ -d "${backups_root}/sets" ]; then
+      set_json="${backups_root}/sets/backup-set-${set_id}.json"
+      if [ ! -s "$set_json" ]; then
+        echo "backup: backup-set metadata missing or empty for set=${set_id} (${set_json})" >&2
+        return 1
+      fi
+    fi
+  elif [ "${DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE:-0}" = "1" ]; then
+    if [ -z "$dump_path" ] || [ ! -s "$dump_path" ]; then
+      echo "backup: dump file missing or empty (path=${dump_path:-<empty>})" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 _write_deploy_backup_wait_state() {
   local state_file="$1" wait_id="$2" wait_head="$3" wait_target="$4" wait_before="$5"
   mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
@@ -4788,7 +4827,14 @@ run_deploy_main() {
         if tracked_done_line=$(_find_completed_backup_for_wait "$LOG" "$tracked_wait_id" "$tracked_wait_before"); then
           case "$tracked_done_line" in
             *" ok "*)
-              resumed_completed_backup="$tracked_done_line"
+              if _verify_completed_backup_artifact "$tracked_done_line"; then
+                resumed_completed_backup="$tracked_done_line"
+              else
+                echo "backup: tracked completed backup (id=${tracked_wait_id:-tracked}) artifact is no longer available; taking a fresh backup"
+                rm -f "$backup_wait_state_file" 2>/dev/null || true
+                tracked_wait_id=""
+                tracked_wait_before=""
+              fi
               ;;
             *)
               rm -f "$backup_wait_state_file" 2>/dev/null || true
@@ -4869,13 +4915,17 @@ run_deploy_main() {
         fi
         sleep "$backup_poll_s"
       done  # default 7h (25200s): covers 2h lock phase + 4h object mirror + 1h reconcile/publish
-      after="${matched_bak_line:-$(tail -1 "$LOG" 2>/dev/null)}"; echo "backup: $after"
       if [ "$backup_done" -eq 1 ]; then
+        after="$matched_bak_line"
+        echo "backup: $after"
         rm -f "$backup_wait_state_file" 2>/dev/null || true
         case "$after" in
           *" ok "*)
             if [ "$after" = "$wait_before_line" ]; then
               echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            if ! _verify_completed_backup_artifact "$after"; then
+              echo "backup artifact unavailable, abort"; release_deploy_lock || true; exit 1
             fi
             ;;
           *)
@@ -4894,13 +4944,20 @@ run_deploy_main() {
         exit 75
       else
         rm -f "$backup_tag_file" "$backup_next_id_file" "$backup_wait_state_file" 2>/dev/null || true
-        if matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
-          after="$matched_bak_line"
+        if ! matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
+          echo "backup: no matching terminal record found for id=${wait_backup_id:-unknown} (last log line: $(tail -1 "$LOG" 2>/dev/null || true)); abort"
+          release_deploy_lock || true
+          exit 1
         fi
+        after="$matched_bak_line"
+        echo "backup: $after"
         case "$after" in
           *" ok "*)
             if [ "$after" = "$wait_before_line" ]; then
               echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            if ! _verify_completed_backup_artifact "$after"; then
+              echo "backup artifact unavailable, abort"; release_deploy_lock || true; exit 1
             fi
             DEPLOY_BACKUP_STATUS="fresh"
             ;;

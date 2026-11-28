@@ -480,6 +480,51 @@ def resolve_runtime_bucket_specs(
     return out
 
 
+class _StreamDrain:
+    """Continuously drain a subprocess pipe in a daemon thread so output never fills OS pipe buffers."""
+
+    def __init__(self, stream: Any, *, max_bytes: int | None = None) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self._buf = bytearray()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="consistent-backup-pipe-drain",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(65536)
+                if not chunk:
+                    break
+                if self._max_bytes is None:
+                    self._buf.extend(chunk)
+                else:
+                    rem = self._max_bytes - len(self._buf)
+                    if rem > 0:
+                        self._buf.extend(chunk[:rem])
+        except Exception:
+            pass
+        finally:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+
+    def read_all(self, timeout: float = 2.0) -> bytes:
+        self._thread.join(timeout=timeout)
+        return bytes(self._buf)
+
+
 @dataclasses.dataclass
 class PgDumpProcess:
     """Managed non-blocking ``pg_dump --snapshot`` subprocess with process-group termination."""
@@ -488,6 +533,7 @@ class PgDumpProcess:
     out_path: Path
     out_fh: Any
     cmd_label: str = "pg_dump"
+    stderr_drain: _StreamDrain | None = None
     closed: bool = False
 
 
@@ -514,7 +560,18 @@ def start_pg_dump_process(
     except Exception:
         out_fh.close()
         raise
-    return PgDumpProcess(popen=popen, out_path=out_path, out_fh=out_fh, cmd_label=cmd_label)
+    stderr_drain = (
+        _StreamDrain(popen.stderr, max_bytes=1024 * 1024)
+        if popen.stderr is not None
+        else None
+    )
+    return PgDumpProcess(
+        popen=popen,
+        out_path=out_path,
+        out_fh=out_fh,
+        cmd_label=cmd_label,
+        stderr_drain=stderr_drain,
+    )
 
 
 def terminate_pg_dump_process(proc: PgDumpProcess) -> None:
@@ -545,7 +602,9 @@ def terminate_pg_dump_process(proc: PgDumpProcess) -> None:
                 except subprocess.TimeoutExpired:
                     pass
     finally:
-        if proc.popen.stderr is not None:
+        if proc.stderr_drain is not None:
+            proc.stderr_drain.close()
+        elif proc.popen.stderr is not None:
             try:
                 proc.popen.stderr.close()
             except Exception:
@@ -555,6 +614,17 @@ def terminate_pg_dump_process(proc: PgDumpProcess) -> None:
         except Exception:
             pass
         proc.closed = True
+
+
+def _read_pg_dump_stderr(proc: PgDumpProcess) -> bytes:
+    if proc.stderr_drain is not None:
+        return proc.stderr_drain.read_all()
+    if proc.popen.stderr is not None:
+        try:
+            return proc.popen.stderr.read()
+        except (OSError, ValueError):
+            return b""
+    return b""
 
 
 async def wait_pg_dump_imported(
@@ -571,12 +641,7 @@ async def wait_pg_dump_imported(
         rc = proc.popen.poll()
         if rc is not None:
             if rc != 0:
-                err_bytes = b""
-                if proc.popen.stderr is not None:
-                    try:
-                        err_bytes = proc.popen.stderr.read()
-                    except (OSError, ValueError):
-                        err_bytes = b""
+                err_bytes = _read_pg_dump_stderr(proc)
                 terminate_pg_dump_process(proc)
                 err = err_bytes.decode("utf-8", errors="replace").strip()
                 raise ConsistentBackupError(
@@ -609,12 +674,7 @@ async def wait_pg_dump_finished(
             raise BackupTimeoutError(f"{proc.cmd_label} was terminated before completing dump")
         rc = proc.popen.poll()
         if rc is not None:
-            err_bytes = b""
-            if proc.popen.stderr is not None:
-                try:
-                    err_bytes = proc.popen.stderr.read()
-                except (OSError, ValueError):
-                    err_bytes = b""
+            err_bytes = _read_pg_dump_stderr(proc)
             try:
                 proc.out_fh.flush()
             except Exception:
@@ -1090,6 +1150,9 @@ class AsrArchiveProcess:
     popen: subprocess.Popen[bytes]
     ids_path: Path
     output_path: Path
+    summary_path: Path | None = None
+    stdout_drain: _StreamDrain | None = None
+    stderr_drain: _StreamDrain | None = None
     closed: bool = False
 
 
@@ -1121,6 +1184,11 @@ def start_asr_archive_process(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd, ids_name = tempfile.mkstemp(prefix=".asr-job-ids-", suffix=".json", dir=str(output_path.parent))
     ids_path = Path(ids_name)
+    sfd, summary_name = tempfile.mkstemp(
+        prefix=".asr-archive-summary-", suffix=".json", dir=str(output_path.parent)
+    )
+    os.close(sfd)
+    summary_path = Path(summary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"terminal_asr_job_ids": list(terminal_job_ids)}, fh)
@@ -1129,7 +1197,9 @@ def start_asr_archive_process(
         root_str = str(_REPO_ROOT)
         if root_str not in existing_pp.split(os.pathsep):
             sub_env["PYTHONPATH"] = f"{root_str}{os.pathsep}{existing_pp}" if existing_pp else root_str
-        cmd = _build_asr_archive_cmd(asr_jobs_dir, ids_path, output_path)
+        cmd = list(_build_asr_archive_cmd(asr_jobs_dir, ids_path, output_path))
+        if "archive-asr-jobs" in cmd and "--summary-out" not in cmd:
+            cmd.extend(["--summary-out", str(summary_path)])
         popen = subprocess.Popen(
             cmd,
             cwd=root_str,
@@ -1140,8 +1210,22 @@ def start_asr_archive_process(
         )
     except Exception:
         ids_path.unlink(missing_ok=True)
+        summary_path.unlink(missing_ok=True)
         raise
-    return AsrArchiveProcess(popen=popen, ids_path=ids_path, output_path=output_path)
+    stdout_drain = _StreamDrain(popen.stdout) if popen.stdout is not None else None
+    stderr_drain = (
+        _StreamDrain(popen.stderr, max_bytes=1024 * 1024)
+        if popen.stderr is not None
+        else None
+    )
+    return AsrArchiveProcess(
+        popen=popen,
+        ids_path=ids_path,
+        output_path=output_path,
+        summary_path=summary_path,
+        stdout_drain=stdout_drain,
+        stderr_drain=stderr_drain,
+    )
 
 
 def terminate_asr_archive_process(proc: AsrArchiveProcess) -> None:
@@ -1172,13 +1256,23 @@ def terminate_asr_archive_process(proc: AsrArchiveProcess) -> None:
                 except subprocess.TimeoutExpired:
                     pass
     finally:
-        for pipe in (proc.popen.stdout, proc.popen.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except Exception:
-                    pass
+        if proc.stdout_drain is not None:
+            proc.stdout_drain.close()
+        elif proc.popen.stdout is not None:
+            try:
+                proc.popen.stdout.close()
+            except Exception:
+                pass
+        if proc.stderr_drain is not None:
+            proc.stderr_drain.close()
+        elif proc.popen.stderr is not None:
+            try:
+                proc.popen.stderr.close()
+            except Exception:
+                pass
         proc.ids_path.unlink(missing_ok=True)
+        if proc.summary_path is not None:
+            proc.summary_path.unlink(missing_ok=True)
         proc.closed = True
 
 
@@ -1198,25 +1292,36 @@ async def wait_asr_archive_finished(
                 terminate_asr_archive_process(proc)
                 raise BackupTimeoutError("archive-asr-jobs exceeded lock-phase hard deadline")
             out_bytes = b""
-            err_bytes = b""
-            if proc.popen.stdout is not None:
+            if proc.stdout_drain is not None:
+                out_bytes = proc.stdout_drain.read_all()
+            elif proc.popen.stdout is not None:
                 try:
                     out_bytes = proc.popen.stdout.read()
                 except (OSError, ValueError):
                     out_bytes = b""
-            if proc.popen.stderr is not None:
+            err_bytes = b""
+            if proc.stderr_drain is not None:
+                err_bytes = proc.stderr_drain.read_all()
+            elif proc.popen.stderr is not None:
                 try:
                     err_bytes = proc.popen.stderr.read()
                 except (OSError, ValueError):
                     err_bytes = b""
+            summary_raw = b""
+            if proc.summary_path is not None and proc.summary_path.is_file():
+                try:
+                    summary_raw = proc.summary_path.read_bytes()
+                except OSError:
+                    summary_raw = b""
             terminate_asr_archive_process(proc)
             if rc != 0:
                 err = err_bytes.decode("utf-8", errors="replace").strip()
                 raise ConsistentBackupError(
                     f"archive-asr-jobs subprocess failed (rc={rc}): {err}"
                 )
+            json_source = summary_raw if summary_raw.strip() else out_bytes
             try:
-                payload = json.loads(out_bytes.decode("utf-8"))
+                payload = json.loads(json_source.decode("utf-8"))
             except Exception as exc:
                 raise ConsistentBackupError(
                     f"archive-asr-jobs returned invalid JSON summary: {exc}"
@@ -1504,12 +1609,8 @@ def _run_in_daemon_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> 
     return fut
 
 
-def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None) -> None:
-    """Best-effort immediate closure of the DB control session from the watchdog thread.
-
-    Drops both GC session advisory locks and aborts any open snapshot transaction at
-    PostgreSQL immediately, even if the main or worker thread is stalled in I/O.
-    """
+def _force_close_pgconn_sync(conn: Any) -> None:
+    """Synchronously abort and close underlying libpq/force_close handles without blocking on SQL."""
     pgconn = getattr(conn, "pgconn", None)
     if pgconn is not None:
         cancel_fn = getattr(pgconn, "cancel", None)
@@ -1532,6 +1633,15 @@ def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None
         except Exception:
             pass
 
+
+def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None) -> None:
+    """Best-effort immediate closure of the DB control session from a non-event-loop thread.
+
+    Drops both GC session advisory locks and aborts any open snapshot transaction at
+    PostgreSQL immediately, even if the main or worker thread is stalled in I/O.
+    """
+    _force_close_pgconn_sync(conn)
+
     close_fn = getattr(conn, "close", None)
     if not callable(close_fn):
         return
@@ -1539,7 +1649,7 @@ def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None
         if loop is not None and loop.is_running():
             try:
                 fut = asyncio.run_coroutine_threadsafe(close_fn(), loop)
-                fut.result(timeout=2.0)
+                fut.result(timeout=1.0)
             except Exception:
                 pass
     else:
@@ -1549,7 +1659,7 @@ def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None
                 if loop is not None and loop.is_running():
                     try:
                         fut = asyncio.run_coroutine_threadsafe(res, loop)
-                        fut.result(timeout=2.0)
+                        fut.result(timeout=1.0)
                     except Exception:
                         pass
                 else:
@@ -1558,13 +1668,53 @@ def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None
             pass
 
 
+async def _force_close_db_connection_async(conn: Any) -> None:
+    """Best-effort immediate closure of the DB control session from inside the event loop.
+
+    Never waits for ``ROLLBACK`` or ``pg_advisory_unlock``: closing the session drops both
+    advisory locks and aborts any open transaction atomically on PostgreSQL.
+    """
+    _force_close_pgconn_sync(conn)
+
+    close_fn = getattr(conn, "close", None)
+    if not callable(close_fn):
+        return
+    try:
+        if inspect.iscoroutinefunction(close_fn):
+            await asyncio.wait_for(close_fn(), timeout=1.0)
+        else:
+            res = close_fn()
+            if asyncio.iscoroutine(res):
+                await asyncio.wait_for(res, timeout=1.0)
+    except Exception:
+        pass
+
+
+def _close_stream_isolated(body: Any, *, join_timeout_s: float = 0.05) -> None:
+    """Close an object response stream in a daemon thread so a blocking ``close()`` never stalls teardown."""
+    close_fn = getattr(body, "close", None)
+    if not callable(close_fn):
+        return
+
+    def _closer() -> None:
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_closer, name="consistent-backup-stream-close", daemon=True)
+    t.start()
+    t.join(timeout=join_timeout_s)
+
+
 class _LockPhaseWatchdog:
     """Independent daemon thread enforcing the hard GC lock-phase deadline.
 
-    On timeout, immediately:
-    1. Terminates active ``pg_dump`` and ASR archive process groups.
-    2. Closes any active S3 response streams so stalled reads unblock.
-    3. Closes the PostgreSQL control session (dropping both GC advisory locks).
+    On timeout, immediately executes in strict order:
+    1. Closes the PostgreSQL control session FIRST (dropping both GC advisory locks).
+    2. Terminates active ``pg_dump`` and ASR archive process groups.
+    3. Closes any active S3 response streams LAST in isolated daemon threads so a
+       blocking ``close()`` can never delay DB session closure or process termination.
     4. Cancels the asyncio lock-phase task so ``run_consistent_backup`` raises
        :class:`BackupTimeoutError` promptly without waiting for blocked I/O.
     """
@@ -1645,9 +1795,13 @@ class _LockPhaseWatchdog:
             task = self._task
 
         logger.error(
-            "Consistent backup lock-phase watchdog expired during %s; closing DB session and killing child process groups",
+            "Consistent backup lock-phase watchdog expired during %s; closing DB session first, then terminating child process groups and streams",
             self.timeout_phase,
         )
+        # 1. Close DB control session FIRST so both GC advisory locks drop immediately.
+        _force_close_db_connection(self._conn, self._loop)
+        self.db_closed_by_watchdog = True
+        # 2. Terminate child process groups (pg_dump & ASR archiver).
         if dump_term is not None:
             try:
                 dump_term()
@@ -1658,15 +1812,11 @@ class _LockPhaseWatchdog:
                 asr_term()
             except Exception as exc:
                 logger.warning("Watchdog failed terminating ASR archiver: %s", exc)
+        # 3. Close registered object streams LAST in isolated daemon threads so a blocking close()
+        #    cannot hold locks or stall watchdog completion.
         for body in streams:
-            close_fn = getattr(body, "close", None)
-            if callable(close_fn):
-                try:
-                    close_fn()
-                except Exception:
-                    pass
-        _force_close_db_connection(self._conn, self._loop)
-        self.db_closed_by_watchdog = True
+            _close_stream_isolated(body)
+        # 4. Cancel the asyncio lock-phase task promptly.
         if self._loop.is_running():
             try:
                 self._loop.call_soon_threadsafe(task.cancel)
@@ -2016,16 +2166,22 @@ async def run_consistent_backup(
                 )
 
         manifest_records = object_sink.finalize()
-    except Exception as exc:
-        if watchdog is not None:
-            watchdog.disarm()
+    except BaseException as exc:
+        # Close DB session FIRST without waiting for ROLLBACK or pg_advisory_unlock so
+        # both session advisory locks and any open snapshot txn drop immediately even if
+        # the database connection is stalled. Keep the watchdog armed until the session is closed.
+        if (locks_held or snapshot_open) and not (
+            watchdog is not None and watchdog.db_closed_by_watchdog
+        ):
+            await _force_close_db_connection_async(conn)
+            locks_held = False
+            snapshot_open = False
         _terminate_dump_if_running()
         _terminate_asr_if_running()
+        if watchdog is not None:
+            watchdog.disarm()
         if isinstance(object_sink, TarGzObjectSink):
             object_sink.abort()
-        if snapshot_open and not (watchdog is not None and watchdog.db_closed_by_watchdog):
-            await rollback_exported_snapshot(conn)
-            snapshot_open = False
         if watchdog is not None and watchdog.timed_out and not isinstance(exc, BackupTimeoutError):
             raise BackupTimeoutError(
                 f"Consistent backup exceeded hard lock-phase deadline during {watchdog.timeout_phase}"
@@ -2466,6 +2622,7 @@ async def reconcile_restored_inflight_states(
                             UPDATE workspace_file_uploads
                                SET lease_until = NULL,
                                    placing_inode = NULL,
+                                   attempts = 0,
                                    error = NULL,
                                    updated_at = NOW()
                              WHERE upload_id = %s
@@ -2508,41 +2665,10 @@ async def reconcile_restored_inflight_states(
                     )
                 ws_aborted = max(0, int(cur.rowcount or 0))
 
-            # 4. dalton_transcription_jobs (includes `indeterminate` -> failed, resubmit only;
-            #    persists usage.restored_no_resume = true so normal submit & /retry are rejected)
+            # 4. dalton_transcription_jobs (includes `indeterminate` and `awaiting_upload` rows
+            #    with persisted submit intent -> failed, resubmit only; persists
+            #    usage.restored_no_resume = true so normal submit & /retry are rejected)
             if await _table_exists(cur, "public.dalton_transcription_jobs"):
-                if restored_before is not None:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_transcription_jobs
-                           SET status = 'cancelled',
-                               stage = 'cancelled',
-                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
-                               completed_at = COALESCE(completed_at, NOW()),
-                               updated_at = NOW(),
-                               version = version + 1
-                         WHERE status = 'awaiting_upload'
-                           AND COALESCE((usage -> 'upload' ->> 'completed')::boolean, FALSE) IS NOT TRUE
-                           AND created_at <= %s
-                        """,
-                        (restored_before,),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_transcription_jobs
-                           SET status = 'cancelled',
-                               stage = 'cancelled',
-                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
-                               completed_at = COALESCE(completed_at, NOW()),
-                               updated_at = NOW(),
-                               version = version + 1
-                         WHERE status = 'awaiting_upload'
-                           AND COALESCE((usage -> 'upload' ->> 'completed')::boolean, FALSE) IS NOT TRUE
-                        """
-                    )
-                asr_cancelled = max(0, int(cur.rowcount or 0))
-
                 if restored_before is not None:
                     await cur.execute(
                         """
@@ -2555,7 +2681,13 @@ async def reconcile_restored_inflight_states(
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
-                         WHERE status = ANY(%s)
+                         WHERE (
+                               status = ANY(%s)
+                               OR (
+                                   status = 'awaiting_upload'
+                                   AND COALESCE((usage ->> 'submit_attempted')::boolean, FALSE) IS TRUE
+                               )
+                         )
                            AND created_at <= %s
                         """,
                         (
@@ -2576,11 +2708,51 @@ async def reconcile_restored_inflight_states(
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
-                         WHERE status = ANY(%s)
+                         WHERE (
+                               status = ANY(%s)
+                               OR (
+                                   status = 'awaiting_upload'
+                                   AND COALESCE((usage ->> 'submit_attempted')::boolean, FALSE) IS TRUE
+                               )
+                         )
                         """,
                         (RESTORED_INFLIGHT_ERROR_MESSAGE, list(RESTORED_NONTERMINAL_ASR_STATUSES)),
                     )
                 asr_failed = max(0, int(cur.rowcount or 0))
+
+                if restored_before is not None:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_transcription_jobs
+                           SET status = 'cancelled',
+                               stage = 'cancelled',
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
+                               completed_at = COALESCE(completed_at, NOW()),
+                               updated_at = NOW(),
+                               version = version + 1
+                         WHERE status = 'awaiting_upload'
+                           AND COALESCE((usage -> 'upload' ->> 'completed')::boolean, FALSE) IS NOT TRUE
+                           AND COALESCE((usage ->> 'submit_attempted')::boolean, FALSE) IS NOT TRUE
+                           AND created_at <= %s
+                        """,
+                        (restored_before,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_transcription_jobs
+                           SET status = 'cancelled',
+                               stage = 'cancelled',
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
+                               completed_at = COALESCE(completed_at, NOW()),
+                               updated_at = NOW(),
+                               version = version + 1
+                         WHERE status = 'awaiting_upload'
+                           AND COALESCE((usage -> 'upload' ->> 'completed')::boolean, FALSE) IS NOT TRUE
+                           AND COALESCE((usage ->> 'submit_attempted')::boolean, FALSE) IS NOT TRUE
+                        """
+                    )
+                asr_cancelled = max(0, int(cur.rowcount or 0))
 
     return InflightReconcileSummary(
         drive_uploads_aborted=drive_aborted,
@@ -2682,6 +2854,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_asr.add_argument("--asr-jobs-dir", required=True)
     p_asr.add_argument("--job-ids-json", required=True)
     p_asr.add_argument("--output", required=True)
+    p_asr.add_argument(
+        "--summary-out",
+        default="",
+        help="Optional path to write JSON summary atomically instead of stdout.",
+    )
 
     return ap
 
@@ -2730,19 +2907,25 @@ def main(argv: list[str] | None = None) -> int:
             [str(x) for x in job_ids],
             Path(args.output),
         )
-        print(
-            json.dumps(
-                {
-                    "archive_path": str(summary.archive_path),
-                    "size_bytes": summary.size_bytes,
-                    "sha256": summary.sha256,
-                    "included_job_ids": list(summary.included_job_ids),
-                    "included_usage_ledger": summary.included_usage_ledger,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        summary_json = json.dumps(
+            {
+                "archive_path": str(summary.archive_path),
+                "size_bytes": summary.size_bytes,
+                "sha256": summary.sha256,
+                "included_job_ids": list(summary.included_job_ids),
+                "included_usage_ledger": summary.included_usage_ledger,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
+        if args.summary_out:
+            summary_dest = Path(args.summary_out)
+            summary_dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp_summary = summary_dest.with_name(f".{summary_dest.name}.tmp.{os.getpid()}")
+            tmp_summary.write_text(summary_json + "\n", encoding="utf-8")
+            os.replace(tmp_summary, summary_dest)
+        else:
+            print(summary_json)
         return 0
     return 2
 

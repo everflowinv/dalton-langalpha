@@ -249,8 +249,21 @@ PY
   fi
 }
 
-# External PostgreSQL guard: strictly read from .env (never shell environment).
-DB_HOST="$(read_env_file_var "$ENV_FILE" "DB_HOST" "postgres")"
+# External PostgreSQL & conflict guard: strictly read from .env via stdlib resolver (never shell env).
+if ! EARLY_PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config \
+    --env-file "$ENV_FILE" \
+    --default-host postgres \
+    --check-conflict \
+    --caller backup)"; then
+  exit 1
+fi
+EARLY_PG_LINES="$(printf '%s' "$EARLY_PG_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "user", "dbname"):
+    print(d.get(k, ""))
+')"
+DB_HOST="$(printf '%s\n' "$EARLY_PG_LINES" | sed -n '1p')"
 if [[ "$DB_HOST" != "postgres" ]]; then
   err "External PostgreSQL detected (DB_HOST='${DB_HOST}'; expected Compose-managed 'postgres')."
   err "backup.sh only backs up the Compose-managed PostgreSQL container. For external databases, run pg_dump directly against your database host."
@@ -266,8 +279,10 @@ if ! python3 "${SCRIPT_DIR}/storage_config.py" check-env \
   exit 1
 fi
 
-DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
-DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
+DB_USER="$(printf '%s\n' "$EARLY_PG_LINES" | sed -n '2p')"
+DB_NAME="$(printf '%s\n' "$EARLY_PG_LINES" | sed -n '3p')"
+DB_USER="${DB_USER:-postgres}"
+DB_NAME="${DB_NAME:-postgres}"
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
   PROJECT_NAME="$PROJECT_NAME_ARG"
 else
@@ -343,6 +358,7 @@ for key in (
     "DB_USER",
     "DB_PASSWORD",
     "DB_NAME",
+    "DATABASE_URL",
 ):
     seen.add(key)
     print(key)
@@ -1474,14 +1490,50 @@ release_publish_lock() {
 
 CONSISTENT_BACKEND_PID=""
 PG_DUMP_PID=""
+PG_DUMP_CONTAINER_PIDFILE=""
 BUNDLE_TAR_PID=""
 CTL_IN_FIFO=""
 CTL_ERR_FIFO=""
 BUNDLE_OUT_FIFO=""
 
+terminate_container_pg_dump() {
+  if [[ -n "${PG_DUMP_CONTAINER_PIDFILE:-}" ]]; then
+    compose_cmd exec -T postgres sh -c '
+      pidfile="$1"
+      if [ -f "$pidfile" ]; then
+        cpid="$(tr -dc "0-9" < "$pidfile" 2>/dev/null || true)"
+        if [ -n "$cpid" ] && kill -0 "$cpid" 2>/dev/null; then
+          kill -TERM "$cpid" 2>/dev/null || true
+          i=0
+          while [ "$i" -lt 10 ] && kill -0 "$cpid" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+          done
+          if kill -0 "$cpid" 2>/dev/null; then
+            kill -KILL "$cpid" 2>/dev/null || true
+            sleep 0.1
+          fi
+        fi
+        rm -f "$pidfile" 2>/dev/null || true
+      fi
+    ' _ "$PG_DUMP_CONTAINER_PIDFILE" >/dev/null 2>&1 || true
+    PG_DUMP_CONTAINER_PIDFILE=""
+  fi
+  if [[ -n "${PG_DUMP_PID:-}" ]]; then
+    if kill -0 "$PG_DUMP_PID" 2>/dev/null; then
+      kill -TERM "$PG_DUMP_PID" 2>/dev/null || true
+      sleep 0.2
+      kill -KILL "$PG_DUMP_PID" 2>/dev/null || true
+    fi
+    wait "$PG_DUMP_PID" 2>/dev/null || true
+    PG_DUMP_PID=""
+  fi
+}
+
 stop_consistent_backup_children() {
+  terminate_container_pg_dump
   local pid=""
-  for pid in "${PG_DUMP_PID:-}" "${CONSISTENT_BACKEND_PID:-}" "${BUNDLE_TAR_PID:-}"; do
+  for pid in "${CONSISTENT_BACKEND_PID:-}" "${BUNDLE_TAR_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill -TERM "$pid" 2>/dev/null || true
       sleep 0.2
@@ -1489,7 +1541,6 @@ stop_consistent_backup_children() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  PG_DUMP_PID=""
   CONSISTENT_BACKEND_PID=""
   BUNDLE_TAR_PID=""
   if [[ -n "${CTL_IN_FIFO:-}" ]]; then
@@ -1528,14 +1579,15 @@ trap cleanup EXIT
 info "Starting zero-downtime consistent backup into ${FINAL_DIR}..."
 
 # 1 & 2. Consistent PostgreSQL + MinIO + terminal ASR-jobs backup via shared consistent_backup protocol (§3.1):
-#   - Resolve ONE unified PostgreSQL connection config (honoring DATABASE_URL > DB_* across
-#     Compose `backend` config + .env) and pass it to BOTH compose-backup control session and pg_dump.
+#   - Resolve ONE unified PostgreSQL connection config via stdlib-only `storage_config.py resolve-pg-config`
+#     (honoring DB_* > DATABASE_URL identically to backend and restore, failing fast on conflict)
+#     and pass it to BOTH compose-backup control session and in-container pg_dump.
 #   - Mount the `dalton-asr-jobs` volume read-only into the one-shot backup container and pass
 #     `--asr-jobs-dir /var/lib/dalton/asr_jobs` so terminal ASR jobs enter the same reconciliation.
-#   - Wait for SNAPSHOT_READY using LOCK_TIMEOUT_S (default 7200s); SNAP_IMPORT_TIMEOUT_S (default 120s)
-#     is used ONLY for waiting on pg_dump to import the snapshot after SNAPSHOT_READY.
+#   - Enforce ONE shared lock-phase deadline across SNAPSHOT_READY + pg_dump, and terminate the
+#     actual in-container pg_dump PID immediately on watchdog `TERMINATE_PG_DUMP` or deadline expiry.
 COMPOSE_CFG_TMP="${STAGE_DIR}/.compose-config.json"
-COMPOSE_PG_ARGS=(--env-file "$ENV_FILE")
+COMPOSE_PG_ARGS=(--env-file "$ENV_FILE" --default-host postgres --check-conflict --caller backup)
 if compose_cmd --profile transcription config --format json > "$COMPOSE_CFG_TMP" 2>/dev/null && [[ -s "$COMPOSE_CFG_TMP" ]]; then
   COMPOSE_PG_ARGS+=(--compose-config-json "$COMPOSE_CFG_TMP" --service backend)
 else
@@ -1543,7 +1595,9 @@ else
   COMPOSE_CFG_TMP=""
 fi
 
-PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/consistent_backup.py" resolve-pg-config "${COMPOSE_PG_ARGS[@]}")"
+if ! PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/storage_config.py" resolve-pg-config "${COMPOSE_PG_ARGS[@]}")"; then
+  exit 1
+fi
 PG_CFG_LINES="$(printf '%s' "$PG_CFG_JSON" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -1610,11 +1664,12 @@ if [[ -n "${DALTON_BACKUP_MIRROR_TIMEOUT_S:-}" ]]; then
   CONSISTENT_BACKEND_ARGS+=(--mirror-timeout-s "${DALTON_BACKUP_MIRROR_TIMEOUT_S}")
 fi
 
+LOCK_START_TS="$(date +%s)"
+SNAP_READY_DEADLINE=$(( LOCK_START_TS + LOCK_TIMEOUT_S ))
 DALTON_BACKUP_PG_DSN="$PG_TARGET_DSN" compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"$BUNDLE_OUT_FIFO" 2>"$CTL_ERR_FIFO" &
 CONSISTENT_BACKEND_PID=$!
 
 SNAPSHOT_ID=""
-SNAP_READY_DEADLINE=$(( $(date +%s) + LOCK_TIMEOUT_S ))
 while true; do
   NOW_TS="$(date +%s)"
   if (( NOW_TS >= SNAP_READY_DEADLINE )); then
@@ -1630,6 +1685,12 @@ while true; do
         SNAPSHOT_ID="${ctl_line#@@DALTON_CTL@@ SNAPSHOT_READY }"
         SNAPSHOT_ID="${SNAPSHOT_ID//$'\r'/}"
         break
+        ;;
+      "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
+        err "consistent_backup lock-phase supervisor requested abort before snapshot export."
+        exec 5>&- 6<&- || true
+        stop_consistent_backup_children
+        exit 1
         ;;
       "@@DALTON_CTL@@ "*)
         ;;
@@ -1654,14 +1715,20 @@ if [[ -z "$SNAPSHOT_ID" ]]; then
 fi
 
 info "Exported PostgreSQL snapshot '${SNAPSHOT_ID}'; launching pg_dump --snapshot..."
+PG_DUMP_CONTAINER_PIDFILE="/tmp/dalton-pg-dump-$$-$(date +%s).pid"
 DALTON_PG_DUMP_DSN="$PG_DUMP_CONTAINER_DSN" compose_cmd exec -T -e DALTON_PG_DUMP_DSN postgres \
-  sh -c 'exec pg_dump "$DALTON_PG_DUMP_DSN" -Fc --no-owner --no-acl "$1"' _ "--snapshot=${SNAPSHOT_ID}" \
+  sh -c 'printf "%s\n" "$$" > "$2"; exec pg_dump "$DALTON_PG_DUMP_DSN" -Fc --no-owner --no-acl "$1"' _ \
+  "--snapshot=${SNAPSHOT_ID}" "$PG_DUMP_CONTAINER_PIDFILE" \
   > "${STAGE_DIR}/postgres.dump" &
 PG_DUMP_PID=$!
 
 # Wait until pg_dump emits custom-format bytes (confirming snapshot import) or exits early.
-# SNAP_IMPORT_TIMEOUT_S (default 120s) applies ONLY to snapshot import after SNAPSHOT_READY.
+# SNAP_IMPORT_TIMEOUT_S (default 120s) applies ONLY to snapshot import after SNAPSHOT_READY,
+# while staying strictly bounded by the shared lock-phase deadline and watchdog control channel.
 IMPORT_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))
+if (( SNAP_READY_DEADLINE < IMPORT_DEADLINE )); then
+  IMPORT_DEADLINE="$SNAP_READY_DEADLINE"
+fi
 DUMP_IMPORTED=0
 while true; do
   if [[ -s "${STAGE_DIR}/postgres.dump" ]]; then
@@ -1671,6 +1738,12 @@ while true; do
   if ! kill -0 "$PG_DUMP_PID" 2>/dev/null; then
     break
   fi
+  if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+    err "consistent_backup supervisor exited while waiting for pg_dump snapshot import; terminating in-container pg_dump."
+    exec 5>&- 6<&- || true
+    stop_consistent_backup_children
+    exit 1
+  fi
   if (( $(date +%s) >= IMPORT_DEADLINE )); then
     err "pg_dump --snapshot timed out waiting to import snapshot (${SNAP_IMPORT_TIMEOUT_S}s)."
     printf 'PG_DUMP_FAILED\n' >&5 || true
@@ -1678,7 +1751,21 @@ while true; do
     stop_consistent_backup_children
     exit 1
   fi
-  sleep 0.1
+  if IFS= read -r -t 0.1 ctl_line <&6; then
+    case "$ctl_line" in
+      "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
+        err "consistent_backup lock-phase supervisor requested in-container pg_dump termination during snapshot import."
+        exec 5>&- 6<&- || true
+        stop_consistent_backup_children
+        exit 1
+        ;;
+      "@@DALTON_CTL@@ "*)
+        ;;
+      *)
+        printf '%s\n' "$ctl_line" >&2
+        ;;
+    esac
+  fi
 done
 
 if [[ "$DUMP_IMPORTED" -eq 0 ]]; then
@@ -1699,24 +1786,56 @@ fi
 # Notify consistent_backup that pg_dump imported the snapshot so it commits the export txn immediately.
 printf 'SNAPSHOT_IMPORTED\n' >&5
 
-# Wait for pg_dump to complete within PG_DUMP_TIMEOUT_S.
+# Wait for pg_dump to complete within the shared lock-phase deadline AND PG_DUMP_TIMEOUT_S,
+# continuously honoring watchdog `TERMINATE_PG_DUMP` signals so in-container pg_dump exits immediately on timeout.
 DUMP_DEADLINE=$(( $(date +%s) + PG_DUMP_TIMEOUT_S ))
+if (( SNAP_READY_DEADLINE < DUMP_DEADLINE )); then
+  DUMP_DEADLINE="$SNAP_READY_DEADLINE"
+fi
 if [[ -n "$PG_DUMP_PID" ]]; then
   while kill -0 "$PG_DUMP_PID" 2>/dev/null; do
     if (( $(date +%s) >= DUMP_DEADLINE )); then
-      err "pg_dump --snapshot exceeded hard timeout (${PG_DUMP_TIMEOUT_S}s); terminating."
+      err "pg_dump --snapshot exceeded shared lock/dump hard timeout; terminating in-container pg_dump."
       printf 'PG_DUMP_FAILED\n' >&5 || true
       exec 5>&- 6<&- || true
       stop_consistent_backup_children
       exit 1
     fi
-    sleep 0.5
+    if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+      err "consistent_backup lock-phase supervisor exited before pg_dump completed; terminating in-container pg_dump."
+      exec 5>&- 6<&- || true
+      stop_consistent_backup_children
+      exit 1
+    fi
+    if IFS= read -r -t 0.2 ctl_line <&6; then
+      case "$ctl_line" in
+        "@@DALTON_CTL@@ TERMINATE_PG_DUMP"*)
+          err "consistent_backup lock-phase watchdog expired; terminating in-container pg_dump immediately."
+          exec 5>&- 6<&- || true
+          stop_consistent_backup_children
+          exit 1
+          ;;
+        "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
+          info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+          ;;
+        "@@DALTON_CTL@@ "*)
+          ;;
+        *)
+          printf '%s\n' "$ctl_line" >&2
+          ;;
+      esac
+    fi
   done
   set +e
   wait "$PG_DUMP_PID"
   pg_rc=$?
   set -e
   PG_DUMP_PID=""
+  # Remove container pidfile cleanly after pg_dump exits
+  if [[ -n "${PG_DUMP_CONTAINER_PIDFILE:-}" ]]; then
+    compose_cmd exec -T postgres rm -f "$PG_DUMP_CONTAINER_PIDFILE" >/dev/null 2>&1 || true
+    PG_DUMP_CONTAINER_PIDFILE=""
+  fi
 else
   pg_rc=0
 fi

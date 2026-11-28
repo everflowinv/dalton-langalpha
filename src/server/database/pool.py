@@ -67,18 +67,12 @@ def get_db_connection_string() -> str:
         DB_USER: Database user (default: postgres)
         DB_PASSWORD: Database password (default: postgres)
         DB_SSLMODE: TLS mode (default: prefer)
+        DATABASE_URL: Optional fallback DSN when DB_* variables are unset
     """
-    import os
+    # DALTON-HOOK(standalone-core): share unified DB_* / DATABASE_URL resolution with backup and restore
+    from src.dalton.pg_config import resolve_pg_dsn
 
-    from urllib.parse import quote_plus
-
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "postgres")
-    db_user = os.getenv("DB_USER", "postgres")
-    db_password = os.getenv("DB_PASSWORD", "postgres")
-
-    return f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_name}?sslmode={DB_SSLMODE}"
+    return resolve_pg_dsn(default_host="localhost", default_sslmode=DB_SSLMODE)
 
 
 def _on_reconnect_failed(pool):

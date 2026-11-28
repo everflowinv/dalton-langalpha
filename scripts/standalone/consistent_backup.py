@@ -23,24 +23,17 @@ import tarfile
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote_plus, urlsplit, urlunsplit
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.dalton import consistent_backup, storage_refs
-from src.dalton.consistent_backup import (
-    BucketArchiveSpec,
-    ConsistentBackupError,
-    PgDumpProcess,
-    TarGzObjectSink,
-    build_backup_s3_client,
-    resolve_runtime_bucket_specs,
-    run_consistent_backup,
-    start_pg_dump_process,
-)
+from src.dalton.pg_config import PgConfigConflictError, resolve_pg_config, resolve_pg_dsn
+
+if TYPE_CHECKING:
+    from src.dalton.consistent_backup import BucketArchiveSpec, PgDumpProcess
 
 RESTORE_MARKER_KEY = ".dalton-restore.json"
 RESTORE_TAG_KEY = "dalton-restore"
@@ -105,87 +98,40 @@ def is_restore_created_bucket(s3_client: Any, bucket_name: str) -> bool:
 def resolve_standalone_pg_dsn(
     pg_dsn: str = "",
     env: Mapping[str, str] | None = None,
+    *,
+    default_host: str = "localhost",
+    check_conflict: bool = False,
 ) -> str:
-    """Resolve one unified PostgreSQL DSN for BOTH control session locks and ``pg_dump``.
+    """Resolve one unified PostgreSQL DSN shared with backend, backup, and restore.
 
-    Priority:
-    1. Explicit ``--pg-dsn``
-    2. ``DALTON_BACKUP_PG_DSN`` environment override (passed by ``backup.sh``)
-    3. ``DATABASE_URL`` environment variable
-    4. ``DB_HOST`` / ``DB_PORT`` / ``DB_NAME`` / ``DB_USER`` / ``DB_PASSWORD`` / ``DB_SSLMODE``
+    Delegates to :func:`src.dalton.pg_config.resolve_pg_dsn` (stdlib-only) with
+    ``allow_backup_override=True`` so ``DB_*`` > ``DATABASE_URL`` priority matches
+    ``src/server/database/pool.py`` and ``scripts/standalone/restore.sh`` identically.
     """
-    explicit = (pg_dsn or "").strip()
-    if explicit:
-        return explicit
-    em = os.environ if env is None else env
-    override_url = (em.get("DALTON_BACKUP_PG_DSN") or "").strip()
-    if override_url:
-        return override_url
-    env_url = (em.get("DATABASE_URL") or "").strip()
-    if env_url:
-        return env_url
-    db_host = (em.get("DB_HOST") or "localhost").strip()
-    db_port = (em.get("DB_PORT") or "5432").strip()
-    db_name = (em.get("DB_NAME") or "postgres").strip()
-    db_user = (em.get("DB_USER") or "postgres").strip()
-    db_password = em.get("DB_PASSWORD") or "postgres"
-    db_sslmode = (em.get("DB_SSLMODE") or "prefer").strip() or "prefer"
-    return (
-        f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}"
-        f"@{db_host}:{db_port}/{db_name}?sslmode={quote_plus(db_sslmode)}"
+    return resolve_pg_dsn(
+        pg_dsn,
+        env=env,
+        default_host=default_host,
+        allow_backup_override=True,
+        check_conflict=check_conflict,
     )
 
 
 def resolve_standalone_pg_config(
     pg_dsn: str = "",
     env: Mapping[str, str] | None = None,
+    *,
+    default_host: str = "localhost",
+    check_conflict: bool = False,
 ) -> dict[str, str]:
-    """Resolve unified PostgreSQL connection fields from the single DSN resolver.
-
-    Returns ``dsn`` (for control session) AND ``container_dsn`` (with ``postgres`` host
-    rewritten to ``127.0.0.1`` for ``docker compose exec postgres pg_dump``), plus parsed
-    ``host``, ``port``, ``dbname``, ``user``, ``password``, ``sslmode``, and ``source``.
-    """
-    em = os.environ if env is None else env
-    if (pg_dsn or "").strip():
-        source = "pg_dsn"
-    elif (em.get("DALTON_BACKUP_PG_DSN") or "").strip():
-        source = "backup_pg_dsn"
-    elif (em.get("DATABASE_URL") or "").strip():
-        source = "database_url"
-    else:
-        source = "db_vars"
-
-    dsn = resolve_standalone_pg_dsn(pg_dsn, em)
-    parsed = urlsplit(dsn)
-    host = parsed.hostname or (em.get("DB_HOST") or "localhost").strip()
-    port = str(parsed.port or (em.get("DB_PORT") or "5432").strip())
-    dbname = unquote_plus((parsed.path or "").lstrip("/")) or (em.get("DB_NAME") or "postgres").strip()
-    user = unquote_plus(parsed.username) if parsed.username is not None else (em.get("DB_USER") or "postgres").strip()
-    password = unquote_plus(parsed.password) if parsed.password is not None else (em.get("DB_PASSWORD") or "")
-    qs = parse_qs(parsed.query)
-    sslmode = (qs.get("sslmode", [None])[0] or (em.get("DB_SSLMODE") or "prefer")).strip() or "prefer"
-
-    # Build a DSN suitable for running `pg_dump` inside the `postgres` container itself.
-    container_dsn = dsn
-    if parsed.scheme in ("postgres", "postgresql") and host.lower() == "postgres":
-        auth = quote_plus(user)
-        if parsed.password is not None:
-            auth = f"{auth}:{quote_plus(password)}"
-        netloc = f"{auth}@127.0.0.1:{port}"
-        container_dsn = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
-
-    return {
-        "dsn": dsn,
-        "container_dsn": container_dsn,
-        "host": host,
-        "port": port,
-        "dbname": dbname,
-        "user": user,
-        "password": password,
-        "sslmode": sslmode,
-        "source": source,
-    }
+    """Resolve unified PostgreSQL connection fields from :mod:`src.dalton.pg_config`."""
+    return resolve_pg_config(
+        pg_dsn,
+        env=env,
+        default_host=default_host,
+        allow_backup_override=True,
+        check_conflict=check_conflict,
+    )
 
 
 async def open_standalone_session_connection(dsn: str) -> Any:
@@ -208,14 +154,25 @@ async def open_standalone_session_connection(dsn: str) -> Any:
 def resolve_standalone_bucket_specs(
     env: Mapping[str, str] | None = None,
     *,
-    client_factory: Callable[..., Any] = build_backup_s3_client,
+    client_factory: Callable[..., Any] | None = None,
 ) -> list[BucketArchiveSpec]:
-    """Resolve active Standalone Core buckets via shared runtime rules (supporting ``AWS_*``)."""
+    """Resolve active Standalone Core buckets matching the running backend's effective config.
+
+    Uses ``apply_core_defaults=False`` (matching ``src/utils/storage/__init__.py``) so
+    backup never invents or probes ``dalton-storage`` when the running backend has no
+    main storage bucket configured.
+    """
+    from src.dalton.consistent_backup import (
+        build_backup_s3_client,
+        resolve_runtime_bucket_specs,
+    )
+
+    factory = build_backup_s3_client if client_factory is None else client_factory
     return resolve_runtime_bucket_specs(
         env=env,
-        apply_core_defaults=True,
+        apply_core_defaults=False,
         rewrite_container_minio=False,
-        client_factory=client_factory,
+        client_factory=factory,
     )
 
 
@@ -292,6 +249,8 @@ def _standalone_manifest_extra(
 
 
 def _start_pg_dump(snapshot_id: str, out_path: Path, *, dsn: str) -> PgDumpProcess:
+    from src.dalton.consistent_backup import start_pg_dump_process
+
     cmd = ["pg_dump", dsn, "-Fc", "--no-owner", "--no-acl", f"--snapshot={snapshot_id}"]
     return start_pg_dump_process(cmd, out_path, cmd_label="pg_dump")
 
@@ -303,13 +262,15 @@ def _cmd_backup(
     pg_dump_starter: Callable[..., Any] = _start_pg_dump,
     bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
 ) -> int:
+    from src.dalton.consistent_backup import TarGzObjectSink, run_consistent_backup
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dump_path = out_dir / "postgres.dump"
     minio_tar = out_dir / "minio-objects.tar.gz"
     asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None
     asr_tar = (out_dir / "asr-jobs.tar.gz") if (asr_dir and asr_dir.is_dir()) else None
-    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ)
+    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ, check_conflict=True)
     if not dsn:
         print("DATABASE_URL, --pg-dsn, or DB_* configuration is required", file=sys.stderr)
         return 2
@@ -364,6 +325,7 @@ def _cmd_compose_backup(
     *,
     conn_opener: Callable[[str], Any] = open_standalone_session_connection,
     bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
+    terminate_pg_dump_hook: Callable[[str], None] | None = None,
 ) -> int:
     """Coordinate consistent snapshot backup with host-driven ``docker compose exec postgres pg_dump``.
 
@@ -373,11 +335,21 @@ def _cmd_compose_backup(
     2. Host starts ``pg_dump --snapshot=<snapshot_id>`` in postgres container, waits for dump output,
        and writes ``SNAPSHOT_IMPORTED`` to stdin -> container immediately COMMITs export txn.
     3. Container lists versions, selects objects, and waits for ``PG_DUMP_DONE`` on stdin.
+       If the lock-phase watchdog expires (or any error occurs) while ``pg_dump`` is still active,
+       the watchdog emits ``@@DALTON_CTL@@ TERMINATE_PG_DUMP <snapshot_id>`` so the host supervisor
+       immediately kills the in-container ``pg_dump`` process.
     4. Container releases GC locks (before versioned mirroring), builds ``minio-objects.tar.gz``,
        runs full 17-consumer reconciliation, streams ``minio-objects.tar.gz`` to stdout (or ``--out-tar``),
        and emits ``@@DALTON_CTL@@ BACKUP_SUMMARY <json>`` to stderr.
     """
-    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ)
+    from src.dalton.consistent_backup import (
+        ConsistentBackupError,
+        TarGzObjectSink,
+        _run_in_daemon_thread,
+        run_consistent_backup,
+    )
+
+    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ, check_conflict=True)
     specs = bucket_resolver(os.environ)
     stage_dir = Path(tempfile.mkdtemp(prefix="dalton-core-cb-"))
     stream_bundle = bool(getattr(args, "stream_bundle", False))
@@ -398,8 +370,24 @@ def _cmd_compose_backup(
         sys.stderr.write(f"{CTL_PREFIX}{msg}\n")
         sys.stderr.flush()
 
+    def _start_host_pg_dump(snap_id: str, _out_p: Path) -> str:
+        _emit_ctl(f"SNAPSHOT_READY {snap_id}")
+        return snap_id
+
+    terminated_sent = False
+
+    def _terminate_host_pg_dump(handle: Any) -> None:
+        nonlocal terminated_sent
+        if terminated_sent:
+            return
+        terminated_sent = True
+        snap_id = str(handle or "")
+        _emit_ctl(f"TERMINATE_PG_DUMP {snap_id}".strip())
+        if terminate_pg_dump_hook is not None:
+            terminate_pg_dump_hook(snap_id)
+
     async def _read_ctl_token(expected: str) -> None:
-        line = await asyncio.to_thread(sys.stdin.readline)
+        line = await _run_in_daemon_thread(sys.stdin.readline)
         tok = (line or "").strip()
         if tok != expected:
             raise ConsistentBackupError(
@@ -419,9 +407,10 @@ def _cmd_compose_backup(
                 return await run_consistent_backup(
                     conn=conn,
                     pg_dump_path=stage_dir / "host-managed-postgres.dump",
-                    pg_dump_fn=lambda snap_id, _out_p: _emit_ctl(f"SNAPSHOT_READY {snap_id}"),
+                    pg_dump_fn=_start_host_pg_dump,
                     wait_pg_dump_imported_fn=lambda _h: _read_ctl_token("SNAPSHOT_IMPORTED"),
                     wait_pg_dump_finished_fn=lambda _h: _read_ctl_token("PG_DUMP_DONE"),
+                    terminate_pg_dump_fn=_terminate_host_pg_dump,
                     bucket_specs=specs,
                     object_sink=sink,
                     asr_jobs_dir=asr_dir if asr_tar is not None else None,
@@ -479,9 +468,40 @@ def _cmd_resolve_pg_config(args: argparse.Namespace) -> int:
             service_name=args.service or "backend",
         )
         merged_env.update(svc_env)
-    cfg = resolve_standalone_pg_config(args.pg_dsn, merged_env if (args.env_file or args.compose_config_json) else os.environ)
+    use_env: Mapping[str, str] = (
+        merged_env if (args.env_file or args.compose_config_json) else os.environ
+    )
+    try:
+        cfg = resolve_standalone_pg_config(
+            args.pg_dsn,
+            use_env,
+            default_host=getattr(args, "default_host", "localhost") or "localhost",
+            check_conflict=bool(getattr(args, "check_conflict", False)),
+        )
+    except PgConfigConflictError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     print(json.dumps(cfg, ensure_ascii=False))
     return 0
+
+
+def _cmd_reconcile_restored(args: argparse.Namespace) -> int:
+    from src.dalton import consistent_backup
+
+    return int(
+        consistent_backup.main(
+            ["reconcile-restored-inflight-states"]
+            + (["--skip-object-check"] if args.skip_object_check else [])
+            + (["--asr-jobs-dir", args.asr_jobs_dir] if args.asr_jobs_dir else [])
+            + (["--restored-before", args.restored_before] if args.restored_before else [])
+        )
+    )
+
+
+def _cmd_reconcile_refs(args: argparse.Namespace) -> int:
+    from src.dalton import storage_refs
+
+    return int(storage_refs.main(["reconcile", *args.extra]))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -521,24 +541,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_pg.add_argument("--compose-config-json", default="")
     p_pg.add_argument("--service", default="backend")
     p_pg.add_argument("--pg-dsn", default="")
+    p_pg.add_argument("--default-host", default="localhost")
+    p_pg.add_argument("--check-conflict", action="store_true")
     p_pg.set_defaults(func=_cmd_resolve_pg_config)
 
     p_rec = sub.add_parser("reconcile-restored-inflight-states")
     p_rec.add_argument("--skip-object-check", action="store_true")
     p_rec.add_argument("--asr-jobs-dir", default="")
     p_rec.add_argument("--restored-before", default="")
-    p_rec.set_defaults(
-        func=lambda a: consistent_backup.main(
-            ["reconcile-restored-inflight-states"]
-            + (["--skip-object-check"] if a.skip_object_check else [])
-            + (["--asr-jobs-dir", a.asr_jobs_dir] if a.asr_jobs_dir else [])
-            + (["--restored-before", a.restored_before] if a.restored_before else [])
-        )
-    )
+    p_rec.set_defaults(func=_cmd_reconcile_restored)
 
     p_ref = sub.add_parser("reconcile")
     p_ref.add_argument("extra", nargs=argparse.REMAINDER)
-    p_ref.set_defaults(func=lambda a: storage_refs.main(["reconcile", *a.extra]))
+    p_ref.set_defaults(func=_cmd_reconcile_refs)
     return ap
 
 

@@ -1164,28 +1164,160 @@ def _discover_colima_disk_paths(
     return _dedup(candidates), _dedup(disk_files)
 
 
+class ColimaConfigResolutionError(RuntimeError):
+    """Raised when the active Docker host/context cannot be mapped unambiguously to a Colima profile."""
+
+
+def _parse_colima_socket_path(
+    endpoint: str,
+    *,
+    expected_home: Path | None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+) -> tuple[Path | None, str | None]:
+    """Extract ``(colima_home, profile)`` from a ``unix://`` Docker endpoint pointing to Colima."""
+    ep = (endpoint or "").strip()
+    if not ep.startswith("unix://"):
+        return None, None
+    raw_sock = ep[len("unix://") :]
+    if not raw_sock:
+        return None, None
+
+    expected_real = Path(realpath_fn(str(expected_home))) if expected_home is not None else None
+    candidates = [Path(raw_sock)]
+    try:
+        real_sock = Path(realpath_fn(raw_sock))
+        if real_sock not in candidates:
+            candidates.append(real_sock)
+    except OSError:
+        pass
+
+    for sock in candidates:
+        if sock.name != "docker.sock":
+            continue
+        # Pattern 1: <colima_home>/_lima/colima[-<profile>]/sock/docker.sock
+        if (
+            sock.parent.name == "sock"
+            and sock.parent.parent.parent.name == "_lima"
+            and (
+                sock.parent.parent.name == "colima"
+                or sock.parent.parent.name.startswith("colima-")
+            )
+        ):
+            lima_name = sock.parent.parent.name
+            prof = "default" if lima_name == "colima" else lima_name[len("colima-") :]
+            home = sock.parent.parent.parent.parent
+            if prof:
+                return home, prof
+
+        # Pattern 2: <colima_home>/<profile>/docker.sock
+        prof_dir = sock.parent
+        home_dir = prof_dir.parent
+        prof_name = prof_dir.name
+        if not prof_name or home_dir == prof_dir:
+            continue
+        is_expected_home = False
+        if expected_home is not None:
+            try:
+                home_real = Path(realpath_fn(str(home_dir)))
+            except OSError:
+                home_real = home_dir
+            if home_dir == expected_home or (
+                expected_real is not None and home_real == expected_real
+            ):
+                is_expected_home = True
+        looks_like_colima_home = (
+            is_expected_home
+            or home_dir.name in (".colima", "colima")
+            or "colima" in home_dir.name.lower()
+            or (home_dir / "_lima").is_dir()
+        )
+        if looks_like_colima_home:
+            return home_dir, prof_name
+
+    return None, None
+
+
+def _inspect_active_docker_endpoint(
+    *,
+    env: Mapping[str, str],
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    timeout_s: float = 10.0,
+) -> tuple[str | None, str | None, str | None]:
+    """Return ``(endpoint_url, context_name, error_reason)`` for the active Docker daemon."""
+    docker_host = (env.get("DOCKER_HOST") or "").strip()
+    if docker_host:
+        return docker_host, None, None
+
+    ctx_env = (env.get("DOCKER_CONTEXT") or "").strip()
+    inspect_cmd = ["docker", "context", "inspect"]
+    if ctx_env:
+        inspect_cmd.append(ctx_env)
+    try:
+        proc = run_fn(
+            inspect_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env=dict(env),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, ctx_env or None, f"failed running {' '.join(inspect_cmd)!r}: {exc}"
+
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        err_msg = (proc.stderr or "").strip() or f"rc={proc.returncode}"
+        return None, ctx_env or None, f"{' '.join(inspect_cmd)!r} failed ({err_msg})"
+
+    try:
+        parsed = json.loads(proc.stdout)
+    except ValueError as exc:
+        return None, ctx_env or None, f"invalid JSON from {' '.join(inspect_cmd)!r}: {exc}"
+
+    if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], dict):
+        return None, ctx_env or None, f"unexpected JSON shape from {' '.join(inspect_cmd)!r}"
+
+    entry = parsed[0]
+    ctx_name = str(entry.get("Name") or ctx_env or "").strip() or None
+    endpoints = entry.get("Endpoints")
+    docker_ep_obj = endpoints.get("docker") if isinstance(endpoints, dict) else None
+    endpoint_url = (
+        str(docker_ep_obj.get("Host") or "").strip()
+        if isinstance(docker_ep_obj, dict)
+        else ""
+    )
+    if not endpoint_url:
+        return None, ctx_name, f"Docker context {ctx_name!r} has no Endpoints.docker.Host"
+    return endpoint_url, ctx_name, None
+
+
 def resolve_active_colima_config(
     *,
     colima_dir: Path | None = None,
     colima_profile: str | None = None,
     env: Mapping[str, str] | None = None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
     timeout_s: float = 10.0,
 ) -> tuple[Path, str]:
-    """Resolve the active Colima home directory and running profile (honoring ``COLIMA_HOME``).
+    """Resolve the active Colima home directory and profile from the actual Docker context/host.
 
     Priority:
-    - Home directory: explicit ``colima_dir`` > ``COLIMA_HOME`` env > ``~/.colima``.
-    - Profile: explicit ``colima_profile`` > ``COLIMA_PROFILE`` env > active running profile
-      reported by ``colima list --json`` (matching ``DOCKER_HOST`` socket if present, else
-      ``default`` if running, else first running profile) > ``"default"``.
+    - Explicit ``colima_profile`` / ``COLIMA_PROFILE`` override: honors explicit ``colima_dir`` /
+      ``COLIMA_HOME`` / ``~/.colima`` directly.
+    - Otherwise, resolves the active Docker daemon from ``DOCKER_HOST`` or the active Docker
+      context (``DOCKER_CONTEXT`` / ``docker context inspect``) and maps its endpoint to the
+      exact Colima home and profile.
+    - Fails closed with :class:`ColimaConfigResolutionError` if the active Docker context/host
+      cannot be determined or cannot be mapped unambiguously to a running Colima profile.
     """
     em = os.environ if env is None else env
+    raw_home = (em.get("COLIMA_HOME") or "").strip()
     if colima_dir is not None:
         home_path = colima_dir
+    elif raw_home:
+        home_path = Path(raw_home).expanduser()
     else:
-        raw_home = (em.get("COLIMA_HOME") or "").strip()
-        home_path = Path(raw_home).expanduser() if raw_home else (Path.home() / ".colima")
+        home_path = Path.home() / ".colima"
 
     if colima_profile is not None and str(colima_profile).strip():
         return home_path, str(colima_profile).strip()
@@ -1199,7 +1331,53 @@ def resolve_active_colima_config(
         sub_env[str(k)] = str(v)
     sub_env["COLIMA_HOME"] = str(home_path)
 
+    docker_endpoint, docker_context, docker_err = _inspect_active_docker_endpoint(
+        env=sub_env,
+        run_fn=runner,
+        timeout_s=timeout_s,
+    )
+    if docker_err is not None or not docker_endpoint:
+        raise ColimaConfigResolutionError(
+            "Cannot determine active Docker context/endpoint to map Colima configuration: "
+            f"{docker_err or 'empty endpoint'}"
+        )
+
+    sock_home, sock_profile = _parse_colima_socket_path(
+        docker_endpoint,
+        expected_home=home_path,
+        realpath_fn=realpath_fn,
+    )
+    if sock_profile is None or sock_home is None:
+        raise ColimaConfigResolutionError(
+            f"Active Docker endpoint {docker_endpoint!r} "
+            f"(context={docker_context or 'DOCKER_HOST'}) does not map to a Colima socket; "
+            "refusing to guess Colima profile or virtual disk location"
+        )
+
+    # Use the actual Colima home indicated by the Docker context socket so preflight checks
+    # the real virtual disk file (not an unrelated default ~/.colima). If caller explicitly
+    # pinned a conflicting colima_dir, fail closed instead of silently checking the wrong home.
+    resolved_home = sock_home
+    if colima_dir is not None:
+        try:
+            pinned_real = Path(realpath_fn(str(colima_dir)))
+            sock_home_real = Path(realpath_fn(str(sock_home)))
+        except OSError:
+            pinned_real = colima_dir
+            sock_home_real = sock_home
+        if pinned_real != sock_home_real:
+            raise ColimaConfigResolutionError(
+                f"Active Docker endpoint {docker_endpoint!r} uses Colima home {sock_home} "
+                f"(profile={sock_profile!r}), which conflicts with specified colima_dir={colima_dir}"
+            )
+        resolved_home = colima_dir
+
+    # Verify against `colima list --json` under the resolved Colima home when available:
+    # if `colima list --json` reports running profiles and the Docker context's profile is NOT
+    # running there, fail closed so we never check a stopped/mismatched profile.
+    sub_env["COLIMA_HOME"] = str(resolved_home)
     running_profiles: list[str] = []
+    colima_list_ok = False
     try:
         proc = runner(
             ["colima", "list", "--json"],
@@ -1210,6 +1388,7 @@ def resolve_active_colima_config(
             env=sub_env,
         )
         if proc.returncode == 0 and proc.stdout:
+            colima_list_ok = True
             for line in proc.stdout.splitlines():
                 raw = line.strip()
                 if not raw:
@@ -1225,17 +1404,14 @@ def resolve_active_colima_config(
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    if running_profiles:
-        docker_host = (em.get("DOCKER_HOST") or "").strip()
-        if docker_host:
-            for prof in running_profiles:
-                if f"/{prof}/docker.sock" in docker_host:
-                    return home_path, prof
-        if "default" in running_profiles:
-            return home_path, "default"
-        return home_path, running_profiles[0]
+    if colima_list_ok and sock_profile not in running_profiles:
+        raise ColimaConfigResolutionError(
+            f"Active Docker context ({docker_context or 'DOCKER_HOST'}, endpoint={docker_endpoint!r}) "
+            f"maps to Colima profile {sock_profile!r} under {resolved_home}, but that profile is not "
+            f"running according to `colima list --json` (running={running_profiles})"
+        )
 
-    return home_path, "default"
+    return resolved_home, sock_profile
 
 
 def parse_df_available_bytes(df_stdout: str) -> int | None:
@@ -1311,17 +1487,35 @@ def preflight_disk_space(
     3. Host internal root ``/`` free space >= ``min_internal_gb`` (default 10 GB).
     4. Active Colima profile's ``/var/lib/docker`` free space >= ``min_colima_docker_gb`` (default 55 GB).
     """
-    colima_target, active_profile = resolve_active_colima_config(
-        colima_dir=colima_dir,
-        colima_profile=colima_profile,
-        env=env,
-        run_fn=colima_run_fn,
-    )
-    resolved_colima = Path(realpath_fn(str(colima_target)))
     checks: list[PreflightDiskCheckItem] = []
+    colima_target: Path | None = None
+    active_profile = ""
+    resolved_colima_str = ""
+    colima_resolution_err: str | None = None
+    try:
+        colima_target, active_profile = resolve_active_colima_config(
+            colima_dir=colima_dir,
+            colima_profile=colima_profile,
+            env=env,
+            run_fn=colima_run_fn,
+            realpath_fn=realpath_fn,
+        )
+        resolved_colima = Path(realpath_fn(str(colima_target)))
+        resolved_colima_str = str(resolved_colima)
+    except ColimaConfigResolutionError as exc:
+        colima_resolution_err = str(exc)
+        resolved_colima = None
 
     # Gate 0: Colima root AND active profile virtual disk file(s) must exist on external mount's st_dev
-    if not colima_target.exists() and not colima_target.is_symlink():
+    if colima_resolution_err is not None or colima_target is None or resolved_colima is None:
+        checks.append(
+            PreflightDiskCheckItem(
+                name="colima_location",
+                ok=False,
+                detail=colima_resolution_err or "Failed resolving active Colima configuration",
+            )
+        )
+    elif not colima_target.exists() and not colima_target.is_symlink():
         checks.append(
             PreflightDiskCheckItem(
                 name="colima_location",
@@ -1452,45 +1646,55 @@ def preflight_disk_space(
 
     # Gate 3: Active Colima profile's /var/lib/docker >= 55 GB (using the SAME resolved Colima config)
     req_colima = int(min_colima_docker_gb) * _BYTES_PER_GB
-    if colima_docker_free_bytes_fn is not None:
-        colima_free = colima_docker_free_bytes_fn()
-    else:
-        colima_free = _probe_colima_docker_free_bytes(
-            colima_home=colima_target,
-            profile=active_profile,
-            env=env,
-            run_fn=colima_run_fn if colima_run_fn is not None else subprocess.run,
-        )
-    if colima_free is None:
+    if colima_resolution_err is not None or colima_target is None:
         checks.append(
             PreflightDiskCheckItem(
                 name="colima_docker_free",
                 ok=False,
                 required_bytes=req_colima,
-                detail=(
-                    "Failed probing Colima /var/lib/docker free space "
-                    f"(required >= {min_colima_docker_gb} GB)"
-                ),
+                detail=f"Cannot probe Colima /var/lib/docker free space: {colima_resolution_err}",
             )
         )
     else:
-        ok_colima = int(colima_free) >= req_colima
-        checks.append(
-            PreflightDiskCheckItem(
-                name="colima_docker_free",
-                ok=ok_colima,
-                free_bytes=int(colima_free),
-                required_bytes=req_colima,
-                detail=(
-                    f"Colima /var/lib/docker free={int(colima_free) / _BYTES_PER_GB:.1f} GB "
-                    f"(required >= {min_colima_docker_gb} GB)"
-                ),
+        if colima_docker_free_bytes_fn is not None:
+            colima_free = colima_docker_free_bytes_fn()
+        else:
+            colima_free = _probe_colima_docker_free_bytes(
+                colima_home=colima_target,
+                profile=active_profile,
+                env=env,
+                run_fn=colima_run_fn if colima_run_fn is not None else subprocess.run,
             )
-        )
+        if colima_free is None:
+            checks.append(
+                PreflightDiskCheckItem(
+                    name="colima_docker_free",
+                    ok=False,
+                    required_bytes=req_colima,
+                    detail=(
+                        "Failed probing Colima /var/lib/docker free space "
+                        f"(required >= {min_colima_docker_gb} GB)"
+                    ),
+                )
+            )
+        else:
+            ok_colima = int(colima_free) >= req_colima
+            checks.append(
+                PreflightDiskCheckItem(
+                    name="colima_docker_free",
+                    ok=ok_colima,
+                    free_bytes=int(colima_free),
+                    required_bytes=req_colima,
+                    detail=(
+                        f"Colima /var/lib/docker free={int(colima_free) / _BYTES_PER_GB:.1f} GB "
+                        f"(required >= {min_colima_docker_gb} GB)"
+                    ),
+                )
+            )
 
     return PreflightDiskReport(
         ok=all(c.ok for c in checks),
-        colima_resolved_path=str(resolved_colima),
+        colima_resolved_path=resolved_colima_str,
         checks=tuple(checks),
     )
 
