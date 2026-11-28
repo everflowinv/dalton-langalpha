@@ -7,10 +7,11 @@ skill off) has no page to read, so its prompt names none. A subagent's prompt
 has no such section and keeps the pointer each of its sections carries.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langgraph.graph.state import CompiledStateGraph
 
 from ptc_agent.agent.agent import PTCAgent
 from ptc_agent.agent.prompts import get_loader, guidance_template_vars
@@ -23,6 +24,10 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
 )
+from ptc_agent.core.mcp_registry import MCPRegistry
+from ptc_agent.core.sandbox.asset_gate import AssetGate
+from ptc_agent.core.sandbox.drive_mount import NO_DRIVE
+from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
 PREFIX = ".agents/skills/langalpha-doc/"
 # Page -> the build flags its case needs.
@@ -64,17 +69,30 @@ def _built_prompt(*, skills: bool = True, disabled: frozenset[str] = frozenset()
 
     def fake_create_agent(_model, **built):
         captured.append(built)
-        graph = MagicMock()
+        graph = create_autospec(CompiledStateGraph, instance=True)
         graph.with_config.return_value = graph
         return graph
 
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.config = config
+    sandbox.assets = AssetGate()
+    sandbox.livefs = None
+    sandbox.drive = NO_DRIVE
+    sandbox.history = None
+    sandbox.sandbox_id = "sb-1"
+    sandbox.runtime = None
+    sandbox.call_filer = None
+    sandbox.paid_calls = None
+    sandbox.livefs_lost = False
+    mcp_registry = create_autospec(MCPRegistry, instance=True)
+    mcp_registry.get_all_tools.return_value = {}
     with (
         patch.object(AgentConfig, "get_llm_client", return_value=llm),
         patch("ptc_agent.agent.middleware.compaction.compact.create_llm", return_value=llm),
         patch("ptc_agent.agent.agent.create_agent", side_effect=fake_create_agent),
     ):
         PTCAgent(config).create_agent(
-            llm=llm, thread_id="t-1", sandbox=MagicMock(), mcp_registry=MagicMock()
+            llm=llm, thread_id="t-1", sandbox=sandbox, mcp_registry=mcp_registry
         )
     return str(captured[0]["system_prompt"])
 

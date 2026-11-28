@@ -63,11 +63,29 @@ _JS_TOKEN_RE = re.compile(
 # (e.g., missing closing `-->` / `*/`, or wrong spacing/casing).
 _STRAY_MARKER_RE = re.compile(r"(?:/?DALTON_CAP(?:_ELSE|:)?)", re.IGNORECASE)
 
+# Strip developer-only DALTON hook HTML comments from assembled markdown so they never reach the model.
+_DALTON_HOOK_HTML_COMMENT_RE = re.compile(
+    r"<!--\s*DALTON-" r"HOOK\([^)]*\)[\s\S]*?-->\n?"
+)
+
 _ASSEMBLED_TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {".md", ".mdx", ".txt", ".js", ".json", ".yaml", ".yml"}
 )
 
-_VALID_CAPABILITY_VALUES: str = ", ".join(sorted(c.value for c in CapabilityId))
+
+def _is_artifact_comments_enabled() -> bool:
+    from src.dalton.settings import is_artifact_publishing_enabled
+
+    return bool(is_artifact_publishing_enabled())
+
+
+_RUNTIME_SWITCH_EVALUATORS: dict[str, Any] = {
+    "artifact_comments": _is_artifact_comments_enabled,
+}
+
+_VALID_CAPABILITY_VALUES: str = ", ".join(
+    sorted([*(c.value for c in CapabilityId), *_RUNTIME_SWITCH_EVALUATORS.keys()])
+)
 
 
 def _format_loc(path: Path | str | None, text: str | None = None, pos: int | None = None) -> str:
@@ -123,14 +141,17 @@ def evaluate_capability_expr(
                 raise ContentAssemblyError(
                     f"{loc}: invalid DALTON_CAP expression {expr!r} (misplaced '!')"
                 )
-            try:
-                cap = CapabilityId(cap_name)
-            except ValueError as exc:
-                raise ContentAssemblyError(
-                    f"{loc}: unknown capability {cap_name!r} in DALTON_CAP expression {expr!r} "
-                    f"(valid: {_VALID_CAPABILITY_VALUES})"
-                ) from exc
-            present = cap in active_caps
+            if cap_name in _RUNTIME_SWITCH_EVALUATORS:
+                present = bool(_RUNTIME_SWITCH_EVALUATORS[cap_name]())
+            else:
+                try:
+                    cap = CapabilityId(cap_name)
+                except ValueError as exc:
+                    raise ContentAssemblyError(
+                        f"{loc}: unknown capability {cap_name!r} in DALTON_CAP expression {expr!r} "
+                        f"(valid: {_VALID_CAPABILITY_VALUES})"
+                    ) from exc
+                present = cap in active_caps
             if negate:
                 present = not present
             if not present:
@@ -419,6 +440,8 @@ def assemble_markdown_text(
     """Assemble Markdown/text content with ``<!-- DALTON_CAP:... -->`` blocks."""
     active_caps = effective_capabilities() if capabilities is None else capabilities
     out = _assemble_stacked(text, _HTML_TOKEN_RE, active_caps, path=path)
+    if "<!--" in out:
+        out = _DALTON_HOOK_HTML_COMMENT_RE.sub("", out)
     if path is not None:
         out = _assemble_langalpha_doc_markdown(out, Path(path).as_posix())
     if not any(cap in active_caps for cap in _PROPRIETARY_RESEARCH_CAPS):

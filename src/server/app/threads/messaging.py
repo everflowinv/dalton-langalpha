@@ -1735,11 +1735,11 @@ async def replay_thread_messages(
         resolved_source = page.source
         paged = limit is not None or before_turn is not None
 
-        # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs
+        # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs per PagePart
         from src.dalton.share_media import prepare_owner_replay_media
 
         replay_lines, _media_set_cookies = await prepare_owner_replay_media(
-            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id
+            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id, page=page
         )
 
         async def event_generator():

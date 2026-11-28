@@ -6,7 +6,9 @@
 import { useEffect, useMemo, type ReactNode, type RefObject } from 'react';
 import type { IChartApi, ISeriesApi } from 'lightweight-charts';
 import { useTranslation } from 'react-i18next';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(artifact-publishing-off)
+import { useTeamReadOnly } from '@/pages/ChatAgent/components/dalton/TeamSharing'; // DALTON-HOOK(team-sharing)
 import { ChartComments, type ChartCommentsHost } from '@/pages/ChatAgent/components/viewers/comments/chart/ChartComments';
 import { CommentTools } from '@/pages/ChatAgent/components/viewers/html/comments/CommentTools';
 import type { ChartLayerDrawing } from './useChartLayerIntegration';
@@ -36,15 +38,23 @@ export function useChartComments(
 ): ChartCommentsWiring {
   const { t } = useTranslation();
   // DALTON-HOOK(artifact-publishing-off): chart comments ride the deployment's
-  // file-comments switch; off, a chart shows no comment controls at all.
+  // file-comments switch and reuse file-comment caller identity and workspace
+  // ownership checks (external/unconfirmed callers and colleague workspaces get no entry).
   const { artifactCommentsEnabled } = useCapabilities();
-  const comments = artifactCommentsEnabled ? host : null;
+  const identity = useCallerIdentity(); // DALTON-HOOK(external-share-guard)
+  const teamReadOnly = useTeamReadOnly(workspaceId); // DALTON-HOOK(team-sharing)
+  const canComment =
+    artifactCommentsEnabled
+    && identity.canActAsOwner
+    && !identity.isConfirming
+    && !teamReadOnly.isColleague;
+  const comments = canComment ? host : null;
   const mode = isCustom && !!comments && comments.ui.modeTab === comments.tabId;
-  const { setMode } = comments?.ui ?? {};
-  const tab = comments?.tabId;
+  const { setMode } = host?.ui ?? {};
+  const tab = host?.tabId;
   useEffect(() => {
-    if (!isCustom && tab) setMode?.(tab, false);
-  }, [isCustom, tab, setMode]);
+    if ((!isCustom || !canComment) && tab) setMode?.(tab, false);
+  }, [isCustom, canComment, tab, setMode]);
 
   const kept = comments && workspaceId && chartId ? { comments, workspaceId, chartId } : null;
   // The same element while nothing it shows changes, so a live bar repainting the chart passes it by.

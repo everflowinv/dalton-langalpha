@@ -23,8 +23,6 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from fastapi import HTTPException
-
 from src.server.database.conversation.replay_rows import ThreadRows
 from src.server.database.shared_workspaces import is_holder
 from src.server.services.forks.model import Borrowing, ForkLineage
@@ -226,7 +224,7 @@ class _BorrowedRead:
                 before_turn=top + 1,
                 limit=room.limit,
                 budget=room.budget,
-                persist=self.persist,  # DALTON-HOOK(team-sharing)
+                persist=False,  # DALTON-HOOK(team-sharing): borrowed ancestor reads never persist turn slices
             )
             self.stubbed = self.stubbed or resolved == "stub"
             if page.turns:
@@ -275,11 +273,12 @@ class _BorrowedRead:
         return state, rows
 
     async def _readable(self, thread_id: str) -> bool:
-        try:
-            await thread_access(thread_id, self.viewer)
-        except HTTPException:
-            return False
-        return True
+        # DALTON-HOOK(colleague-dispatch): reuse Dalton colleague/workspace-owner read access in multiuser mode
+        from src.dalton.sharing import check_borrowed_thread_readable
+
+        return await check_borrowed_thread_readable(
+            thread_id, self.viewer, upstream_access=thread_access
+        )
 
     async def _divider(self) -> Line:
         ancestors = self.ancestors

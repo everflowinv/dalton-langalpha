@@ -93,10 +93,11 @@ For anything computed from the bars, read `.agents/skills/chart-annotation/refer
 
 `manage_chart_layers` lists the layers on a chart with their ids, and deletes them by id or all at once. The chart's own lines (52-week high, analyst targets, earnings markers) are the app's and stay.
 
-## A comment on the chart
+<!-- DALTON-HOOK(artifact-publishing-off): gate chart comment reply instructions on the file-comments switch -->
+<!-- DALTON_CAP:artifact_comments -->## A comment on the chart
 
 A comment with `<chart>` is on part of that chart. Its anchor is a `<region>`, a time span and price range with a `<picture>` of it; a `<point>`, one price at one time; or a `<layer>` and `<element>`, one of your shapes named as the read-back names it, with `<at>` where the user clicked. It carries no bars: fetch them with `bars()`. Answer with `reply_to_comment`, and when it helps, draw your read on the same chart: `c.box((start, high), (end, low))` over a region, `c.marker(time)` or `c.level(price)` at a point, or republish the layer under its id with the element changed.
 
-## A chart for a report
+<!-- /DALTON_CAP -->## A chart for a report
 
 A layer is for the live chart. A chart that goes into a report, PDF or deck is an image you render in code. When the user asks to see the live chart, link the snapshot PNG: it is their chart.

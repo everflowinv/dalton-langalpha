@@ -1616,9 +1616,17 @@ def test_dockerfile_installs_the_toolset_as_the_recipe_does():
     assert copied == list(step.files)
     assert {(_ROOT / source).parent for source in sources} == {step.source}
     (command,) = run.commands
-    assert f"\nRUN {command}\n" in _DOCKERFILE
+    # DALTON-HOOK(browser-kill-switch): Dockerfile.sandbox gates the toolset
+    # converge on ARG INSTALL_AGENT_BROWSER=1 (upstream default=1 runs the
+    # exact recipe command; Dalton builds pass INSTALL_AGENT_BROWSER=0 to skip).
+    assert "\nARG INSTALL_AGENT_BROWSER=1\n" in _DOCKERFILE
+    assert (
+        f'\nRUN if [ "${{INSTALL_AGENT_BROWSER}}" = "1" ]; then {command}; fi\n'
+        in _DOCKERFILE
+    )
     # The browser's pins live in the table now, not beside the Dockerfile.
-    assert "AGENT_BROWSER" not in _DOCKERFILE
+    assert "AGENT_BROWSER_VERSION" not in _DOCKERFILE
+    assert "AGENT_BROWSER_SHA256" not in _DOCKERFILE
     assert "chrome_for_testing/policies" not in _DOCKERFILE
 
 

@@ -4278,7 +4278,7 @@ async def _build_borrowed_fork_public_replay(
         before_turn=before_turn,
         limit=PUBLIC_SHARE_MAX_TURNS,
         budget=budget,
-        persist=eff.allow_files,
+        persist=False,
     )
 
     borrowed_tids = [
@@ -4363,16 +4363,23 @@ async def _build_borrowed_fork_public_replay(
             if ws_from_rows:
                 thread_for_media["workspace_id"] = str(ws_from_rows)
 
-        bindings = await resolve_thread_media_bindings(
-            thread_for_media,
-            part_rows.queries if part_rows is not None else (),
-            part_items,
-        )
+        from src.dalton.share_media import match_borrowed_segment_index
+
+        seg_index = match_borrowed_segment_index(lineage, part) if is_borrowed else None
+        if is_borrowed and seg_index is None:
+            bindings = None
+        else:
+            bindings = await resolve_thread_media_bindings(
+                thread_for_media,
+                part_rows.queries if part_rows is not None else (),
+                part_items,
+            )
         part_items = rewrite_items_for_public_media(
             part_items,
             thread_id=thread_id,
             share_token=share_token,
             bindings=bindings,
+            source_segment_index=seg_index,
             source_thread_id=part_tid if is_borrowed else None,
         )
         emitted_events.extend(
