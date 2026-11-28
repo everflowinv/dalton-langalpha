@@ -454,7 +454,7 @@
 
 > **治理准则**：C 类变量绑定在 Everflow 单机宿主机 `researchdata_bridge.py`、私有商业数据授权、Supabase 托管认证准入、宿主机 `launchd`（macOS 系统守护进程管理器）运维脚本或上游 Ginlix 多租户云平台上。核心安装（`DALTON_PROFILE=core`）通过 `src.dalton.profile` 与 `src.dalton.capabilities` 默认关闭并隐去，这些变量继续留在 Everflow 生产 `.env` 与 `~/.config/dalton/*.env`。
 
-#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（40 项）
+#### C1. Everflow 宿主机研究桥（`researchdata_bridge`）与专有数据源能力开关（37 项；11-28 停用代码清理删去 3 项）
 
 | 变量名 | 来源 | 用途 | 谁读取 | 读取时机 | 改动后生效方式 | 核心安装是否需要 |
 |---|---|---|---|---|---|---|

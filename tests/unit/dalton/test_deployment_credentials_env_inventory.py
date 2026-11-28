@@ -351,7 +351,7 @@ def test_design_doc_four_categories_are_disjoint_and_cover_all_b1_fields() -> No
             assert overlap == set(), f"Categories {left} and {right} overlap: {sorted(overlap)}"
 
     total = sum(len(inv[c]) for c in categories)
-    assert total == 460, f"Expected 460 archived env keys across A/B/C/D, got {total}"
+    assert total == 459, f"Expected 459 archived env keys across A/B/C/D, got {total}"
 
     b1_catalog_names = {spec.name for spec in BATCH1_FIELD_SPECS}
     assert len(b1_catalog_names) == 6
