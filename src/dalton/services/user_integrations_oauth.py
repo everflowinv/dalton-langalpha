@@ -74,6 +74,7 @@ from src.dalton.integrations.constants import (
     PENDING_CONFIRMATION_TTL_SECONDS,
     build_integration_redirect_uri,
     get_connector_spec,
+    is_google_calendar_write_scope,
     scope_satisfied,
 )
 from src.dalton.integrations.oauth_clients import (
@@ -848,8 +849,17 @@ async def start_oauth_authorization(
 
         if not switch_account and same_client_active:
             merged_scopes: set[str] = set(target_scopes)
+            stripped_calendar_write = False
             for row in same_client_active:
-                merged_scopes.update(_parse_scopes(row.granted_scopes))
+                for scope in _parse_scopes(row.granted_scopes):
+                    if is_google_calendar_write_scope(scope):
+                        stripped_calendar_write = True
+                        continue
+                    merged_scopes.add(scope)
+            if stripped_calendar_write and any(
+                r.service == "calendar" for r in same_client_active
+            ):
+                merged_scopes.update(GOOGLE_CALENDAR_MIN_SCOPES)
             requested_scope_str = _format_scopes(merged_scopes)
             include_granted = "true"
             prompt = "consent"

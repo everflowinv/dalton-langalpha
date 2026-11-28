@@ -51,6 +51,24 @@ GOOGLE_CALENDAR_MIN_SCOPES: tuple[str, ...] = (
     GOOGLE_SCOPE_CALENDAR_LIST_RO,
     GOOGLE_SCOPE_CALENDAR_EVENTS_RO,
 )
+GOOGLE_CALENDAR_WRITE_SCOPES: frozenset[str] = frozenset(
+    {
+        GOOGLE_SCOPE_CALENDAR_EVENTS,
+        GOOGLE_SCOPE_CALENDAR_FULL,
+    }
+)
+
+
+def is_google_calendar_write_scope(scope: str) -> bool:
+    """Return True if ``scope`` is a Google Calendar write or full-access scope."""
+    cleaned = str(scope or "").strip()
+    if cleaned in GOOGLE_CALENDAR_WRITE_SCOPES:
+        return True
+    return (
+        cleaned.startswith("https://www.googleapis.com/auth/calendar.")
+        and not cleaned.endswith(".readonly")
+        and cleaned != "https://www.googleapis.com/auth/calendar.freebusy"
+    )
 GOOGLE_GMAIL_MIN_SCOPES: tuple[str, ...] = (GOOGLE_SCOPE_GMAIL_READONLY,)
 GOOGLE_GMAIL_DRAFT_SCOPES: tuple[str, ...] = (
     GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE,

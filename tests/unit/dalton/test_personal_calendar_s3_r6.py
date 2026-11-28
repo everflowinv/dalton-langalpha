@@ -219,10 +219,14 @@ async def test_r6_langsmith_tracing_disables_calendar_readiness_blocks_oauth_and
     assert cap_mod.is_langsmith_tracing_active() is True
 
     summary_on = cap_mod.get_connector_providers_summary()
-    assert summary_on["google"]["ready"] is False
+    assert summary_on["google"]["ready"] is True
     assert summary_on["google"]["langsmith_tracing_enabled"] is True
-    assert summary_on["feishu"]["ready"] is False
+    assert summary_on["google"]["services"]["calendar"]["ready"] is False
+    assert summary_on["google"]["services"]["mail"]["ready"] is True
+    assert summary_on["feishu"]["ready"] is True
     assert summary_on["feishu"]["langsmith_tracing_enabled"] is True
+    assert summary_on["feishu"]["services"]["calendar"]["ready"] is False
+    assert summary_on["feishu"]["services"]["mail"]["ready"] is True
 
     # Neither CoS nor Analyst mounts dalton_calendar (covers PTC, Claude Code, and subagents).
     assert not any(t.name == "dalton_calendar" for t in build_dalton_tools("chief_of_staff"))

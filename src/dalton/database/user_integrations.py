@@ -839,8 +839,12 @@ async def record_touch(
                     """,
                     (tid,),
                 )
-                return True
-            return False
+            from src.dalton.services.personal_integration_guard import (
+                mark_thread_personal_private_runtime,
+            )
+
+            mark_thread_personal_private_runtime(tid)
+            return not was_private
 
     if conn is not None:
         return await _run(conn)

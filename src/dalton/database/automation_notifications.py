@@ -25,7 +25,6 @@ from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import (
     _build_feishu_personal_redirect_notice_card,
     _default_notify_admin,
-    _is_group_notify_target,
     _resolve_unit_managed_notify_gate,
     _split_target_channel,
     dalton_kind_for_stored_category,
@@ -435,24 +434,18 @@ async def _eligibility(
     )
     if not gate_ok:
         return False, gate_reason
-    allowed, reason, effective_targets = await evaluate_user_notify_eligibility(
+    allowed, reason, _effective_targets = await evaluate_user_notify_eligibility(
         user_id,
         automation,
         target=target,
         include_chat_targets=gate_include_chats,
+        allow_personal_dm_redirect=allow_personal_dm_redirect,
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,
         resolve_routes_fn=resolve_routes_fn,
         is_admin_fn=is_admin_fn,
     )
-    if (
-        not allowed
-        and reason == "target_removed"
-        and allow_personal_dm_redirect
-        and any(_is_group_notify_target(t) for t in effective_targets)
-    ):
-        return True, None
     return allowed, reason
 
 

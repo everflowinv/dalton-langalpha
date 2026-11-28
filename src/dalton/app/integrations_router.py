@@ -39,6 +39,7 @@ from src.dalton.capabilities import (
     CapabilityId,
     effective_capabilities,
     get_connector_providers_summary,
+    is_connector_service_ready,
     require_personal_integration_capability,
 )
 from src.dalton.company_identity import is_company_system_user
@@ -471,6 +472,9 @@ async def list_personal_integrations_endpoint(
     for spec in PERSONAL_INTEGRATION_CONNECTOR_SPECS:
         cap_enabled = CapabilityId(spec.capability_id) in active_caps
         p_info = provider_summary.get(spec.provider, {})
+        tracing_blocked = bool(
+            spec.service == "calendar" and p_info.get("langsmith_tracing_enabled")
+        )
         connectors.append(
             {
                 "provider": spec.provider,
@@ -478,11 +482,9 @@ async def list_personal_integrations_endpoint(
                 "capability_id": spec.capability_id,
                 "batch": spec.batch,
                 "enabled": cap_enabled,
-                "ready": bool(p_info.get("ready")),
+                "ready": is_connector_service_ready(p_info, spec.service),
                 "credentials_ready": bool(p_info.get("credentials_ready")),
-                "langsmith_tracing_enabled": bool(
-                    p_info.get("langsmith_tracing_enabled")
-                ),
+                "langsmith_tracing_enabled": tracing_blocked,
                 "callback_url": build_integration_redirect_uri(spec.provider),
                 "events_url": (
                     build_feishu_integration_events_url()

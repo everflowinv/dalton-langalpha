@@ -18,6 +18,7 @@ Enforces the same caller-identity and effective privacy policy for both
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
@@ -79,6 +80,65 @@ PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE = (
 _CHANNEL_PLATFORMS: frozenset[str] = frozenset(
     {"feishu", "discord", "weixin", "telegram", "slack"}
 )
+
+# Bounded in-process set of thread IDs known to carry personal integration data so
+# synchronous SSE event logging redacts payloads from the very first read without
+# waiting for a DB round-trip per frame.
+_PERSONAL_PRIVATE_RUNTIME_MAX = 4096
+_PERSONAL_PRIVATE_THREADS: OrderedDict[str, None] = OrderedDict()
+
+
+def _norm_runtime_thread_id(thread_id: str | None) -> str:
+    return str(thread_id or "").strip().lower()
+
+
+def mark_thread_personal_private_runtime(thread_id: str | None) -> None:
+    """Record ``thread_id`` in the bounded in-process personal-private set."""
+    tid = _norm_runtime_thread_id(thread_id)
+    if not tid:
+        return
+    _PERSONAL_PRIVATE_THREADS.pop(tid, None)
+    _PERSONAL_PRIVATE_THREADS[tid] = None
+    while len(_PERSONAL_PRIVATE_THREADS) > _PERSONAL_PRIVATE_RUNTIME_MAX:
+        _PERSONAL_PRIVATE_THREADS.popitem(last=False)
+
+
+def is_thread_personal_private_runtime(thread_id: str | None) -> bool:
+    """Return True if ``thread_id`` is known in-process to carry personal integration data."""
+    if not is_dalton_enabled():
+        return False
+    tid = _norm_runtime_thread_id(thread_id)
+    if not tid:
+        return False
+    return tid in _PERSONAL_PRIVATE_THREADS
+
+
+def clear_thread_personal_private_runtime(thread_id: str | None = None) -> None:
+    """Clear one ``thread_id`` (or the entire cache when None) from the runtime set."""
+    if thread_id is None:
+        _PERSONAL_PRIVATE_THREADS.clear()
+        return
+    tid = _norm_runtime_thread_id(thread_id)
+    if tid:
+        _PERSONAL_PRIVATE_THREADS.pop(tid, None)
+
+
+async def is_thread_sse_log_redacted(
+    thread_id: str | None,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True if SSE log payloads for ``thread_id`` must be omitted."""
+    if not is_dalton_enabled():
+        return False
+    if is_thread_personal_private_runtime(thread_id):
+        return True
+    if not thread_id:
+        return False
+    if await is_thread_personal_private(str(thread_id), conn=conn):
+        mark_thread_personal_private_runtime(str(thread_id))
+        return True
+    return False
 
 
 class PersonalIntegrationNotSharableError(HTTPException):
@@ -786,6 +846,9 @@ async def verify_personal_integration_surface(
             hint=ctx["turn_index"],
         )
 
+        if bool(row.get("has_personal_integration_data")):
+            mark_thread_personal_private_runtime(thread_id)
+
         is_first_touch = False
         if (
             record_touch_now
@@ -804,6 +867,7 @@ async def verify_personal_integration_surface(
                 provider_account_id=provider_account_id,
                 conn=db_conn,
             )
+            mark_thread_personal_private_runtime(thread_id)
 
         notice: str | None = None
         first_touch_event: dict[str, Any] | None = None
@@ -1320,11 +1384,15 @@ __all__ = [
     "check_personal_thread_send_allowed",
     "check_thread_surface_still_private",
     "claim_first_touch_notice_if_needed",
+    "clear_thread_personal_private_runtime",
     "enforce_personal_thread_owner_only",
     "extract_surface_context",
     "get_thread_creator_user_id",
     "is_thread_personal_private",
+    "is_thread_personal_private_runtime",
+    "is_thread_sse_log_redacted",
     "list_bound_personal_dm_targets",
+    "mark_thread_personal_private_runtime",
     "verify_personal_dm_target_bound",
     "verify_personal_integration_surface",
 ]

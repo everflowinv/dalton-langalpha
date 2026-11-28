@@ -385,6 +385,8 @@ class RunSSEProducer:
         self.interrupt_reason: Optional[str] = None
         # A credit pause's denial, which the finalize stamps on the row.
         self.pause_message: Optional[str] = None
+        # DALTON-HOOK(personal-integrations): redact SSE log bodies once a thread carries personal integration data
+        self._personal_integration_sse_redacted: bool = False
 
     def _open_compaction_window(self, ns_key: tuple) -> None:
         """Track a newly-opened compaction window. The FIRST window on this
@@ -483,6 +485,16 @@ class RunSSEProducer:
             from src.tools.decorators import _tool_usage_context
             _tool_usage_context.set(self.tool_tracker)
             logger.debug(f"[RunSSEProducer] Tool usage tracking ContextVar set for thread_id={self.thread_id}")
+
+        # DALTON-HOOK(personal-integrations): pre-check whether this thread already carries personal integration data
+        if not getattr(self, "_personal_integration_sse_redacted", False):
+            from src.dalton.services.personal_integration_guard import (
+                is_thread_sse_log_redacted,
+            )
+
+            self._personal_integration_sse_redacted = await is_thread_sse_log_redacted(
+                self.thread_id
+            )
 
         _stream_span = _otel_tracer.start_span(
             "chat.turn.stream",
@@ -831,6 +843,7 @@ class RunSSEProducer:
 
                         # DALTON-HOOK(personal-integrations): emit live first-touch privacy notice onto the turn stream
                         if event_type == "personal_integration_notice":
+                            self._personal_integration_sse_redacted = True
                             yield self._build_sse_event(
                                 "personal_integration_notice",
                                 {
@@ -2186,7 +2199,18 @@ class RunSSEProducer:
 
         # Log SSE events to dedicated logger if enabled
         if SSE_EVENT_LOG_ENABLED:
-            sse_logger.info(f"{result}")
+            # DALTON-HOOK(personal-integrations): log only sequence id and event type on personal-private threads
+            from src.dalton.services.personal_integration_guard import (
+                is_thread_personal_private_runtime,
+            )
+
+            if getattr(self, "_personal_integration_sse_redacted", False) or (
+                is_thread_personal_private_runtime(self.thread_id)
+            ):
+                self._personal_integration_sse_redacted = True
+                sse_logger.info(f"id: {self.event_sequence}\nevent: {event_type}\n\n")
+            else:
+                sse_logger.info(f"{result}")
 
         return result
 

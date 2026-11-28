@@ -598,6 +598,32 @@ def is_langsmith_tracing_active(
     return False
 
 
+def is_connector_service_ready(
+    provider_summary: Mapping[str, Any] | None,
+    service: str,
+) -> bool:
+    """Return whether ``service`` (``calendar`` or ``mail``) is ready on ``provider_summary``.
+
+    LangSmith tracing mutual exclusion applies only to ``calendar``; ``mail``
+    readiness depends strictly on provider OAuth/origin/encryption setup.
+    """
+    if not isinstance(provider_summary, Mapping):
+        return False
+    norm_service = str(service or "").strip().lower()
+    services_map = provider_summary.get("services")
+    if isinstance(services_map, Mapping):
+        svc_info = services_map.get(norm_service)
+        if isinstance(svc_info, Mapping) and "ready" in svc_info:
+            return bool(svc_info["ready"])
+    if not bool(provider_summary.get("ready")):
+        return False
+    if norm_service == "calendar" and bool(
+        provider_summary.get("langsmith_tracing_enabled")
+    ):
+        return False
+    return True
+
+
 def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
     """Return a redacted readiness summary for personal integration providers (§6).
 
@@ -623,6 +649,8 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
         and str(f_event.values.get("DALTON_FEISHU_ENCRYPT_KEY") or "").strip()
         and str(f_event.values.get("DALTON_FEISHU_VERIFICATION_TOKEN") or "").strip()
     )
+    g_base_ready = bool(g_group.ready and g_uri_ok and enc_ok)
+    f_base_ready = bool(f_group.ready and bool(public_url) and enc_ok)
 
     return {
         "google": {
@@ -632,9 +660,17 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
             "redirect_uri_reason": g_uri_reason,
             "encryption_configured": enc_ok,
             "langsmith_tracing_enabled": langsmith_tracing_on,
-            "ready": bool(
-                g_group.ready and g_uri_ok and enc_ok and not langsmith_tracing_on
-            ),
+            "ready": g_base_ready,
+            "services": {
+                "calendar": {
+                    "ready": bool(g_base_ready and not langsmith_tracing_on),
+                    "langsmith_tracing_enabled": langsmith_tracing_on,
+                },
+                "mail": {
+                    "ready": g_base_ready,
+                    "langsmith_tracing_enabled": False,
+                },
+            },
         },
         "feishu": {
             "credentials_ready": bool(f_group.ready),
@@ -643,9 +679,17 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
             "public_url_configured": bool(public_url),
             "encryption_configured": enc_ok,
             "langsmith_tracing_enabled": langsmith_tracing_on,
-            "ready": bool(
-                f_group.ready and bool(public_url) and enc_ok and not langsmith_tracing_on
-            ),
+            "ready": f_base_ready,
+            "services": {
+                "calendar": {
+                    "ready": bool(f_base_ready and not langsmith_tracing_on),
+                    "langsmith_tracing_enabled": langsmith_tracing_on,
+                },
+                "mail": {
+                    "ready": f_base_ready,
+                    "langsmith_tracing_enabled": False,
+                },
+            },
         },
     }
 
@@ -658,7 +702,7 @@ def capabilities_fingerprint(
     canonical_caps = ",".join(sorted(cap.value for cap in active))
     providers = get_connector_providers_summary()
     canonical_providers = ",".join(
-        f"{name}:{int(bool(info.get('ready')))}:{int(bool(info.get('event_credentials_ready', False)))}"
+        f"{name}:{int(bool(info.get('ready')))}:{int(bool(info.get('event_credentials_ready', False)))}:{int(bool(info.get('langsmith_tracing_enabled', False)))}"
         for name, info in sorted(providers.items())
     )
     canonical = f"{canonical_caps}|connectors={canonical_providers}"
@@ -757,9 +801,14 @@ def require_personal_integration_capability(
         )
 
     norm_provider = str(provider).strip().lower()
+    norm_service = str(service).strip().lower()
     summary = get_connector_providers_summary().get(norm_provider)
-    if not summary or not summary.get("ready"):
-        if summary and summary.get("langsmith_tracing_enabled"):
+    if not is_connector_service_ready(summary, norm_service):
+        if (
+            norm_service == "calendar"
+            and summary
+            and summary.get("langsmith_tracing_enabled")
+        ):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -767,7 +816,7 @@ def require_personal_integration_capability(
                     "reason": "langsmith_tracing_enabled",
                     "message": "当前部署开启了调用追踪，个人日历不可用。",
                     "provider": norm_provider,
-                    "service": str(service).strip().lower(),
+                    "service": norm_service,
                     "missing": ["langsmith_tracing_disabled"],
                 },
             )
@@ -788,7 +837,7 @@ def require_personal_integration_capability(
                 "code": "personal_integrations_not_ready",
                 "message": "管理员尚未完成该个人集成的 OAuth 凭据或加密环境配置，请先在「部署设置 → 集成凭据」配置后再连接。",
                 "provider": norm_provider,
-                "service": str(service).strip().lower(),
+                "service": norm_service,
                 "missing": missing,
             },
         )

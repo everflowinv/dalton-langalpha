@@ -40,6 +40,7 @@ from src.dalton.capabilities import (
     CapabilityId,
     effective_capabilities,
     get_connector_providers_summary,
+    is_connector_service_ready,
     is_langsmith_tracing_active,
 )
 from src.dalton.database import user_integrations as db
@@ -300,7 +301,9 @@ def _provider_not_ready_command(
 ) -> Command | None:
     """Reuse backend ``ready`` summary to give admin-setup guidance when connectors are not ready."""
     summary = get_connector_providers_summary()
-    not_ready = [p for p in providers if not bool((summary.get(p) or {}).get("ready"))]
+    not_ready = [
+        p for p in providers if not is_connector_service_ready(summary.get(p), "calendar")
+    ]
     if not not_ready or len(not_ready) < len(providers):
         return None
     names = "或".join(_provider_display_name(p) for p in not_ready)
@@ -1346,7 +1349,9 @@ def create_calendar_tools(
                     return not_ready_cmd
                 summary_map = get_connector_providers_summary()
                 ready_providers = [
-                    p for p in enabled_providers if bool((summary_map.get(p) or {}).get("ready"))
+                    p
+                    for p in enabled_providers
+                    if is_connector_service_ready(summary_map.get(p), "calendar")
                 ] or enabled_providers
                 avail_names = "或".join(_provider_display_name(p) for p in ready_providers)
                 return _error_command(

@@ -2515,6 +2515,63 @@ def _build_feishu_personal_redirect_notice_card(notice_text: str) -> dict[str, A
     }
 
 
+async def _evaluate_personal_private_delivery_target(
+    *,
+    row: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    target: str,
+) -> tuple[bool, str | None, bool, bool]:
+    """Enforce personal-private redirect & current DM binding verification for a delivery row.
+
+    Returns ``(allowed, skip_reason, allow_personal_dm_redirect, is_group_notice)``.
+    Shared between initial settlement and retry so both apply the exact same
+    redirect-to-owner-DM rule and verify the thread creator's current channel
+    binding before every send attempt.
+    """
+    from src.dalton.services.personal_integration_guard import (
+        get_thread_creator_user_id,
+        is_thread_personal_private,
+        verify_personal_dm_target_bound,
+    )
+
+    row_thread_id = (
+        str(
+            payload.get("thread_id")
+            or payload.get("conversation_thread_id")
+            or row.get("conversation_thread_id")
+            or row.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
+    is_group_notice = bool(payload.get("personal_private_group_notice"))
+    is_dm_redirect = bool(payload.get("personal_private_dm_redirect"))
+    thread_is_personal_private = bool(
+        row_thread_id and await is_thread_personal_private(row_thread_id)
+    )
+    if not (thread_is_personal_private or is_group_notice or is_dm_redirect):
+        return (True, None, False, False)
+
+    _, cleaned_tgt = _split_target_channel(target)
+    if is_group_notice:
+        if not _is_group_notify_target(cleaned_tgt):
+            return (False, "invalid_notice_target", False, True)
+        return (True, None, False, True)
+
+    if not _is_personal_dm_notify_target(cleaned_tgt):
+        return (False, "personal_integration_private_only", False, False)
+
+    thread_creator_id = (
+        await get_thread_creator_user_id(row_thread_id) if row_thread_id else None
+    )
+    if not thread_creator_id or not await verify_personal_dm_target_bound(
+        thread_creator_id, cleaned_tgt
+    ):
+        return (False, "personal_dm_recipient_unverified", False, False)
+
+    return (True, None, True, False)
+
+
 def _verdict_payoff_assessment(
     verdict_row: Mapping[str, Any] | None,
 ) -> Mapping[str, Any] | None:
@@ -2691,6 +2748,7 @@ async def evaluate_user_notify_eligibility(
     *,
     target: str | None = None,
     include_chat_targets: bool | None = None,
+    allow_personal_dm_redirect: bool = False,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -2810,6 +2868,12 @@ async def evaluate_user_notify_eligibility(
     if target is not None:
         cleaned_target = _split_target_channel(target)[1]
         if cleaned_target not in effective_targets:
+            if (
+                allow_personal_dm_redirect
+                and _is_personal_dm_notify_target(cleaned_target)
+                and any(_is_group_notify_target(t) for t in effective_targets)
+            ):
+                return (True, None, effective_targets)
             return (False, "target_removed", effective_targets)
 
     return (True, None, effective_targets)
@@ -5203,11 +5267,44 @@ async def retry_failed_notify_deliveries(
                     )
                     continue
 
+                (
+                    personal_ok,
+                    personal_skip_reason,
+                    allow_personal_dm_redirect,
+                    is_personal_group_notice_row,
+                ) = await _evaluate_personal_private_delivery_target(
+                    row=row,
+                    payload=payload,
+                    target=tgt,
+                )
+                if not personal_ok:
+                    skipped_updated = await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="skipped",
+                        reason=personal_skip_reason or "personal_integration_private_only",
+                        error_code=personal_skip_reason or "personal_integration_private_only",
+                        expected_status=skip_expected_status,
+                        expected_attempt_count=attempt_count,
+                        expected_updated_at=row_updated_at,
+                        exclude_uncertain_data_task=True,
+                    )
+                    if skipped_updated:
+                        logger.info(
+                            "[DALTON_NOTIFY] Skipped retry delivery for execution_id=%s (reason=%s)",
+                            exec_id,
+                            personal_skip_reason or "personal_integration_private_only",
+                        )
+                    continue
+
                 allowed, skip_reason, _ = await evaluate_user_notify_eligibility(
                     user_id,
                     automation_info,
                     target=tgt,
                     include_chat_targets=gate_include_chats,
+                    allow_personal_dm_redirect=allow_personal_dm_redirect,
                     resolve_enabled_fn=resolve_enabled_fn,
                     resolve_overrides_fn=resolve_overrides_fn,
                     resolve_targets_fn=resolve_targets_fn,
@@ -5447,12 +5544,26 @@ async def retry_failed_notify_deliveries(
                     )
                     break
 
-                text = str(payload.get("text") or "")
-                card = (
-                    payload.get("card")
-                    if isinstance(payload.get("card"), dict)
-                    else None
-                )
+                if is_personal_group_notice_row:
+                    from src.dalton.services.personal_integration_guard import (
+                        PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                    )
+
+                    text = PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                    card = (
+                        _build_feishu_personal_redirect_notice_card(
+                            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                        )
+                        if ch == "feishu"
+                        else None
+                    )
+                else:
+                    text = str(payload.get("text") or "")
+                    card = (
+                        payload.get("card")
+                        if isinstance(payload.get("card"), dict)
+                        else None
+                    )
                 wait_for_timeout_s = (
                     request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
@@ -6707,6 +6818,7 @@ async def on_automation_settled(
         is_personal_private_thread = bool(
             thread_id and await is_thread_personal_private(str(thread_id))
         )
+        thread_creator_id: str | None = None
         dm_targets: list[str] = []
         group_redirect_targets: list[str] = []
         if is_personal_private_thread:
@@ -6977,6 +7089,30 @@ async def on_automation_settled(
             batch_any_sent = False
             sent_channels: set[str] = set()
             for ch, cleaned_tgt, delivery_id, target_via_gateway in claimed_targets:
+                if (
+                    is_personal_private_thread
+                    and not is_group_notice
+                    and (
+                        not thread_creator_id
+                        or not await verify_personal_dm_target_bound(
+                            thread_creator_id, cleaned_tgt
+                        )
+                    )
+                ):
+                    if claim_execution_fn is None:
+                        await _invoke_mark_delivery(
+                            mark_target_fn,
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="skipped",
+                            reason="personal_dm_recipient_unverified",
+                            error_code="personal_dm_recipient_unverified",
+                            expected_status="pending",
+                        )
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                    continue
                 try:
                     if target_via_gateway:
                         bridge_res = await post_automation_gateway_notify(
