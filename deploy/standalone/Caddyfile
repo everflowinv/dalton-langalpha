@@ -43,6 +43,8 @@
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete
 				request>headers>X-Dalton-Relay-Token delete
+				# Go net/http canonicalizes X-LangAlpha-Owner -> X-Langalpha-Owner in logged request headers.
+				request>headers>X-Langalpha-Owner delete
 				request>headers>Authorization delete
 				request>headers>Cookie delete
 				resp_headers>Location delete

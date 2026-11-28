@@ -11,8 +11,8 @@ Verifies on a running Standalone Core (`auth: oss`) deployment:
 2. Backend Docker image manifest layers (and optional `EXPORT_DIR`) contain
    zero `plugins/dalton_data/` files and zero `Proprietary` plugin manifests,
    while shipping `plugins/dalton_sec/`.
-3. `GET /api/v1/dalton/capabilities` reports `profile == "core"` with zero
-   enabled optional capabilities, `GET /api/v1/dalton/system-jobs` lists zero
+3. `GET /api/v1/dalton/capabilities` reports `profile == "core"` with only the
+   default Core capability set (`["company_wiki"]`), `GET /api/v1/dalton/system-jobs` lists zero
    host `ops-*` or `data-*` jobs, `PATCH /api/v1/plugins/dalton-data/enabled`
    returns 404, disabled capability routes return 404/403, and backend logs
    show zero outbound attempts to `:8960` / `:8962`.
@@ -48,6 +48,7 @@ DEFAULT_USER_ID = "local-dev-user"
 HTTP_TIMEOUT_S = 30.0
 DOCKER_TIMEOUT_S = 120.0
 REQUIRED_DALTON_REVISIONS = ("d045", "d047")
+EXPECTED_CORE_DEFAULT_CAPABILITIES: list[str] = ["company_wiki"]
 _DALTON_REV_RE = re.compile(r"\b(d\d+)\b")
 
 
@@ -220,9 +221,8 @@ def _acquire_auth_session(
       acquires a Bearer session via ``STANDALONE_ACCESS_TOKEN``, first-admin bootstrap
       (``POST /api/v1/dalton/bootstrap/admin``), or local login
       (``POST /api/v1/dalton/auth/local/login``).
-    - In ``oss`` auth mode (``bootstrap/status`` returns 404): attaches
-      ``X-LangAlpha-Owner`` when ``LANGALPHA_OWNER_SECRET`` is configured, or empty
-      headers otherwise.
+    - In ``oss`` auth mode (``bootstrap/status`` returns 404): resolves
+      ``X-LangAlpha-Owner`` via ``_lib.oss_owner_headers(ctx)``.
     """
     boot_resp = _lib.http_request(
         "GET", f"{base_url}/api/v1/dalton/bootstrap/status", timeout=HTTP_TIMEOUT_S
@@ -308,12 +308,7 @@ def _acquire_auth_session(
         assert access_token and uid, f"Login response missing access_token/user_id: {login_data!r}"
         return {"Authorization": f"Bearer {access_token}"}, uid
 
-    owner_secret = (
-        ctx.env.get("LANGALPHA_OWNER_SECRET")
-        or os.environ.get("LANGALPHA_OWNER_SECRET")
-        or ""
-    ).strip()
-    headers = {"X-LangAlpha-Owner": owner_secret} if owner_secret else {}
+    headers = _lib.oss_owner_headers(ctx)
     user_id = os.environ.get("TEST_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
     return headers, user_id
 
@@ -335,8 +330,9 @@ def _check_capabilities_and_disabled_routes(
     )
     cap_body = cap_resp.json()
     assert cap_body.get("profile") == "core", f"Expected profile='core', got {cap_body!r}"
-    assert cap_body.get("capabilities") == [], (
-        f"Expected zero optional capabilities in Core, got {cap_body!r}"
+    assert cap_body.get("capabilities") == EXPECTED_CORE_DEFAULT_CAPABILITIES, (
+        f"Expected Core default capabilities {EXPECTED_CORE_DEFAULT_CAPABILITIES!r}, "
+        f"got {cap_body!r}"
     )
 
     jobs_resp = _lib.http_request(
@@ -394,7 +390,10 @@ def _check_capabilities_and_disabled_routes(
             f"Disabled capability route {method} {path} returned {resp.status} "
             f"(expected 403/404): {resp.text}"
         )
-    log("3/5 OK (capabilities='core' [], 0 ops/data jobs, dalton-data toggle 404, disabled routes 403/404).")
+    log(
+        f"3/5 OK (capabilities='core' {EXPECTED_CORE_DEFAULT_CAPABILITIES}, "
+        "0 ops/data jobs, dalton-data toggle 404, disabled routes 403/404)."
+    )
 
 
 def _check_dalton_sec_plugin_toggle_closure(

@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import secrets
 import subprocess
 import tarfile
 import tempfile
@@ -27,6 +28,8 @@ from urllib.request import Request, urlopen
 
 VALID_AUTH_MODES = ("oss", "local")
 _AUTH_HEADER_RE = re.compile(r"^\s*#\s*auth\s*:\s*([a-z0-9_-]+)\s*$", re.IGNORECASE)
+OWNER_SECRET_ENV_KEY = "LANGALPHA_OWNER_SECRET"
+OWNER_HEADER_NAME = "X-LangAlpha-Owner"
 
 
 def parse_check_auth(script_path: Path) -> str:
@@ -321,7 +324,104 @@ SECRET_ENV_KEYS: tuple[str, ...] = (
     "EGRESS_RELAY_SECRET",
     "JWT_SIGNING_SECRET",
     "BOOTSTRAP_SETUP_TOKEN",
+    OWNER_SECRET_ENV_KEY,
 )
+
+
+def ensure_oss_owner_secret(env_path: Path, *, num_bytes: int = 32) -> None:
+    """Generate a fresh random ``LANGALPHA_OWNER_SECRET`` and write it to ``env_path``.
+
+    Preserves all other lines/comments in ``env_path``, replaces any existing
+    ``LANGALPHA_OWNER_SECRET`` assignment (or appends one if absent), enforces
+    mode ``0600`` atomically, and never prints or returns the secret value.
+    """
+    secret_val = secrets.token_hex(num_bytes)
+    existing_lines: list[str] = []
+    file_mode = 0o600
+    if env_path.is_file():
+        existing_lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        existing_mode = env_path.stat().st_mode & 0o777
+        # Keep owner-only permissions; tighten if group/other readable.
+        file_mode = existing_mode & 0o600 or 0o600
+
+    out: list[str] = []
+    replaced = False
+    for raw_line in existing_lines:
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("#"):
+            key_part = stripped[len("export ") :].strip() if stripped.startswith("export ") else stripped
+            if "=" in key_part and key_part.split("=", 1)[0].strip() == OWNER_SECRET_ENV_KEY:
+                if not replaced:
+                    out.append(f"{OWNER_SECRET_ENV_KEY}={secret_val}\n")
+                    replaced = True
+                continue
+        out.append(raw_line)
+
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+    if not replaced:
+        out.append(f"{OWNER_SECRET_ENV_KEY}={secret_val}\n")
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".env.owner.", dir=str(env_path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, file_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join(out))
+        os.replace(tmp_path, env_path)
+        os.chmod(env_path, file_mode)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _resolve_oss_owner_secret(
+    ctx: ComposeContext | None = None,
+    *,
+    env_map: Mapping[str, str] | None = None,
+) -> str:
+    if env_map is not None:
+        val = (env_map.get(OWNER_SECRET_ENV_KEY) or "").strip()
+        if val:
+            return val
+    if ctx is not None:
+        val = (ctx.env.get(OWNER_SECRET_ENV_KEY) or "").strip()
+        if val:
+            return val
+    return (os.environ.get(OWNER_SECRET_ENV_KEY) or "").strip()
+
+
+def oss_owner_headers(
+    ctx: ComposeContext | None = None,
+    *,
+    extra: Mapping[str, str] | None = None,
+    env_map: Mapping[str, str] | None = None,
+    owner_secret: str | None = None,
+    required: bool = False,
+) -> dict[str, str]:
+    """Build request headers carrying ``X-LangAlpha-Owner`` for ``auth: oss`` edge calls.
+
+    Resolves ``LANGALPHA_OWNER_SECRET`` from ``owner_secret``, ``env_map``, ``ctx.env``,
+    and finally ``os.environ``. Any ``extra`` headers are merged on top without mutating
+    the caller's mapping. Never embeds any secret value in error messages.
+    """
+    secret = (
+        owner_secret.strip()
+        if owner_secret is not None
+        else _resolve_oss_owner_secret(ctx, env_map=env_map)
+    )
+    if required and not secret:
+        raise RuntimeError(
+            f"{OWNER_SECRET_ENV_KEY} is missing from .env and environment; "
+            "required for auth: oss requests through Caddy edge"
+        )
+    merged: dict[str, str] = {}
+    if secret:
+        merged[OWNER_HEADER_NAME] = secret
+    if extra:
+        merged.update(extra)
+    return merged
 
 
 def _redact_secrets_text(text: str, env: Mapping[str, str]) -> str:
@@ -761,6 +861,7 @@ def configure_fake_llm_model(
     model_id: str | None = None,
     base_url: str = FAKE_BASE_URL,
     api_key: str = FAKE_API_KEY,
+    headers: Mapping[str, str] | None = None,
 ) -> str:
     """Register the CI fake OpenAI Responses API provider/model via the HTTP API.
 
@@ -768,9 +869,11 @@ def configure_fake_llm_model(
     and self-contained when a check script is invoked on a fresh stack.
     """
     resolved_model_id = model_id or os.environ.get("FAKE_LLM_MODEL", "gpt-6-luna")
+    req_headers = dict(headers) if headers is not None else oss_owner_headers(ctx)
     pref_resp = http_request(
         "PUT",
         f"{ctx.edge_url}/api/v1/users/me/preferences",
+        headers=req_headers,
         json_body={
             "model_preference": {
                 "custom_providers": [
@@ -799,6 +902,7 @@ def configure_fake_llm_model(
     key_resp = http_request(
         "PUT",
         f"{ctx.edge_url}/api/v1/users/me/api-keys",
+        headers=req_headers,
         json_body={
             "byok_enabled": True,
             "api_keys": {provider_name: api_key},
@@ -812,6 +916,7 @@ def configure_fake_llm_model(
     test_key_resp = http_request(
         "POST",
         f"{ctx.edge_url}/api/v1/keys/test",
+        headers=req_headers,
         json_body={
             "provider": provider_name,
             "api_key": api_key,

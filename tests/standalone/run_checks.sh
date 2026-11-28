@@ -210,6 +210,17 @@ verify_backend_auth_mode() {
     return 1
   fi
   echo "[run_checks] Verified backend active DALTON_AUTH_MODE=${actual_mode}"
+  if [[ "$expected_mode" == "oss" ]]; then
+    local owner_secret_set
+    owner_secret_set="$(compose_run exec -T backend uv run --no-sync python -c \
+      "import os; print('1' if os.environ.get('LANGALPHA_OWNER_SECRET', '').strip() else '0')" \
+      | tr -d '\r\n' | tail -n 1)"
+    if [[ "$owner_secret_set" != "1" ]]; then
+      echo "ERROR: Backend container missing LANGALPHA_OWNER_SECRET for auth=oss" >&2
+      return 1
+    fi
+    echo "[run_checks] Verified backend has LANGALPHA_OWNER_SECRET configured (value redacted)"
+  fi
 }
 
 OVERALL_RC=0
@@ -232,6 +243,20 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
     export DALTON_ALLOW_DEV_OSS_AUTH=1
     export DALTON_AUTH_COOKIE_SECURE=""
     export CI_GINLIX_DATA_URL=""
+    unset LANGALPHA_OWNER_SECRET || true
+    # Generate a random LANGALPHA_OWNER_SECRET into .env (mode 0600, never printed)
+    # so oss-group checks authenticate through Caddy edge via X-LangAlpha-Owner.
+    "$PYTHON_BIN" - "$CHECKS_DIR" "${WORK_DIR}/.env" <<'PY'
+from pathlib import Path
+import sys
+
+checks_dir, env_path = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(checks_dir))
+import _lib
+
+_lib.ensure_oss_owner_secret(env_path)
+PY
+    echo "[run_checks] Configured random LANGALPHA_OWNER_SECRET in .env for auth=oss (value not printed)."
   else
     export DALTON_ALLOW_DEV_OSS_AUTH=""
     export DALTON_AUTH_COOKIE_SECURE="false"

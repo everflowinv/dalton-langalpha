@@ -15,9 +15,12 @@ All test doubles use ``unittest.mock.create_autospec``.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 from typing import Any
 from unittest.mock import create_autospec
@@ -34,11 +37,15 @@ from src.dalton import auth as dalton_auth
 from src.dalton.app import dalton_router
 from src.dalton.auth import dispatch as dispatch_mod
 from src.dalton.auth.tokens import issue_local_access_token
+from src.dalton.capabilities import effective_capabilities
+from src.dalton.profile import DeploymentProfile
 from src.dalton.settings import get_dalton_config
 from src.server.auth import jwt_bearer as jwt_bearer_mod
 from src.server.utils import api as api_utils
 from tests.standalone.checks import _lib as standalone_lib
+from tests.standalone.checks import b1_dev_mode as b1_check
 from tests.standalone.checks import b2_backend_capabilities as b2_check
+from tests.standalone.checks import b6_tls_backup_upgrade as b6_check
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "standalone-core-e2e.yml"
@@ -350,7 +357,13 @@ class TestB2CapabilitiesSessionFlow:
             _ = method, json_body, data, timeout
             observed_headers.append(dict(headers) if headers else None)
             if url.endswith("/api/v1/dalton/capabilities"):
-                return _json_response(200, {"profile": "core", "capabilities": []})
+                return _json_response(
+                    200,
+                    {
+                        "profile": "core",
+                        "capabilities": list(b2_check.EXPECTED_CORE_DEFAULT_CAPABILITIES),
+                    },
+                )
             if url.endswith("/api/v1/dalton/system-jobs"):
                 return _json_response(200, {"jobs": []})
             return _json_response(404, {"detail": "disabled"})
@@ -365,6 +378,519 @@ class TestB2CapabilitiesSessionFlow:
         )
         assert len(observed_headers) == 12
         assert all(hdr == bearer for hdr in observed_headers)
+
+    def test_b2_expected_core_capabilities_matches_product_defaults(self) -> None:
+        actual_core_defaults = sorted(
+            cap.value
+            for cap in effective_capabilities(
+                profile=DeploymentProfile.CORE,
+                environ={"APP_ENV": "core", "DALTON_PROFILE": "core"},
+            )
+        )
+        assert b2_check.EXPECTED_CORE_DEFAULT_CAPABILITIES == actual_core_defaults
+        assert actual_core_defaults == ["company_wiki"]
+
+    def test_b2_acquire_session_oss_delegates_to_shared_owner_header_helper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy_http = create_autospec(
+            b2_check._lib.http_request,
+            return_value=_json_response(404, {"detail": "Not Found"}),
+        )
+        spy_owner_headers = create_autospec(
+            b2_check._lib.oss_owner_headers,
+            return_value={"X-LangAlpha-Owner": "delegated-owner-secret"},
+        )
+        monkeypatch.setattr(b2_check._lib, "http_request", spy_http)
+        monkeypatch.setattr(b2_check._lib, "oss_owner_headers", spy_owner_headers)
+
+        ctx = create_autospec(standalone_lib.ComposeContext, instance=True)
+        ctx.env = {}
+        headers, uid = b2_check._acquire_auth_session(ctx, "http://127.0.0.1:8088")
+        assert headers == {"X-LangAlpha-Owner": "delegated-owner-secret"}
+        assert uid == b2_check.DEFAULT_USER_ID
+        spy_owner_headers.assert_called_once_with(ctx)
+
+
+class TestStandaloneOssOwnerSecretHelpers:
+    """Verify shared owner-secret helpers in ``_lib.py``, ``run_checks.sh``, and Caddyfile."""
+
+    def test_ensure_oss_owner_secret_writes_0600_and_replaces_duplicates(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "# header\n"
+            "APP_ENV=core\n"
+            "LANGALPHA_OWNER_SECRET=old-secret-1\n"
+            "export LANGALPHA_OWNER_SECRET=old-secret-2\n"
+            "DALTON_AUTH_MODE=local\n",
+            encoding="utf-8",
+        )
+        env_path.chmod(0o644)
+
+        result = standalone_lib.ensure_oss_owner_secret(env_path)
+        assert result is None
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+
+        raw_lines = env_path.read_text(encoding="utf-8").splitlines()
+        owner_lines = [ln for ln in raw_lines if "LANGALPHA_OWNER_SECRET=" in ln]
+        assert len(owner_lines) == 1
+        parsed = standalone_lib.load_env_file(env_path)
+        secret_val = parsed["LANGALPHA_OWNER_SECRET"]
+        assert len(secret_val) == 64
+        assert secret_val not in ("old-secret-1", "old-secret-2")
+        assert parsed["APP_ENV"] == "core"
+        assert parsed["DALTON_AUTH_MODE"] == "local"
+
+    def test_oss_owner_headers_precedence_merge_and_required_error_redaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LANGALPHA_OWNER_SECRET", "from-os-env")
+        ctx = create_autospec(standalone_lib.ComposeContext, instance=True)
+        ctx.env = {"LANGALPHA_OWNER_SECRET": "from-ctx-env"}
+
+        extra = {"X-Probe": "1"}
+        # Precedence: owner_secret > env_map > ctx.env > os.environ
+        assert standalone_lib.oss_owner_headers(
+            ctx,
+            env_map={"LANGALPHA_OWNER_SECRET": "from-env-map"},
+            owner_secret="from-explicit",
+            extra=extra,
+        ) == {"X-LangAlpha-Owner": "from-explicit", "X-Probe": "1"}
+        assert extra == {"X-Probe": "1"}  # caller mapping untouched
+
+        assert standalone_lib.oss_owner_headers(
+            ctx, env_map={"LANGALPHA_OWNER_SECRET": "from-env-map"}
+        ) == {"X-LangAlpha-Owner": "from-env-map"}
+        assert standalone_lib.oss_owner_headers(ctx) == {"X-LangAlpha-Owner": "from-ctx-env"}
+
+        ctx.env = {}
+        assert standalone_lib.oss_owner_headers(ctx) == {"X-LangAlpha-Owner": "from-os-env"}
+
+        monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+        assert standalone_lib.oss_owner_headers(ctx) == {}
+        with pytest.raises(RuntimeError, match="LANGALPHA_OWNER_SECRET"):
+            standalone_lib.oss_owner_headers(ctx, required=True)
+
+    def test_configure_fake_llm_model_forwards_owner_header_to_all_three_calls(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seen_headers: list[dict[str, str] | None] = []
+
+        def _fake_http(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> standalone_lib.HttpResponse:
+            _ = method, url, json_body, data, timeout
+            seen_headers.append(dict(headers) if headers else None)
+            return _json_response(200, {"ok": True})
+
+        spy_http = create_autospec(standalone_lib.http_request, side_effect=_fake_http)
+        monkeypatch.setattr(standalone_lib, "http_request", spy_http)
+
+        ctx = create_autospec(standalone_lib.ComposeContext, instance=True)
+        ctx.edge_url = "http://127.0.0.1:8088"
+        ctx.env = {"LANGALPHA_OWNER_SECRET": "fake-llm-owner-secret"}
+
+        model = standalone_lib.configure_fake_llm_model(ctx)
+        assert model == standalone_lib.FAKE_MODEL_NAME
+        assert len(seen_headers) == 3
+        assert all(hdr == {"X-LangAlpha-Owner": "fake-llm-owner-secret"} for hdr in seen_headers)
+
+    def test_owner_secret_in_secret_scan_and_caddy_access_log_redaction(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        assert "LANGALPHA_OWNER_SECRET" in standalone_lib.SECRET_ENV_KEYS
+
+        owner_val = "0123456789abcdef0123456789abcdef"
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"LANGALPHA_OWNER_SECRET={owner_val}\n", encoding="utf-8")
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "compose-logs-oss.txt").write_text(
+            f'{{"X-Langalpha-Owner":["{owner_val}"]}}\n', encoding="utf-8"
+        )
+        leaks = standalone_lib.scan_artifacts_for_secrets(artifacts, env_file)
+        assert leaks == ["compose-logs-oss.txt: leaked LANGALPHA_OWNER_SECRET"]
+        assert all(owner_val not in hit for hit in leaks)
+
+        caddy_src = (REPO_ROOT / "deploy" / "standalone" / "Caddyfile").read_text(
+            encoding="utf-8"
+        )
+        assert "request>headers>X-Langalpha-Owner delete" in caddy_src
+
+    def test_run_checks_oss_writes_owner_secret_without_printing_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        work_dir = tmp_path / "work"
+        checks_dir = tmp_path / "checks"
+        artifacts_dir = tmp_path / "artifacts"
+        fake_bin = tmp_path / "bin"
+        for d in (work_dir, checks_dir, artifacts_dir, fake_bin):
+            d.mkdir()
+
+        for name in ("docker-compose.yml", "docker-compose.core.yml", "docker-compose.ci.yml"):
+            (work_dir / name).write_text("services: {}\n", encoding="utf-8")
+        env_file = work_dir / ".env"
+        env_file.write_text("APP_ENV=core\nDALTON_AUTH_MODE=local\n", encoding="utf-8")
+        env_file.chmod(0o600)
+
+        (checks_dir / "_lib.py").write_text(
+            (REPO_ROOT / "tests/standalone/checks/_lib.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (checks_dir / "b1_stub.py").write_text(
+            "# auth: oss\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"
+            "import _lib\n"
+            "ctx = _lib.ComposeContext.from_environment()\n"
+            "hdrs = _lib.oss_owner_headers(ctx, required=True)\n"
+            "assert len(hdrs['X-LangAlpha-Owner']) == 64\n"
+            "print('b1_stub_ok')\n",
+            encoding="utf-8",
+        )
+
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$1" == "ps" || "$1" == "volume" ]]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "$1" == "compose" ]]; then\n'
+            '  if [[ "$*" == *"get_dalton_auth_mode"* ]]; then\n'
+            '    echo "oss"\n'
+            "    exit 0\n"
+            "  fi\n"
+            '  if [[ "$*" == *"LANGALPHA_OWNER_SECRET"* ]]; then\n'
+            '    echo "1"\n'
+            "    exit 0\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+        env["LANGALPHA_OWNER_SECRET"] = "stale-shell-secret-must-be-unset"
+
+        proc = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "tests/standalone/run_checks.sh"),
+                "--auth",
+                "oss",
+                "--work-dir",
+                str(work_dir),
+                "--checks-dir",
+                str(checks_dir),
+                "--ci-compose",
+                str(work_dir / "docker-compose.ci.yml"),
+                "--artifacts-dir",
+                str(artifacts_dir),
+                "--project-name",
+                "unit-oss-owner-test",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode == 0, f"run_checks.sh failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        assert "b1_stub_ok" in proc.stdout
+
+        parsed = standalone_lib.load_env_file(env_file)
+        owner_secret = parsed.get("LANGALPHA_OWNER_SECRET", "")
+        assert len(owner_secret) == 64
+        assert owner_secret != "stale-shell-secret-must-be-unset"
+        assert parsed.get("DALTON_AUTH_MODE") == "local"
+        assert (env_file.stat().st_mode & 0o777) == 0o600
+        assert owner_secret not in proc.stdout
+        assert owner_secret not in proc.stderr
+
+
+class TestB1AndB6OwnerHeaderAndEnvContracts:
+    """Verify b1 & b6 attach ``X-LangAlpha-Owner`` on edge calls and respect ``init.sh`` defaults."""
+
+    def test_b1_edge_requests_attach_owner_header_and_probe_omits_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owner_secret = "b1-test-owner-secret-value-0001"
+        ctx = create_autospec(b1_check._lib.ComposeContext, instance=True)
+        ctx.edge_url = "http://127.0.0.1:8088"
+        ctx.internal_service_token = "svc-tok-012345678901234567890123456789"
+        ctx.env = {"LANGALPHA_OWNER_SECRET": owner_secret}
+        ctx.psql_query.return_value = "probe-tid-1"
+
+        seen_http: list[tuple[str, str, dict[str, str] | None]] = []
+
+        def _fake_http(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> Any:
+            _ = json_body, data, timeout
+            hdr_copy = dict(headers) if headers else None
+            seen_http.append((method, url, hdr_copy))
+            if url.endswith("/__probe/headers"):
+                return _json_response(200, {"headers": {"X-Probe-Sentinel": "keep-me"}})
+            if url.endswith("/api/v1/users/me"):
+                return _json_response(200, {"user": {"user_id": b1_check.LOCAL_DEV_USER}})
+            if url.endswith("/messages/replay"):
+                return _json_response(403, {"detail": "Forbidden"})
+            if url.endswith("/sandbox-object"):
+                return _json_response(404, {"detail": "Not Found"})
+            if url.endswith("/api/v1/workspaces"):
+                return _json_response(201, {"workspace_id": "ws-b1-1"})
+            if url.endswith("/sandbox/preview-url"):
+                return _json_response(200, {"url": "http://127.0.0.1:8765/"})
+            return _json_response(200, {"ok": True})
+
+        def _fake_direct(
+            _ctx: Any,
+            *,
+            method: str,
+            path: str,
+            user_id: str,
+            json_body: Any = None,
+        ) -> tuple[int, str]:
+            _ = method, json_body
+            if path == "/api/v1/users/me":
+                return 200, json.dumps({"user": {"user_id": user_id}})
+            if path == "/api/v1/workspaces":
+                return 201, json.dumps({"workspace_id": "probe-ws-1"})
+            return 200, ""
+
+        monkeypatch.setattr(
+            b1_check._lib,
+            "http_request",
+            create_autospec(b1_check._lib.http_request, side_effect=_fake_http),
+        )
+        monkeypatch.setattr(
+            b1_check,
+            "_direct_backend_http",
+            create_autospec(b1_check._direct_backend_http, side_effect=_fake_direct),
+        )
+        monkeypatch.setattr(
+            b1_check._lib,
+            "wait_for_http_ready",
+            create_autospec(
+                b1_check._lib.wait_for_http_ready,
+                return_value=_json_response(200, {"ok": True}),
+            ),
+        )
+
+        b1_check.check_users_and_edge_header_stripping(ctx)
+        ws_id = b1_check.configure_fake_model_and_workspace(ctx)
+        assert ws_id == "ws-b1-1"
+        b1_check.check_loopback_preview(ctx, ws_id)
+
+        by_suffix = {url.split("8088", 1)[1]: hdrs for _m, url, hdrs in seen_http}
+        # Public /__probe/headers must NOT receive X-LangAlpha-Owner (avoid echoing secret)
+        assert "X-LangAlpha-Owner" not in (by_suffix["/__probe/headers"] or {})
+        # Authenticated edge endpoints MUST carry X-LangAlpha-Owner
+        for path in (
+            "/api/v1/users/me",
+            "/api/v1/threads/probe-tid-1/messages/replay",
+            "/api/v1/users/me/preferences",
+            "/api/v1/users/me/api-keys",
+            "/api/v1/keys/test",
+            "/api/v1/workspaces",
+            "/api/v1/workspaces/ws-b1-1/sandbox/preview-url",
+        ):
+            assert (by_suffix[path] or {}).get("X-LangAlpha-Owner") == owner_secret, (
+                f"b1 call to {path} missing X-LangAlpha-Owner header"
+            )
+
+    def test_b6_seed_and_verify_restored_data_forward_owner_headers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owner_secret = "b6-test-owner-secret-value-0002"
+        ctx = create_autospec(b6_check._lib.ComposeContext, instance=True)
+        ctx.edge_url = "http://127.0.0.1:8088"
+        ctx.env = {
+            "LANGALPHA_OWNER_SECRET": owner_secret,
+            "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+        }
+        ctx.psql_query.side_effect = ["uploads/obj-1.txt", "uploading"]
+
+        http_headers_seen: list[tuple[str, dict[str, str] | None]] = []
+        sse_headers_seen: list[tuple[str, dict[str, str] | None]] = []
+
+        def _fake_http(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> Any:
+            _ = method, json_body, data, timeout
+            http_headers_seen.append((url, dict(headers) if headers else None))
+            if url.endswith("/api/v1/workspaces"):
+                return _json_response(201, {"workspace_id": "ws-b6-1"})
+            if url.endswith("/api/v1/dalton/chat-uploads"):
+                return _json_response(200, {"upload_id": "up-1"})
+            return _json_response(200, {"ok": True})
+
+        @contextmanager
+        def _fake_sse(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            json_body: Any = None,
+            timeout: float = 120.0,
+        ) -> Any:
+            _ = method, json_body, timeout
+            sse_headers_seen.append((url, dict(headers) if headers else None))
+            events = [
+                b6_check._lib.SSEEvent(
+                    event_id="1",
+                    event="message_chunk",
+                    raw_data='{"thread_id":"tid-b6-1","content":"hello restored"}',
+                    data={"thread_id": "tid-b6-1", "content": "hello restored"},
+                ),
+                b6_check._lib.SSEEvent(
+                    event_id="2",
+                    event="replay_done",
+                    raw_data="{}",
+                    data={},
+                ),
+            ]
+            yield 200, {}, iter(events)
+
+        monkeypatch.setattr(
+            b6_check._lib,
+            "http_request",
+            create_autospec(b6_check._lib.http_request, side_effect=_fake_http),
+        )
+        monkeypatch.setattr(b6_check._lib, "open_sse_stream", _fake_sse)
+
+        sentinel = b6_check.seed_sentinel_data(ctx)
+        assert sentinel["workspace_id"] == "ws-b6-1"
+        assert sentinel["thread_id"] == "tid-b6-1"
+        assert len(http_headers_seen) == 8  # 3 fake-llm + 1 workspace + 4 chat-upload calls
+        assert all(
+            (hdrs or {}).get("X-LangAlpha-Owner") == owner_secret
+            for _url, hdrs in http_headers_seen
+        )
+        assert len(sse_headers_seen) == 2  # chat POST + replay GET
+        assert all(
+            (hdrs or {}).get("X-LangAlpha-Owner") == owner_secret
+            for _url, hdrs in sse_headers_seen
+        )
+
+        # Verify _verify_restored_data forwards auth_headers to /workspaces and /messages/replay
+        https_seen: list[tuple[str, dict[str, str] | None]] = []
+
+        def _fake_https(
+            method: str,
+            server_hostname: str,
+            port: int,
+            path: str,
+            *,
+            context: ssl.SSLContext,
+            headers: dict[str, str] | None = None,
+            json_body: Any = None,
+            data: bytes | None = None,
+            timeout: float = 30.0,
+        ) -> Any:
+            _ = method, server_hostname, port, context, json_body, data, timeout
+            https_seen.append((path, dict(headers) if headers else None))
+            if path == "/api/v1/workspaces":
+                return _json_response(200, {"workspaces": [{"workspace_id": "ws-b6-1"}]})
+            sse_raw = (
+                b'event: message_chunk\n'
+                b'data: {"thread_id":"tid-b6-1","content":"hello restored"}\n\n'
+                b'event: replay_done\ndata: {}\n\n'
+            )
+            return b6_check._lib.HttpResponse(status=200, headers={}, body=sse_raw)
+
+        monkeypatch.setattr(
+            b6_check,
+            "_https_request",
+            create_autospec(b6_check._https_request, side_effect=_fake_https),
+        )
+        monkeypatch.setattr(
+            b6_check,
+            "_snapshot_table_counts",
+            create_autospec(b6_check._snapshot_table_counts, return_value={"users": 1}),
+        )
+        monkeypatch.setattr(
+            b6_check,
+            "_query_thread_row",
+            create_autospec(b6_check._query_thread_row, return_value="row-1"),
+        )
+        monkeypatch.setattr(
+            b6_check,
+            "_count_minio_objects",
+            create_autospec(b6_check._count_minio_objects, return_value=1),
+        )
+        monkeypatch.setattr(
+            b6_check,
+            "_fetch_minio_object_sha_and_ct",
+            create_autospec(
+                b6_check._fetch_minio_object_sha_and_ct,
+                return_value=(sentinel["payload_sha"], "text/plain"),
+            ),
+        )
+
+        auth_hdrs = {"X-LangAlpha-Owner": owner_secret}
+        b6_check._verify_restored_data(
+            ["docker", "compose"],
+            Path("/tmp"),
+            {},
+            18543,
+            create_autospec(ssl.SSLContext, instance=True),
+            "postgres",
+            "postgres",
+            {"users": 1},
+            "row-1",
+            1,
+            sentinel,
+            auth_headers=auth_hdrs,
+        )
+        assert https_seen == [
+            ("/api/v1/workspaces", auth_hdrs),
+            ("/api/v1/threads/tid-b6-1/messages/replay", auth_hdrs),
+        ]
+
+    def test_b6_does_not_assert_stale_oss_default_on_init_env(self) -> None:
+        b6_src = (
+            REPO_ROOT / "tests" / "standalone" / "checks" / "b6_tls_backup_upgrade.py"
+        ).read_text(encoding="utf-8")
+        assert 'assert cur_env_map.get("DALTON_AUTH_MODE") == "local"' in b6_src
+        assert 'assert cur_env_map.get("DALTON_AUTH_MODE") == "oss"' not in b6_src
+        assert '_lib.OWNER_SECRET_ENV_KEY: restore_owner_secret' in b6_src
+        assert '_lib.OWNER_SECRET_ENV_KEY: upgrade_owner_secret' in b6_src
 
 
 class TestCustomerSmokeWorkflowContract:
