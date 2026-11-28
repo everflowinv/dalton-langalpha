@@ -1624,6 +1624,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("integrations_router.py", "retry_personal_integration_revoke_endpoint"): CORE_CAPABILITY,
         ("integrations_router.py", "feishu_integration_events_endpoint"): CORE_CAPABILITY,
         ("integrations_router.py", "feishu_integration_internal_events_endpoint"): CORE_CAPABILITY,
+        # --- tracker_calendar_router.py (Everflow earnings tracker gate, §5.3, §6 item 2) ---
+        ("tracker_calendar_router.py", "tracker_calendar_mcp_endpoint"): CapabilityId.FUND_AUTOMATIONS,
     }
 )
 

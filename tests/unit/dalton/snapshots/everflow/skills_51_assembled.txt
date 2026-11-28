@@ -22039,7 +22039,7 @@ description: "无人值守的 Richard 财报日期周扫：按 105 家名单核�
 
 安装路径是 `.agents/skills/dalton-richard-earnings/`。命令用 `scripts/richard_earnings.py`。每条命令都带 `--workspace-dir <workspace>` 和 `--json`。`<workspace>` 是本轮工作区根目录。
 
-日历写入走 `research(route="gcal")`。列事件、建事件、改期和删除都由脚本完成。模型不直接调用 `research(route="gcal")`，也不在宿主机上运行 `gws`。
+日历写入走 `research(route="gcal")`。自检（`health_check`）、列事件、建事件、改期、删除和重连后的旧日程回收均由脚本经服务端门控完成。模型只调用脚本命令，跳过直接调用 `research(route="gcal")` 或宿主机 `gws`。
 
 名单共 105 家：A 组 Core（核心关注）27 家，B/C/D 组 Watch（观察名单）78 家，含美股、港股和 A 股。这份名单和日历与 `dalton-earnings-calendar` 分开维护。
 

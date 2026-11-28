@@ -585,17 +585,19 @@ def _scan_failure(row: dict[str, Any]) -> dict[str, str]:
 def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     workspace = require_workspace(args.workspace_dir)
     day = today_et()
-    start, end = _day_bounds(day)
     calendar_ok = False
     try:
         result = call_research(
             route="gcal",
-            operation="list_events",
-            time_min=start,
-            time_max=end,
-            limit=1,
+            operation="health_check",
         )
-        calendar_ok = isinstance(result, dict) and result.get("ok") is True
+        data = result.get("data") if isinstance(result, dict) else None
+        calendar_ok = (
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and isinstance(data, dict)
+            and data.get("calendar_ok") is True
+        )
     except Exception:  # noqa: BLE001 - self-test records calendar failure without the exception text
         calendar_ok = False
     try:
@@ -845,6 +847,43 @@ def _apply_one(
             errors.append(_research_error(deleted))
             _remember_pending_delete(watchlist, old_id)
             delete_failed = True
+    elif plan["action"] == "replace" and not old_id:
+        # Post-reconnect first-run stale event reclamation: local calendar_event_id was
+        # cleared during disconnect purge, so look up the old slot remotely and delete it.
+        old_day = parse_iso_date(plan.get("old_date"))
+        if old_day is not None:
+            old_start, old_end = _day_bounds(old_day)
+            old_listed = call_research(
+                route="gcal",
+                operation="list_events",
+                query=ticker,
+                time_min=old_start,
+                time_max=old_end,
+                limit=50,
+            )
+            old_events = _events_from(old_listed)
+            if old_events is None:
+                errors.append(_research_error(old_listed))
+                delete_failed = True
+            else:
+                old_timing = str(plan.get("old_timing") or "unknown")
+                for ev in old_events:
+                    ev_summary = ev.get("summary") if isinstance(ev.get("summary"), str) else ""
+                    stale_id = ev.get("id").strip() if isinstance(ev.get("id"), str) else ""
+                    if not stale_id or stale_id == event_id or f"({ticker})" not in ev_summary:
+                        continue
+                    if not _slot_matches(ev, old_day.isoformat(), old_timing):
+                        continue
+                    deleted = call_research(
+                        route="gcal", operation="delete_event", event_id=stale_id
+                    )
+                    if _delete_is_refused(deleted):
+                        errors.append(_research_error(deleted))
+                        delete_failed = True
+                    elif _delete_is_fatal(deleted):
+                        errors.append(_research_error(deleted))
+                        _remember_pending_delete(watchlist, stale_id)
+                        delete_failed = True
     entry = {
         "ticker": ticker,
         "name": plan["name"],
@@ -960,9 +999,39 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             continue
         old = confirmed[ticker]
         old_timing = old.get("timing") or "unknown"
+        reconcile_needed = bool(watchlist.get("tracker_reconcile_needed"))
+        old_has_event_id = isinstance(old.get("calendar_event_id"), str) and bool(
+            old["calendar_event_id"].strip()
+        )
         if old.get("date") == earnings_date and old_timing == timing:
+            if reconcile_needed and not old_has_event_id:
+                plan.append(
+                    {
+                        "action": "reconcile",
+                        "ticker": ticker,
+                        "name": old.get("name") or ticker,
+                        "quarter": old.get("quarter") or row.get("quarter_label") or "",
+                        "date": earnings_date,
+                        "timing": old_timing,
+                        "confidence": old.get("confidence") or confidence,
+                        "source": old.get("source") or row.get("source_url") or "",
+                    }
+                )
             continue
         if old.get("date") == earnings_date and timing == "unknown":
+            if reconcile_needed and not old_has_event_id:
+                plan.append(
+                    {
+                        "action": "reconcile",
+                        "ticker": ticker,
+                        "name": old.get("name") or ticker,
+                        "quarter": old.get("quarter") or row.get("quarter_label") or "",
+                        "date": earnings_date,
+                        "timing": old_timing,
+                        "confidence": old.get("confidence") or confidence,
+                        "source": old.get("source") or row.get("source_url") or "",
+                    }
+                )
             continue
         old_rank = CONF_RANK.get(old.get("confidence"), 0)
         if CONF_RANK[confidence] < old_rank:
@@ -1001,6 +1070,8 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if done is not None:
             applied.append(done)
+    if watchlist.get("tracker_reconcile_needed") and not errors:
+        watchlist.pop("tracker_reconcile_needed", None)
     watchlist["updated"] = scan_date
     _save_watchlist(workspace, watchlist)
     confirmed_ids = set(_ticker_map(watchlist["confirmed"]))

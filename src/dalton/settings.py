@@ -1208,6 +1208,42 @@ def get_ai_finance_owner_user_id() -> str | None:
     return canonical
 
 
+def get_dalton_gcal_backend() -> str:
+    """Return the tracker calendar backend channel (``legacy_gws`` or ``official_mcp``).
+
+    Defaults to ``legacy_gws`` when unset so production behavior remains unchanged
+    until cutover. Any unknown non-empty value raises ``ValueError`` (fail closed).
+    """
+    raw = os.getenv("DALTON_GCAL_BACKEND", "").strip().lower()
+    if not raw:
+        return "legacy_gws"
+    if raw in ("legacy_gws", "official_mcp"):
+        return raw
+    raise ValueError(f"Unsupported DALTON_GCAL_BACKEND value: {raw!r}")
+
+
+def get_tracker_calendar_owner_id() -> str | None:
+    """Return ``DALTON_TRACKER_CALENDAR_OWNER_ID`` (canonical lowercase UUID if UUID, or None if unset)."""
+    raw = os.getenv("DALTON_TRACKER_CALENDAR_OWNER_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return str(uuid.UUID(raw))
+    except (TypeError, ValueError, AttributeError):
+        return raw
+
+
+def get_tracker_calendar_automation_id() -> str | None:
+    """Return ``DALTON_TRACKER_CALENDAR_AUTOMATION_ID`` (canonical lowercase UUID if UUID, or None if unset)."""
+    raw = os.getenv("DALTON_TRACKER_CALENDAR_AUTOMATION_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return str(uuid.UUID(raw))
+    except (TypeError, ValueError, AttributeError):
+        return raw
+
+
 def get_internal_service_token() -> str:
     """Return ``INTERNAL_SERVICE_TOKEN`` from environment (empty string if unset)."""
     return os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()

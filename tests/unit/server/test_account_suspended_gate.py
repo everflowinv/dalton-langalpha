@@ -179,12 +179,14 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/internal/llm/complete"),
     ("POST", "/api/v1/dalton/internal/model-availability/check"),
     ("PUT", "/api/v1/dalton/channels/internal/settings"),
-    # DALTON-HOOK(user-integrations): a personal connector sign-in's return, bound to
-    # the state its start minted; Feishu's signed event push; and the gateway's
-    # forward of it behind X-Service-Token.
+    # DALTON-HOOK(personal-integrations): a personal connector sign-in's return, bound to
+    # the state its start minted; Feishu's signed event push; the gateway's forward of it
+    # behind X-Service-Token; and the tracker-calendar MCP gate authenticated by
+    # X-Dalton-Bridge-Token + signed X-Dalton-Caller-Token (no user session credential).
     ("GET", "/api/v1/dalton/integrations/{provider}/callback"),
     ("POST", "/api/v1/dalton/integrations/feishu/events"),
     ("POST", "/api/v1/dalton/integrations/internal/feishu/events"),
+    ("POST", "/api/v1/dalton/mcp/tracker-calendar"),
 }
 
 
