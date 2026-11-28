@@ -21,6 +21,8 @@ import {
 } from '@/lib/dalton/turnAdmission';
 // DALTON-HOOK(antigravity-series): created-thread detection for first-send model/tuning carry-over
 import { createdThreadIdFromSend } from '@/lib/dalton/threadTuningDalton';
+// DALTON-HOOK(model-picker-races): read latest composer reasoningEffort/fastMode when flushing queued sends
+import { mergeLatestQueuedTuning } from '@/lib/dalton/threadModelDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-identifiers)
 import { holdReload } from '@/lib/reloadHolds';
@@ -3459,7 +3461,9 @@ export function useChatMessages(
     // handoff to an automatic resend parks it, its definite not-taken puts it
     // back — and settleQueued resolves the queueing call's deferred boolean,
     // which deletes nothing on its own.
-    void handleSendMessage(message, additionalContext, attachmentMeta, { ...modelOptions, onAccepted: queuedAccepted, onHandedOff: queuedHandedOff, onNotTaken: queuedNotTaken }, { shown: { userId: messageId } })
+    // DALTON-HOOK(model-picker-races): refresh reasoningEffort/fastMode from the live composer at flush time instead of the enqueue-time snapshot
+    const flushedOptions = mergeLatestQueuedTuning(modelOptions, readComposerOptions?.());
+    void handleSendMessage(message, additionalContext, attachmentMeta, { ...flushedOptions, onAccepted: queuedAccepted, onHandedOff: queuedHandedOff, onNotTaken: queuedNotTaken }, { shown: { userId: messageId } })
       .then(settleQueued);
     // Fires on isCompacting transitions. The send handler is captured from
     // the render where isCompacting went false — that render is the correct
@@ -3526,7 +3530,9 @@ export function useChatMessages(
     // DALTON-HOOK(composer-drafts): the flushed send's outcome settles the
     // queueing call's deferred boolean; its own callbacks (acceptance,
     // not-taken) riding the queued options do the real settling.
-    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } })
+    // DALTON-HOOK(model-picker-races): refresh reasoningEffort/fastMode from the live composer at flush time instead of the enqueue-time snapshot
+    const flushedOptions = mergeLatestQueuedTuning(next.modelOptions, readComposerOptions?.());
+    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, flushedOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } })
       .then((sent) => next.settleQueued?.(sent));
     // Fires when the view goes idle, a steer is answered or the workspace
     // arrives. The send handler is captured from that render, which is the

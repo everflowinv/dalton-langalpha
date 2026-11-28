@@ -6,13 +6,16 @@ import type { ThreadTuning } from '@/components/ui/chat-input.types';
 import { isDaltonBuild } from '@/config/brand';
 import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
 import {
+  buildDeferredTuningConditions,
   createClearLocalTuningHandle,
   isCreatedThreadTransition,
   resolveTuningThreadTransition,
   scrubFailedTuningHold,
   shouldDeferCreatedRowTuningSave,
+  shouldFlushDeferredTuningPick,
   type ClearLocalHandle,
   type DaltonTuningHold,
+  type DeferredTuningPick,
   type NullHandleBinder,
 } from '@/lib/dalton/threadTuningDalton';
 import type { Thread } from '@/types/api';
@@ -154,9 +157,10 @@ function useThreadOverride<F extends TuningField>({
   const landingHold = (value: Override<F>): Hold<Override<F>> => (value === null ? null : { value });
   const [held, setHeld] = useState<Hold<Override<F>>>(landing ? landingHold(landing.value) : null);
   // DALTON-HOOK(antigravity-series): retain a tuning pick made while workspace write permission is unresolved so it flushes via PATCH once confirmed personal
-  const [deferredPick, setDeferredPick] = useState<{ threadId: string; value: Override<F> } | null>(null);
+  // DALTON-HOOK(model-picker-races): capture expected server value on deferredPick for conditional flush
+  const [deferredPick, setDeferredPick] = useState<DeferredTuningPick<Override<F>> | null>(null);
   const heldRef = useRef<Hold<Override<F>>>(held);
-  const deferredPickRef = useRef<{ threadId: string; value: Override<F> } | null>(deferredPick);
+  const deferredPickRef = useRef<DeferredTuningPick<Override<F>> | null>(deferredPick);
   // DALTON-HOOK(antigravity-series): monotonic epoch & null-origin handle binders track the created thread and invalidate on switch to another thread
   const sessionEpochRef = useRef(0);
   const boundNullHandlesRef = useRef<Set<NullHandleBinder>>(new Set());
@@ -229,6 +233,7 @@ function useThreadOverride<F extends TuningField>({
   }, [createdThreadId, deferredPick, held, liveThreadId, rowValue, save, skipSave]);
 
   // DALTON-HOOK(antigravity-series): flush a deferred tuning pick via PATCH once write permission resolves to confirmed personal, or drop it on shared threads
+  // DALTON-HOOK(model-picker-races): abandon deferred flush if another tab already updated the row while unresolved, and attach expected-value CAS guard on flush
   useEffect(() => {
     if (!deferredPick || isUnresolved) return;
     if (deferredPick.threadId !== liveThreadId || !liveThreadId) {
@@ -241,13 +246,27 @@ function useThreadOverride<F extends TuningField>({
       setDeferredPick(null);
       return;
     }
+    if (!shouldFlushDeferredTuningPick(deferredPick, rowValue)) {
+      deferredPickRef.current = null;
+      setDeferredPick(null);
+      heldRef.current = null;
+      setHeld(null);
+      return;
+    }
     const { threadId: targetThreadId, value: targetValue } = deferredPick;
+    const conditions = buildDeferredTuningConditions(field, deferredPick);
     deferredPickRef.current = null;
     setDeferredPick(null);
     createdRef.current = null;
     // DALTON-HOOK(antigravity-series): always persist the user's last explicit deferred pick even when it matches cached rowValue (which may be stale)
-    void save({ threadId: targetThreadId, value: targetValue, before: null });
-  }, [deferredPick, isUnresolved, liveThreadId, save, skipSave]);
+    void save({
+      threadId: targetThreadId,
+      value: targetValue,
+      before: null,
+      ...(conditions ? { conditions } : {}),
+      background: 'deferred',
+    });
+  }, [deferredPick, field, isUnresolved, liveThreadId, rowValue, save, skipSave]);
 
   /** Resolves false only when this pick's own save failed. */
   const set = useCallback((next: Override<F>): Promise<boolean> => {
@@ -260,8 +279,16 @@ function useThreadOverride<F extends TuningField>({
       return Promise.resolve(true);
     }
     // DALTON-HOOK(antigravity-series): defer PATCH while workspace write permission is unresolved; skip on confirmed shared workspaces
+    // DALTON-HOOK(model-picker-races): snapshot server value when staging a deferred pick so flush uses expected-value CAS
     if (isUnresolved) {
-      const nextDeferred = { threadId: liveThreadId, value: next };
+      const prevDeferred = deferredPickRef.current;
+      const keepPrevExpected = Boolean(prevDeferred && prevDeferred.threadId === liveThreadId && prevDeferred.hasExpected);
+      const nextDeferred: DeferredTuningPick<Override<F>> = {
+        threadId: liveThreadId,
+        value: next,
+        expected: keepPrevExpected ? prevDeferred!.expected : rowValue,
+        hasExpected: keepPrevExpected || rowValue !== undefined,
+      };
       deferredPickRef.current = nextDeferred;
       setDeferredPick(nextDeferred);
       return Promise.resolve(true);
@@ -271,7 +298,7 @@ function useThreadOverride<F extends TuningField>({
     if (skipSave) return Promise.resolve(true);
     // `before` goes unused: a failure drops the hold rather than restoring one.
     return save({ threadId: liveThreadId, value: next, before: null });
-  }, [isUnresolved, liveThreadId, save, skipSave]);
+  }, [isUnresolved, liveThreadId, rowValue, save, skipSave]);
 
   const shownThreadRef = useRef(liveThreadId);
   shownThreadRef.current = liveThreadId;

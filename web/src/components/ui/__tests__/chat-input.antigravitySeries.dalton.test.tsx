@@ -325,4 +325,45 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     expect(h.removeManyFavorites).toHaveBeenCalledWith(['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth']);
     expect(h.removeFavorite).not.toHaveBeenCalled();
   });
+
+  // DALTON-HOOK(model-picker-races): Report High #1 — global default reasoning_effort='high' must NOT leak onto an Antigravity Low send
+  it('omits standard reasoningEffort (null) when sending an Antigravity variant even if account default reasoning_effort is high', () => {
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-low-oauth',
+        reasoning_effort: 'high',
+      },
+      other_preference: {},
+    };
+    const onSend = vi.fn();
+    const inputRef = { current: null as import('../chat-input').ChatInputHandle | null };
+    const { container } = renderComposer({
+      ref: inputRef,
+      model: 'gemini-4-neon-low-oauth',
+      sendModel: 'gemini-4-neon-low-oauth',
+      tuning: { reasoningEffort: null, fastMode: null },
+      onSend,
+    });
+
+    const modelPill = container.querySelector('button[data-pill="model"]')!;
+    expect(modelPill).toHaveTextContent('Gemini 4 Neon');
+    expect(modelPill).toHaveTextContent('Low');
+
+    // getModelOptions() must report reasoningEffort: null (variant key itself carries 'low').
+    expect(inputRef.current?.getModelOptions()).toMatchObject({
+      model: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+    });
+
+    // Sending a message must pass reasoningEffort: null (never 'high') so backend does not remap Low -> High.
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'hello neon low' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({
+      model: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+    });
+    expect(onSend.mock.calls[0][0].modelOptions).not.toHaveProperty('reasoningEffortOverride');
+  });
 });

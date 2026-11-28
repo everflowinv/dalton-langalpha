@@ -508,9 +508,12 @@ function ChatInput({
     }
   }, [isLoading]);
   const tuning = hostTuning === undefined ? ownTuning : hostTuning;
-  const sentEffort = tuning.reasoningEffort === undefined
+  // DALTON-HOOK(model-picker-races): Antigravity variants encode reasoning effort in the model key; never forward standard/global reasoning_effort
+  const sentEffort = pillSeriesMatch
     ? null
-    : tuning.reasoningEffort ?? settingsTuning.reasoning_effort;
+    : tuning.reasoningEffort === undefined
+      ? null
+      : tuning.reasoningEffort ?? settingsTuning.reasoning_effort;
   // DALTON-HOOK(antigravity-series): derive pill effort from saved Antigravity variant
   const resolvedEffort = pillSeriesMatch
     ? pillSeriesMatch.effort
@@ -523,9 +526,10 @@ function ChatInput({
   // A composer with no thread behind it hands its picks to the thread its
   // send starts, which keeps them as its own.
   const ownOverrides = useMemo(() => (hostTuning === undefined ? {
-    ...(ownTuning.reasoningEffort !== null ? { reasoningEffortOverride: ownTuning.reasoningEffort } : {}),
+    // DALTON-HOOK(model-picker-races): never persist a standard reasoning_effort override when sending an Antigravity variant
+    ...(!pillSeriesMatch && ownTuning.reasoningEffort !== null ? { reasoningEffortOverride: ownTuning.reasoningEffort } : {}),
     ...(ownTuning.fastMode !== null ? { fastModeOverride: ownTuning.fastMode } : {}),
-  } : {}), [hostTuning, ownTuning]);
+  } : {}), [hostTuning, ownTuning, pillSeriesMatch]);
 
   // The Subagents switch a send names. A thread host owns it. Without one the
   // composer holds a pick, null until touched so the toggle shows the user's
@@ -750,9 +754,10 @@ function ChatInput({
           }
         : {};
       // DALTON-HOOK(automation-effort): retry submits the variant only when it was picked for this retry
+      // DALTON-HOOK(model-picker-races): never forward standard reasoningEffort on Antigravity retries
       return attachComposerModelPickSeq({
         model: retryModel,
-        reasoningEffort: matchedExplicit ? explicit.effort : null,
+        reasoningEffort: !pillSeriesMatch && matchedExplicit ? explicit.effort : null,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,

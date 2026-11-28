@@ -9,7 +9,7 @@ these exact strings. This is that guard.
 
 import re
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import pytest
 
@@ -31,6 +31,8 @@ LIFECYCLE_TYPES = {
     "thread_pinned",
     "thread_subagents",
     "thread_tuning",
+    # DALTON-HOOK(model-picker-races): cross-tab broadcast when thread llm_model changes
+    "thread_model",
     # A summary written while the thread sat idle, which no stream carries.
     "thread_compacted",
     "thread_deleted",
@@ -179,3 +181,20 @@ async def test_run_started_says_where_the_run_came_from():
         "origin": "wakeup",
         "notification": {"kind": "started", "title": "NVDA", "body": "Checking back in…"},
     }
+
+
+# DALTON-HOOK(model-picker-races): lock wire shape of thread_model lifecycle event
+@pytest.mark.asyncio
+@pytest.mark.parametrize("llm_model", ["gemini-4-neon-low-oauth", None])
+async def test_thread_model_event_carries_llm_model(llm_model):
+    sent = create_autospec(thread_lifecycle_feed.publish_user_event)
+    with patch.object(thread_lifecycle_feed, "publish_user_event", sent):
+        await thread_lifecycle_feed.publish_thread_model(
+            user_id="user-1", thread_id="t-1", workspace_id="ws-1", llm_model=llm_model
+        )
+    user_id, event = sent.await_args.args
+    assert user_id == "user-1"
+    assert event["type"] == "thread_model"
+    # Present even as null, which tells a tab the thread follows the account default.
+    assert "llm_model" in event
+    assert event["llm_model"] is llm_model

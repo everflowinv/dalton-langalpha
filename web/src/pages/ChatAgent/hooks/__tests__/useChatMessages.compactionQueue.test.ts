@@ -681,4 +681,48 @@ describe('useChatMessages – queued send during compaction', () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.activeTurnModel).toBeNull();
   });
+
+  // DALTON-HOOK(model-picker-races): Report Medium #5 — compaction-queued message reads live composer reasoningEffort/fastMode on flush instead of enqueue-time snapshot
+  it('reads latest composer reasoningEffort when flushing a compaction-queued message', async () => {
+    let liveEffort: string | null = 'high';
+    let liveFast: boolean | null = true;
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-test', 'thread-q-effort', {
+        readComposerOptions: () => ({
+          model: null,
+          reasoningEffort: liveEffort,
+          fastMode: liveFast,
+        }),
+      }),
+    );
+
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+
+    // User queues message while composer is on High + fastMode: true.
+    await act(async () => {
+      void result.current.handleSendMessage('queued during compact', null, null, {
+        model: null,
+        reasoningEffort: 'high',
+        fastMode: true,
+      });
+    });
+    expect(mockSendStream).not.toHaveBeenCalled();
+
+    // While compaction is still running, user lowers reasoning effort to Low + fastMode: false.
+    liveEffort = 'low';
+    liveFast = false;
+
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    expect(mockSendStream.mock.calls[0][0]).toBe('queued during compact');
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      reasoningEffort: 'low',
+      fastMode: false,
+    });
+  });
 });

@@ -10,7 +10,8 @@ and HITL resume reach the same handler.
 """
 
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -371,3 +372,93 @@ async def test_a_turn_nobody_started_runs_on_the_setup_token_the_user_stored(tur
 
     assert resp.status_code == 200
     m["astream"].assert_called_once()
+
+
+# DALTON-HOOK(model-picker-races): PATCH /threads/{id} broadcasts thread_model and enforces optional CAS guards (409 on mismatch)
+@pytest.mark.asyncio
+async def test_patch_thread_model_publishes_event_and_background_cas_returns_409_on_mismatch():
+    from src.server.app.threads import crud as crud_mod
+    from src.server.services import thread_lifecycle_feed
+    from src.server.services.shared_workspaces.access import Access
+    from src.server.utils.api import get_current_user_id
+
+    now = datetime.now(timezone.utc)
+    updated_row = {
+        "conversation_thread_id": "tid-cas-1",
+        "workspace_id": "ws-1",
+        "thread_index": 0,
+        "current_status": "completed",
+        "msg_type": "ptc",
+        "title": "Thread",
+        "llm_model": "gemini-4-neon-low-oauth",
+        "subagents_allowed": None,
+        "reasoning_effort": None,
+        "fast_mode": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    app = _app()
+    app.dependency_overrides[get_current_user_id] = lambda: USER
+
+    # 1) Direct user click (no expected_*) writes unconditionally and publishes thread_model.
+    update_ok = create_autospec(crud_mod.update_thread_fields, return_value=updated_row)
+    pub_model = create_autospec(thread_lifecycle_feed.publish_thread_model)
+    require_sel = create_autospec(crud_mod.require_selectable_model)
+    meta_ok = create_autospec(
+        crud_mod.get_thread_auth_meta,
+        return_value={"llm_model": "gemini-4-neon-high-oauth", "workspace_id": "ws-1"},
+    )
+    with (
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER))),
+        patch.object(crud_mod, "require_selectable_model", new=require_sel),
+        patch.object(crud_mod, "get_thread_auth_meta", new=meta_ok),
+        patch.object(crud_mod, "update_thread_fields", new=update_ok),
+        patch.object(crud_mod, "publish_thread_model", new=pub_model),
+        patch("src.server.handlers.thread_maintenance.hand_off_on_switch", new=AsyncMock(return_value=False)),
+        patch("src.server.services.llm.thread_model.next_turn_runs_claude_code", new=AsyncMock(return_value=False)),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.patch(
+                "/api/v1/threads/tid-cas-1",
+                json={"llm_model": "gemini-4-neon-low-oauth"},
+            )
+    assert resp.status_code == 200
+    update_ok.assert_awaited_once_with("tid-cas-1", llm_model="gemini-4-neon-low-oauth")
+    pub_model.assert_awaited_once_with(
+        user_id=USER,
+        thread_id="tid-cas-1",
+        workspace_id="ws-1",
+        llm_model="gemini-4-neon-low-oauth",
+    )
+
+    # 2) Background conditional repatch whose expected_llm_model no longer matches returns 409 without publishing.
+    update_miss = create_autospec(crud_mod.update_thread_fields, return_value=None)
+    pub_model_2 = create_autospec(thread_lifecycle_feed.publish_thread_model)
+    meta_moved = create_autospec(
+        crud_mod.get_thread_auth_meta,
+        return_value={"llm_model": "gpt-6.2-sol", "workspace_id": "ws-1"},
+    )
+    with (
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=meta_moved),
+        patch.object(crud_mod, "update_thread_fields", new=update_miss),
+        patch.object(crud_mod, "publish_thread_model", new=pub_model_2),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp2 = await c.patch(
+                "/api/v1/threads/tid-cas-1",
+                json={
+                    "llm_model": "gemini-4-neon-low-oauth",
+                    "expected_llm_model": "gemini-4-neon-high-oauth",
+                },
+            )
+    assert resp2.status_code == 409
+    assert resp2.json()["detail"]["type"] == "thread_setting_conflict"
+    update_miss.assert_awaited_once_with(
+        "tid-cas-1",
+        llm_model="gemini-4-neon-low-oauth",
+        expected_llm_model="gemini-4-neon-high-oauth",
+    )
+    pub_model_2.assert_not_awaited()

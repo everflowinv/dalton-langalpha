@@ -1248,10 +1248,13 @@ describe('useThreadModel', () => {
       mocks.sharedEntry = null;
       rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
 
+      // DALTON-HOOK(model-picker-races): deferred flush carries expected_llm_model and expected_reasoning_effort CAS guards
       await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
       expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
         llm_model: 'gemini-4-neon-high-oauth',
         reasoning_effort: null,
+        expected_llm_model: 'gemini-4-neon-medium-oauth',
+        expected_reasoning_effort: 'high',
       });
       expect(cachedModel(queryClient)).toBe('gemini-4-neon-high-oauth');
       expect(result.current.model).toBe('gemini-4-neon-high-oauth');
@@ -1323,9 +1326,11 @@ describe('useThreadModel', () => {
       mocks.sharedEntry = null;
       rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
 
+      // DALTON-HOOK(model-picker-races): deferred flush carries expected_llm_model CAS guard
       await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
       expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
         llm_model: 'gemini-4-neon-high-oauth',
+        expected_llm_model: 'model-retired',
       });
       expect(cachedModel(queryClient)).toBe('gemini-4-neon-high-oauth');
       expect(result.current.model).toBe('gemini-4-neon-high-oauth');
@@ -1949,7 +1954,11 @@ describe('useThreadModel', () => {
       mocks.sharedEntry = null;
       mocks.sharedError = false;
       personalView.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
-      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { llm_model: 'gemini-4-neon-high-oauth' }));
+      // DALTON-HOOK(model-picker-races): deferred flush carries expected_llm_model CAS guard
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-high-oauth',
+        expected_llm_model: 'gemini-4-neon-medium-oauth',
+      }));
       expect(personalView.result.current.model).toBe('gemini-4-neon-high-oauth');
     });
 
@@ -2056,8 +2065,12 @@ describe('useThreadModel', () => {
         await personalReread.promise;
       });
       // turnEndCheck re-persists Low onto the personal thread row and keeps UI & sendModel on Low.
+      // DALTON-HOOK(model-picker-races): background repatch carries expected_llm_model CAS guard
       await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(3));
-      expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, { llm_model: 'gemini-4-neon-low-oauth' });
+      expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-low-oauth',
+        expected_llm_model: 'gemini-4-neon-high-oauth',
+      });
       expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
       expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
 
@@ -2500,9 +2513,10 @@ describe('useThreadModel', () => {
         activeTurnModel: null,
       });
 
+      // DALTON-HOOK(model-picker-races): background repatch carries expected_llm_model CAS guard
       await waitFor(() => expect(mocks.updateThread).toHaveBeenLastCalledWith(
         THREAD,
-        { llm_model: 'gemini-4-neon-low-oauth' },
+        { llm_model: 'gemini-4-neon-low-oauth', expected_llm_model: 'gemini-4-neon-high-oauth' },
       ));
       expect(result.current.model).toBe('gemini-4-neon-low-oauth');
     });
@@ -2553,9 +2567,10 @@ describe('useThreadModel', () => {
         activeTurnModel: null,
       });
 
+      // DALTON-HOOK(model-picker-races): background repatch carries expected_llm_model CAS guard
       await waitFor(() => expect(mocks.updateThread).toHaveBeenLastCalledWith(
         THREAD,
-        { llm_model: 'gemini-4-neon-low-oauth' },
+        { llm_model: 'gemini-4-neon-low-oauth', expected_llm_model: 'gemini-4-neon-high-oauth' },
       ));
       expect(result.current.model).toBe('gemini-4-neon-low-oauth');
     });
@@ -2721,6 +2736,206 @@ describe('useThreadModel', () => {
       expect(result.current.tuning.tuning.reasoningEffort).toBe('high');
       expect(result.current.model.model).toBe('model-a');
       expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(model-picker-races): R1-1 — background repatch failing with network/5xx preserves unsent Low pick & sendModel
+    it('R1-1: preserves unsent Low pick and sendModel when turn-end background repatch fails with 503', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = null;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-personal', activeTurnModel: null },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      // Step 1: pick High (seq 1) and enqueue M1.
+      await act(async () => { await result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq!;
+      // Step 2: before M1 starts, switch to Low (seq 2, saved to DB).
+      await act(async () => { await result.current.pickModel('gemini-4-neon-low-oauth'); });
+      expect(result.current.model).toBe('gemini-4-neon-low-oauth');
+
+      // Step 3: M1 (High, seq 1) starts and is admitted; server row moves back to High.
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+
+      // Step 4: M1 ends -> reread returns High -> conditional repatch fails with 503.
+      mocks.server = row('gemini-4-neon-high-oauth');
+      mocks.getThread.mockResolvedValue(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockRejectedValueOnce(Object.assign(new Error('503'), { response: { status: 503 } }));
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenLastCalledWith(
+        THREAD,
+        { llm_model: 'gemini-4-neon-low-oauth', expected_llm_model: 'gemini-4-neon-high-oauth' },
+      ));
+      await act(async () => {});
+
+      // Pill and next-message sendModel MUST stay on Low (never fall back to High).
+      expect(result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+    });
+
+    // DALTON-HOOK(model-picker-races): R1-2a — when another tab changed the thread model while M1 ran, turn-end skips repatch and follows the other tab's model
+    it('R1-2: skips repatch and follows Tab B model when turn-end reread shows an external model change', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gpt-6.2-sol',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = null;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-personal', activeTurnModel: null },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      await act(async () => { await result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq!;
+      await act(async () => { await result.current.pickModel('gemini-4-neon-low-oauth'); });
+      mocks.updateThread.mockClear();
+
+      // M1 (High) runs while Tab B switches the thread to gpt-6.2-sol + reasoning_effort: 'high'.
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+
+      const tabBRow = { ...row('gpt-6.2-sol'), reasoning_effort: 'high' } as Thread;
+      mocks.server = tabBRow;
+      mocks.getThread.mockResolvedValueOnce(tabBRow);
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+
+      await waitFor(() => expect(result.current.model).toBe('gpt-6.2-sol'));
+      expect(result.current.sendModel).toBeNull();
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(model-picker-races): R1-2b — when conditional repatch receives 409 conflict, silently abandon repatch, refetch, and follow server's latest model
+    it('R1-2: abandons repatch silently on 409 conflict and follows server latest model', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gpt-6.2-sol',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = null;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-personal', activeTurnModel: null },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      await act(async () => { await result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq!;
+      await act(async () => { await result.current.pickModel('gemini-4-neon-low-oauth'); });
+      mocks.toast.mockClear();
+
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+
+      // Reread still sees High, so Tab A issues conditional repatch, which hits 409 because Tab B saved gpt-6.2-sol in between.
+      const tabBRow = row('gpt-6.2-sol');
+      mocks.getThread
+        .mockResolvedValueOnce(row('gemini-4-neon-high-oauth'))
+        .mockResolvedValueOnce(tabBRow);
+      mocks.updateThread.mockRejectedValueOnce(
+        Object.assign(new Error('Conflict'), { response: { status: 409 } }),
+      );
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+
+      await waitFor(() => expect(result.current.model).toBe('gpt-6.2-sol'));
+      expect(result.current.sendModel).toBeNull();
+      expect(mocks.toast).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(model-picker-races): unresolved deferred flush carries expected_llm_model and yields on mid-wait update or 409
+    it('unresolved deferred model flush skips PATCH on mid-wait update and yields silently on 409', async () => {
+      mocks.catalogModelNames = new Set(['model-default', 'model-a', 'model-x', 'model-y']);
+      mocks.sharedEnabled = true;
+      mocks.sharedEntry = undefined;
+
+      // Case A: mid-wait detail update from Tab B (model-a -> model-y) before permission resolves.
+      const viewA = setup({ workspaceId: 'ws-personal' }, row('model-a'));
+      act(() => { void viewA.result.current.pickModel('model-x'); });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      act(() => {
+        viewA.queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-y'));
+      });
+      mocks.sharedEntry = null;
+      viewA.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(viewA.result.current.model).toBe('model-y'));
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(viewA.result.current.sendModel).toBeNull();
+      viewA.unmount();
+
+      // Case B: cache stays stale model-a -> resolves and sends conditional PATCH -> backend returns 409 -> yields & refetches model-y.
+      mocks.sharedEntry = undefined;
+      mocks.toast.mockClear();
+      const viewB = setup({ workspaceId: 'ws-personal' }, row('model-a'));
+      act(() => { void viewB.result.current.pickModel('model-x'); });
+
+      mocks.updateThread.mockRejectedValueOnce(
+        Object.assign(new Error('Conflict'), { response: { status: 409 } }),
+      );
+      mocks.getThread.mockResolvedValueOnce(row('model-y'));
+      mocks.sharedEntry = null;
+      viewB.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(
+        THREAD,
+        { llm_model: 'model-x', expected_llm_model: 'model-a' },
+      ));
+      await waitFor(() => expect(viewB.result.current.model).toBe('model-y'));
+      expect(viewB.result.current.sendModel).toBeNull();
+      expect(mocks.toast).not.toHaveBeenCalled();
+      viewB.unmount();
     });
   });
 });

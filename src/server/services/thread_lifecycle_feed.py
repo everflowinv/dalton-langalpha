@@ -335,6 +335,25 @@ async def publish_thread_tuning(
     await publish_user_event(user_id, event)
 
 
+# DALTON-HOOK(model-picker-races): broadcast thread llm_model changes to other open tabs
+async def publish_thread_model(
+    *,
+    user_id: Optional[str],
+    thread_id: str,
+    workspace_id: Optional[str],
+    llm_model: Optional[str],
+) -> None:
+    """Model hint: a thread's model lives only on its row, so a tab with the
+    thread open learns of a pick made in another one (or by the agent) only
+    from this event or its next read of the thread."""
+    event = build_lifecycle_event(
+        type="thread_model", thread_id=thread_id, workspace_id=workspace_id
+    )
+    # Always present: null is the thread following the account default.
+    event["llm_model"] = llm_model
+    await publish_user_event(user_id, event)
+
+
 async def publish_thread_compacted(
     *,
     user_id: Optional[str],

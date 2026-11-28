@@ -1,9 +1,30 @@
 import type { QueryClient } from '@tanstack/react-query';
+import { apiErrorStatus } from '@/api/errors';
 import { isDaltonBuild } from '@/config/brand';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
 import type { Thread } from '@/types/api';
 import type { ThreadUpdates } from '@/pages/ChatAgent/utils/api';
+
+export type ThreadFieldSaveBackground = 'repatch' | 'deferred';
+
+export type ThreadFieldSaveConditions = Pick<
+  ThreadUpdates,
+  'expected_llm_model' | 'expected_reasoning_effort' | 'expected_fast_mode'
+>;
+
+/**
+ * True when a background conditional save (turn-end repatch or unresolved-permission
+ * deferred flush) was rejected with HTTP 409 because another writer already updated
+ * the thread row. In that case the client silently yields to the server's newer value.
+ */
+export function isDaltonBackgroundConflict(
+  background: ThreadFieldSaveBackground | undefined,
+  error: unknown,
+): boolean {
+  if (!isDaltonBuild || !background) return false;
+  return apiErrorStatus(error) === 409;
+}
 
 const confirmedEffortByClient = new WeakMap<
   QueryClient,

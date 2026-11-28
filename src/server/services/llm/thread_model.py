@@ -768,6 +768,22 @@ async def switch_thread_model(
             changed=False,
         )
 
+    # DALTON-HOOK(model-picker-races): atomically clear stale standard reasoning_effort when switching to a built-in Antigravity variant and broadcast thread_model (and thread_tuning) SSE events
+    from src.dalton.llm.antigravity_series import is_builtin_antigravity_variant
+    from src.server.services.thread_lifecycle_feed import (
+        publish_thread_model,
+        publish_thread_tuning,
+    )
+
+    pref_for_variant = model_pref
+    if pref_for_variant is None and model is not None:
+        try:
+            pref_for_variant = await user_models.get_model_preference(user_id)
+        except RuntimeError:
+            pref_for_variant = None
+    clear_effort = is_builtin_antigravity_variant(model, model_pref=pref_for_variant)
+    extra_fields: dict[str, Any] = {"reasoning_effort": None} if clear_effort else {}
+
     if defer_handoff:
         # DALTON-HOOK(cos-settings-tools): carry per-run (model, system_only) candidate pairs and parallel run_ids into the pending handoff marker
         marker = build_pending_model_handoff_marker(
@@ -781,6 +797,7 @@ async def switch_thread_model(
             thread_id,
             llm_model=model,
             metadata_merge={PENDING_MODEL_HANDOFF_KEY: marker},
+            **extra_fields,
         )
         if not updated_thread:
             raise HTTPException(
@@ -791,6 +808,20 @@ async def switch_thread_model(
             if updated_thread.get("workspace_id")
             else None
         )
+        await publish_thread_model(
+            user_id=user_id,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            llm_model=updated_thread.get("llm_model"),
+        )
+        if clear_effort:
+            await publish_thread_tuning(
+                user_id=user_id,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                reasoning_effort=updated_thread.get("reasoning_effort"),
+                fast_mode=updated_thread.get("fast_mode"),
+            )
         return ThreadModelSwitchResult(
             thread=updated_thread,
             workspace_id=workspace_id,
@@ -800,7 +831,7 @@ async def switch_thread_model(
         )
 
     updated_thread = await threads_write.update_thread_fields(
-        thread_id, llm_model=model
+        thread_id, llm_model=model, **extra_fields
     )
     if not updated_thread:
         raise HTTPException(
@@ -812,6 +843,20 @@ async def switch_thread_model(
         if updated_thread.get("workspace_id")
         else None
     )
+    await publish_thread_model(
+        user_id=user_id,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        llm_model=updated_thread.get("llm_model"),
+    )
+    if clear_effort:
+        await publish_thread_tuning(
+            user_id=user_id,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            reasoning_effort=updated_thread.get("reasoning_effort"),
+            fast_mode=updated_thread.get("fast_mode"),
+        )
     if _immediate_handoff_runner is None:
         logger.warning(
             f"[handoff] thread {thread_id}: immediate handoff runner not registered"

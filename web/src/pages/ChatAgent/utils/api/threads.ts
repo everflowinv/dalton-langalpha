@@ -262,6 +262,10 @@ export interface ThreadUpdates {
   /** The thread's own fast mode, stored as sent. `null` returns it to
    *  following Settings. */
   fast_mode?: boolean | null;
+  // DALTON-HOOK(model-picker-races): optional expected-value CAS guards for background auto-saves (repatch / deferred flush)
+  expected_llm_model?: string | null;
+  expected_reasoning_effort?: string | null;
+  expected_fast_mode?: boolean | null;
 }
 
 /**

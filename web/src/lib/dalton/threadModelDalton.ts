@@ -1,10 +1,12 @@
 import type { MutableRefObject } from 'react';
 import { isDaltonBuild } from '@/config/brand';
+import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
 import type { Thread } from '@/types/api';
 
 export interface ManualModelPick {
   model: string;
   seq: number;
+  beforeRowModel?: string | null;
 }
 
 export interface DeferredSharedPick {
@@ -12,7 +14,16 @@ export interface DeferredSharedPick {
   picked: string;
   before: string | null;
   seq: number;
+  expectedModel?: string | null;
+  hasExpectedModel?: boolean;
+  expectedEffort?: string | null;
+  hasExpectedEffort?: boolean;
   onSettled?: (saved: boolean) => void;
+}
+
+export interface RepatchExpectedModel {
+  known: boolean;
+  model: string | null;
 }
 
 export interface TrackedTurnPick {
@@ -189,11 +200,37 @@ export interface TurnPickRecordingRefs {
   pendingRef: MutableRefObject<string | null>;
   deferredSharedPickRef: MutableRefObject<DeferredSharedPick | null>;
   preservedUnsentSeqRef: MutableRefObject<number | null>;
+  repatchExpectedRef?: MutableRefObject<RepatchExpectedModel>;
 }
 
 /**
- * Thin-hook helper for `useThreadModel.ts`: computes consumed turn pick and
- * records unsent-pick protection in `preservedUnsentSeqRef`.
+ * Computes the server `llm_model` value that the ending turn itself is expected
+ * to have left on the thread row when an unsent newer pick is being protected.
+ * A background repatch only fires if the reread row still holds this exact model.
+ */
+export function resolveRepatchExpectedModel(
+  turnModel: ActiveTurnModelInfo | null,
+  currentPick: ManualModelPick | null,
+  snapshot: { thread: Thread | undefined; updatedAt: number },
+): RepatchExpectedModel {
+  if (!turnModel) return { known: false, model: null };
+  if (turnModel.model !== null) return { known: true, model: turnModel.model };
+  if (turnModel.modelUnknown) {
+    if (currentPick && 'beforeRowModel' in currentPick) {
+      return { known: true, model: currentPick.beforeRowModel ?? null };
+    }
+    return { known: false, model: null };
+  }
+  if (snapshot.thread !== undefined) {
+    return { known: true, model: snapshot.thread.llm_model ?? null };
+  }
+  return { known: false, model: null };
+}
+
+/**
+ * Thin-hook helper for `useThreadModel.ts`: computes consumed turn pick,
+ * records unsent-pick protection in `preservedUnsentSeqRef`, and records the
+ * expected old-turn model for conditional repatching.
  */
 export function recordDaltonTurnPick(
   turnModel: ActiveTurnModelInfo | null,
@@ -210,8 +247,112 @@ export function recordDaltonTurnPick(
     hasDeferredShared: refs.deferredSharedPickRef.current !== null,
     snapshot,
   });
-  if (preserveUnsentSeq !== null) refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
+  if (preserveUnsentSeq !== null) {
+    refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
+    if (refs.repatchExpectedRef) {
+      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(
+        turnModel,
+        refs.manualPickRef.current,
+        snapshot,
+      );
+    }
+  }
   return consumedPick;
+}
+
+/**
+ * True only when the reread row still matches the model written by the old turn
+ * that just finished. If another tab or `switch_thread_model` moved the thread
+ * to a different model, returns false so the client abandons repatching.
+ */
+export function shouldRepatchPreservedPick(
+  freshModel: string | null,
+  repatchExpected: RepatchExpectedModel | null | undefined,
+): boolean {
+  if (!isDaltonBuild || !repatchExpected?.known) return false;
+  return freshModel === repatchExpected.model;
+}
+
+/**
+ * True when an unresolved-permission deferred model pick is still eligible to
+ * flush: returns false if the cached thread row already moved away from the
+ * model observed when the deferred pick was staged.
+ */
+export function shouldFlushDeferredModelPick(
+  pick: DeferredSharedPick,
+  thread: Thread | undefined,
+): boolean {
+  if (!isDaltonBuild || !pick.hasExpectedModel || thread === undefined) return true;
+  return (thread.llm_model ?? null) === (pick.expectedModel ?? null);
+}
+
+/**
+ * Builds the optional CAS guard fields sent on a deferred model flush.
+ */
+export function buildDeferredModelConditions(
+  pick: DeferredSharedPick,
+  shouldClearEffort: boolean,
+): ThreadFieldSaveConditions | undefined {
+  if (!isDaltonBuild) return undefined;
+  const conditions: ThreadFieldSaveConditions = {};
+  if (pick.hasExpectedModel) {
+    conditions.expected_llm_model = pick.expectedModel ?? null;
+  }
+  if (shouldClearEffort && pick.hasExpectedEffort) {
+    conditions.expected_reasoning_effort = pick.expectedEffort ?? null;
+  }
+  return Object.keys(conditions).length > 0 ? conditions : undefined;
+}
+
+/**
+ * Refreshes a queued message's reasoningEffort / fastMode from the live composer
+ * at flush time instead of sending the stale snapshot captured when it was queued.
+ *
+ * - If the queued message explicitly targets a different model than the composer
+ *   now shows (e.g. a queued Antigravity High turn after the user switched the
+ *   composer to a standard model), keeps the queued message's own tuning.
+ * - Otherwise, when live composer options are available, adopts their latest
+ *   `reasoningEffort` and `fastMode`.
+ * - When no composer reader is mounted (headless caller), clears the stale
+ *   enqueue-time snapshot so the server reads the thread row's latest tuning.
+ */
+export function mergeLatestQueuedTuning<
+  T extends {
+    model?: string | null;
+    reasoningEffort?: string | null;
+    fastMode?: boolean | null;
+  },
+>(
+  queuedOptions: T,
+  latestComposerOptions:
+    | {
+        model?: string | null;
+        reasoningEffort?: string | null;
+        fastMode?: boolean | null;
+      }
+    | undefined,
+): T {
+  if (latestComposerOptions !== undefined) {
+    if (
+      queuedOptions.model
+      && latestComposerOptions.model
+      && queuedOptions.model !== latestComposerOptions.model
+    ) {
+      return queuedOptions;
+    }
+    return {
+      ...queuedOptions,
+      reasoningEffort: latestComposerOptions.reasoningEffort ?? null,
+      ...(latestComposerOptions.fastMode !== undefined
+        ? { fastMode: latestComposerOptions.fastMode }
+        : {}),
+    };
+  }
+  return {
+    ...queuedOptions,
+    reasoningEffort: undefined,
+    fastMode: undefined,
+  };
 }
 
 /**

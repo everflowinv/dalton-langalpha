@@ -6,7 +6,10 @@ import { isDaltonBuild } from '@/config/brand';
 import {
   getConfirmedEffortMap,
   hasPendingModelEffortUpdate,
+  isDaltonBackgroundConflict,
   resolveDaltonFieldRollback,
+  type ThreadFieldSaveBackground,
+  type ThreadFieldSaveConditions,
 } from '@/lib/dalton/threadFieldSaveDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
@@ -22,6 +25,9 @@ export interface ThreadFieldSave<V> {
   before: V | null;
   // DALTON-HOOK(antigravity-series): optional extra fields sent atomically in the same PATCH (e.g. clearing reasoning_effort)
   extraUpdates?: Partial<ThreadUpdates>;
+  // DALTON-HOOK(model-picker-races): optional CAS guards and background-write kind (never written to cached Thread)
+  conditions?: ThreadFieldSaveConditions;
+  background?: ThreadFieldSaveBackground;
 }
 
 interface UseThreadFieldSaveOptions<F extends ThreadField> {
@@ -31,7 +37,7 @@ interface UseThreadFieldSaveOptions<F extends ThreadField> {
   /** What the toast says when the latest save on a thread fails. */
   failedMessage: string;
   /** Puts the composer back after that failure, called only while it still shows the thread. */
-  onFailed: (save: ThreadFieldSave<FieldValue<F>>) => void;
+  onFailed: (save: ThreadFieldSave<FieldValue<F>>, error?: unknown) => void;
   /** Hears the server's answer to each save that lands. */
   onSaved?: (saved: Thread) => void;
 }
@@ -86,9 +92,10 @@ export function useThreadFieldSave<F extends ThreadField>({
   const { mutateAsync } = useMutation({
     mutationKey: threadFieldMutationKey(threadId ?? '', field),
     scope: { id: scopeId },
-    mutationFn: ({ threadId: id, value, extraUpdates }: ThreadFieldSave<FieldValue<F>>) => (
+    mutationFn: ({ threadId: id, value, extraUpdates, conditions }: ThreadFieldSave<FieldValue<F>>) => (
       // DALTON-HOOK(antigravity-series): merge extraUpdates into the same single PATCH request
-      updateThread(id, { [field]: value, ...(extraUpdates ?? {}) } as ThreadUpdates)
+      // DALTON-HOOK(model-picker-races): forward optional CAS conditions without writing them into the query cache
+      updateThread(id, { [field]: value, ...(extraUpdates ?? {}), ...(conditions ?? {}) } as ThreadUpdates)
     ),
     onMutate: async ({ threadId: id, value, extraUpdates }: ThreadFieldSave<FieldValue<F>>) => {
       const key = queryKeys.threads.detail(id);
@@ -176,7 +183,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       confirmedRef.current.set(id, { value: confirmedValue, ...(mergedExtra ? { extra: mergedExtra } : {}) });
       if (saved) onSaved?.(saved);
     },
-    onError: (_error, save, context) => {
+    onError: (error, save, context) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, field) }) !== 1) return;
       // Only this field rolls back; anything else a read brought in since the
       // optimistic write is newer than the snapshot. The save's own snapshot
@@ -186,8 +193,11 @@ export function useThreadFieldSave<F extends ThreadField>({
       // DALTON-HOOK(antigravity-series): resolve serialized model/effort rollback via Dalton module
       const rollback = resolveDaltonFieldRollback({ queryClient, field, save, restored });
       if (rollback) writeField(save.threadId, rollback.value, rollback.extra);
-      if (shownThreadRef.current === save.threadId) onFailed(save);
-      toast({ description: failedMessage, variant: 'destructive' });
+      // DALTON-HOOK(model-picker-races): pass error to onFailed and suppress destructive toast when a background conditional save yields on 409
+      if (shownThreadRef.current === save.threadId) onFailed(save, error);
+      if (!isDaltonBackgroundConflict(save.background, error)) {
+        toast({ description: failedMessage, variant: 'destructive' });
+      }
     },
     onSettled: (saved, error, { threadId: id, value, extraUpdates }) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) !== 1) return;

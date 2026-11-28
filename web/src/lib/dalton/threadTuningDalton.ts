@@ -1,15 +1,50 @@
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { isDaltonBuild } from '@/config/brand';
+import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
 
 export type ClearLocalHandle = (() => void) & { confirm: () => void };
 
 export type NullHandleBinder = (createdId: string) => void;
 
+export interface DeferredTuningPick<V> {
+  threadId: string;
+  value: V;
+  expected?: V;
+  hasExpected?: boolean;
+}
+
+/**
+ * True when an unresolved-permission deferred tuning pick is still eligible to
+ * flush: returns false if the cached thread row already moved away from the
+ * value observed when the deferred pick was staged.
+ */
+export function shouldFlushDeferredTuningPick<V>(
+  pick: DeferredTuningPick<V>,
+  rowValue: V | undefined,
+): boolean {
+  if (!isDaltonBuild || !pick.hasExpected || rowValue === undefined) return true;
+  return rowValue === pick.expected;
+}
+
+/**
+ * Builds the optional CAS guard field sent on a deferred tuning flush.
+ */
+export function buildDeferredTuningConditions<V>(
+  field: 'reasoning_effort' | 'fast_mode',
+  pick: DeferredTuningPick<V>,
+): ThreadFieldSaveConditions | undefined {
+  if (!isDaltonBuild || !pick.hasExpected) return undefined;
+  if (field === 'reasoning_effort') {
+    return { expected_reasoning_effort: (pick.expected ?? null) as string | null };
+  }
+  return { expected_fast_mode: (pick.expected ?? null) as boolean | null };
+}
+
 export type DaltonTuningHold<V> = {
   value: V;
   clearToken?: symbol;
   restoreHeld?: DaltonTuningHold<V>;
-  restoreDeferred?: { threadId: string; value: V } | null;
+  restoreDeferred?: DeferredTuningPick<V> | null;
 } | null;
 
 export interface TuningClearSession<V> {
@@ -17,10 +52,10 @@ export interface TuningClearSession<V> {
   sessionEpochRef: MutableRefObject<number>;
   createdRef: MutableRefObject<string | null>;
   heldRef: MutableRefObject<DaltonTuningHold<V>>;
-  deferredPickRef: MutableRefObject<{ threadId: string; value: V } | null>;
+  deferredPickRef: MutableRefObject<DeferredTuningPick<V> | null>;
   boundNullHandlesRef: MutableRefObject<Set<NullHandleBinder>>;
   setHeld: Dispatch<SetStateAction<DaltonTuningHold<V>>>;
-  setDeferredPick: Dispatch<SetStateAction<{ threadId: string; value: V } | null>>;
+  setDeferredPick: Dispatch<SetStateAction<DeferredTuningPick<V> | null>>;
 }
 
 /**

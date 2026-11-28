@@ -269,9 +269,16 @@ describe('useThreadTuning', () => {
       mocks.sharedError = false;
       rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
 
+      // DALTON-HOOK(model-picker-races): deferred recovery flushes carry expected_* CAS guards
       await waitFor(() => {
-        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { reasoning_effort: 'high' });
-        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { fast_mode: true });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+          reasoning_effort: 'high',
+          expected_reasoning_effort: 'low',
+        });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+          fast_mode: true,
+          expected_fast_mode: false,
+        });
       });
       expect(mocks.updateThread).toHaveBeenCalledTimes(2);
       unmount();
@@ -394,24 +401,84 @@ describe('useThreadTuning', () => {
       expect(mocks.updateThread).not.toHaveBeenCalled();
       expect(result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: false });
 
-      // Even if a mid-wait detail update lands from another tab with different values, the user's unsaved explicit picks win.
-      act(() => {
-        queryClient.setQueryData(
-          queryKeys.threads.detail(THREAD),
-          row({ reasoning_effort: 'medium', fast_mode: true }),
-        );
-      });
-      expect(result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: false });
-
-      // Shared workspace list resolves confirming personal -> both explicit picks flush via PATCH.
+      // DALTON-HOOK(model-picker-races): when cached row has not moved externally, deferred flush carries expected_* CAS guards
       mocks.sharedWorkspaces = [];
       rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
 
       await waitFor(() => {
-        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { reasoning_effort: 'low' });
-        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { fast_mode: false });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+          reasoning_effort: 'low',
+          expected_reasoning_effort: 'low',
+        });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+          fast_mode: false,
+          expected_fast_mode: false,
+        });
       });
       expect(mocks.updateThread).toHaveBeenCalledTimes(2);
+    });
+
+    // DALTON-HOOK(model-picker-races): unresolved deferred tuning flush abandons on mid-wait external update and yields silently on 409
+    it('abandons unresolved deferred tuning flush when another tab updated the row or server returns 409', async () => {
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = true;
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = false;
+
+      // Case A: mid-wait detail update from Tab B (low/false -> medium/true) before permission resolves.
+      const viewA = setup(
+        { workspaceId: 'ws-personal' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+      await act(async () => {
+        await viewA.result.current.setReasoningEffort('high');
+        await viewA.result.current.setFastMode(true);
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      act(() => {
+        viewA.queryClient.setQueryData(
+          queryKeys.threads.detail(THREAD),
+          row({ reasoning_effort: 'medium', fast_mode: true }),
+        );
+      });
+      mocks.sharedWorkspaces = [];
+      viewA.rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+      await waitFor(() => {
+        expect(viewA.result.current.tuning).toEqual({ reasoningEffort: 'medium', fastMode: true });
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      viewA.unmount();
+
+      // Case B: cache stayed stale low -> flush sends expected_reasoning_effort: 'low' -> server 409 -> no toast, refetches medium.
+      mocks.sharedWorkspaces = undefined;
+      mocks.toast.mockClear();
+      const viewB = setup(
+        { workspaceId: 'ws-personal' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+      await act(async () => {
+        await viewB.result.current.setReasoningEffort('high');
+      });
+
+      mocks.updateThread.mockRejectedValueOnce(
+        Object.assign(new Error('Conflict'), { response: { status: 409 } }),
+      );
+      mocks.getThread.mockResolvedValueOnce(row({ reasoning_effort: 'medium', fast_mode: false }));
+      mocks.sharedWorkspaces = [];
+      viewB.rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+
+      await waitFor(() => {
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+          reasoning_effort: 'high',
+          expected_reasoning_effort: 'low',
+        });
+      });
+      await waitFor(() => {
+        expect(viewB.result.current.tuning.reasoningEffort).toBe('medium');
+      });
+      expect(mocks.toast).not.toHaveBeenCalled();
+      viewB.unmount();
     });
 
     // DALTON-HOOK(antigravity-series): R3 — when an effort PATCH fails while a non-Antigravity model PATCH is queued behind it, roll back the cached effort immediately before reread

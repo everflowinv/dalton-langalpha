@@ -1841,7 +1841,11 @@ describe('MarketChatPanel', () => {
       agSeriesMock.featuresPromise = null;
       agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
 
-      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', { llm_model: 'gpt-5' }));
+      // DALTON-HOOK(model-picker-races): deferred unresolved flush carries expected_llm_model CAS guard
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+        llm_model: 'gpt-5',
+        expected_llm_model: 'claude-sonnet-4',
+      }));
       expect(ci.props!.model).toBe('gpt-5');
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
     });

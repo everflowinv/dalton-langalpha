@@ -134,22 +134,50 @@ vi.mock('@/hooks/usePreferences', async () => {
   };
 });
 
-vi.mock('@/hooks/useAllModels', () => ({
-  useAllModels: () => ({
-    models: {},
-    slotModels: {},
-    claudeCodeState: 'off',
-    payers: {},
-    validModelNames: new Set<string>(),
-    catalogModelNames: new Set<string>(),
-    metadata: { 'model-code': { provider: 'claude-code', sdk: 'claude-code' } },
-    isLoading: false,
-    systemDefaults: { default_model: 'model-default', background_model: '' },
-    offPlanModels: new Set(),
-    platform: { model_tier: 0, byok_providers: [], oauth_providers: [] },
-    rawApiResponse: {},
-  }),
-}));
+vi.mock('@/hooks/useAllModels', async () => {
+  // DALTON-HOOK(model-picker-races): expose Antigravity series catalog in mobile MarketView composer test
+  const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+  const neonSeries = buildSeriesCatalog([
+    {
+      series_id: 'antigravity-oauth:gemini-4-neon',
+      series_prefix: 'gemini-4-neon',
+      provider: 'antigravity-oauth',
+      display_name: 'Gemini 4 Neon',
+      qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+      default_effort: 'high',
+      default_model: 'gemini-4-neon-high-oauth',
+      efforts: ['low', 'medium', 'high'],
+      variants: {
+        low: 'gemini-4-neon-low-oauth',
+        medium: 'gemini-4-neon-medium-oauth',
+        high: 'gemini-4-neon-high-oauth',
+      },
+    },
+  ]);
+  const rawMeta = {
+    'model-code': { provider: 'claude-code', sdk: 'claude-code' },
+    'model-x': { provider: 'openai', reasoning_efforts: ['low', 'medium', 'high'] },
+    'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth', reasoning_efforts: ['low'] },
+  };
+  return {
+    useAllModels: () => ({
+      models: {},
+      slotModels: {},
+      claudeCodeState: 'off',
+      payers: {},
+      validModelNames: new Set<string>(['model-default', 'model-x', 'model-y', 'gemini-4-neon-low-oauth']),
+      catalogModelNames: new Set<string>(['model-default', 'model-x', 'model-y', 'gemini-4-neon-low-oauth']),
+      metadata: rawMeta,
+      customModels: [],
+      seriesCatalog: neonSeries,
+      isLoading: false,
+      systemDefaults: { default_model: 'model-default', background_model: '' },
+      offPlanModels: new Set(),
+      platform: { model_tier: 0, byok_providers: [], oauth_providers: [] },
+      rawApiResponse: { model_metadata: rawMeta },
+    }),
+  };
+});
 
 vi.mock('@/hooks/useUpdatePreferences', () => ({
   PREFERENCE_MUTATION_KEY: ['user-preferences'],
@@ -159,14 +187,18 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
 // The menu's own rendering is not under test; the buttons reach the same
 // onSelectModel the dropdown items call.
 vi.mock('@/components/ui/chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ onSelectModel, selectedModel }: {
+  ChatInputModelMenu: ({ onSelectModel, selectedModel, tuning }: {
     onSelectModel: (m: string) => void;
     selectedModel: string | null;
+    tuning?: { onPickEffort?: (e: string | null) => void; reasoningEffort?: string | null };
   }) => (
     <>
       <span>{`pill:${selectedModel}`}</span>
       <button type="button" onClick={() => onSelectModel('model-x')}>pick-x</button>
       <button type="button" onClick={() => onSelectModel('model-y')}>pick-y</button>
+      {/* DALTON-HOOK(model-picker-races): controls to test switching from standard+high effort to Antigravity variant */}
+      <button type="button" onClick={() => tuning?.onPickEffort?.('high')}>pick-effort-high</button>
+      <button type="button" onClick={() => onSelectModel('gemini-4-neon-low-oauth')}>pick-neon-low</button>
     </>
   ),
   ModelTriggerMeasure: () => null,
@@ -184,6 +216,8 @@ interface ChatState {
   workspaceId?: string;
   model?: string;
   subagentsAllowed?: boolean;
+  reasoningEffort?: string | null;
+  reasoningEffortOverride?: string | null;
 }
 
 function ChatPage() {
@@ -193,6 +227,8 @@ function ChatPage() {
       data-testid="chat-page"
       data-workspace={state?.workspaceId}
       data-subagents={String(state?.subagentsAllowed)}
+      data-effort={String(state?.reasoningEffort)}
+      data-effort-override={String(state?.reasoningEffortOverride)}
     >
       {state?.model ?? ''}
     </div>
@@ -318,6 +354,24 @@ describe('the mobile market composer', () => {
 
     send('Build me a DCF');
     expect(await screen.findByTestId('chat-page')).toHaveAttribute('data-subagents', 'false');
+  });
+
+  // DALTON-HOOK(model-picker-races): Report Medium #4 — mobile FAB clears standard reasoning_effort when switching to an Antigravity variant before sending
+  it('clears local standard reasoningEffort when switching to an Antigravity variant in the mobile FAB', async () => {
+    renderPage();
+    expand();
+    // Pick standard model + High reasoning effort.
+    fireEvent.click(screen.getByRole('button', { name: 'pick-x' }));
+    fireEvent.click(screen.getByRole('button', { name: 'pick-effort-high' }));
+    // Switch to Gemini 4 Neon Low before sending.
+    fireEvent.click(screen.getByRole('button', { name: 'pick-neon-low' }));
+    expect(screen.getByText('pill:gemini-4-neon-low-oauth')).toBeInTheDocument();
+
+    send('Analyze NVDA');
+    const chatPage = await screen.findByTestId('chat-page');
+    expect(chatPage).toHaveTextContent('gemini-4-neon-low-oauth');
+    expect(chatPage).toHaveAttribute('data-effort', 'undefined');
+    expect(chatPage).toHaveAttribute('data-effort-override', 'undefined');
   });
 });
 

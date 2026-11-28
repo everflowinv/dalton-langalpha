@@ -809,4 +809,61 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     expect(mockSendStream.mock.lastCall?.[0]).toBe('read this');
     expect(mockSendStream.mock.lastCall?.[3]).toMatchObject({ additionalContext: FILES });
   });
+
+  // DALTON-HOOK(model-picker-races): Report Medium #5 — a not_running-queued follow-up reads live composer reasoningEffort at flush time instead of enqueue-time snapshot
+  it('reads latest composer reasoningEffort when flushing a not_running queued message', async () => {
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-effort' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return { disconnected: false };
+      },
+    );
+
+    let liveEffort: string | null = 'high';
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-nr', null, {
+        readComposerOptions: () => ({
+          model: null,
+          reasoningEffort: liveEffort,
+          fastMode: null,
+        }),
+      }),
+    );
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    // Follow-up steer sent with reasoningEffort: 'high' gets refused as not_running and queued.
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up effort', null, null, {
+        model: null,
+        reasoningEffort: 'high',
+      });
+    });
+    expect(mockSendStream).toHaveBeenCalledTimes(2);
+
+    // Before the old turn finishes and the queue flushes, user lowers composer effort to 'low'.
+    liveEffort = 'low';
+
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up effort');
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      reasoningEffort: 'low',
+    });
+  });
 });
