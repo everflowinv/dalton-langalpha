@@ -14,9 +14,11 @@ Rejects any release archive containing:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 FORBIDDEN_PAX_PREFIXES: tuple[str, ...] = (
     "LIBARCHIVE.xattr.",
@@ -37,13 +39,14 @@ FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
     ("plugins", "dalton_data"),
     ("plugins", "dalton", "skills", "dalton-richard-coverage-weekly"),
     ("plugins", "dalton", "skills", "dalton-ai-app-weekly-monitor"),
+    ("src", "dalton", "data_jobs", "everflow_defaults.yaml"),
     ("web", ".env.dalton"),
 )
 
-# `scripts/dalton/` is default-deny: only these files ship in Core (they must
+# `scripts/dalton/` is default-deny: only these paths ship in Core (they must
 # match the release allowlist in package_release.sh). Everything else under it
-# (the research runtime, ops and launchd scripts, Everflow-only bridges) is rejected
-# without this shipped file having to name it.
+# (the research runtime, ops and launchd scripts, data_assets/skills, Everflow-only
+# bridges) is rejected without having to enumerate every private file.
 CORE_SCRIPTS_DALTON_PREFIX: tuple[str, ...] = ("scripts", "dalton")
 CORE_SCRIPTS_DALTON_ALLOWED: frozenset[str] = frozenset(
     {
@@ -52,6 +55,64 @@ CORE_SCRIPTS_DALTON_ALLOWED: frozenset[str] = frozenset(
         "docker_entrypoint_dalton.sh",
         "configure_minio.sh",
         "log_redaction.py",
+        "seed_openclaw_data.sh",
+        "data_assets/scripts",
+        "data_assets/everflow_only.txt",
+    }
+)
+CORE_SCRIPTS_DALTON_ALLOWED_DIRS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("data_assets", "scripts"),
+    }
+)
+_CORE_SCRIPTS_DALTON_ALLOWED_PARTS: frozenset[tuple[str, ...]] = frozenset(
+    tuple(entry.split("/")) for entry in CORE_SCRIPTS_DALTON_ALLOWED
+)
+_CORE_SCRIPTS_DALTON_PARENT_DIRS: frozenset[tuple[str, ...]] = frozenset(
+    parts[:i]
+    for parts in _CORE_SCRIPTS_DALTON_ALLOWED_PARTS
+    for i in range(1, len(parts))
+)
+
+# Post-package content gate matching out-of-package checker (zero proprietary leaks).
+FORBIDDEN_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("everflow_company_domain", re.compile(r"everflowinv", re.IGNORECASE)),
+    ("personal_home_path", re.compile(r"/Users/richardlu", re.IGNORECASE)),
+    ("everflow_home_path", re.compile(r"/Users/everflow", re.IGNORECASE)),
+    (
+        "windows_eve_path",
+        re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[/\\]Eve(?![A-Za-z0-9_])", re.IGNORECASE),
+    ),
+    ("feishu_chat_id", re.compile(r"oc_[0-9a-f]{20,}", re.IGNORECASE)),
+    ("feishu_user_id", re.compile(r"ou_[0-9a-f]{20,}", re.IGNORECASE)),
+    ("discord_target_id", re.compile(r"(?:user|channel):[0-9]{15,}", re.IGNORECASE)),
+)
+
+_BINARY_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".bmp",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".tgz",
+        ".tar",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".eot",
+        ".parquet",
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".dylib",
+        ".wasm",
     }
 )
 
@@ -61,11 +122,15 @@ def _matches_forbidden_subpath(rel_parts: tuple[str, ...]) -> tuple[str, ...] | 
         if len(rel_parts) >= len(forbidden) and rel_parts[: len(forbidden)] == forbidden:
             return forbidden
     prefix_len = len(CORE_SCRIPTS_DALTON_PREFIX)
-    if (
-        len(rel_parts) > prefix_len
-        and rel_parts[:prefix_len] == CORE_SCRIPTS_DALTON_PREFIX
-        and rel_parts[prefix_len] not in CORE_SCRIPTS_DALTON_ALLOWED
-    ):
+    if len(rel_parts) > prefix_len and rel_parts[:prefix_len] == CORE_SCRIPTS_DALTON_PREFIX:
+        sub = rel_parts[prefix_len:]
+        if sub in _CORE_SCRIPTS_DALTON_ALLOWED_PARTS or sub in _CORE_SCRIPTS_DALTON_PARENT_DIRS:
+            return None
+        for allowed_dir in CORE_SCRIPTS_DALTON_ALLOWED_DIRS:
+            if len(sub) > len(allowed_dir) and sub[: len(allowed_dir)] == allowed_dir:
+                return None
+        if len(sub) >= 2 and sub[:1] in _CORE_SCRIPTS_DALTON_PARENT_DIRS:
+            return rel_parts[: prefix_len + 2]
         return rel_parts[: prefix_len + 1]
     return None
 
@@ -83,18 +148,21 @@ def _normalized_parts(member_name: str) -> tuple[str, ...]:
 
 
 def inspect_tarball(
-    tar_path: Path | str,
+    tar_path: Path | str | None = None,
     *,
+    fileobj: BinaryIO | None = None,
     expected_top_dir: str | None = None,
 ) -> list[str]:
-    """Inspect a tar archive and return a list of policy violations (empty if clean)."""
-    path = Path(tar_path)
+    """Inspect a tar archive (path or in-memory fileobj) and return policy violations."""
+    if tar_path is None and fileobj is None:
+        raise ValueError("inspect_tarball requires tar_path or fileobj")
     violations: list[str] = []
     member_count = 0
     recognized_top_dirs: set[str] = set()
     nested_file_count = 0
 
-    with tarfile.open(path, mode="r:*") as tf:
+    open_kwargs = {"fileobj": fileobj, "mode": "r:*"} if fileobj is not None else {"name": Path(tar_path), "mode": "r:*"}
+    with tarfile.open(**open_kwargs) as tf:
         global_pax = getattr(tf, "pax_headers", None) or {}
         for key in sorted(global_pax):
             if _is_forbidden_pax_key(key):
@@ -119,10 +187,22 @@ def inspect_tarball(
                 else parts
             )
             matched_forbidden = _matches_forbidden_subpath(rel_parts)
+            if (
+                matched_forbidden is None
+                and not member.isdir()
+                and len(rel_parts) > len(CORE_SCRIPTS_DALTON_PREFIX)
+                and rel_parts[: len(CORE_SCRIPTS_DALTON_PREFIX)] == CORE_SCRIPTS_DALTON_PREFIX
+                and rel_parts[len(CORE_SCRIPTS_DALTON_PREFIX) :] in _CORE_SCRIPTS_DALTON_PARENT_DIRS
+            ):
+                matched_forbidden = rel_parts
             if matched_forbidden is not None:
                 violations.append(
                     f"forbidden Everflow-only member in core archive: {member.name} "
                     f"(matched {'/'.join(matched_forbidden)})"
+                )
+            elif parts and parts[-1].endswith(".dalton.yaml"):
+                violations.append(
+                    f"forbidden Everflow overlay member in core archive: {member.name}"
                 )
 
             pax_headers = member.pax_headers or {}
@@ -131,6 +211,43 @@ def inspect_tarball(
                     violations.append(
                         f"forbidden metadata pax header on {member.name}: {key}"
                     )
+
+            for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                if pattern.search(member.name):
+                    violations.append(
+                        f"forbidden proprietary member path ({rule_name}): {member.name}"
+                    )
+
+            if (member.issym() or member.islnk()) and member.linkname:
+                link_target = member.linkname
+                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                    if pattern.search(link_target):
+                        violations.append(
+                            f"forbidden proprietary link target ({rule_name}): "
+                            f"{member.name} -> {link_target}"
+                        )
+                if link_target.endswith(".dalton.yaml") or link_target.endswith(
+                    "everflow_defaults.yaml"
+                ):
+                    violations.append(
+                        f"forbidden Everflow overlay link target: {member.name} -> {link_target}"
+                    )
+
+            if member.isfile():
+                suffix = PurePosixPath(member.name).suffix.lower()
+                if suffix not in _BINARY_SUFFIXES:
+                    extracted = tf.extractfile(member)
+                    if extracted is not None:
+                        raw_bytes = extracted.read()
+                        if b"\x00" not in raw_bytes[:8192]:
+                            text = raw_bytes.decode("utf-8", errors="replace")
+                            for line_no, line in enumerate(text.splitlines(), 1):
+                                for rule_name, pattern in FORBIDDEN_CONTENT_PATTERNS:
+                                    if pattern.search(line):
+                                        violations.append(
+                                            f"forbidden proprietary content ({rule_name}): "
+                                            f"{member.name}:{line_no}"
+                                        )
 
             if expected_top_dir is not None:
                 if raw_name.startswith("/") or ".." in parts:

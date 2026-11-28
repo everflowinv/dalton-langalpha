@@ -2672,8 +2672,10 @@ async def register_and_resolve_inbound(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-1: Idempotently register inbound event and resolve identity, tier, workspace, and generation."""
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+
     if str(platform or "").strip().lower() == "weixin":
-        return await _register_and_resolve_weixin_inbound(
+        result = await _register_and_resolve_weixin_inbound(
             platform_user_id=platform_user_id,
             chat_type=chat_type,
             chat_address=chat_address,
@@ -2692,29 +2694,33 @@ async def register_and_resolve_inbound(
             require_gateway_epoch=require_gateway_epoch,
             conn=conn,
         )
-    return await _run_tx_with_retry(
-        "register_and_resolve_inbound",
-        conn,
-        lambda attempt_conn: _register_and_resolve_inbound_once(
-            platform=platform,
-            platform_user_id=platform_user_id,
-            chat_type=chat_type,
-            chat_address=chat_address,
-            thread_scope_key=thread_scope_key,
-            message_id=message_id,
-            request_key=request_key,
-            raw_payload=raw_payload,
-            external_topic_id=external_topic_id,
-            root_message_id=root_message_id,
-            weixin_context_token=weixin_context_token,
-            weixin_bot_id=weixin_bot_id,
-            weixin_bot_generation=weixin_bot_generation,
-            weixin_context_seq=weixin_context_seq,
-            gateway_epoch=gateway_epoch,
-            require_gateway_epoch=require_gateway_epoch,
-            conn=attempt_conn,
-        ),
-    )
+    else:
+        result = await _run_tx_with_retry(
+            "register_and_resolve_inbound",
+            conn,
+            lambda attempt_conn: _register_and_resolve_inbound_once(
+                platform=platform,
+                platform_user_id=platform_user_id,
+                chat_type=chat_type,
+                chat_address=chat_address,
+                thread_scope_key=thread_scope_key,
+                message_id=message_id,
+                request_key=request_key,
+                raw_payload=raw_payload,
+                external_topic_id=external_topic_id,
+                root_message_id=root_message_id,
+                weixin_context_token=weixin_context_token,
+                weixin_bot_id=weixin_bot_id,
+                weixin_bot_generation=weixin_bot_generation,
+                weixin_context_seq=weixin_context_seq,
+                gateway_epoch=gateway_epoch,
+                require_gateway_epoch=require_gateway_epoch,
+                conn=attempt_conn,
+            ),
+        )
+    if isinstance(result, dict):
+        result["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
+    return result
 
 
 async def _register_and_resolve_weixin_inbound(
@@ -11003,6 +11009,8 @@ async def authorize_and_claim_delivery(
     attempt_id: str | None = None,
     reclaim_stale_attempt_id: str | None = None,
     reclaim_stale_source_attempt_id: str | None = None,
+    retry_dedup_by_target: bool = False,
+    payload_digest: str | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -12582,6 +12590,140 @@ async def authorize_and_claim_delivery(
                     reject_company_system_auth(resolved_user_id)
                 require_channel_platform_capability(resolved_platform)
 
+                cleaned_payload_digest = (
+                    str(payload_digest).strip()
+                    if isinstance(payload_digest, str) and payload_digest.strip()
+                    else None
+                )
+                # Retry-generated send_message deduplication by (logical turn attempt chain,
+                # normalized target, payload_digest): atomically serialize concurrent claims
+                # on the same logical turn + target + payload, walk /retry attempt chains,
+                # and NEVER block distinct text/attachment messages sent to the current chat.
+                if (
+                    retry_dedup_by_target
+                    and cleaned_kind == "agent_send"
+                    and cleaned_rid
+                    and cleaned_payload_digest
+                    and existing is None
+                ):
+                    attempt_run_ids = [cleaned_rid]
+                    logical_turn_root_id = cleaned_rid
+                    norm_rid_uuid = normalize_uuid(cleaned_rid)
+                    if norm_rid_uuid:
+                        await cur.execute(
+                            """
+                            WITH RECURSIVE ancestors AS (
+                                SELECT conversation_response_id, retry_of_run_id, 0 AS depth
+                                FROM conversation_responses
+                                WHERE conversation_response_id = %s::uuid
+                                UNION ALL
+                                SELECT r.conversation_response_id, r.retry_of_run_id, a.depth + 1
+                                FROM conversation_responses r
+                                JOIN ancestors a ON r.conversation_response_id = a.retry_of_run_id
+                                WHERE a.depth < 16
+                            ),
+                            root AS (
+                                SELECT conversation_response_id AS root_id
+                                FROM ancestors
+                                ORDER BY (retry_of_run_id IS NULL) DESC, depth DESC
+                                LIMIT 1
+                            ),
+                            chain AS (
+                                SELECT root_id AS conversation_response_id, 0 AS depth FROM root
+                                UNION ALL
+                                SELECT r.conversation_response_id, c.depth + 1
+                                FROM conversation_responses r
+                                JOIN chain c ON r.retry_of_run_id = c.conversation_response_id
+                                WHERE c.depth < 16
+                            )
+                            SELECT DISTINCT conversation_response_id::text AS run_id,
+                                   (SELECT root_id::text FROM root) AS root_run_id
+                            FROM chain
+                            """,
+                            (norm_rid_uuid,),
+                        )
+                        chain_rows = await cur.fetchall()
+                        if chain_rows:
+                            found_ids = [
+                                str(r["run_id"]).strip()
+                                for r in chain_rows
+                                if r.get("run_id")
+                            ]
+                            if found_ids:
+                                attempt_run_ids = list(dict.fromkeys([cleaned_rid, *found_ids]))
+                            root_val = chain_rows[0].get("root_run_id")
+                            if root_val:
+                                logical_turn_root_id = str(root_val).strip()
+
+                    norm_dedup_target = str(resolved_target_address or "").strip().lower()
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (
+                            f"dalton_retry_send:{logical_turn_root_id}:{norm_dedup_target}:{cleaned_payload_digest}",
+                        ),
+                    )
+                    await cur.execute(
+                        """
+                        SELECT *
+                        FROM dalton_channel_deliveries
+                        WHERE run_id = ANY(%s)
+                          AND kind = 'agent_send'
+                          AND status IN ('sent', 'partial', 'in_flight', 'unknown')
+                          AND LOWER(COALESCE(target_address, '')) = LOWER(%s)
+                          AND COALESCE(
+                              authorized_target_meta ->> 'payload_digest',
+                              first_response_json ->> 'payload_digest'
+                          ) = %s
+                        ORDER BY
+                            CASE status
+                                WHEN 'sent' THEN 0
+                                WHEN 'partial' THEN 1
+                                WHEN 'in_flight' THEN 2
+                                ELSE 3
+                            END,
+                            updated_at DESC
+                        LIMIT 1
+                        """,
+                        (
+                            attempt_run_ids,
+                            str(resolved_target_address or ""),
+                            cleaned_payload_digest,
+                        ),
+                    )
+                    prior_match = await cur.fetchone()
+                    if prior_match is not None:
+                        prior_status = str(prior_match.get("status") or "sent")
+                        if prior_status in ("sent", "partial"):
+                            return {
+                                "claim_status": "already_completed",
+                                "status": prior_status,
+                                "platform": prior_match.get("platform") or resolved_platform,
+                                "target_address": prior_match.get("target_address")
+                                or resolved_target_address,
+                                "is_current": bool(prior_match.get("is_current", is_current)),
+                                "first_response_json": prior_match.get("first_response_json"),
+                                "confirmed_thread_address": _delivery_confirmed_thread_address(
+                                    prior_match
+                                ),
+                                "discord_body_phase": _delivery_discord_body_phase(prior_match),
+                                "delivery_attempt": _delivery_attempt(prior_match),
+                            }
+                        return {
+                            "claim_status": "in_flight_or_unknown",
+                            "existing_status": prior_status,
+                            "status": prior_status,
+                            "platform": prior_match.get("platform") or resolved_platform,
+                            "target_address": prior_match.get("target_address")
+                            or resolved_target_address,
+                            "is_current": bool(prior_match.get("is_current", is_current)),
+                            "sent_chunks": int(prior_match.get("sent_chunks") or 0),
+                            "confirmed_thread_address": _delivery_confirmed_thread_address(
+                                prior_match
+                            ),
+                            "discord_body_phase": _delivery_discord_body_phase(prior_match),
+                            "delivery_attempt": _delivery_attempt(prior_match),
+                        }
+
                 # Multi-account Weixin authorization, source generation check, and token resolution (§3.2 #4, D18, Codex ①)
                 if resolved_platform == "weixin":
                     await wx_db.verify_gateway_epoch_in_tx(
@@ -13328,6 +13470,11 @@ async def authorize_and_claim_delivery(
                             resolved_recipient_id if resolved_platform == "weixin" else None
                         ),
                         "source_delivery_key": cleaned_key,
+                        **(
+                            {"payload_digest": cleaned_payload_digest}
+                            if cleaned_payload_digest
+                            else {}
+                        ),
                     }
                     await cur.execute(
                         """
@@ -13503,6 +13650,18 @@ async def authorize_and_claim_delivery(
                             replay_recovery,
                         ),
                     )
+                    if cleaned_payload_digest:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_deliveries
+                            SET authorized_target_meta = COALESCE(authorized_target_meta, '{}'::jsonb) || %s::jsonb
+                            WHERE delivery_key = %s
+                            """,
+                            (
+                                Jsonb({"payload_digest": cleaned_payload_digest}),
+                                cleaned_key,
+                            ),
+                        )
 
                 home_ws_id = (
                     get_home_workspace_id(resolved_user_id)
@@ -16314,6 +16473,13 @@ async def _update_inbound_progress_once(
                 has_in_flight = False
                 has_unknown = False
                 sent_count = 0
+                has_delivered_current_agent_send = False
+                has_delivered_current_files_only = False
+                has_failed_current_agent_send = False
+                has_unresolved_current_agent_send_images = False
+                unresolved_current_agent_sends: list[dict[str, Any]] = []
+                resolved_run_images: dict[str, str] = {}
+                resolved_run_images_by_message: dict[str, dict[str, str]] = {}
                 if effective_run_id:
                     await cur.execute(
                         """
@@ -16357,6 +16523,183 @@ async def _update_inbound_progress_once(
                         (effective_run_id, effective_run_id),
                     )
                     sent_count = int((await cur.fetchone())["cnt"])
+                    await cur.execute(
+                        """
+                        SELECT
+                            COALESCE(
+                                BOOL_OR(
+                                    status IN ('sent', 'partial')
+                                    AND (
+                                        has_non_empty_text = TRUE
+                                        OR jsonb_array_length(COALESCE(files_status, '[]'::jsonb)) > 0
+                                    )
+                                ),
+                                FALSE
+                            ) AS has_delivered_current_agent_send,
+                            COALESCE(
+                                BOOL_OR(
+                                    status IN ('sent', 'partial')
+                                    AND has_non_empty_text = FALSE
+                                    AND jsonb_array_length(COALESCE(files_status, '[]'::jsonb)) > 0
+                                ),
+                                FALSE
+                            ) AS has_delivered_current_files_only,
+                            COALESCE(
+                                BOOL_OR(status = 'failed'),
+                                FALSE
+                            ) AS has_failed_current_agent_send,
+                            COALESCE(
+                                BOOL_OR(
+                                    status IN ('sent', 'partial')
+                                    AND COALESCE(
+                                        (first_response_json ->> 'unresolved_sandbox_images')::boolean,
+                                        FALSE
+                                    ) = TRUE
+                                ),
+                                FALSE
+                            ) AS has_unresolved_current_agent_send_images,
+                            COALESCE(
+                                jsonb_agg(
+                                    jsonb_build_object(
+                                        'delivery_key', delivery_key,
+                                        'delivered_text', first_response_json ->> 'delivered_text',
+                                        'unresolved_image_paths', COALESCE(
+                                            first_response_json -> 'unresolved_sandbox_image_paths',
+                                            '[]'::jsonb
+                                        ),
+                                        'source_message_id', first_response_json ->> 'source_message_id',
+                                        'captured_images', COALESCE(
+                                            first_response_json -> 'captured_images',
+                                            '{}'::jsonb
+                                        )
+                                    )
+                                    ORDER BY updated_at ASC
+                                ) FILTER (
+                                    WHERE status IN ('sent', 'partial')
+                                      AND COALESCE(
+                                          (first_response_json ->> 'unresolved_sandbox_images')::boolean,
+                                          FALSE
+                                      ) = TRUE
+                                ),
+                                '[]'::jsonb
+                            ) AS unresolved_current_agent_sends
+                        FROM dalton_channel_deliveries
+                        WHERE run_id = %s
+                          AND is_current = TRUE
+                          AND kind = 'agent_send'
+                        """,
+                        (effective_run_id,),
+                    )
+                    agent_send_row = await cur.fetchone()
+                    if agent_send_row:
+                        has_delivered_current_agent_send = bool(
+                            agent_send_row.get("has_delivered_current_agent_send")
+                        )
+                        has_delivered_current_files_only = bool(
+                            agent_send_row.get("has_delivered_current_files_only")
+                        )
+                        has_failed_current_agent_send = (
+                            bool(agent_send_row.get("has_failed_current_agent_send"))
+                            and not has_delivered_current_agent_send
+                        )
+                        has_unresolved_current_agent_send_images = bool(
+                            agent_send_row.get("has_unresolved_current_agent_send_images")
+                        )
+                        raw_unresolved = agent_send_row.get("unresolved_current_agent_sends")
+                        if isinstance(raw_unresolved, list):
+                            for entry in raw_unresolved:
+                                if not isinstance(entry, dict) or not entry.get("delivery_key"):
+                                    continue
+                                raw_paths = entry.get("unresolved_image_paths")
+                                clean_paths = (
+                                    [str(p) for p in raw_paths if isinstance(p, str) and p]
+                                    if isinstance(raw_paths, list)
+                                    else []
+                                )
+                                raw_src_mid = entry.get("source_message_id")
+                                src_mid = (
+                                    str(raw_src_mid).strip()
+                                    if isinstance(raw_src_mid, str) and raw_src_mid.strip()
+                                    else None
+                                )
+                                raw_cap = entry.get("captured_images")
+                                clean_cap = (
+                                    {
+                                        str(k): str(v)
+                                        for k, v in raw_cap.items()
+                                        if isinstance(k, str) and k and isinstance(v, str) and v
+                                    }
+                                    if isinstance(raw_cap, dict)
+                                    else {}
+                                )
+                                item_entry: dict[str, Any] = {
+                                    "delivery_key": str(entry["delivery_key"]),
+                                    "delivered_text": (
+                                        entry.get("delivered_text")
+                                        if isinstance(entry.get("delivered_text"), str)
+                                        else None
+                                    ),
+                                    "unresolved_image_paths": clean_paths,
+                                }
+                                if src_mid is not None:
+                                    item_entry["source_message_id"] = src_mid
+                                if clean_cap:
+                                    item_entry["captured_images"] = clean_cap
+                                unresolved_current_agent_sends.append(item_entry)
+                    if has_unresolved_current_agent_send_images:
+                        norm_img_rid = normalize_uuid(effective_run_id)
+                        if norm_img_rid:
+                            await cur.execute(
+                                """
+                                SELECT
+                                    replay_facts -> 'images' AS images,
+                                    replay_facts -> 'images_by_message' AS images_by_message
+                                FROM conversation_responses
+                                WHERE conversation_response_id = %s::uuid
+                                """,
+                                (norm_img_rid,),
+                            )
+                            img_row = await cur.fetchone()
+                            raw_imgs = img_row.get("images") if isinstance(img_row, dict) else None
+                            if isinstance(raw_imgs, dict):
+                                resolved_run_images = {
+                                    str(k): str(v)
+                                    for k, v in raw_imgs.items()
+                                    if isinstance(k, str) and k and isinstance(v, str) and v
+                                }
+                            raw_by_msg = (
+                                img_row.get("images_by_message")
+                                if isinstance(img_row, dict)
+                                else None
+                            )
+                            if isinstance(raw_by_msg, dict):
+                                for mid_key, per_map in raw_by_msg.items():
+                                    if (
+                                        not isinstance(mid_key, str)
+                                        or not mid_key
+                                        or not isinstance(per_map, dict)
+                                    ):
+                                        continue
+                                    cleaned_per = {
+                                        str(k): str(v)
+                                        for k, v in per_map.items()
+                                        if isinstance(k, str) and k and isinstance(v, str) and v
+                                    }
+                                    if cleaned_per:
+                                        resolved_run_images_by_message[mid_key] = cleaned_per
+                            # Bind each unresolved delivery to its own message's capture (never global last-write-wins).
+                            if resolved_run_images_by_message:
+                                for item_entry in unresolved_current_agent_sends:
+                                    src_mid = item_entry.get("source_message_id")
+                                    if isinstance(src_mid, str) and src_mid in resolved_run_images_by_message:
+                                        merged_entry_imgs = {
+                                            **resolved_run_images_by_message[src_mid],
+                                            **(item_entry.get("captured_images") or {}),
+                                        }
+                                        if merged_entry_imgs:
+                                            item_entry["captured_images"] = merged_entry_imgs
+
+                from src.dalton.settings import is_strict_deliverable_text_enabled
 
                 return {
                     "ok": True,
@@ -16365,7 +16708,15 @@ async def _update_inbound_progress_once(
                     "has_unknown_current_text": has_unknown,
                     "has_in_flight_or_unknown_current_text": has_in_flight or has_unknown,
                     "sent_to_current_count": sent_count,
+                    "has_delivered_current_agent_send": has_delivered_current_agent_send,
+                    "has_delivered_current_files_only": has_delivered_current_files_only,
+                    "has_failed_current_agent_send": has_failed_current_agent_send,
+                    "has_unresolved_current_agent_send_images": has_unresolved_current_agent_send_images,
+                    "unresolved_current_agent_sends": unresolved_current_agent_sends,
+                    "resolved_run_images": resolved_run_images,
+                    "resolved_run_images_by_message": resolved_run_images_by_message,
                     "session_is_current_for_interrupt": session_is_current_for_interrupt,
+                    "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
                 }
 
 
@@ -17944,6 +18295,8 @@ async def _recover_channel_state_once(
                     auto_row["chart_snapshots"] = auto_snaps
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
+                    from src.dalton.settings import is_strict_deliverable_text_enabled
+                    auto_row["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
 
                 (
                     bt2_link_recoveries,
@@ -17954,8 +18307,11 @@ async def _recover_channel_state_once(
                     cur, enabled_platforms=enabled_platforms
                 )
 
+                from src.dalton.settings import is_strict_deliverable_text_enabled
+
                 return {
                     "mode": "startup",
+                    "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
                     "inbound_events": _json_safe_rows(inbound_events),
                     "background_runs": _json_safe_rows(background_runs),
                     "thread_watches": _json_safe_rows(thread_watches),
@@ -18485,24 +18841,59 @@ async def finish_automation_run(
                 # Claim as 'finishing' and annotate each target with whether agent_send already reached it
                 await cur.execute(
                     """
-                    SELECT DISTINCT target_address
+                    SELECT
+                        target_address,
+                        BOOL_OR(status IN ('sent', 'partial')) AS agent_sent,
+                        BOOL_OR(
+                            status IN ('sent', 'partial')
+                            AND has_non_empty_text = FALSE
+                            AND jsonb_array_length(COALESCE(files_status, '[]'::jsonb)) > 0
+                        ) AS agent_sent_files_only,
+                        BOOL_OR(status = 'failed') AS agent_send_failed
                     FROM dalton_channel_deliveries
                     WHERE execution_id = %s
                       AND kind = 'agent_send'
-                      AND status IN ('sent', 'partial')
+                    GROUP BY target_address
                     """,
                     (norm_exec_id,),
                 )
-                agent_sent_addrs = {
-                    str(r["target_address"]) for r in await cur.fetchall()
-                }
+                agent_sent_addrs: set[str] = set()
+                agent_sent_files_only_addrs: set[str] = set()
+                agent_send_failed_addrs: set[str] = set()
+                for r in await cur.fetchall():
+                    raw_addr = str(r["target_address"] or "").strip()
+                    if not raw_addr:
+                        continue
+                    norm_addr = raw_addr.lower()
+                    if r.get("agent_sent"):
+                        agent_sent_addrs.add(raw_addr)
+                        agent_sent_addrs.add(norm_addr)
+                    if r.get("agent_sent_files_only"):
+                        agent_sent_files_only_addrs.add(raw_addr)
+                        agent_sent_files_only_addrs.add(norm_addr)
+                    if r.get("agent_send_failed") and not r.get("agent_sent"):
+                        agent_send_failed_addrs.add(raw_addr)
+                        agent_send_failed_addrs.add(norm_addr)
                 enriched_targets: list[dict[str, Any]] = []
                 for t_item in list(row.get("targets") or []):
                     if not isinstance(t_item, dict):
                         continue
                     t_copy = dict(t_item)
-                    t_addr = str(t_copy.get("address") or "")
-                    t_copy["agent_sent"] = t_addr in agent_sent_addrs
+                    t_addr = str(t_copy.get("address") or "").strip()
+                    t_norm = t_addr.lower()
+                    sent_match = t_addr in agent_sent_addrs or t_norm in agent_sent_addrs
+                    t_copy["agent_sent"] = sent_match
+                    t_copy["agent_sent_files_only"] = (
+                        t_addr in agent_sent_files_only_addrs
+                        or t_norm in agent_sent_files_only_addrs
+                    )
+                    t_copy["agent_send_failed"] = (
+                        not sent_match
+                        and (
+                            t_addr in agent_send_failed_addrs
+                            or t_norm in agent_send_failed_addrs
+                        )
+                    )
                     enriched_targets.append(t_copy)
 
                 await cur.execute(
@@ -18558,6 +18949,8 @@ async def finish_automation_run(
                             norm_exec_id,
                             exc_info=True,
                         )
+                from src.dalton.settings import is_strict_deliverable_text_enabled
+
                 return {
                     "execution_id": norm_exec_id,
                     "status": "finishing",
@@ -18580,6 +18973,7 @@ async def finish_automation_run(
                     "finish_status": updated.get("finish_status"),
                     "final_text": updated.get("final_text"),
                     "targets": enriched_targets,
+                    "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
                 }
 
 
@@ -18652,4 +19046,62 @@ async def resolve_authorized_automation_run_platforms(
                 seen.add(prefix)
                 platforms.append(prefix)
     return platforms
+
+
+async def get_execution_agent_send_delivery_status(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Return actual ``dalton_channel_deliveries`` delivery truth for ``execution_id`` (§5.3):
+    whether any ``agent_send`` succeeded, whether any text ``agent_send`` succeeded,
+    whether only files-only sends succeeded, and the delivered text ``delivery_key``s."""
+    empty: dict[str, Any] = {
+        "has_delivered_agent_send": False,
+        "has_delivered_text_agent_send": False,
+        "has_delivered_files_only": False,
+        "delivered_text_delivery_keys": [],
+    }
+    norm_exec = normalize_uuid(execution_id)
+    if not norm_exec:
+        return empty
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT
+                    delivery_key,
+                    has_non_empty_text,
+                    jsonb_array_length(COALESCE(files_status, '[]'::jsonb)) AS files_count
+                FROM dalton_channel_deliveries
+                WHERE execution_id = %s::uuid
+                  AND kind = 'agent_send'
+                  AND status IN ('sent', 'partial')
+                ORDER BY updated_at ASC
+                """,
+                (norm_exec,),
+            )
+            rows = await cur.fetchall()
+    if not rows:
+        return empty
+    has_delivered_text = False
+    has_delivered_files = False
+    delivered_text_keys: list[str] = []
+    for r in rows:
+        has_text = bool(r.get("has_non_empty_text"))
+        has_files = int(r.get("files_count") or 0) > 0
+        if has_text:
+            has_delivered_text = True
+            dkey = str(r.get("delivery_key") or "").strip()
+            if dkey:
+                delivered_text_keys.append(dkey)
+        if has_files:
+            has_delivered_files = True
+    has_delivered_any = has_delivered_text or has_delivered_files
+    return {
+        "has_delivered_agent_send": has_delivered_any,
+        "has_delivered_text_agent_send": has_delivered_text,
+        "has_delivered_files_only": has_delivered_files and not has_delivered_text,
+        "delivered_text_delivery_keys": delivered_text_keys,
+    }
 

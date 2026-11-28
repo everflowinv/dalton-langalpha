@@ -37,6 +37,10 @@
         <string>__HOME__</string>
         <key>DALTON_HOST_PLATFORM</key>
         <string>macos</string>
+        <key>DALTON_CHANNEL_GATEWAY_URL</key>
+        <string>http://127.0.0.1:8962</string>
+        <key>DALTON_CHANNEL_GATEWAY_ENV_FILE</key>
+        <string>__HOME__/.config/dalton/channel-gateway.env</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

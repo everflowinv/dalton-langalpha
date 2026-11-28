@@ -30,6 +30,7 @@ OUTPUT_SET=0
 TAR_PATH=""
 REPORT_PATH=""
 INCLUDE_CI=0
+STRICT_SCAN=1
 
 usage() {
   cat <<'EOF'
@@ -43,6 +44,7 @@ Options:
   --report <file>     Also write the release verification report to this path
   --include-ci        Also export CI compose overlay & standalone test harness
                       (docker-compose.ci.yml, tests/fakes, tests/standalone)
+  --strict-scan       Enforce out-of-package zero-leak check on exported artifact (enabled by default)
   -h, --help          Show this help
 EOF
 }
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --include-ci)
       INCLUDE_CI=1
+      shift
+      ;;
+    --strict-scan)
+      STRICT_SCAN=1
       shift
       ;;
     -h|--help)
@@ -166,8 +172,9 @@ SHORT_SHA="${COMMIT_SHA:0:9}"
 RELEASE_TOP_DIR="dalton-core-${SHORT_SHA}"
 
 # Explicit allowlist of paths required to build and run Standalone Core.
-# Host-only Everflow runtime, ops, launchd, channel gateway, and *.dalton.*
-# deployment overlays are excluded by omission and post-extract denylist.
+# Host-only Everflow runtime, ops, launchd, channel gateway, Everflow-only
+# data-asset scripts/skills, and *.dalton.* deployment overlays are excluded
+# by omission and post-extract stripping.
 ALLOWLIST_REQUIRED=(
   "LICENSE"
   "README.md"
@@ -226,6 +233,9 @@ ALLOWLIST_OPTIONAL=(
   "docs/dalton/dev-guide/STANDALONE-DEPLOY.md"
   "deploy/standalone"
   "scripts/standalone"
+  "scripts/dalton/seed_openclaw_data.sh"
+  "scripts/dalton/data_assets/scripts"
+  "scripts/dalton/data_assets/everflow_only.txt"
   "plugins/dalton_sec"
   "plugins/dalton_macro"
   "plugins/dalton_company_wiki"
@@ -293,6 +303,8 @@ DENY_PATHS=(
   "scripts/dalton/ops"
   "scripts/dalton/launchd"
   "scripts/standalone/package_release.sh"
+  "scripts/standalone/verify_release_tarball.py"
+  "src/dalton/data_jobs/everflow_defaults.yaml"
   "web/.env.dalton"
   "docs-site/src/content/docs/everflow"
   "docs-site/src/content/docs/explore/deliver-to-feishu.mdx"
@@ -305,13 +317,87 @@ for deny in "${DENY_PATHS[@]}"; do
   fi
 done
 
+# Customer release artifacts exclude frontend test fixtures unless --include-ci is set.
+if [[ "$INCLUDE_CI" -eq 0 ]]; then
+  rm -rf "${EXPORT_ROOT}/web/e2e"
+  if [[ -d "${EXPORT_ROOT}/web" ]]; then
+    find "${EXPORT_ROOT}/web" -type d -name '__tests__' -exec rm -rf {} +
+  fi
+fi
+
+# Strip Everflow-only `DALTON_CAP:researchdata_bridge` branches from exported skill
+# docs so proprietary emails/host paths never ship inside Standalone Core artifacts.
+if [[ -d "${EXPORT_ROOT}/plugins" ]]; then
+  python3 - "${EXPORT_ROOT}/plugins" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+plugins_root = Path(sys.argv[1])
+block_re = re.compile(
+    r"<!--\s*DALTON_CAP:researchdata_bridge\s*-->"
+    r"(?:(?!-->|<!--\s*/DALTON_CAP\s*-->).|\n)*?"
+    r"(?:<!--\s*DALTON_CAP_ELSE\s*-->(?P<else_body>(?:(?!<!--\s*/DALTON_CAP\s*-->).|\n)*?))?"
+    r"<!--\s*/DALTON_CAP\s*-->",
+    re.DOTALL,
+)
+
+for md_path in sorted(plugins_root.rglob("*.md")):
+    if not md_path.is_file():
+        continue
+    original = md_path.read_text(encoding="utf-8", errors="replace")
+    if "DALTON_CAP:researchdata_bridge" not in original:
+        continue
+    updated = block_re.sub(lambda m: m.group("else_body") or "", original)
+    if updated != original:
+        md_path.write_text(updated, encoding="utf-8")
+PY
+fi
+
+# Strip Everflow-only data_assets entries listed in everflow_only.txt so
+# Standalone Core ships only generic data-task scripts.
+strip_everflow_only_data_assets() {
+  local export_root="$1"
+  local list_file="$2"
+  local assets_root="${export_root}/scripts/dalton/data_assets"
+  [[ -d "$assets_root" && -f "$list_file" ]] || return 0
+  local raw_line entry target
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    raw_line="${raw_line%$'\r'}"
+    entry="${raw_line%%#*}"
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" == /* || "$entry" == *".."* ]]; then
+      echo "ERROR: Unsafe everflow_only.txt entry: ${entry}" >&2
+      return 1
+    fi
+    target="${assets_root}/${entry}"
+    if [[ -e "$target" || -L "$target" ]]; then
+      rm -rf "$target"
+    fi
+  done < "$list_file"
+  rm -f "${assets_root}/everflow_only.txt"
+}
+
+EVERFLOW_ONLY_LIST=""
+if [[ -f "${EXPORT_ROOT}/scripts/dalton/data_assets/everflow_only.txt" ]]; then
+  EVERFLOW_ONLY_LIST="${EXPORT_ROOT}/scripts/dalton/data_assets/everflow_only.txt"
+elif [[ -f "${REPO_ROOT}/scripts/dalton/data_assets/everflow_only.txt" ]]; then
+  EVERFLOW_ONLY_LIST="${REPO_ROOT}/scripts/dalton/data_assets/everflow_only.txt"
+fi
+if [[ -n "$EVERFLOW_ONLY_LIST" ]]; then
+  strip_everflow_only_data_assets "$EXPORT_ROOT" "$EVERFLOW_ONLY_LIST"
+fi
+
 # Strip any *.dalton.yaml file anywhere in the exported tree
 find "$EXPORT_ROOT" -type f -name '*.dalton.yaml' -delete
 
 # Record release provenance metadata (clean, no working-tree state)
 printf '%s\n' "$COMMIT_SHA" > "${EXPORT_ROOT}/.release_git_sha"
 
-# Out-of-package release gate check (when invoked from full repo checkout with ops checker present)
+# Out-of-package release gate check (when invoked from full repo checkout with ops checker present).
+# Keeps proprietary scan lists and regex patterns outside package_release.sh and customer releases.
 SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
 TOOL_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OUT_OF_PKG_CHECKER=""
@@ -326,7 +412,13 @@ if [[ -n "$OUT_OF_PKG_CHECKER" ]]; then
 else
   {
     echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
-    echo "Exported clean allowlisted Standalone Core release tree."
+    if [[ "$STRICT_SCAN" -eq 1 ]]; then
+      echo "status: FAIL"
+      echo "ERROR: Out-of-package checker scripts/dalton/ops/check_core_release_package.py not found."
+      CHECKER_RC=1
+    else
+      echo "Exported clean allowlisted Standalone Core release tree."
+    fi
   } > "$SCAN_OUTPUT"
 fi
 
@@ -337,8 +429,8 @@ if [[ -n "$REPORT_PATH" ]]; then
   cp "$SCAN_OUTPUT" "$REPORT_PATH"
 fi
 
-if [[ "$CHECKER_RC" -ne 0 ]]; then
-  echo "ERROR: Out-of-package Core release verification failed (rc=${CHECKER_RC})." >&2
+if [[ "$STRICT_SCAN" -eq 1 && "$CHECKER_RC" -ne 0 ]]; then
+  echo "ERROR: Out-of-package Core release failed zero-leak scan (rc=${CHECKER_RC})." >&2
   exit "$CHECKER_RC"
 fi
 

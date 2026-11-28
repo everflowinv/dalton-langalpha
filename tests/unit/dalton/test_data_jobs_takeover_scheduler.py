@@ -820,17 +820,39 @@ async def test_claim_second_expiry_branch_also_publishes_monitor_and_persists_fa
     assert publish_calls[0]["run_id"] == "run-second-branch-exp"
     assert "takeover_retry_expired" in publish_calls[0]["failure_reason"]
 
-    # Pending monitor publish persisted on disk even though publish raised!
+    # No local JSON pending_monitor_publishes.json file is created (retired in favor of PG lease queue).
     pending_file = path_map.backend_var_dir / "pending_monitor_publishes.json"
-    assert pending_file.is_file()
-    assert "run-second-branch-exp" in pending_file.read_text(encoding="utf-8")
+    assert not pending_file.exists()
 
-    # On next tick / restart, replay_pending_monitor_publishes succeeds and clears the pending entry
+    # On next tick / restart, replay_pending_monitor_publishes claims due rows from PostgreSQL and replays.
     should_fail["flag"] = False
-    replayed = await sched_mod.replay_pending_monitor_publishes(path_map=path_map)
+    replay_conn, _replay_state = _make_autospec_db(
+        [
+            {
+                "fetchall": [
+                    {
+                        "run_id": "run-second-branch-exp",
+                        "job_key": "pm-market-state",
+                        "status": "cancelled",
+                        "failure_reason": "takeover_retry_expired",
+                        "scheduled_slot_utc": slot_utc,
+                        "completed_at": deadline_utc,
+                        "monitor_publish_status": "pending",
+                        "monitor_publish_attempts": 0,
+                        "monitor_publish_claim_epoch": 0,
+                        "monitor_publish_detail": {},
+                    }
+                ]
+            },
+            {"fetchone": {"monitor_publish_attempts": 1, "monitor_publish_claim_epoch": 1}},
+            {"rowcount": 1},  # fenced settle_monitor_publish_run_tx
+        ]
+    )
+    replayed = await sched_mod.replay_pending_monitor_publishes(
+        replay_conn, path_map=path_map
+    )
     assert replayed == 1
     assert len(publish_calls) == 2
-    assert "run-second-branch-exp" not in pending_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

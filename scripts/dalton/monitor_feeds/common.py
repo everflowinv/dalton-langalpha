@@ -27,7 +27,7 @@ CN_TZ = ZoneInfo("Asia/Shanghai")
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 US_TZ = ZoneInfo("America/New_York")
 
-MarketKind = Literal["cn", "hk"]
+MarketKind = Literal["cn", "hk", "us"]
 
 
 def now_cn() -> datetime:
@@ -121,6 +121,7 @@ class SourceStatus:
     label: str | None = None
     note: str | None = None
     counts: dict[str, int] | None = None
+    removed_codes: tuple[str, ...] | None = None
 
     @property
     def is_clean(self) -> bool:
@@ -140,6 +141,8 @@ class SourceStatus:
             out["note"] = self.note
         if self.counts is not None:
             out["counts"] = dict(self.counts)
+        if self.removed_codes is not None:
+            out["removed_codes"] = list(self.removed_codes)
         return out
 
     @classmethod
@@ -148,6 +151,12 @@ class SourceStatus:
         counts = (
             {str(k): int(v) for k, v in raw_counts.items()}
             if isinstance(raw_counts, dict)
+            else None
+        )
+        raw_removed = data.get("removed_codes")
+        removed_codes = (
+            tuple(str(c) for c in raw_removed if str(c).strip())
+            if isinstance(raw_removed, (list, tuple))
             else None
         )
         return cls(
@@ -160,6 +169,7 @@ class SourceStatus:
             label=data.get("label"),
             note=data.get("note"),
             counts=counts,
+            removed_codes=removed_codes,
         )
 
 
@@ -173,9 +183,15 @@ def make_source_result(
     label: str | None = None,
     note: str | None = None,
     counts: dict[str, int] | None = None,
+    removed_codes: Iterable[str] | None = None,
 ) -> SourceStatus:
     """Create a collector status result; callers never advance ``last_success_at`` here."""
     eff_stale = (not ok) if stale is None else bool(stale)
+    rem_tuple = (
+        tuple(str(c) for c in removed_codes if str(c).strip())
+        if removed_codes is not None
+        else None
+    )
     return SourceStatus(
         name=name,
         ok=bool(ok) and not eff_stale,
@@ -186,6 +202,7 @@ def make_source_result(
         label=label or name,
         note=note,
         counts=dict(counts) if counts is not None else None,
+        removed_codes=rem_tuple,
     )
 
 
@@ -280,6 +297,8 @@ class SourceStatusStore:
                 ent["note"] = res.note
             if res.counts is not None:
                 ent["counts"] = dict(res.counts)
+            if res.removed_codes is not None:
+                ent["removed_codes"] = list(res.removed_codes)
             sources[res.name] = ent
 
         req_keys = list(required) if required is not None else list(sources.keys())
@@ -369,22 +388,36 @@ class SourceStatusStore:
 # A run exits 0 iff page HTML rendered cleanly AND all required publishable sources succeeded
 # (so partial optional-source degradation publishes the page with per-source expiry notices).
 ASHARE_REQUIRED_PUBLISH_SOURCES: tuple[str, ...] = ("indices", "breadth")
-HK_REQUIRED_PUBLISH_SOURCES: tuple[str, ...] = ("hsi_history", "index_compute")
-HK_MONTH_END_REQUIRED_SOURCES: tuple[str, ...] = (
+HK_REQUIRED_PUBLISH_SOURCES: tuple[str, ...] = (
     "hkex_universe",
     "ggt_list",
     "hk_spot",
     "hk_history",
     "hsi_history",
     "index_compute",
-    "html_render",
 )
+HK_SKIP_FETCH_PUBLISH_SOURCES: tuple[str, ...] = ("hsi_history", "index_compute")
+HK_MONTH_END_REQUIRED_SOURCES: tuple[str, ...] = HK_REQUIRED_PUBLISH_SOURCES + ("html_render",)
 PM_REQUIRED_L1_SOURCES: tuple[str, ...] = ("us",)
 PM_REQUIRED_L2_MARKET_SOURCES: tuple[str, ...] = ("us", "cn")
+PM_US_PANEL_REQUIRED_SOURCES: tuple[str, ...] = ("us",)
+PM_CN_PANEL_REQUIRED_SOURCES: tuple[str, ...] = ("cn", "cn_valuation")
+PM_REQUIRED_ALL_SOURCES: tuple[str, ...] = ("us", "cn", "cn_valuation")
+
+
+def pm_required_sources(mode: str) -> tuple[str, ...]:
+    """Return required collector sources for a ``pm_cockpit`` run mode."""
+    if mode == "us":
+        return ("us",)
+    if mode == "cn":
+        return ("cn", "cn_valuation")
+    if mode == "cnval":
+        return ("cn_valuation",)
+    return PM_REQUIRED_ALL_SOURCES
 
 
 # ---------------------------------------------------------------------------
-# Exchange Trading Calendars (XSHG / XHKG via exchange_calendars)
+# Exchange Trading Calendars (XSHG / XHKG / XNYS via exchange_calendars)
 # ---------------------------------------------------------------------------
 
 
@@ -392,7 +425,64 @@ class CalendarLookupError(RuntimeError):
     """Raised when exchange calendar lookup fails instead of silently falling back."""
 
 
-@lru_cache(maxsize=4)
+EXTRA_HOLIDAYS_PATH = Path(__file__).resolve().parent / "market_holidays.json"
+_EXTRA_HOLIDAYS_CACHE: dict[str, tuple[int, dict[str, dict[str, str]]]] = {}
+
+
+def load_extra_holidays(path: str | Path | None = None) -> dict[str, dict[str, str]]:
+    """Load configurable per-market temporary closure overrides from JSON.
+
+    Each market entry accepts either a list of ``YYYY-MM-DD`` date strings or a
+    mapping of ``{"YYYY-MM-DD": "reason"}``.
+    """
+    env_override = os.environ.get("DALTON_MONITOR_HOLIDAYS_PATH", "").strip()
+    target = (
+        Path(path).expanduser()
+        if path is not None and str(path).strip()
+        else (Path(env_override).expanduser() if env_override else EXTRA_HOLIDAYS_PATH)
+    )
+    key = str(target)
+    try:
+        st = target.stat()
+    except OSError:
+        _EXTRA_HOLIDAYS_CACHE.pop(key, None)
+        return {"cn": {}, "hk": {}, "us": {}}
+
+    cached = _EXTRA_HOLIDAYS_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns:
+        return cached[1]
+
+    raw = load_json_safe(target, {})
+    parsed: dict[str, dict[str, str]] = {"cn": {}, "hk": {}, "us": {}}
+    if isinstance(raw, dict):
+        for mk in ("cn", "hk", "us"):
+            val = raw.get(mk)
+            if isinstance(val, list):
+                for item in val:
+                    ds = str(item).strip()[:10]
+                    if ds:
+                        parsed[mk][ds] = ""
+            elif isinstance(val, dict):
+                for d_k, reason_v in val.items():
+                    ds = str(d_k).strip()[:10]
+                    if ds:
+                        parsed[mk][ds] = str(reason_v or "").strip()
+    _EXTRA_HOLIDAYS_CACHE[key] = (st.st_mtime_ns, parsed)
+    return parsed
+
+
+def _is_calendar_out_of_bounds(exc: Exception) -> bool:
+    if type(exc).__name__ == "DateOutOfBounds":
+        return True
+    try:
+        from exchange_calendars.errors import DateOutOfBounds
+
+        return isinstance(exc, DateOutOfBounds)
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=6)
 def _get_exchange_calendar(cal_name: str):
     import exchange_calendars as xcals
 
@@ -400,14 +490,28 @@ def _get_exchange_calendar(cal_name: str):
 
 
 def _calendar_name(market: MarketKind) -> str:
-    return "XSHG" if market == "cn" else "XHKG"
+    if market == "cn":
+        return "XSHG"
+    if market == "hk":
+        return "XHKG"
+    if market == "us":
+        return "XNYS"
+    raise ValueError(f"Unsupported market: {market!r}")
 
 
 def _market_tz(market: MarketKind) -> ZoneInfo:
-    return CN_TZ if market == "cn" else HK_TZ
+    if market == "cn":
+        return CN_TZ
+    if market == "hk":
+        return HK_TZ
+    if market == "us":
+        return US_TZ
+    raise ValueError(f"Unsupported market: {market!r}")
 
 
 def _default_windows(market: MarketKind) -> tuple[int, int, int, int]:
+    if market == "us":
+        return (9 * 60 + 30, 16 * 60, 16 * 60, 16 * 60)
     return (
         9 * 60 + 30,
         (11 * 60 + 30) if market == "cn" else 12 * 60,
@@ -426,16 +530,37 @@ def _to_local_hm(ts_val: Any, tz: ZoneInfo) -> int:
     return dt.hour * 60 + dt.minute
 
 
-def is_trading_day(market: MarketKind, day: date) -> bool:
-    """Return True if ``day`` is an exchange trading session (raises on calendar failure)."""
+def inspect_trading_day(market: MarketKind, day: date) -> tuple[bool, str, str | None]:
+    """Return ``(is_trading, session_source, session_note)`` merging extra holidays & OOB fallback.
+
+    - Configured temporary closures in ``market_holidays.json`` override exchange calendars.
+    - When ``exchange_calendars`` raises ``DateOutOfBounds`` (e.g. XSHG queried for 2027),
+      fall back to weekday-as-trading-day and report ``session_source="weekday_fallback"``
+      with a human-readable note instead of raising.
+    - Other calendar failures still raise ``CalendarLookupError``.
+    """
     cal_name = _calendar_name(market)
     day_str = day.isoformat()
+    extra = load_extra_holidays().get(market) or {}
+    if day_str in extra:
+        note = extra[day_str] or f"休市补充表标注 {day_str} 休市"
+        return False, "holiday_override", note
     try:
         cal = _get_exchange_calendar(cal_name)
-        return bool(cal.is_session(day_str))
+        return bool(cal.is_session(day_str)), "calendar", None
     except Exception as exc:
+        if _is_calendar_out_of_bounds(exc):
+            note = f"交易日历 {cal_name} 未覆盖 {day_str}，按工作日兜底"
+            logger.warning("%s (%s)", note, exc)
+            return day.weekday() < 5, "weekday_fallback", note
         logger.error("交易所日历 %s 查询交易日 %s 失败: %s", cal_name, day_str, exc)
         raise CalendarLookupError(f"交易所日历 {cal_name} 查询 {day_str} 失败: {exc}") from exc
+
+
+def is_trading_day(market: MarketKind, day: date) -> bool:
+    """Return True if ``day`` is an exchange trading session (falls back to weekday on OOB)."""
+    is_td, _src, _note = inspect_trading_day(market, day)
+    return is_td
 
 
 def get_session_schedule(market: MarketKind, day: date) -> dict[str, Any]:
@@ -443,7 +568,8 @@ def get_session_schedule(market: MarketKind, day: date) -> dict[str, Any]:
     cal_name = _calendar_name(market)
     tz = _market_tz(market)
     day_str = day.isoformat()
-    if not is_trading_day(market, day):
+    is_td, src, note = inspect_trading_day(market, day)
+    if not is_td:
         return {
             "market": market,
             "trade_date": day_str,
@@ -454,9 +580,41 @@ def get_session_schedule(market: MarketKind, day: date) -> dict[str, Any]:
             "pm_start": None,
             "pm_end": None,
             "has_break": False,
-            "using_default_schedule": False,
-            "session_source": "calendar",
-            "session_note": None,
+            "using_default_schedule": src == "weekday_fallback",
+            "session_source": src,
+            "session_note": note,
+        }
+
+    if src == "weekday_fallback":
+        am_start, am_end, pm_start, pm_end = _default_windows(market)
+        if market == "us":
+            return {
+                "market": market,
+                "trade_date": day_str,
+                "is_trading_day": True,
+                "windows": [[am_start, pm_end]],
+                "am_start": am_start,
+                "am_end": pm_end,
+                "pm_start": None,
+                "pm_end": pm_end,
+                "has_break": False,
+                "using_default_schedule": True,
+                "session_source": "weekday_fallback",
+                "session_note": note,
+            }
+        return {
+            "market": market,
+            "trade_date": day_str,
+            "is_trading_day": True,
+            "windows": [[am_start, am_end], [pm_start, pm_end]],
+            "am_start": am_start,
+            "am_end": am_end,
+            "pm_start": pm_start,
+            "pm_end": pm_end,
+            "has_break": True,
+            "using_default_schedule": True,
+            "session_source": "weekday_fallback",
+            "session_note": note,
         }
 
     try:
@@ -498,6 +656,21 @@ def get_session_schedule(market: MarketKind, day: date) -> dict[str, Any]:
             day_str,
             exc,
         )
+        if market == "us":
+            return {
+                "market": market,
+                "trade_date": day_str,
+                "is_trading_day": True,
+                "windows": [[am_start, pm_end]],
+                "am_start": am_start,
+                "am_end": pm_end,
+                "pm_start": None,
+                "pm_end": pm_end,
+                "has_break": False,
+                "using_default_schedule": True,
+                "session_source": "default",
+                "session_note": "交易时段为默认值",
+            }
         return {
             "market": market,
             "trade_date": day_str,
@@ -522,6 +695,110 @@ def previous_trading_day(market: MarketKind, day: date) -> date:
             return cursor
         cursor -= timedelta(days=1)
     return cursor
+
+
+def trading_days_in_range(
+    market: MarketKind,
+    start_day: date | str,
+    end_day: date | str,
+) -> list[str]:
+    """Return ISO dates of exchange trading sessions strictly after ``start_day`` up to and including ``end_day``."""
+    d0 = date.fromisoformat(start_day) if isinstance(start_day, str) else start_day
+    d1 = date.fromisoformat(end_day) if isinstance(end_day, str) else end_day
+    if d1 <= d0:
+        return []
+    cal_name = _calendar_name(market)
+    start_next = (d0 + timedelta(days=1)).isoformat()
+    end_str = d1.isoformat()
+    extra = load_extra_holidays().get(market) or {}
+    try:
+        cal = _get_exchange_calendar(cal_name)
+        sessions = cal.sessions_in_range(start_next, end_str)
+        out = [ts.strftime("%Y-%m-%d") for ts in sessions]
+        if extra:
+            out = [ds for ds in out if ds not in extra]
+        return out
+    except Exception as exc:
+        if _is_calendar_out_of_bounds(exc):
+            logger.warning(
+                "交易所日历 %s 枚举交易日区间 (%s, %s] 越界，按工作日与休市补充表兜底: %s",
+                cal_name,
+                d0.isoformat(),
+                end_str,
+                exc,
+            )
+            cal = _get_exchange_calendar(cal_name)
+            cal_first = cal.first_session.date()
+            cal_last = cal.last_session.date()
+            range_start = d0 + timedelta(days=1)
+            out_days: list[str] = []
+            # Prefix strictly before calendar first_session
+            if range_start < cal_first:
+                pre_end = min(d1, cal_first - timedelta(days=1))
+                for offset in range((pre_end - range_start).days + 1):
+                    cand = range_start + timedelta(days=offset)
+                    if is_trading_day(market, cand):
+                        out_days.append(cand.isoformat())
+            # In-bounds overlap via fast calendar slice
+            in_start = max(range_start, cal_first)
+            in_end = min(d1, cal_last)
+            if in_start <= in_end:
+                in_sessions = cal.sessions_in_range(in_start.isoformat(), in_end.isoformat())
+                for ts in in_sessions:
+                    ds = ts.strftime("%Y-%m-%d")
+                    if ds not in extra:
+                        out_days.append(ds)
+            # Suffix strictly after calendar last_session
+            if d1 > cal_last:
+                suf_start = max(range_start, cal_last + timedelta(days=1))
+                for offset in range((d1 - suf_start).days + 1):
+                    cand = suf_start + timedelta(days=offset)
+                    if is_trading_day(market, cand):
+                        out_days.append(cand.isoformat())
+            return out_days
+        logger.error(
+            "交易所日历 %s 枚举交易日区间 (%s, %s] 失败: %s",
+            cal_name,
+            d0.isoformat(),
+            end_str,
+            exc,
+        )
+        raise CalendarLookupError(
+            f"交易所日历 {cal_name} 枚举交易日区间 ({d0.isoformat()}, {end_str}] 失败: {exc}"
+        ) from exc
+
+
+def trading_days_between(
+    market: MarketKind,
+    start_day: date | str,
+    end_day: date | str,
+) -> int:
+    """Count exchange trading sessions strictly after ``start_day`` up to and including ``end_day``."""
+    return len(trading_days_in_range(market, start_day, end_day))
+
+
+def completed_trading_weeks(
+    market: MarketKind,
+    start_day: date | str,
+    as_of_day: date | str,
+) -> list[str]:
+    """Return final trading day (ISO) of every completed ISO trading week in ``[start_day, as_of_day]``."""
+    d_start = date.fromisoformat(start_day) if isinstance(start_day, str) else start_day
+    d_end = date.fromisoformat(as_of_day) if isinstance(as_of_day, str) else as_of_day
+    if d_end < d_start:
+        return []
+    week_sunday = d_end + timedelta(days=6 - d_end.weekday())
+    sessions = trading_days_in_range(market, d_start - timedelta(days=1), week_sunday)
+    by_iso_week: dict[tuple[int, int], str] = {}
+    for ds in sessions:
+        dt = date.fromisoformat(ds)
+        iso_wk = (dt.isocalendar().year, dt.isocalendar().week)
+        prev = by_iso_week.get(iso_wk)
+        if prev is None or ds > prev:
+            by_iso_week[iso_wk] = ds
+    start_str = d_start.isoformat()
+    end_str = d_end.isoformat()
+    return sorted(ds for ds in by_iso_week.values() if start_str <= ds <= end_str)
 
 
 def last_trading_day_of_month(market: MarketKind, year: int, month: int) -> date:
@@ -697,23 +974,42 @@ class MonitorPushHttpError(RuntimeError):
 def push_monitor_data(
     slug: str,
     data_key: str,
-    payload: Any,
+    payload: Any = None,
     *,
     as_of: str | None = None,
+    attempt_seq: int | None = None,
+    is_stale: bool = False,
+    error: str | None = None,
+    last_attempt_at: str | None = None,
     backend_url: str | None = None,
     token: str | None = None,
     timeout: float = 15.0,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Write realtime payload to ``PUT /api/v1/dalton/monitors/internal/{slug}/data/{key}``."""
+    """Write realtime payload or health status to ``PUT /api/v1/dalton/monitors/internal/{slug}/data/{key}``."""
     base = (backend_url or os.environ.get("DALTON_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/")
     tok = token if token is not None else os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip()
     if not tok:
         raise RuntimeError("INTERNAL_SERVICE_TOKEN 未配置，无法写入监控实时数据")
     url = f"{base}/api/v1/dalton/monitors/internal/{slug}/data/{data_key}"
-    body: dict[str, Any] = {"data": payload}
-    if as_of is not None:
-        body["as_of"] = as_of
+    body: dict[str, Any] = {}
+    if is_stale:
+        body["is_stale"] = True
+        if error is not None:
+            body["error"] = error
+        if last_attempt_at is not None:
+            body["last_attempt_at"] = last_attempt_at
+        if attempt_seq is not None:
+            body["attempt_seq"] = int(attempt_seq)
+    else:
+        body["data"] = payload
+        if as_of is not None:
+            body["as_of"] = as_of
+        if attempt_seq is not None:
+            body["attempt_seq"] = int(attempt_seq)
+            body["is_stale"] = False
+        if last_attempt_at is not None:
+            body["last_attempt_at"] = last_attempt_at
     headers = {
         "X-Service-Token": tok,
         "Content-Type": "application/json",
@@ -885,6 +1181,7 @@ def build_grant_poller_js(
   var dataBase = null;
   var lastDataTsMs = NaN;
   var lastReceivedTsMs = NaN;
+  var serverStaleMsg = null;
 
   function formatBjTime(ms) {{
     if (!Number.isFinite(ms)) return '';
@@ -965,6 +1262,10 @@ def build_grant_poller_js(
     }}
     var refTsMs = Number.isFinite(lastReceivedTsMs) ? lastReceivedTsMs : lastDataTsMs;
     window.__DALTON_LAST_RECEIVED_MS__ = refTsMs;
+    if (serverStaleMsg) {{
+      if (typeof window[{json.dumps(on_stale_fn)}] === 'function') window[{json.dumps(on_stale_fn)}](serverStaleMsg);
+      return true;
+    }}
     if (!Number.isFinite(refTsMs)) return false;
     if (!isNowInTradingSession(curPayload)) {{
       if (typeof window[{json.dumps(on_stale_fn)}] === 'function') window[{json.dumps(on_stale_fn)}](null);
@@ -1009,10 +1310,22 @@ def build_grant_poller_js(
       etag = resp.headers.get('ETag') || etag;
       var body = await resp.json();
       if (body && body.data) window.__DALTON_LAST_PAYLOAD__ = body.data;
-      checkDataFreshness(
-        body && body.data ? body.data : null,
-        body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
-      );
+      if (body && body.is_stale) {{
+        var errMsg = body.last_error
+          ? ('实时行情采集异常（' + body.last_error + '），当前展示上一可用快照')
+          : '实时行情采集异常，当前展示上一可用快照';
+        serverStaleMsg = errMsg;
+        checkDataFreshness(
+          body && body.data ? body.data : null,
+          body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
+        );
+      }} else {{
+        serverStaleMsg = null;
+        checkDataFreshness(
+          body && body.data ? body.data : null,
+          body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
+        );
+      }}
       {on_data_fn}(body);
     }} catch (err) {{
       var msg = (err && err.name === 'AbortError')

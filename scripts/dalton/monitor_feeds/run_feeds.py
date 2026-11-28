@@ -24,6 +24,7 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import time
 from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -125,6 +126,14 @@ class FeedDaemon:
     def _save_state(self) -> None:
         with self._state_lock:
             atomic_write_json(self.state_file, json.loads(json.dumps(self.state)))
+
+    def _next_attempt_seq(self, market: MarketKind) -> int:
+        """Return a strictly monotonic attempt sequence number persisted across restarts."""
+        with self._state_lock:
+            prev = int(self.state[market].get("last_attempt_seq") or 0)
+            seq = max(prev + 1, time.time_ns() // 1_000_000)
+            self.state[market]["last_attempt_seq"] = seq
+            return seq
 
     def _hk_daily_dirs(self) -> list[Path]:
         dirs: list[Path] = []
@@ -294,14 +303,41 @@ class FeedDaemon:
         ) -> dict[str, Any]:
             p_slug = str(pending.get("slug") or slug)
             p_key = str(pending.get("data_key") or data_key)
-            p_payload = pending["payload"]
-            p_as_of = pending.get("as_of") or p_payload.get("as_of_iso") or cur_iso
+            p_payload = pending.get("payload")
+            p_stale = bool(
+                pending.get("is_stale")
+                if "is_stale" in pending
+                else (isinstance(p_payload, dict) and p_payload.get("stale"))
+            )
+            if "as_of" in pending:
+                p_as_of = pending.get("as_of")
+            elif p_stale:
+                p_as_of = None
+            else:
+                p_as_of = (
+                    (p_payload.get("as_of_iso") if isinstance(p_payload, dict) else None)
+                    or cur_iso
+                )
+            p_attempt_seq = (
+                int(pending["attempt_seq"])
+                if pending.get("attempt_seq") is not None
+                else self._next_attempt_seq(market)
+            )
+            p_error = (
+                pending.get("error")
+                or (p_payload.get("stale_reason") if isinstance(p_payload, dict) else None)
+            )
+            p_last_attempt_at = pending.get("last_attempt_at") or cur_iso
             try:
                 self._push(
                     p_slug,
                     p_key,
                     p_payload,
                     as_of=p_as_of,
+                    attempt_seq=p_attempt_seq,
+                    is_stale=p_stale,
+                    error=p_error if p_stale else None,
+                    last_attempt_at=p_last_attempt_at,
                     backend_url=self.backend_url,
                 )
             except Exception as retry_exc:
@@ -334,13 +370,12 @@ class FeedDaemon:
                 res: dict[str, Any] = {
                     "market": market,
                     "action": "retry_push_failed",
-                    "stale": bool(p_payload.get("stale")),
+                    "stale": p_stale,
                     "error": str(retry_exc),
                 }
                 if extra_result:
                     res.update(extra_result)
                 return res
-            p_stale = bool(p_payload.get("stale"))
             p_trade_date = str(pending.get("trade_date") or trade_date)
             p_daily_sig = str(pending.get("current_daily_sig") or "")
             with self._state_lock:
@@ -350,13 +385,13 @@ class FeedDaemon:
                 if pending.get("is_closed_td") and not pending.get("in_window") and not p_stale:
                     if pending.get("needs_post_close"):
                         self.state[market]["post_close_written_date"] = p_trade_date
-                    sc = p_payload.get("smallcap") or {}
-                    ng = p_payload.get("nonggt") or {}
+                    sc = p_payload.get("smallcap") or {} if isinstance(p_payload, dict) else {}
+                    ng = p_payload.get("nonggt") or {} if isinstance(p_payload, dict) else {}
                     pushed_daily_date = (
-                        p_payload.get("daily_close_date")
-                        or p_payload.get("trade_date")
-                        or p_trade_date
-                    )
+                        (p_payload.get("daily_close_date") or p_payload.get("trade_date"))
+                        if isinstance(p_payload, dict)
+                        else None
+                    ) or p_trade_date
                     if (
                         market == "hk"
                         and isinstance(sc, dict)
@@ -372,7 +407,7 @@ class FeedDaemon:
                 "market": market,
                 "action": action_on_ok,
                 "stale": p_stale,
-                "as_of": p_payload.get("as_of"),
+                "as_of": p_payload.get("as_of") if isinstance(p_payload, dict) else None,
             }
             if extra_result:
                 ok_res.update(extra_result)
@@ -381,11 +416,12 @@ class FeedDaemon:
         # Calendar error must be reported & pushed BEFORE skipping collection,
         # while preserving any newer unpushed pending snapshot instead of stamping last_good_payload.
         if sess.get("calendar_error"):
+            cal_reason = f"交易日历不可用: {sess['calendar_error']}"
             cal_st = make_source_result(
                 "calendar",
                 ok=False,
                 stale=True,
-                reason=f"交易日历不可用: {sess['calendar_error']}",
+                reason=cal_reason,
                 label="交易日历",
             )
             daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
@@ -410,17 +446,22 @@ class FeedDaemon:
                     "market_status": "calendar_error",
                     "market_status_label": "交易日历不可用",
                     "stale": True,
-                    "stale_reason": f"交易日历不可用: {sess['calendar_error']}",
+                    "stale_reason": cal_reason,
                     "last_success_at": fstate_snap.get("last_success_at"),
                     "sources": merged_sources,
                 }
             )
+            attempt_seq = self._next_attempt_seq(market)
             try:
                 self._push(
                     slug,
                     data_key,
                     payload,
-                    as_of=cur_iso,
+                    as_of=None,
+                    attempt_seq=attempt_seq,
+                    is_stale=True,
+                    error=cal_reason,
+                    last_attempt_at=cur_iso,
                     backend_url=self.backend_url,
                 )
             except Exception as exc:
@@ -430,7 +471,11 @@ class FeedDaemon:
                         "slug": slug,
                         "data_key": data_key,
                         "payload": payload,
-                        "as_of": cur_iso,
+                        "as_of": None,
+                        "attempt_seq": attempt_seq,
+                        "is_stale": True,
+                        "error": cal_reason,
+                        "last_attempt_at": cur_iso,
                         "trade_date": trade_date,
                         "in_window": False,
                         "is_closed_td": False,
@@ -486,6 +531,7 @@ class FeedDaemon:
             return {"market": market, "action": "skip", "status": sess["status"]}
 
         daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
+        collect_failed = False
         try:
             payload = (
                 self._cn_collect()
@@ -495,6 +541,7 @@ class FeedDaemon:
             if not isinstance(payload, dict):
                 raise RuntimeError("采集结果格式无效")
         except Exception as exc:
+            collect_failed = True
             with self._state_lock:
                 fstate_cur = dict(self.state[market])
             daemon_err_st = make_source_result(
@@ -559,13 +606,29 @@ class FeedDaemon:
                 elif not payload.get("last_success_at") and self.state[market].get("last_success_at"):
                     payload["last_success_at"] = self.state[market]["last_success_at"]
 
-        push_as_of = payload.get("as_of_iso") or cur_iso
+        is_stale = bool(payload.get("stale"))
+        if collect_failed:
+            push_as_of = None
+        elif is_stale:
+            push_as_of = payload.get("as_of_iso")
+        else:
+            push_as_of = payload.get("as_of_iso") or cur_iso
+        push_error = (
+            str(payload.get("stale_reason") or "采集异常")
+            if is_stale
+            else None
+        )
+        attempt_seq = self._next_attempt_seq(market)
         try:
             self._push(
                 slug,
                 data_key,
                 payload,
                 as_of=push_as_of,
+                attempt_seq=attempt_seq,
+                is_stale=is_stale,
+                error=push_error,
+                last_attempt_at=cur_iso,
                 backend_url=self.backend_url,
             )
         except Exception as exc:
@@ -576,6 +639,10 @@ class FeedDaemon:
                     "data_key": data_key,
                     "payload": payload,
                     "as_of": push_as_of,
+                    "attempt_seq": attempt_seq,
+                    "is_stale": is_stale,
+                    "error": push_error,
+                    "last_attempt_at": cur_iso,
                     "trade_date": trade_date,
                     "in_window": in_window,
                     "is_closed_td": is_closed_td,
@@ -588,11 +655,9 @@ class FeedDaemon:
             return {
                 "market": market,
                 "action": "push_failed",
-                "stale": bool(payload.get("stale")),
+                "stale": is_stale,
                 "error": str(exc),
             }
-
-        is_stale = bool(payload.get("stale"))
         with self._state_lock:
             self.state[market].pop("pending_push", None)
             if market == "hk" and current_daily_sig:

@@ -23,6 +23,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -58,6 +59,59 @@ from src.dalton.tools import ingest_tools as ingest_tools_mod
 from src.dalton.tools import wiki_tools as wiki_tools_mod
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _snapshot_working_tree_repo(tmp_path: Path) -> Path:
+    """Return REPO_ROOT if clean, else a temp git repo snapshotting HEAD + working-tree changes."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if not status.strip():
+        return REPO_ROOT
+
+    snap = tmp_path / "working-tree-repo"
+    snap.mkdir()
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", "HEAD"],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+    )
+    try:
+        subprocess.run(["tar", "-xf", "-", "-C", str(snap)], stdin=archive.stdout, check=True)
+    finally:
+        if archive.stdout is not None:
+            archive.stdout.close()
+        assert archive.wait() == 0
+
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        rel = line[3:].strip().strip('"')
+        if " -> " in rel:
+            old_rel, rel = rel.split(" -> ", 1)
+            old_dst = snap / old_rel
+            if old_dst.exists() or old_dst.is_symlink():
+                old_dst.unlink()
+        src = REPO_ROOT / rel
+        dst = snap / rel
+        if "D" in xy and not src.exists():
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    subprocess.run(["git", "init", "-q"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(snap), check=True)
+    subprocess.run(["git", "add", "-A", "-f"], cwd=str(snap), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "working-tree-snapshot"], cwd=str(snap), check=True)
+    return snap
 
 
 def _load_module_from_path(name: str, path: Path) -> Any:
@@ -3058,14 +3112,15 @@ async def test_r7_wiki_pause_writes_shared_dotenv_interpolation_host_allowlist_a
     # 4. Item #4: package_release.sh excludes docs-site/src/content/docs/everflow/
     pkg_src = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
     assert '"docs-site/src/content/docs/everflow"' in pkg_src
-    # Run package_release.sh against current repo HEAD (using working-tree script) to verify exported dir
+    # Run package_release.sh against current repo working tree (or HEAD when clean) to verify exported dir
+    source_repo = _snapshot_working_tree_repo(tmp_path)
     pkg_out = tmp_path / "core_release_export"
     pkg_res = subprocess.run(
         [
             "bash",
             str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
             "--repo",
-            str(REPO_ROOT),
+            str(source_repo),
             "--ref",
             "HEAD",
             "--output",
@@ -3377,13 +3432,14 @@ async def test_r8_wiki_pause_lease_owner_ttl_dotenv_disabled_feishu_pkg_and_sec_
         assert r_unblocked.status_code == 200 and r_unblocked.json()["ok"] is True
 
     # 2. r8 #3: Core release package excludes deliver-to-feishu.mdx & everflow/ AND b3_skills_prompts_ui check passes
+    source_repo = _snapshot_working_tree_repo(tmp_path)
     pkg_out = tmp_path / "core_release_r8"
     pkg_res = subprocess.run(
         [
             "bash",
             str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
             "--repo",
-            str(REPO_ROOT),
+            str(source_repo),
             "--ref",
             "HEAD",
             "--output",

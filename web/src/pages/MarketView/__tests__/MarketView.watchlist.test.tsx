@@ -1616,4 +1616,103 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     unmountDash();
     unmountMv();
   });
+
+  it('renders per-year loading valuation status with loading indicator instead of no-coverage fallback', () => {
+    const companies = [
+      { ticker: 'NIO', name: 'NIO Inc.', tier: 'watch' as const, is_private: false },
+      { ticker: 'XPEV', name: 'XPeng Inc.', tier: 'watch' as const, is_private: false },
+    ];
+    render(
+      <WatchlistFullTable
+        companies={companies}
+        metrics={{
+          NIO: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'NIO',
+            price: 4.5,
+            currency: 'USD',
+            pe_fy1: null,
+            pe_fy2: null,
+            eps_growth_fy2: null,
+            valuation: {
+              fy1_eps: -5.2,
+              fy2_eps: 1.8,
+              fy1_end: '2026-12-31',
+              fy2_end: '2027-12-31',
+              estimate_currency: 'CNY',
+              quote_currency: 'USD',
+              shares_per_quote_unit: null,
+              unit_verified: false,
+              analyst_count: 20,
+              provider: 'yfinance',
+              as_of: '2026-11-27T08:00:00Z',
+              status: 'loading',
+              pe_fy1: null,
+              pe_fy2: null,
+              eps_growth_fy2: null,
+              pe_fy1_status: 'loss',
+              pe_fy2_status: 'loading',
+              eps_growth_fy2_status: 'loss',
+            },
+          },
+          XPEV: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'XPEV',
+            price: 12.0,
+            currency: 'USD',
+            pe_fy1: null,
+            pe_fy2: null,
+            eps_growth_fy2: null,
+            valuation: {
+              fy1_eps: null,
+              fy2_eps: null,
+              fy1_end: null,
+              fy2_end: null,
+              estimate_currency: null,
+              quote_currency: 'USD',
+              shares_per_quote_unit: null,
+              unit_verified: false,
+              analyst_count: null,
+              provider: null,
+              as_of: null,
+              status: 'loading',
+              pe_fy1: null,
+              pe_fy2: null,
+              eps_growth_fy2: null,
+            },
+          },
+        }}
+        metricsLoading={false}
+        visibleColumns={['pe_fy1', 'pe_fy2', 'eps_growth_fy2']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const nioRow = screen.getByTestId('watchlist-row-NIO');
+    const nioCells = nioRow.querySelectorAll('td');
+    // td[0] is ticker/company, td[1] is pe_fy1, td[2] is pe_fy2, td[3] is eps_growth_fy2
+    expect(nioCells[1].getAttribute('data-valuation-status')).toBe('loss');
+    expect(nioCells[1].textContent).toBe('NM');
+
+    expect(nioCells[2].getAttribute('data-valuation-status')).toBe('loading');
+    expect(nioCells[2].textContent).toBe('…');
+    expect(nioCells[2].getAttribute('title')).toMatch(/加载|Loading/i);
+    expect(nioCells[2].getAttribute('title')).not.toMatch(/暂无一致预期覆盖|No analyst consensus coverage/i);
+
+    expect(nioCells[3].getAttribute('data-valuation-status')).toBe('loss');
+    expect(nioCells[3].textContent).toBe('NM');
+
+    // Row-level `status: 'loading'` without per-year overrides also renders loading cells
+    const xpevRow = screen.getByTestId('watchlist-row-XPEV');
+    const xpevLoadingCells = xpevRow.querySelectorAll('[data-valuation-status="loading"]');
+    expect(xpevLoadingCells.length).toBe(3);
+    for (const cell of xpevLoadingCells) {
+      expect(cell.textContent).toBe('…');
+      expect(cell.getAttribute('title')).toMatch(/加载|Loading/i);
+    }
+  });
 });

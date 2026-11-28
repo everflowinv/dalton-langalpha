@@ -1072,6 +1072,8 @@ class LocalRunExecutor:
         chart_snapshots: Optional[list[dict[str, Any]]] = None,
         chart_layers: Optional[list[dict[str, Any]]] = None,
         outbound_blocked: Optional[bool] = None,
+        # DALTON-HOOK(deliverable-text): pass per-message captured images on run_end
+        images_by_message: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> None:
         """Write the closing frames to the per-run Stream (I6), exactly once.
 
@@ -1117,6 +1119,7 @@ class LocalRunExecutor:
             chart_snapshots=chart_snapshots,  # DALTON-HOOK(channel-chart-snapshot)
             chart_layers=chart_layers,  # DALTON-HOOK(channel-chart-snapshot)
             outbound_blocked=outbound_blocked,  # DALTON-HOOK(channel-chart-snapshot)
+            images_by_message=images_by_message,  # DALTON-HOOK(deliverable-text)
             redis_event_ttl=self.redis_event_ttl,
             max_stored_messages=self.max_stored_messages,
         )
@@ -1508,6 +1511,8 @@ class LocalRunExecutor:
                 chart_snapshots=metadata.get("persisted_chart_snapshots"),
                 chart_layers=metadata.get("persisted_report_chart_layers"),
                 outbound_blocked=metadata.get("persisted_outbound_blocked"),
+                # DALTON-HOOK(deliverable-text): forward per-message captured images on run_end
+                images_by_message=metadata.get("persisted_images_by_message"),
             )
 
             if status == "completed" and completion_callback:

@@ -26,10 +26,12 @@ from src.dalton.auth_guards import (
 from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 from src.dalton.monitors import db as monitor_db
+from src.dalton.monitors import verify as monitor_verify
 from src.dalton.monitors.data_job_registry import (
     HostDirFileSource,
     MonitorDataJobBinding,
     ScopedMountFileSource,
+    check_binding_source_health,
     get_registered_monitor_binding_by_slug,
     get_registered_monitor_bindings,
 )
@@ -64,7 +66,11 @@ from src.dalton.monitors.permissions import (
     require_monitor_view,
     validate_publish_permissions,
 )
-from src.dalton.settings import is_artifact_publishing_enabled
+from src.dalton.settings import (
+    get_monitor_multi_binding_publish_mode,
+    is_artifact_publishing_enabled,
+    is_monitor_verify_readback_enabled,
+)
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts import VersionFile
 from src.server.database.artifacts.versions import (
@@ -102,6 +108,22 @@ from src.server.services.workspace_files import (
 
 logger = logging.getLogger(__name__)
 _REAL_GET_USER_TIER = get_user_tier
+_REAL_COMMIT_MONITOR_PUBLISH_TX = monitor_db.commit_monitor_publish_tx
+_REAL_COMMIT_MONITOR_VERSION_TX = monitor_db.commit_monitor_version_tx
+_REAL_STAGE_MONITOR_CANDIDATE_VERSION_TX = monitor_db.stage_monitor_candidate_version_tx
+_REAL_MIGRATE_DATA_JOB_MONITOR_AND_CUT_TX = monitor_db.migrate_data_job_monitor_and_cut_tx
+
+
+def _should_use_verified_publish_flow(legacy_fn: Any, real_legacy_fn: Any) -> bool:
+    """Use the 3-stage verified publish pipeline unless disabled or a test mocked the legacy tx."""
+    if not is_monitor_verify_readback_enabled():
+        return False
+    if (
+        legacy_fn is not real_legacy_fn
+        and monitor_db.stage_monitor_candidate_version_tx is _REAL_STAGE_MONITOR_CANDIDATE_VERSION_TX
+    ):
+        return False
+    return True
 
 
 def _require_publishing_enabled() -> None:
@@ -220,6 +242,9 @@ async def cut_monitor_version(
     )
 
 
+_REAL_CUT_MONITOR_VERSION = cut_monitor_version
+
+
 def _translate_snapshot_error(exc: Exception) -> HTTPException:
     from src.dalton.colleague_outbound_guard import (
         PENDING_CONFIRM_REQUIRED_MESSAGE,
@@ -332,13 +357,73 @@ async def _build_monitor_detail_payload(
     }
 
 
-async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
-    """Return trimmed read-only monitor detail for an anonymous viewer when ``visibility == 'public'``."""
+async def get_public_monitor_detail(
+    slug: str,
+    *,
+    candidate_probe: str | None = None,
+) -> dict[str, Any]:
+    """Return trimmed read-only monitor detail for an anonymous viewer, or a pre-promote candidate probe."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
+    if candidate_probe:
+        try:
+            verified_probe = await monitor_verify.verify_candidate_probe_token(
+                candidate_probe,
+                expected_artifact_id=(monitor.artifact_id if monitor is not None else None),
+            )
+        except monitor_verify.CandidateProbeError:
+            raise HTTPException(status_code=404, detail="监控面板不存在") from None
+        if monitor is not None:
+            if not is_monitor_capability_enabled(monitor):
+                raise HTTPException(status_code=404, detail="监控面板不存在")
+            serialized = serialize_monitor(monitor, can_manage=False)
+            serialized["visibility"] = "public"
+            serialized["published_seq"] = verified_probe.candidate_seq
+            serialized["last_verified_seq"] = verified_probe.candidate_seq
+        else:
+            serialized = {
+                "monitor_id": "",
+                "slug": slug,
+                "owner_name": None,
+                "title": slug,
+                "category": "other",
+                "sort_order": 0,
+                "visibility": "public",
+                "published_seq": verified_probe.candidate_seq,
+                "last_verified_seq": verified_probe.candidate_seq,
+                "keep_updated": False,
+                "source_kind": "workspace",
+                "acl_revision": 0,
+                "has_recent_publish_issue": False,
+                "data_as_of": None,
+                "can_manage": False,
+            }
+        for internal_key in (
+            "workspace_id",
+            "artifact_id",
+            "artifact_code",
+            "owner_user_id",
+            "entry_path",
+            "source_ref",
+            "last_publish_error",
+            "last_publish_failed_at",
+        ):
+            serialized.pop(internal_key, None)
+        serialized["owner_email"] = None
+        serialized["member_user_ids"] = []
+        return {
+            "monitor": serialized,
+            "versions": [],
+            "monitor_grant": "",
+            "frame_base": f"/api/v1/dalton/monitors/public/{slug}/",
+            "data_base": f"/api/v1/dalton/monitors/public/{slug}/data",
+            "expires_in": 0,
+        }
+
     if (
         monitor is None
         or monitor.visibility != "public"
         or not is_monitor_capability_enabled(monitor)
+        or monitor.effective_seq <= 0
         or await _get_superseded_shared_document(monitor) is not None
     ):
         raise HTTPException(status_code=404, detail="监控面板不存在")
@@ -384,6 +469,11 @@ def serialize_monitor(monitor: MonitorRecord, *, can_manage: bool = False) -> di
         "visibility": monitor.visibility,
         "member_user_ids": list(monitor.member_user_ids),
         "published_seq": monitor.published_seq,
+        "last_verified_seq": (
+            monitor.effective_seq
+            if (monitor.last_verified_seq is not None and monitor.published_seq > monitor.last_verified_seq)
+            else monitor.last_verified_seq
+        ),
         "keep_updated": monitor.keep_updated,
         "source_kind": monitor.source_kind,
         "source_ref": monitor.source_ref,
@@ -394,6 +484,7 @@ def serialize_monitor(monitor: MonitorRecord, *, can_manage: bool = False) -> di
             if monitor.last_publish_failed_at
             else None
         ),
+        "has_recent_publish_issue": bool(monitor.last_publish_error),
         "data_as_of": monitor.data_as_of.isoformat() if monitor.data_as_of else None,
         "created_at": monitor.created_at.isoformat(),
         "updated_at": monitor.updated_at.isoformat(),
@@ -486,6 +577,14 @@ async def mint_grant_for_monitor(slug: str, *, viewer_id: str) -> dict[str, Any]
         "data_base": data_prefix(grant),
         "expires_in": seconds_left(grant.expires_at),
         "acl_revision": monitor.acl_revision,
+        "published_seq": monitor.published_seq,
+        "last_verified_seq": (
+            monitor.effective_seq
+            if (monitor.last_verified_seq is not None and monitor.published_seq > monitor.last_verified_seq)
+            else monitor.last_verified_seq
+        ),
+        "entry_path": monitor.entry_path,
+        "updated_at": monitor.updated_at.isoformat(),
     }
 
 
@@ -592,28 +691,88 @@ async def publish_workspace_monitor(
 
     effective_title = (payload.title or "").strip() or snap.title or title
     try:
-        updated_monitor, result = await monitor_db.commit_monitor_publish_tx(
-            slug=slug,
-            artifact_id=artifact.artifact_id,
-            workspace_owner_id=caller_id,
-            monitor_owner_id=caller_id,
-            title=effective_title,
-            category=payload.category,
-            sort_order=payload.sort_order,
-            visibility=payload.visibility,
-            keep_updated=payload.keep_updated,
-            source_kind="workspace",
-            source_ref=f"{workspace['workspace_id']}:{rel_path}",
-            member_user_ids=members,
-            files=snap.files,
-            label=payload.label,
-            read_basis=ReadBasis.of(artifact),
-            origin="owner",
-            loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
-            left_out_files=[e.path for e in snap.left_out],
-            verify_public_authority=_verify_user_is_admin,
-            reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
-        )
+        if _should_use_verified_publish_flow(
+            monitor_db.commit_monitor_publish_tx, _REAL_COMMIT_MONITOR_PUBLISH_TX
+        ):
+            staged = await monitor_db.stage_monitor_candidate_version_tx(
+                artifact_id=artifact.artifact_id,
+                workspace_owner_id=caller_id,
+                files=snap.files,
+                title=effective_title,
+                label=payload.label,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+                left_out_files=[e.path for e in snap.left_out],
+                monitor_id=existing.monitor_id if existing is not None else None,
+                monitor_owner_id=caller_id,
+                visibility=payload.visibility,
+                source_kind="workspace",
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+                is_update_flow=False,
+            )
+            await monitor_verify.verify_candidate_monitor_version(
+                artifact_id=artifact.artifact_id,
+                candidate_seq=staged.candidate_seq,
+                entry_path=rel_path,
+                snap_files=snap.files,
+                snap_entry_sha256=snap.entry_sha256,
+                visibility=payload.visibility,
+                slug=slug,
+            )
+            promoted = await monitor_db.promote_verified_monitor_version_tx(
+                artifact_id=artifact.artifact_id,
+                candidate_seq=staged.candidate_seq,
+                workspace_owner_id=caller_id,
+                paths=[f.path for f in snap.files],
+                monitor_id=existing.monitor_id if existing is not None else None,
+                slug=slug,
+                monitor_owner_id=caller_id,
+                title=effective_title,
+                category=payload.category,
+                sort_order=payload.sort_order,
+                visibility=payload.visibility,
+                keep_updated=payload.keep_updated,
+                source_kind="workspace",
+                source_ref=f"{workspace['workspace_id']}:{rel_path}",
+                member_user_ids=members,
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+                update_metadata=True,
+                is_update_flow=False,
+                expected_share_revision=staged.share_revision,
+                expected_share_audience=staged.share_audience if staged.share_revision is not None else monitor_db._UNSET,
+                expected_acl_revision=staged.monitor_acl_revision,
+                expected_left_out_files=staged.left_out_files if staged.share_revision is not None else None,
+            )
+            assert promoted.monitor is not None
+            updated_monitor = promoted.monitor
+            was_cut = staged.cut
+        else:
+            updated_monitor, result = await monitor_db.commit_monitor_publish_tx(
+                slug=slug,
+                artifact_id=artifact.artifact_id,
+                workspace_owner_id=caller_id,
+                monitor_owner_id=caller_id,
+                title=effective_title,
+                category=payload.category,
+                sort_order=payload.sort_order,
+                visibility=payload.visibility,
+                keep_updated=payload.keep_updated,
+                source_kind="workspace",
+                source_ref=f"{workspace['workspace_id']}:{rel_path}",
+                member_user_ids=members,
+                files=snap.files,
+                label=payload.label,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+                left_out_files=[e.path for e in snap.left_out],
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+            )
+            was_cut = result.cut
     except Exception as exc:
         from src.dalton.colleague_outbound_guard import WorkspaceAutoPublishPaused
 
@@ -625,7 +784,7 @@ async def publish_workspace_monitor(
         raise _translate_snapshot_error(exc) from None
 
     detail = await _build_monitor_detail_payload(updated_monitor, viewer_id=caller_id)
-    detail["cut"] = result.cut
+    detail["cut"] = was_cut
     # Only explicit web manual publish by the workspace owner may CAS-clear pending_outbound_confirm
     if allow_clear_pause and str(caller_id) == str(workspace.get("user_id") or ""):
         from src.dalton.settings import is_dalton_sharing_auth_enabled
@@ -814,21 +973,74 @@ async def republish_workspace_monitor(
             earlier=tuple(payload.earlier),
             reviewed_page=payload.page_sha256,
         )
-        updated, result, _deduped = await cut_monitor_version(
-            monitor=monitor,
-            owner_user_id=workspace_owner_id,
-            files=snap.files,
-            title=monitor.title,
-            label=payload.label,
-            read_basis=ReadBasis.of(artifact),
-            origin="owner",
-            loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
-            left_out_files=[e.path for e in snap.left_out],
-            new_owner_user_id=takeover_owner,
-            caller_user_id=caller_id,
-            verify_public_authority=_verify_user_is_admin,
-            reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
-        )
+        if (
+            _should_use_verified_publish_flow(
+                monitor_db.commit_monitor_version_tx, _REAL_COMMIT_MONITOR_VERSION_TX
+            )
+            and cut_monitor_version is _REAL_CUT_MONITOR_VERSION
+        ):
+            staged = await monitor_db.stage_monitor_candidate_version_tx(
+                artifact_id=monitor.artifact_id,
+                workspace_owner_id=workspace_owner_id,
+                files=snap.files,
+                title=monitor.title,
+                label=payload.label,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+                left_out_files=[e.path for e in snap.left_out],
+                monitor_id=monitor.monitor_id,
+                new_owner_user_id=takeover_owner,
+                caller_user_id=caller_id,
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+                is_update_flow=True,
+            )
+            await monitor_verify.verify_candidate_monitor_version(
+                artifact_id=monitor.artifact_id,
+                candidate_seq=staged.candidate_seq,
+                entry_path=artifact.path,
+                snap_files=snap.files,
+                snap_entry_sha256=snap.entry_sha256,
+                visibility=monitor.visibility,
+                slug=monitor.slug,
+            )
+            promoted = await monitor_db.promote_verified_monitor_version_tx(
+                artifact_id=monitor.artifact_id,
+                candidate_seq=staged.candidate_seq,
+                workspace_owner_id=workspace_owner_id,
+                paths=[f.path for f in snap.files],
+                monitor_id=monitor.monitor_id,
+                new_owner_user_id=takeover_owner,
+                caller_user_id=caller_id,
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+                is_update_flow=True,
+                expected_share_revision=staged.share_revision,
+                expected_share_audience=staged.share_audience if staged.share_revision is not None else monitor_db._UNSET,
+                expected_acl_revision=staged.monitor_acl_revision,
+                expected_left_out_files=staged.left_out_files if staged.share_revision is not None else None,
+            )
+            assert promoted.monitor is not None
+            updated = promoted.monitor
+            was_cut = staged.cut
+        else:
+            updated, result, _deduped = await cut_monitor_version(
+                monitor=monitor,
+                owner_user_id=workspace_owner_id,
+                files=snap.files,
+                title=monitor.title,
+                label=payload.label,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+                left_out_files=[e.path for e in snap.left_out],
+                new_owner_user_id=takeover_owner,
+                caller_user_id=caller_id,
+                verify_public_authority=_verify_user_is_admin,
+                reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
+            )
+            was_cut = bool(result.cut) if result is not None else False
     except Exception as exc:
         from src.dalton.colleague_outbound_guard import WorkspaceAutoPublishPaused
 
@@ -845,7 +1057,7 @@ async def republish_workspace_monitor(
         raise _translate_snapshot_error(exc) from None
 
     detail = await _build_monitor_detail_payload(updated, viewer_id=caller_id)
-    detail["cut"] = bool(result.cut) if result is not None else False
+    detail["cut"] = was_cut
     # Only explicit web manual republish by the workspace owner may CAS-clear pending_outbound_confirm
     if allow_clear_pause and artifact.workspace_id and str(caller_id) == str(workspace_owner_id):
         from src.dalton.settings import is_dalton_sharing_auth_enabled
@@ -967,20 +1179,67 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 monitor.published_seq or artifact.latest_seq,
                 snap,
             )
-            await cut_monitor_version(
-                monitor=monitor,
-                owner_user_id=workspace_owner_id,
-                files=snap.files,
-                title=monitor.title,
-                read_basis=ReadBasis.of(artifact),
-                origin="owner",
-                loaded_files=[
-                    e.path for e in snap.entries if e.reason == REASON_LOADED
-                ],
-                artifact=artifact,
-                verify_public_authority=_verify_user_is_admin,
-                check_pending_outbound_confirm=sharing_auth_enabled,
-            )
+            if (
+                _should_use_verified_publish_flow(
+                    monitor_db.commit_monitor_version_tx, _REAL_COMMIT_MONITOR_VERSION_TX
+                )
+                and cut_monitor_version is _REAL_CUT_MONITOR_VERSION
+            ):
+                staged = await monitor_db.stage_monitor_candidate_version_tx(
+                    artifact_id=monitor.artifact_id,
+                    workspace_owner_id=workspace_owner_id,
+                    files=snap.files,
+                    title=monitor.title,
+                    read_basis=ReadBasis.of(artifact),
+                    origin="owner",
+                    loaded_files=[
+                        e.path for e in snap.entries if e.reason == REASON_LOADED
+                    ],
+                    monitor_id=monitor.monitor_id,
+                    verify_public_authority=_verify_user_is_admin,
+                    check_pending_outbound_confirm=sharing_auth_enabled,
+                    is_update_flow=True,
+                )
+                if staged.paused or staged.deduped:
+                    continue
+                await monitor_verify.verify_candidate_monitor_version(
+                    artifact_id=monitor.artifact_id,
+                    candidate_seq=staged.candidate_seq,
+                    entry_path=artifact.path,
+                    snap_files=snap.files,
+                    snap_entry_sha256=snap.entry_sha256,
+                    visibility=monitor.visibility,
+                    slug=monitor.slug,
+                )
+                await monitor_db.promote_verified_monitor_version_tx(
+                    artifact_id=monitor.artifact_id,
+                    candidate_seq=staged.candidate_seq,
+                    workspace_owner_id=workspace_owner_id,
+                    paths=[f.path for f in snap.files],
+                    monitor_id=monitor.monitor_id,
+                    verify_public_authority=_verify_user_is_admin,
+                    check_pending_outbound_confirm=sharing_auth_enabled,
+                    is_update_flow=True,
+                    expected_share_revision=staged.share_revision,
+                    expected_share_audience=staged.share_audience if staged.share_revision is not None else monitor_db._UNSET,
+                    expected_acl_revision=staged.monitor_acl_revision,
+                    expected_left_out_files=staged.left_out_files if staged.share_revision is not None else None,
+                )
+            else:
+                await cut_monitor_version(
+                    monitor=monitor,
+                    owner_user_id=workspace_owner_id,
+                    files=snap.files,
+                    title=monitor.title,
+                    read_basis=ReadBasis.of(artifact),
+                    origin="owner",
+                    loaded_files=[
+                        e.path for e in snap.entries if e.reason == REASON_LOADED
+                    ],
+                    artifact=artifact,
+                    verify_public_authority=_verify_user_is_admin,
+                    check_pending_outbound_confirm=sharing_auth_enabled,
+                )
         except monitor_db.MonitorSupersededBySharedDocumentError:
             logger.info(
                 "Skipping auto-update for workspace monitor %s (%s): superseded by shared document",
@@ -1059,7 +1318,15 @@ def _open_binding_reader_source(
         raise
     scoped = ScopedMountFileSource(mounts, primary_mount=binding.slug)
     work_dir = str(data_root / Path(binding.rel_dir).parent)
-    extra_files = () if binding.dependencies_only else scoped.list_primary_artifact_files()
+    primary_files = scoped.list_primary_artifact_files()
+    if binding.dependencies_only:
+        extra_files: tuple[str, ...] = tuple(
+            monitor_verify.filter_sibling_json_paths(
+                primary_files, _binding_entry_path(binding, is_multi=is_multi)
+            )
+        )
+    else:
+        extra_files = primary_files
     return scoped, work_dir, extra_files
 
 
@@ -1082,30 +1349,74 @@ def _is_migratable_legacy_data_job_monitor(
     )
 
 
-async def _republish_single_binding(
+async def _record_data_job_publish_failure(
+    monitor_id: str,
+    *,
+    error_message: str,
+    run_id: str | None = None,
+    claim_epoch: int | None = None,
+) -> MonitorRecord | None:
+    """Record a data-job publish failure, fenced by ``claim_epoch`` when leased."""
+    if claim_epoch is not None and run_id:
+        return await monitor_db.record_monitor_publish_failure(
+            monitor_id,
+            error_message=error_message,
+            run_id=run_id,
+            expected_claim_epoch=claim_epoch,
+        )
+    return await monitor_db.record_monitor_publish_failure(
+        monitor_id,
+        error_message=error_message,
+    )
+
+
+async def _prepare_and_verify_single_binding(
     binding: MonitorDataJobBinding,
     *,
     clean_run_id: str,
     data_root: Path,
     existing: MonitorRecord | None,
     is_multi: bool,
+    pre_staged_candidate_seq: int | None = None,
+    on_staged: Any = None,
+    claim_epoch: int | None = None,
 ) -> dict[str, Any]:
+    """Run health checks + Stage 1 (stage) + Stage 2 (verify) for one data-job binding."""
     if existing is not None and await monitor_db.has_processed_monitor_run(
         existing.monitor_id, clean_run_id
     ):
         return {
-            "monitor_id": existing.monitor_id,
-            "slug": existing.slug,
-            "published_seq": existing.published_seq,
-            "cut": False,
-            "deduplicated": True,
+            "kind": "deduplicated",
+            "result": {
+                "monitor_id": existing.monitor_id,
+                "slug": existing.slug,
+                "published_seq": existing.published_seq,
+                "last_verified_seq": existing.last_verified_seq,
+                "cut": False,
+                "deduplicated": True,
+                "status": "unchanged",
+            },
         }
+
+    health_ok, health_err = check_binding_source_health(data_root, binding)
+    if not health_ok:
+        err_msg = health_err or f"面板 {binding.slug} 必需数据源校验失败"
+        if existing is not None:
+            await _record_data_job_publish_failure(
+                existing.monitor_id,
+                error_message=err_msg,
+                run_id=clean_run_id,
+                claim_epoch=claim_epoch,
+            )
+        raise RuntimeError(err_msg)
 
     if binding.visibility == "public" and not (binding.approved_by_admin_user_id or "").strip():
         if existing is not None:
-            await monitor_db.record_monitor_publish_failure(
+            await _record_data_job_publish_failure(
                 existing.monitor_id,
                 error_message=PUBLIC_PERMISSION_LOST_MESSAGE,
+                run_id=clean_run_id,
+                claim_epoch=claim_epoch,
             )
         raise HTTPException(
             status_code=403,
@@ -1123,8 +1434,11 @@ async def _republish_single_binding(
             )
         except PublicAuthorityLostError as exc:
             if existing is not None:
-                await monitor_db.record_monitor_publish_failure(
-                    existing.monitor_id, error_message=str(exc)
+                await _record_data_job_publish_failure(
+                    existing.monitor_id,
+                    error_message=str(exc),
+                    run_id=clean_run_id,
+                    claim_epoch=claim_epoch,
                 )
             raise HTTPException(status_code=403, detail=str(exc)) from None
 
@@ -1143,11 +1457,16 @@ async def _republish_single_binding(
                     existing.monitor_id, clean_run_id
                 ):
                     return {
-                        "monitor_id": existing.monitor_id,
-                        "slug": existing.slug,
-                        "published_seq": existing.published_seq,
-                        "cut": False,
-                        "deduplicated": True,
+                        "kind": "deduplicated",
+                        "result": {
+                            "monitor_id": existing.monitor_id,
+                            "slug": existing.slug,
+                            "published_seq": existing.published_seq,
+                            "last_verified_seq": existing.last_verified_seq,
+                            "cut": False,
+                            "deduplicated": True,
+                            "status": "unchanged",
+                        },
                     }
                 if existing.visibility == "public":
                     try:
@@ -1156,8 +1475,11 @@ async def _republish_single_binding(
                             is_existing_public=True,
                         )
                     except PublicAuthorityLostError as exc:
-                        await monitor_db.record_monitor_publish_failure(
-                            existing.monitor_id, error_message=str(exc)
+                        await _record_data_job_publish_failure(
+                            existing.monitor_id,
+                            error_message=str(exc),
+                            run_id=clean_run_id,
+                            claim_epoch=claim_epoch,
                         )
                         raise HTTPException(status_code=403, detail=str(exc)) from None
             else:
@@ -1198,32 +1520,42 @@ async def _republish_single_binding(
                 extra_paths=extra_files,
             )
         workspace_id = await monitor_db.ensure_company_monitor_workspace()
-        if monitor is not None and _is_migratable_legacy_data_job_monitor(
+        is_legacy_migrate = monitor is not None and _is_migratable_legacy_data_job_monitor(
             monitor, binding, is_multi=is_multi
-        ):
-            logger.info(
-                "Auto-migrating legacy data-job monitor: job_key=%s slug=%s monitor_id=%s from=%s to=%s",
-                binding.job_key,
-                binding.slug,
-                monitor.monitor_id,
-                monitor.entry_path,
-                entry_path,
+        )
+        use_verified = (
+            _should_use_verified_publish_flow(
+                monitor_db.commit_monitor_version_tx, _REAL_COMMIT_MONITOR_VERSION_TX
             )
-            updated, result, deduped = await monitor_db.migrate_data_job_monitor_and_cut_tx(
-                monitor_id=monitor.monitor_id,
-                artifact_id=monitor.artifact_id,
-                workspace_id=workspace_id,
-                workspace_owner_id=COMPANY_SYSTEM_USER_ID,
-                target_entry_path=entry_path,
-                legacy_entry_path=binding.entry_file,
-                expected_slug=binding.slug,
-                target_source_ref=binding.job_key,
-                files=snap.files,
-                title=monitor.title,
-                origin="owner",
-                run_id=clean_run_id,
-                verify_public_authority=_verify_job_public_in_tx,
+            and cut_monitor_version is _REAL_CUT_MONITOR_VERSION
+            and (
+                not is_legacy_migrate
+                or monitor_db.migrate_data_job_monitor_and_cut_tx
+                is _REAL_MIGRATE_DATA_JOB_MONITOR_AND_CUT_TX
             )
+        )
+        if is_legacy_migrate and not use_verified:
+            return {
+                "kind": "legacy_migrate",
+                "binding": binding,
+                "monitor": monitor,
+                "workspace_id": workspace_id,
+                "entry_path": entry_path,
+                "snap": snap,
+                "clean_run_id": clean_run_id,
+                "verify_fn": _verify_job_public_in_tx,
+            }
+
+        if is_legacy_migrate:
+            assert monitor is not None
+            artifact = await artifacts_db.get_artifact(
+                monitor.artifact_id, user_id=COMPANY_SYSTEM_USER_ID
+            )
+            if artifact is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"监控面板 '{binding.slug}' 关联资源不存在",
+                )
         else:
             artifact = await artifacts_db.ensure_artifact(workspace_id, entry_path)
             if monitor is not None and monitor.artifact_id != artifact.artifact_id:
@@ -1243,6 +1575,190 @@ async def _republish_single_binding(
                         f"无法自动迁移到 '{entry_path}'"
                     ),
                 )
+        await _abort_if_absent_dependencies(
+            artifact.artifact_id,
+            (monitor.published_seq if monitor is not None else 0) or artifact.latest_seq,
+            snap,
+        )
+
+        if not use_verified:
+            return {
+                "kind": "legacy_commit",
+                "binding": binding,
+                "monitor": monitor,
+                "artifact": artifact,
+                "entry_path": entry_path,
+                "snap": snap,
+                "clean_run_id": clean_run_id,
+                "verify_fn": _verify_job_public_in_tx,
+            }
+
+        eff_visibility: Any = monitor.visibility if monitor is not None else binding.visibility
+        staged_share_revision: int | None = int(artifact.revision)
+        staged_share_audience: Any = artifact.audience
+        staged_left_out_files: tuple[str, ...] = tuple(sorted(artifact.left_out_files))
+        staged_acl_revision: int | None = (
+            int(monitor.acl_revision) if monitor is not None else None
+        )
+        if pre_staged_candidate_seq is not None and pre_staged_candidate_seq > 0:
+            candidate_seq = int(pre_staged_candidate_seq)
+            staged_cut = True
+        else:
+            if is_legacy_migrate and monitor is not None:
+                logger.info(
+                    "Staging legacy data-job monitor migration for verification: job_key=%s slug=%s monitor_id=%s from=%s to=%s",
+                    binding.job_key,
+                    binding.slug,
+                    monitor.monitor_id,
+                    monitor.entry_path,
+                    entry_path,
+                )
+            staged = await monitor_db.stage_monitor_candidate_version_tx(
+                artifact_id=artifact.artifact_id,
+                workspace_owner_id=COMPANY_SYSTEM_USER_ID,
+                files=snap.files,
+                title=monitor.title if monitor is not None else binding.title,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                monitor_id=monitor.monitor_id if monitor is not None else None,
+                monitor_owner_id=COMPANY_SYSTEM_USER_ID,
+                visibility=eff_visibility,
+                source_kind="data_job",
+                verify_public_authority=_verify_job_public_in_tx,
+                run_id=clean_run_id,
+                is_update_flow=monitor is not None,
+                candidate_entry_path=entry_path if is_legacy_migrate else None,
+                expected_legacy_entry_path=binding.entry_file if is_legacy_migrate else None,
+                expected_slug=binding.slug if is_legacy_migrate else None,
+                expected_workspace_id=workspace_id if is_legacy_migrate else None,
+            )
+            if staged.deduped and staged.existing_monitor is not None:
+                return {
+                    "kind": "deduplicated",
+                    "result": {
+                        "monitor_id": staged.existing_monitor.monitor_id,
+                        "slug": staged.existing_monitor.slug,
+                        "published_seq": staged.existing_monitor.published_seq,
+                        "last_verified_seq": staged.existing_monitor.last_verified_seq,
+                        "cut": False,
+                        "deduplicated": True,
+                        "status": "unchanged",
+                    },
+                }
+            candidate_seq = staged.candidate_seq
+            staged_cut = staged.cut
+            if staged.share_revision is not None:
+                staged_share_revision = staged.share_revision
+                staged_share_audience = staged.share_audience
+                staged_left_out_files = staged.left_out_files
+            if staged.monitor_acl_revision is not None:
+                staged_acl_revision = staged.monitor_acl_revision
+            if on_staged is not None:
+                await on_staged(binding.slug, artifact.artifact_id, candidate_seq)
+
+        verified = await monitor_verify.verify_candidate_monitor_version(
+            artifact_id=artifact.artifact_id,
+            candidate_seq=candidate_seq,
+            entry_path=entry_path,
+            snap_files=snap.files,
+            snap_entry_sha256=snap.entry_sha256,
+            visibility=eff_visibility,
+            slug=binding.slug,
+        )
+        return {
+            "kind": "verified_ready",
+            "binding": binding,
+            "monitor": monitor,
+            "artifact": artifact,
+            "entry_path": entry_path,
+            "snap": snap,
+            "candidate_seq": candidate_seq,
+            "staged_cut": staged_cut,
+            "verified": verified,
+            "clean_run_id": clean_run_id,
+            "verify_fn": _verify_job_public_in_tx,
+            "share_revision": staged_share_revision,
+            "share_audience": staged_share_audience,
+            "left_out_files": staged_left_out_files,
+            "monitor_acl_revision": staged_acl_revision,
+            "migrate_entry_path": entry_path if is_legacy_migrate else None,
+            "migrate_legacy_entry_path": binding.entry_file if is_legacy_migrate else None,
+            "migrate_source_ref": binding.job_key if is_legacy_migrate else None,
+            "migrate_workspace_id": workspace_id if is_legacy_migrate else None,
+        }
+    except Exception as exc:
+        if monitor is not None:
+            await _record_data_job_publish_failure(
+                monitor.monitor_id,
+                error_message=str(exc),
+                run_id=clean_run_id,
+                claim_epoch=claim_epoch,
+            )
+        raise _translate_snapshot_error(exc) from None
+
+
+async def _promote_prepared_binding(
+    prepared: dict[str, Any],
+    *,
+    before_promote: Any = None,
+    claim_epoch: int | None = None,
+    check_superseded: bool = False,
+) -> dict[str, Any]:
+    """Run Stage 3 atomic fenced promotion for a prepared data-job binding (zero post-commit readback)."""
+    kind = prepared["kind"]
+    if kind == "deduplicated":
+        return prepared["result"]
+
+    binding: MonitorDataJobBinding = prepared["binding"]
+    monitor: MonitorRecord | None = prepared["monitor"]
+    entry_path: str = prepared["entry_path"]
+    snap = prepared["snap"]
+    clean_run_id: str = prepared["clean_run_id"]
+    verify_fn = prepared["verify_fn"]
+
+    if before_promote is not None:
+        should_continue = await before_promote()
+        if not should_continue:
+            return {
+                "monitor_id": monitor.monitor_id if monitor is not None else None,
+                "slug": binding.slug,
+                "published_seq": monitor.published_seq if monitor is not None else 0,
+                "last_verified_seq": monitor.last_verified_seq if monitor is not None else None,
+                "cut": False,
+                "deduplicated": False,
+                "superseded": True,
+                "status": "superseded",
+            }
+
+    try:
+        if kind == "legacy_migrate":
+            assert monitor is not None
+            logger.info(
+                "Auto-migrating legacy data-job monitor: job_key=%s slug=%s monitor_id=%s from=%s to=%s",
+                binding.job_key,
+                binding.slug,
+                monitor.monitor_id,
+                monitor.entry_path,
+                entry_path,
+            )
+            updated, result, deduped = await monitor_db.migrate_data_job_monitor_and_cut_tx(
+                monitor_id=monitor.monitor_id,
+                artifact_id=monitor.artifact_id,
+                workspace_id=prepared["workspace_id"],
+                workspace_owner_id=COMPANY_SYSTEM_USER_ID,
+                target_entry_path=entry_path,
+                legacy_entry_path=binding.entry_file,
+                expected_slug=binding.slug,
+                target_source_ref=binding.job_key,
+                files=snap.files,
+                title=monitor.title,
+                origin="owner",
+                run_id=clean_run_id,
+                verify_public_authority=verify_fn,
+            )
+            was_cut = bool(result.cut) if result is not None else False
+        elif kind == "legacy_commit":
+            artifact = prepared["artifact"]
             if monitor is None:
                 monitor = await monitor_db.upsert_monitor(
                     slug=binding.slug,
@@ -1257,11 +1773,6 @@ async def _republish_single_binding(
                     source_ref=binding.job_key,
                     member_user_ids=(),
                 )
-            await _abort_if_absent_dependencies(
-                monitor.artifact_id,
-                monitor.published_seq or artifact.latest_seq,
-                snap,
-            )
             updated, result, deduped = await cut_monitor_version(
                 monitor=monitor,
                 owner_user_id=COMPANY_SYSTEM_USER_ID,
@@ -1271,13 +1782,90 @@ async def _republish_single_binding(
                 origin="owner",
                 run_id=clean_run_id,
                 artifact=artifact,
-                verify_public_authority=_verify_job_public_in_tx,
+                verify_public_authority=verify_fn,
             )
+            was_cut = bool(result.cut) if result is not None else False
+        else:
+            artifact = prepared["artifact"]
+            candidate_seq: int = prepared["candidate_seq"]
+            promoted = await monitor_db.promote_verified_monitor_version_tx(
+                artifact_id=artifact.artifact_id,
+                candidate_seq=candidate_seq,
+                workspace_owner_id=COMPANY_SYSTEM_USER_ID,
+                paths=[f.path for f in snap.files],
+                monitor_id=monitor.monitor_id if monitor is not None else None,
+                slug=binding.slug,
+                monitor_owner_id=COMPANY_SYSTEM_USER_ID,
+                title=monitor.title if monitor is not None else binding.title,
+                category=binding.category,
+                sort_order=binding.sort_order,
+                visibility=monitor.visibility if monitor is not None else binding.visibility,
+                keep_updated=True,
+                source_kind="data_job",
+                source_ref=binding.job_key,
+                member_user_ids=(),
+                run_id=clean_run_id,
+                verify_public_authority=verify_fn,
+                update_metadata=False,
+                is_update_flow=monitor is not None,
+                expected_claim_epoch=claim_epoch,
+                check_superseded=check_superseded,
+                expected_share_revision=prepared.get("share_revision"),
+                expected_share_audience=prepared.get("share_audience", monitor_db._UNSET),
+                expected_acl_revision=prepared.get("monitor_acl_revision"),
+                expected_left_out_files=prepared.get("left_out_files"),
+                migrate_entry_path=prepared.get("migrate_entry_path"),
+                migrate_legacy_entry_path=prepared.get("migrate_legacy_entry_path"),
+                migrate_source_ref=prepared.get("migrate_source_ref"),
+                migrate_workspace_id=prepared.get("migrate_workspace_id"),
+            )
+            if promoted.fenced_out:
+                mon_ref = promoted.monitor or monitor
+                return {
+                    "monitor_id": mon_ref.monitor_id if mon_ref is not None else None,
+                    "slug": binding.slug,
+                    "published_seq": mon_ref.published_seq if mon_ref is not None else 0,
+                    "last_verified_seq": mon_ref.last_verified_seq if mon_ref is not None else None,
+                    "cut": False,
+                    "deduplicated": False,
+                    "fenced_out": True,
+                    "status": "fenced_out",
+                }
+            if promoted.deferred_to_newer:
+                mon_ref = promoted.monitor or monitor
+                return {
+                    "monitor_id": mon_ref.monitor_id if mon_ref is not None else None,
+                    "slug": binding.slug,
+                    "published_seq": mon_ref.published_seq if mon_ref is not None else 0,
+                    "last_verified_seq": mon_ref.last_verified_seq if mon_ref is not None else None,
+                    "cut": False,
+                    "deduplicated": False,
+                    "deferred": True,
+                    "status": "deferred",
+                }
+            if promoted.superseded_by_newer:
+                mon_ref = promoted.monitor or monitor
+                return {
+                    "monitor_id": mon_ref.monitor_id if mon_ref is not None else None,
+                    "slug": binding.slug,
+                    "published_seq": mon_ref.published_seq if mon_ref is not None else 0,
+                    "last_verified_seq": mon_ref.last_verified_seq if mon_ref is not None else None,
+                    "cut": False,
+                    "deduplicated": False,
+                    "superseded": True,
+                    "status": "superseded",
+                }
+            assert promoted.monitor is not None
+            updated = promoted.monitor
+            deduped = promoted.deduped
+            was_cut = bool(prepared["staged_cut"]) and promoted.promoted
     except Exception as exc:
         if monitor is not None:
-            await monitor_db.record_monitor_publish_failure(
+            await _record_data_job_publish_failure(
                 monitor.monitor_id,
                 error_message=str(exc),
+                run_id=clean_run_id,
+                claim_epoch=claim_epoch,
             )
         raise _translate_snapshot_error(exc) from None
 
@@ -1285,9 +1873,42 @@ async def _republish_single_binding(
         "monitor_id": updated.monitor_id,
         "slug": updated.slug,
         "published_seq": updated.published_seq,
-        "cut": bool(result.cut) if result is not None else False,
+        "last_verified_seq": updated.last_verified_seq,
+        "cut": was_cut,
         "deduplicated": deduped,
+        "status": "published" if was_cut else "unchanged",
     }
+
+
+async def _republish_single_binding(
+    binding: MonitorDataJobBinding,
+    *,
+    clean_run_id: str,
+    data_root: Path,
+    existing: MonitorRecord | None,
+    is_multi: bool,
+    pre_staged_candidate_seq: int | None = None,
+    before_promote: Any = None,
+    on_staged: Any = None,
+    claim_epoch: int | None = None,
+    check_superseded: bool = False,
+) -> dict[str, Any]:
+    prepared = await _prepare_and_verify_single_binding(
+        binding,
+        clean_run_id=clean_run_id,
+        data_root=data_root,
+        existing=existing,
+        is_multi=is_multi,
+        pre_staged_candidate_seq=pre_staged_candidate_seq,
+        on_staged=on_staged,
+        claim_epoch=claim_epoch,
+    )
+    return await _promote_prepared_binding(
+        prepared,
+        before_promote=before_promote,
+        claim_epoch=claim_epoch,
+        check_superseded=check_superseded,
+    )
 
 
 async def republish_data_job_monitor(
@@ -1295,8 +1916,14 @@ async def republish_data_job_monitor(
     job_key: str,
     run_id: str,
     data_root: Path | None = None,
+    panel_progress: dict[str, dict[str, Any]] | None = None,
+    before_promote: Any = None,
+    on_staged: Any = None,
+    raise_on_partial: bool = True,
+    claim_epoch: int | None = None,
+    check_superseded: bool = False,
 ) -> dict[str, Any]:
-    """Republish registered data-job monitor(s) from their pre-registered host output dir."""
+    """Republish registered data-job monitor(s) from their pre-registered host or frozen dir."""
     if not has_capability(CapabilityId.DATA_JOBS):
         raise HTTPException(status_code=404, detail="数据任务监控未启用")
     _require_publishing_enabled()
@@ -1318,6 +1945,17 @@ async def republish_data_job_monitor(
 
     if len(bindings) == 1:
         binding = bindings[0]
+        prev_panel = (panel_progress or {}).get(binding.slug) or {}
+        if prev_panel.get("status") in ("published", "unchanged"):
+            return {
+                "monitor_id": prev_panel.get("monitor_id"),
+                "slug": binding.slug,
+                "published_seq": prev_panel.get("published_seq", 0),
+                "cut": prev_panel.get("status") == "published",
+                "deduplicated": True,
+                "status": prev_panel["status"],
+                "panel_results": {binding.slug: dict(prev_panel)},
+            }
         existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
         if existing is not None and existing.slug != binding.slug:
             logger.error(
@@ -1328,51 +1966,352 @@ async def republish_data_job_monitor(
                 existing.monitor_id,
             )
             existing = None
-        return await _republish_single_binding(
+        res = await _republish_single_binding(
             binding,
             clean_run_id=clean_run_id,
             data_root=data_root,
             existing=existing,
             is_multi=False,
+            pre_staged_candidate_seq=prev_panel.get("candidate_seq"),
+            before_promote=before_promote,
+            on_staged=on_staged,
+            claim_epoch=claim_epoch,
+            check_superseded=check_superseded,
         )
+        res["panel_results"] = {binding.slug: dict(res)}
+        return res
 
     existing_rows = await monitor_db.list_monitors_by_data_job(job_key)
     by_entry = {row.entry_path: row for row in existing_rows if row.entry_path}
     by_slug = {row.slug: row for row in existing_rows}
 
+    publish_mode = get_monitor_multi_binding_publish_mode()
     results: list[dict[str, Any]] = []
+    panel_results: dict[str, dict[str, Any]] = {}
     first_exc: Exception | None = None
-    for binding in bindings:
-        entry_path = _binding_entry_path(binding, is_multi=True)
-        existing = by_entry.get(entry_path) or by_slug.get(binding.slug)
-        try:
-            res = await _republish_single_binding(
-                binding,
-                clean_run_id=clean_run_id,
-                data_root=data_root,
-                existing=existing,
-                is_multi=True,
-            )
-            results.append(res)
-        except Exception as exc:
-            if first_exc is None:
-                first_exc = exc
-            logger.warning(
-                "Republishing data-job monitor %s (%s) failed: %s",
-                binding.slug,
-                binding.job_key,
-                exc,
-                exc_info=True,
-            )
 
-    if first_exc is not None:
+    if publish_mode == "all_or_nothing":
+        prepared_list: list[tuple[MonitorDataJobBinding, dict[str, Any]]] = []
+        for binding in bindings:
+            prev_panel = (panel_progress or {}).get(binding.slug) or {}
+            if prev_panel.get("status") in ("published", "unchanged"):
+                panel_results[binding.slug] = dict(prev_panel)
+                continue
+            entry_path = _binding_entry_path(binding, is_multi=True)
+            existing = by_entry.get(entry_path) or by_slug.get(binding.slug)
+            try:
+                prepared = await _prepare_and_verify_single_binding(
+                    binding,
+                    clean_run_id=clean_run_id,
+                    data_root=data_root,
+                    existing=existing,
+                    is_multi=True,
+                    pre_staged_candidate_seq=prev_panel.get("candidate_seq"),
+                    on_staged=on_staged,
+                    claim_epoch=claim_epoch,
+                )
+                prepared_list.append((binding, prepared))
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+                panel_results[binding.slug] = {
+                    "slug": binding.slug,
+                    "status": "failed",
+                    "error": _extract_publish_failure_message(exc),
+                }
+                logger.warning(
+                    "Preparing data-job monitor %s (%s) failed (all_or_nothing): %s",
+                    binding.slug,
+                    binding.job_key,
+                    exc,
+                    exc_info=True,
+                )
+
+        if first_exc is not None:
+            for binding, _prep in prepared_list:
+                panel_results.setdefault(
+                    binding.slug,
+                    {"slug": binding.slug, "status": "aborted_batch"},
+                )
+            if raise_on_partial:
+                raise first_exc
+            return {
+                "job_key": job_key,
+                "monitors": results,
+                "panel_results": panel_results,
+                "cut": False,
+                "deduplicated": False,
+                "status": "failed",
+                "error": _extract_publish_failure_message(first_exc),
+            }
+
+        # Promote all verified_ready panels atomically in ONE transaction!
+        if before_promote is not None:
+            should_continue = await before_promote()
+            if not should_continue:
+                for binding, prepared in prepared_list:
+                    mon = prepared.get("monitor")
+                    res = {
+                        "monitor_id": mon.monitor_id if mon is not None else None,
+                        "slug": binding.slug,
+                        "published_seq": mon.published_seq if mon is not None else 0,
+                        "last_verified_seq": mon.last_verified_seq if mon is not None else None,
+                        "cut": False,
+                        "deduplicated": False,
+                        "superseded": True,
+                        "status": "superseded",
+                    }
+                    results.append(res)
+                    panel_results[binding.slug] = dict(res)
+                return {
+                    "job_key": job_key,
+                    "monitors": results,
+                    "panel_results": panel_results,
+                    "cut": False,
+                    "deduplicated": False,
+                    "superseded": True,
+                    "status": "superseded",
+                    "error": None,
+                }
+
+        verified_entries: list[tuple[MonitorDataJobBinding, dict[str, Any]]] = []
+        non_verified_entries: list[tuple[MonitorDataJobBinding, dict[str, Any]]] = []
+        for binding, prepared in prepared_list:
+            if prepared["kind"] == "deduplicated":
+                res = prepared["result"]
+                results.append(res)
+                panel_results[binding.slug] = dict(res)
+            elif prepared["kind"] == "verified_ready":
+                verified_entries.append((binding, prepared))
+            else:
+                non_verified_entries.append((binding, prepared))
+
+        if verified_entries:
+            batch_items = [
+                monitor_db.PromoteMonitorItem(
+                    artifact_id=prep["artifact"].artifact_id,
+                    candidate_seq=prep["candidate_seq"],
+                    workspace_owner_id=COMPANY_SYSTEM_USER_ID,
+                    paths=[f.path for f in prep["snap"].files],
+                    monitor_id=prep["monitor"].monitor_id if prep["monitor"] is not None else None,
+                    slug=bnd.slug,
+                    monitor_owner_id=COMPANY_SYSTEM_USER_ID,
+                    title=prep["monitor"].title if prep["monitor"] is not None else bnd.title,
+                    category=bnd.category,
+                    sort_order=bnd.sort_order,
+                    visibility=(
+                        prep["monitor"].visibility if prep["monitor"] is not None else bnd.visibility
+                    ),
+                    keep_updated=True,
+                    source_kind="data_job",
+                    source_ref=bnd.job_key,
+                    member_user_ids=(),
+                    verify_public_authority=prep["verify_fn"],
+                    update_metadata=False,
+                    is_update_flow=prep["monitor"] is not None,
+                    expected_share_revision=prep.get("share_revision"),
+                    expected_share_audience=prep.get("share_audience", monitor_db._UNSET),
+                    expected_acl_revision=prep.get("monitor_acl_revision"),
+                    expected_left_out_files=prep.get("left_out_files"),
+                    migrate_entry_path=prep.get("migrate_entry_path"),
+                    migrate_legacy_entry_path=prep.get("migrate_legacy_entry_path"),
+                    migrate_source_ref=prep.get("migrate_source_ref"),
+                    migrate_workspace_id=prep.get("migrate_workspace_id"),
+                )
+                for bnd, prep in verified_entries
+            ]
+            try:
+                batch_res = await monitor_db.promote_verified_monitor_batch_tx(
+                    batch_items,
+                    run_id=clean_run_id,
+                    expected_claim_epoch=claim_epoch,
+                    check_superseded=check_superseded,
+                )
+                if batch_res.fenced_out:
+                    for bnd, prep in verified_entries:
+                        mon = prep.get("monitor")
+                        res = {
+                            "monitor_id": mon.monitor_id if mon is not None else None,
+                            "slug": bnd.slug,
+                            "published_seq": mon.published_seq if mon is not None else 0,
+                            "last_verified_seq": mon.last_verified_seq if mon is not None else None,
+                            "cut": False,
+                            "deduplicated": False,
+                            "fenced_out": True,
+                            "status": "fenced_out",
+                        }
+                        results.append(res)
+                        panel_results[bnd.slug] = dict(res)
+                elif batch_res.deferred_to_newer:
+                    for bnd, prep in verified_entries:
+                        mon = prep.get("monitor")
+                        res = {
+                            "monitor_id": mon.monitor_id if mon is not None else None,
+                            "slug": bnd.slug,
+                            "published_seq": mon.published_seq if mon is not None else 0,
+                            "last_verified_seq": mon.last_verified_seq if mon is not None else None,
+                            "cut": False,
+                            "deduplicated": False,
+                            "deferred": True,
+                            "status": "deferred",
+                        }
+                        results.append(res)
+                        panel_results[bnd.slug] = dict(res)
+                elif batch_res.superseded_by_newer:
+                    for bnd, prep in verified_entries:
+                        mon = prep.get("monitor")
+                        res = {
+                            "monitor_id": mon.monitor_id if mon is not None else None,
+                            "slug": bnd.slug,
+                            "published_seq": mon.published_seq if mon is not None else 0,
+                            "last_verified_seq": mon.last_verified_seq if mon is not None else None,
+                            "cut": False,
+                            "deduplicated": False,
+                            "superseded": True,
+                            "status": "superseded",
+                        }
+                        results.append(res)
+                        panel_results[bnd.slug] = dict(res)
+                else:
+                    for (bnd, prep), promoted in zip(verified_entries, batch_res.results):
+                        assert promoted.monitor is not None
+                        updated = promoted.monitor
+                        was_cut = bool(prep["staged_cut"]) and promoted.promoted
+                        res = {
+                            "monitor_id": updated.monitor_id,
+                            "slug": updated.slug,
+                            "published_seq": updated.published_seq,
+                            "last_verified_seq": updated.last_verified_seq,
+                            "cut": was_cut,
+                            "deduplicated": promoted.deduped,
+                            "status": "published" if was_cut else "unchanged",
+                        }
+                        results.append(res)
+                        panel_results[bnd.slug] = dict(res)
+            except Exception as exc:
+                first_exc = exc
+                err_msg = _extract_publish_failure_message(exc)
+                for bnd, prep in verified_entries:
+                    if prep.get("monitor") is not None:
+                        await _record_data_job_publish_failure(
+                            prep["monitor"].monitor_id,
+                            error_message=err_msg,
+                            run_id=clean_run_id,
+                            claim_epoch=claim_epoch,
+                        )
+                    panel_results[bnd.slug] = {
+                        "slug": bnd.slug,
+                        "status": "failed",
+                        "error": err_msg,
+                    }
+                logger.warning(
+                    "Atomic batch promotion failed for %s (rolled back all %d panels): %s",
+                    job_key,
+                    len(verified_entries),
+                    exc,
+                    exc_info=True,
+                )
+
+        if first_exc is None:
+            for binding, prepared in non_verified_entries:
+                try:
+                    res = await _promote_prepared_binding(
+                        prepared,
+                        before_promote=None,
+                        claim_epoch=claim_epoch,
+                        check_superseded=check_superseded,
+                    )
+                    results.append(res)
+                    panel_results[binding.slug] = dict(res)
+                except Exception as exc:
+                    if first_exc is None:
+                        first_exc = exc
+                    panel_results[binding.slug] = {
+                        "slug": binding.slug,
+                        "status": "failed",
+                        "error": _extract_publish_failure_message(exc),
+                    }
+    else:
+        for binding in bindings:
+            prev_panel = (panel_progress or {}).get(binding.slug) or {}
+            if prev_panel.get("status") in ("published", "unchanged"):
+                panel_results[binding.slug] = dict(prev_panel)
+                results.append(
+                    {
+                        "monitor_id": prev_panel.get("monitor_id"),
+                        "slug": binding.slug,
+                        "published_seq": prev_panel.get("published_seq", 0),
+                        "cut": prev_panel.get("status") == "published",
+                        "deduplicated": True,
+                        "status": prev_panel["status"],
+                    }
+                )
+                continue
+            entry_path = _binding_entry_path(binding, is_multi=True)
+            existing = by_entry.get(entry_path) or by_slug.get(binding.slug)
+            try:
+                res = await _republish_single_binding(
+                    binding,
+                    clean_run_id=clean_run_id,
+                    data_root=data_root,
+                    existing=existing,
+                    is_multi=True,
+                    pre_staged_candidate_seq=prev_panel.get("candidate_seq"),
+                    before_promote=before_promote,
+                    on_staged=on_staged,
+                    claim_epoch=claim_epoch,
+                    check_superseded=check_superseded,
+                )
+                results.append(res)
+                panel_results[binding.slug] = dict(res)
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+                panel_results[binding.slug] = {
+                    "slug": binding.slug,
+                    "status": "failed",
+                    "error": _extract_publish_failure_message(exc),
+                }
+                logger.warning(
+                    "Republishing data-job monitor %s (%s) failed: %s",
+                    binding.slug,
+                    binding.job_key,
+                    exc,
+                    exc_info=True,
+                )
+
+    if first_exc is not None and raise_on_partial:
         raise first_exc
+
+    statuses = {str(p.get("status") or "") for p in panel_results.values()}
+    if "fenced_out" in statuses:
+        agg_status = "fenced_out"
+    elif "superseded" in statuses:
+        agg_status = "superseded"
+    elif "failed" in statuses:
+        agg_status = (
+            "partial_failed"
+            if statuses & {"published", "unchanged"}
+            else "failed"
+        )
+    elif "deferred" in statuses:
+        agg_status = "deferred"
+    elif any(r.get("cut") for r in results):
+        agg_status = "published"
+    else:
+        agg_status = "unchanged"
 
     return {
         "job_key": job_key,
         "monitors": results,
-        "cut": any(r["cut"] for r in results),
-        "deduplicated": all(r["deduplicated"] for r in results),
+        "panel_results": panel_results,
+        "cut": any(r.get("cut") for r in results),
+        "deduplicated": bool(results) and all(r.get("deduplicated") for r in results),
+        "fenced_out": agg_status == "fenced_out",
+        "superseded": agg_status == "superseded",
+        "deferred": agg_status == "deferred",
+        "status": agg_status,
+        "error": _extract_publish_failure_message(first_exc) if first_exc else None,
     }
 
 
@@ -1449,6 +2388,7 @@ async def maybe_publish_data_job_monitor(
     terminal_status: str,
     failure_reason: str | None = None,
     data_root: Path | None = None,
+    claim_epoch: int | None = None,
 ) -> None:
     """Scheduler post-run hook: republish on success, record failure without touching ``published_seq``."""
     if not has_capability(CapabilityId.DATA_JOBS):
@@ -1460,7 +2400,7 @@ async def maybe_publish_data_job_monitor(
         return
     if terminal_status == "succeeded":
         await republish_data_job_monitor(
-            job_key=job_key, run_id=run_id, data_root=data_root
+            job_key=job_key, run_id=run_id, data_root=data_root, claim_epoch=claim_epoch
         )
         return
     if len(bindings) == 1:
@@ -1483,9 +2423,11 @@ async def maybe_publish_data_job_monitor(
         data_root=data_root,
     )
     for existing in existing_rows:
-        await monitor_db.record_monitor_publish_failure(
+        await _record_data_job_publish_failure(
             existing.monitor_id,
             error_message=enriched_error,
+            run_id=run_id,
+            claim_epoch=claim_epoch,
         )
 
 
@@ -1536,18 +2478,15 @@ async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
     return monitor, verified.user_id
 
 
-async def _serve_monitor_version_file(
-    monitor: MonitorRecord,
+async def _serve_artifact_version_file(
+    artifact_id: str,
     seq: int,
     path: str,
     *,
     if_none_match: str | None = None,
     head: bool = False,
 ) -> ServedArtifactFile:
-    if not await monitor_db.is_monitor_version_published(monitor.monitor_id, seq):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    stored = await artifacts_db.get_version_file(monitor.artifact_id, seq, path)
+    stored = await artifacts_db.get_version_file(artifact_id, seq, path)
     if stored is None:
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -1581,6 +2520,26 @@ async def _serve_monitor_version_file(
         body = await asyncio.to_thread(with_bridge, body, bridge)
     headers.append(("content-length", str(len(body))))
     return ServedArtifactFile(body=body, headers=headers)
+
+
+async def _serve_monitor_version_file(
+    monitor: MonitorRecord,
+    seq: int,
+    path: str,
+    *,
+    if_none_match: str | None = None,
+    head: bool = False,
+) -> ServedArtifactFile:
+    if not await monitor_db.is_monitor_version_published(monitor.monitor_id, seq):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return await _serve_artifact_version_file(
+        monitor.artifact_id,
+        seq,
+        path,
+        if_none_match=if_none_match,
+        head=head,
+    )
 
 
 async def serve_monitor_file(
@@ -1666,9 +2625,90 @@ async def serve_public_monitor_file(
     rel: str | None = None,
     if_none_match: str | None = None,
     head: bool = False,
+    candidate_probe: str | None = None,
 ) -> ServedArtifactFile:
-    """Anonymously serve the current published version file when ``visibility == 'public'``."""
+    """Anonymously serve the verified public version file, or an HMAC-signed Stage 2 candidate probe."""
+    if not seq.isdigit() or int(seq) < 1:
+        raise HTTPException(status_code=404, detail="File not found")
+    seq_int = int(seq)
+
     monitor = await monitor_db.get_monitor_by_slug(slug)
+
+    if candidate_probe:
+        try:
+            verified_probe = await monitor_verify.verify_candidate_probe_token(
+                candidate_probe,
+                expected_artifact_id=(monitor.artifact_id if monitor is not None else None),
+                expected_seq=seq_int,
+            )
+        except monitor_verify.CandidateProbeError:
+            raise HTTPException(status_code=404, detail="File not found") from None
+
+        async def _candidate_entry_path_from_version() -> str:
+            cand_ver = await artifacts_db.get_version(
+                verified_probe.artifact_id, verified_probe.candidate_seq
+            )
+            return str(cand_ver.entry_path or "") if cand_ver is not None else ""
+
+        candidate_entry_path = (monitor.entry_path if monitor is not None else "") or ""
+        if not candidate_entry_path:
+            candidate_entry_path = await _candidate_entry_path_from_version()
+
+        target_path = path or candidate_entry_path
+        if not target_path or not _valid_path(target_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        try:
+            return await _serve_artifact_version_file(
+                verified_probe.artifact_id,
+                verified_probe.candidate_seq,
+                target_path,
+                if_none_match=if_none_match,
+                head=head,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            # Try entry_dir fallback with known entry_path first (avoids extra DB hit on normal updates).
+            entry_dir = posixpath.dirname(candidate_entry_path)
+            if path and entry_dir:
+                nested = posixpath.normpath(f"{entry_dir}/{path}")
+                if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+                    try:
+                        return await _serve_artifact_version_file(
+                            verified_probe.artifact_id,
+                            verified_probe.candidate_seq,
+                            nested,
+                            if_none_match=if_none_match,
+                            head=head,
+                        )
+                    except HTTPException as nested_exc:
+                        if nested_exc.status_code != 404:
+                            raise
+            # On legacy migration (e.g. index.html -> <slug>/index.html), the staged
+            # candidate version already carries the new entry_path before share_links.path moves.
+            version_entry_path = await _candidate_entry_path_from_version()
+            if version_entry_path and version_entry_path != candidate_entry_path:
+                if not path and _valid_path(version_entry_path):
+                    return await _serve_artifact_version_file(
+                        verified_probe.artifact_id,
+                        verified_probe.candidate_seq,
+                        version_entry_path,
+                        if_none_match=if_none_match,
+                        head=head,
+                    )
+                ver_entry_dir = posixpath.dirname(version_entry_path)
+                if path and ver_entry_dir:
+                    ver_nested = posixpath.normpath(f"{ver_entry_dir}/{path}")
+                    if ver_nested.startswith(f"{ver_entry_dir}/") and _valid_path(ver_nested):
+                        return await _serve_artifact_version_file(
+                            verified_probe.artifact_id,
+                            verified_probe.candidate_seq,
+                            ver_nested,
+                            if_none_match=if_none_match,
+                            head=head,
+                        )
+            raise
+
     if (
         monitor is None
         or monitor.visibility != "public"
@@ -1676,11 +2716,10 @@ async def serve_public_monitor_file(
         or await _get_superseded_shared_document(monitor) is not None
     ):
         raise HTTPException(status_code=404, detail="File not found")
+    effective_seq = monitor.effective_seq
     if (
-        not seq.isdigit()
-        or int(seq) < 1
-        or monitor.published_seq <= 0
-        or int(seq) != monitor.published_seq
+        effective_seq <= 0
+        or seq_int != effective_seq
     ):
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -1690,7 +2729,7 @@ async def serve_public_monitor_file(
             raise HTTPException(status_code=404, detail="File not found")
         return await _serve_monitor_version_file(
             monitor,
-            int(seq),
+            seq_int,
             resolved,
             if_none_match=if_none_match,
             head=head,
@@ -1709,7 +2748,7 @@ async def serve_public_monitor_file(
             try:
                 return await _serve_monitor_version_file(
                     monitor,
-                    int(seq),
+                    seq_int,
                     nested,
                     if_none_match=if_none_match,
                     head=head,
@@ -1731,20 +2770,31 @@ async def _read_monitor_data_response(
     data_key: str,
     *,
     if_none_match: str | None = None,
+    include_error_detail: bool = False,
 ) -> tuple[int, dict[str, Any] | None, dict[str, str]]:
     entry = await monitor_db.get_monitor_data(monitor.monitor_id, data_key)
     if entry is None:
         raise HTTPException(status_code=404, detail="Monitor data key not found")
 
-    response_body = {
+    response_body: dict[str, Any] = {
         "monitor_id": monitor.monitor_id,
         "slug": monitor.slug,
         "key": entry.data_key,
-        "as_of": entry.as_of.isoformat(),
+        "as_of": entry.as_of.isoformat() if entry.as_of is not None else None,
         "sha256": entry.sha256,
         "updated_at": entry.updated_at.isoformat(),
         "data": entry.payload,
+        "attempt_seq": entry.attempt_seq,
+        "is_stale": entry.is_stale,
+        "last_attempt_at": (
+            entry.last_attempt_at.isoformat()
+            if entry.last_attempt_at is not None
+            else None
+        ),
+        "has_fetch_error": bool(entry.is_stale or entry.last_error),
     }
+    if include_error_detail:
+        response_body["last_error"] = entry.last_error
     etag = hashlib.sha256(
         json.dumps(
             response_body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
@@ -1772,7 +2822,7 @@ async def read_monitor_data_by_grant(
 
     monitor, _viewer_id = await _authorize_grant(grant_token)
     return await _read_monitor_data_response(
-        monitor, data_key, if_none_match=if_none_match
+        monitor, data_key, if_none_match=if_none_match, include_error_detail=True
     )
 
 
@@ -1794,16 +2844,20 @@ async def read_public_monitor_data(
     ):
         raise HTTPException(status_code=404, detail="Monitor not found")
     return await _read_monitor_data_response(
-        monitor, data_key, if_none_match=if_none_match
+        monitor, data_key, if_none_match=if_none_match, include_error_detail=False
     )
 
 
 async def write_monitor_data_internal(
     slug: str,
     data_key: str,
-    payload: Any,
+    payload: Any = None,
     *,
     as_of: datetime | None = None,
+    attempt_seq: int | None = None,
+    is_stale: bool = False,
+    error: str | None = None,
+    last_attempt_at: datetime | None = None,
 ) -> dict[str, Any]:
     if not has_capability(CapabilityId.DATA_JOBS):
         raise HTTPException(status_code=404, detail="数据任务监控未启用")
@@ -1828,12 +2882,24 @@ async def write_monitor_data_internal(
         data_key,
         payload,
         as_of=as_of,
+        attempt_seq=attempt_seq,
+        is_stale=is_stale,
+        error=error,
+        last_attempt_at=last_attempt_at,
     )
     return {
         "monitor_id": entry.monitor_id,
         "slug": monitor.slug,
         "key": entry.data_key,
-        "as_of": entry.as_of.isoformat(),
+        "as_of": entry.as_of.isoformat() if entry.as_of is not None else None,
         "sha256": entry.sha256,
         "updated_at": entry.updated_at.isoformat(),
+        "attempt_seq": entry.attempt_seq,
+        "is_stale": entry.is_stale,
+        "last_attempt_at": (
+            entry.last_attempt_at.isoformat()
+            if entry.last_attempt_at is not None
+            else None
+        ),
+        "last_error": entry.last_error,
     }

@@ -1,0 +1,10 @@
+# Everflow deployment defaults for data-task runtime wrappers and host bridge.
+# Loaded ONLY when src.dalton.profile resolves to "everflow"; any environment
+# variable or workspace config/data_tasks.env setting overrides these defaults.
+# Stripped from Standalone Core releases by scripts/standalone/package_release.sh
+# and rejected by scripts/standalone/verify_release_tarball.py.
+DALTON_DATA_TASK_DISCORD_DEV_CHANNEL: "channel:1481256083589697566"
+DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL: "channel:1480405100672581875"
+DALTON_DATA_TASK_DISCORD_DM_TARGET: "user:1134818575211839498"
+DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET: "user:ou_75b483fb76c31370c715e3a3df1e0a61"
+DALTON_DATA_TASK_GS_PB_PYTHON: "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python"

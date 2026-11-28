@@ -1328,15 +1328,69 @@ urllib.request.OpenerDirector.open = _fast_open
     assert json.loads(ok_gp.stdout)["data"][0]["transcript_id"] == "gp-1"
 
 
+def _snapshot_working_tree_repo(tmp_path: Path) -> Path:
+    """Return REPO_ROOT if clean, else a temp git repo snapshotting HEAD + working-tree changes."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if not status.strip():
+        return REPO_ROOT
+
+    snap = tmp_path / "working-tree-repo"
+    snap.mkdir()
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", "HEAD"],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+    )
+    try:
+        subprocess.run(["tar", "-xf", "-", "-C", str(snap)], stdin=archive.stdout, check=True)
+    finally:
+        if archive.stdout is not None:
+            archive.stdout.close()
+        assert archive.wait() == 0
+
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        rel = line[3:].strip().strip('"')
+        if " -> " in rel:
+            old_rel, rel = rel.split(" -> ", 1)
+            old_dst = snap / old_rel
+            if old_dst.exists() or old_dst.is_symlink():
+                old_dst.unlink()
+        src = REPO_ROOT / rel
+        dst = snap / rel
+        if "D" in xy and not src.exists():
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    subprocess.run(["git", "init", "-q"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(snap), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(snap), check=True)
+    subprocess.run(["git", "add", "-A", "-f"], cwd=str(snap), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "working-tree-snapshot"], cwd=str(snap), check=True)
+    return snap
+
+
 def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> None:
-    """Run real `scripts/standalone/package_release.sh` and assert all 3 gates on the unmodified git archive export."""
+    """Run real `scripts/standalone/package_release.sh` and assert all gates on the unmodified git archive export."""
+    source_repo = _snapshot_working_tree_repo(tmp_path)
     export_dir = tmp_path / "core_export"
     pkg_res = subprocess.run(
         [
             "bash",
             str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
             "--repo",
-            str(REPO_ROOT),
+            str(source_repo),
             "--ref",
             "HEAD",
             "--output",
@@ -1361,7 +1415,7 @@ def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> Non
             sys.executable,
             str(SCRIPTS_DALTON_DIR / "ops" / "check_core_release_package.py"),
             "--repo-root",
-            str(REPO_ROOT),
+            str(source_repo),
             "--export-dir",
             str(export_dir),
             "--json",
@@ -1377,7 +1431,7 @@ def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> Non
     assert report["forbidden_paths_present"] == []
     assert report["export_migrated_hits"] == []
     assert report["whole_export_commercial_hits"] == []
-    assert report["whole_export_commercial_hits"] == []
+    assert report["whole_export_forbidden_regex_hits"] == []
 
 
 # ===========================================================================

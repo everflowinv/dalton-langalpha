@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 from unittest.mock import create_autospec
 from uuid import uuid4
 
@@ -312,7 +313,9 @@ async def test_host_run_rejects_t34_drift_and_mirror_before_launch(
         root = tmp_path / f"reject-{index}"
         status, body = await _call(root, _host_body(f"reject-{index}", **extra))
         assert status == 400
-        assert body == {"ok": False, "rejected": True, "error": "host_command_rejected"}
+        assert body["ok"] is False
+        assert body["rejected"] is True
+        assert body["error"] == "host_command_rejected"
         assert launched == []
         assert not (root / ".dalton-runs").exists()
 
@@ -456,6 +459,31 @@ def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path
     assert "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py" in dry.stdout
     assert not dst.exists()
 
+    preflight_cfg = dst / "config" / "data_tasks.env"
+    preflight_cfg.parent.mkdir(parents=True, exist_ok=True)
+    preflight_cfg.write_text(
+        "\n".join(
+            [
+                "DALTON_DATA_TASK_BBG_HOST=bbg@test.example",
+                "DALTON_DATA_TASK_BBG_CSV_REMOTE=C:/test/bbg.csv",
+                "DALTON_DATA_TASK_BBG_XLSX_REMOTE=C:/test/bbg.xlsx",
+                "DALTON_DATA_TASK_BBG_REFRESH_CMD=cmd /c test.bat",
+                "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID=oc_placeholder_tracking",
+                "DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID=oc_placeholder_semi",
+                "DALTON_DATA_TASK_FEISHU_ASIA_TARGET=chat:oc_placeholder_asia",
+                "DALTON_DATA_TASK_FEISHU_MEGACAP_TARGET=oc_placeholder_megacap",
+                "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID=oc_placeholder_sentiment",
+                "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET=user:ou_placeholder_ashare",
+                "DALTON_DATA_TASK_DISCORD_DM_TARGET=user:100000000000000001",
+                "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL=channel:100000000000000002",
+                "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL=channel:100000000000000003",
+                "DALTON_SEC_USER_AGENT=TestBot test@example.com",
+                "DALTON_DATA_TASK_GS_PB_PYTHON=/opt/test/gs-pb/bin/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     apply = subprocess.run(
         ["bash", str(script_path), "--apply", "--target", str(dst)],
         capture_output=True,
@@ -467,8 +495,15 @@ def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path
     assert (dst / "skills/kweb-dashboard/SKILL.md").is_file()
 
 
-def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> None:
+def test_none_payload_source_ignores_stdout_trigger_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``none`` does not turn stdout into an outbox. Other sources still do."""
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DEV_CHANNEL", "channel:100000000000000002")
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL", "channel:100000000000000003")
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DM_TARGET", "user:100000000000000001")
+    monkeypatch.setenv("DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET", "user:ou_placeholder_ashare")
     none_jobs = {
         "bbg-data-pull-asia",  # T1
         "cn-leverage-daily",  # T5
@@ -781,7 +816,9 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
     last_ok_file = tmp_path / "state" / "kweb-dashboard" / "etf_last_success.json"
     assert json.loads(last_ok_file.read_text(encoding="utf-8"))["as_of"] == "2026-11-16"
 
-    # 2) Partial ETF fetch failure: page builds & deploy succeeds, ETF section top shows stale banner.
+    # 2) Partial ETF fetch failure: page builds with stale banner on ETF tab,
+    #    AND Batch 2 §1 requires deploy(--no-upload) to return non-zero + ok=False
+    #    so the data-job scheduler does not silently republish a degraded dashboard as succeeded.
     fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
         lambda _cfg, _ws, _rsi: {},
         return_value={
@@ -790,10 +827,11 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
         },
     )
     rc_partial = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
-    assert rc_partial == 0
+    assert rc_partial == 1
     partial_payload = json.loads(capsys.readouterr().out)
-    assert partial_payload["ok"] is True
+    assert partial_payload["ok"] is False
     assert partial_payload["upload_skipped"] is True
+    assert "SOXX 没取到行情" in (partial_payload.get("error") or "")
     assert not outbox_file.exists()
     html_partial = out_html.read_text(encoding="utf-8")
     etf_block = html_partial.split('<main id="tab-etf"', 1)[1]
@@ -801,16 +839,16 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
     assert "ETF 数据未更新（上次成功：2026-11-16，原因：SOXX 没取到行情；周期/防御缺失）" in etf_block
     assert etf_block.index("stale-banner") < etf_block.index('class="stats"')
 
-    # 3) Full ETF failure (exception) without prior state: falls back to "未知", still succeeds.
+    # 3) Full ETF failure (exception) without prior state: falls back to "未知", reports failure.
     last_ok_file.unlink()
     fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
         lambda _cfg, _ws, _rsi: {},
         side_effect=RuntimeError("yfinance timeout"),
     )
     rc_exc = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
-    assert rc_exc == 0
+    assert rc_exc == 1
     exc_payload = json.loads(capsys.readouterr().out)
-    assert exc_payload["ok"] is True
+    assert exc_payload["ok"] is False
     assert not outbox_file.exists()
     html_exc = out_html.read_text(encoding="utf-8")
     etf_exc_block = html_exc.split('<main id="tab-etf"', 1)[1]

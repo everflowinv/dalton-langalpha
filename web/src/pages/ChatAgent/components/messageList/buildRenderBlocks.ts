@@ -180,15 +180,27 @@ export function groupSegments(segments: ContentSegmentRecord[]): ContentSegmentR
     const closeRun = () => {
       if (!run.length) return;
       const first = run[0];
+      // DALTON-HOOK(deliverable-text): keep phase, messageId, continuation link, and per-segment capturedImages intact
+      const continuedFrom = run.find((s) => s.continuedFromMessageId)?.continuedFromMessageId;
+      const capturedImages = run.find((s) => s.capturedImages)?.capturedImages;
       groups.push({
         type: 'text',
         content: run.length === 1 ? first.content : run.map((s) => s.content || '').join(''),
         order: first.order,
+        ...(first.phase ? { phase: first.phase } : {}),
+        ...(first.messageId ? { messageId: first.messageId } : {}),
+        ...(continuedFrom ? { continuedFromMessageId: continuedFrom } : {}),
+        ...(capturedImages ? { capturedImages } : {}),
       });
       run = [];
     };
     for (const segment of inChunkOrder(segments)) {
       if (segment.type === 'text') {
+        // DALTON-HOOK(deliverable-text): never merge across different phases or distinct messageIds
+        const prev = run[0];
+        if (prev && (prev.phase !== segment.phase || prev.messageId !== segment.messageId)) {
+          closeRun();
+        }
         run.push(segment);
       } else {
         closeRun();

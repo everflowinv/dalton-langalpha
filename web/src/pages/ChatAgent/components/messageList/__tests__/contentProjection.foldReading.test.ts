@@ -72,10 +72,10 @@ describe('reading a turn\'s answer texts', () => {
     const texts = projection.blocks.filter((block) => block.type === 'text');
 
     expect(shown().map((block) => block.key)).toEqual(['text-2', 'text-4']);
-    // The reply's closing text stands whatever it says, so only the others score.
-    expect(scored).toHaveBeenCalledTimes(texts.length - 1);
+    // DALTON-HOOK(deliverable-text): pre-tool text before a business tool boundary is excluded without scoring; only post-tool non-closing texts score.
+    expect(scored).toHaveBeenCalledTimes(1);
     shown();
     holdsAnswerText(projection, true);
-    expect(scored).toHaveBeenCalledTimes(texts.length - 1);
+    expect(scored).toHaveBeenCalledTimes(1);
   });
 });

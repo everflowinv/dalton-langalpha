@@ -54,6 +54,10 @@ interface SSEEvent {
   tool_call_chunks?: Array<{ id?: string; name?: string; args?: string }>;
   finish_reason?: string;
   phase?: 'commentary' | 'final_answer';
+  // DALTON-HOOK(deliverable-text): continuation predecessor id and alternate stream chunk ids for discard
+  continued_from_message_id?: string;
+  stream_id?: string;
+  ids?: string[];
   artifact_type?: string;
   artifact_id?: string;
   artifact?: Record<string, unknown>;
@@ -105,6 +109,8 @@ interface SSEEvent {
   /** Where each sandbox image the run's reply named was captured, by the path
    *  as written, on a `run_end` frame. */
   images?: Record<string, string>;
+  // DALTON-HOOK(deliverable-text): per-message captured image map on `run_end`
+  images_by_message?: Record<string, Record<string, string>>;
   [key: string]: unknown;
 }
 

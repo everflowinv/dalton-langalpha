@@ -143,6 +143,23 @@ def _coverage_units_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
 
 
+# DALTON-HOOK(deliverable-text): keep upstream unit tests on upstream semantics while Dalton unit tests exercise production defaults
+@pytest.fixture(autouse=True)
+def _dalton_deliverable_switches_off_for_upstream_unit_tests(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default Dalton strict deliverable-text and near-empty retry switches off
+    for upstream unit tests outside ``tests/unit/dalton/`` so upstream contracts
+    stay unchanged; Dalton tests continue running with production defaults.
+    """
+    parts = Path(str(request.path)).parts
+    if "dalton" in parts:
+        return
+    monkeypatch.setenv("DALTON_STRICT_DELIVERABLE_TEXT", "0")
+    monkeypatch.setenv("DALTON_NEAR_EMPTY_RETRY_ENABLED", "0")
+
+
 @pytest.fixture(scope="session")
 def shipped_skill_md():
     """Locate a shipped skill's SKILL.md on disk, by name.

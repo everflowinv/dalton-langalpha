@@ -159,21 +159,23 @@ def history_events_to_sse(
                 data["finish_reason"] = event.data["finish_reason"]
             if event.data.get("phase"):
                 data["phase"] = event.data["phase"]
+            # DALTON-HOOK(deliverable-text): propagate output_cap continuation link on replay
+            if event.data.get("continued_from_message_id"):
+                data["continued_from_message_id"] = event.data["continued_from_message_id"]
             items.append(_sse("message_chunk", data))
         elif event.kind == "tool-call":
-            items.append(
-                _sse(
-                    "tool_calls",
-                    {
-                        "thread_id": thread_id,
-                        "agent": event.agent,
-                        "id": event.message_id,
-                        "role": "assistant",
-                        "tool_calls": event.data["tool_calls"],
-                        "finish_reason": "tool_calls",
-                    },
-                )
-            )
+            tc_sse_data: dict[str, Any] = {
+                "thread_id": thread_id,
+                "agent": event.agent,
+                "id": event.message_id,
+                "role": "assistant",
+                "tool_calls": event.data["tool_calls"],
+                "finish_reason": "tool_calls",
+            }
+            # DALTON-HOOK(deliverable-text): propagate plan close-out marker on replayed tool_calls
+            if event.data.get("close_out"):
+                tc_sse_data["close_out"] = True
+            items.append(_sse("tool_calls", tc_sse_data))
         elif event.kind == "tool-result":
             data = {
                 "thread_id": thread_id,
@@ -312,6 +314,10 @@ def _project_ai_message(
     tool_call_index: dict[str, dict[str, Any]],
     agent: str,
 ) -> list[HistoryEvent]:
+    # DALTON-HOOK(deliverable-text): skip superseded non-continuation retry attempts on replay
+    msg_kwargs = message.additional_kwargs or {}
+    if msg_kwargs.get("dalton_retried_attempt"):
+        return []
     events: list[HistoryEvent] = []
     message_id = message.id or "unknown"
     # A compaction before this call: live, its signal fires before the call
@@ -321,15 +327,17 @@ def _project_ai_message(
     from src.dalton.history_phase import build_ai_phase_events
 
     tool_calls = _filter_tool_calls(message.tool_calls or [])
-    events.extend(build_ai_phase_events(message.content, agent=agent, message_id=message_id, is_close_out=is_close_out_reply(message), has_tool_calls=bool(tool_calls), event_cls=HistoryEvent))
+    close_out = is_close_out_reply(message)
+    # DALTON-HOOK(deliverable-text): pass continued_from_message_id onto replayed text chunks
+    events.extend(build_ai_phase_events(message.content, agent=agent, message_id=message_id, is_close_out=close_out, has_tool_calls=bool(tool_calls), event_cls=HistoryEvent, continued_from_message_id=msg_kwargs.get("continued_from_message_id")))
 
     if tool_calls:
         for tool_call in tool_calls:
             if tool_call.get("id"):
                 tool_call_index[tool_call["id"]] = tool_call
-        events.append(
-            HistoryEvent("tool-call", agent, message_id, {"tool_calls": tool_calls})
-        )
+        # DALTON-HOOK(deliverable-text): tag close-out UpdatePlan tool calls so replay preserves prior final answer
+        tc_data: dict[str, Any] = {"tool_calls": tool_calls, **({"close_out": True} if close_out else {})}
+        events.append(HistoryEvent("tool-call", agent, message_id, tc_data))
 
     # The live token_usage emitter (compaction middleware) builds its event
     # from the same fields, so the two cannot part.

@@ -57,7 +57,7 @@ def upgrade() -> None:
             timeout_seconds             INTEGER,
             no_output_timeout_seconds   INTEGER,
             command_argv                JSONB NOT NULL,
-            workdir                     TEXT NOT NULL DEFAULT '/Users/everflow/.openclaw/workspace',
+            workdir                     TEXT NOT NULL DEFAULT '/workspace',
             required_secrets            JSONB NOT NULL DEFAULT '[]'::jsonb,
             cos_mode                    TEXT NOT NULL DEFAULT 'skip'
                 CHECK (cos_mode IN ('skip', 'prod')),

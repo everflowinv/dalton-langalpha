@@ -930,6 +930,49 @@ class InMemoryWeixinMultiAccountStore:
             return [{"has_unknown_text": has_unk}]
         if "SELECT COALESCE(MAX(sent_to_current_count), 0) AS cnt" in norm:
             return [{"cnt": 0}]
+        if "AS has_delivered_current_agent_send" in norm and "FROM dalton_channel_deliveries" in norm:
+            rid_f = str(params[0]) if params else ""
+            matching = [
+                d
+                for d in self.deliveries.values()
+                if str(d.get("run_id") or "") == rid_f
+                and bool(d.get("is_current", True))
+                and d.get("kind") == "agent_send"
+            ]
+            has_delivered = any(
+                d.get("status") in ("sent", "partial")
+                and (bool(d.get("has_non_empty_text")) or bool(d.get("files_status")))
+                for d in matching
+            )
+            has_files_only = any(
+                d.get("status") in ("sent", "partial")
+                and not bool(d.get("has_non_empty_text"))
+                and bool(d.get("files_status"))
+                for d in matching
+            )
+            has_failed = any(d.get("status") == "failed" for d in matching)
+            unresolved_sends = []
+            for d in matching:
+                fr = d.get("first_response_json") if isinstance(d.get("first_response_json"), dict) else {}
+                if d.get("status") in ("sent", "partial") and bool(fr.get("unresolved_sandbox_images")):
+                    unresolved_sends.append(
+                        {
+                            "delivery_key": d.get("delivery_key"),
+                            "delivered_text": fr.get("delivered_text"),
+                            "unresolved_image_paths": fr.get("unresolved_sandbox_image_paths") or [],
+                            "source_message_id": fr.get("source_message_id"),
+                            "captured_images": fr.get("captured_images") or {},
+                        }
+                    )
+            return [
+                {
+                    "has_delivered_current_agent_send": has_delivered,
+                    "has_delivered_current_files_only": has_files_only,
+                    "has_failed_current_agent_send": has_failed,
+                    "has_unresolved_current_agent_send_images": bool(unresolved_sends),
+                    "unresolved_current_agent_sends": unresolved_sends,
+                }
+            ]
         if "FROM dalton_channel_deliveries" in norm and "SELECT" in norm:
             if "WHERE delivery_key = %s" in norm:
                 d = self.deliveries.get(str(params[0]))

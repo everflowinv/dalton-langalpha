@@ -201,8 +201,12 @@ class RedisCacheClient:
             # handing them out, so poisoned connections (dropped by the server or
             # network) get detected and discarded instead of lingering in the pool.
             pool_timeout = get_redis_pool_timeout()
-            self.pool = BlockingConnectionPool.from_url(
+            # DALTON-HOOK(redis-write-diag): instrument cache pool & connection seams
+            from src.dalton.observability.redis_diagnostics import create_cache_connection_pool
+
+            self.pool = create_cache_connection_pool(
                 self.url,
+                fallback_pool_cls=BlockingConnectionPool,
                 max_connections=self.max_connections,
                 timeout=pool_timeout,
                 socket_timeout=self.socket_timeout,
@@ -240,6 +244,10 @@ class RedisCacheClient:
 
     def _log_error(self, context: str, err: Exception) -> None:
         """Log a Redis error, with pool stats if the error is pool exhaustion."""
+        # DALTON-HOOK(redis-write-diag): record cache error/timeout into worker diagnostics
+        from src.dalton.observability.redis_diagnostics import record_redis_error
+
+        record_redis_error(context, err, pool=getattr(self, "pool", None))
         if is_pool_exhaustion(err):
             logger.error(
                 f"{context} — {type(err).__name__}: {err} "
@@ -338,13 +346,15 @@ class RedisCacheClient:
             return False
 
         try:
-            # Serialize to JSON with datetime support
-            serialized = json.dumps(value, ensure_ascii=False, cls=DateTimeEncoder)
+            # DALTON-HOOK(redis-write-diag): tag >=256 KiB JSON serialization and time set wire I/O
+            from src.dalton.observability.redis_diagnostics import dumps_with_heavy_task, estimate_serialized_bytes, redis_op_span
 
-            if ttl == PERSIST:
-                await self.client.set(key, serialized)
-            else:
-                await self.client.setex(key, ttl if ttl and ttl > 0 else SAFETY_TTL, serialized)
+            serialized = dumps_with_heavy_task(value, ensure_ascii=False, cls=DateTimeEncoder)
+            with redis_op_span("set", key, payload_bytes=estimate_serialized_bytes(serialized), pool=getattr(self, "pool", None)):
+                if ttl == PERSIST:
+                    await self.client.set(key, serialized)
+                else:
+                    await self.client.setex(key, ttl if ttl and ttl > 0 else SAFETY_TTL, serialized)
 
             self.stats["sets"] += 1
             logger.debug(f"Cache SET: {key} (TTL: {ttl}s)")
@@ -747,19 +757,22 @@ class RedisCacheClient:
         reset_epoch = not bare and event_id == 1
         heal_retention = not bare and event_id % _HEAL_INTERVAL == 0
 
+        # DALTON-HOOK(redis-write-diag): split acquire_ms vs pure wire_ms for xadd and tx pipeline
+        from src.dalton.observability.redis_diagnostics import redis_event_buffer_span
         try:
-            if not (reset_epoch or heal_retention or ttl is not None):
-                await self.client.xadd(stream_key, fields, **append)
-            else:
-                async with self.client.pipeline(transaction=True) as pipe:
-                    if reset_epoch:
-                        pipe.delete(stream_key)
-                    pipe.xadd(stream_key, fields, **append)
-                    if ttl is not None:
-                        pipe.expire(stream_key, ttl)
-                    elif heal_retention:
-                        pipe.persist(stream_key)
-                    await pipe.execute()
+            with redis_event_buffer_span(stream_key, payload, fields.get(b"record"), reset_epoch, heal_retention, ttl, getattr(self, "pool", None)):
+                if not (reset_epoch or heal_retention or ttl is not None):
+                    await self.client.xadd(stream_key, fields, **append)
+                else:
+                    async with self.client.pipeline(transaction=True) as pipe:
+                        if reset_epoch:
+                            pipe.delete(stream_key)
+                        pipe.xadd(stream_key, fields, **append)
+                        if ttl is not None:
+                            pipe.expire(stream_key, ttl)
+                        elif heal_retention:
+                            pipe.persist(stream_key)
+                        await pipe.execute()
         except Exception:
             self.stats["errors"] += 1
             raise

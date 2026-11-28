@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import shutil
+import socket
 import time
 from typing import Any
 from uuid import uuid4
@@ -39,7 +41,10 @@ from src.dalton.data_jobs.evaluators import (
     TimeoutKind,
     evaluate_task_run,
 )
-from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
+from src.dalton.data_jobs.freeze import (
+    freeze_monitor_publish_artifacts,
+    freeze_task_run_artifacts,
+)
 from src.dalton.data_jobs.host_runner import (
     DataTaskHostBridgeClient,
     HostBridgeError,
@@ -60,6 +65,7 @@ from src.dalton.data_jobs.notification_payloads import (
     prepare_t27_run_outbox,
 )
 from src.dalton.data_jobs.runner_wrapper import (
+    DEFAULT_WORKSPACE_DIR,
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
     atomic_write_json,
@@ -1072,7 +1078,7 @@ async def claim_next_queued_run(
             generation=int(claimed_generation),
             runner=runner,
             command_argv=[str(a) for a in raw_argv],
-            workdir=str(cand.get("workdir") or "/Users/everflow/.openclaw/workspace"),
+            workdir=str(cand.get("workdir") or DEFAULT_WORKSPACE_DIR),
             timeout_seconds=cand.get("timeout_seconds"),
             no_output_timeout_seconds=cand.get("no_output_timeout_seconds"),
             required_secrets=[str(s) for s in raw_secrets],
@@ -1595,6 +1601,76 @@ async def finalize_task_run(
         json.dumps(frozen_manifest, ensure_ascii=False) if frozen_manifest is not None else None
     )
 
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.monitors.data_job_registry import get_registered_monitor_bindings
+    from src.dalton.settings import is_artifact_publishing_enabled
+
+    monitor_bindings = (
+        get_registered_monitor_bindings(claimed.job_key)
+        if has_capability(CapabilityId.DATA_JOBS)
+        else ()
+    )
+    mp_status = "not_applicable"
+    mp_schedule_now = False
+    mp_detail: dict[str, Any] = {}
+    if monitor_bindings:
+        if not is_artifact_publishing_enabled():
+            mp_status = "disabled"
+            mp_detail = {
+                "reason": "artifact_publishing_disabled",
+                "last_error": "DALTON_ARTIFACT_PUBLISHING_ENABLED 未开启，看板发布已禁用",
+                "panels": {b.slug: {"status": "disabled"} for b in monitor_bindings},
+            }
+        elif terminal_status == "succeeded":
+            frozen_monitor_dir: Path | None = None
+            freeze_err: str | None = None
+            try:
+                frozen_monitor_dir = freeze_monitor_publish_artifacts(
+                    data_root=paths.backend_data_root,
+                    job_key=claimed.job_key,
+                    run_id=str(claimed.run_id),
+                )
+            except Exception as freeze_mon_exc:
+                freeze_err = str(freeze_mon_exc)
+                logger.warning(
+                    "Failed to freeze monitor artifacts for data task run %s (%s): %s",
+                    claimed.run_id,
+                    claimed.job_key,
+                    freeze_mon_exc,
+                )
+            if (
+                frozen_monitor_dir is not None
+                and frozen_monitor_dir.is_dir()
+                and not frozen_monitor_dir.is_symlink()
+            ):
+                mp_status = "pending"
+                mp_schedule_now = True
+                mp_detail = {
+                    "frozen_dir": str(frozen_monitor_dir),
+                    "panels": {b.slug: {"status": "pending"} for b in monitor_bindings},
+                }
+            else:
+                reason = f"冻结看板产物失败: {freeze_err or '未生成有效冻结目录'}"
+                mp_status = "failed"
+                mp_schedule_now = False
+                mp_detail = {
+                    "frozen_dir": None,
+                    "last_error": reason[:1000],
+                    "panels": {
+                        b.slug: {"status": "failed", "error": reason[:1000]}
+                        for b in monitor_bindings
+                    },
+                }
+        else:
+            mp_status = "pending"
+            mp_schedule_now = True
+            mp_detail = {
+                "terminal_status": terminal_status,
+                "failure_reason": evaluation.failure_reason,
+                "panels": {b.slug: {"status": "pending"} for b in monitor_bindings},
+            }
+    serialized_mp_detail = json.dumps(mp_detail, ensure_ascii=False)
+
     consecutive_failures: int | None = None
     try:
         async with conn.transaction():
@@ -1611,6 +1687,9 @@ async def finalize_task_run(
                         notify_preview  = %(notify_preview)s::jsonb,
                         notify_status   = %(notify_status)s,
                         frozen_manifest = %(frozen_manifest)s::jsonb,
+                        monitor_publish_status        = %(monitor_publish_status)s,
+                        monitor_publish_next_retry_at = CASE WHEN %(monitor_publish_schedule_now)s THEN NOW() ELSE NULL END,
+                        monitor_publish_detail        = %(monitor_publish_detail)s::jsonb,
                         completed_at    = NOW(),
                         updated_at      = NOW()
                     WHERE run_id = %(run_id)s::uuid
@@ -1626,6 +1705,9 @@ async def finalize_task_run(
                         "notify_preview": serialized_outbox,
                         "notify_status": notify_status,
                         "frozen_manifest": serialized_manifest,
+                        "monitor_publish_status": mp_status,
+                        "monitor_publish_schedule_now": mp_schedule_now,
+                        "monitor_publish_detail": serialized_mp_detail,
                         "run_id": claimed.run_id,
                     },
                 )
@@ -1677,23 +1759,45 @@ async def finalize_task_run(
             freeze_exc,
         )
 
-    # DALTON-HOOK(monitors): publish or record failure for any monitor bound to this job_key.
-    try:
-        from src.dalton.monitors.service import maybe_publish_data_job_monitor
+    # DALTON-HOOK(monitors): claim & execute monitor publish via shared PostgreSQL lease queue.
+    if mp_status == "pending":
+        try:
+            await process_monitor_publish_for_run(
+                conn,
+                run_id=str(claimed.run_id),
+                path_map=paths,
+            )
+        except Exception as monitor_exc:
+            logger.warning(
+                "First-pass monitor publish for data task run %s (%s) deferred to PG replay: %s",
+                claimed.run_id,
+                claimed.job_key,
+                monitor_exc,
+            )
+    elif mp_status in ("disabled", "failed"):
+        err_detail = str(mp_detail.get("last_error") or mp_detail.get("reason") or mp_status)
+        if mp_status == "failed":
+            try:
+                from src.dalton.monitors import service as monitor_service
 
-        await maybe_publish_data_job_monitor(
+                await monitor_service.maybe_publish_data_job_monitor(
+                    job_key=claimed.job_key,
+                    run_id=str(claimed.run_id),
+                    terminal_status="failed",
+                    failure_reason=err_detail,
+                    data_root=paths.backend_data_root,
+                )
+            except Exception as rec_exc:
+                logger.debug(
+                    "Recording freeze failure on existing monitors for %s failed: %s",
+                    claimed.job_key,
+                    rec_exc,
+                )
+        await _emit_monitor_publish_ops_alert(
             job_key=claimed.job_key,
             run_id=str(claimed.run_id),
-            terminal_status=terminal_status,
-            failure_reason=evaluation.failure_reason,
-            data_root=paths.backend_data_root,
-        )
-    except Exception as monitor_exc:
-        logger.warning(
-            "Failed to update monitor for data task run %s (%s): %s",
-            claimed.run_id,
-            claimed.job_key,
-            monitor_exc,
+            status=mp_status,
+            detail_text=err_detail,
         )
 
     if container_id and docker_client is not None:
@@ -1783,8 +1887,637 @@ async def _stop_and_confirm_container(
 
 
 TAKEOVER_RETRY_TRIGGERED_BY = "system:takeover_retry"
-_PENDING_MONITOR_PUBLISHES_FILE = "pending_monitor_publishes.json"
 _PENDING_TAKEOVER_RETRIES_FILE = "pending_takeover_retries.json"
+
+MAX_MONITOR_PUBLISH_ATTEMPTS = 3
+MONITOR_PUBLISH_LEASE_SECONDS = 120
+MONITOR_PUBLISH_RETRY_BACKOFFS_S: tuple[int, ...] = (60, 300)
+
+
+@dataclass(frozen=True)
+class ClaimedMonitorPublishRun:
+    """One ``dalton_data_task_runs`` row leased for verified monitor publishing."""
+
+    run_id: str
+    job_key: str
+    status: str
+    failure_reason: str | None
+    scheduled_slot_utc: datetime | None
+    completed_at: datetime | None
+    attempts: int
+    claim_epoch: int
+    detail: dict[str, Any]
+
+
+def _default_monitor_publish_worker_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _parse_jsonb_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+async def _emit_monitor_publish_ops_alert(
+    *,
+    job_key: str,
+    run_id: str,
+    status: str,
+    detail_text: str,
+) -> bool:
+    """Send a best-effort loopback ops alert to channel gateway on terminal monitor publish failure."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.settings import get_dalton_channel_gateway_url, get_internal_service_token
+
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return False
+    base_url = get_dalton_channel_gateway_url()
+    if not base_url:
+        return False
+    token = get_internal_service_token()
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Service-Token"] = token
+    summary = f"{job_key} ({status}, run={run_id[:8]}): {detail_text}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{base_url.rstrip('/')}/internal/ops-alerts",
+                json={"code": "monitor_publish_failed", "detail": summary[:600]},
+                headers=headers,
+            )
+            return resp.status_code < 400
+    except Exception as exc:
+        logger.warning(
+            "Failed sending monitor_publish_failed ops alert for %s (%s): %s",
+            job_key,
+            run_id,
+            exc,
+        )
+        return False
+
+
+async def _is_run_superseded_in_cur(
+    cur: Any,
+    *,
+    run_id: str,
+    job_key: str,
+    scheduled_slot_utc: datetime | None,
+    completed_at: datetime | None,
+) -> bool:
+    await cur.execute(
+        """
+        SELECT 1
+          FROM dalton_data_task_runs
+         WHERE job_key = %(job_key)s
+           AND run_id <> %(run_id)s::uuid
+           AND status = 'succeeded'
+           AND monitor_publish_status IN ('published', 'unchanged', 'partial_failed')
+           AND (
+               (%(slot_utc)s::timestamptz IS NOT NULL AND scheduled_slot_utc > %(slot_utc)s::timestamptz)
+               OR (
+                   (%(slot_utc)s::timestamptz IS NULL OR scheduled_slot_utc = %(slot_utc)s::timestamptz)
+                   AND COALESCE(completed_at, updated_at) > COALESCE(%(completed_at)s::timestamptz, '-infinity'::timestamptz)
+               )
+           )
+         LIMIT 1
+        """,
+        {
+            "job_key": job_key,
+            "run_id": run_id,
+            "slot_utc": scheduled_slot_utc,
+            "completed_at": completed_at,
+        },
+    )
+    return await cur.fetchone() is not None
+
+
+async def is_run_superseded_for_monitor_publish(
+    conn: Any,
+    *,
+    run_id: str,
+    job_key: str,
+    scheduled_slot_utc: datetime | None,
+    completed_at: datetime | None,
+) -> bool:
+    """Return True if a newer succeeded run of ``job_key`` already reached terminal publish status."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        return await _is_run_superseded_in_cur(
+            cur,
+            run_id=run_id,
+            job_key=job_key,
+            scheduled_slot_utc=scheduled_slot_utc,
+            completed_at=completed_at,
+        )
+
+
+def _terminal_status_from_detail(detail: Mapping[str, Any]) -> str:
+    panels = detail.get("panels")
+    if isinstance(panels, Mapping) and panels:
+        statuses = {
+            str(v.get("status") or "")
+            for v in panels.values()
+            if isinstance(v, Mapping)
+        }
+        if statuses & {"published", "unchanged"}:
+            return "partial_failed"
+    return "failed"
+
+
+async def claim_monitor_publish_run_tx(
+    conn: Any,
+    *,
+    run_id: str | None = None,
+    claimed_by: str | None = None,
+    lease_seconds: int = MONITOR_PUBLISH_LEASE_SECONDS,
+    limit: int = 10,
+) -> list[ClaimedMonitorPublishRun]:
+    """Atomically claim due or lease-expired ``dalton_data_task_runs`` for monitor publishing.
+
+    Shared by both first-pass trigger in ``finalize_task_run`` and background replay scanner.
+    Uses ``FOR UPDATE SKIP LOCKED``, enforces 120s lease takeover, settles exhausted attempt-3
+    crashes to ``failed``/``partial_failed``, and converges older superseded runs to ``superseded``.
+    """
+    worker_id = claimed_by or _default_monitor_publish_worker_id()
+    claimed_runs: list[ClaimedMonitorPublishRun] = []
+    exhausted_alerts: list[tuple[str, str, str, str]] = []
+
+    run_filter_sql = "AND run_id = %(run_id)s::uuid" if run_id is not None else ""
+    params: dict[str, Any] = {
+        "limit": max(1, int(limit)),
+    }
+    if run_id is not None:
+        params["run_id"] = str(run_id)
+
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT run_id::text AS run_id,
+                       job_key,
+                       status,
+                       failure_reason,
+                       scheduled_slot_utc,
+                       completed_at,
+                       monitor_publish_status,
+                       monitor_publish_attempts,
+                       monitor_publish_claim_epoch,
+                       monitor_publish_detail
+                  FROM dalton_data_task_runs
+                 WHERE (
+                     (monitor_publish_status IN ('pending', 'retrying')
+                      AND COALESCE(monitor_publish_next_retry_at, NOW()) <= NOW())
+                     OR
+                     (monitor_publish_status = 'publishing'
+                      AND monitor_publish_lease_expires_at <= NOW())
+                 )
+                 {run_filter_sql}
+                 ORDER BY COALESCE(monitor_publish_next_retry_at, completed_at, created_at) ASC
+                 LIMIT %(limit)s
+                   FOR UPDATE SKIP LOCKED
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+            for row in rows:
+                rid = str(row["run_id"])
+                jk = str(row["job_key"])
+                run_status = str(row["status"])
+                slot_utc = row.get("scheduled_slot_utc")
+                comp_at = row.get("completed_at")
+                attempts = int(row.get("monitor_publish_attempts") or 0)
+                detail = _parse_jsonb_dict(row.get("monitor_publish_detail"))
+
+                if run_status == "succeeded" and await _is_run_superseded_in_cur(
+                    cur,
+                    run_id=rid,
+                    job_key=jk,
+                    scheduled_slot_utc=slot_utc,
+                    completed_at=comp_at,
+                ):
+                    detail["superseded_at"] = datetime.now(timezone.utc).isoformat()
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_runs
+                           SET monitor_publish_status = 'superseded',
+                               monitor_publish_detail = %(detail)s::jsonb,
+                               monitor_publish_lease_expires_at = NULL,
+                               monitor_publish_next_retry_at = NULL,
+                               updated_at = NOW()
+                         WHERE run_id = %(run_id)s::uuid
+                        """,
+                        {
+                            "run_id": rid,
+                            "detail": json.dumps(detail, ensure_ascii=False),
+                        },
+                    )
+                    continue
+
+                if attempts >= MAX_MONITOR_PUBLISH_ATTEMPTS:
+                    terminal_mp = _terminal_status_from_detail(detail)
+                    detail["exhausted_after_lease_timeout"] = True
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_runs
+                           SET monitor_publish_status = %(status)s,
+                               monitor_publish_detail = %(detail)s::jsonb,
+                               monitor_publish_lease_expires_at = NULL,
+                               monitor_publish_next_retry_at = NULL,
+                               updated_at = NOW()
+                         WHERE run_id = %(run_id)s::uuid
+                        """,
+                        {
+                            "run_id": rid,
+                            "status": terminal_mp,
+                            "detail": json.dumps(detail, ensure_ascii=False),
+                        },
+                    )
+                    exhausted_alerts.append(
+                        (jk, rid, terminal_mp, "租约超时且已达到最大重试次数 (3)")
+                    )
+                    continue
+
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                       SET monitor_publish_status = 'publishing',
+                           monitor_publish_attempts = monitor_publish_attempts + 1,
+                           monitor_publish_claim_epoch = monitor_publish_claim_epoch + 1,
+                           monitor_publish_claimed_by = %(claimed_by)s,
+                           monitor_publish_lease_expires_at = NOW() + make_interval(secs => %(lease_s)s),
+                           updated_at = NOW()
+                     WHERE run_id = %(run_id)s::uuid
+                    RETURNING monitor_publish_attempts, monitor_publish_claim_epoch
+                    """,
+                    {
+                        "run_id": rid,
+                        "claimed_by": worker_id,
+                        "lease_s": int(lease_seconds),
+                    },
+                )
+                upd = await cur.fetchone()
+                new_attempts = (
+                    int(upd["monitor_publish_attempts"]) if upd is not None else attempts + 1
+                )
+                new_epoch = (
+                    int(upd["monitor_publish_claim_epoch"])
+                    if upd is not None
+                    else int(row.get("monitor_publish_claim_epoch") or 0) + 1
+                )
+                claimed_runs.append(
+                    ClaimedMonitorPublishRun(
+                        run_id=rid,
+                        job_key=jk,
+                        status=run_status,
+                        failure_reason=row.get("failure_reason"),
+                        scheduled_slot_utc=slot_utc,
+                        completed_at=comp_at,
+                        attempts=new_attempts,
+                        claim_epoch=new_epoch,
+                        detail=detail,
+                    )
+                )
+
+    for jk, rid, st, msg in exhausted_alerts:
+        await _emit_monitor_publish_ops_alert(
+            job_key=jk, run_id=rid, status=st, detail_text=msg
+        )
+
+    return claimed_runs
+
+
+async def update_monitor_publish_panel_staged_tx(
+    conn: Any,
+    *,
+    run_id: str,
+    claim_epoch: int,
+    slug: str,
+    artifact_id: str,
+    candidate_seq: int,
+    detail: dict[str, Any],
+) -> bool:
+    """Persist staged ``(artifact_id, candidate_seq)`` for ``slug`` under claim-epoch fence."""
+    panels = detail.setdefault("panels", {})
+    if not isinstance(panels, dict):
+        panels = {}
+        detail["panels"] = panels
+    cur_panel = dict(panels.get(slug) or {})
+    cur_panel.update(
+        {
+            "status": "staged",
+            "artifact_id": artifact_id,
+            "candidate_seq": int(candidate_seq),
+        }
+    )
+    panels[slug] = cur_panel
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_runs
+                   SET monitor_publish_detail = %(detail)s::jsonb,
+                       updated_at = NOW()
+                 WHERE run_id = %(run_id)s::uuid
+                   AND monitor_publish_status = 'publishing'
+                   AND monitor_publish_claim_epoch = %(claim_epoch)s
+                """,
+                {
+                    "run_id": run_id,
+                    "claim_epoch": int(claim_epoch),
+                    "detail": json.dumps(detail, ensure_ascii=False),
+                },
+            )
+            return cur.rowcount == 1
+
+
+async def settle_monitor_publish_run_tx(
+    conn: Any,
+    *,
+    run_id: str,
+    claim_epoch: int,
+    next_status: str,
+    detail: dict[str, Any],
+    next_retry_delay_s: int | None = None,
+    refund_attempt: bool = False,
+) -> bool:
+    """Fenced settlement of a claimed monitor publish run (ignores slow stale-epoch writers)."""
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_runs
+                   SET monitor_publish_status = %(next_status)s,
+                       monitor_publish_attempts = CASE
+                           WHEN %(refund_attempt)s::boolean
+                           THEN GREATEST(monitor_publish_attempts - 1, 0)
+                           ELSE monitor_publish_attempts
+                       END,
+                       monitor_publish_detail = %(detail)s::jsonb,
+                       monitor_publish_lease_expires_at = NULL,
+                       monitor_publish_next_retry_at = CASE
+                           WHEN %(delay_s)s::int IS NOT NULL
+                           THEN NOW() + make_interval(secs => %(delay_s)s::int)
+                           ELSE NULL
+                       END,
+                       updated_at = NOW()
+                 WHERE run_id = %(run_id)s::uuid
+                   AND monitor_publish_status = 'publishing'
+                   AND monitor_publish_claim_epoch = %(claim_epoch)s
+                """,
+                {
+                    "run_id": run_id,
+                    "claim_epoch": int(claim_epoch),
+                    "next_status": next_status,
+                    "detail": json.dumps(detail, ensure_ascii=False),
+                    "delay_s": next_retry_delay_s,
+                    "refund_attempt": bool(refund_attempt),
+                },
+            )
+            return cur.rowcount == 1
+
+
+async def execute_claimed_monitor_publish(
+    conn: Any,
+    claimed_pub: ClaimedMonitorPublishRun,
+    *,
+    path_map: DataTaskPathMap | None = None,
+) -> str:
+    """Execute one claimed monitor publish run strictly from its immutable ``frozen_dir`` and settle under fence."""
+    from src.dalton.monitors import service as monitor_service
+    from src.dalton.settings import is_artifact_publishing_enabled
+
+    paths = path_map or build_path_map()
+    detail = dict(claimed_pub.detail)
+    panels = detail.get("panels")
+    if not isinstance(panels, dict):
+        panels = {}
+        detail["panels"] = panels
+
+    async def _before_promote() -> bool:
+        superseded = await is_run_superseded_for_monitor_publish(
+            conn,
+            run_id=claimed_pub.run_id,
+            job_key=claimed_pub.job_key,
+            scheduled_slot_utc=claimed_pub.scheduled_slot_utc,
+            completed_at=claimed_pub.completed_at,
+        )
+        return not superseded
+
+    async def _on_staged(slug: str, artifact_id: str, candidate_seq: int) -> None:
+        await update_monitor_publish_panel_staged_tx(
+            conn,
+            run_id=claimed_pub.run_id,
+            claim_epoch=claimed_pub.claim_epoch,
+            slug=slug,
+            artifact_id=artifact_id,
+            candidate_seq=candidate_seq,
+            detail=detail,
+        )
+
+    next_status = "failed"
+    retry_delay_s: int | None = None
+    refund_attempt = False
+    is_deferred = False
+    error_summary = ""
+
+    try:
+        if claimed_pub.status == "succeeded":
+            if not is_artifact_publishing_enabled():
+                next_status = "disabled"
+                error_summary = "DALTON_ARTIFACT_PUBLISHING_ENABLED 未开启，看板发布已禁用"
+                detail["reason"] = "artifact_publishing_disabled"
+            else:
+                raw_frozen = detail.get("frozen_dir")
+                frozen_path = (
+                    Path(raw_frozen.strip())
+                    if isinstance(raw_frozen, str) and raw_frozen.strip()
+                    else None
+                )
+                if (
+                    frozen_path is None
+                    or not frozen_path.is_dir()
+                    or frozen_path.is_symlink()
+                ):
+                    error_summary = "冻结目录不存在或不可读，拒绝回退共享 data_root"
+                    for slug, pinfo in list(panels.items()):
+                        if isinstance(pinfo, dict) and pinfo.get("status") not in (
+                            "published",
+                            "unchanged",
+                        ):
+                            updated_p = dict(pinfo)
+                            updated_p["status"] = "failed"
+                            updated_p["error"] = error_summary
+                            panels[slug] = updated_p
+                    next_status = _terminal_status_from_detail(detail)
+                    try:
+                        await monitor_service.maybe_publish_data_job_monitor(
+                            job_key=claimed_pub.job_key,
+                            run_id=claimed_pub.run_id,
+                            terminal_status="failed",
+                            failure_reason=error_summary,
+                            data_root=paths.backend_data_root,
+                            claim_epoch=claimed_pub.claim_epoch,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    result = await monitor_service.republish_data_job_monitor(
+                        job_key=claimed_pub.job_key,
+                        run_id=claimed_pub.run_id,
+                        data_root=frozen_path,
+                        panel_progress=panels,
+                        before_promote=_before_promote,
+                        on_staged=_on_staged,
+                        raise_on_partial=False,
+                        claim_epoch=claimed_pub.claim_epoch,
+                        check_superseded=True,
+                    )
+                    res_status = str(result.get("status") or "")
+                    if res_status == "fenced_out" or result.get("fenced_out"):
+                        return "fenced_out"
+                    panel_results = result.get("panel_results")
+                    has_panel_results = isinstance(panel_results, dict) and bool(panel_results)
+                    if isinstance(panel_results, dict):
+                        for slug, pinfo in panel_results.items():
+                            if isinstance(pinfo, dict):
+                                merged = dict(panels.get(slug) or {})
+                                merged.update(pinfo)
+                                if pinfo.get("status") != "failed" and "error" not in pinfo:
+                                    merged.pop("error", None)
+                                if pinfo.get("status") != "deferred" and "deferred" not in pinfo:
+                                    merged.pop("deferred", None)
+                                panels[slug] = merged
+                    error_summary = str(result.get("error") or "").strip()
+                    if not error_summary and isinstance(panel_results, dict):
+                        for pinfo in panel_results.values():
+                            if (
+                                isinstance(pinfo, dict)
+                                and pinfo.get("status") == "failed"
+                                and str(pinfo.get("error") or "").strip()
+                            ):
+                                error_summary = str(pinfo["error"]).strip()
+                                break
+                    panel_statuses = {
+                        str(p.get("status") or "")
+                        for p in panels.values()
+                        if isinstance(p, dict)
+                    }
+                    has_failed_panel = (
+                        res_status in ("failed", "partial_failed")
+                        or "failed" in panel_statuses
+                    )
+                    unfinished_panel_statuses = panel_statuses - {"published", "unchanged"}
+                    is_pure_deferred = (
+                        not has_failed_panel
+                        and (res_status == "deferred" or bool(result.get("deferred")))
+                        and (
+                            not has_panel_results
+                            or unfinished_panel_statuses == {"deferred"}
+                        )
+                    )
+                    if res_status == "superseded" or result.get("superseded"):
+                        next_status = "superseded"
+                    elif is_pure_deferred:
+                        is_deferred = True
+                        next_status = "retrying"
+                        retry_delay_s = None
+                        refund_attempt = True
+                    elif (
+                        has_failed_panel
+                        or res_status == "deferred"
+                        or result.get("deferred")
+                    ):
+                        if claimed_pub.attempts < MAX_MONITOR_PUBLISH_ATTEMPTS:
+                            next_status = "retrying"
+                            idx = min(
+                                claimed_pub.attempts - 1,
+                                len(MONITOR_PUBLISH_RETRY_BACKOFFS_S) - 1,
+                            )
+                            retry_delay_s = MONITOR_PUBLISH_RETRY_BACKOFFS_S[idx]
+                        else:
+                            next_status = (
+                                res_status
+                                if res_status in ("failed", "partial_failed")
+                                else _terminal_status_from_detail(detail)
+                            )
+                    elif res_status in ("published", "unchanged"):
+                        next_status = res_status
+                    else:
+                        next_status = "published" if result.get("cut") else "unchanged"
+        else:
+            await monitor_service.maybe_publish_data_job_monitor(
+                job_key=claimed_pub.job_key,
+                run_id=claimed_pub.run_id,
+                terminal_status=claimed_pub.status,
+                failure_reason=claimed_pub.failure_reason,
+                data_root=paths.backend_data_root,
+                claim_epoch=claimed_pub.claim_epoch,
+            )
+            next_status = "unchanged"
+    except Exception as exc:
+        error_summary = str(exc)
+        detail["last_error"] = error_summary[:1000]
+        if claimed_pub.attempts < MAX_MONITOR_PUBLISH_ATTEMPTS:
+            next_status = "retrying"
+            idx = min(
+                claimed_pub.attempts - 1,
+                len(MONITOR_PUBLISH_RETRY_BACKOFFS_S) - 1,
+            )
+            retry_delay_s = MONITOR_PUBLISH_RETRY_BACKOFFS_S[idx]
+        else:
+            next_status = _terminal_status_from_detail(detail)
+
+    if error_summary:
+        detail["last_error"] = error_summary[:1000]
+
+    settled = await settle_monitor_publish_run_tx(
+        conn,
+        run_id=claimed_pub.run_id,
+        claim_epoch=claimed_pub.claim_epoch,
+        next_status=next_status,
+        detail=detail,
+        next_retry_delay_s=retry_delay_s,
+        refund_attempt=refund_attempt,
+    )
+    if settled and next_status in ("failed", "partial_failed", "disabled"):
+        await _emit_monitor_publish_ops_alert(
+            job_key=claimed_pub.job_key,
+            run_id=claimed_pub.run_id,
+            status=next_status,
+            detail_text=error_summary or "看板发布核验耗尽重试次数",
+        )
+    if is_deferred:
+        return "deferred" if settled else "fenced_out"
+    return next_status if settled else "fenced_out"
+
+
+async def process_monitor_publish_for_run(
+    conn: Any,
+    *,
+    run_id: str,
+    path_map: DataTaskPathMap | None = None,
+    claimed_by: str | None = None,
+) -> str | None:
+    """First-pass monitor publish entry point sharing ``claim_monitor_publish_run_tx``."""
+    claimed_list = await claim_monitor_publish_run_tx(
+        conn,
+        run_id=run_id,
+        claimed_by=claimed_by,
+        limit=1,
+    )
+    if not claimed_list:
+        return None
+    return await execute_claimed_monitor_publish(
+        conn, claimed_list[0], path_map=path_map
+    )
 
 
 def _read_json_store(path: Path) -> dict[str, dict[str, Any]]:
@@ -1808,41 +2541,6 @@ def _write_json_store(path: Path, data: Mapping[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + f".{uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(dict(data), ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
-
-
-def _record_pending_monitor_publish(
-    paths: DataTaskPathMap,
-    *,
-    run_id: str,
-    job_key: str,
-    terminal_status: str,
-    failure_reason: str,
-) -> None:
-    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
-    records = _read_json_store(store_path)
-    records[str(run_id)] = {
-        "run_id": str(run_id),
-        "job_key": str(job_key),
-        "terminal_status": str(terminal_status),
-        "failure_reason": str(failure_reason),
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        _write_json_store(store_path, records)
-    except Exception as exc:
-        logger.warning("Failed persisting pending monitor publish %s: %s", run_id, exc)
-
-
-def _clear_pending_monitor_publish(paths: DataTaskPathMap, run_id: str) -> None:
-    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
-    records = _read_json_store(store_path)
-    if str(run_id) not in records:
-        return
-    records.pop(str(run_id), None)
-    try:
-        _write_json_store(store_path, records)
-    except Exception as exc:
-        logger.warning("Failed clearing pending monitor publish %s: %s", run_id, exc)
 
 
 def _record_pending_takeover_retry(
@@ -1884,19 +2582,45 @@ async def _durable_publish_data_job_monitor(
     terminal_status: str,
     failure_reason: str,
     paths: DataTaskPathMap,
+    conn: Any = None,
 ) -> bool:
-    """Persist a pending monitor publish record before calling ``maybe_publish_data_job_monitor``
-    and remove it only on success so failures survive slot reset and process restarts."""
-    _record_pending_monitor_publish(
-        paths,
-        run_id=str(run_id),
-        job_key=job_key,
-        terminal_status=terminal_status,
-        failure_reason=failure_reason,
-    )
-    try:
-        from src.dalton.monitors.service import maybe_publish_data_job_monitor
+    """Record a failure/cancelled monitor update via PostgreSQL durable queue (no local JSON file)."""
+    from src.dalton.monitors.data_job_registry import get_registered_monitor_bindings
+    from src.dalton.monitors.service import maybe_publish_data_job_monitor
 
+    if not get_registered_monitor_bindings(job_key):
+        return True
+
+    if conn is not None:
+        detail = {
+            "terminal_status": str(terminal_status),
+            "failure_reason": str(failure_reason),
+        }
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_runs
+                           SET monitor_publish_status = 'pending',
+                               monitor_publish_next_retry_at = NOW(),
+                               monitor_publish_detail = %(detail)s::jsonb,
+                               updated_at = NOW()
+                         WHERE run_id = %(run_id)s::uuid
+                        """,
+                        {
+                            "run_id": str(run_id),
+                            "detail": json.dumps(detail, ensure_ascii=False),
+                        },
+                    )
+        except Exception as db_exc:
+            logger.debug(
+                "Could not mark PG monitor_publish_status pending for %s: %s",
+                run_id,
+                db_exc,
+            )
+
+    try:
         await maybe_publish_data_job_monitor(
             job_key=job_key,
             run_id=str(run_id),
@@ -1906,39 +2630,68 @@ async def _durable_publish_data_job_monitor(
         )
     except Exception as monitor_exc:
         logger.warning(
-            "Failed to update monitor for data task run %s (%s, %s); kept pending for replay: %s",
+            "Failed to update monitor for data task run %s (%s, %s); kept pending in PG for replay: %s",
             run_id,
             job_key,
             terminal_status,
             monitor_exc,
         )
         return False
-    _clear_pending_monitor_publish(paths, str(run_id))
+
+    if conn is not None:
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_runs
+                           SET monitor_publish_status = 'unchanged',
+                               monitor_publish_lease_expires_at = NULL,
+                               monitor_publish_next_retry_at = NULL,
+                               updated_at = NOW()
+                         WHERE run_id = %(run_id)s::uuid
+                           AND monitor_publish_status IN ('pending', 'retrying')
+                        """,
+                        {"run_id": str(run_id)},
+                    )
+        except Exception:
+            pass
     return True
 
 
 async def replay_pending_monitor_publishes(
+    conn: Any = None,
     *,
     path_map: DataTaskPathMap | None = None,
+    limit: int = 10,
+    claimed_by: str | None = None,
 ) -> int:
-    """Replay any persisted monitor publish failures that previously failed before succeeding."""
+    """Replay due or lease-expired monitor publishes from PostgreSQL ``dalton_data_task_runs``."""
     paths = path_map or build_path_map()
-    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
-    records = _read_json_store(store_path)
-    if not records:
-        return 0
-    replayed = 0
-    for rid, rec in list(records.items()):
-        ok = await _durable_publish_data_job_monitor(
-            job_key=str(rec.get("job_key") or ""),
-            run_id=str(rec.get("run_id") or rid),
-            terminal_status=str(rec.get("terminal_status") or "aborted"),
-            failure_reason=str(rec.get("failure_reason") or "scheduler_takeover_aborted"),
-            paths=paths,
+
+    async def _run_with_conn(active_conn: Any) -> int:
+        claimed_runs = await claim_monitor_publish_run_tx(
+            active_conn,
+            claimed_by=claimed_by,
+            limit=limit,
         )
-        if ok:
-            replayed += 1
-    return replayed
+        processed = 0
+        for item in claimed_runs:
+            await execute_claimed_monitor_publish(active_conn, item, path_map=paths)
+            processed += 1
+        return processed
+
+    if conn is not None:
+        return await _run_with_conn(conn)
+
+    try:
+        from src.server.database.pool import get_db_connection
+
+        async with get_db_connection() as pooled_conn:
+            return await _run_with_conn(pooled_conn)
+    except Exception as exc:
+        logger.debug("Skipping PG monitor publish replay (DB unavailable): %s", exc)
+        return 0
 
 
 async def _cancel_and_publish_expired_takeover_retry(
@@ -2898,8 +3651,6 @@ async def recover_on_takeover(
                     WHERE slot_id = 1
                     """
                 )
-
-    await replay_pending_monitor_publishes(path_map=paths)
 
     secrets_root = paths.backend_var_dir / "run-secrets"
     if secrets_root.is_dir():
@@ -4835,7 +5586,7 @@ async def run_data_task_scheduler_loop(
                 # Enqueue due cron tasks every minute, even while a background task is running.
                 await enqueue_due_cron_tasks(work_conn)
                 await flush_pending_takeover_retries(work_conn)
-                await replay_pending_monitor_publishes()
+                await replay_pending_monitor_publishes(work_conn)
                 await expire_low_memory_runs(work_conn)
 
                 if active_exec_task is None and not stop.is_set():

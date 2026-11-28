@@ -1,0 +1,5 @@
+# Everflow deployment container workspace & home overlay (excluded from Standalone Core).
+# `scripts/standalone/package_release.sh` strips all `*.dalton.yaml` files before scanning/packaging.
+# Existing Everflow production var/dalton/openclaw-data/scripts/ and skills/ mount at this path inside task containers.
+container_home: /Users/everflow
+container_workspace_dir: /Users/everflow/.openclaw/workspace

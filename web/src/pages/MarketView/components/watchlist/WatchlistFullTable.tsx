@@ -478,6 +478,20 @@ export function WatchlistFullTable({
         );
       }
 
+      if (cellStatus === 'loading') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="loading"
+            title={t('marketView:watchlist.loading')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            …
+          </td>
+        );
+      }
+
       if (cellStatus === 'no_coverage' || numVal == null) {
         return (
           <td
