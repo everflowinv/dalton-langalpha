@@ -402,6 +402,9 @@ class HistoryRule:
     max_bytes: int | None = 100 * 1024 * 1024
     undo_days: int = 7
     grace_seconds: int = 3600
+    # DALTON-HOOK(drive-long-history): retain pre-#890 long history bounds for ordinary Drive files
+    keep_days: int | None = 30
+    keep_max: int | None = 10
 
 
 @dataclass(frozen=True)

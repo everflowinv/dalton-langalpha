@@ -894,13 +894,12 @@ function ThreadTreeRowImpl({
           </HoverCardTrigger>
           <ThreadMetaCard thread={thread} title={title} t={t} />
         </HoverCard>
-<<<<<<< HEAD
         {/* DALTON-HOOK(colleague-dispatch): pass permission-filtered handlers to ThreadRowMenu */}
         {canOpenMenu && (
           <ThreadRowMenu
             isPinned={isPinned}
             onCloseAutoFocus={handleMenuCloseAutoFocus}
-            onOpenInNewTab={isDesktopShell() ? undefined : () => window.open(threadHref(tid), '_blank', 'noopener')}
+            threadPath={threadPath(tid)}
             onCopyLink={copyLink}
             onTogglePin={effectivePinThread ? () => effectivePinThread(wsId, tid, !isPinned) : undefined}
             onRename={effectiveRenameThread ? () => { renameAfterMenuRef.current = true; } : undefined}
@@ -909,19 +908,6 @@ function ThreadTreeRowImpl({
             onDelete={effectiveDeleteThread ? () => effectiveDeleteThread(wsId, tid, title) : undefined}
           />
         )}
-=======
-        <ThreadRowMenu
-          isPinned={isPinned}
-          onCloseAutoFocus={handleMenuCloseAutoFocus}
-          threadPath={threadPath(tid)}
-          onCopyLink={copyLink}
-          onTogglePin={onPinThread ? () => onPinThread(wsId, tid, !isPinned) : undefined}
-          onRename={onRenameThread ? () => { renameAfterMenuRef.current = true; } : undefined}
-          onShare={onShareThread ? () => onShareThread(wsId, tid) : undefined}
-          onArchive={onArchiveThread ? () => onArchiveThread(wsId, tid) : undefined}
-          onDelete={onDeleteThread ? () => onDeleteThread(wsId, tid, title) : undefined}
-        />
->>>>>>> db284da5a
       </ContextMenu>
 
       {/* Agent rows -- only when subagents exist, for current thread when expanded */}

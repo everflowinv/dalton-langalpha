@@ -52,11 +52,8 @@ import {
   type ManageTask,
 } from './utils/taskKind';
 import { AUTOMATION_TEMPLATES, type TemplateId, applyTemplate } from './utils/templates';
-<<<<<<< HEAD
-=======
 import type { Automation } from '@/types/automation';
 import { usePageTabLeaveGuard } from '@/components/PageTabs/usePageTabLeaveGuard';
->>>>>>> db284da5a
 import './Automations.css';
 
 const VIEW_STORAGE_KEY = 'automations:view';

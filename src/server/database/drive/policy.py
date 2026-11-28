@@ -33,30 +33,50 @@ from src.server.database.drive.records import Actor, DriveError, Entry, MemoChan
 #: ``history``: each version of the files ``%(ids)s`` with its ``role`` and
 #: whether it is ``small`` enough to be kept as an undo copy (``%(max)s``,
 #: the rule's ``max_bytes``; null keeps every size). Used as a CTE.
+# DALTON-HOOK(drive-long-history): ordinary Drive files retain pre-#890 long history
+# (every version for text; up to keep_max versions under max_bytes for keep_days for binary)
+# instead of upstream #890's 7-day single-copy undo window.
 HISTORY_SQL = """
-    history AS (
-        SELECT v.entry_id, v.seq, v.sha256,
+    _ranked AS (
+        SELECT v.entry_id, v.seq, v.sha256, v.is_text,
                (%(max)s::bigint IS NULL OR v.byte_len < %(max)s::bigint) AS small,
                COALESCE(m.is_memo, false) AS memo,
-               CASE
-                   WHEN v.seq = e.head_seq THEN 'head'
-                   WHEN v.seq = m.final_seq THEN 'final'
-                   WHEN COALESCE(m.is_memo, false)
-                        OR v.seq <= COALESCE(m.kept_through_seq, 0) THEN 'record'
-                   WHEN v.seq = max(v.seq) FILTER (
-                            WHERE v.seq <> e.head_seq AND v.seq > COALESCE(m.kept_through_seq, 0))
-                            OVER (PARTITION BY v.entry_id)
-                        AND (%(max)s::bigint IS NULL OR v.byte_len < %(max)s::bigint) THEN 'undo'
-                   ELSE 'spare'
-               END AS role
+               e.head_seq, m.final_seq, COALESCE(m.kept_through_seq, 0) AS kept_through_seq,
+               lead(v.created_at) OVER (PARTITION BY v.entry_id ORDER BY v.seq) AS replaced_at,
+               count(*) FILTER (
+                   WHERE v.seq <> e.head_seq
+                     AND NOT v.is_text
+                     AND (%(max)s::bigint IS NULL OR v.byte_len < %(max)s::bigint)
+                     AND NOT COALESCE(m.is_memo, false)
+                     AND v.seq > COALESCE(m.kept_through_seq, 0)
+               ) OVER (
+                   PARTITION BY v.entry_id ORDER BY v.seq DESC
+                   ROWS UNBOUNDED PRECEDING
+               ) AS bin_rank
           FROM drive_versions v
           JOIN drive_entries e ON e.entry_id = v.entry_id
           LEFT JOIN drive_memos m ON m.entry_id = v.entry_id
-         WHERE v.entry_id = ANY(%(ids)s::uuid[]))
+         WHERE v.entry_id = ANY(%(ids)s::uuid[])),
+    history AS (
+        SELECT entry_id, seq, sha256, small, memo, replaced_at,
+               CASE
+                   WHEN seq = head_seq THEN 'head'
+                   WHEN seq = final_seq THEN 'final'
+                   WHEN memo OR seq <= kept_through_seq THEN 'record'
+                   WHEN is_text THEN 'history'
+                   WHEN small
+                        AND (%(keep)s::int IS NULL OR bin_rank <= %(keep)s::int)
+                        AND (%(days)s::int IS NULL
+                             OR replaced_at IS NULL
+                             OR replaced_at + make_interval(days => %(days)s::int) > now()) THEN 'history'
+                   ELSE 'spare'
+               END AS role
+          FROM _ranked)
 """
 
 #: The roles a clear drops: every version but the head and a memo's final.
-CLEARED = ("record", "undo", "spare")
+# DALTON-HOOK(drive-long-history): include 'history' role in clearable versions
+CLEARED = ("record", "history", "undo", "spare")
 
 #: The version an undo of ``e`` (an alias of ``drive_entries``) puts back:
 #: the state before the last save, or nothing. A new version takes the

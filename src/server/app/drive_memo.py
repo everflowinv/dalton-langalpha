@@ -14,6 +14,7 @@ from src.server.app.drive import (
     ReadPrincipal,
     WritePrincipal,
     _actor,
+    _DriveGateRoute,  # DALTON-HOOK(drive-kill-switch)
     _entries_out,
     _entry_out,
     _Errors,
@@ -45,7 +46,11 @@ from src.server.models.drive import (
 from src.server.services import drive
 from src.server.services.drive import extract, memo, texts
 
-router = APIRouter(prefix="/api/v1/drive", tags=["Drive"])
+router = APIRouter(
+    prefix="/api/v1/drive",
+    tags=["Drive"],
+    route_class=_DriveGateRoute,  # DALTON-HOOK(drive-kill-switch)
+)
 
 
 @router.post("/{space}/versions/note", response_model=VersionOut)

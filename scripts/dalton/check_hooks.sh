@@ -574,6 +574,11 @@ ALLOWED_HOOKS=(
   "workspace-file-write-mode"
   "workspace-file-exclusions"
   "workspace-file-download-ticket"
+  # sync14b: user decisions — widget SSR off by default, uvloop off by default,
+  # and ordinary Drive files retain long history instead of 7-day single-step undo.
+  "widget-ssr-off"
+  "uvloop-off"
+  "drive-long-history"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

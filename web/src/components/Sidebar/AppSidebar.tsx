@@ -1,16 +1,7 @@
 import React, { lazy, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-<<<<<<< HEAD
-import { ArrowLeft, ArrowRight, LayoutGrid, PanelLeftClose, PanelLeftOpen, Plus, Search, SquarePen } from 'lucide-react'; // DALTON-HOOK(global-search)
-import logoLight from '../../assets/img/logo.svg';
-import logoDark from '../../assets/img/logo-dark.svg';
-import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
-import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
-import { useTheme } from '../../contexts/ThemeContext';
-=======
 import { LayoutGrid, Plus, Search } from 'lucide-react';
->>>>>>> db284da5a
 import { useNavActive } from '../nav/useNavActive';
 import { useDesktopNavItems } from '../nav/useNavItems';
 import { cn } from '@/lib/utils';
@@ -31,15 +22,12 @@ import { useSidebarAgents } from '@/pages/ChatAgent/components/sidebarAgentsBrid
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { GettingStartedGate } from '@/pages/Onboarding';
 import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './sidebarWidth';
-<<<<<<< HEAD
 // DALTON-HOOK(team-sharing): collapsible Team workspaces section
 import { TeamWorkspacesSection } from '@/pages/ChatAgent/components/dalton/TeamSharing';
 // DALTON-HOOK(coverage-tree): sidebar coverage-structure tree (sectors → members)
 import { CoverageTreeSection } from '@/pages/ChatAgent/components/dalton/CoverageTreeSection';
 import { isDaltonAuth } from '@/config/daltonAuth';
-=======
 import type { SidebarPeek } from './useSidebarPeek';
->>>>>>> db284da5a
 import './Sidebar.css';
 
 // Off first load: only the desktop app has an update to offer, so a browser
@@ -164,111 +152,6 @@ function AppSidebar({ hidden, width, onWidthChange, peek, panelRef }: AppSidebar
   // Same create flow as the gallery, without leaving the current page first.
   const openCreateWorkspace = useOpenCreateWorkspace();
 
-<<<<<<< HEAD
-  // DALTON-HOOK(global-search): Command Palette shortcut label for sidebar search buttons
-  const searchLabel = t('sidebar.search', { shortcut: paletteShortcut() });
-
-  // One persistent <aside> so the width transition runs across mode flips;
-  // the keyed fragments force each mode's content to cleanly remount (React
-  // would otherwise morph rail nodes into panel nodes in place), which lets
-  // the sidebar-content-in mount animation choreograph the swap.
-  if (collapsed) {
-    return (
-      <aside className="sidebar" data-chrome>
-        <React.Fragment key="rail">
-        <div className="sidebar-window-drag" aria-hidden="true" />
-        <button
-          type="button"
-          className="sidebar-logo"
-          onClick={() => navigate('/dashboard')}
-          aria-label={t('sidebar.dashboard')}
-        >
-          {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7 shrink-0" /> : <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
-        </button>
-        <button
-          className="sidebar-rail-toggle"
-          onClick={onToggleCollapse}
-          aria-label={t('sidebar.expand')}
-          title={t('sidebar.expand')}
-        >
-          <PanelLeftOpen className="h-4 w-4" />
-        </button>
-        {/* DALTON-HOOK(global-search): search button with tooltip below expand button in collapsed rail */}
-        <TooltipProvider delayDuration={300}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className="sidebar-rail-toggle"
-                onClick={(e) => palette?.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
-                onPointerEnter={palette?.preload}
-                aria-label={searchLabel}
-                aria-keyshortcuts={paletteKeyShortcuts()}
-                title={searchLabel}
-              >
-                <Search className="h-4 w-4" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" sideOffset={8}>
-              {searchLabel}
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <nav className="sidebar-nav">
-          <TooltipProvider delayDuration={300}>
-            {palette && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    className="sidebar-nav-item tap-target"
-                    onClick={(e) => palette.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
-                    onPointerEnter={palette.preload}
-                    aria-label={t('palette.search')}
-                    aria-keyshortcuts={paletteKeyShortcuts()}
-                  >
-                    <Search className="sidebar-nav-icon" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  {t('palette.search')} <span className="sidebar-shortcut">{paletteShortcut()}</span>
-                </TooltipContent>
-              </Tooltip>
-            )}
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const label = t(item.labelKey);
-              const active = isActive(item);
-              return (
-                <Tooltip key={item.key}>
-                  <TooltipTrigger asChild>
-                    <button
-                      className={cn('sidebar-nav-item tap-target', active && 'active')}
-                      onClick={() => navigate(item.key)}
-                      aria-label={label}
-                      aria-current={active ? 'page' : undefined}
-                    >
-                      <Icon className="sidebar-nav-icon" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent side="right" sideOffset={8}>
-                    {label}
-                  </TooltipContent>
-                </Tooltip>
-              );
-            })}
-          </TooltipProvider>
-        </nav>
-        <div className="sidebar-bottom">
-          <GettingStartedGate variant="rail" onExpand={onToggleCollapse} />
-          <AccountMenu />
-        </div>
-        </React.Fragment>
-      </aside>
-    );
-  }
-
-=======
->>>>>>> db284da5a
   return (
     <aside
       ref={panelRef}
@@ -281,45 +164,8 @@ function AppSidebar({ hidden, width, onWidthChange, peek, panelRef }: AppSidebar
       onPointerLeave={peek.panelHover?.onPointerLeave}
     >
       <div className="sidebar-window-drag" aria-hidden="true" />
-<<<<<<< HEAD
-      {/* The brand row doubles as titlebar: the buttons inside it declare
-          no-drag for themselves, so only the gaps move the window. */}
-      <div className="sidebar-panel-header" data-chrome="drag">
-        <button
-          type="button"
-          className="sidebar-brand"
-          onClick={() => navigate('/dashboard')}
-          aria-label={t('sidebar.dashboard')}
-        >
-          {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7 shrink-0" /> : <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
-          <span className="sidebar-wordmark title-font">{BRAND_NAME}</span> {/* DALTON-HOOK(brand-name) */}
-        </button>
-        {/* DALTON-HOOK(global-search): search icon button between brand and collapse button */}
-        <button
-          type="button"
-          className="sidebar-collapse-btn"
-          onClick={(e) => palette?.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
-          onPointerEnter={palette?.preload}
-          aria-label={searchLabel}
-          aria-keyshortcuts={paletteKeyShortcuts()}
-          title={searchLabel}
-        >
-          <Search className="h-4 w-4" />
-        </button>
-        <button
-          className="sidebar-collapse-btn"
-          onClick={onToggleCollapse}
-          aria-label={t('sidebar.collapse')}
-          title={t('sidebar.collapse')}
-        >
-          <PanelLeftClose className="h-4 w-4" />
-        </button>
-        <HistoryButtons />
-      </div>
-=======
       {/* The panel's share of the top bar, under the bar's corner. */}
       <div className="sidebar-panel-header" data-chrome="drag" />
->>>>>>> db284da5a
 
       <nav className="sidebar-panel-nav">
         {palette && (

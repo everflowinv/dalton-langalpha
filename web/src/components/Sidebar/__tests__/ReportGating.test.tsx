@@ -44,7 +44,7 @@ describe('DALTON-HOOK(problem-reports-off): frontend report entry gating', () =>
     state.reportsEnabled = false;
     renderWithProviders(
       <>
-        <AccountMenu variant="row" />
+        <AccountMenu />
         <ReportFailure
           error={{ kind: 'internal', message: 'Internal failure', runId: 'run-1' }}
           threadId="t-1"
@@ -59,7 +59,7 @@ describe('DALTON-HOOK(problem-reports-off): frontend report entry gating', () =>
     state.reportsEnabled = true;
     renderWithProviders(
       <>
-        <AccountMenu variant="row" />
+        <AccountMenu />
         <ReportFailure
           error={{ kind: 'internal', message: 'Internal failure', runId: 'run-1' }}
           threadId="t-1"

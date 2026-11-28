@@ -404,7 +404,6 @@ export function useAllModels(): UseAllModelsResult {
     )));
   }, [payers, policy, visible]);
 
-<<<<<<< HEAD
   // DALTON-HOOK(antigravity-series): enable series catalog & collapsing only in Dalton builds
   const enableAntigravitySeries = isDaltonBuild;
   const seriesCatalog = useMemo(
@@ -430,7 +429,7 @@ export function useAllModels(): UseAllModelsResult {
     }),
     [seriesCatalog, offeredSlots, rawMetadata, customModels, visible.customPairs],
   );
-=======
+
   const isLoading = modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading;
   const unread = (modelsError && !modelsData) || !!configuredUnread || claudeCode.unread;
   // On a platform the plan serves the deployment's models; standalone only a
@@ -440,7 +439,6 @@ export function useAllModels(): UseAllModelsResult {
       ? publishedDefaults
       : runnableDeploymentDefaults(publishedDefaults, (m) => visible.validModelNames.has(m))
   ), [publishedDefaults, isLoading, unread, visible]);
->>>>>>> db284da5a
 
   return {
     models: offered,

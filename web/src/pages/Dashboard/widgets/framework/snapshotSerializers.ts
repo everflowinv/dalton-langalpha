@@ -8,10 +8,9 @@
 
 import { tickerImpactRows, type NewsSentiment } from '../../utils/tickerImpact';
 
-<<<<<<< HEAD
 // DALTON-HOOK(extended-hours-quotes): Share roundQuote2 and formatSignedPct2 from deriveQuoteDisplay so exports match screen formatting.
 import { formatSignedPct2, roundQuote2 } from '@/lib/dalton/quotes/deriveQuoteDisplay';
-=======
+
 /**
  * An attribute value that stays one: a title or symbol can come from data the
  * user or an agent wrote, and a `>` in it would end the tag early.
@@ -24,7 +23,6 @@ function attrValue(v: string): string {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
->>>>>>> db284da5a
 
 /** Wrap a body in a <widget-context> envelope with type and arbitrary key/value attributes. */
 export function wrapWidgetContext(

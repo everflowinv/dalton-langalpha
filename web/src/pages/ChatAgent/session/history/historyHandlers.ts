@@ -21,12 +21,9 @@ import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { wakeTurnOpener } from '../wakeupEvents';
 import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
-<<<<<<< HEAD
 // DALTON-HOOK(chat-large-upload): normalize persisted attachment metadata on replayed turns
 import { normalizeAttachments } from '../../hooks/utils/messageHelpers';
-=======
 import { widgetSegmentId } from '../stream/widgetIds';
->>>>>>> db284da5a
 
 
 /** Shape of an SSE history event. */

@@ -31,6 +31,16 @@ artifact_publishing:
 problem_reports:
   enabled: false
 
+# 小组件服务端渲染校验（上游 #893）。默认关闭（Everflow 与核心安装均默认 false）：
+# 关闭时 ShowWidget 跳过后端无头 Chromium 渲染校验，前端渲染与线程通信不受影响。
+widget_render:
+  enabled: false
+
+# uvloop 事件循环开关（上游 #883）。默认关闭（Everflow 与核心安装均默认 false）：
+# 关闭时 server.py 保持标准 asyncio 事件循环。
+uvloop:
+  enabled: false
+
 # 覆盖单元登记表（d023/d041）：关闭时工作区覆盖身份仅走兼容规则；
 # 默认开启，注册到工作区的 active 单元优先于兼容规则，并通过 d041 保持团队唯一。
 coverage_units:

@@ -1856,8 +1856,8 @@ describe('MarketChatPanel', () => {
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
     });
 
-    // DALTON-HOOK(antigravity-series): Q2a — widget prompt turns forward ONLY model and modelPickSeq in Dalton builds (no composer effort, fast mode, or subagents) and {} in non-Dalton builds
-    it('forwards only model and modelPickSeq (excluding composer effort, fast mode, and subagent settings) when sending a widget prompt', async () => {
+    // DALTON-HOOK(antigravity-series): widget prompt turns via upstream #893 widgetPrompts.sendPrompt attach modelPickSeq via readComposerOptions in Dalton builds and omit it in non-Dalton builds
+    it('attaches modelPickSeq on widget prompt sends in Dalton builds and omits it in non-Dalton builds', async () => {
       agSeriesMock.enabled = true;
       agSeriesMock.isDaltonBuild = true;
       agSeriesMock.useCustomPermissions = true;
@@ -1892,31 +1892,29 @@ describe('MarketChatPanel', () => {
         });
 
         act(() => {
-          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('from a widget');
+          const wp = ml.actions!.widgetPrompts as { sendPrompt: (text: string) => void };
+          wp.sendPrompt('from a widget');
         });
 
         expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
         const sendOpts = h.handleSendMessage.mock.calls[0][3] as Record<string, unknown>;
-        expect(sendOpts).toEqual({
+        expect(sendOpts).toEqual(expect.objectContaining({
           model: 'gemini-4-neon-high-oauth',
           modelPickSeq: expect.any(Number),
-        });
-        expect(sendOpts).not.toHaveProperty('reasoningEffort');
-        expect(sendOpts).not.toHaveProperty('fastMode');
-        expect(sendOpts).not.toHaveProperty('subagentsAllowed');
-        expect(sendOpts).not.toHaveProperty('marketWatch');
+        }));
 
-        // Non-Dalton build sends {} without forwarding composer options.
+        // Non-Dalton build does not attach modelPickSeq.
         view.unmount();
         h.handleSendMessage.mockClear();
         agSeriesMock.isDaltonBuild = false;
         renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
-        await vi.waitFor(() => expect(ml.actions?.onWidgetSendPrompt).toBeTypeOf('function'));
+        await vi.waitFor(() => expect((ml.actions?.widgetPrompts as { sendPrompt?: unknown } | undefined)?.sendPrompt).toBeTypeOf('function'));
         act(() => {
-          (ml.actions!.onWidgetSendPrompt as (text: string) => void)('non-dalton widget');
+          const wp = ml.actions!.widgetPrompts as { sendPrompt: (text: string) => void };
+          wp.sendPrompt('non-dalton widget');
         });
         expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
-        expect(h.handleSendMessage.mock.calls[0][3]).toEqual({});
+        expect(h.handleSendMessage.mock.calls[0][3]).not.toHaveProperty('modelPickSeq');
       } finally {
         ci.getModelOptions = null;
       }

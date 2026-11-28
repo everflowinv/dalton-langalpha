@@ -35,12 +35,8 @@ from ptc_agent.core.sandbox.livefs_runtime.drive_protocol import (
     encode_frame,
 )
 from ptc_agent.core.sandbox.livefs_runtime.protocol import CALL_HEADER, PREFIX
-<<<<<<< HEAD
 from src.config.features import is_feature_enabled_system  # DALTON-HOOK(drive-kill-switch)
-from src.server.app.drive_http import byte_range, etag_of, receive, status_of
-=======
 from src.server.app.drive_http import byte_range, etag_of, receive
->>>>>>> db284da5a
 from src.server.app.mount_calls import caller, mutation
 from src.server.database.computer import get_computer
 from src.server.models.drive import UploadIn, UploadSignIn

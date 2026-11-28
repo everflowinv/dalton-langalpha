@@ -144,15 +144,19 @@ async def versions(
     """A file's versions, newest first, and whether its head is too large to
     keep as an undo copy once replaced. ``expires_at`` is the undo copy's
     end (``policy.HISTORY_SQL``): the file's undo window."""
+    # DALTON-HOOK(drive-long-history): pass keep_max/keep_days and compute expires_at from long history
     rows = await fetch(
         f"WITH {HISTORY_SQL}"
         f" SELECT {VERSION_COLUMNS},"
-        " CASE WHEN h.role = 'undo' THEN e.undo_until END AS expires_at,"
+        " CASE WHEN h.role = 'history' AND NOT v.is_text AND %(days)s::int IS NOT NULL"
+        "           AND h.replaced_at IS NOT NULL"
+        "      THEN h.replaced_at + make_interval(days => %(days)s::int)"
+        "      WHEN h.role = 'undo' THEN e.undo_until END AS expires_at,"
         " (h.role = 'head' AND NOT h.small AND NOT h.memo) AS head_large"
         " FROM drive_versions v JOIN history h ON h.entry_id = v.entry_id AND h.seq = v.seq"
         " JOIN drive_entries e ON e.entry_id = v.entry_id"
         " ORDER BY v.seq DESC",
-        {"ids": [entry_id], "max": rule.max_bytes},
+        {"ids": [entry_id], "max": rule.max_bytes, "keep": rule.keep_max, "days": rule.keep_days},
         conn,
     )
     # Popped from every row before any() looks: it stops at the first true.
@@ -188,6 +192,8 @@ async def clearable(
             "id": entry_id,
             "ids": [entry_id],
             "max": rule.max_bytes,
+            "keep": rule.keep_max,  # DALTON-HOOK(drive-long-history)
+            "days": rule.keep_days,  # DALTON-HOOK(drive-long-history)
             "roles": list(CLEARED),
             "before": before,
         },

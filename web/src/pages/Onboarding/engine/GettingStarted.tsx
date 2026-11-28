@@ -112,13 +112,8 @@ export function GettingStartedSection({
   const { t } = useTranslation();
   const [open, setOpen] = useState(() => defaultOpen ?? readOpen());
   const listId = useId();
-<<<<<<< HEAD
-  const nextRef = useRef<HTMLButtonElement>(null);
   const visibleTasks = tasks.filter(({ def }) => def.to !== null); // DALTON-HOOK(help)
   const next = visibleTasks.findIndex((task) => !task.done);
-=======
-  const next = tasks.findIndex((task) => !task.done);
->>>>>>> db284da5a
   // Only the browser takes a cross-app task to a tab of its own.
   const newTab = !isDesktopShell();
   const title = t('onboarding.gettingStarted.title');

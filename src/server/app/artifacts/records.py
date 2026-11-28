@@ -242,7 +242,6 @@ def artifact_path(workspace: dict[str, Any], path: str) -> tuple[str, str]:
     return str(workspace["workspace_id"]), relative
 
 
-<<<<<<< HEAD
 # DALTON-HOOK(artifact-publishing-off): the deployment switch for #666's
 # publishing, versions and file comments (dalton.artifact_publishing.enabled,
 # false by code default). These refusals sit beside the guards below rather
@@ -290,7 +289,8 @@ async def _require_admin_for_public_publish(user_id: str) -> None:
         from src.dalton.auth_guards import raise_admin_required
 
         raise_admin_required("仅管理员可公开分享文件，请通过监控面板发布")
-=======
+
+
 async def _reached_workspace(
     workspace_id: str, user_id: str, *, on_computer: bool
 ) -> dict[str, Any]:
@@ -313,7 +313,6 @@ async def _reached_workspace(
     if workspace.get("status") == "deleted":
         raise not_found("Workspace")
     return workspace
->>>>>>> db284da5a
 
 
 async def _record_key(

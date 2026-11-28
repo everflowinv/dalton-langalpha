@@ -28,12 +28,8 @@ from fastapi.responses import JSONResponse, StreamingResponse  # DALTON-HOOK(dri
 from fastapi.routing import APIRoute  # DALTON-HOOK(drive-kill-switch)
 
 from src.config.core import get_infrastructure_config
-<<<<<<< HEAD
 from src.config.features import is_feature_enabled_system  # DALTON-HOOK(drive-kill-switch)
-from src.server.app.drive_http import byte_range, etag_of, receive, status_of
-=======
 from src.server.app.drive_http import byte_range, etag_of, receive
->>>>>>> db284da5a
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import Principal, computer_call, require_scopes

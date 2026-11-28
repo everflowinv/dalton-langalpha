@@ -181,8 +181,13 @@ async def allowance(user_id: str | None) -> int | None:
 
 def history_rule() -> HistoryRule:
     h = _config().history
+    # DALTON-HOOK(drive-long-history): carry keep_days / keep_max for ordinary Drive file history
     return HistoryRule(
-        max_bytes=h.max_bytes, undo_days=h.undo_days, grace_seconds=h.replaced_grace_seconds
+        max_bytes=h.max_bytes,
+        undo_days=h.undo_days,
+        grace_seconds=h.replaced_grace_seconds,
+        keep_days=h.keep_days,
+        keep_max=h.keep_max,
     )
 
 

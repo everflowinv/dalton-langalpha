@@ -707,6 +707,11 @@ async def render_widget(
     time, or the browser failed: a widget never checked is never reported
     broken.
     """
+    # DALTON-HOOK(widget-ssr-off): refuse server-side widget render while disabled.
+    from src.dalton.settings import is_widget_ssr_enabled
+
+    if not is_widget_ssr_enabled():
+        raise WidgetRenderUnavailable("widget server-side rendering is disabled")
     try:
         from playwright.async_api import Error as PlaywrightError
     except ImportError:

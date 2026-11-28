@@ -2100,19 +2100,16 @@
       "stepRunning": "进行中",
       "stepPending": "未开始"
     },
-<<<<<<< HEAD
     "attachmentEmpty": "{{name}} 是空文件，未添加。",
     "attachmentTooLarge": "{{name}} 超过 {{max}} MB 上限，未添加。",
     "attachmentsTotalTooLarge": "{{name}} 未添加：单条消息的附件总大小不能超过 {{max}} MB。",
     "attachmentsTooMany": "未添加：单条消息的附件总数（含截图）不能超过 {{max}} 个。",
-    "steerTemporaryRetry": "暂时失败，可重试。"
-=======
+    "steerTemporaryRetry": "暂时失败，可重试。",
     "dockMinimize": "收起输入框",
     "dockRestore": "发消息",
     "dockWorking": "运行中",
     "dockPillHint": "点击展开，拖动可移动",
     "dockWaiting": "等你回复"
->>>>>>> db284da5a
   },
   "context": {
     "quote": {
@@ -4231,7 +4228,6 @@
     "openInNewTab": "在新标签页中打开",
     "copyLink": "复制链接"
   },
-<<<<<<< HEAD
   "dalton": {
     "budget": {
       "adjust": "调整日预算",
@@ -4929,13 +4925,12 @@
         "street_estimate": "一致预期"
       }
     }
-=======
+  },
   "pageTabs": {
     "label": "已打开的页面",
     "newTab": "新标签页",
     "close": "关闭{{title}}",
     "untitled": "LangAlpha",
     "full": "已打开 {{count}} 个标签页，请先关闭一个再打开新的。"
->>>>>>> db284da5a
   }
 }

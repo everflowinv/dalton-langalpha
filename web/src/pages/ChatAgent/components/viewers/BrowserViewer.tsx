@@ -3,24 +3,15 @@ import { useTranslation } from 'react-i18next';
 import { isImeComposing } from '@/lib/ime';
 import { cn } from '@/lib/utils';
 import type { Modifiers, MouseButton } from '../filePanel/browserProtocol';
-<<<<<<< HEAD
 // DALTON-HOOK(mobile-web): Keyboard icon for on-demand touch software keyboard toggle
-import { Globe, Hand, Keyboard } from 'lucide-react';
-import { isBlankPage, type BrowserPhase } from '../filePanel/browserPhase';
-import { PHASE_CARDS } from './browserPhaseCards';
-import type { BrowserViewSession } from '../filePanel/browserStream';
-import { useBrowserViewState } from '../filePanel/useBrowserView';
-// DALTON-HOOK(mobile-web): canvasScrollPoint maps letterbox swipes onto remote page scroll coordinates
-import { canvasScrollPoint, keyInput, modifiersOf, mouseButton, pagePoint } from './browserInput';
-=======
-import { Hand } from 'lucide-react';
+import { Hand, Keyboard } from 'lucide-react';
 import { isTransient, startStateOf, type BrowserPhase, type BrowserStartState } from '../filePanel/browserPhase';
 import { cardOf } from './browserPhaseCards';
 import type { BrowserViewSession } from '../filePanel/browserStream';
 import { useBrowserViewState } from '../filePanel/useBrowserView';
-import { isHandBackKey, keyInput, modifiersOf, mouseButton, pagePoint } from './browserInput';
+// DALTON-HOOK(mobile-web): canvasScrollPoint maps letterbox swipes onto remote page scroll coordinates
+import { canvasScrollPoint, isHandBackKey, keyInput, modifiersOf, mouseButton, pagePoint } from './browserInput';
 import { BrowserStartPage } from './BrowserStartPage';
->>>>>>> db284da5a
 import { StatusCard } from './StatusCard';
 import './BrowserViewer.css';
 

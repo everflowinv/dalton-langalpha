@@ -1,11 +1,7 @@
 import { useLocation, useNavigate, type NavigateFunction } from 'react-router';
 import { useTranslation } from 'react-i18next';
-<<<<<<< HEAD
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
-=======
-import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useOpenInNewTab } from '@/components/PageTabs/useOpenInNewTab';
->>>>>>> db284da5a
 import { useChatRoute } from '@/components/Sidebar/useChatRoute';
 import { toast } from '@/components/ui/use-toast';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
@@ -20,12 +16,8 @@ import { useUser } from '@/hooks/useUser'; // DALTON-HOOK(colleague-dispatch)
 import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-dispatch)
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { copyText } from '@/lib/clipboard';
-<<<<<<< HEAD
 // DALTON-HOOK(global-search): Dalton document hit navigation types and memo directory path
 import type { GlobalSearchDocumentItem } from '@/lib/dalton/searchApi';
-import { isDesktopShell } from '@/lib/desktop';
-=======
->>>>>>> db284da5a
 import { relativeTime } from '@/lib/format';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { MEMO_USER_DIR } from '@/pages/ChatAgent/utils/agentPaths.generated';

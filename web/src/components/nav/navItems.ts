@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-import { Blocks, ChartCandlestick, HardDrive, LayoutDashboard, LibraryBig, MessagesSquare, Monitor, Settings, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
-=======
-import { Blocks, ChartCandlestick, HardDrive, LayoutDashboard, LibraryBig, MessagesSquare, Receipt, Settings, SquarePen, Timer } from 'lucide-react';
->>>>>>> db284da5a
+import { Blocks, ChartCandlestick, HardDrive, LayoutDashboard, LibraryBig, MessagesSquare, Monitor, Settings, SquarePen, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
 import type { LucideIcon } from 'lucide-react';
 import { RESUME_CHAT } from '@/pages/ChatAgent/hooks/utils/chatSessionRestore';
 
@@ -28,15 +24,9 @@ export interface NavItem {
 
 // Single source of truth for primary navigation (rail + mobile tab bar).
 export const NAV_ITEMS: NavItem[] = [
-<<<<<<< HEAD
   { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub', requires: 'dashboard' }, // DALTON-HOOK(dalton-nav)
-  { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix' },
-  { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
-=======
-  { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub' },
   { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix', state: RESUME_CHAT },
-  { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub' },
->>>>>>> db284da5a
+  { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
   { key: '/monitors', icon: Monitor, labelKey: 'sidebar.monitors', match: 'exact-or-sub' }, // DALTON-HOOK(monitors)
   { key: '/drive', icon: HardDrive, labelKey: 'sidebar.drive', match: 'exact-or-sub', requires: 'drive' },

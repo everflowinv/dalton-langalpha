@@ -308,6 +308,9 @@ async def browser_close(sandbox: Any, *, viewer: str) -> protocol.CloseRefusal |
     closed. The machine refuses while someone else holds the page
     (``browser_runtime.machine.close``); one that does not answer may have
     closed it or not, which the next look tells."""
+    # DALTON-HOOK(browser-kill-switch): skip browser close calls when features.browser is off.
+    if not is_feature_enabled_system("browser"):
+        return "not_running"
     try:
         answer = await _ask(sandbox, "close", viewer, timeout=_CLOSE_TIMEOUT_S)
     except Exception as e:
@@ -327,6 +330,9 @@ async def browser_fit(
     closes, or None for one left as it is for now. The machine decides how large
     and whether at all (``browser_runtime.fit``); a machine whose runtime
     predates the command, or that does not answer, leaves the page as it is."""
+    # DALTON-HOOK(browser-kill-switch): skip browser fit calls when features.browser is off.
+    if not is_feature_enabled_system("browser"):
+        return None
     try:
         answer = await _ask(sandbox, "fit", viewer, str(width), str(height), timeout=_STATUS_TIMEOUT_S)
     except Exception as e:

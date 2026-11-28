@@ -23,13 +23,11 @@ interface InlineWidgetProps {
   title?: string;
   /** Inline data file contents — injected directly as __WIDGET_DATA__. */
   data?: Record<string, string>;
-<<<<<<< HEAD
   /** DALTON-HOOK(shared-widgets): export actions offered; all by default. */
   exports?: WidgetExports;
   /** DALTON-HOOK(share-redaction): static placeholder mode for redacted shared widgets. */
   redacted?: boolean;
   payload?: { redacted?: boolean };
-=======
   /**
    * The widget's segment id, which its kept localStorage and the data its
    * prompt calls pass are filed under. Absent, the content stands in for it.
@@ -43,7 +41,7 @@ interface InlineWidgetProps {
    * frame waits blank rather than loading once without workspace files and
    * again with them.
    */
-  base: string | null | undefined;
+  base?: string | null | undefined;
   /**
    * The height of the preview this widget replaces. The box holds it, and the
    * widget stays transparent over the preview, until its document reports.
@@ -51,7 +49,6 @@ interface InlineWidgetProps {
   handoffHeight?: number;
   /** The widget's document reported its first height: it is now on screen. */
   onShown?: () => void;
->>>>>>> db284da5a
 }
 
 /**
@@ -77,7 +74,6 @@ function widgetHeightKey(html: string, data?: Record<string, string>): string {
   return `${h}|${html.length}|${dataSig}`;
 }
 
-<<<<<<< HEAD
 // DALTON-HOOK(share-redaction): short-circuit to static placeholder card without mounting any iframe when redacted
 export default function InlineWidget(props: InlineWidgetProps) {
   const shareRedaction = useSharedRedaction();
@@ -88,12 +84,9 @@ export default function InlineWidget(props: InlineWidgetProps) {
 }
 
 // DALTON-HOOK(shared-widgets): `exports` narrows the export actions on a shared view.
-function InlineWidgetFrame({ html, title, onSendPrompt, data, exports = 'all' }: InlineWidgetProps & { html: string }) {
-=======
-export default function InlineWidget({
-  html, title, prompts, data, widgetId, base, handoffHeight, onShown,
-}: InlineWidgetProps) {
->>>>>>> db284da5a
+function InlineWidgetFrame({
+  html, title, prompts, data, widgetId, base, handoffHeight, onShown, exports = 'all',
+}: InlineWidgetProps & { html: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [zoom, setZoom] = useState<{ src: string; alt?: string } | null>(null);
@@ -154,23 +147,6 @@ export default function InlineWidget({
     if (height != null) shown();
   }, [height]);
 
-<<<<<<< HEAD
-  // One action set for both surfaces, built on the inline srcDoc. The fullscreen
-  // variant is display markup for the dialog it is shown in and nothing else:
-  // opening, downloading or printing it would hand the user a document carrying
-  // the dialog's own layout, and on paper the box is 680px wide and neither the
-  // column cap nor the magnification means anything.
-  const allActions = useHtmlActions({ mode: 'widget', srcDoc, fileName: title });
-  // DALTON-HOOK(shared-widgets): a surface may offer fewer exports (a shared view).
-  const actions = useMemo(
-    () => ({
-      openInNewTab: exports === 'all' ? allActions.openInNewTab : undefined,
-      downloadHtml: exports === 'none' ? undefined : allActions.downloadHtml,
-      exportPdf: exports === 'all' ? allActions.exportPdf : undefined,
-    }),
-    [exports, allActions.openInNewTab, allActions.downloadHtml, allActions.exportPdf],
-  );
-=======
   // Live report wins; the preview's height or a cached one bridges the load;
   // 150px is the cold guess.
   const displayHeight = height ?? handoffHeight ?? lastKnownHeights.get(heightKey) ?? null;
@@ -194,8 +170,16 @@ export default function InlineWidget({
     return typeof inlined === 'string' ? build(inlined) : inlined.then(build);
   };
   // Its actions are offered only once `srcDoc` is built, so the '' is never acted on.
-  const actions = useHtmlActions({ mode: 'widget', srcDoc: srcDoc ?? '', exportDoc, fileName: title });
->>>>>>> db284da5a
+  const allActions = useHtmlActions({ mode: 'widget', srcDoc: srcDoc ?? '', exportDoc, fileName: title });
+  // DALTON-HOOK(shared-widgets): a surface may offer fewer exports (a shared view).
+  const actions = useMemo(
+    () => ({
+      openInNewTab: exports === 'all' ? allActions.openInNewTab : undefined,
+      downloadHtml: exports === 'none' ? undefined : allActions.downloadHtml,
+      exportPdf: exports === 'all' ? allActions.exportPdf : undefined,
+    }),
+    [exports, allActions.openInNewTab, allActions.downloadHtml, allActions.exportPdf],
+  );
 
   // No max-height cap — widgets span naturally to fit content (charts, tables,
   // dashboards). The agent controls HTML output and the skill doc guides it to

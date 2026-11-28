@@ -205,9 +205,15 @@
     "stop_backup_close_timeout_s": 10.0,
     "stop_backup_total_timeout_s": 120.0,
     "timezone": "Asia/Shanghai",
+    "uvloop": {
+      "enabled": false
+    },
     "weixin": {
       "allow_external": true,
       "max_concurrent_accounts": 200
+    },
+    "widget_render": {
+      "enabled": false
     }
   },
   "dalton_skills_visibility": {

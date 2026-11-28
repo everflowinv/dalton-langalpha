@@ -104,7 +104,7 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     vi.stubEnv('VITE_BRAND_MARK', '');
     vi.resetModules();
 
-    const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
+    const { SidebarCorner } = await import('@/components/Sidebar/SidebarCorner');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
     // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
     // itself needs routes and a query client, which these brand checks don't).
@@ -115,11 +115,11 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     const { container } = render(
       <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
-        <AppSidebar
-          collapsed={false}
-          onToggleCollapse={() => {}}
-          width={260}
-          onWidthChange={() => {}}
+        <SidebarCorner
+          hidden={false}
+          onToggleHidden={() => {}}
+          peek={{ open: false }}
+          cornerRef={null}
         />
         <ShareTopBar name="report.html" />
         <WizardTopBar />
@@ -153,7 +153,7 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     vi.stubEnv('VITE_BRAND_MARK', 'everflow');
     vi.resetModules();
 
-    const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
+    const { SidebarCorner } = await import('@/components/Sidebar/SidebarCorner');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
     // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
     // itself needs routes and a query client, which these brand checks don't).
@@ -163,11 +163,11 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     const { container } = render(
       <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
-        <AppSidebar
-          collapsed={false}
-          onToggleCollapse={() => {}}
-          width={260}
-          onWidthChange={() => {}}
+        <SidebarCorner
+          hidden={false}
+          onToggleHidden={() => {}}
+          peek={{ open: false }}
+          cornerRef={null}
         />
         <ShareTopBar name="report.html" />
         <WizardTopBar />

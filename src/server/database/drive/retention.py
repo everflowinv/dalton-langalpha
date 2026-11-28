@@ -191,7 +191,14 @@ async def _drop(tx: Tx, ids: list[str], roles: tuple[str, ...], before: int | No
         " WHERE v.entry_id = h.entry_id AND v.seq = h.seq AND h.role = ANY(%(roles)s)"
         " AND (%(before)s::int IS NULL OR v.seq < %(before)s::int)"
         " RETURNING v.sha256",
-        {"ids": ids, "max": tx.limits.history.max_bytes, "roles": list(roles), "before": before},
+        {
+            "ids": ids,
+            "max": tx.limits.history.max_bytes,
+            "keep": tx.limits.history.keep_max,  # DALTON-HOOK(drive-long-history)
+            "days": tx.limits.history.keep_days,  # DALTON-HOOK(drive-long-history)
+            "roles": list(roles),
+            "before": before,
+        },
     )
     if clearing:
         await tx.cur.execute("SELECT set_config('drive.clearing', 'off', true)")

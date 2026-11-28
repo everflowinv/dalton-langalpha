@@ -854,14 +854,6 @@ async def lock_user_preferences(user_id: str, *, conn) -> Optional[Dict[str, Any
         return dict(row) if row else None
 
 
-<<<<<<< HEAD
-async def delete_user_preferences(  # DALTON-HOOK(data-jobs): allow callers to delete inside an existing transaction and profile lock
-    user_id: str,
-    conn=None,
-    *,
-    keep_overrides: Collection[str] = (),
-) -> bool:
-=======
 #: Model settings that live in ``other_preference``: the legacy copies of the
 #: moved keys, and the model-adjacent keys that stay there by design (the web's
 #: ``MODEL_PREF_KEYS`` names the same split).
@@ -875,8 +867,12 @@ _KEPT_MODEL_KEYS: frozenset[str] = frozenset(MOVED_MODEL_KEYS) | {
 }
 
 
-async def delete_user_preferences(user_id: str, *, keep_overrides: Collection[str] = ()) -> bool:
->>>>>>> db284da5a
+async def delete_user_preferences(  # DALTON-HOOK(data-jobs): allow callers to delete inside an existing transaction and profile lock
+    user_id: str,
+    conn=None,
+    *,
+    keep_overrides: Collection[str] = (),
+) -> bool:
     """
     Delete a user's preferences, except their model settings, the
     ``feature_overrides`` named in ``keep_overrides`` and the account setup

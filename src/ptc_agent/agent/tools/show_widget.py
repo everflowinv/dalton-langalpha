@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 from typing import TYPE_CHECKING, Annotated, Any
+from uuid import uuid4  # DALTON-HOOK(channel-deep-links)
 
 import structlog
 from langchain_core.tools import BaseTool, InjectedToolCallId
@@ -199,6 +200,11 @@ async def _render(html: str, data: dict[str, str] | None) -> "WidgetRenderReport
     The user already has the widget by now; this only tells the agent whether
     it works, so any failure here costs the report, never the widget.
     """
+    # DALTON-HOOK(widget-ssr-off): server-side widget Chromium render check is off by default.
+    from src.dalton.settings import is_widget_ssr_enabled
+
+    if not is_widget_ssr_enabled():
+        return None
     # Imported here: the tool module stays importable without the server's
     # render stack loaded.
     from src.server.services.widget_render import WidgetRenderError, render_widget
@@ -351,7 +357,14 @@ def create_show_widget_tool(backend: SandboxBackend) -> BaseTool:
                 ), {}
 
         name = title or "widget"
-        artifact: dict[str, Any] = {"type": "html_widget", "html": html, "title": title or ""}
+        widget_id = f"widget_{uuid4().hex[:8]}"
+        artifact: dict[str, Any] = {
+            "type": "html_widget",
+            # DALTON-HOOK(channel-deep-links): persist stable widget_id in checkpointed artifact for replay and deep links
+            "widget_id": widget_id,
+            "html": html,
+            "title": title or "",
+        }
         # Replay reads only the checkpointed artifact: large payloads go to
         # object storage as a content-addressed data_ref so state carries
         # pointers, not bulk data.
@@ -364,30 +377,6 @@ def create_show_widget_tool(backend: SandboxBackend) -> BaseTool:
             writer = get_stream_writer()
         except Exception:
             writer = None
-<<<<<<< HEAD
-
-        widget_id = f"widget_{uuid4().hex[:8]}"
-        display_title = title or ""
-
-        artifact: dict[str, Any] = {
-            "type": "html_widget",
-            # DALTON-HOOK(channel-deep-links): persist stable widget_id in checkpointed artifact for replay and deep links
-            "widget_id": widget_id,
-            "html": html,
-            "title": display_title,
-        }
-
-        # Resolve data files into the checkpointed artifact, which is all
-        # replay reads: large payloads go to object storage as a
-        # content-addressed data_ref so state carries pointers, not bulk data.
-        resolved_data: dict[str, str] | None = None
-        if data_files and backend is not None:
-            resolved_data = await _resolve_data_files(backend, data_files) or None
-        if resolved_data:
-            await _attach_widget_data(artifact, resolved_data)
-
-=======
->>>>>>> db284da5a
         if writer:
             # The call's own id, as replay uses, so the live widget replaces
             # the preview streamed from this call's arguments in place.

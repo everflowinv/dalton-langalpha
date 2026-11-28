@@ -1,9 +1,5 @@
 import React, { useState, useRef, useEffect, useEffectEvent, useCallback, useMemo } from 'react';
-<<<<<<< HEAD
-import { useLocation, useNavigate, useSearchParams } from 'react-router';
-=======
-import { NavigationType, useNavigate, useNavigationType, useSearchParams } from 'react-router';
->>>>>>> db284da5a
+import { NavigationType, useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Info } from 'lucide-react';
@@ -61,12 +57,9 @@ import { ArtifactCommentSendContext } from '../ChatAgent/components/artifactComm
 import type { ChatCommentSends } from '../ChatAgent/components/artifactComments/useChatCommentSends';
 import type { ArtifactCommentRef } from '../ChatAgent/components/artifactComments/artifactCommentReply';
 import { layerAskContext } from './utils/layerAsk';
-<<<<<<< HEAD
-=======
 import { draftKeys } from '@/lib/composerDrafts';
 import { SidebarReveal } from '@/components/Sidebar/SidebarReveal';
 import { usePageTabTitle } from '@/components/PageTabs/usePageTabTitle';
->>>>>>> db284da5a
 
 // Stable identity for the pre-data render, so the reconcile effect's
 // `workspaces` dependency doesn't change on every render before the fetch
@@ -111,13 +104,9 @@ function pickQuickQueryIndices(): number[] {
 function MarketViewInner() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-<<<<<<< HEAD
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
-=======
-  const [searchParams] = useSearchParams();
   const editSearchParams = useEditSearchParams();
->>>>>>> db284da5a
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const { prices: wsPrices, connectionStatus: wsStatus, dataLevel: wsDataLevel, subscribe: wsSubscribe, unsubscribe: wsUnsubscribe } = useMarketDataWSContext();
@@ -126,16 +115,12 @@ function MarketViewInner() {
   // mount as a scope change the user made, and drops the forwarded `?thread`
   // for a fresh chat. Seeded here, the effect below re-applies the same values
   // and React bails, so the link's conversation survives the landing.
-<<<<<<< HEAD
   // DALTON-HOOK(watchlist): restore consumed ws/returnTo from history entry state & detect watchlist route
   const [openingRoute] = useState(() => daltonWatchlist.readDaltonOpeningMarketRoute(searchParams, location.state));
   const showWatchlistView = daltonWatchlist.shouldShowDaltonWatchlist(searchParams);
-=======
-  const [openingRoute] = useState(() => readMarketViewRoute(searchParams));
   const navigationType = useNavigationType();
   // The symbol the address last named, which the page has already followed.
   const urlSymbol = useRef(openingRoute.symbol ? displaySpelling(openingRoute.symbol) : null);
->>>>>>> db284da5a
   // Every way in (link, saved pref, search, sidebar, chip) lands on the display
   // spelling, so a `600519.SS` link, its header, pref and chart keys all read
   // `600519.SH` from the first render.
@@ -143,7 +128,7 @@ function MarketViewInner() {
     () => displaySpelling(openingRoute.symbol || loadPref('symbol', 'GOOGL')) || 'GOOGL',
   );
   const [selectedStockDisplay, setSelectedStockDisplay] = useState<SymbolDisplayOverride | null>(null);
-  usePageTabTitle(selectedStock);
+  usePageTabTitle(showWatchlistView ? null : selectedStock); // DALTON-HOOK(watchlist)
   const wsHasData = wsPrices.has(selectedStock);
   const streamsLive = wsStatus === 'connected' && wsHasData;
 
@@ -402,7 +387,8 @@ function MarketViewInner() {
       setSelectedStock(symbol);
       setSelectedStockDisplay(null);
       setChartMeta(null);
-    } else if (symbol !== selectedStock) {
+    } else if (!showWatchlistView && symbol !== selectedStock) {
+      // DALTON-HOOK(watchlist): do not stamp ?symbol= onto /market while showing the watchlist view
       editSearchParams((params) => params.set('symbol', selectedStock), { replace: true });
     }
     // Land on the timeframe the expanded card was drawn for, so its layers
@@ -425,11 +411,7 @@ function MarketViewInner() {
     // A comment a phone opened from the chat comes forward on the chart the
     // route lands on, as one the Market chat names does.
     const commentChart = route.commentId ? chartIdFor(route.symbol, route.timeframe) : null;
-<<<<<<< HEAD
-    if (route.commentId && commentChart) {
-      focusSerial.current += 1;
-      requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId, key: focusSerial.current });
-    }
+    if (route.commentId && commentChart) requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId });
     // `thread` stays for MarketChatPanel, which consumes it itself.
     // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL & persist consumed `ws`/`returnTo` in history state
     const consumed = MARKET_VIEW_ROUTE_PARAMS.filter(
@@ -443,19 +425,7 @@ function MarketViewInner() {
         return next;
       }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, setSearchParams, selectWorkspace, location.state, requestFocus]);
-=======
-    if (route.commentId && commentChart) requestFocus({ kind: 'chart', path: commentChart, commentId: route.commentId });
-    // `thread` stays for MarketChatPanel, which consumes it itself, and
-    // `symbol` stays as the page's own address.
-    const consumed = MARKET_VIEW_ROUTE_PARAMS.filter((key) => key !== 'thread' && key !== 'symbol' && searchParams.has(key));
-    if (consumed.length > 0) {
-      editSearchParams((params) => {
-        for (const key of consumed) params.delete(key);
-      }, { replace: true });
-    }
-  }, [searchParams, selectedStock, editSearchParams, requestFocus, navigationType]);
->>>>>>> db284da5a
+  }, [searchParams, selectedStock, showWatchlistView, setSearchParams, editSearchParams, location.state, requestFocus, navigationType]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);
@@ -956,18 +926,15 @@ function MarketViewInner() {
                   wsStatus={wsStatus}
                   marketStatus={marketStatus}
                   comments={chartComments}
-<<<<<<< HEAD
                   toolbarLead={
                     backToWatchlistButton ? (
-                      <div className="inline-flex items-center">
+                      <div className="inline-flex items-center gap-1 min-w-0">
+                        <SidebarReveal titlebar />
                         {backToWatchlistButton}
                         {legend.toolbarLead}
                       </div>
-                    ) : legend.toolbarLead
+                    ) : toolbarLead
                   }
-=======
-                  toolbarLead={toolbarLead}
->>>>>>> db284da5a
                   toolbarLeadKey={legend.toolbarLeadKey}
                   measureToolbarLead={legend.measureToolbarLead}
                   toolbarTrail={toolbarTrail}

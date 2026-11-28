@@ -21,8 +21,8 @@ export function shouldShowDaltonWatchlist(searchParams: URLSearchParams): boolea
 }
 
 export function shouldConsumeMarketRouteParam(key: string): boolean {
-  if (key === 'thread') return false;
-  if (isDaltonBuild && (key === 'symbol' || key === 'tf')) return false;
+  if (key === 'thread' || key === 'symbol') return false;
+  if (isDaltonBuild && key === 'tf') return false;
   return true;
 }
 

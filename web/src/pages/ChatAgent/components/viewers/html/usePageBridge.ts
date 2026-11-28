@@ -1,12 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react';
-<<<<<<< HEAD
-import { resolveThemeVars } from './buildHtmlSrcDoc';
+import { paletteCss, readThemePalette } from './frameTheme';
 // DALTON-HOOK(mobile-web): import PageReadyPathState for tri-state bridge location tracking
 import { parsePageMessage, type PageReadyPathState, type PageToViewer, type ViewerToPage } from './pageProtocol';
-=======
-import { paletteCss, readThemePalette } from './frameTheme';
-import { parsePageMessage, type PageToViewer, type ViewerToPage } from './pageProtocol';
->>>>>>> db284da5a
 
 /** The viewer's end of the bridge, handed to whatever draws over the frame. */
 export interface PageBridge {

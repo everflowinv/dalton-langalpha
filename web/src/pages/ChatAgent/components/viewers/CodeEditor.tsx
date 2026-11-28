@@ -232,12 +232,8 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
               }
               diffRef.current = { editor: diffEditor, listeners, keepsModified: seedOnly };
             }}
-<<<<<<< HEAD
             // DALTON-HOOK(mobile-web): switch Monaco DiffEditor to single-column inline diff on phones
-            options={{ ...EDITOR_OPTIONS, readOnly, renderSideBySide: !isMobile }}
-=======
-            options={{ ...EDITOR_OPTIONS, readOnly, renderSideBySide: !inline }}
->>>>>>> db284da5a
+            options={{ ...EDITOR_OPTIONS, readOnly, renderSideBySide: !(inline || isMobile) }}
           />
         </div>
       )}

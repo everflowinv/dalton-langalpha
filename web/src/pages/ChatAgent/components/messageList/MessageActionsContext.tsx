@@ -106,20 +106,16 @@ export interface MessageActions {
   onThumbDown?: (turnIndex: number, issueCategories: string[], comment: string | null, consentHumanReview: boolean) => Promise<FeedbackResult | null>;
   /** Add to a sent thumbs-down's report, or withdraw it. */
   onThumbDownFollowUp?: (turnIndex: number, action: ThumbDownFollowUp) => Promise<ThumbDownFollowUpOutcome>;
-<<<<<<< HEAD
-  onWidgetSendPrompt?: (text: string) => void;
+  /** What a ShowWidget widget's prompt calls do here, one identity-stable
+   *  object (`useWidgetPromptActions`). A call left out does nothing: a shared
+   *  view answers none. */
+  widgetPrompts?: WidgetPrompts;
   /** DALTON-HOOK(shared-widgets): which of an inline widget's export actions
    *  the surface offers. Absent means all of them (the owner's view). A shared
    *  view offers no new tab or PDF, which run the widget outside its sandbox
    *  on the app's origin, and the HTML download only where the share allows
    *  downloads. */
   widgetExports?: WidgetExports;
-=======
-  /** What a ShowWidget widget's prompt calls do here, one identity-stable
-   *  object (`useWidgetPromptActions`). A call left out does nothing: a shared
-   *  view answers none. */
-  widgetPrompts?: WidgetPrompts;
->>>>>>> db284da5a
   /** The thread a failed turn's card offers to report, once the server has
    *  named it. Absent where reporting is not offered (a shared view). */
   reportThreadId?: string;

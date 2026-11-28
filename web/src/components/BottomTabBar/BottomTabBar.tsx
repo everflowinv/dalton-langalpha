@@ -1,7 +1,6 @@
 import { useRef } from 'react'; // DALTON-HOOK(mobile-web)
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-<<<<<<< HEAD
 import { MoreHorizontal, Search } from 'lucide-react'; // DALTON-HOOK(global-search) DALTON-HOOK(mobile-web)
 import { useCommandPalette } from '@/components/CommandPalette/CommandPaletteProvider'; // DALTON-HOOK(global-search)
 // DALTON-HOOK(mobile-web): use Radix DropdownMenu so "More" gets arrow-key roving focus, Escape, and aria-haspopup natively
@@ -11,9 +10,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-=======
-import { SETTINGS_ITEM, type NavItem } from '../nav/navItems';
->>>>>>> db284da5a
+import type { NavItem } from '../nav/navItems';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
 import { useMobileBottomNavItems } from '@/lib/dalton/mobileBottomNav'; // DALTON-HOOK(mobile-web)
@@ -30,20 +27,13 @@ export default function BottomTabBar() {
   const openingPaletteRef = useRef(false);
   // Settings rides at the end of whichever primary items this user can see.
   const navItems = useNavItems();
-<<<<<<< HEAD
   const { primaryItems, overflowItems } = useMobileBottomNavItems(navItems); // DALTON-HOOK(mobile-web)
   const hasMoreMenu = overflowItems.length > 0 || Boolean(palette);
   const moreActive = overflowItems.some((item) => isActive(item));
 
-  const handleItemClick = (path: string) => {
-    if (location.pathname === path) return;
-    navigate(path);
-=======
-  const menuItems = [...navItems, SETTINGS_ITEM];
   const handleItemClick = (item: NavItem) => {
     if (location.pathname === item.key) return;
     navigate(item.key, { state: item.state });
->>>>>>> db284da5a
   };
 
   return (
@@ -105,7 +95,7 @@ export default function BottomTabBar() {
                       color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
                       fontWeight: active ? 600 : 400,
                     }}
-                    onSelect={() => handleItemClick(item.key)}
+                    onSelect={() => handleItemClick(item)}
                     aria-current={active ? 'page' : undefined}
                   >
                     <Icon className="h-4 w-4 shrink-0" />

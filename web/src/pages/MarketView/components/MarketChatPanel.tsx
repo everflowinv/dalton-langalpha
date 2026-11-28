@@ -18,7 +18,7 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { isDaltonAuth } from '@/config/daltonAuth';
 // DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
-import { attachComposerModelPickSeq, buildWidgetPromptModelOptions } from '@/lib/dalton/threadModelDalton';
+import { attachComposerModelPickSeq } from '@/lib/dalton/threadModelDalton';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
 import { useAllModels } from '@/hooks/useAllModels';
@@ -55,13 +55,9 @@ import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
-<<<<<<< HEAD
-import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
-=======
-import { attachmentSendParts, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
+import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload'; // DALTON-HOOK(chat-attachment-count)
 import type { WidgetSendParts } from '../../ChatAgent/utils/widgetPrompt';
 import type { SendOptions } from '../../ChatAgent/session/types';
->>>>>>> db284da5a
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
@@ -187,84 +183,16 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   const computers = useComputerRoots({ enabled: !!activeWorkspace });
   const folders = useMemo(() => computerFolders(activeWorkspace, null, computers), [activeWorkspace, computers]);
 
-<<<<<<< HEAD
-  // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
-  // (workspace, symbol), then a new chat. This state determines which thread
-  // mounts on the keyed `<ChatBody>` — changing it forces a remount so the SSE
-  // engine can re-initialise with a different thread.
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [activeThreadInit, setActiveThreadInit] = useState<string>(() => {
-    const fromUrl = readMarketViewRoute(searchParams).threadId;
-    if (fromUrl) return fromUrl;
-    return getMarketThreadId(activeWorkspaceId, symbol) ?? '__default__';
-  });
-
-  // Re-resolve thread when symbol changes: restore the last-seen thread for
-  // the new symbol in the current workspace, or start a fresh chat if none.
-  // A fresh chat also drops `?thread` from the URL; the mirror below rewrites
-  // it for a restored thread but never touches it for a default one, so a
-  // reload would otherwise reopen the previous symbol's conversation and
-  // save it as this symbol's.
-  const lastSymbolRef = useRef(symbol);
-  useEffect(() => {
-    if (lastSymbolRef.current === symbol) return;
-    lastSymbolRef.current = symbol;
-    const restored = getMarketThreadId(activeWorkspaceId, symbol);
-    setActiveThreadInit(restored ?? '__default__');
-    if (restored) return;
-    setSearchParams((p) => {
-      const next = new URLSearchParams(p);
-      if (next.has('thread')) next.delete('thread');
-      return next;
-    }, { replace: true });
-  }, [symbol, activeWorkspaceId, setSearchParams]);
-
-  // Reset to a fresh chat when the scope or workspace changes. The user
-  // explicitly chose a different scope — surface a clean slate. localStorage
-  // is keyed by (workspace, symbol), so the previous scope's pointer stays
-  // intact and is reachable via the history dropdown.
-  const prevWorkspaceRef = useRef<string | null>(activeWorkspaceId);
-  useEffect(() => {
-    const prev = prevWorkspaceRef.current;
-    if (prev === activeWorkspaceId) return;
-    prevWorkspaceRef.current = activeWorkspaceId;
-    if (prev === null || activeWorkspaceId === null) return;
-    setActiveThreadInit(`__default__#${Date.now()}`);
-    setSearchParams((p) => {
-      const next = new URLSearchParams(p);
-      if (next.has('thread')) next.delete('thread');
-      return next;
-    }, { replace: true });
-  }, [activeWorkspaceId, setSearchParams]);
-
-  const handleSelectThread = useCallback((threadId: string) => {
-    setMarketThreadId(activeWorkspaceId, symbol, threadId);
-    setActiveThreadInit(threadId);
-  }, [activeWorkspaceId, symbol]);
-
+  // The thread the keyed `<ChatBody>` mounts on: a change remounts it, so the
+  // SSE engine re-initialises on the other thread.
+  const route = useMarketThreadRoute(activeWorkspaceId, symbol);
   const handleStartNewChat = useCallback(() => {
-    clearMarketThreadId(activeWorkspaceId, symbol);
     // DALTON-HOOK(composer-drafts): clear new-chat draft and cancel pending save on explicit New Chat
     if (activeWorkspaceId) {
       clearChatDraft(`market:panel:${activeWorkspaceId}:${(symbol || 'default').toUpperCase()}`);
     }
-    // Force a remount even if we were already on __default__ — append a
-    // monotonic suffix that's stripped before passing to useChatMessages.
-    setActiveThreadInit(`__default__#${Date.now()}`);
-    // Clear `?thread=` from the URL too — otherwise a refresh on the
-    // empty new-chat panel would restore the old thread from the URL,
-    // beating the freshly-cleared localStorage entry.
-    setSearchParams((p) => {
-      const next = new URLSearchParams(p);
-      if (next.has('thread')) next.delete('thread');
-      return next;
-    }, { replace: true });
-  }, [activeWorkspaceId, symbol, setSearchParams]);
-=======
-  // The thread the keyed `<ChatBody>` mounts on: a change remounts it, so the
-  // SSE engine re-initialises on the other thread.
-  const route = useMarketThreadRoute(activeWorkspaceId, symbol);
->>>>>>> db284da5a
+    route.startNewChat();
+  }, [activeWorkspaceId, symbol, route.startNewChat]);
 
   if (scope === 'workspace' && !activeWorkspaceId) {
     return (
@@ -286,7 +214,7 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
         activeWorkspaceId={activeWorkspaceId}
         initialThreadId={route.threadId}
         onSelectThread={route.selectThread}
-        onStartNewChat={route.startNewChat}
+        onStartNewChat={handleStartNewChat}
         onStartThread={route.startThread}
         firstSend={route.firstSend}
       />
@@ -772,35 +700,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     setDialogPayload({ type: 'toolcall', toolCallId });
   }, []);
 
-<<<<<<< HEAD
-  // The panel's transcript action surface. Each member is useStableHandler'd
-  // so the context value survives every streamed chunk — the chat engine
-  // rebuilds its handlers per render, and a fresh value here would re-render
-  // every settled bubble in the panel.
-  const stableOpenSubagentTask = useStableHandler(handleOpenSubagentTask);
-  const stableToolCallDetail = useStableHandler(handleToolCallDetailClick);
-  const stableAnswerQuestion = useStableHandler(handleAnswerQuestion);
-  const stableSkipQuestion = useStableHandler(handleSkipQuestion);
-  const stableApproveCreateWorkspace = useStableHandler(handleApproveCreateWorkspace);
-  const stableRejectCreateWorkspace = useStableHandler(handleRejectCreateWorkspace);
-  const stableApproveStartQuestion = useStableHandler(handleApproveStartQuestion);
-  const stableRejectStartQuestion = useStableHandler(handleRejectStartQuestion);
-  const stableApprovePTCAgent = useStableHandler(handleApprovePTCAgent);
-  const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
-  const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
-  const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
-  // DALTON-HOOK(watchlist): stable watchlist confirmation handlers
-  const stableApproveWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
-    handleApproveWatchlistAction?.(proposalData));
-  const stableRejectWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
-    handleRejectWatchlistAction?.(proposalData));
-  const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
-  const stableApproveToolCall = useStableHandler(handleApproveToolCall);
-  const stableRejectToolCall = useStableHandler(handleRejectToolCall);
-  const stableEditMessage = useStableHandler((id: string, content: string) =>
-    handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
-  const stableRegenerate = useStableHandler((id: string) =>
-    handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
   // DALTON-HOOK(automation-effort): identify the currently retryable failed reply so prior unsent effort picks do not carry into a later retry
   const retryTargetId = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -811,27 +710,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     }
     return null;
   }, [messages]);
-  // DALTON-HOOK(automation-effort): prefer getRetryModelOptions so saved composer effort is not auto-sent on retry
-  const stableRetry = useStableHandler(() =>
-    handleRetry(
-      chatInputRef.current?.getRetryModelOptions?.()
-      ?? chatInputRef.current?.getModelOptions?.(),
-    ));
-=======
->>>>>>> db284da5a
   // Steering the agent finished without reading, edit text whose message is
   // gone, and the files of a send a stop held back come back to the composer,
   // beside whatever was typed there since.
   useComposerGiveBack(chatInputRef, chat);
-<<<<<<< HEAD
-  const stableThumbUp = useStableHandler(handleThumbUp);
-  const stableThumbDown = useStableHandler(handleThumbDown);
-  const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
-  // DALTON-HOOK(antigravity-series): forward only model and modelPickSeq on Dalton widget prompts
-  const stableWidgetSendPrompt = useStableHandler((text: string) => {
-    const opts = buildWidgetPromptModelOptions(chatInputRef.current?.getModelOptions?.()?.model, threadModel);
-    handleSendMessage(text, null, null, opts);
-=======
   // A widget's prompt calls send as the box's send would, with the chart's
   // skill and views; a new chat opens in the panel, as its "new chat" does.
   const sendFromWidget = (text: string, parts: WidgetSendParts, options: SendOptions) => {
@@ -845,7 +727,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     send: (text, parts) => sendFromWidget(text, parts, { ...readComposerOptions(), subagentsAllowed: subagentsToSend, ...tuningToSend }),
     openThread: (text, parts, carry) => onStartThread({ text, parts, options: carry }),
     readCarry: () => newThreadCarry(readComposerOptions(), threadSubagents, threadTuning.tuning),
->>>>>>> db284da5a
   });
   // The first message of a chat a widget's startThread opened, once its
   // engine has mounted. The guard is set when it goes, so a strict-mode
@@ -862,37 +743,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   }, [firstSend, sendFirst]);
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
-<<<<<<< HEAD
   // DALTON-HOOK(external-share-guard)/(team-sharing): the market transcript's
   // file cards offer Publish to the workspace's own owner only — a colleague
   // (rw or ro) or an external/unknown member gets no entry; the server refuses them.
   const identity = useCallerIdentity();
   const publishAllowed =
     !teamReadOnly.isColleague && identity.canActAsOwner && !identity.isConfirming;
-  const messageActions = useMemo<MessageActions>(() => ({
-    onOpenArtifactComment: commentOpeners,
-    onOpenSubagentTask: stableOpenSubagentTask,
-    onToolCallDetailClick: stableToolCallDetail,
-    onAnswerQuestion: stableAnswerQuestion,
-    onSkipQuestion: stableSkipQuestion,
-    onApproveCreateWorkspace: stableApproveCreateWorkspace,
-    onRejectCreateWorkspace: stableRejectCreateWorkspace,
-    onApproveStartQuestion: stableApproveStartQuestion,
-    onRejectStartQuestion: stableRejectStartQuestion,
-    onApprovePTCAgent: stableApprovePTCAgent,
-    onRejectPTCAgent: stableRejectPTCAgent,
-    onApproveSecretaryAction: stableApproveSecretaryAction,
-    onRejectSecretaryAction: stableRejectSecretaryAction,
-    // DALTON-HOOK(watchlist): expose watchlist confirmation handlers on MarketChatPanel
-    onApproveWatchlistAction: stableApproveWatchlistAction,
-    onRejectWatchlistAction: stableRejectWatchlistAction,
-    onResumeCreditPause: stableResumeCreditPause,
-    onApproveToolCall: stableApproveToolCall,
-    onRejectToolCall: stableRejectToolCall,
-    onEditMessage: stableEditMessage,
-    onRegenerate: stableRegenerate,
-    onRetry: stableRetry,
-=======
   // The panel's transcript action surface, identity-stable across streamed
   // chunks: the chat engine rebuilds its handlers per render, and a fresh
   // value here would re-render every settled bubble in the panel.
@@ -910,38 +766,27 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onRejectPTCAgent: handleRejectPTCAgent,
     onApproveSecretaryAction: handleApproveSecretaryAction,
     onRejectSecretaryAction: handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): expose watchlist confirmation handlers on MarketChatPanel
+    onApproveWatchlistAction: handleApproveWatchlistAction,
+    onRejectWatchlistAction: handleRejectWatchlistAction,
     onResumeCreditPause: handleResumeCreditPause,
     onApproveToolCall: handleApproveToolCall,
     onRejectToolCall: handleRejectToolCall,
     onEditMessage: handleEditMessage,
     onRegenerate: handleRegenerate,
     onRetry: handleRetry,
->>>>>>> db284da5a
     editDrafts,
     onThumbUp: handleThumbUp,
     onThumbDown: handleThumbDown,
     onThumbDownFollowUp: handleThumbDownFollowUp,
     widgetPrompts,
     onRevealMessage: follow.reveal,
-    ...(publishAllowed ? { onPublishFile } : {}), // DALTON-HOOK(external-share-guard)
+    onPublishFile,
+    publishAllowed, // DALTON-HOOK(external-share-guard)
     // A thread the server has named, so a failed turn's banner can offer "Report this".
     reportThreadId: realThreadId,
-<<<<<<< HEAD
-  }), [
-    stableOpenSubagentTask, stableToolCallDetail,
-    stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
-    stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
-    stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction, // DALTON-HOOK(watchlist)
-    stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
-    stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, realThreadId, // DALTON-HOOK(external-share-guard)
-    commentOpeners,
-  ]);
-=======
     chatInputRef,
   });
->>>>>>> db284da5a
 
   // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
   // proposal so its "open in chat" deep-link lands back here. Null in a

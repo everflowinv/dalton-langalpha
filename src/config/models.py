@@ -617,6 +617,17 @@ class DriveHistoryConfig(BaseModel):
             "7 days and 100 MB"
         ),
     )
+    # DALTON-HOOK(drive-long-history): retain pre-#890 long history bounds for ordinary Drive files
+    keep_days: int | None = Field(
+        default=30,
+        ge=1,
+        description="Days an old version of a file not held as text is kept; null for no age limit",
+    )
+    keep_max: int | None = Field(
+        default=10,
+        ge=0,
+        description="Old versions per file kept, besides text; null for no count limit",
+    )
     replaced_grace_seconds: int = Field(
         default=3600,
         ge=0,

@@ -215,9 +215,9 @@ export const SETTINGS = {
   notifyNeedsInput: { section: 'general', anchor: 'notify-needs-input', labelKey: 'settings:desktop.notifyNeedsInput', descKey: 'settings:desktop.notifyNeedsInputDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
   notifyWakeup: { section: 'general', anchor: 'notify-wakeup', labelKey: 'settings:desktop.notifyWakeup', descKey: 'settings:desktop.notifyWakeupDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
   notifyAutomation: { section: 'general', anchor: 'notify-automation', labelKey: 'settings:desktop.notifyAutomation', descKey: 'settings:desktop.notifyAutomationDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
-  notifyStarted: { section: 'general', anchor: 'notify-started', labelKey: 'settings:desktop.notifyStarted', descKey: 'settings:desktop.notifyStartedDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  notifyStarted: { section: 'general', anchor: 'notify-started', labelKey: 'settings:desktop.notifyStarted', descKey: 'settings:desktop.notifyStartedDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup', 'settings:desktop.badge'] },
   menubarIcon: { section: 'general', anchor: 'menubar-icon', labelKey: 'settings:desktop.menubarIcon', descKey: 'settings:desktop.menubarIconDesc', desktopOnly: true, alsoKeys: ['settings:desktop.shortcut', 'settings:desktop.keepRunning', 'settings:desktop.openAtLogin'] },
-  menubarItems: { section: 'general', anchor: 'menubar-items', labelKey: 'settings:desktop.menubarItems', descKey: 'settings:desktop.menubarItemsDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarStyle', 'settings:desktop.menubarStyleRotate', 'settings:desktop.menubarStyleSide', 'settings:desktop.addSymbol'] },
+  menubarItems: { section: 'general', anchor: 'menubar-items', labelKey: 'settings:desktop.menubarItems', descKey: 'settings:desktop.menubarItemsDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarStyle', 'settings:desktop.menubarStyleRotate', 'settings:desktop.menubarStyleSide', 'settings:desktop.menubarLogo', 'settings:desktop.addSymbol'] },
   menubarShow: { section: 'general', anchor: 'menubar-show', labelKey: 'settings:desktop.menubarShow', descKey: 'settings:desktop.menubarShowDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarGroup'] },
   menubarExtendedHours: { section: 'general', anchor: 'menubar-extended-hours', labelKey: 'settings:desktop.menubarExtended', descKey: 'settings:desktop.menubarExtendedDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarGroup'] },
   panelSections: { section: 'general', anchor: 'panel-sections', labelKey: 'settings:desktop.panelSections', descKey: 'settings:desktop.panelSectionsDesc', desktopOnly: true, alsoKeys: ['settings:desktop.panelGroup'] },
@@ -230,7 +230,6 @@ export const SETTINGS = {
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings:turnEndScroll', descKey: 'settings:turnEndScrollDesc' },
   composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings:composerTray', descKey: 'settings:composerTrayDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings:voiceInput', descKey: 'settings:voiceInputDesc' },
-<<<<<<< HEAD
   // DALTON-HOOK(settings-section): bilingual search keywords for artifacts & output settings
   commentDestination: { section: 'chat', anchor: 'comment-destination', labelKey: 'settings:artifacts.destination', descKey: 'settings:artifacts.destinationDesc', keywords: '评论去向 comment destination' },
   commentEnter: { section: 'chat', anchor: 'comment-enter', labelKey: 'settings:artifacts.enter', descKey: 'settings:artifacts.enterDesc', keywords: '评论 回车 comment enter' },
@@ -247,36 +246,6 @@ export const SETTINGS = {
   // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
   // DALTON-HOOK(standalone-core): gate Home Team Memory on conversation_archive
   daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings:dalton.homeTeamMemoryLabel', descKey: 'settings:dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', capability: 'conversation_archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
-=======
-  commentDestination: { section: 'artifacts', anchor: 'comment-destination', labelKey: 'settings:artifacts.destination', descKey: 'settings:artifacts.destinationDesc' },
-  commentEnter: { section: 'artifacts', anchor: 'comment-enter', labelKey: 'settings:artifacts.enter', descKey: 'settings:artifacts.enterDesc' },
-  artifactAnswers: { section: 'artifacts', anchor: 'artifact-answers', labelKey: 'settings:artifacts.answers', descKey: 'settings:artifacts.answersDesc' },
-  notifyTurn: { section: 'desktop', anchor: 'notify-turn', labelKey: 'settings:desktop.notifyTurn', descKey: 'settings:desktop.notifyTurnDesc', alsoKeys: ['settings:desktop.notificationsGroup'] },
-  notifyNeedsInput: { section: 'desktop', anchor: 'notify-needs-input', labelKey: 'settings:desktop.notifyNeedsInput', descKey: 'settings:desktop.notifyNeedsInputDesc', alsoKeys: ['settings:desktop.notificationsGroup'] },
-  notifyWakeup: { section: 'desktop', anchor: 'notify-wakeup', labelKey: 'settings:desktop.notifyWakeup', descKey: 'settings:desktop.notifyWakeupDesc', alsoKeys: ['settings:desktop.notificationsGroup'] },
-  notifyAutomation: { section: 'desktop', anchor: 'notify-automation', labelKey: 'settings:desktop.notifyAutomation', descKey: 'settings:desktop.notifyAutomationDesc', alsoKeys: ['settings:desktop.notificationsGroup'] },
-  // The badge row under it is drawn only where the shell draws a badge.
-  notifyStarted: { section: 'desktop', anchor: 'notify-started', labelKey: 'settings:desktop.notifyStarted', descKey: 'settings:desktop.notifyStartedDesc', alsoKeys: ['settings:desktop.notificationsGroup', 'settings:desktop.badge'] },
-  // The rows under it are drawn only where the platform can do them.
-  menubarIcon: { section: 'desktop', anchor: 'menubar-icon', labelKey: 'settings:desktop.menubarIcon', descKey: 'settings:desktop.menubarIconDesc', alsoKeys: ['settings:desktop.shortcut', 'settings:desktop.keepRunning', 'settings:desktop.openAtLogin'] },
-  // Drawn while the icon is on, which it is by default. Rotate / side by side
-  // and the logo switch are drawn only where the text sits beside the icon
-  // (macOS), so they are found through the list they lay out.
-  menubarItems: { section: 'desktop', anchor: 'menubar-items', labelKey: 'settings:desktop.menubarItems', descKey: 'settings:desktop.menubarItemsDesc', alsoKeys: ['settings:desktop.menubarStyle', 'settings:desktop.menubarStyleRotate', 'settings:desktop.menubarStyleSide', 'settings:desktop.menubarLogo', 'settings:desktop.addSymbol'] },
-  menubarShow: { section: 'desktop', anchor: 'menubar-show', labelKey: 'settings:desktop.menubarShow', descKey: 'settings:desktop.menubarShowDesc', alsoKeys: ['settings:desktop.menubarGroup'] },
-  menubarExtendedHours: { section: 'desktop', anchor: 'menubar-extended-hours', labelKey: 'settings:desktop.menubarExtended', descKey: 'settings:desktop.menubarExtendedDesc', alsoKeys: ['settings:desktop.menubarGroup'] },
-  panelSections: { section: 'desktop', anchor: 'panel-sections', labelKey: 'settings:desktop.panelSections', descKey: 'settings:desktop.panelSectionsDesc', alsoKeys: ['settings:desktop.panelGroup'] },
-  panelTiles: { section: 'desktop', anchor: 'panel-tiles', labelKey: 'settings:desktop.panelTiles', descKey: 'settings:desktop.panelTilesDesc', alsoKeys: ['settings:desktop.panelGroup'] },
-  panelWatchlist: { section: 'desktop', anchor: 'panel-watchlist', labelKey: 'settings:desktop.panelWatchlist', descKey: 'settings:desktop.panelWatchlistDesc', alsoKeys: ['settings:desktop.panelGroup'] },
-  outputFormat: { section: 'agent', anchor: 'output-format', labelKey: 'settings:outputFormat', descKey: 'settings:outputFormatDesc' },
-  researchDepth: { section: 'agent', anchor: 'research-depth', labelKey: 'settings:researchDepth', descKey: 'settings:researchDepthDesc' },
-  reachingOut: { section: 'agent', anchor: 'reaching-out', labelKey: 'settings:reachingOut', descKey: 'settings:reachingOutDesc' },
-  subagents: { section: 'agent', anchor: 'subagents', labelKey: 'settings:subagentsDefault', descKey: 'settings:subagentsDefaultDesc' },
-  ownContext: { section: 'agent', anchor: 'own-context', labelKey: 'settings:ownContext', descKey: 'settings:ownContextDesc', feature: 'shared_workspaces_member_context' },
-  approveHandoffs: { section: 'agent', anchor: 'approve-handoffs', labelKey: 'settings:autoApproveHandoffs', descKey: 'settings:autoApproveHandoffsDesc' },
-  approveWorkspaces: { section: 'agent', anchor: 'approve-workspaces', labelKey: 'settings:autoApproveWorkspaceCreation', descKey: 'settings:autoApproveWorkspaceCreationDesc' },
-  searchProvider: { section: 'agent', anchor: 'search-provider', labelKey: 'settings:searchProvider', descKey: 'settings:searchProviderDesc', alsoKeys: ['settings:searchDepth'] },
->>>>>>> db284da5a
   // A machine's own settings are in the Computers panel each row opens, so
   // the list is what a search for one of them lands on.
   computers: {

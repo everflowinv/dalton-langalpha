@@ -46,11 +46,8 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import httpx
 
-<<<<<<< HEAD
-from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
-=======
 from ptc_agent.agent.middleware.runtime_context.surface import CHAT_APP_NAMES
->>>>>>> db284da5a
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
 from src.tools.messaging import tools as messaging
 
 logger = logging.getLogger(__name__)

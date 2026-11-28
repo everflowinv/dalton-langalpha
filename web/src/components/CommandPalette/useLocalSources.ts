@@ -15,24 +15,17 @@ import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { readRecentTickers } from '@/lib/recentTickers';
 import { useStorageUser } from '@/lib/userStorage';
 import type { SkillInfo } from '@/pages/ChatAgent/utils/api/skills';
-<<<<<<< HEAD
 // DALTON-HOOK(colleague-dispatch): palette reads the sidebar's workspace permissions
 import { resolveNavWorkspacePermissions } from '@/pages/ChatAgent/components/NavigationRows';
-=======
 import { workspacePath } from '@/pages/ChatAgent/utils/chatRoutes';
->>>>>>> db284da5a
 import { useSaveFailureToast } from '@/pages/Settings/panels/usePreferenceWrite';
 // DALTON-HOOK(settings-section): palette settings use the rail's card visibility
 import { useDaltonSettingsVisibility } from '@/pages/Settings/components/SettingsRail';
 // DALTON-HOOK(standalone-core): import capability-aware settingLabelKey for palette display & matching
 import { SECTIONS, searchableSettings, settingLabelKey, settingSearchText } from '@/pages/Settings/sections';
 import type { Workspace } from '@/types/api';
-<<<<<<< HEAD
-import { runs, type Verbs } from './rows';
-import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
-=======
 import { inNewTab, runs, type Verbs } from './rows';
->>>>>>> db284da5a
+import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
 import type { PaletteItem } from './types';
 
 /**
@@ -82,15 +75,11 @@ export function useLocalSources(v: Verbs, returnFocus?: () => HTMLElement | null
         runs('open', t('palette.do.open'), FolderOpen, () =>
           navigate(workspacePath(ws.workspace_id), { state: { workspaceName: name, workspaceStatus: ws.status ?? null } }),
         ),
-<<<<<<< HEAD
+        ...inNewTab(workspacePath(ws.workspace_id), v),
         // DALTON-HOOK(colleague-dispatch): new-thread only where the sidebar would allow creating one
         ...(!permissionsLoading && perms.canCreateThread
           ? [runs('new-thread', t('palette.do.newThreadIn', { workspace: name }), SquarePen, () => v.newThread(ws.workspace_id))]
           : []),
-=======
-        ...inNewTab(workspacePath(ws.workspace_id), v),
-        runs('new-thread', t('palette.do.newThreadIn', { workspace: name }), SquarePen, () => v.newThread(ws.workspace_id)),
->>>>>>> db284da5a
       ],
     };
   };

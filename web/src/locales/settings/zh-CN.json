@@ -145,10 +145,7 @@
     },
     "claude_oauth": {
       "label": "Claude 登录（旧版）",
-<<<<<<< HEAD
       "description": "通过登录你的 Claude 账户使用 Claude Pro 或 Max 套餐，由 {{brand}} 直接调用 Claude。Claude Code 模式将取代它。"
-=======
-      "description": "通过登录你的 Claude 账户使用 Claude Pro 或 Max 套餐，由 LangAlpha 直接调用 Claude。Claude Code 模式将取代它。"
     },
     "page_tabs": {
       "label": "页面标签",
@@ -157,7 +154,6 @@
       "off_if": "你习惯用侧边栏切换页面，想让窗口顶部保持清爽。",
       "cost": "不产生额外费用",
       "good_to_know": "标签记住的是所在的页面，不是滚动到的位置。所有标签共用一套后退和前进记录，并且只保存在这台设备上。"
->>>>>>> db284da5a
     }
   },
   "theme": "主题",

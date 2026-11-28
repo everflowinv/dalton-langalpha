@@ -1523,7 +1523,7 @@ def test_show_widget_persists_widget_id_and_projector_preserves_it_on_replay() -
 
     tool = create_show_widget_tool(backend=None)  # type: ignore[arg-type]
     _content, artifact = asyncio.run(
-        tool.coroutine(html="<div>NVDA valuation</div>", title="NVDA Table")
+        tool.coroutine(html="<div>NVDA valuation</div>", title="NVDA Table", tool_call_id="call_widget_99")
     )
     persisted_id = artifact.get("widget_id")
     assert isinstance(persisted_id, str) and persisted_id.startswith("widget_")

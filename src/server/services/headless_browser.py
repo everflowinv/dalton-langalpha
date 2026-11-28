@@ -111,7 +111,13 @@ async def _is_request_allowed(url: str, workspace_serve_prefix: str | None) -> b
     try:
         await resolve_public_ips(parsed.hostname)
     except EgressBlockedError:
-        return False
+        # DALTON-HOOK(fake-ip-allow): behind the host's fake-IP proxy every
+        # public name resolves into 198.18.0.0/15, which the check above calls
+        # private; the in-house guard's real-target recheck decides instead,
+        # and the gated fetch that follows dials the rechecked address.
+        from src.tools.web.inhouse.guard import host_passes_guard
+
+        return await host_passes_guard(parsed.hostname)
     return True
 
 
@@ -527,6 +533,10 @@ async def _reset_browser() -> None:
     browser, playwright = _browser, _playwright
     _browser = None
     _playwright = None
+    # DALTON-HOOK(browser-memory-sampler): clear explicitly registered render root PIDs on reset.
+    from src.observability.browser_memory import clear_pdf_render_pids
+
+    clear_pdf_render_pids()
     try:
         if browser is not None:
             try:
@@ -729,9 +739,11 @@ async def get_browser():
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise BrowserUnavailable("playwright is not installed") from exc
+        # DALTON-HOOK(browser-memory-sampler): explicitly capture and register render driver/browser root PIDs.
+        from src.observability.browser_memory import capture_browser_launch
+
         pw = None
         try:
-            pw = await async_playwright().start()
             options: dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
             if wrapper := await _oom_first():
                 options["executable_path"] = wrapper
@@ -740,7 +752,11 @@ async def get_browser():
                 # it, every process keeps the 1000 it inherits. Playwright
                 # already runs Chromium without its sandbox, which this needs.
                 options["args"].append("--no-zygote")
-            browser = await pw.chromium.launch(**options)
+            async with capture_browser_launch("pdf_render") as launch_capture:
+                cm = async_playwright()
+                pw = await cm.start()
+                browser = await pw.chromium.launch(**options)
+                launch_capture.register_handles(cm, pw, browser)
         except BaseException as exc:
             # Any failure, cancellation too, would leave the driver running
             # with nothing holding it.

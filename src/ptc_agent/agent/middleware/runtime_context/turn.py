@@ -66,17 +66,12 @@ from ptc_agent.agent.middleware.runtime_context.state import (
     as_dict,
     state_get,
 )
-<<<<<<< HEAD
-from ptc_agent.agent.middleware.runtime_context.surface import Surface, parse_surface
-=======
-from ptc_agent.agent.middleware.runtime_context.state import STATE_BASELINE, state_get
 # BUILT_IN_SURFACES is also read from here by callers outside this package.
 from ptc_agent.agent.middleware.runtime_context.surface import (
     BUILT_IN_SURFACES,
     Surface,
     parse_surface,
 )
->>>>>>> db284da5a
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
 from ptc_agent.agent.middleware.runtime_context.turn_context import ForkNotice, HomeAway
 

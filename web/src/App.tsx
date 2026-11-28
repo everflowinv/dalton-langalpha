@@ -239,7 +239,6 @@ function CallbackRoute() {
  * dashboard's place.
  */
 function RootRedirect() {
-<<<<<<< HEAD
   // DALTON-HOOK(channel-links): read router search and navigate inside SPA so post-login redirect restores deep links (?file=...)
   const { search } = useLocation();
   const [redirectTo] = useState(() => {
@@ -257,12 +256,7 @@ function RootRedirect() {
     }
     return safe;
   });
-=======
-  const [redirectTo] = useState(() =>
-    inAppPath(new URLSearchParams(window.location.search).get('redirect') ?? hostedSignInReturn())
-  );
   const resume = useResumeTab();
->>>>>>> db284da5a
   if (redirectTo) {
     return <Navigate to={redirectTo} replace />;
   }

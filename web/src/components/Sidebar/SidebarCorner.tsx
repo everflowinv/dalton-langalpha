@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { ArrowLeft, ArrowRight, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import logoLight from '../../assets/img/logo.svg';
 import logoDark from '../../assets/img/logo-dark.svg';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
+import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useTheme } from '../../contexts/ThemeContext';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import type { SidebarPeek } from './useSidebarPeek';
@@ -108,8 +110,8 @@ export function SidebarCorner({ hidden, onToggleHidden, peek, cornerRef }: {
           onClick={() => navigate('/dashboard')}
           aria-label={t('sidebar.dashboard')}
         >
-          <img src={theme === 'light' ? logoDark : logoLight} alt="" style={{ width: '22px', height: '22px', objectFit: 'contain' }} />
-          <span className="sidebar-wordmark title-font">LangAlpha</span>
+          {BRAND_MARK === 'everflow' ? <BrandMark className="h-[22px] w-[22px] shrink-0" /> : <img src={theme === 'light' ? logoDark : logoLight} alt="" style={{ width: '22px', height: '22px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
+          <span className="sidebar-wordmark title-font">{BRAND_NAME}</span> {/* DALTON-HOOK(brand-name) */}
         </button>
       )}
       <SidebarToggle hidden={hidden} onToggle={onToggleHidden} hover={peek.toggleHover} />

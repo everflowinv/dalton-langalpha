@@ -717,6 +717,7 @@ def read_live_concurrency() -> ConcurrencySnapshot:
     pdf_driver_pid: int | None = min(pdf_roots) if pdf_roots else None
 
     try:
+        from src.server.services import headless_browser as hb_mod
         from src.server.services import pdf_render as pdf_mod
 
         render_sem = getattr(pdf_mod, "_RENDER_SEMAPHORE", None)
@@ -724,10 +725,14 @@ def read_live_concurrency() -> ConcurrencySnapshot:
             avail = getattr(render_sem, "_value", None)
             if isinstance(avail, int):
                 pdf_active = max(0, pdf_limit - avail)
-        cm = getattr(pdf_mod, "_playwright_cm", None)
-        browser = getattr(pdf_mod, "_browser", None)
+        cm = getattr(hb_mod, "_playwright", None)
+        if cm is None:
+            cm = getattr(pdf_mod, "_playwright_cm", None)
+        browser = getattr(hb_mod, "_browser", None)
+        if browser is None:
+            browser = getattr(pdf_mod, "_browser", None)
         # Prefer explicit registration; fall back to public attrs then private chain
-        # only when no PID was registered (e.g. unit test setting `_playwright_cm` directly).
+        # only when no PID was registered (e.g. unit test setting `_playwright` directly).
         if not pdf_roots and (cm is not None or browser is not None):
             pub_pids = _extract_public_pids(cm, browser)
             if pub_pids:

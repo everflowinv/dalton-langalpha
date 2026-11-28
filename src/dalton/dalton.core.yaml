@@ -21,6 +21,12 @@ artifact_publishing:
 problem_reports:
   enabled: false
 
+widget_render:
+  enabled: false
+
+uvloop:
+  enabled: false
+
 coverage_units:
   enabled: true
 

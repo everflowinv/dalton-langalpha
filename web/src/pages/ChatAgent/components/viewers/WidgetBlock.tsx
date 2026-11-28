@@ -10,6 +10,7 @@ import { useWidgetBase } from './html/useWidgetBase';
 import { WIDGET_FRAME } from './html/sandbox';
 import { postToWidget } from './html/widgetProtocol';
 import InlineWidget from './InlineWidget';
+import type { WidgetExports } from '../messageList/MessageActionsContext'; // DALTON-HOOK(shared-widgets)
 import './InlineWidget.css';
 
 /** At most one redraw of the preview this often: each parses all the markup so far. */
@@ -22,6 +23,8 @@ interface WidgetBlockProps {
   preview?: WidgetDraft;
   widgetId?: string;
   prompts?: WidgetPrompts;
+  /** DALTON-HOOK(shared-widgets): export actions offered on a shared view. */
+  exports?: WidgetExports;
 }
 
 /**
@@ -33,7 +36,7 @@ interface WidgetBlockProps {
  * over the preview, which goes once the fade is done. A widget that arrives
  * whole, as in a replayed thread, draws as it always has.
  */
-export default function WidgetBlock({ widget, preview, widgetId, prompts }: WidgetBlockProps) {
+export default function WidgetBlock({ widget, preview, widgetId, prompts, exports }: WidgetBlockProps) {
   const base = useWidgetBase();
   // Whether this block began as a preview; one that began as the widget never draws one.
   const [previewed] = useState(() => preview !== undefined);
@@ -75,6 +78,8 @@ export default function WidgetBlock({ widget, preview, widgetId, prompts }: Widg
           data={widget.data}
           widgetId={widgetId}
           prompts={prompts}
+          exports={exports} // DALTON-HOOK(shared-widgets)
+          redacted={(widget as HtmlWidgetData & { redacted?: boolean }).redacted} // DALTON-HOOK(share-redaction)
           base={base}
           handoffHeight={handoff ?? undefined}
           onShown={handoff != null ? () => setHandedOver(true) : undefined}
