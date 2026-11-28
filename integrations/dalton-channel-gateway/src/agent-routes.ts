@@ -897,6 +897,9 @@ export class AgentRoutesHandler {
               "completed") as AgentAutomationRunFinishRequest["status"],
           finalText: body.final_text ?? claimed.data.final_text ?? null,
           strictDeliverableTextEnabled: claimed.data.strict_deliverable_text_enabled,
+          failureNoticeEnabled: claimed.data.failure_notice_enabled === true,
+          forceSealNoticeFailure: body.final_attempt === true,
+          isRecovery: false,
           targets: claimed.data.targets ?? [],
         },
         { callerHoldsExecutionLock: true },
@@ -938,6 +941,8 @@ export class AgentRoutesHandler {
     finishStatus: AgentAutomationRunFinishRequest["status"];
     finalText: string | null;
     strictDeliverableTextEnabled?: boolean;
+    failureNoticeEnabled?: boolean;
+    recoveryRetryDelayMs?: number;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
     if (this.activeFinishExecutors.has(params.executionId)) {
@@ -950,7 +955,27 @@ export class AgentRoutesHandler {
         error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
       }));
     }
-    const detailed = await this.executeAutomationRunFinishDetailed(params);
+    let detailed = await this.executeAutomationRunFinishDetailed({
+      ...params,
+      failureNoticeEnabled: params.failureNoticeEnabled === true,
+      isRecovery: true,
+      forceSealNoticeFailure: false,
+    });
+    if (detailed.noticeRetryable && !detailed.replayPending && !detailed.chartsInFlight) {
+      const delayMs =
+        typeof params.recoveryRetryDelayMs === "number" && params.recoveryRetryDelayMs >= 0
+          ? params.recoveryRetryDelayMs
+          : 500;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      detailed = await this.executeAutomationRunFinishDetailed({
+        ...params,
+        failureNoticeEnabled: params.failureNoticeEnabled === true,
+        isRecovery: true,
+        forceSealNoticeFailure: true,
+      });
+    }
     return detailed.targets;
   }
 
@@ -966,6 +991,9 @@ export class AgentRoutesHandler {
       finishStatus: AgentAutomationRunFinishRequest["status"];
       finalText: string | null;
       strictDeliverableTextEnabled?: boolean;
+      failureNoticeEnabled?: boolean;
+      forceSealNoticeFailure?: boolean;
+      isRecovery?: boolean;
       targets: AutomationRunTargetRecord[];
     },
     opts?: { callerHoldsExecutionLock?: boolean },
@@ -1261,11 +1289,17 @@ export class AgentRoutesHandler {
             error: null,
           });
         } else {
+          const isUnknownOrInFlight =
+            noticeRes.status === "unknown" || noticeRes.code === "in_flight";
+          const isRetryableCode =
+            noticeRes.code === "unavailable" || noticeRes.code === "rate_limited";
+          // Only return 503 / defer sealing when failure_notice_enabled is ON, retries remain,
+          // and startup recovery is not observing an already-unknown/in_flight delivery key
+          // (which will never resend on the same key and must seal).
           const isTransientNoticeFailure =
-            noticeRes.status === "unknown" ||
-            noticeRes.code === "unavailable" ||
-            noticeRes.code === "rate_limited" ||
-            noticeRes.code === "in_flight";
+            params.failureNoticeEnabled === true &&
+            params.forceSealNoticeFailure !== true &&
+            (isRetryableCode || (!params.isRecovery && isUnknownOrInFlight));
           if (isTransientNoticeFailure) {
             noticeRetryable = true;
           }

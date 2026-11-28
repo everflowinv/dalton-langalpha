@@ -96,6 +96,13 @@ FAILURE_NOTICE_TERMINAL_ERROR_CODES: frozenset[str] = frozenset(
         "card_limit_exceeded",
         "attempts_exhausted",
         "delivery_outcome_unknown_timeout",
+        "task_disabled",
+        "task_notify_disabled",
+        "toggle_off",
+        "target_removed",
+        "target_not_routed",
+        "unknown_task",
+        "covered_by_existing_delivery",
     }
 )
 
@@ -103,6 +110,20 @@ FAILURE_NOTICE_CLAIM_TTL_SECONDS = 60
 FAILURE_NOTICE_UNKNOWN_TIMEOUT_MINUTES = 15
 FAILURE_NOTICE_MAX_ATTEMPTS = 3
 FAILURE_NOTICE_RETRY_BACKOFF_SECONDS: tuple[int, ...] = (60, 300)
+FAILURE_NOTICE_SWEEP_INTERVAL_SECONDS = 30.0
+
+_STABLE_CODE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_SAFE_SEGMENT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_DATE_OR_TIMESTAMP_RE = re.compile(r"\d{4}[-/]\d{2}[-/]\d{2}")
+_TWO_PART_STABLE_PREFIXES: frozenset[str] = frozenset(
+    {
+        "t5_missing_top_key",
+        "t5_top_step_error",
+        "sentiment_missing_shared_asset",
+        "sentiment_missing_or_empty_panel",
+        "sentiment_stale_panel_not_updated",
+    }
+)
 
 _FEISHU_USER_RE = re.compile(r"^feishu:user:(ou_[A-Za-z0-9_-]+)$")
 _FEISHU_CHAT_RE = re.compile(r"^feishu:chat:(oc_[A-Za-z0-9_-]+)$")
@@ -253,14 +274,175 @@ def _target_is_covered(
     return False
 
 
+def normalize_data_task_failure_code(
+    failure_reason: str | None,
+    *,
+    terminal_status: str = "failed",
+    explicit_code: str | None = None,
+    details: Mapping[str, Any] | None = None,
+) -> str:
+    """Derive a stable failure-type code (free of dates and volatile error prose) for data-task dedup."""
+    fallback = str(terminal_status or "failed").strip().lower()
+    if not _STABLE_CODE_RE.match(fallback):
+        fallback = "failed"
+
+    if explicit_code:
+        cleaned_explicit = str(explicit_code).strip().lower()
+        if (
+            cleaned_explicit
+            and _STABLE_CODE_RE.match(cleaned_explicit)
+            and not _DATE_OR_TIMESTAMP_RE.search(cleaned_explicit)
+        ):
+            return cleaned_explicit
+
+    if isinstance(details, Mapping):
+        for key in ("failure_code", "report_prep_code", "timeout_kind"):
+            val = details.get(key)
+            if key == "timeout_kind" and val in ("total", "no_output"):
+                return f"{val}_timed_out"
+            if isinstance(val, str):
+                cleaned_val = val.strip().lower()
+                if (
+                    cleaned_val
+                    and _STABLE_CODE_RE.match(cleaned_val)
+                    and not _DATE_OR_TIMESTAMP_RE.search(cleaned_val)
+                ):
+                    return cleaned_val
+
+    raw = str(failure_reason or "").strip()
+    if not raw:
+        return fallback
+
+    # Drop trailing "| 数据日期: ..." or similar pipe-delimited dynamic context.
+    head = raw.split("|", 1)[0].strip()
+    if not head:
+        return fallback
+
+    # Handle structured colon-delimited evaluator reasons like
+    # "t5_stale_unwind_date:2026-11-25:ref=..." or "report_preparation_failed: ...".
+    if ":" in head:
+        parts = [p.strip().lower() for p in head.split(":")]
+        prefix = parts[0]
+        if _STABLE_CODE_RE.match(prefix) and not _DATE_OR_TIMESTAMP_RE.search(prefix):
+            if (
+                prefix in _TWO_PART_STABLE_PREFIXES
+                and len(parts) >= 2
+                and _SAFE_SEGMENT_RE.match(parts[1])
+                and not _DATE_OR_TIMESTAMP_RE.search(parts[1])
+            ):
+                return f"{prefix}:{parts[1]}"
+            return prefix
+        return fallback
+
+    lowered = head.lower()
+    if _STABLE_CODE_RE.match(lowered) and not _DATE_OR_TIMESTAMP_RE.search(lowered):
+        return lowered
+    return fallback
+
+
+async def evaluate_data_task_failure_notice_eligibility(
+    conn: Any,
+    *,
+    job_key: str,
+    recipient_user_id: str,
+    run_id: str | None = None,
+    task_notify_enabled: bool | None = None,
+    notify_status: str | None = None,
+    evaluate_eligibility_fn: Callable[..., Awaitable[tuple[bool, str | None, list[str]]]] | None = None,
+) -> tuple[bool, str | None, list[tuple[str, str]], set[tuple[str, str]]]:
+    """Evaluate data-task push settings, DM targets, and ``notify_on_failure`` overlap.
+
+    Reuses the same push-permission checks as ``dispatch_data_task_run_notification``:
+    - ``dalton_data_task_defs.enabled`` and ``dalton_data_task_defs.notify_enabled``
+    - ``evaluate_user_notify_eligibility(recipient_user_id, build_data_task_notify_automation(job_key))``
+    - Excludes every target already handled by ``notify_status IN ('pending_dispatch', 'dispatched')``.
+
+    Never falls back to ``load_bound_dm_targets`` when targets are empty or disabled.
+    """
+    cleaned_job_key = str(job_key or "").strip()
+    cleaned_uid = str(recipient_user_id or "").strip()
+    if not cleaned_job_key or not cleaned_uid:
+        return (False, "toggle_off", [], set())
+
+    if task_notify_enabled is False:
+        return (False, "task_notify_disabled", [], set())
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        if task_notify_enabled is None:
+            await cur.execute(
+                """
+                SELECT enabled, notify_enabled
+                FROM dalton_data_task_defs
+                WHERE job_key = %s
+                """,
+                (cleaned_job_key,),
+            )
+            def_row = await cur.fetchone()
+            if not isinstance(def_row, Mapping):
+                return (False, "unknown_task", [], set())
+            if not bool(def_row.get("enabled")):
+                return (False, "task_disabled", [], set())
+            if not bool(def_row.get("notify_enabled")):
+                return (False, "task_notify_disabled", [], set())
+
+        eff_notify_status = str(notify_status or "").strip().lower()
+        if not eff_notify_status and run_id:
+            norm_rid = _normalize_uuid(run_id)
+            if norm_rid is not None:
+                await cur.execute(
+                    """
+                    SELECT notify_status
+                    FROM dalton_data_task_runs
+                    WHERE run_id = %s::uuid
+                    """,
+                    (norm_rid,),
+                )
+                run_row = await cur.fetchone()
+                if isinstance(run_row, Mapping):
+                    eff_notify_status = str(run_row.get("notify_status") or "").strip().lower()
+
+    from src.dalton.data_jobs.scheduler import build_data_task_notify_automation
+    from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
+
+    eval_fn = evaluate_eligibility_fn or evaluate_user_notify_eligibility
+    automation = build_data_task_notify_automation(cleaned_job_key)
+    allowed, skip_reason, effective_targets = await eval_fn(cleaned_uid, automation)
+    if not allowed:
+        return (False, skip_reason or "toggle_off", [], set())
+
+    dm_targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    covered: set[tuple[str, str]] = set()
+    existing_delivery_active = eff_notify_status in ("pending_dispatch", "dispatched")
+
+    for raw in effective_targets or ():
+        parsed = normalize_channel_target(str(raw))
+        if parsed is None:
+            continue
+        ch, canon = parsed
+        if existing_delivery_active:
+            covered.add((ch, canon))
+            if canon == f"{ch}:@me" or _is_dm_target(canon):
+                covered.add((ch, f"{ch}:@me"))
+        if _is_dm_target(canon) and is_channel_target_enabled(canon):
+            pair = (ch, canon)
+            if pair not in seen:
+                seen.add(pair)
+                dm_targets.append(pair)
+
+    return (True, None, dm_targets, covered)
+
+
 async def _resolve_dm_targets_in_tx(
     conn: Any,
     recipient_user_id: str,
     *,
     explicit_targets: Sequence[str] | None = None,
+    allow_bound_fallback: bool = True,
 ) -> list[tuple[str, str]]:
     """Resolve enabled DM targets for ``recipient_user_id`` inside the active transaction."""
     candidates: list[str] = []
+    has_explicit_pref_list = False
     if explicit_targets is not None:
         candidates.extend(str(t).strip() for t in explicit_targets if str(t or "").strip())
     elif recipient_user_id:
@@ -277,16 +459,16 @@ async def _resolve_dm_targets_in_tx(
         if isinstance(pref_row, Mapping):
             for bag_key in ("model_preference", "other_preference"):
                 bag = pref_row.get(bag_key)
-                if isinstance(bag, Mapping):
+                if isinstance(bag, Mapping) and "dalton_notify_targets" in bag:
                     raw_list = bag.get("dalton_notify_targets")
                     if isinstance(raw_list, list):
+                        has_explicit_pref_list = True
                         for item in raw_list:
                             s = str(item or "").strip()
                             if s:
                                 candidates.append(s)
-                        if candidates:
-                            break
-        if not candidates:
+                        break
+        if not candidates and not has_explicit_pref_list and allow_bound_fallback:
             from src.dalton.llm.model_prefs import load_bound_dm_targets
 
             bound = await load_bound_dm_targets(recipient_user_id, conn=conn)
@@ -435,6 +617,9 @@ async def enqueue_failure_notice_in_tx(
     targets: Sequence[str] | None = None,
     metadata: Mapping[str, Any] | None = None,
     max_attempts: int = FAILURE_NOTICE_MAX_ATTEMPTS,
+    data_task_notify_enabled: bool | None = None,
+    data_task_notify_status: str | None = None,
+    data_task_failure_code: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically enqueue one failure notice + per-target receipts inside the caller's tx.
 
@@ -444,7 +629,8 @@ async def enqueue_failure_notice_in_tx(
     - Unattended wakeup quota exhaustion (Item 2, ``subject_kind='wakeup'``)
 
     Uses ``uq_dalton_failure_notices_dedup_key`` for atomic cross-worker anti-spam dedup
-    and strips targets already covered by ``hook_outbox(automation_finish)``.
+    and strips targets already covered by ``hook_outbox(automation_finish)`` or
+    data-task ``notify_on_failure`` delivery.
     """
     if not is_failure_notice_enabled():
         return None
@@ -454,7 +640,15 @@ async def enqueue_failure_notice_in_tx(
     kind = str(subject_kind or "").strip()
     subj_id = str(subject_id or "").strip()
     src_key = str(source_key or "").strip()
-    reason = str(failure_reason or "failed").strip().lower() or "failed"
+    raw_reason = str(failure_reason or "failed").strip()
+    if kind == "data_task":
+        reason = normalize_data_task_failure_code(
+            raw_reason,
+            explicit_code=data_task_failure_code,
+            details=metadata if isinstance(metadata, Mapping) else None,
+        )
+    else:
+        reason = raw_reason.lower() or "failed"
     if kind not in FAILURE_NOTICE_SUBJECT_KINDS or not subj_id or not src_key:
         raise ValueError(
             f"Invalid failure notice identity: subject_kind={kind!r}, subject_id={subj_id!r}, source_key={src_key!r}"
@@ -511,12 +705,36 @@ async def enqueue_failure_notice_in_tx(
                 if canon == f"{ch}:@me" or _is_dm_target(canon):
                     covered.add((ch, f"{ch}:@me"))
 
-    # 3. Resolve candidate DM targets and deduplicate against automation_finish
-    candidate_targets = await _resolve_dm_targets_in_tx(
-        conn,
-        eff_recipient,
-        explicit_targets=targets,
-    )
+    # 3. Resolve candidate DM targets and deduplicate against automation_finish / notify_on_failure
+    ineligible_reason: str | None = None
+    if kind == "data_task" and targets is None:
+        dt_allowed, dt_skip_reason, dt_dm_targets, dt_covered = (
+            await evaluate_data_task_failure_notice_eligibility(
+                conn,
+                job_key=src_key,
+                recipient_user_id=eff_recipient,
+                run_id=subj_id,
+                task_notify_enabled=data_task_notify_enabled,
+                notify_status=data_task_notify_status,
+            )
+        )
+        covered.update(dt_covered)
+        if not dt_allowed:
+            ineligible_reason = dt_skip_reason or "toggle_off"
+            candidate_targets: list[tuple[str, str]] = []
+        else:
+            candidate_targets = dt_dm_targets
+    elif kind == "data_task" and data_task_notify_enabled is False:
+        ineligible_reason = "task_notify_disabled"
+        candidate_targets = []
+    else:
+        candidate_targets = await _resolve_dm_targets_in_tx(
+            conn,
+            eff_recipient,
+            explicit_targets=targets,
+            allow_bound_fallback=(kind != "data_task"),
+        )
+
     uncovered_targets = [
         (ch, tgt) for ch, tgt in candidate_targets if not _target_is_covered(ch, tgt, covered)
     ]
@@ -531,14 +749,21 @@ async def enqueue_failure_notice_in_tx(
         "retrying_count": len(uncovered_targets),
         "covered_by_finish_count": len(candidate_targets) - len(uncovered_targets),
     }
+    if detail:
+        summary_base["detail"] = _sanitize_text(detail, max_chars=260)
+    if isinstance(metadata, Mapping) and metadata.get("index_dates"):
+        summary_base["index_dates"] = metadata["index_dates"]
+    if ineligible_reason:
+        summary_base["ineligible_reason"] = ineligible_reason
 
-    # If no targets remain: either covered by automation_finish (not_applicable) or unconfigured
+    # If no targets remain: either disabled/covered (not_applicable) or unconfigured
     if not uncovered_targets:
-        terminal_agg = (
-            "not_applicable"
-            if (candidate_targets and len(uncovered_targets) == 0) or (not candidate_targets and covered)
-            else "unconfigured"
-        )
+        if ineligible_reason in ("task_disabled", "task_notify_disabled", "toggle_off", "unknown_task"):
+            terminal_agg = "not_applicable"
+        elif (candidate_targets and len(uncovered_targets) == 0) or (not candidate_targets and covered):
+            terminal_agg = "not_applicable"
+        else:
+            terminal_agg = "unconfigured"
         summary_base["retrying_count"] = 0
         notice_id = str(uuid4())
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -744,65 +969,59 @@ async def on_automation_settle_in_tx(
     thread_id: str | None = None,
     workspace_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Hook called inside ``automation_settlement.py`` ``leave_finish`` transaction."""
+    """Hook called inside ``automation_settlement.py`` ``leave_finish`` transaction.
+
+    When ``is_failure_notice_enabled()`` is False, this is a strict no-op.
+    When enabled, any SQL error propagates so the outer settlement transaction rolls back
+    and existing settlement retry re-runs both settlement and enqueue atomically.
+    """
     if not is_failure_notice_enabled():
         return None
     auto_id = str(automation.get("automation_id") or "").strip()
     if not auto_id:
         return None
 
-    try:
-        async with conn.transaction():
-            from src.dalton.database.automation_recycle import automation_is_soft_deleted
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
 
-            if await automation_is_soft_deleted(auto_id, conn=conn):
-                return None
+    if await automation_is_soft_deleted(auto_id, conn=conn):
+        return None
 
-            raw_uid = str(automation.get("user_id") or "").strip()
-            is_company = (
-                is_company_system_user(raw_uid)
-                or str(automation.get("scope") or "").strip().lower() == "company"
-            )
-            subject_kind = "company_automation" if is_company else "personal_automation"
+    raw_uid = str(automation.get("user_id") or "").strip()
+    is_company = (
+        is_company_system_user(raw_uid)
+        or str(automation.get("scope") or "").strip().lower() == "company"
+    )
+    subject_kind = "company_automation" if is_company else "personal_automation"
 
-            if outcome_status == "completed":
-                await bump_failure_notice_recovery_epoch_in_tx(
-                    conn,
-                    subject_kind=subject_kind,
-                    source_key=auto_id,
-                )
-                return None
-
-            if outcome_status != "failed":
-                return None
-
-            reason = str(failure_reason or "failed").strip().lower() or "failed"
-            auto_name = str(automation.get("name") or "").strip()
-            return await enqueue_failure_notice_in_tx(
-                conn,
-                subject_kind=subject_kind,
-                subject_id=str(execution_id),
-                source_key=auto_id,
-                recipient_user_id=None if is_company else raw_uid,
-                failure_reason=reason,
-                title=f"定时任务失败：{auto_name}" if auto_name else "定时任务执行失败提醒",
-                detail=error,
-                delivery=delivery,
-                metadata={
-                    "automation_name": auto_name,
-                    "thread_id": thread_id,
-                    "workspace_id": workspace_id,
-                },
-            )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(
-            "[FAILURE_NOTICE] In-tx automation settle hook failed for execution_id=%s (%s)",
-            execution_id,
-            type(exc).__name__,
+    if outcome_status == "completed":
+        await bump_failure_notice_recovery_epoch_in_tx(
+            conn,
+            subject_kind=subject_kind,
+            source_key=auto_id,
         )
         return None
+
+    if outcome_status != "failed":
+        return None
+
+    reason = str(failure_reason or "failed").strip().lower() or "failed"
+    auto_name = str(automation.get("name") or "").strip()
+    return await enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind=subject_kind,
+        subject_id=str(execution_id),
+        source_key=auto_id,
+        recipient_user_id=None if is_company else raw_uid,
+        failure_reason=reason,
+        title=f"定时任务失败：{auto_name}" if auto_name else "定时任务执行失败提醒",
+        detail=error,
+        delivery=delivery,
+        metadata={
+            "automation_name": auto_name,
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+        },
+    )
 
 
 async def recompute_failure_notice_aggregate_in_tx(
@@ -1396,7 +1615,12 @@ async def process_due_failure_notices(
     post_fn: Callable[..., Awaitable[dict[str, Any]]] = post_failure_notice_gateway_notify,
     conn: Any = None,
 ) -> dict[str, int]:
-    """Run one bounded cycle: reconcile expired/uncertain targets, then claim and dispatch due targets."""
+    """Run one bounded cycle: reconcile expired/uncertain targets, then claim & dispatch one target at a time.
+
+    Each due target is claimed (consuming one attempt and starting its 60s lease) only
+    immediately before its gateway request is initiated. When ``max_duration_s`` elapses,
+    remaining due targets stay untouched in their existing status without consuming attempts.
+    """
     if not is_failure_notice_enabled():
         return {"reconciled": 0, "claimed": 0, "sent": 0, "failed": 0, "uncertain": 0}
     if post_fn is post_failure_notice_gateway_notify and not has_capability(
@@ -1404,8 +1628,9 @@ async def process_due_failure_notices(
     ):
         return {"reconciled": 0, "claimed": 0, "sent": 0, "failed": 0, "uncertain": 0}
 
+    eff_limit = max(1, int(limit or 10))
     started = time.monotonic()
-    reconcile_stats = await reconcile_uncertain_failure_notice_targets(limit=limit, conn=conn)
+    reconcile_stats = await reconcile_uncertain_failure_notice_targets(limit=eff_limit, conn=conn)
     summary = {
         "reconciled": reconcile_stats["reconciled"],
         "claimed": 0,
@@ -1413,16 +1638,20 @@ async def process_due_failure_notices(
         "failed": 0,
         "uncertain": reconcile_stats["still_uncertain"],
     }
-    if time.monotonic() - started >= max_duration_s:
-        return summary
 
-    claimed_rows = await claim_due_failure_notice_targets(limit=limit, conn=conn)
-    summary["claimed"] = len(claimed_rows)
-
-    for row in claimed_rows:
+    seen_ids: set[str] = set()
+    for _ in range(eff_limit):
         if time.monotonic() - started >= max_duration_s:
             break
+        claimed_rows = await claim_due_failure_notice_targets(limit=1, conn=conn)
+        if not claimed_rows:
+            break
+        row = claimed_rows[0]
         tr_id = str(row["target_receipt_id"])
+        if tr_id in seen_ids:
+            break
+        seen_ids.add(tr_id)
+        summary["claimed"] += 1
         claim_tok = str(row["claim_token"])
         target = str(row["target"])
         try:
@@ -1470,10 +1699,99 @@ async def process_due_failure_notices(
     return summary
 
 
+class FailureNoticeSweeper:
+    """Lifespan-managed periodic scanner for ``dalton_failure_notice_targets``.
+
+    Every backend worker may run one instance; PostgreSQL ``FOR UPDATE OF t SKIP LOCKED``
+    ensures at-most-one worker claims each due target or reconciles each expired lease.
+    When ``is_failure_notice_enabled()`` is False, ticks perform zero database queries.
+    """
+
+    _instance: "FailureNoticeSweeper | None" = None
+
+    def __init__(
+        self,
+        *,
+        interval_s: float = FAILURE_NOTICE_SWEEP_INTERVAL_SECONDS,
+        limit: int = 10,
+        max_duration_s: float = 25.0,
+        process_fn: Callable[..., Awaitable[dict[str, int]]] | None = None,
+    ) -> None:
+        self._interval_s = max(0.05, float(interval_s))
+        self._limit = max(1, int(limit))
+        self._max_duration_s = max(1.0, float(max_duration_s))
+        self._process_fn = process_fn
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._wake_event = asyncio.Event()
+
+    @classmethod
+    def get_instance(cls) -> "FailureNoticeSweeper":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stopping.clear()
+        self._wake_event.clear()
+        self._task = asyncio.create_task(self._run(), name="dalton-failure-notice-sweeper")
+        logger.info("[FAILURE_NOTICE] Periodic sweeper started (interval=%.1fs)", self._interval_s)
+
+    def nudge(self) -> None:
+        if self.running:
+            self._wake_event.set()
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        self._wake_event.set()
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def run_once(self) -> dict[str, int]:
+        if not is_failure_notice_enabled() or not has_capability(CapabilityId.CHANNEL_GATEWAY):
+            return {"reconciled": 0, "claimed": 0, "sent": 0, "failed": 0, "uncertain": 0}
+        fn = self._process_fn or process_due_failure_notices
+        return await fn(limit=self._limit, max_duration_s=self._max_duration_s)
+
+    async def _run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[FAILURE_NOTICE] Periodic sweep failed (%s)",
+                    type(exc).__name__,
+                )
+            self._wake_event.clear()
+            if self._stopping.is_set():
+                break
+            try:
+                await asyncio.wait_for(self._wake_event.wait(), timeout=self._interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+
 def wake_failure_notice_dispatcher() -> None:
     """Best-effort nudge on the local worker loop to drain newly enqueued failure notices."""
     global _dispatch_wake_task
     if not is_failure_notice_enabled() or not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return
+    sweeper = FailureNoticeSweeper._instance
+    if sweeper is not None and sweeper.running:
+        sweeper.nudge()
         return
     try:
         loop = asyncio.get_running_loop()

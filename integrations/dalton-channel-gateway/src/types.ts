@@ -541,6 +541,7 @@ export interface AgentAutomationRunFinishRequest {
   thread_id?: string | null;
   run_id?: string | null;
   final_text?: string | null;
+  final_attempt?: boolean;
 }
 
 export interface AgentAutomationRunFinishTargetRow {

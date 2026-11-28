@@ -28,6 +28,7 @@ from src.dalton.capabilities import require_channel_platform_capability
 from src.dalton.notify.failure_receipts import (
     FAILURE_NOTICE_SUBJECT_KINDS,
     failure_notice_delivery_key,
+    normalize_channel_target,
 )
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
@@ -151,6 +152,86 @@ def _is_lease_valid(
     if ref_now.tzinfo is None:
         ref_now = ref_now.replace(tzinfo=timezone.utc)
     return exp > ref_now
+
+
+async def _verify_data_task_push_permission_in_tx(
+    cur: Any,
+    *,
+    job_key: str,
+    run_id: str,
+    recipient_user_id: str,
+    stored_target: str,
+    platform: str,
+) -> tuple[bool, str, str]:
+    """Re-verify data-task push settings, target routing, and ``notify_on_failure`` overlap at claim time."""
+    await cur.execute(
+        """
+        SELECT enabled, notify_enabled
+        FROM dalton_data_task_defs
+        WHERE job_key = %s
+        """,
+        (job_key,),
+    )
+    def_row = await cur.fetchone()
+    if not isinstance(def_row, Mapping):
+        return (False, "unknown_task", "Data-task definition was not found.")
+    if not bool(def_row.get("enabled")):
+        return (False, "task_disabled", "Data task is currently disabled.")
+    if not bool(def_row.get("notify_enabled")):
+        return (False, "task_notify_disabled", "Notifications are disabled for this data task.")
+
+    from src.dalton.data_jobs.scheduler import build_data_task_notify_automation
+    from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
+
+    automation = build_data_task_notify_automation(job_key)
+    allowed, skip_reason, effective_targets = await evaluate_user_notify_eligibility(
+        recipient_user_id,
+        automation,
+    )
+    if not allowed:
+        return (
+            False,
+            skip_reason or "toggle_off",
+            "Current user notification preferences disable delivery for this data task.",
+        )
+
+    matched = False
+    for raw_t in effective_targets or ():
+        norm = normalize_channel_target(str(raw_t))
+        if norm is None:
+            continue
+        ch, canon = norm
+        if ch == platform and (canon == stored_target or canon == f"{platform}:@me"):
+            matched = True
+            break
+    if not matched:
+        return (
+            False,
+            "target_not_routed",
+            "Failure notice target is not authorized by the data task's current notification route.",
+        )
+
+    norm_rid = _normalize_uuid(run_id)
+    if norm_rid is not None:
+        await cur.execute(
+            """
+            SELECT notify_status
+            FROM dalton_data_task_runs
+            WHERE run_id = %s::uuid
+            """,
+            (norm_rid,),
+        )
+        run_row = await cur.fetchone()
+        if isinstance(run_row, Mapping):
+            run_notify_st = str(run_row.get("notify_status") or "").strip().lower()
+            if run_notify_st in ("pending_dispatch", "dispatched"):
+                return (
+                    False,
+                    "covered_by_existing_delivery",
+                    "Data-task failure target is already handled by existing notify_on_failure delivery.",
+                )
+
+    return (True, "", "")
 
 
 async def _dm_identity_matches(
@@ -285,6 +366,23 @@ async def authorize_failure_notice_plan(
                     "Recipient does not hold a matching active DM binding for this target.",
                     requested_target=target,
                 )
+
+            if subject_kind == "data_task":
+                dt_ok, dt_code, dt_msg = await _verify_data_task_push_permission_in_tx(
+                    cur,
+                    job_key=str(row.get("source_key") or "").strip(),
+                    run_id=str(row.get("subject_id") or "").strip(),
+                    recipient_user_id=recipient_user_id,
+                    stored_target=target,
+                    platform=parsed["platform"],
+                )
+                if not dt_ok:
+                    return _deny_plan(
+                        "failed",
+                        dt_code,
+                        dt_msg,
+                        requested_target=target,
+                    )
 
             payload = _payload_dict(row.get("payload_json"))
             d_key = failure_notice_delivery_key(tr_id)
@@ -439,7 +537,83 @@ async def authorize_and_claim_failure_notice(
                         "Failure notice target was not found.",
                     )
 
-                # Check idempotent replay in dalton_channel_deliveries first
+                # Lock order (aligned with reconciler AND unbind_weixin_account):
+                # 1. dalton_failure_notice_targets FOR UPDATE OF t (matches reconciler)
+                # 2. dalton_channel_weixin_accounts FOR KEY SHARE ORDER BY account_id ASC
+                #    BEFORE dalton_channel_deliveries FOR UPDATE (matches unbind_weixin_account
+                #    so concurrent Weixin retry + unbind never AB-BA deadlocks).
+                await cur.execute(
+                    """
+                    SELECT user_id, platform,
+                           weixin_account_id::text AS weixin_account_id
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = %s
+                    """,
+                    (cleaned_key,),
+                )
+                pre_del = await cur.fetchone()
+                row_channel = str(row.get("channel") or "").strip().lower()
+                pre_platform = (
+                    str(pre_del.get("platform") or "").strip().lower()
+                    if isinstance(pre_del, Mapping)
+                    else ""
+                )
+                pre_uid = (
+                    str(row.get("recipient_user_id") or "").strip()
+                    or (
+                        str(pre_del.get("user_id") or "").strip()
+                        if isinstance(pre_del, Mapping)
+                        else ""
+                    )
+                )
+                pre_aid = (
+                    _normalize_uuid(pre_del.get("weixin_account_id"))
+                    if isinstance(pre_del, Mapping)
+                    else None
+                )
+                locked_wx_accounts: list[Mapping[str, Any]] = []
+                if row_channel == "weixin" or pre_platform == "weixin":
+                    if pre_aid and pre_uid:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                                   bot_generation, ilink_user_id, status
+                            FROM dalton_channel_weixin_accounts
+                            WHERE user_id = %s OR account_id = %s::uuid
+                            ORDER BY account_id ASC
+                            FOR KEY SHARE
+                            """,
+                            (pre_uid, pre_aid),
+                        )
+                        locked_wx_accounts = list(await cur.fetchall() or [])
+                    elif pre_aid:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                                   bot_generation, ilink_user_id, status
+                            FROM dalton_channel_weixin_accounts
+                            WHERE account_id = %s::uuid
+                            ORDER BY account_id ASC
+                            FOR KEY SHARE
+                            """,
+                            (pre_aid,),
+                        )
+                        locked_wx_accounts = list(await cur.fetchall() or [])
+                    elif pre_uid:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                                   bot_generation, ilink_user_id, status
+                            FROM dalton_channel_weixin_accounts
+                            WHERE user_id = %s
+                            ORDER BY account_id ASC
+                            FOR KEY SHARE
+                            """,
+                            (pre_uid,),
+                        )
+                        locked_wx_accounts = list(await cur.fetchall() or [])
+
+                # Check idempotent replay in dalton_channel_deliveries AFTER locking Weixin account
                 await cur.execute(
                     """
                     SELECT *
@@ -518,17 +692,17 @@ async def authorize_and_claim_failure_notice(
 
                 require_channel_platform_capability(parsed["platform"])
 
-                if not await _dm_identity_matches(
-                    cur,
-                    user_id=recipient_user_id,
-                    platform=parsed["platform"],
-                    recipient_id=parsed["recipient_id"],
-                ):
-                    return _deny_claim(
-                        "failed",
-                        "dm_binding_missing",
-                        "Recipient does not hold a matching active DM binding for this target.",
+                if subject_kind == "data_task":
+                    dt_ok, dt_code, dt_msg = await _verify_data_task_push_permission_in_tx(
+                        cur,
+                        job_key=str(row.get("source_key") or "").strip(),
+                        run_id=str(row.get("subject_id") or "").strip(),
+                        recipient_user_id=recipient_user_id,
+                        stored_target=stored_target,
+                        platform=parsed["platform"],
                     )
+                    if not dt_ok:
+                        return _deny_claim("failed", dt_code, dt_msg)
 
                 wx_account_id: str | None = None
                 wx_bot_id: str | None = None
@@ -547,17 +721,15 @@ async def authorize_and_claim_failure_notice(
                         )
                     from src.server.database.encryption import get_encryption_key
 
-                    await cur.execute(
-                        """
-                        SELECT account_id::text AS account_id, ilink_bot_id,
-                               bot_generation, ilink_user_id, status
-                        FROM dalton_channel_weixin_accounts
-                        WHERE user_id = %s AND status = 'active'
-                        FOR KEY SHARE
-                        """,
-                        (recipient_user_id,),
-                    )
-                    wx_acc = await cur.fetchone()
+                    wx_acc: Mapping[str, Any] | None = None
+                    for acc_row in locked_wx_accounts:
+                        if (
+                            isinstance(acc_row, Mapping)
+                            and str(acc_row.get("user_id") or "").strip() == recipient_user_id
+                            and str(acc_row.get("status") or "").strip().lower() == "active"
+                        ):
+                            wx_acc = acc_row
+                            break
                     if (
                         not isinstance(wx_acc, Mapping)
                         or str(wx_acc.get("ilink_user_id") or "").strip() != parsed["recipient_id"]
@@ -592,6 +764,18 @@ async def authorize_and_claim_failure_notice(
                             "failed",
                             "weixin_session_expired",
                             "Weixin reply token is missing.",
+                        )
+                else:
+                    if not await _dm_identity_matches(
+                        cur,
+                        user_id=recipient_user_id,
+                        platform=parsed["platform"],
+                        recipient_id=parsed["recipient_id"],
+                    ):
+                        return _deny_claim(
+                            "failed",
+                            "dm_binding_missing",
+                            "Recipient does not hold a matching active DM binding for this target.",
                         )
 
                 exec_uuid = _normalize_uuid(row.get("subject_id"))

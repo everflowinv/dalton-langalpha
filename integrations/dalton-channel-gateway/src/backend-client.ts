@@ -901,11 +901,13 @@ export interface RecoverAutomationRunRow {
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
 }
 
 export interface I7RecoverResponse {
   mode: "startup" | "watch_reconnect";
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
   inbound_events?: RecoverInboundEventRow[];
   background_runs: RecoverBackgroundRunRow[];
   thread_watches: RecoverThreadWatchRow[];
@@ -949,6 +951,7 @@ export interface I8AutomationRunFinishResponse {
   final_text: string | null;
   targets: AutomationRunTargetRecord[];
   strict_deliverable_text_enabled?: boolean;
+  failure_notice_enabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,6 +1654,11 @@ export interface BackendClient {
 
   authorizeAutomationNotificationPlan?(req: {
     delivery_id: string;
+  }): Promise<DataTaskAuthorizePlanResponse>;
+
+  authorizeFailureNoticePlan?(req: {
+    target_receipt_id: string;
+    claim_token: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
 
   downloadDataTaskRunArtifact?(

@@ -18,9 +18,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,  # DALTON-HOOK(execution-delivery-status)
     ValidationError,
     ValidationInfo,
     field_validator,
+    model_serializer,  # DALTON-HOOK(execution-delivery-status)
     model_validator,
 )
 
@@ -845,6 +847,16 @@ class FailureNoticeSummary(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+# DALTON-HOOK(execution-delivery-status): preserve original execution payload shape when failure_notice switch is OFF
+def _omit_disabled_failure_notice(data: Any) -> Any:
+    if isinstance(data, dict) and data.get("failure_notice") is None:
+        from src.dalton.settings import is_failure_notice_enabled
+
+        if not is_failure_notice_enabled():
+            data.pop("failure_notice", None)
+    return data
+
+
 class AutomationExecutionResponse(BaseModel):
     """One execution: a history row, and an automation's newest run."""
 
@@ -874,6 +886,11 @@ class AutomationExecutionResponse(BaseModel):
     excerpt: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+    # DALTON-HOOK(execution-delivery-status): omit failure_notice key when feature switch is OFF
+    @model_serializer(mode="wrap")
+    def _serialize_failure_notice_flag(self, handler: SerializerFunctionWrapHandler) -> Any:
+        return _omit_disabled_failure_notice(handler(self))
 
 
 class AutomationResponse(BaseModel):
@@ -983,11 +1000,18 @@ class ScriptExecutionResponse(BaseModel):
     notify_status: Optional[str] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary for script runs
+    failure_notice: Optional[FailureNoticeSummary] = None
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+    # DALTON-HOOK(execution-delivery-status): omit failure_notice key when feature switch is OFF
+    @model_serializer(mode="wrap")
+    def _serialize_failure_notice_flag(self, handler: SerializerFunctionWrapHandler) -> Any:
+        return _omit_disabled_failure_notice(handler(self))
 
 
 class ScriptAutomationResponse(BaseModel):
@@ -1062,6 +1086,8 @@ class ScriptRunResponse(BaseModel):
     notify_status: Optional[str] = None
     # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
     delivery_summary: Optional[ExecutionDeliverySummary] = None
+    # DALTON-HOOK(execution-delivery-status): durable failure-notice receipt summary for script runs
+    failure_notice: Optional[FailureNoticeSummary] = None
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None
@@ -1069,6 +1095,11 @@ class ScriptRunResponse(BaseModel):
     excerpt: None = None
 
     model_config = {"from_attributes": True}
+
+    # DALTON-HOOK(execution-delivery-status): omit failure_notice key when feature switch is OFF
+    @model_serializer(mode="wrap")
+    def _serialize_failure_notice_flag(self, handler: SerializerFunctionWrapHandler) -> Any:
+        return _omit_disabled_failure_notice(handler(self))
 
 
 AutomationRunReadResponse = Annotated[

@@ -18312,8 +18312,12 @@ async def _recover_channel_state_once(
                     auto_row["chart_snapshots"] = auto_snaps
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
-                    from src.dalton.settings import is_strict_deliverable_text_enabled
+                    from src.dalton.settings import (
+                        is_failure_notice_enabled,
+                        is_strict_deliverable_text_enabled,
+                    )
                     auto_row["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
+                    auto_row["failure_notice_enabled"] = is_failure_notice_enabled()
 
                 (
                     bt2_link_recoveries,
@@ -18324,11 +18328,15 @@ async def _recover_channel_state_once(
                     cur, enabled_platforms=enabled_platforms
                 )
 
-                from src.dalton.settings import is_strict_deliverable_text_enabled
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
 
                 return {
                     "mode": "startup",
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+                    "failure_notice_enabled": is_failure_notice_enabled(),
                     "inbound_events": _json_safe_rows(inbound_events),
                     "background_runs": _json_safe_rows(background_runs),
                     "thread_watches": _json_safe_rows(thread_watches),
@@ -18966,7 +18974,10 @@ async def finish_automation_run(
                             norm_exec_id,
                             exc_info=True,
                         )
-                from src.dalton.settings import is_strict_deliverable_text_enabled
+                from src.dalton.settings import (
+                    is_failure_notice_enabled,
+                    is_strict_deliverable_text_enabled,
+                )
 
                 return {
                     "execution_id": norm_exec_id,
@@ -18991,6 +19002,7 @@ async def finish_automation_run(
                     "final_text": updated.get("final_text"),
                     "targets": enriched_targets,
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
+                    "failure_notice_enabled": is_failure_notice_enabled(),
                 }
 
 

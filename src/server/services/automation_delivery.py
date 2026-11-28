@@ -581,6 +581,8 @@ async def finish_run(
     thread_id: Optional[str] = None,
     # DALTON-HOOK(channel-chart-snapshot): pass the settlement task's own run_id so channel gateway settles charts/widgets for that exact run
     run_id: Optional[str] = None,
+    # DALTON-HOOK(dalton-notify): tell gateway this is the final finish attempt so transient notice errors still seal the run
+    final_attempt: bool = False,
 ) -> Finish:
     """Ask the messaging service to end the run, once.
 
@@ -602,6 +604,9 @@ async def finish_run(
     # DALTON-HOOK(channel-chart-snapshot): include run_id in automation finish request body
     if run_id:
         body["run_id"] = str(run_id)
+    # DALTON-HOOK(dalton-notify): forward final_attempt so gateway seals finishing runs when retries exhaust
+    if final_attempt:
+        body["final_attempt"] = True
     if status == "completed" and final_text and final_text.strip():
         # DALTON-HOOK(standalone-core): rewrite same-origin /monitors/... links and avoid cutting mid-link when truncating for channel-gateway fallback delivery
         from src.dalton.notify.dispatch import (

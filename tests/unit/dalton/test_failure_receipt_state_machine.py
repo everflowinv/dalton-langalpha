@@ -58,11 +58,15 @@ class _InMemoryFailureNoticeDB:
         self.user_prefs: dict[str, dict[str, Any]] = {}
         self.soft_deleted_automations: set[str] = set()
         self.automation_executions: dict[str, dict[str, Any]] = {}
+        self.data_task_defs: dict[str, dict[str, Any]] = {}
+        self.data_task_runs: dict[str, dict[str, Any]] = {}
+        self.sql_log: list[str] = []
 
     def add_identity(self, user_id: str, platform: str, platform_user_id: str) -> None:
         if platform == "weixin":
             self.weixin_accounts[user_id] = {
                 "account_id": str(uuid4()),
+                "user_id": user_id,
                 "ilink_bot_id": "wx_bot_1",
                 "bot_generation": 1,
                 "ilink_user_id": platform_user_id,
@@ -108,9 +112,22 @@ class _InMemoryFailureNoticeDB:
             async def _execute(sql: Any, params: Any = None) -> None:
                 nonlocal last_rows
                 s = " ".join(str(sql).split())
+                db.sql_log.append(s)
                 p = params or ()
                 last_rows = []
                 cur.rowcount = 0
+
+                if "FROM dalton_data_task_defs" in s:
+                    jk = str(p[0])
+                    if jk in db.data_task_defs:
+                        last_rows = [dict(db.data_task_defs[jk])]
+                    return
+
+                if "SELECT notify_status FROM dalton_data_task_runs" in s:
+                    rid = str(p[0])
+                    if rid in db.data_task_runs:
+                        last_rows = [dict(db.data_task_runs[rid])]
+                    return
 
                 if "INSERT INTO dalton_failure_notice_streaks" in s and "DO UPDATE" in s:
                     kind, src_key = p[0], p[1]
@@ -160,10 +177,19 @@ class _InMemoryFailureNoticeDB:
                     return
 
                 if "FROM dalton_channel_weixin_accounts" in s and "FOR KEY SHARE" in s:
-                    uid = p[0]
-                    acc = db.weixin_accounts.get(uid)
-                    if acc and acc["status"] == "active":
-                        last_rows = [dict(acc)]
+                    matched: list[dict[str, Any]] = []
+                    for acc in db.weixin_accounts.values():
+                        if "user_id = %s OR account_id = %s::uuid" in s:
+                            if acc.get("user_id") == p[0] or acc.get("account_id") == str(p[1]):
+                                matched.append(dict(acc))
+                        elif "WHERE account_id = %s::uuid" in s:
+                            if acc.get("account_id") == str(p[0]):
+                                matched.append(dict(acc))
+                        else:
+                            if acc.get("user_id") == p[0]:
+                                matched.append(dict(acc))
+                    matched.sort(key=lambda r: str(r.get("account_id") or ""))
+                    last_rows = matched
                     return
 
                 if "FROM dalton_channel_weixin_accounts" in s:
@@ -1093,13 +1119,24 @@ async def test_all_four_subject_kinds_plan_and_claim_authorize(
     recipient = f"user-{subject_kind}"
     open_id = f"ou_{subject_kind}"
     db.add_identity(recipient, "feishu", open_id)
+    src_key = f"src-{subject_kind}"
+    if subject_kind == "data_task":
+        db.data_task_defs[src_key] = {"enabled": True, "notify_enabled": True}
+        monkeypatch.setattr(
+            dispatch_mod,
+            "evaluate_user_notify_eligibility",
+            create_autospec(
+                dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [f"feishu:user:{open_id}"]),
+            ),
+        )
     conn = db.make_conn()
 
     enq = await fr_mod.enqueue_failure_notice_in_tx(
         conn,
         subject_kind=subject_kind,
         subject_id=str(uuid4()),
-        source_key=f"src-{subject_kind}",
+        source_key=src_key,
         recipient_user_id=recipient,
         failure_reason="subscription_quota_exhausted",
         targets=[f"feishu:user:{open_id}"],
@@ -1514,5 +1551,697 @@ async def test_data_job_finalize_task_run_enqueues_failure_notice_and_bumps_epoc
     assert bump_events[0][0] is True  # strictly inside conn.transaction()
     assert bump_events[0][1]["subject_kind"] == "data_task"
     assert bump_events[0][1]["source_key"] == "daily-macro-fetch"
+
+
+# ---------------------------------------------------------------------------
+# 8. Round 2 Review Fixes (Sweeper, Rollback, Per-Target Claim, Data-Task Push
+#    Permissions, Weixin Lock Order, Stable Dedup Key, Script List APIs, Seal)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_sweeper_periodic_scan_and_switch_off_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Periodic sweeper runs independently without preflight traffic and is a strict no-op when OFF."""
+    import asyncio
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_process(**kwargs: Any) -> dict[str, int]:
+        calls.append(kwargs)
+        return {"reconciled": 1, "claimed": 1, "sent": 1, "failed": 0, "uncertain": 0}
+
+    proc_spy = create_autospec(fr_mod.process_due_failure_notices, side_effect=_fake_process)
+    sweeper = fr_mod.FailureNoticeSweeper(interval_s=0.05, limit=7, max_duration_s=10.0, process_fn=proc_spy)
+
+    # Switch OFF -> zero calls
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    off_res = await sweeper.run_once()
+    assert off_res["claimed"] == 0
+    assert proc_spy.await_count == 0
+
+    # Switch ON -> periodic background loop ticks without any preflight activity
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    sweeper.start()
+    try:
+        for _ in range(20):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.03)
+    finally:
+        await sweeper.stop()
+    assert len(calls) >= 2
+    assert calls[0]["limit"] == 7
+
+
+@pytest.mark.asyncio
+async def test_on_automation_settle_in_tx_propagates_sql_error_for_rollback_and_is_noop_when_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When enabled, enqueue SQL failures propagate so outer settlement rolls back; when OFF, enqueue never runs."""
+    from src.dalton.database import automation_recycle as recycle_mod
+
+    monkeypatch.setattr(
+        recycle_mod,
+        "automation_is_soft_deleted",
+        create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False),
+    )
+    enq_boom = create_autospec(
+        fr_mod.enqueue_failure_notice_in_tx,
+        side_effect=psycopg.OperationalError("lock timeout"),
+    )
+    monkeypatch.setattr(fr_mod, "enqueue_failure_notice_in_tx", enq_boom)
+
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    automation = {
+        "automation_id": str(uuid4()),
+        "user_id": "user-rollback-1",
+        "name": "Rollback Test Task",
+    }
+
+    # Switch OFF -> strict no-op, enqueue never invoked
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    res_off = await fr_mod.on_automation_settle_in_tx(
+        conn,
+        automation=automation,
+        execution_id=str(uuid4()),
+        outcome_status="failed",
+        failure_reason="plan_limit",
+    )
+    assert res_off is None
+    assert enq_boom.await_count == 0
+
+    # Switch ON -> OperationalError MUST propagate (never swallowed)
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    with pytest.raises(psycopg.OperationalError, match="lock timeout"):
+        await fr_mod.on_automation_settle_in_tx(
+            conn,
+            automation=automation,
+            execution_id=str(uuid4()),
+            outcome_status="failed",
+            failure_reason="plan_limit",
+        )
+    assert enq_boom.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_due_failure_notices_claims_per_target_respecting_time_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targets are claimed one-by-one right before dispatch; targets remaining after budget expiry stay pending with attempt_count=0."""
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    enq = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id="user-budget",
+        failure_reason="plan_limit",
+        targets=["feishu:user:ou_t1", "discord:user:123456789012345678", "weixin:user:wx_t3"],
+    )
+    assert enq is not None and len(enq["target_receipt_ids"]) == 3
+    tr_ids = list(enq["target_receipt_ids"])
+
+    # Advance monotonic clock during first post so budget expires right after target #1
+    clock = {"now": 100.0}
+    monkeypatch.setattr(fr_mod.time, "monotonic", lambda: clock["now"])
+
+    dispatched: list[str] = []
+
+    async def _slow_post(
+        target_receipt_id: str,
+        claim_token: str,
+        *,
+        target: str,
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        _ = claim_token, target
+        dispatched.append(target_receipt_id)
+        # First target consumes the full 5s cycle budget
+        clock["now"] += 6.0
+        return {"ok": True, "status": "sent", "items_sent": 1, "items_total": 1}
+
+    post_spy = create_autospec(fr_mod.post_failure_notice_gateway_notify, side_effect=_slow_post)
+    stats = await fr_mod.process_due_failure_notices(
+        limit=10,
+        max_duration_s=5.0,
+        post_fn=post_spy,
+        conn=conn,
+    )
+    assert stats["claimed"] == 1
+    assert stats["sent"] == 1
+    assert len(dispatched) == 1
+
+    # Remaining two targets MUST still be untouched: pending, attempt_count=0, claim_token=None
+    untouched = [db.targets[tid] for tid in tr_ids if tid != dispatched[0]]
+    assert len(untouched) == 2
+    for t in untouched:
+        assert t["status"] == "pending"
+        assert t["attempt_count"] == 0
+        assert t["claim_token"] is None
+        assert t["claim_expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_data_task_enqueue_and_claim_respect_push_settings_and_exclude_notify_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Data-task failure notices enforce push permissions at enqueue & claim, never fall back to bound DM,
+    and exclude targets already covered by ``notify_on_failure``."""
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    admin_uid = "admin-user-1"
+    admin_open_id = "ou_admin_1"
+    db.add_identity(admin_uid, "feishu", admin_open_id)
+    conn = db.make_conn()
+
+    # 1. Data task has notify_enabled=False -> not_applicable, 0 targets (even though admin has bound DM)
+    db.data_task_defs["job-disabled-notify"] = {"enabled": True, "notify_enabled": False}
+    enq_disabled = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="job-disabled-notify",
+        recipient_user_id=admin_uid,
+        failure_reason="exit_code_1",
+        data_task_notify_enabled=False,
+    )
+    assert enq_disabled is not None
+    assert enq_disabled["aggregate_status"] == "not_applicable"
+    assert enq_disabled["target_receipt_ids"] == []
+
+    # 2. User preferences disabled or empty targets -> never falls back to bound DM
+    real_eval_elig = dispatch_mod.evaluate_user_notify_eligibility
+    db.data_task_defs["job-empty-targets"] = {"enabled": True, "notify_enabled": True}
+    monkeypatch.setattr(
+        dispatch_mod,
+        "evaluate_user_notify_eligibility",
+        create_autospec(
+            real_eval_elig,
+            return_value=(False, "target_removed", []),
+        ),
+    )
+    enq_empty = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="job-empty-targets",
+        recipient_user_id=admin_uid,
+        failure_reason="exit_code_1",
+        data_task_notify_enabled=True,
+    )
+    assert enq_empty is not None
+    assert enq_empty["aggregate_status"] == "unconfigured"
+    assert enq_empty["target_receipt_ids"] == []
+
+    # 3. notify_on_failure active (notify_status='pending_dispatch') covers the same DM -> excluded (no double notify)
+    db.data_task_defs["job-nof"] = {"enabled": True, "notify_enabled": True}
+    monkeypatch.setattr(
+        dispatch_mod,
+        "evaluate_user_notify_eligibility",
+        create_autospec(
+            real_eval_elig,
+            return_value=(True, None, [f"feishu:user:{admin_open_id}"]),
+        ),
+    )
+    enq_nof = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="job-nof",
+        recipient_user_id=admin_uid,
+        failure_reason="exit_code_1",
+        data_task_notify_enabled=True,
+        data_task_notify_status="pending_dispatch",
+    )
+    assert enq_nof is not None
+    assert enq_nof["aggregate_status"] == "not_applicable"
+    assert enq_nof["target_receipt_ids"] == []
+
+    # 4. Eligible data task enqueues DM target, then task push is disabled before claim -> claim denies terminally
+    db.data_task_defs["job-claim-recheck"] = {"enabled": True, "notify_enabled": True}
+    enq_ok = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="job-claim-recheck",
+        recipient_user_id=admin_uid,
+        failure_reason="exit_code_1",
+        data_task_notify_enabled=True,
+        data_task_notify_status="skipped",
+    )
+    assert enq_ok is not None and len(enq_ok["target_receipt_ids"]) == 1
+    tr_id = enq_ok["target_receipt_ids"][0]
+    claimed = await fr_mod.claim_due_failure_notice_targets(limit=5, conn=conn)
+    tok = next(r["claim_token"] for r in claimed if r["target_receipt_id"] == tr_id)
+
+    # Admin turns off per-task push between enqueue and claim
+    db.data_task_defs["job-claim-recheck"]["notify_enabled"] = False
+    plan_denied = await claims_mod.authorize_failure_notice_plan(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+        conn=conn,
+        now=db.now,
+    )
+    assert plan_denied["authorized"] is False
+    assert plan_denied["code"] == "task_notify_disabled"
+
+    claim_denied = await claims_mod.authorize_and_claim_failure_notice(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+        conn=conn,
+        now=db.now,
+    )
+    assert claim_denied["claim_status"] == "denied"
+    assert claim_denied["code"] == "task_notify_disabled"
+    assert fr_mod.is_failure_notice_terminal_error_code(claim_denied["code"]) is True
+
+
+@pytest.mark.asyncio
+async def test_weixin_claim_locks_account_for_key_share_before_delivery_for_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weixin failure-notice retry locks ``dalton_channel_weixin_accounts FOR KEY SHARE``
+    strictly BEFORE ``dalton_channel_deliveries FOR UPDATE`` (preventing AB-BA deadlock with unbind)."""
+    from src.dalton.database import weixin_multi_account as wx_db
+    from src.server.database import encryption as enc_mod
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    uid = "wx-lock-user"
+    wx_uid = "wx_user_lock_1@im.wechat"
+    db.add_identity(uid, "weixin", wx_uid)
+    wx_acc_id = db.weixin_accounts[uid]["account_id"]
+    conn = db.make_conn()
+
+    enq = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="personal_automation",
+        subject_id=str(uuid4()),
+        source_key=str(uuid4()),
+        recipient_user_id=uid,
+        failure_reason="plan_limit",
+        targets=[f"weixin:user:{wx_uid}"],
+    )
+    assert enq is not None
+    tr_id = enq["target_receipt_ids"][0]
+    claimed = await fr_mod.claim_due_failure_notice_targets(limit=5, conn=conn)
+    tok = claimed[0]["claim_token"]
+
+    # Pre-seed an existing failed delivery row pointing to wx_acc_id (simulating a retry)
+    d_key = fr_mod.failure_notice_delivery_key(tr_id)
+    db.channel_deliveries[d_key] = {
+        "delivery_key": d_key,
+        "user_id": uid,
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "status": "failed",
+        "sent_chunks": 0,
+        "weixin_account_id": wx_acc_id,
+    }
+
+    monkeypatch.setattr(enc_mod, "get_encryption_key", lambda: "test-key")
+    monkeypatch.setattr(
+        wx_db,
+        "resolve_weixin_account_context_token_in_tx",
+        create_autospec(
+            wx_db.resolve_weixin_account_context_token_in_tx,
+            return_value=("ctx-token-ok", 1, False),
+        ),
+    )
+
+    db.sql_log.clear()
+    claim = await claims_mod.authorize_and_claim_failure_notice(
+        target_receipt_id=tr_id,
+        claim_token=tok,
+        conn=conn,
+        now=db.now,
+    )
+    assert claim["claim_status"] == "claimed"
+    assert claim["weixin_account_id"] == wx_acc_id
+
+    wx_lock_indices = [
+        idx
+        for idx, sql in enumerate(db.sql_log)
+        if "FROM dalton_channel_weixin_accounts" in sql and "FOR KEY SHARE" in sql
+    ]
+    del_lock_indices = [
+        idx
+        for idx, sql in enumerate(db.sql_log)
+        if "FROM dalton_channel_deliveries" in sql and "FOR UPDATE" in sql
+    ]
+    assert len(wx_lock_indices) == 1
+    assert len(del_lock_indices) == 1
+    assert wx_lock_indices[0] < del_lock_indices[0]
+
+
+@pytest.mark.asyncio
+async def test_data_task_dedup_key_uses_stable_failure_code_ignoring_dates_and_prose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive data-task failures of the same type with different dates/details share one dedup_window_key."""
+    from src.dalton.data_jobs import evaluators as eval_mod
+
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    db = _InMemoryFailureNoticeDB(now=NOW)
+    conn = db.make_conn()
+
+    # Evaluator outputs with different dates on day 1 vs day 2
+    ev1 = eval_mod.evaluate_task_run(
+        eval_mod.TaskEvaluationContext(
+            job_key="daily-macro",
+            exit_code=1,
+            stdout='{"stale_reason": "stale_data", "index_dates": {"csi300": "2026-11-26"}}',
+        )
+    )
+    ev2 = eval_mod.evaluate_task_run(
+        eval_mod.TaskEvaluationContext(
+            job_key="daily-macro",
+            exit_code=1,
+            stdout='{"stale_reason": "stale_data", "index_dates": {"csi300": "2026-11-27"}}',
+        )
+    )
+    assert ev1.failure_reason != ev2.failure_reason
+    assert ev1.details["index_dates"] == {"csi300": "2026-11-26"}
+    assert ev2.details["index_dates"] == {"csi300": "2026-11-27"}
+
+    code1 = fr_mod.normalize_data_task_failure_code(
+        ev1.failure_reason, explicit_code=ev1.failure_code, details=ev1.details
+    )
+    code2 = fr_mod.normalize_data_task_failure_code(
+        ev2.failure_reason, explicit_code=ev2.failure_code, details=ev2.details
+    )
+    assert code1 == code2 == "stale_data"
+
+    # Also verify evaluator colon-delimited date reasons normalize cleanly
+    assert (
+        fr_mod.normalize_data_task_failure_code(
+            "t5_stale_unwind_date:2026-11-25:ref=2026-11-27:min=2026-11-26"
+        )
+        == "t5_stale_unwind_date"
+    )
+    assert (
+        fr_mod.normalize_data_task_failure_code(
+            "sentiment_signals_stale:2026-11-20:ref=2026-11-27:age_days=7"
+        )
+        == "sentiment_signals_stale"
+    )
+    assert (
+        fr_mod.normalize_data_task_failure_code("2026-11-27 抓取失败：上游超时")
+        == "failed"
+    )
+
+    r1 = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="daily-macro",
+        recipient_user_id="admin-1",
+        failure_reason=ev1.failure_reason or "failed",
+        detail=ev1.failure_reason,
+        metadata={"job_key": "daily-macro", "index_dates": ev1.details.get("index_dates")},
+        targets=["feishu:user:ou_admin"],
+    )
+    r2 = await fr_mod.enqueue_failure_notice_in_tx(
+        conn,
+        subject_kind="data_task",
+        subject_id=str(uuid4()),
+        source_key="daily-macro",
+        recipient_user_id="admin-1",
+        failure_reason=ev2.failure_reason or "failed",
+        detail=ev2.failure_reason,
+        metadata={"job_key": "daily-macro", "index_dates": ev2.details.get("index_dates")},
+        targets=["feishu:user:ou_admin"],
+    )
+    assert r1 is not None and r1["aggregate_status"] == "retrying"
+    assert r1["dedup_window_key"] == "stale_data:epoch:0"
+    assert db.notices[r1["notice_id"]]["summary_json"]["index_dates"] == {"csi300": "2026-11-26"}
+    assert "2026-11-26" in db.notices[r1["notice_id"]]["summary_json"]["detail"]
+    assert r2 is not None and r2["aggregate_status"] == "suppressed"
+    assert r2["suppressed"] is True
+
+
+def test_execution_list_api_omits_failure_notice_when_off_and_returns_on_script_endpoints_when_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real FastAPI execution-list endpoints (company feed + data-task history) omit ``failure_notice``
+    when the flag is OFF and return populated ``failure_notice`` on ``ScriptRunResponse`` when ON."""
+    from typing import get_args
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.dalton.database import company_data_tasks as company_data_db
+    from src.dalton.services import company_automations as company_auto_svc
+    from src.dalton.services import company_task_read as ctr_mod
+    from src.server.app import automations as auto_router_mod
+    from src.server.dependencies.principal import Principal, ReadPrincipal
+    from src.server.models.automation import (
+        AutomationRunResponse,
+        ScriptExecutionResponse,
+        ScriptRunResponse,
+    )
+
+    script_run_id = uuid4()
+    agent_exec_id = uuid4()
+    agent_auto_id = uuid4()
+    job_key = "daily-macro-fetch"
+
+    script_row = {
+        "engine_kind": "script",
+        "automation_execution_id": script_run_id,
+        "automation_id": f"data:{job_key}",
+        "automation_name": "Daily Macro Fetch",
+        "status": "failed",
+        "scheduled_at": NOW,
+        "started_at": NOW,
+        "completed_at": NOW,
+        "created_at": NOW,
+        "exit_code": 1,
+        "failure_reason": "exit_code_1",
+        "notify_status": "skipped",
+        "triggered_by_user_id": None,
+        "log_tail": None,
+        "trigger_source": "cron",
+    }
+    agent_row = {
+        "engine_kind": "agent",
+        "automation_execution_id": agent_exec_id,
+        "automation_id": agent_auto_id,
+        "automation_name": "Company Brief",
+        "trigger_type": "cron",
+        "status": "failed",
+        "scheduled_at": NOW,
+        "started_at": NOW,
+        "completed_at": NOW,
+        "created_at": NOW,
+        "failure_reason": "plan_limit",
+    }
+
+    notice_summaries = {
+        str(script_run_id).lower(): {
+            "notice_id": str(uuid4()),
+            "subject_kind": "data_task",
+            "status": "delivered",
+            "failure_reason": "exit_code_1",
+            "total_targets": 1,
+            "sent_count": 1,
+            "failed_count": 0,
+            "retrying_count": 0,
+            "last_error_code": None,
+            "updated_at": NOW,
+        },
+        str(agent_exec_id).lower(): {
+            "notice_id": str(uuid4()),
+            "subject_kind": "company_automation",
+            "status": "retrying",
+            "failure_reason": "plan_limit",
+            "total_targets": 1,
+            "sent_count": 0,
+            "failed_count": 0,
+            "retrying_count": 1,
+            "last_error_code": None,
+            "updated_at": NOW,
+        },
+    }
+
+    monkeypatch.setattr(
+        company_auto_svc,
+        "require_company_scope_read_access",
+        create_autospec(company_auto_svc.require_company_scope_read_access, return_value=None),
+    )
+    monkeypatch.setattr(
+        ctr_mod,
+        "require_company_scope_read_access",
+        create_autospec(ctr_mod.require_company_scope_read_access, return_value=None),
+    )
+    monkeypatch.setattr(
+        ctr_mod,
+        "_require_complete_manifest",
+        create_autospec(ctr_mod._require_complete_manifest, return_value=[job_key]),
+    )
+    monkeypatch.setattr(
+        ctr_mod,
+        "_require_known_manifest_key",
+        create_autospec(ctr_mod._require_known_manifest_key, return_value=None),
+    )
+    monkeypatch.setattr(
+        company_data_db,
+        "get_script_def_row",
+        create_autospec(
+            company_data_db.get_script_def_row,
+            return_value={"job_key": job_key, "deleted_at": None},
+        ),
+    )
+    monkeypatch.setattr(
+        company_data_db,
+        "list_company_agent_execution_window",
+        create_autospec(
+            company_data_db.list_company_agent_execution_window,
+            return_value=[agent_row],
+        ),
+    )
+    monkeypatch.setattr(
+        company_data_db,
+        "list_script_execution_window",
+        create_autospec(
+            company_data_db.list_script_execution_window,
+            return_value=[script_row],
+        ),
+    )
+    monkeypatch.setattr(
+        eds_mod,
+        "load_execution_notify_rows",
+        create_autospec(eds_mod.load_execution_notify_rows, return_value={}),
+    )
+    monkeypatch.setattr(
+        fr_mod,
+        "load_failure_notice_summaries",
+        create_autospec(fr_mod.load_failure_notice_summaries, return_value=notice_summaries),
+    )
+
+    app = FastAPI()
+    app.include_router(auto_router_mod.router)
+    read_principal_dep = get_args(ReadPrincipal)[1].dependency
+    app.dependency_overrides[read_principal_dep] = lambda: Principal(user_id="admin-1", auth="session")
+    client = TestClient(app)
+
+    # 1. Switch OFF -> both endpoints omit ``failure_notice`` key completely (preserving pre-change shape)
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    r_feed_off = client.get("/api/v1/automations/executions?scope=company")
+    assert r_feed_off.status_code == 200
+    for item in r_feed_off.json()["executions"]:
+        assert "failure_notice" not in item
+
+    r_hist_off = client.get(f"/api/v1/automations/data:{job_key}/executions")
+    assert r_hist_off.status_code == 200
+    for item in r_hist_off.json()["executions"]:
+        assert "failure_notice" not in item
+
+    # Direct model check for ScriptExecutionResponse / AutomationRunResponse / ScriptRunResponse when OFF
+    assert "failure_notice" not in ScriptExecutionResponse(
+        automation_execution_id=script_run_id,
+        automation_id=f"data:{job_key}",
+        status="failed",
+        scheduled_at=NOW,
+        created_at=NOW,
+    ).model_dump()
+    assert "failure_notice" not in AutomationRunResponse.model_validate(agent_row).model_dump()
+    assert "failure_notice" not in ScriptRunResponse.model_validate(script_row).model_dump()
+
+    # 2. Switch ON -> BOTH company execution feed and data-task history return ``failure_notice`` on script runs
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    r_feed_on = client.get("/api/v1/automations/executions?scope=company")
+    assert r_feed_on.status_code == 200
+    feed_by_id = {e["automation_execution_id"]: e for e in r_feed_on.json()["executions"]}
+    assert feed_by_id[str(script_run_id)]["failure_notice"]["status"] == "delivered"
+    assert feed_by_id[str(script_run_id)]["failure_notice"]["subject_kind"] == "data_task"
+    assert feed_by_id[str(agent_exec_id)]["failure_notice"]["status"] == "retrying"
+
+    r_hist_on = client.get(f"/api/v1/automations/data:{job_key}/executions")
+    assert r_hist_on.status_code == 200
+    hist_items = r_hist_on.json()["executions"]
+    assert len(hist_items) == 1
+    assert hist_items[0]["automation_execution_id"] == str(script_run_id)
+    assert hist_items[0]["failure_notice"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_finish_held_run_passes_final_attempt_on_last_outbox_try_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_finish_held_run`` sends ``final_attempt=True`` on the last outbox attempt when the switch is ON,
+    and keeps the original call shape when the switch is OFF."""
+    from src.server.database import automation as auto_db
+    from src.server.services import automation_settlement as settle_mod
+    from src.server.services.hook_outbox import MAX_ATTEMPTS
+
+    exec_id = str(uuid4())
+    auto_id = str(uuid4())
+    job_base = {
+        "hook_outbox_id": str(uuid4()),
+        "conversation_thread_id": str(uuid4()),
+        "run_id": str(uuid4()),
+        "attempts": MAX_ATTEMPTS,
+        "payload": {
+            "execution_id": exec_id,
+            "automation_id": auto_id,
+            "user_id": "user-1",
+            "status": "failed",
+            "delivery": {
+                "id": exec_id,
+                "targets": [
+                    {"entry": "feishu:@me", "address": "feishu:@me", "name": "DM", "ok": True}
+                ],
+            },
+            "recorded": False,
+            "answered": False,
+        },
+    }
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation",
+        create_autospec(
+            auto_db.get_automation,
+            return_value={"automation_id": auto_id, "user_id": "user-1", "name": "Task"},
+        ),
+    )
+    monkeypatch.setattr(
+        settle_mod,
+        "_keep_record",
+        create_autospec(settle_mod._keep_record, return_value=True),
+    )
+
+    captured_kwargs: list[dict[str, Any]] = []
+
+    async def _fake_finish_run(*_args: Any, **kwargs: Any) -> automation_delivery.Finish:
+        captured_kwargs.append(dict(kwargs))
+        return automation_delivery.Finish(
+            [{"method": "feishu:@me", "address": "feishu:@me", "name": "DM", "success": False, "via": None, "error": "failed"}],
+            retry=False,
+            answered=True,
+        )
+
+    finish_spy = create_autospec(automation_delivery.finish_run, side_effect=_fake_finish_run)
+    monkeypatch.setattr(automation_delivery, "finish_run", finish_spy)
+
+    # Switch OFF -> final_attempt NOT passed
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "0")
+    await settle_mod._finish_held_run(dict(job_base))
+    assert "final_attempt" not in captured_kwargs[-1]
+
+    # Switch ON + attempts == MAX_ATTEMPTS -> final_attempt=True passed so gateway seals finishing run
+    monkeypatch.setenv("DALTON_FAILURE_NOTICE_ENABLED", "1")
+    await settle_mod._finish_held_run(dict(job_base))
+    assert captured_kwargs[-1].get("final_attempt") is True
+
+    # Switch ON + attempts < MAX_ATTEMPTS -> final_attempt NOT passed yet (503 retry stays active)
+    early_job = {**job_base, "attempts": 1}
+    await settle_mod._finish_held_run(early_job)
+    assert "final_attempt" not in captured_kwargs[-1]
 
 

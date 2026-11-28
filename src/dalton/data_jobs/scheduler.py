@@ -1733,6 +1733,7 @@ async def finalize_task_run(
                     from src.dalton.notify.failure_receipts import (
                         bump_failure_notice_recovery_epoch_in_tx,
                         enqueue_failure_notice_in_tx,
+                        normalize_data_task_failure_code,
                     )
 
                     if terminal_status == "succeeded":
@@ -1742,15 +1743,27 @@ async def finalize_task_run(
                             source_key=claimed.job_key,
                         )
                     else:
+                        stable_failure_code = normalize_data_task_failure_code(
+                            evaluation.failure_reason,
+                            terminal_status=terminal_status,
+                            explicit_code=evaluation.failure_code,
+                            details=evaluation.details,
+                        )
+                        notice_meta: dict[str, Any] = {"job_key": claimed.job_key}
+                        if isinstance(evaluation.details, Mapping) and evaluation.details.get("index_dates"):
+                            notice_meta["index_dates"] = evaluation.details["index_dates"]
                         await enqueue_failure_notice_in_tx(
                             conn,
                             subject_kind="data_task",
                             subject_id=str(claimed.run_id),
                             source_key=claimed.job_key,
-                            failure_reason=evaluation.failure_reason or terminal_status,
+                            failure_reason=stable_failure_code,
                             title=f"数据任务失败：{claimed.job_key}",
                             detail=evaluation.failure_reason,
-                            metadata={"job_key": claimed.job_key},
+                            metadata=notice_meta,
+                            data_task_notify_enabled=claimed.notify_enabled,
+                            data_task_notify_status=notify_status,
+                            data_task_failure_code=stable_failure_code,
                         )
     except _TerminalRollback:
         return False, None

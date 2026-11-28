@@ -100,7 +100,7 @@ describe("failure notice gateway route & automation finish 503", () => {
 
   it("POST /internal/failure-notices forwards claim_token to plan and I-6 authorize-and-claim", async () => {
     const backend = createMockBackend();
-    backend.authorizeFailureNoticePlan.mockResolvedValueOnce(failureNoticePlan());
+    vi.spyOn(backend, "authorizeFailureNoticePlan").mockResolvedValueOnce(failureNoticePlan());
     const claimResp: I6AuthorizeAndClaimResponse = {
       claim_status: "claimed",
       platform: "feishu",
@@ -153,7 +153,7 @@ describe("failure notice gateway route & automation finish 503", () => {
 
   it("POST /internal/failure-notices aborts without sending when I-6 denies expired claim_token", async () => {
     const backend = createMockBackend();
-    backend.authorizeFailureNoticePlan.mockResolvedValueOnce(failureNoticePlan());
+    vi.spyOn(backend, "authorizeFailureNoticePlan").mockResolvedValueOnce(failureNoticePlan());
     vi.spyOn(backend, "authorizeAndClaimDelivery").mockResolvedValueOnce({
       claim_status: "denied",
       status: "failed",
@@ -187,7 +187,7 @@ describe("failure notice gateway route & automation finish 503", () => {
     expect(feishu.sentCards.length).toBe(0);
   });
 
-  it("executeAutomationRunFinishDetailed returns 503 and leaves run unsealed on transient noticeRes failure", async () => {
+  it("executeAutomationRunFinishDetailed returns 503 and leaves run unsealed on transient noticeRes failure when failure_notice_enabled is true", async () => {
     const backend = createMockBackend();
     const execId = "cccccccc-1111-4222-8333-444444444444";
     const finishSpy = vi.spyOn(backend, "finishAutomationRun").mockResolvedValue({
@@ -195,18 +195,21 @@ describe("failure notice gateway route & automation finish 503", () => {
       data: {
         execution_id: execId,
         user_id: "user-1",
+        workspace_id: null,
         thread_id: "thread-1",
         automation_name: "Daily Brief",
         status: "finishing",
         previous_status: "registered",
         finish_status: "failed",
         final_text: null,
+        failure_notice_enabled: true,
         targets: [
           {
             entry: "feishu:@me",
             address: "feishu:@me",
             name: "Alice DM",
             ok: true,
+            message: null,
           },
         ],
       },
@@ -242,6 +245,213 @@ describe("failure notice gateway route & automation finish 503", () => {
     expect(finishSpy.mock.calls[0]?.[1]?.mark_finished).toBe(false);
   });
 
+  it("executeAutomationRunFinishDetailed seals run and returns 200 on transient noticeRes failure when failure_notice_enabled is false (default)", async () => {
+    const backend = createMockBackend();
+    const execId = "cceeeeee-1111-4222-8333-444444444444";
+    const finishSpy = vi
+      .spyOn(backend, "finishAutomationRun")
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          execution_id: execId,
+          user_id: "user-1",
+          workspace_id: null,
+          thread_id: "thread-1",
+          automation_name: "Daily Brief",
+          status: "finishing",
+          previous_status: "registered",
+          finish_status: "failed",
+          final_text: null,
+          failure_notice_enabled: false,
+          targets: [
+            {
+              entry: "feishu:@me",
+              address: "feishu:@me",
+              name: "Alice DM",
+              ok: true,
+              message: null,
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          execution_id: execId,
+          user_id: "user-1",
+          workspace_id: null,
+          thread_id: "thread-1",
+          automation_name: "Daily Brief",
+          status: "finished",
+          previous_status: "finishing",
+          finish_status: "failed",
+          final_text: null,
+          targets: [],
+        },
+      });
+
+    const feishu = new FakeChannelAdapter("feishu");
+    vi.spyOn(feishu, "isConnected").mockReturnValue(false);
+    const app = makeApp(backend, new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]));
+
+    const res = await fetchGatewayServer(
+      app,
+      `http://127.0.0.1/agent/automation-runs/${execId}/finish`,
+      {
+        method: "POST",
+        headers: {
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+          "X-User-Id": "user-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          status: "failed",
+          thread_id: "thread-1",
+          final_text: null,
+        }),
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(finishSpy).toHaveBeenCalledTimes(2);
+    expect(finishSpy.mock.calls[1]?.[1]?.mark_finished).toBe(true);
+  });
+
+  it("executeAutomationRunFinishDetailed seals run and returns 200 when final_attempt is true despite transient noticeRes failure", async () => {
+    const backend = createMockBackend();
+    const execId = "ccffffff-1111-4222-8333-444444444444";
+    const finishSpy = vi
+      .spyOn(backend, "finishAutomationRun")
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          execution_id: execId,
+          user_id: "user-1",
+          workspace_id: null,
+          thread_id: "thread-1",
+          automation_name: "Daily Brief",
+          status: "finishing",
+          previous_status: "registered",
+          finish_status: "failed",
+          final_text: null,
+          failure_notice_enabled: true,
+          targets: [
+            {
+              entry: "feishu:@me",
+              address: "feishu:@me",
+              name: "Alice DM",
+              ok: true,
+              message: null,
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          execution_id: execId,
+          user_id: "user-1",
+          workspace_id: null,
+          thread_id: "thread-1",
+          automation_name: "Daily Brief",
+          status: "finished",
+          previous_status: "finishing",
+          finish_status: "failed",
+          final_text: null,
+          targets: [],
+        },
+      });
+
+    const feishu = new FakeChannelAdapter("feishu");
+    vi.spyOn(feishu, "isConnected").mockReturnValue(false);
+    const app = makeApp(backend, new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]));
+
+    const res = await fetchGatewayServer(
+      app,
+      `http://127.0.0.1/agent/automation-runs/${execId}/finish`,
+      {
+        method: "POST",
+        headers: {
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+          "X-User-Id": "user-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          status: "failed",
+          thread_id: "thread-1",
+          final_text: null,
+          final_attempt: true,
+        }),
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(finishSpy).toHaveBeenCalledTimes(2);
+    expect(finishSpy.mock.calls[1]?.[1]?.mark_finished).toBe(true);
+  });
+
+  it("startup recovery executeAutomationRunFinish seals run on unknown/in_flight notice and retries boundedly on unavailable", async () => {
+    const backend = createMockBackend();
+    const execUnknown = "eeeeeeee-1111-4222-8333-444444444444";
+    const finishSpy = vi.spyOn(backend, "finishAutomationRun").mockResolvedValue({
+      status: 200,
+      data: {
+        execution_id: execUnknown,
+        user_id: "user-1",
+        workspace_id: null,
+        thread_id: "thread-1",
+        automation_name: "Daily Brief",
+        status: "finished",
+        previous_status: "finishing",
+        finish_status: "failed",
+        final_text: null,
+        targets: [],
+      },
+    });
+    vi.spyOn(backend, "authorizeAndClaimDelivery").mockResolvedValueOnce({
+      claim_status: "in_flight_or_unknown",
+      status: "unknown",
+      code: "in_flight",
+      message: "Earlier attempt still unknown.",
+      platform: "feishu",
+      target_address: "feishu:@me",
+      is_current: false,
+    });
+
+    const feishu = new FakeChannelAdapter("feishu");
+    const app = makeApp(backend, new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]));
+
+    await app.agentRoutes.executeAutomationRunFinish({
+      executionId: execUnknown,
+      userId: "user-1",
+      threadId: "thread-1",
+      automationName: "Daily Brief",
+      finishStatus: "failed",
+      finalText: null,
+      failureNoticeEnabled: true,
+      recoveryRetryDelayMs: 0,
+      targets: [{ entry: "feishu:@me", address: "feishu:@me", name: "Alice DM", ok: true, message: null }],
+    });
+    expect(finishSpy).toHaveBeenCalledTimes(1);
+    expect(finishSpy.mock.calls[0]?.[1]?.mark_finished).toBe(true);
+
+    // On genuinely retryable unavailable error during startup recovery, retries once then seals
+    const execUnavailable = "ffffffff-1111-4222-8333-444444444444";
+    finishSpy.mockClear();
+    vi.spyOn(feishu, "isConnected").mockReturnValue(false);
+    await app.agentRoutes.executeAutomationRunFinish({
+      executionId: execUnavailable,
+      userId: "user-1",
+      threadId: "thread-1",
+      automationName: "Daily Brief",
+      finishStatus: "failed",
+      finalText: null,
+      failureNoticeEnabled: true,
+      recoveryRetryDelayMs: 0,
+      targets: [{ entry: "feishu:@me", address: "feishu:@me", name: "Alice DM", ok: true, message: null }],
+    });
+    expect(finishSpy).toHaveBeenCalledTimes(1);
+    expect(finishSpy.mock.calls[0]?.[1]?.mark_finished).toBe(true);
+  });
+
   it("executeAutomationRunFinishDetailed seals run and returns 200 on permanent noticeRes denial", async () => {
     const backend = createMockBackend();
     const execId = "dddddddd-1111-4222-8333-444444444444";
@@ -252,6 +462,7 @@ describe("failure notice gateway route & automation finish 503", () => {
         data: {
           execution_id: execId,
           user_id: "user-1",
+          workspace_id: null,
           thread_id: "thread-1",
           automation_name: "Daily Brief",
           status: "finishing",
@@ -264,6 +475,7 @@ describe("failure notice gateway route & automation finish 503", () => {
               address: "feishu:@me",
               name: "Alice DM",
               ok: true,
+              message: null,
             },
           ],
         },
@@ -273,6 +485,7 @@ describe("failure notice gateway route & automation finish 503", () => {
         data: {
           execution_id: execId,
           user_id: "user-1",
+          workspace_id: null,
           thread_id: "thread-1",
           automation_name: "Daily Brief",
           status: "finished",

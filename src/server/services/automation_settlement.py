@@ -559,12 +559,18 @@ async def _finish_here(
     """Ask the messaging service to end a held run from this process, for a
     run with no outbox job to leave it to. The first ask's record stands
     until a retry says more."""
+    # DALTON-HOOK(dalton-notify): pass final_attempt when failure-notice retries are exhausted so gateway seals the run
+    from src.dalton.settings import is_failure_notice_enabled
+
     ask = functools.partial(
         automation_delivery.finish_run, automation, delivery.id, status,
         targets=delivery.targets, final_text=final_text, thread_id=thread_id,
         run_id=run_id,  # DALTON-HOOK(channel-chart-snapshot)
     )
-    finish = await ask()
+    first_kw: Dict[str, Any] = {}
+    if not automation_delivery.FINISH_RETRY_DELAYS and is_failure_notice_enabled():
+        first_kw["final_attempt"] = True
+    finish = await ask(**first_kw)
     # DALTON-HOOK(execution-delivery-status): persist whether finish will be retried
     will_retry = finish.retry and bool(automation_delivery.FINISH_RETRY_DELAYS)
     await _record_delivery(
@@ -572,8 +578,13 @@ async def _finish_here(
     )
     if finish.retry:
         # Off the settle's path, which the executor waits on.
+        ask_final = (
+            functools.partial(ask, final_attempt=True)
+            if is_failure_notice_enabled()
+            else ask
+        )
         _hold(asyncio.create_task(
-            _finish_again(ask, execution_id, answered=finish.answered),
+            _finish_again(ask, execution_id, answered=finish.answered, ask_final=ask_final),
             name=f"settle_finish_{execution_id}",
         ))
 
@@ -614,11 +625,18 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
     answered = payload.get("answered") is True
     # DALTON-HOOK(channel-chart-snapshot): pass the outbox job's own run_id to finish_run
     job_run_id = payload.get("run_id") or job.get("run_id")
+    # DALTON-HOOK(dalton-notify): tell gateway when this is the final outbox attempt so finishing runs always seal
+    from src.dalton.settings import is_failure_notice_enabled
+
+    finish_kw: Dict[str, Any] = {}
+    if int(job["attempts"]) >= MAX_ATTEMPTS and is_failure_notice_enabled():
+        finish_kw["final_attempt"] = True
     finish = await automation_delivery.finish_run(
         automation, delivery.id, payload["status"],
         targets=delivery.targets, final_text=payload.get("final_text"),
         thread_id=str(job["conversation_thread_id"]),
         run_id=str(job_run_id) if job_run_id else None,
+        **finish_kw,
     )
     # DALTON-HOOK(execution-delivery-status): persist sender retry decision on delivery_result
     will_retry = finish.retry and job["attempts"] < MAX_ATTEMPTS
@@ -718,6 +736,8 @@ async def _finish_again(
     execution_id: str,
     *,
     answered: bool,
+    # DALTON-HOOK(dalton-notify): optional final-attempt callable to seal finishing run on last try
+    ask_final: Optional[Callable[[], Awaitable[automation_delivery.Finish]]] = None,
 ) -> None:
     """Ask the messaging service again to end a run whose finish got no
     answer, found it briefly unavailable, or got rows it was still posting
@@ -731,7 +751,8 @@ async def _finish_again(
     delays = automation_delivery.FINISH_RETRY_DELAYS
     for idx, delay in enumerate(delays):
         await asyncio.sleep(delay)
-        finish = await ask()
+        is_last = idx == len(delays) - 1
+        finish = await (ask_final if (is_last and ask_final is not None) else ask)()
         # DALTON-HOOK(execution-delivery-status): persist sender retry decision on replacement records
         will_retry = finish.retry and idx < len(delays) - 1
         if _replaces_record(finish, answered):

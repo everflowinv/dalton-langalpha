@@ -789,6 +789,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # diagnostics must never block startup
         logger.warning(f"Failed to start RedisDiagnosticsService: {e}")
 
+    # DALTON-HOOK(dalton-notify): start periodic durable failure-notice sweeper (PG SKIP LOCKED across workers)
+    try:
+        from src.dalton.notify.failure_receipts import FailureNoticeSweeper
+
+        FailureNoticeSweeper.get_instance().start()
+    except Exception as e:
+        logger.warning(f"Failed to start FailureNoticeSweeper: {e}")
+
     # Start MarketDataFeed (shared upstream WS to ginlix-data)
     try:
         from src.server.services.market_data_feed import (
@@ -1169,6 +1177,14 @@ async def lifespan(app: FastAPI):
             await _background_singleton(name, module).stop()
         except Exception as e:
             logger.warning(f"Error stopping {name}: {e}")
+
+    # DALTON-HOOK(dalton-notify): stop periodic durable failure-notice sweeper
+    try:
+        from src.dalton.notify.failure_receipts import FailureNoticeSweeper
+
+        await FailureNoticeSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error stopping FailureNoticeSweeper: {e}")
 
     # DALTON-HOOK(redis-write-diag): stop per-worker Redis diagnostics & release PG leader lock
     try:
