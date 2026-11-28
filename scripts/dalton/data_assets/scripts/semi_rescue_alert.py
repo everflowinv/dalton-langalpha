@@ -29,9 +29,53 @@ from zoneinfo import ZoneInfo
 import warnings
 warnings.filterwarnings("ignore")
 
-ROOT = Path(__file__).resolve().parent.parent
-if not (ROOT / "AGENTS.md").exists():
-    ROOT = Path(os.environ.get("OPENCLAW_WORKSPACE", "/Users/everflow/.openclaw/workspace"))
+def _resolve_workspace() -> Path:
+    for var in ("DALTON_DATA_TASK_WORKSPACE", "DALTON_WORKSPACE", "OPENCLAW_WORKSPACE", "WORKDIR"):
+        env_ws = (os.environ.get(var) or "").strip()
+        if env_ws:
+            return Path(env_ws)
+    return Path.cwd()
+
+
+def _read_data_task_config_file(config_path: Path) -> dict[str, str]:
+    if not config_path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            values[key] = val
+    return values
+
+
+def _resolve_sec_user_agent(cfg: dict) -> str:
+    keys = ("DALTON_SEC_USER_AGENT", "DALTON_DATA_TASK_SEC_USER_AGENT", "SEC_USER_AGENT")
+    for key in keys:
+        env_val = (os.environ.get(key) or "").strip()
+        if env_val:
+            return env_val
+    cfg_override = (os.environ.get("DALTON_DATA_TASKS_CONFIG") or "").strip()
+    cfg_path = Path(cfg_override) if cfg_override else (_resolve_workspace() / "config" / "data_tasks.env")
+    env_cfg = _read_data_task_config_file(cfg_path)
+    for key in keys:
+        val = env_cfg.get(key, "").strip()
+        if val:
+            return val
+    return str(cfg.get("sec_user_agent") or "").strip()
+
+
+ROOT = _resolve_workspace()
 CONFIG = ROOT / "config" / "semi_rescue_alert.json"
 STATE_DIR = ROOT / "state" / "semi-rescue-alert"
 OUT_DIR = ROOT / "research-outputs" / "semi-rescue-alert"
@@ -291,10 +335,18 @@ def twse_fetch(days_needed=5, max_back=14):
 
 def sec_latest(cfg):
     out = []
-    for w in cfg.get("sec_watch", []):
+    watch = cfg.get("sec_watch", [])
+    if not watch:
+        return out
+    sec_ua = _resolve_sec_user_agent(cfg)
+    if not sec_ua:
+        raise RuntimeError(
+            "未配置 DALTON_SEC_USER_AGENT（请设置环境变量或在 config/data_tasks.env 中配置）"
+        )
+    for w in watch:
         try:
             j = json.loads(http_get(f"https://data.sec.gov/submissions/CIK{w['cik']}.json",
-                                    headers={"User-Agent": "Everflow research vense.ma.everflowinv@gmail.com"}))
+                                    headers={"User-Agent": sec_ua}))
             r = j["filings"]["recent"]
             since = w.get("since", "1900-01-01")
             hits = [(f, d, a) for f, d, a in zip(r["form"], r["filingDate"], r["accessionNumber"])

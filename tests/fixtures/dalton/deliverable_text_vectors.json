@@ -1,0 +1,91 @@
+{
+  "vectors": [
+    {
+      "name": "pre_tool_preamble_not_returned_when_post_tool_empty",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "content": "我先去拉取最新财报数据……"}},
+        {"event": "tool_calls", "data": {"agent": "main", "id": "m1", "tool_calls": [{"id": "tc1", "name": "sec_query", "args": {}}]}},
+        {"event": "tool_call_result", "data": {"agent": "main", "tool_call_id": "tc1", "content": "ok"}}
+      ],
+      "expected_text": "",
+      "expected_saw_business_tool_call": true
+    },
+    {
+      "name": "close_out_update_plan_preserves_final_answer",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "content": "最终投研结论：维持买入。"}},
+        {"event": "tool_calls", "data": {"agent": "main", "id": "m2", "close_out": true, "tool_calls": [{"id": "tc2", "name": "UpdatePlan", "args": {}}]}}
+      ],
+      "expected_text": "最终投研结论：维持买入。",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "mixed_phase_commentary_stripped_and_final_answer_kept",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "phase": "commentary", "content": "让我先核对一下毛利率。"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "phase": "final_answer", "content": "Q3 毛利率为 42.1%。"}}
+      ],
+      "expected_text": "Q3 毛利率为 42.1%。",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "continuation_chain_concatenates_prefix_and_suffix",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_0", "content_type": "text", "content": "前半段"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_1", "continued_from_message_id": "msg_0", "content_type": "text", "content": "后"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_1", "continued_from_message_id": "msg_0", "content_type": "text", "content": "半段"}}
+      ],
+      "expected_text": "前半段后半段",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "message_id_isolation_and_discarded_fragment_not_glued",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_bad", "content_type": "text", "content": "═"}},
+        {"event": "message_discarded", "data": {"agent": "main", "id": "msg_bad"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_good", "content_type": "text", "content": "完整回复正文。"}}
+      ],
+      "expected_text": "完整回复正文。",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "unrelated_message_id_without_continuation_isolates",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_a", "content_type": "text", "content": "═"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "msg_b", "content_type": "text", "content": "正式回答"}}
+      ],
+      "expected_text": "正式回答",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "opening_thinking_leak_stripped",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "content": "<thinking>internal reasoning</thinking>最终摘要结果"}}
+      ],
+      "expected_text": "最终摘要结果",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "subagent_and_reasoning_events_ignored",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "reasoning", "content": "深度思考中"}},
+        {"event": "message_chunk", "data": {"agent": "task:sub1", "id": "s1", "content_type": "text", "content": "子任务输出"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "m1", "content_type": "text", "content": "主回复"}}
+      ],
+      "expected_text": "主回复",
+      "expected_saw_business_tool_call": false
+    },
+    {
+      "name": "output_cap_then_named_tool_call_malformed_then_continuation_succeeds",
+      "events": [
+        {"event": "message_chunk", "data": {"agent": "main", "id": "lc_run--0", "content_type": "text", "content": "前半段", "finish_reason": "MAX_TOKENS"}},
+        {"event": "tool_calls", "data": {"agent": "main", "id": "lc_run--bad", "tool_calls": [{"id": "antigravity_call_1", "name": "Write", "args": {"file_path": "a.py"}}]}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "lc_run--bad", "finish_reason": "MALFORMED_FUNCTION_CALL"}},
+        {"event": "tool_call_result", "data": {"agent": "main", "id": "lc_run--bad-discarded-antigravity_call_1", "tool_call_id": "antigravity_call_1", "status": "error", "discarded": true, "discarded_reason": "malformed_call", "content": "not executed"}},
+        {"event": "message_chunk", "data": {"agent": "main", "id": "lc_run--2", "continued_from_message_id": "lc_run--0", "content_type": "text", "content": "后半段", "finish_reason": "stop"}}
+      ],
+      "expected_text": "前半段后半段",
+      "expected_saw_business_tool_call": false
+    }
+  ]
+}

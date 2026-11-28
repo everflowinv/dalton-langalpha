@@ -275,6 +275,11 @@ async def agent_output(
     else:
         result = {"thread_id": thread_id, **output._asdict()}
         result["workspace_id"] = result["workspace_id"] or ""
+        # DALTON-HOOK(deliverable-text): expose answer field only when strict deliverable text is enabled
+        from src.dalton.settings import is_strict_deliverable_text_enabled
+
+        if not is_strict_deliverable_text_enabled():
+            result.pop("answer", None)
 
     # A read of a thread mid-run is marked for the loop guard, which cannot
     # tell a poll from the text: a live run's text grows between reads.

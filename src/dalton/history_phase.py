@@ -220,6 +220,7 @@ def build_ai_phase_text_specs(
     *,
     is_close_out: bool,
     has_tool_calls: bool,
+    continued_from_message_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Return ``(text_event_data_list, reasoning)`` for ``projector._project_ai_message``."""
     if is_close_out:
@@ -236,6 +237,8 @@ def build_ai_phase_text_specs(
         }
         if seg_phase:
             data["phase"] = seg_phase
+        if isinstance(continued_from_message_id, str) and continued_from_message_id:
+            data["continued_from_message_id"] = continued_from_message_id
         specs.append(data)
     return specs, reasoning
 
@@ -248,12 +251,14 @@ def build_ai_phase_events(
     is_close_out: bool,
     has_tool_calls: bool,
     event_cls: Any,
+    continued_from_message_id: str | None = None,
 ) -> list[Any]:
     """Build reasoning and phase-split text ``HistoryEvent``s for an ``AIMessage``."""
     text_specs, reasoning = build_ai_phase_text_specs(
         content,
         is_close_out=is_close_out,
         has_tool_calls=has_tool_calls,
+        continued_from_message_id=continued_from_message_id,
     )
     events: list[Any] = []
     if reasoning:

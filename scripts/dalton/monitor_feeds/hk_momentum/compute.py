@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -45,19 +46,27 @@ from scripts.dalton.monitor_feeds.common import (
     previous_trading_day,
     resolve_market_trade_date,
     resolve_state_dir,
+    trading_days_in_range,
 )
 from scripts.dalton.monitor_feeds.hk_momentum.fetch_data import (
+    backfill_missing_suspensions,
     fetch_hsi_spot,
     fetch_spot_batch,
+    is_spot_suspended,
+    load_suspended_history,
+    record_suspended_for_date,
+    spot_meta_state,
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+logger = logging.getLogger(__name__)
 
 TOP_N = 50
 MIN_TURNOVER_WAN = 100.0  # 3M median daily turnover >= 100万港元
 MIN_PRICE = 0.10
 SMALLCAP_LIMIT_E8 = 50.0  # 50亿港元
 BASE = 1000.0
+MAX_SUSPENDED_TRADING_DAYS = 20
 
 _QUOTE_DATE_RE = re.compile(r"(\d{4})[/-]?(\d{2})[/-]?(\d{2})")
 
@@ -222,23 +231,56 @@ def build_index(
     selections: list[list[str]],
     *,
     initial_level: float = BASE,
+    segment_removals: list[dict[str, str]] | None = None,
 ) -> pd.Series:
     level = pd.Series(index=dates, dtype=float)
     lvl = float(initial_level)
     for k, (t_idx, codes) in enumerate(zip(rebal_positions, selections)):
         end_idx = rebal_positions[k + 1] if k + 1 < len(rebal_positions) else len(dates) - 1
-        valid_codes = [c for c in codes if c in px_ff.columns]
-        if not valid_codes:
-            continue
-        p0 = px_ff.iloc[t_idx][valid_codes]
-        valid_codes = [c for c in valid_codes if pd.notna(p0[c]) and p0[c] > 0]
-        if not valid_codes:
-            continue
-        seg = px_ff.iloc[t_idx : end_idx + 1][valid_codes]
-        rel = seg.div(p0[valid_codes], axis=1).ffill().fillna(1.0).mean(axis=1)
-        seg_level = lvl * rel / rel.iloc[0]
-        level.loc[seg_level.index] = seg_level
-        lvl = float(seg_level.iloc[-1])
+        rem_map = (
+            segment_removals[k]
+            if (segment_removals is not None and k < len(segment_removals) and segment_removals[k])
+            else {}
+        )
+        eff_positions_set: set[int] = set()
+        for d_eff in rem_map.values():
+            d_eff_s = str(d_eff)
+            for p in range(t_idx, end_idx + 1):
+                if str(dates[p]) >= d_eff_s:
+                    if p > t_idx:
+                        eff_positions_set.add(p)
+                    break
+        split_effs = sorted(eff_positions_set)
+        sub_ranges: list[tuple[int, int, str]] = []
+        if not split_effs:
+            sub_ranges.append((t_idx, end_idx, str(dates[t_idx])))
+        else:
+            sub_ranges.append((t_idx, split_effs[0] - 1, str(dates[t_idx])))
+            for s_i, eff_p in enumerate(split_effs):
+                sub_anchor = eff_p - 1
+                sub_end = (split_effs[s_i + 1] - 1) if (s_i + 1 < len(split_effs)) else end_idx
+                sub_ranges.append((sub_anchor, sub_end, str(dates[eff_p])))
+        for sub_anchor, sub_end, eff_date_str in sub_ranges:
+            valid_codes = [
+                c
+                for c in codes
+                if c in px_ff.columns
+                and not (
+                    (c in rem_map and str(rem_map[c]) <= eff_date_str)
+                    or (str(c).strip().zfill(5) in rem_map and str(rem_map[str(c).strip().zfill(5)]) <= eff_date_str)
+                )
+            ]
+            if not valid_codes:
+                continue
+            p0 = px_ff.iloc[sub_anchor][valid_codes]
+            valid_codes = [c for c in valid_codes if pd.notna(p0[c]) and p0[c] > 0]
+            if not valid_codes:
+                continue
+            seg = px_ff.iloc[sub_anchor : sub_end + 1][valid_codes]
+            rel = seg.div(p0[valid_codes], axis=1).ffill().fillna(1.0).mean(axis=1)
+            seg_level = lvl * rel / rel.iloc[0]
+            level.loc[seg_level.index] = seg_level
+            lvl = float(seg_level.iloc[-1])
     return level.dropna()
 
 
@@ -302,6 +344,8 @@ def compute_all(
     persist: bool = True,
     universe_df: pd.DataFrame | None = None,
     excluded_codes: Iterable[str] | None = None,
+    backfill_suspensions: bool = False,
+    yf_module: Any = None,
 ) -> dict[str, Any]:
     st_dir = resolve_state_dir("hk_momentum", state_dir)
     frozen_path = st_dir / "frozen_history.json"
@@ -318,6 +362,58 @@ def compute_all(
     frozen_rebals: dict[str, dict[str, list[str]]] = frozen.get("rebalance_snapshots") or {}
     frozen_exclusions: dict[str, Any] = dict(frozen.get("rebalance_exclusions") or {})
     frozen_series_raw: dict[str, Any] = frozen.get("frozen_series") or {}
+    frozen_removals: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    raw_susp_rem = frozen.get("suspended_removals")
+    if isinstance(raw_susp_rem, dict):
+        for idx_k, r_map in raw_susp_rem.items():
+            if not isinstance(r_map, dict):
+                continue
+            parsed_rmap: dict[str, dict[str, dict[str, Any]]] = {}
+            for r_dt, c_map in r_map.items():
+                if not isinstance(c_map, dict):
+                    continue
+                parsed_cmap: dict[str, dict[str, Any]] = {}
+                for c_code, info_val in c_map.items():
+                    c_norm = str(c_code).strip().zfill(5)
+                    if not c_norm:
+                        continue
+                    if isinstance(info_val, dict) and info_val.get("effective_date"):
+                        entry_copy = dict(info_val)
+                        entry_copy["code"] = c_norm
+                        entry_copy["effective_date"] = str(info_val["effective_date"]).strip()[:10]
+                        parsed_cmap[c_norm] = entry_copy
+                    elif isinstance(info_val, str) and info_val.strip():
+                        parsed_cmap[c_norm] = {
+                            "code": c_norm,
+                            "effective_date": info_val.strip()[:10],
+                            "note": "已停牌超过 20 个交易日，移出计算",
+                        }
+                if parsed_cmap:
+                    parsed_rmap[str(r_dt)] = parsed_cmap
+            if parsed_rmap:
+                frozen_removals[str(idx_k)] = parsed_rmap
+    elif isinstance(frozen.get("removed_suspended_codes"), list) and frozen_rebals:
+        # Legacy migration: attach top-level removed_suspended_codes to the latest frozen rebalance
+        legacy_last_rebal = sorted(frozen_rebals.keys())[-1]
+        legacy_f_dates = frozen_series_raw.get("dates") or []
+        legacy_eff = str(legacy_f_dates[-1]) if legacy_f_dates else legacy_last_rebal
+        for idx_k, idx_codes in (frozen_rebals.get(legacy_last_rebal) or {}).items():
+            if not isinstance(idx_codes, list):
+                continue
+            idx_code_set = {str(c).strip().zfill(5) for c in idx_codes if str(c).strip()}
+            for rc in frozen.get("removed_suspended_codes") or []:
+                rc_norm = str(rc).strip().zfill(5)
+                if rc_norm and rc_norm in idx_code_set:
+                    frozen_removals.setdefault(str(idx_k), {}).setdefault(legacy_last_rebal, {})[rc_norm] = {
+                        "code": rc_norm,
+                        "effective_date": legacy_eff,
+                        "note": "已停牌超过 20 个交易日，移出计算",
+                    }
+    prev_suspended_on_last_date: set[str] = {
+        str(c).strip().zfill(5)
+        for c in (frozen.get("suspended_on_last_date") or [])
+        if str(c).strip()
+    }
     held_frozen_codes: set[str] = {
         str(c)
         for snap_map in frozen_rebals.values()
@@ -460,6 +556,72 @@ def compute_all(
 
     # Determine expected target trading day & verify raw un-ffilled coverage before freezing.
     target_str = target_day.isoformat()
+    can_use_csv_spot, can_use_meta_suspended = spot_meta_state(uni_meta, target_str)
+    spot_info_by_code: dict[str, dict[str, Any]] = {}
+    if can_use_csv_spot:
+        for _, r in uni_all_df.iterrows():
+            c_raw = r.get("code")
+            if pd.isna(c_raw):
+                continue
+            c_key = str(c_raw).strip()
+            if not c_key:
+                continue
+            entry_spot: dict[str, Any] = {"price": r.get("price")}
+            for col_name in ("prev_close", "volume", "turnover", "trading_status", "status", "quote_date", "ts"):
+                if col_name in uni_all_df.columns:
+                    val = r.get(col_name)
+                    if pd.notna(val):
+                        entry_spot[col_name] = val
+            spot_info_by_code[c_key] = entry_spot
+    if can_use_meta_suspended and isinstance(uni_meta, dict) and isinstance(uni_meta.get("suspended_spot"), dict):
+        for scode, sentry in uni_meta["suspended_spot"].items():
+            if isinstance(sentry, dict):
+                c_key = str(scode).strip()
+                if c_key:
+                    merged_spot = dict(spot_info_by_code.get(c_key) or {})
+                    merged_spot.update(sentry)
+                    spot_info_by_code[c_key] = merged_spot
+
+    # Merge per-trading-day confirmed suspension records from:
+    # 1) suspended_history.json (written on every clean hk_spot run, even if freeze failed)
+    # 2) frozen_history.json["suspended_by_date"] (persisted on prior freezes)
+    # 3) legacy frozen_history.json["suspended_on_last_date"] (ONLY for frozen_last_date itself)
+    # 4) current-run clean spot quotes for target_str
+    confirmed_suspended_by_date: dict[str, set[str]] = load_suspended_history(st_dir)
+    raw_frozen_sbd = frozen.get("suspended_by_date")
+    if isinstance(raw_frozen_sbd, dict):
+        for d_k, c_list in raw_frozen_sbd.items():
+            d_s = str(d_k).strip()[:10]
+            if d_s and isinstance(c_list, list):
+                confirmed_suspended_by_date.setdefault(d_s, set()).update(
+                    str(c).strip().zfill(5) for c in c_list if str(c).strip()
+                )
+    frozen_dates_raw = frozen_series_raw.get("dates") or []
+    if frozen_dates_raw and prev_suspended_on_last_date:
+        confirmed_suspended_by_date.setdefault(str(frozen_dates_raw[-1]), set()).update(
+            prev_suspended_on_last_date
+        )
+    has_clean_target_spot = bool(can_use_csv_spot or can_use_meta_suspended)
+    if has_clean_target_spot:
+        target_spot_suspended = {
+            str(c).strip().zfill(5)
+            for c, ent in spot_info_by_code.items()
+            if is_spot_suspended(ent, check_date=target_str)
+        }
+        has_target_date_spot_evidence = bool(can_use_meta_suspended) or any(
+            (_extract_quote_date(ent.get("quote_date")) or _extract_quote_date(ent.get("ts"))) == target_str
+            for ent in spot_info_by_code.values()
+        )
+        if has_target_date_spot_evidence:
+            confirmed_suspended_by_date[target_str] = target_spot_suspended
+            if persist:
+                record_suspended_for_date(st_dir, target_str, target_spot_suspended)
+        elif target_spot_suspended:
+            confirmed_suspended_by_date.setdefault(target_str, set()).update(target_spot_suspended)
+    else:
+        # Degraded/stale spot for target_str MUST NOT treat target_str as confirmed suspended.
+        confirmed_suspended_by_date.pop(target_str, None)
+
     raw_px_dates = set(str(d) for d in px.index)
     px_latest_date = str(px.index[-1])
 
@@ -477,6 +639,21 @@ def compute_all(
     is_target_month_end = target_day == last_trading_day_of_month("hk", target_day.year, target_day.month)
     if rebal_incomplete or (is_target_month_end and target_str not in mes):
         comp_reasons.append(f"当月调仓结果不完整 ({target_str})")
+    uni_name_lookup: dict[str, str] = {}
+    for _, r in uni_all_df.iterrows():
+        c_raw = r.get("code")
+        if pd.isna(c_raw):
+            continue
+        c_key = str(c_raw).strip()
+        if not c_key:
+            continue
+        nm_cn = r.get("name_cn")
+        nm_en = r.get("name")
+        if pd.notna(nm_cn) and str(nm_cn).strip():
+            uni_name_lookup[c_key] = str(nm_cn).strip()
+        elif pd.notna(nm_en) and str(nm_en).strip():
+            uni_name_lookup[c_key] = str(nm_en).strip()
+
     def _valid_pos_price(val: Any) -> bool:
         return (
             isinstance(val, (int, float))
@@ -485,76 +662,311 @@ def compute_all(
             and float(val) > 0
         )
 
-    def _missing_held_for_key(key: str, last_f_date: str | None) -> list[str]:
-        """Verify all active held constituents have valid prices (no silent drop/reweight)."""
+    def _is_confirmed_suspended_on(code: str, d_chk: str) -> bool:
+        return str(code).strip().zfill(5) in confirmed_suspended_by_date.get(d_chk, set())
+
+    def _classify_suspended(
+        code: str,
+        d_chk: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Classify a missing daily bar strictly from per-trading-day suspension records.
+
+        A missing bar on ``d_chk`` is exempted ONLY when ``code`` has a confirmed
+        suspension record for ``d_chk`` AND every trading day after its last valid
+        close up to ``d_chk`` (including days before ``last_f_date``) is confirmed
+        suspended. The 21st suspended trading day is determined directly from that
+        verified trading-day span.
+
+        Returns:
+        - ``("carry", info)`` when credibly suspended for 1..MAX_SUSPENDED_TRADING_DAYS
+        - ``("remove", info)`` when credibly suspended for > MAX_SUSPENDED_TRADING_DAYS
+        - ``("missing", None)`` when not confirmed suspended or no prior valid close exists
+        """
+        if not _is_confirmed_suspended_on(code, d_chk):
+            return "missing", None
+        if code not in px.columns:
+            return "missing", None
+        prior = px.loc[px.index < d_chk, code].dropna()
+        if prior.empty:
+            return "missing", None
+        for idx_i in range(len(prior) - 1, -1, -1):
+            val = float(prior.iloc[idx_i])
+            if _valid_pos_price(val):
+                last_d = str(prior.index[idx_i])
+                susp_span = trading_days_in_range("hk", last_d, d_chk)
+                gap = len(susp_span)
+                if gap <= 0:
+                    return "missing", None
+                # Every trading day in (last_d, d_chk] — including days before
+                # last_f_date — MUST have a per-day suspension confirmation.
+                for d_span in susp_span:
+                    if not _is_confirmed_suspended_on(code, d_span):
+                        return "missing", None
+                if 1 <= gap <= MAX_SUSPENDED_TRADING_DAYS:
+                    return "carry", {
+                        "code": code,
+                        "name": uni_name_lookup.get(code, code),
+                        "carried_close_date": last_d,
+                        "carried_close": round(val, 4),
+                        "suspended_trading_days": gap,
+                        "note": f"停牌，沿用 {last_d} 日收盘价",
+                    }
+                if gap > MAX_SUSPENDED_TRADING_DAYS:
+                    return "remove", {
+                        "code": code,
+                        "name": uni_name_lookup.get(code, code),
+                        "carried_close_date": last_d,
+                        "carried_close": round(val, 4),
+                        "suspended_trading_days": gap,
+                        "removal_effective_date": susp_span[MAX_SUSPENDED_TRADING_DAYS],
+                        "note": "已停牌超过 20 个交易日，移出计算",
+                    }
+                return "missing", None
+        return "missing", None
+
+    rebal_dates_used: list[str] = [str(dates[rp]) for rp in rebal_pos]
+
+    def _segments_for_day(d_chk: str, last_f_date: str | None) -> list[int] | None:
+        pos = date_pos.get(d_chk)
+        if pos is None:
+            return None
+        seg_idx = None
+        for k_seg, rpos in enumerate(rebal_pos):
+            if rpos <= pos:
+                seg_idx = k_seg
+        if seg_idx is None:
+            return []
+        # On a newly appended rebalance day, the outgoing basket earns the close-to-close
+        # return into d_chk while the incoming basket anchors p0 at d_chk.
+        if (
+            rebal_pos[seg_idx] == pos
+            and seg_idx > 0
+            and (last_f_date is None or d_chk > last_f_date)
+        ):
+            return [seg_idx - 1, seg_idx]
+        return [seg_idx]
+
+    if backfill_suspensions:
+        backfill_codes_by_date: dict[str, set[str]] = {}
+        for key in idx_defs:
+            has_frozen_k = bool(frozen_series_raw.get("dates") and frozen_series_raw.get(key))
+            if not has_frozen_k:
+                continue
+            last_f_date_k = str(frozen_series_raw["dates"][-1])
+            expected_tail_k = trading_days_in_range("hk", last_f_date_k, target_str)
+            panel_tail_k = [d for d in dates if d > last_f_date_k and d < target_str]
+            gap_days_k = sorted(
+                d for d in (set(expected_tail_k) | set(panel_tail_k)) if d < target_str
+            )
+            key_rem_k = frozen_removals.get(key) or {}
+            for d_chk in gap_days_k:
+                seg_indices_k = _segments_for_day(d_chk, last_f_date_k)
+                if not seg_indices_k:
+                    continue
+                day_codes = backfill_codes_by_date.setdefault(d_chk, set())
+                for s_idx in seg_indices_k:
+                    r_date = rebal_dates_used[s_idx]
+                    r_rem_map = key_rem_k.get(r_date) or {}
+                    for c in selections[key][s_idx]:
+                        c_norm = str(c).strip().zfill(5)
+                        existing_rem = r_rem_map.get(c_norm) or r_rem_map.get(c)
+                        if isinstance(existing_rem, dict):
+                            eff_dt = str(existing_rem.get("effective_date") or "")
+                            if eff_dt and eff_dt <= d_chk:
+                                continue
+                        day_codes.add(c_norm)
+        if backfill_codes_by_date:
+            try:
+                bf_res = backfill_missing_suspensions(
+                    state_dir=st_dir,
+                    target_date=target_str,
+                    yf_module=yf_module,
+                    codes_by_date=backfill_codes_by_date,
+                )
+                for d_rec, rec_codes in (bf_res.get("recorded") or {}).items():
+                    d_s = str(d_rec).strip()[:10]
+                    if d_s and d_s < target_str and isinstance(rec_codes, list):
+                        confirmed_suspended_by_date.setdefault(d_s, set()).update(
+                            str(c).strip().zfill(5) for c in rec_codes if str(c).strip()
+                        )
+            except Exception as exc:
+                logger.warning("HK momentum backfill_missing_suspensions raised: %s", exc)
+
+    def _missing_held_for_key(
+        key: str,
+        last_f_date: str | None,
+        key_removals: dict[str, dict[str, dict[str, Any]]],
+    ) -> tuple[list[str], list[str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Verify every HKEX trading day after ``last_f_date`` for panel & held coverage."""
         if last_f_date is not None:
-            tail_d = [d for d in dates if d > last_f_date and d <= target_str]
+            expected_tail = trading_days_in_range("hk", last_f_date, target_str)
+            panel_tail = [d for d in dates if d > last_f_date and d <= target_str]
+            tail_d = sorted(set(expected_tail) | set(panel_tail))
             check_d = ([last_f_date] + tail_d) if tail_d else ([target_str] if target_str in date_pos else [])
         else:
             check_d = [target_str] if target_str in date_pos else []
         missing: set[str] = set()
+        missing_days: set[str] = set()
+        suspended_on_target: dict[str, dict[str, Any]] = {}
+        latest_seg_idx = len(rebal_pos) - 1
         for d_chk in check_d:
-            pos = date_pos.get(d_chk)
-            if pos is None:
+            seg_indices = _segments_for_day(d_chk, last_f_date)
+            if seg_indices is None:
+                missing_days.add(d_chk)
                 continue
-            seg_idx = None
-            for k_seg, rpos in enumerate(rebal_pos):
-                if rpos <= pos:
-                    seg_idx = k_seg
-            if seg_idx is None:
+            if not seg_indices:
                 continue
-            seg_codes = selections[key][seg_idx]
-            for c in seg_codes:
-                if c not in px.columns or d_chk not in px.index:
-                    missing.add(c)
-                    continue
-                px_val = px.loc[d_chk, c]
-                if pd.isna(px_val) or not _valid_pos_price(float(px_val)):
-                    missing.add(c)
-                    continue
-                if d_chk == target_str and not _valid_pos_price(uni_spot_prices.get(c)):
-                    missing.add(c)
-        return sorted(missing)
+            for s_idx in seg_indices:
+                r_date = rebal_dates_used[s_idx]
+                r_rem_map = key_removals.get(r_date) or {}
+                seg_codes = selections[key][s_idx]
+                for c in seg_codes:
+                    c_norm = str(c).strip().zfill(5)
+                    existing_rem = r_rem_map.get(c_norm) or r_rem_map.get(c)
+                    if isinstance(existing_rem, dict):
+                        eff_dt = str(existing_rem.get("effective_date") or "")
+                        if eff_dt and eff_dt <= d_chk:
+                            continue
+                    if c not in px.columns or d_chk not in px.index:
+                        missing.add(c)
+                        continue
+                    px_val = px.loc[d_chk, c]
+                    if pd.isna(px_val) or not _valid_pos_price(float(px_val)):
+                        kind, info = _classify_suspended(c, d_chk)
+                        if kind == "carry" and info is not None:
+                            if d_chk == target_str and s_idx == latest_seg_idx:
+                                suspended_on_target[c] = info
+                            continue
+                        if kind == "remove" and info is not None:
+                            rem_entry = dict(info)
+                            rem_day = str(rem_entry.pop("removal_effective_date", d_chk))
+                            rem_entry["code"] = c_norm
+                            eff_date = min(max(rem_day, r_date), d_chk)
+                            rem_entry["effective_date"] = eff_date
+                            key_removals.setdefault(r_date, {})[c_norm] = rem_entry
+                            r_rem_map = key_removals[r_date]
+                            continue
+                        missing.add(c)
+                        continue
+                    if (
+                        d_chk == target_str
+                        and not _valid_pos_price(uni_spot_prices.get(c))
+                        and not is_spot_suspended(spot_info_by_code.get(c), check_date=target_str)
+                    ):
+                        missing.add(c)
+        latest_rd = rebal_dates_used[-1]
+        latest_rem_active = {
+            c_code: dict(rem_info)
+            for c_code, rem_info in (key_removals.get(latest_rd) or {}).items()
+            if str(rem_info.get("effective_date") or "") <= target_str
+        }
+        return sorted(missing), sorted(missing_days), suspended_on_target, latest_rem_active
 
     missing_held_by_index: dict[str, list[str]] = {}
+    suspended_by_index: dict[str, dict[str, dict[str, Any]]] = {}
+    removed_suspended_by_index: dict[str, dict[str, dict[str, Any]]] = {}
+    all_suspended_removals: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    active_selections: dict[str, list[list[str]]] = {}
     index_dates: dict[str, str | None] = {}
 
     for key in idx_defs:
-        lvl_full = build_index(px_ff, pd.Index(dates), rebal_pos, selections[key])
-        if frozen_series_raw.get("dates") and frozen_series_raw.get(key):
-            f_ser = pd.Series(
+        has_frozen = bool(frozen_series_raw.get("dates") and frozen_series_raw.get(key))
+        f_ser = (
+            pd.Series(
                 frozen_series_raw[key],
                 index=pd.Index(frozen_series_raw["dates"]),
                 dtype=float,
             )
-            last_f_date = str(f_ser.index[-1])
-            missing_held = _missing_held_for_key(key, last_f_date)
-            missing_held_by_index[key] = list(missing_held)
-            if missing_held:
-                # NEVER reweight remaining constituents or append incomplete day!
+            if has_frozen
+            else pd.Series(dtype=float)
+        )
+        last_f_date_key: str | None = str(f_ser.index[-1]) if has_frozen else None
+        key_removals: dict[str, dict[str, dict[str, Any]]] = {
+            r_dt: {c_k: dict(c_v) for c_k, c_v in c_map.items()}
+            for r_dt, c_map in (frozen_removals.get(key) or {}).items()
+        }
+        missing_held, missing_days, suspended_map, removed_map = _missing_held_for_key(
+            key, last_f_date_key, key_removals
+        )
+        missing_held_by_index[key] = list(missing_held)
+        suspended_by_index[key] = suspended_map
+        removed_suspended_by_index[key] = removed_map
+        if key_removals:
+            all_suspended_removals[key] = key_removals
+
+        seg_rem_dates: list[dict[str, str]] = [
+            {
+                c_code: str(rem_info["effective_date"])
+                for c_code, rem_info in (key_removals.get(rd) or {}).items()
+                if rem_info.get("effective_date")
+            }
+            for rd in rebal_dates_used
+        ]
+        key_sels = [list(s) for s in selections[key]]
+        if removed_map and key_sels:
+            removed_set = set(removed_map.keys())
+            key_sels[-1] = [c for c in key_sels[-1] if str(c).strip().zfill(5) not in removed_set]
+            if not key_sels[-1]:
+                comp_reasons.append(f"{key} 移出长期停牌成分后无剩余有效成分")
+        if len(rebal_dates_used) >= 2 and rebal_dates_used[-1] == target_str:
+            prev_rd = rebal_dates_used[-2]
+            prev_rem_set = {
+                c_code
+                for c_code, rem_info in (key_removals.get(prev_rd) or {}).items()
+                if str(rem_info.get("effective_date") or "") <= target_str
+            }
+            if prev_rem_set and not [
+                c for c in selections[key][-2] if str(c).strip().zfill(5) not in prev_rem_set
+            ]:
+                comp_reasons.append(f"{key} 上期移出长期停牌成分后无剩余有效成分")
+        active_selections[key] = key_sels
+        lvl_full = build_index(
+            px_ff,
+            pd.Index(dates),
+            rebal_pos,
+            selections[key],
+            segment_removals=seg_rem_dates,
+        )
+
+        if has_frozen and last_f_date_key is not None:
+            if missing_days or missing_held:
+                # NEVER reweight remaining constituents or append incomplete/gapped days!
                 series[key] = f_ser
                 valid_idx = f_ser.dropna().index
                 index_dates[key] = str(valid_idx[-1]) if len(valid_idx) else None
-                comp_reasons.append(
-                    f"{key} 持有成分缺少必要价格 {len(missing_held)} 只 (如 {', '.join(missing_held[:5])})"
-                )
+                if missing_days:
+                    day_msg = (
+                        f"个股原始日线面板在补跑区间缺失 {len(missing_days)} 个交易日 "
+                        f"(如 {', '.join(missing_days[:5])})"
+                    )
+                    if day_msg not in comp_reasons:
+                        comp_reasons.append(day_msg)
+                if missing_held:
+                    comp_reasons.append(
+                        f"{key} 持有成分缺少必要价格 {len(missing_held)} 只 (如 {', '.join(missing_held[:5])})"
+                    )
                 continue
-            tail_dates = [d for d in lvl_full.index if d > last_f_date]
+            tail_dates = [d for d in lvl_full.index if d > last_f_date_key]
             if not tail_dates:
                 series[key] = f_ser
-            elif last_f_date in lvl_full.index and float(lvl_full.loc[last_f_date]) > 0:
-                scale = float(f_ser.iloc[-1]) / float(lvl_full.loc[last_f_date])
+            elif last_f_date_key in lvl_full.index and float(lvl_full.loc[last_f_date_key]) > 0:
+                scale = float(f_ser.iloc[-1]) / float(lvl_full.loc[last_f_date_key])
                 tail = lvl_full.loc[tail_dates] * scale
                 series[key] = pd.concat([f_ser, tail])
             else:
                 # Keep frozen series untouched rather than falling back to full recalc!
                 series[key] = f_ser
                 comp_reasons.append(
-                    f"{key} 新增数据缺少最后冻结基准日 {last_f_date}，已保留冻结历史"
+                    f"{key} 新增数据缺少最后冻结基准日 {last_f_date_key}，已保留冻结历史"
                 )
         else:
-            missing_held = _missing_held_for_key(key, None)
-            missing_held_by_index[key] = list(missing_held)
+            if missing_days:
+                day_msg = (
+                    f"个股原始日线面板缺少 {len(missing_days)} 个交易日 "
+                    f"(如 {', '.join(missing_days[:5])})"
+                )
+                if day_msg not in comp_reasons:
+                    comp_reasons.append(day_msg)
             if missing_held:
                 comp_reasons.append(
                     f"{key} 持有成分缺少必要价格 {len(missing_held)} 只 (如 {', '.join(missing_held[:5])})"
@@ -586,7 +998,15 @@ def compute_all(
         if not f_hsi_valid.empty:
             last_f_date = str(f_hsi_valid.index[-1])
 
-    check_hsi_dates = [str(d) for d in common if last_f_date is None or str(d) > last_f_date]
+    expected_hsi_tail = (
+        trading_days_in_range("hk", last_f_date, target_str)
+        if last_f_date is not None and last_f_date < target_str
+        else []
+    )
+    check_hsi_dates = sorted(
+        set(str(d) for d in common if last_f_date is None or str(d) > last_f_date)
+        | set(expected_hsi_tail)
+    )
     hsi_fetched, raw_hsi_dates = _fetch_hsi_history(common, session=hsi_session)
     if hsi_fetched is None:
         hsi_reasons.append("恒生指数历史行情拉取失败")
@@ -647,22 +1067,31 @@ def compute_all(
     )
     cons: dict[str, list[dict[str, Any]]] = {}
     for key in idx_defs:
-        codes = selections[key][-1]
+        codes = active_selections[key][-1]
+        susp_map = suspended_by_index.get(key) or {}
+        eq_weight = (1.0 / len(codes)) if codes else 0.0
         detail = []
         for c in codes:
             row = last_scores.loc[c] if (last_scores is not None and c in last_scores.index) else None
-            name_val = c
+            name_val = uni_name_lookup.get(c, c)
             if c in uni.index:
                 name_val = str(uni.loc[c, "name_cn"] if pd.notna(uni.loc[c, "name_cn"]) else uni.loc[c, "name"])
-            detail.append(
-                {
-                    "code": c,
-                    "name": name_val,
-                    "score": round(float(row["score"]), 2) if row is not None else None,
-                    "mktcap_e8": round(float(row["mktcap_e8"]), 1) if row is not None else None,
-                    "ret12": round(float(row["ret12"]) * 100.0, 1) if row is not None else None,
-                }
-            )
+            entry: dict[str, Any] = {
+                "code": c,
+                "name": name_val,
+                "weight": eq_weight,
+                "score": round(float(row["score"]), 2) if row is not None else None,
+                "mktcap_e8": round(float(row["mktcap_e8"]), 1) if row is not None else None,
+                "ret12": round(float(row["ret12"]) * 100.0, 1) if row is not None else None,
+            }
+            if c in susp_map:
+                carry = susp_map[c]
+                entry["suspended"] = True
+                entry["carried_close_date"] = carry["carried_close_date"]
+                entry["carried_close"] = carry["carried_close"]
+                entry["suspended_trading_days"] = carry["suspended_trading_days"]
+                entry["suspended_note"] = carry["note"]
+            detail.append(entry)
         detail.sort(key=lambda x: -(x["score"] if x["score"] is not None else -99.0))
         cons[key] = detail
 
@@ -683,6 +1112,41 @@ def compute_all(
     completeness_ok = not history_stale
     should_persist = bool(out["dates"]) and completeness_ok and freeze_on_stale
 
+    suspended_list_by_index: dict[str, list[dict[str, Any]]] = {
+        key: [suspended_by_index[key][c] for c in sorted(suspended_by_index.get(key) or {})]
+        for key in idx_defs
+    }
+    removed_suspended_list_by_index: dict[str, list[dict[str, Any]]] = {
+        key: [removed_suspended_by_index[key][c] for c in sorted(removed_suspended_by_index.get(key) or {})]
+        for key in idx_defs
+    }
+    uniq_suspended: dict[str, dict[str, Any]] = {}
+    for items in suspended_list_by_index.values():
+        for item in items:
+            uniq_suspended.setdefault(item["code"], item)
+    uniq_removed: dict[str, dict[str, Any]] = {}
+    for items in removed_suspended_list_by_index.values():
+        for item in items:
+            uniq_removed.setdefault(item["code"], item)
+    removed_codes_sorted = sorted(uniq_removed.keys())
+    comp_note_parts: list[str] = []
+    if not comp_reasons:
+        for item in uniq_suspended.values():
+            lbl = (
+                f"{item['code']}({item['name']})"
+                if item.get("name") and item["name"] != item["code"]
+                else str(item["code"])
+            )
+            comp_note_parts.append(f"{lbl} {item['note']}")
+        for item in uniq_removed.values():
+            lbl = (
+                f"{item['code']}({item['name']})"
+                if item.get("name") and item["name"] != item["code"]
+                else str(item["code"])
+            )
+            comp_note_parts.append(f"{lbl} {item['note']}")
+    comp_note: str | None = "；".join(comp_note_parts) if comp_note_parts else None
+
     hsi_st = make_source_result(
         "hsi_history",
         ok=not bool(hsi_reasons),
@@ -698,6 +1162,8 @@ def compute_all(
         reason="；".join(comp_reasons) if comp_reasons else None,
         as_of=target_str,
         label="动量日度计算",
+        note=comp_note,
+        removed_codes=removed_codes_sorted if removed_codes_sorted else None,
     )
     compute_statuses = {
         "hsi_history": hsi_st.to_dict(),
@@ -709,6 +1175,9 @@ def compute_all(
             [hsi_st, comp_st],
             required=["hsi_history", "index_compute"],
             now_str=f"{now_str} 北京时间",
+            extra_overall=(
+                {"removed_suspended_codes": removed_codes_sorted} if removed_codes_sorted else None
+            ),
         )
         resolved_last_success = status_doc["overall"]["last_success_at"]
     else:
@@ -720,6 +1189,9 @@ def compute_all(
         "last_date": out["dates"][-1],
         "index_dates": index_dates,
         "missing_held_by_index": missing_held_by_index,
+        "suspended_constituents": suspended_list_by_index,
+        "removed_suspended_constituents": removed_suspended_list_by_index,
+        "removed_suspended_codes": removed_codes_sorted,
         "failure_details": list(history_stale_reasons),
         "launch_date": launch_date,
         "last_rebalance_date": mes[-1],
@@ -753,6 +1225,19 @@ def compute_all(
     }
     if frozen_exclusions:
         frozen_payload["rebalance_exclusions"] = frozen_exclusions
+    if uniq_suspended:
+        frozen_payload["suspended_on_last_date"] = sorted(uniq_suspended.keys())
+    persisted_sbd = {
+        d_k: sorted(codes)
+        for d_k, codes in sorted(confirmed_suspended_by_date.items())
+        if d_k <= target_str and codes
+    }
+    if persisted_sbd:
+        frozen_payload["suspended_by_date"] = persisted_sbd
+    if all_suspended_removals:
+        frozen_payload["suspended_removals"] = all_suspended_removals
+    if removed_codes_sorted:
+        frozen_payload["removed_suspended_codes"] = removed_codes_sorted
     result: dict[str, Any] = {
         "series": out,
         "constituents": cons,
@@ -1021,7 +1506,11 @@ def compute_intraday_snapshot(
         fresh_quotes = {
             c: spot[c]
             for c in members
-            if c in spot and _extract_quote_date(spot[c].get("ts")) == expected_q_date
+            if c in spot
+            and (
+                _extract_quote_date(spot[c].get("ts")) == expected_q_date
+                or is_spot_suspended(spot[c], check_date=expected_q_date)
+            )
         }
         missing_codes = [c for c in members if c not in fresh_quotes]
         coverage = (len(fresh_quotes) / n_expected) if n_expected else 0.0
@@ -1066,7 +1555,14 @@ def compute_intraday_snapshot(
                 out[key]["partial_quotes"] = True
             continue
 
-        chg = sum(q["pct"] for q in fresh_quotes.values()) / n_expected / 100.0
+        chg = (
+            sum(
+                0.0 if is_spot_suspended(q, check_date=expected_q_date) else float(q["pct"])
+                for q in fresh_quotes.values()
+            )
+            / n_expected
+            / 100.0
+        )
         last_close = float(series[key][-1])
         out[key] = {
             "level": round(last_close * (1.0 + chg), 2),

@@ -277,7 +277,7 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
     ):
         _touch(rel)
 
-    _touch("src/dalton/settings.py", 'CONTACT = "demo@everflowinv.com"\n')
+    _touch("src/dalton/settings.py", 'CONTACT = "demo@example.com"\n')
 
     for excluded in (
         "plugins/dalton_data/plugin.json",

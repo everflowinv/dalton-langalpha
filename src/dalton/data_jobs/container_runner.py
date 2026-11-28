@@ -13,6 +13,7 @@ from uuid import UUID
 
 from src.dalton.data_jobs.manifest import CONTAINER_PYTHON_BIN, DEFAULT_TIMEOUT_SECONDS
 from src.dalton.data_jobs.runner_wrapper import (
+    DEFAULT_CONTAINER_HOME,
     DEFAULT_SECRETS_DIR,
     DEFAULT_TMPFS_OUTBOX_DIR,
     DEFAULT_WORKSPACE_DIR,
@@ -23,6 +24,7 @@ from src.dalton.data_jobs.safe_fs import (
     normalize_strict_relative_parts,
     safe_read_json_object,
 )
+from src.dalton.data_jobs.task_config import collect_container_data_task_env
 from src.dalton.settings import get_dalton_backend_var_dir, get_dalton_host_var_dir
 
 logger = logging.getLogger(__name__)
@@ -150,6 +152,7 @@ def build_container_create_config(
     cos_mode: str = "skip",
     path_map: DataTaskPathMap | None = None,
     image: str = DEFAULT_TASK_CONTAINER_IMAGE,
+    env_source: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the Docker Engine ``containers.create`` payload per §2.1–§2.3."""
     paths = path_map or build_path_map()
@@ -189,7 +192,7 @@ def build_container_create_config(
     cmd.extend(str(a) for a in command_argv)
 
     env_map = {
-        "HOME": "/Users/everflow",
+        "HOME": DEFAULT_CONTAINER_HOME,
         "OPENCLAW_WORKSPACE": str(paths.container_workspace_dir),
         "WORKDIR": str(paths.container_workspace_dir),
         "TZ": "America/New_York",
@@ -206,6 +209,14 @@ def build_container_create_config(
         "DALTON_RUN_ID": run_id_str,
         "DALTON_JOB_KEY": str(job_key),
     }
+    env_map.update(
+        collect_container_data_task_env(
+            env_source,
+            host_data_root=paths.host_data_root,
+            backend_data_root=paths.backend_data_root,
+            container_workspace_dir=paths.container_workspace_dir,
+        )
+    )
 
     labels = {
         "dalton.data_task": "1",

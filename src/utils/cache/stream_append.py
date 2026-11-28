@@ -101,6 +101,10 @@ _recovered_writes = 0
 def _note_recovery(label: str, event_id: int, attempt: int, how: str) -> None:
     global _recovered_writes
     _recovered_writes += 1
+    # DALTON-HOOK(redis-write-diag): record recovered stream write in worker window
+    from src.dalton.observability.redis_diagnostics import record_stream_recovery
+
+    record_stream_recovery(label, event_id=event_id, attempt=attempt, how=how)
     try:
         # Lazy: ``src.observability.metrics`` reaches back into this package
         # through its Redis-pool callbacks, so importing it at module level
@@ -139,6 +143,11 @@ async def _probe_tail(
         return None
 
 
+# DALTON-HOOK(redis-write-diag): correlate payload_bytes and record fatal transport_lost
+from src.dalton.observability.redis_diagnostics import diag_timeout, observe_stream_append
+
+
+@observe_stream_append
 async def stream_append_with_retry(
     cache,
     stream_key: str,
@@ -209,7 +218,8 @@ async def stream_append_with_retry(
                 f"{budget_s}s budget (id={event_id})"
             ) from last_exc
         try:
-            async with asyncio.timeout(min(attempt_timeout_s, remaining)):
+            # DALTON-HOOK(redis-write-diag): propagate outer attempt timeout to inner redis_op_span
+            async with diag_timeout(min(attempt_timeout_s, remaining)):
                 await cache.pipelined_event_buffer(
                     stream_key,
                     event_id=event_id,

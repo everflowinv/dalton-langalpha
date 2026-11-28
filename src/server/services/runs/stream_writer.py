@@ -107,7 +107,10 @@ async def buffer_event(
 
     # Charged before the write, so a frame that would break the budget never
     # reaches Redis and the cap bounds what the stream holds.
-    breach = quota.charge(event_id, len(event.encode("utf-8")), label=str(key))
+    # DALTON-HOOK(redis-write-diag): tag large SSE frame encoding with heavy_task
+    from src.dalton.observability.redis_diagnostics import encode_stream_frame_with_heavy_task
+
+    breach = quota.charge(event_id, len(encode_stream_frame_with_heavy_task(event)), label=str(key))
     if breach == "events":
         raise StreamQuotaExceededError(
             f"transport_lost: stream quota exceeded for {key} "
@@ -189,6 +192,8 @@ async def append_run_end_event(
     chart_snapshots: Optional[Sequence[Dict[str, Any]]] = None,
     chart_layers: Optional[Sequence[Dict[str, Any]]] = None,
     outbound_blocked: Optional[bool] = None,
+    # DALTON-HOOK(deliverable-text): include per-message captured images on run_end SSE frame
+    images_by_message: Optional[Dict[str, Dict[str, str]]] = None,
     redis_event_ttl: int,
     max_stored_messages: int,
 ) -> None:
@@ -291,6 +296,9 @@ async def append_run_end_event(
             frame_data["chart_layers"] = list(chart_layers)
         if outbound_blocked is not None:
             frame_data["outbound_blocked"] = bool(outbound_blocked)
+        # DALTON-HOOK(deliverable-text): attach per-message captured images on run_end
+        if images_by_message:
+            frame_data["images_by_message"] = images_by_message
         data = json.dumps(frame_data, ensure_ascii=False)
         payload = f"event: {RUN_END_EVENT_TYPE}\ndata: {data}\n\n".encode(
             "utf-8"

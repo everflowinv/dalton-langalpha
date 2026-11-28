@@ -136,6 +136,14 @@ async def read_run_answer(thread_id: str, run_id: str) -> RunAnswer:
     turn = await CheckpointHistoryReader.get_instance().aget_run_turn(thread_id, run_id)
     if turn is None:
         return RunAnswer()
+    # DALTON-HOOK(deliverable-text): delegate final deliverable text extraction (with replay_facts image map) to unified Dalton extractor
+    from src.dalton.channels.deliverable_text import cache_run_turn_messages, extract_deliverable_text_from_messages
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+    if is_strict_deliverable_text_enabled():
+        from src.server.services.runs.finalization import settled_images
+        cache_run_turn_messages(thread_id, run_id, turn.messages)
+        extracted = extract_deliverable_text_from_messages(turn.messages, resolve_images=True, image_url_map=await settled_images(run_id))
+        return RunAnswer(text=extracted.text or None, sent=_result_sent(turn.messages))
     text = None
     for message in reversed(turn.messages):
         if not isinstance(message, AIMessage):

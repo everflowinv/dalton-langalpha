@@ -4,12 +4,34 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from functools import lru_cache
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 import yaml
+
+
+def _load_task_config_module() -> Any:
+    try:
+        from src.dalton.data_jobs import task_config
+
+        return task_config
+    except ImportError:
+        sibling = Path(__file__).resolve().parent / "task_config.py"
+        spec = importlib.util.spec_from_file_location("_dalton_data_jobs_task_config", sibling)
+        if spec is None or spec.loader is None:
+            raise
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
+_TASK_CONFIG = _load_task_config_module()
+DEFAULT_WORKSPACE_DIR: str = _TASK_CONFIG.DEFAULT_WORKSPACE_DIR
+WORKSPACE_PLACEHOLDER: str = _TASK_CONFIG.WORKSPACE_PLACEHOLDER
+resolve_default_workspace_dir = _TASK_CONFIG.resolve_default_workspace_dir
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "manifest.yaml"
 DEFAULT_TIMEOUT_SECONDS = 1800
@@ -32,7 +54,7 @@ class DataTaskManifestEntry(BaseModel):
     timeout_seconds: int | None = None
     no_output_timeout_seconds: int | None = None
     output_max_bytes: int | None = None
-    cwd: str = "/Users/everflow/.openclaw/workspace"
+    cwd: str = DEFAULT_WORKSPACE_DIR
     command: str
     command_argv: list[str]
     secret_names: list[str] = Field(default_factory=list)
@@ -52,6 +74,8 @@ class DataTaskManifestEntry(BaseModel):
             out["cron"] = out["cron_expr"]
         if "cwd" not in out and "workdir" in out:
             out["cwd"] = out["workdir"]
+        if out.get("cwd") == WORKSPACE_PLACEHOLDER:
+            out["cwd"] = resolve_default_workspace_dir()
         if "job_key" not in out and "name" in out:
             out["job_key"] = out["name"]
         if "secret_names" not in out and "required_secrets" in out:

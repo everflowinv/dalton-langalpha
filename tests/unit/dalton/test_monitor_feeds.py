@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
+import akshare as ak
 import numpy as np
 import pandas as pd
 import pytest
@@ -96,7 +97,7 @@ def test_state_dir_defaults_to_var_dalton_monitor_feeds(
 
 
 def _build_pm_fixtures(cfg: dict[str, Any]):
-    dates = pd.bdate_range("2023-01-02", periods=600)
+    dates = pd.bdate_range("2023-01-02", "2026-11-16")
     rng = np.random.default_rng(42)
 
     # US tickers MultiIndex DataFrame mimicking yfinance auto_adjust=False
@@ -119,13 +120,13 @@ def _build_pm_fixtures(cfg: dict[str, Any]):
 
     # Fake akshare module with create_autospec methods
     class _FakeAk:
-        def stock_zh_index_daily(self, symbol: str) -> pd.DataFrame:
+        def stock_zh_index_daily_tx(self, symbol: str) -> pd.DataFrame:
             return pd.DataFrame(
                 {"date": dates.strftime("%Y-%m-%d"), "close": np.linspace(3500.0, 4050.0, len(dates))}
             )
 
         def stock_zh_index_daily_em(self, symbol: str) -> pd.DataFrame:
-            return self.stock_zh_index_daily(symbol)
+            return self.stock_zh_index_daily_tx(symbol)
 
         def sw_index_first_info(self) -> pd.DataFrame:
             return pd.DataFrame(
@@ -152,14 +153,21 @@ def _build_pm_fixtures(cfg: dict[str, Any]):
             )
 
         def index_analysis_week_month_sw(self, symbol: str = "week") -> pd.DataFrame:
-            fridays = pd.date_range("2022-01-07", "2025-12-26", freq="W-FRI")
-            return pd.DataFrame({"date": fridays.strftime("%Y-%m-%d")})
+            wk_dates = feeds_common.completed_trading_weeks("cn", "2021-12-31", date(2026, 11, 16))
+            return pd.DataFrame({"date": wk_dates})
 
         def index_analysis_weekly_sw(self, symbol: str, date: str) -> pd.DataFrame:
             codes = ["801010", "801080"] if symbol == "一级行业" else ["801081", "801012"]
+            pub_dt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             return pd.DataFrame(
                 [
-                    {"指数代码": f"{c}.SI", "市盈率": 20.0 + (hash(date + c) % 15), "市净率": 2.0 + (hash(date) % 10) * 0.1, "股息率": 1.5}
+                    {
+                        "指数代码": f"{c}.SI",
+                        "发布日期": pub_dt,
+                        "市盈率": 20.0 + (hash(date + c) % 15),
+                        "市净率": 2.0 + (hash(date) % 10) * 0.1,
+                        "股息率": 1.5,
+                    }
                     for c in codes
                 ]
             )
@@ -182,7 +190,7 @@ def _build_pm_fixtures(cfg: dict[str, Any]):
     fake_yf = SimpleNamespace(download=create_autospec(yf.download, side_effect=_yf_download))
     real_ak = _FakeAk()
     fake_ak = SimpleNamespace(
-        stock_zh_index_daily=create_autospec(real_ak.stock_zh_index_daily, side_effect=real_ak.stock_zh_index_daily),
+        stock_zh_index_daily_tx=create_autospec(ak.stock_zh_index_daily_tx, side_effect=real_ak.stock_zh_index_daily_tx),
         stock_zh_index_daily_em=create_autospec(real_ak.stock_zh_index_daily_em, side_effect=real_ak.stock_zh_index_daily_em),
         sw_index_first_info=create_autospec(real_ak.sw_index_first_info, side_effect=real_ak.sw_index_first_info),
         sw_index_second_info=create_autospec(real_ak.sw_index_second_info, side_effect=real_ak.sw_index_second_info),
@@ -194,7 +202,10 @@ def _build_pm_fixtures(cfg: dict[str, Any]):
     return fake_yf, fake_ak
 
 
-def test_pm_cockpit_l1_l2_collect_compute_and_render(tmp_path: Path) -> None:
+def test_pm_cockpit_l1_l2_collect_compute_and_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pm_collect.time, "sleep", create_autospec(pm_collect.time.sleep, return_value=None))
     cfg = pm_collect.load_config()
     assert "risk_budget" not in cfg
 
@@ -209,6 +220,7 @@ def test_pm_cockpit_l1_l2_collect_compute_and_render(tmp_path: Path) -> None:
         yf_module=fake_yf,
         ak_module=fake_ak,
         progress_fn=progress_msgs.append,
+        as_of_date=date(2026, 11, 16),
     )
     assert any("stage cn" in m for m in progress_msgs)
     assert any("fetch_cn:" in m for m in progress_msgs)
@@ -824,7 +836,18 @@ async def test_write_monitor_data_internal_allows_registered_feed_keys(
     async def _get_by_slug(slug: str):
         return by_slug.get(slug)
 
-    async def _upsert(monitor_id: str, data_key: str, payload: Any, *, as_of=None):
+    async def _upsert(
+        monitor_id: str,
+        data_key: str,
+        payload: Any,
+        *,
+        as_of=None,
+        attempt_seq=None,
+        is_stale=False,
+        error=None,
+        last_attempt_at=None,
+    ):
+        del attempt_seq, is_stale, error, last_attempt_at
         return MonitorDataEntry(
             monitor_id=monitor_id,
             data_key=data_key,
@@ -1676,17 +1699,17 @@ def test_unified_source_status_store_and_pm_partial_valuation_recovery(
 
     # 2. PM Cockpit Codex #6 & #7: exception / partial / empty MUST preserve status.json last_success_at,
     # and cn_valuation tracks per (date, level) without skipping failed (date, level) pairs!
-    monkeypatch.setattr(pm_collect.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(pm_collect.time, "sleep", create_autospec(pm_collect.time.sleep, return_value=None))
     cfg = pm_collect.load_config()
     fake_yf, fake_ak = _build_pm_fixtures(cfg)
-    # Restrict valuation weeks to 2 dates so full + partial runs stay <0.2s
-    short_weeks = pd.DataFrame({"date": ["2025-12-19", "2025-12-26"]})
-    fake_ak.index_analysis_week_month_sw.side_effect = None
-    fake_ak.index_analysis_week_month_sw.return_value = short_weeks
     pm_state = tmp_path / "pm_matrix"
 
     meta_ok = pm_collect.collect_all(
-        which="all", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak
+        which="all",
+        state_dir=pm_state,
+        yf_module=fake_yf,
+        ak_module=fake_ak,
+        as_of_date=date(2026, 11, 16),
     )
     assert meta_ok["overall"]["ok"] is True
     assert pm_state.joinpath("status.json").is_file()
@@ -1714,7 +1737,7 @@ def test_unified_source_status_store_and_pm_partial_valuation_recovery(
 
     bad_yf = SimpleNamespace(download=create_autospec(yf.download, side_effect=_partial_yf))
     meta_us_partial = pm_collect.collect_all(
-        which="us", state_dir=pm_state, yf_module=bad_yf, ak_module=fake_ak
+        which="us", state_dir=pm_state, yf_module=bad_yf, ak_module=fake_ak, as_of_date=date(2026, 11, 16)
     )
     assert meta_us_partial["us"]["ok"] is False
     assert meta_us_partial["sources"]["us"]["last_success_at"] == prior_us
@@ -1722,7 +1745,7 @@ def test_unified_source_status_store_and_pm_partial_valuation_recovery(
     # (b) US total exception (caught cleanly at collect_all level!) -> preserves prior_us
     exc_yf = SimpleNamespace(download=create_autospec(yf.download, side_effect=RuntimeError("yf down")))
     meta_us_exc = pm_collect.collect_all(
-        which="us", state_dir=pm_state, yf_module=exc_yf, ak_module=fake_ak
+        which="us", state_dir=pm_state, yf_module=exc_yf, ak_module=fake_ak, as_of_date=date(2026, 11, 16)
     )
     assert meta_us_exc["us"]["ok"] is False
     assert meta_us_exc["sources"]["us"]["last_success_at"] == prior_us
@@ -1736,40 +1759,45 @@ def test_unified_source_status_store_and_pm_partial_valuation_recovery(
         else orig_hist_sw(symbol, period=period)
     )
     meta_cn_part = pm_collect.collect_all(
-        which="cn", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_cn_part
+        which="cn", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_cn_part, as_of_date=date(2026, 11, 16)
     )
     assert meta_cn_part["cn"]["ok"] is False
     assert meta_cn_part["sources"]["cn"]["last_success_at"] == prior_cn
 
-    # (d) CN valuation per (date, level) tracking (Codex #7): add a new week "2026-01-02" where
-    # "二级行业" succeeds, while "一级行业" raises transient error -> MUST NOT skip "一级行业", MUST mark stale & preserve prior_val!
+    # (d) CN valuation per (date, level) tracking (Codex #7): unmark latest completed week "2026-11-13" so
+    # "二级行业" succeeds while "一级行业" raises transient error -> MUST NOT skip "一级行业", MUST mark stale & preserve prior_val!
     sdoc_val_seed = json.loads((pm_state / "status.json").read_text(encoding="utf-8"))
     sdoc_val_seed["sources"]["cn_valuation"]["last_success_at"] = prior_val
     (pm_state / "status.json").write_text(json.dumps(sdoc_val_seed, ensure_ascii=False), encoding="utf-8")
 
-    three_weeks = pd.DataFrame({"date": ["2025-12-19", "2025-12-26", "2026-01-02"]})
+    prog_path = pm_state / "raw" / "cn_sw_val_progress.json"
+    prog_seed = json.loads(prog_path.read_text(encoding="utf-8"))
+    prog_seed["done"].pop("2026-11-13", None)
+    prog_path.write_text(json.dumps(prog_seed, ensure_ascii=False), encoding="utf-8")
+    weekly_csv_path = pm_state / "raw" / "cn_sw_val_weekly.csv"
+    weekly_df_seed = pd.read_csv(weekly_csv_path, dtype={"code": str})
+    weekly_df_seed[weekly_df_seed["date"].astype(str) != "2026-11-13"].to_csv(weekly_csv_path, index=False)
+
     _, fake_ak_val = _build_pm_fixtures(cfg)
     orig_weekly = fake_ak_val.index_analysis_weekly_sw.side_effect
-    fake_ak_val.index_analysis_week_month_sw.side_effect = None
-    fake_ak_val.index_analysis_week_month_sw.return_value = three_weeks
 
     def _fail_l1_2026(symbol: str, date: str):
-        if date == "20260102" and symbol == "一级行业":
+        if date == "20261113" and symbol == "一级行业":
             raise RuntimeError("akshare weekly 502")
         return orig_weekly(symbol, date)
 
     fake_ak_val.index_analysis_weekly_sw.side_effect = _fail_l1_2026
     meta_val_fail = pm_collect.collect_all(
-        which="cnval", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_val
+        which="cnval", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_val, as_of_date=date(2026, 11, 16)
     )
     assert meta_val_fail["cn_valuation"]["ok"] is False
     assert meta_val_fail["cn_valuation"]["stale"] is True
     assert meta_val_fail["sources"]["cn_valuation"]["last_success_at"] == prior_val
     prog = json.loads((pm_state / "raw" / "cn_sw_val_progress.json").read_text(encoding="utf-8"))
-    assert "二级行业" in prog["done"]["2026-01-02"]
-    assert "一级行业" not in prog["done"].get("2026-01-02", [])
+    assert "二级行业" in prog["done"]["2026-11-13"]
+    assert "一级行业" not in prog["done"].get("2026-11-13", [])
 
-    # Recovery: fix "一级行业" for 2026-01-02 -> ONLY retries missing (2026-01-02, 一级行业) and succeeds cleanly!
+    # Recovery: fix "一级行业" for 2026-11-13 -> ONLY retries missing (2026-11-13, 一级行业) and succeeds cleanly!
     called_pairs: list[tuple[str, str]] = []
 
     def _recover_l1(symbol: str, date: str):
@@ -1778,9 +1806,9 @@ def test_unified_source_status_store_and_pm_partial_valuation_recovery(
 
     fake_ak_val.index_analysis_weekly_sw.side_effect = _recover_l1
     meta_val_rec = pm_collect.collect_all(
-        which="cnval", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_val
+        which="cnval", state_dir=pm_state, yf_module=fake_yf, ak_module=fake_ak_val, as_of_date=date(2026, 11, 16)
     )
-    assert called_pairs == [("20260102", "一级行业")]
+    assert called_pairs == [("20261113", "一级行业")]
     assert meta_val_rec["cn_valuation"]["ok"] is True
     assert meta_val_rec["cn_valuation"]["stale"] is False
     assert meta_val_rec["sources"]["cn_valuation"]["last_success_at"] != prior_val
@@ -2060,9 +2088,10 @@ def test_hk_history_never_falls_back_to_unadjusted_bars():
         hkf.fetch_hist_one(sess, "00700")
 
 
-def test_hk_history_keeps_the_stored_file_when_only_unadjusted_bars_exist(tmp_path):
+def test_hk_history_keeps_the_stored_file_when_only_unadjusted_bars_exist(tmp_path, monkeypatch):
     from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
 
+    monkeypatch.setattr(hkf.time, "sleep", create_autospec(hkf.time.sleep, return_value=None))
     hist = tmp_path / "hist"
     hist.mkdir(parents=True)
     original = "date,open,close,high,low,volume,turnover_wan\n2025-11-27,1,1,1,1,1,0\n2025-11-28,1,1,1,1,1,0\n"
@@ -2074,8 +2103,16 @@ def test_hk_history_keeps_the_stored_file_when_only_unadjusted_bars_exist(tmp_pa
 
     sess = create_autospec(requests.Session, instance=True)
     sess.get.return_value = _Resp()
+    # Without independent delisting or target-day suspension confirmation, preserves old file AND counts failure.
     res = hkf.download_history(["09986"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
-    assert res["n_errors"] == 0
+    assert res["n_errors"] == 1
+    assert (hist / "09986.csv").read_text(encoding="utf-8") == original
+
+    # When independently confirmed delisted, preserves old file AND exempts from failure count.
+    res_delisted = hkf.download_history(
+        ["09986"], state_dir=tmp_path, target_date="2026-11-19", session=sess, delisted_codes={"09986"}
+    )
+    assert res_delisted["n_errors"] == 0
     assert (hist / "09986.csv").read_text(encoding="utf-8") == original
 
 

@@ -188,7 +188,11 @@ async def _slice_texts(
     except Exception:
         logger.warning("turn slice read failed", exc_info=True)
         return {}
-    return _span_texts(thread_id, slices.stored_spans(serde, anchors, rows))
+    spans = slices.stored_spans(serde, anchors, rows)
+    # DALTON-HOOK(deliverable-text): load replay_facts images only when a span references sandbox images
+    from src.dalton.channels.deliverable_text import load_span_replay_responses
+    responses = await load_span_replay_responses(spans, get_replay_responses)
+    return _span_texts(thread_id, spans, responses=responses)
 
 
 async def _checkpoint_texts(
@@ -211,7 +215,11 @@ async def _checkpoint_texts(
         except Exception:
             logger.warning("turn read failed", exc_info=True)
             continue
-        out.update(_span_texts(thread_id, dict(zip(batch, turns))))
+        spans = dict(zip(batch, turns))
+        # DALTON-HOOK(deliverable-text): load replay_facts images only when a span references sandbox images
+        from src.dalton.channels.deliverable_text import load_span_replay_responses
+        responses = await load_span_replay_responses(spans, get_replay_responses)
+        out.update(_span_texts(thread_id, spans, responses=responses))
     return out
 
 
@@ -220,21 +228,26 @@ async def _archived_texts(response_ids: list[str]) -> dict[str, str]:
     stream."""
     rows = await get_replay_responses(response_ids)
     return {
-        response_id: _main_text(stream)
+        response_id: _main_text(stream, legacy_archive=True)  # DALTON-HOOK(deliverable-text): strict extraction on retained archive fields
         for response_id, row in rows.items()
         if (stream := archived_stream(row)) is not None
     }
 
 
 def _span_texts(
-    thread_id: str, spans: Mapping[str, slices.SpanDelta]
+    thread_id: str,
+    spans: Mapping[str, slices.SpanDelta],
+    *,
+    responses: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
+    from src.dalton.channels.deliverable_text import apply_span_image_urls  # DALTON-HOOK(deliverable-text)
     out: dict[str, str] = {}
     for response_id, span in spans.items():
         try:
             items = history_events_to_sse(
                 messages_to_history_events(span.messages), thread_id=thread_id
             )
+            apply_span_image_urls(items, span, (responses or {}).get(response_id))  # DALTON-HOOK(deliverable-text)
         except Exception:
             logger.warning(
                 "turn slice projection failed for response %s",
@@ -246,7 +259,12 @@ def _span_texts(
     return out
 
 
-def _main_text(items: Iterable[dict[str, Any]]) -> str:
+def _main_text(items: Iterable[dict[str, Any]], *, legacy_archive: bool = False) -> str:
+    # DALTON-HOOK(deliverable-text): extract final deliverable text via unified extractor
+    from src.dalton.channels.deliverable_text import extract_deliverable_text_from_archived_events, extract_deliverable_text_from_events
+    from src.dalton.settings import is_strict_deliverable_text_enabled
+    if is_strict_deliverable_text_enabled():
+        return (extract_deliverable_text_from_archived_events(items) if legacy_archive else extract_deliverable_text_from_events(items)).text
     return "".join(
         d["content"]
         for i in items

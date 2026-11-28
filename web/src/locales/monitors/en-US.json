@@ -15,6 +15,7 @@
   "dataUpdatedAt": "Data as of: {{time}}",
   "ownerLabel": "Published by {{owner}}",
   "lastPublishFailed": "Last update failed: {{time}}",
+  "recentPublishIssue": "Latest update did not take effect; showing the previous verified version.",
   "forbiddenTitle": "Access denied",
   "forbiddenDesc": "You do not have permission to view this monitor.",
   "notFoundTitle": "Monitor not found",

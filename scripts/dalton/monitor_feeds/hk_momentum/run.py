@@ -18,10 +18,12 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.monitor_feeds.common import (  # noqa: E402
     HK_MONTH_END_REQUIRED_SOURCES,
     HK_REQUIRED_PUBLISH_SOURCES,
+    HK_SKIP_FETCH_PUBLISH_SOURCES,
     SourceStatus,
     SourceStatusStore,
     atomic_write_json,
     format_source_statuses,
+    inspect_trading_day,
     is_trading_day,
     last_trading_day_of_month,
     load_json_safe,
@@ -292,6 +294,11 @@ def _format_hk_failure_summary(
     return headline
 
 
+def _hk_daily_required_sources(*, skip_fetch: bool) -> tuple[str, ...]:
+    """Single source of truth for HK daily persistence and publish exit-code gates."""
+    return HK_SKIP_FETCH_PUBLISH_SOURCES if skip_fetch else HK_REQUIRED_PUBLISH_SOURCES
+
+
 def _hk_publish_ok(
     *,
     sources: dict[str, dict[str, Any]],
@@ -300,7 +307,7 @@ def _hk_publish_ok(
     skip_fetch: bool,
     render_ok: bool,
 ) -> bool:
-    """Exit 0 iff page rendered & required daily close series succeeded (all month-end sources on rebalance day)."""
+    """Exit 0 iff page rendered & all required daily sources succeeded (same gate as persistence)."""
     if not render_ok or month_end_failed:
         return False
 
@@ -308,11 +315,12 @@ def _hk_publish_ok(
         ent = sources.get(name) or {}
         return bool(ent.get("ok")) and (not bool(ent.get("stale")))
 
-    req = (
-        HK_REQUIRED_PUBLISH_SOURCES
-        if (not is_month_end or skip_fetch)
-        else HK_MONTH_END_REQUIRED_SOURCES
-    )
+    if skip_fetch:
+        req = _hk_daily_required_sources(skip_fetch=True)
+    elif is_month_end:
+        req = HK_MONTH_END_REQUIRED_SOURCES
+    else:
+        req = _hk_daily_required_sources(skip_fetch=False)
     return all(_clean(k) for k in req)
 
 
@@ -323,11 +331,14 @@ def run_daily_job(
     proxy: str | None = None,
     skip_fetch: bool = False,
     as_of_date: date | None = None,
+    yf_module: Any = None,
 ) -> dict[str, Any]:
     """Run HK momentum daily pipeline in container (writes state/HTML only; host daemon pushes)."""
     st_dir = resolve_state_dir("hk_momentum", state_dir)
     status_store = SourceStatusStore(st_dir)
     now_local = now_hk()
+    check_cal_day = as_of_date if as_of_date is not None else now_local.date()
+    _, hk_cal_src, hk_cal_note = inspect_trading_day("hk", check_cal_day)
     ref_day = resolve_market_trade_date("hk", now=now_local, as_of_date=as_of_date)
     ref_str = ref_day.isoformat()
     now_str = f"{now_local.strftime('%Y-%m-%d %H:%M:%S')} 北京时间"
@@ -405,7 +416,8 @@ def run_daily_job(
         )
 
     # Separate calculation from persistence: compute_all runs with persist=False & freeze_on_stale=True,
-    # and run_daily_job commits series/frozen/constituents ONLY after all checks and render pass.
+    # backfills missed-day suspensions for actual per-day constituents (including new month-end
+    # additions) before completeness checks, and run_daily_job commits ONLY after checks & render pass.
     uni_override = (
         fetched_uni
         if (not (st_dir / "universe.csv").is_file() and fetched_uni is not None)
@@ -419,6 +431,8 @@ def run_daily_job(
             update_last_success=False,
             persist=False,
             universe_df=uni_override,
+            backfill_suspensions=not skip_fetch,
+            yf_module=yf_module,
         )
     except Exception as exc:
         logger.exception("HK momentum compute_all raised: %s", exc)
@@ -485,17 +499,21 @@ def run_daily_job(
 
     # Separate daily status (saved to index_meta.json) from combined daily+intraday status (status.json / HTML).
     render_ok = make_source_result("html_render", ok=True, stale=False, as_of=now_str, label="页面渲染")
-    daily_source_names = (
-        ["hsi_history", "index_compute"]
-        if skip_fetch
-        else ["hkex_universe", "ggt_list", "hk_spot", "hk_history", "hsi_history", "index_compute"]
-    )
+    daily_source_names = list(_hk_daily_required_sources(skip_fetch=skip_fetch))
+    removed_suspended_codes = [
+        str(c) for c in (meta.get("removed_suspended_codes") or []) if str(c).strip()
+    ]
+    extra_overall: dict[str, Any] = {"month_end_failed": False}
+    if removed_suspended_codes:
+        extra_overall["removed_suspended_codes"] = removed_suspended_codes
+    if hk_cal_src == "weekday_fallback" and hk_cal_note:
+        extra_overall["calendar_note"] = hk_cal_note
     daily_results = [s for s in all_results if s.name in daily_source_names]
     daily_doc = status_store.preview_sources(
         daily_results + [render_ok],
         required=daily_source_names + ["html_render"],
         now_str=now_str,
-        extra_overall={"month_end_failed": False},
+        extra_overall=extra_overall,
     )
     daily_overall = daily_doc["overall"]
     daily_clean = bool(daily_overall.get("ok")) and bool(meta.get("completeness_ok", True))
@@ -504,7 +522,7 @@ def run_daily_job(
         all_results + [render_ok],
         required=required_names,
         now_str=now_str,
-        extra_overall={"month_end_failed": False},
+        extra_overall=extra_overall,
     )
     prov_overall = provisional_doc["overall"]
     meta["month_end_failed"] = False
@@ -608,7 +626,7 @@ def run_daily_job(
         all_results + [render_ok],
         required=required_names,
         now_str=now_str,
-        extra_overall={"month_end_failed": False},
+        extra_overall=extra_overall,
     )
     overall = final_doc["overall"]
     publish_ok = _hk_publish_ok(
@@ -642,6 +660,7 @@ def run_daily_job(
         "last_date": meta.get("last_date"),
         "index_dates": meta.get("index_dates"),
         "missing_held_by_index": meta.get("missing_held_by_index"),
+        "removed_suspended_codes": removed_suspended_codes,
         "launch_date": meta.get("launch_date"),
         "stale": bool(overall.get("stale")),
         "month_end_failed": False,

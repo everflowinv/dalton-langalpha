@@ -4,6 +4,7 @@ import type {
   I4StateResponse,
 } from "./backend-client.js";
 import { canViewPlatformChat, type ChannelAdapter } from "./channels/adapter.js";
+import { AUTOMATION_EMPTY_AFTER_TOOLS_SUMMARY } from "./shared/deliverable-text.js";
 import {
   deliverTurnChartsAndWidgets,
   extractRunChartsAndWidgetsFromReplay,
@@ -116,6 +117,10 @@ export class AgentRoutesHandler {
       newThread: Boolean(body.new_thread),
       activityOrigin:
         isAutomationSend || hasExplicitTarget ? "notification" : "conversation",
+      retryDedupByTarget: Boolean(body.retry_dedup_by_target),
+      payloadDigest: body.payload_digest ?? null,
+      sourceMessageId: body.source_message_id ?? null,
+      capturedImages: body.captured_images ?? null,
     });
     return { status: 200, data: result };
   }
@@ -879,6 +884,7 @@ export class AgentRoutesHandler {
               claimed.data.finish_status ??
               "completed") as AgentAutomationRunFinishRequest["status"],
           finalText: body.final_text ?? claimed.data.final_text ?? null,
+          strictDeliverableTextEnabled: claimed.data.strict_deliverable_text_enabled,
           targets: claimed.data.targets ?? [],
         },
         { callerHoldsExecutionLock: true },
@@ -917,6 +923,7 @@ export class AgentRoutesHandler {
     automationName: string;
     finishStatus: AgentAutomationRunFinishRequest["status"];
     finalText: string | null;
+    strictDeliverableTextEnabled?: boolean;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
     if (this.activeFinishExecutors.has(params.executionId)) {
@@ -944,6 +951,7 @@ export class AgentRoutesHandler {
       automationName: string;
       finishStatus: AgentAutomationRunFinishRequest["status"];
       finalText: string | null;
+      strictDeliverableTextEnabled?: boolean;
       targets: AutomationRunTargetRecord[];
     },
     opts?: { callerHoldsExecutionLock?: boolean },
@@ -1171,13 +1179,46 @@ export class AgentRoutesHandler {
             continue;
           }
 
+          if (!replayDenied && params.strictDeliverableTextEnabled !== false) {
+            const emptySummaryRes = await this.deliveryService.executeDelivery({
+              deliveryKey: `automation:${executionId}:${t.entry}:summary`,
+              kind: "automation",
+              userId,
+              threadId,
+              executionId,
+              target: t.address,
+              text: AUTOMATION_EMPTY_AFTER_TOOLS_SUMMARY,
+            });
+            if (
+              emptySummaryRes.status === "sent" ||
+              emptySummaryRes.status === "partial"
+            ) {
+              results.push({
+                ...t,
+                address: emptySummaryRes.address ?? t.address,
+                reached: true,
+                via: "fallback",
+                error: null,
+              });
+              continue;
+            }
+            results.push({
+              ...t,
+              reached: false,
+              via: null,
+              error:
+                emptySummaryRes.message ||
+                "Failed to deliver automation empty-summary notice.",
+            });
+            continue;
+          }
+
           results.push({
             ...t,
             reached: false,
             via: null,
-            error: replayDenied
-              ? "Target platform capability or replay permission denied; charts and widgets were not delivered."
-              : "Automation completed without sending a message or final summary.",
+            error:
+              "Target platform capability or replay permission denied; charts and widgets were not delivered.",
           });
           continue;
         }

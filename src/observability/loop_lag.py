@@ -28,15 +28,15 @@ _INTERVAL_S = 0.5
 
 # A stall this long is already enough to trip short Redis deadlines (the
 # subagent spill uses 0.5s), so it is worth a line in the log on its own.
-_WARN_THRESHOLD_MS = 1000.0
+_WARN_THRESHOLD_MS = 300.0  # DALTON-HOOK(loop-stall-stack)
 
 # Re-log suppression: a sustained stall would otherwise emit a line per sample.
 _WARN_COOLDOWN_S = 10.0
 
 # DALTON-HOOK(loop-stall-stack): daemon watchdog thread that samples the event
-# loop thread's call stack via sys._current_frames() when heartbeat stalls >5s.
+# loop thread's call stack via sys._current_frames() when heartbeat stalls >1.5s.
 _STALL_WATCHDOG_ENV = "LOOP_LAG_WATCHDOG_ENABLED"
-_STALL_THRESHOLD_S = 5.0
+_STALL_THRESHOLD_S = 1.5
 _STALL_COOLDOWN_S = 60.0
 _STALL_MAX_FRAMES = 40
 
@@ -72,12 +72,18 @@ class EventLoopLagMonitor:
         self._last_stall_sample_at = 0.0
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        # DALTON-HOOK(loop-stall-stack): 5s/60s lock-free lag window for diagnostics
+        from src.dalton.observability.loop_lag_window import LoopLagRingWindow
+        self._lag_window = LoopLagRingWindow()
 
     @classmethod
     def get_instance(cls) -> "EventLoopLagMonitor":
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    def snapshot_recent_lag(self) -> dict[str, float | int]:  # DALTON-HOOK(loop-stall-stack)
+        return self._lag_window.snapshot(self._last_heartbeat)
 
     def _touch_heartbeat(self) -> None:  # DALTON-HOOK(loop-stall-stack)
         self._last_heartbeat = time.monotonic()
@@ -108,9 +114,7 @@ class EventLoopLagMonitor:
             "[loop-lag] watchdog enabled=%s stall_threshold_s=%.1f "
             "stall_cooldown_s=%.1f all_thread_stacks=%s max_frames=%d",
             watchdog_enabled,
-            self._stall_threshold_s
-            if self._stall_threshold_s is not None
-            else _STALL_THRESHOLD_S,
+            self._effective_stall_threshold_s(),
             self._stall_cooldown_s
             if self._stall_cooldown_s is not None
             else _STALL_COOLDOWN_S,
@@ -128,6 +132,10 @@ class EventLoopLagMonitor:
         if task is not None:
             await cancel_and_join(task)
 
+    def _effective_stall_threshold_s(self) -> float:  # DALTON-HOOK(loop-stall-stack)
+        from src.dalton.observability.loop_lag_window import resolve_stall_threshold_s
+        return resolve_stall_threshold_s(self._stall_threshold_s, _STALL_THRESHOLD_S)
+
     # DALTON-HOOK(loop-stall-stack): capture every thread's stack once per
     # stall (>5s without heartbeat) with a 60s cooldown, truncated to 40 frames
     # per thread, each labelled with its thread name, plus the in-flight heavy
@@ -135,11 +143,7 @@ class EventLoopLagMonitor:
     # holding the GIL through the stall.
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.is_set():
-            threshold_s = (
-                self._stall_threshold_s
-                if self._stall_threshold_s is not None
-                else _STALL_THRESHOLD_S
-            )
+            threshold_s = self._effective_stall_threshold_s()
             cooldown_s = (
                 self._stall_cooldown_s
                 if self._stall_cooldown_s is not None
@@ -236,6 +240,7 @@ class EventLoopLagMonitor:
             if lag_ms < 0:
                 lag_ms = 0.0
             self.max_lag_ms = max(self.max_lag_ms, lag_ms)
+            self._lag_window.record(lag_ms)  # DALTON-HOOK(loop-stall-stack)
             try:
                 event_loop_lag_ms.record(lag_ms)
             except Exception:
@@ -248,11 +253,7 @@ class EventLoopLagMonitor:
                     # no thread stacks — below the stall threshold the
                     # watchdog never samples, and a disabled watchdog samples
                     # nothing at any duration.
-                    stall_threshold_s = (
-                        self._stall_threshold_s
-                        if self._stall_threshold_s is not None
-                        else _STALL_THRESHOLD_S
-                    )
+                    stall_threshold_s = self._effective_stall_threshold_s()
                     if not _is_watchdog_enabled():
                         stack_note = "；看门狗未启用，未采集栈"
                     elif lag_ms < stall_threshold_s * 1000.0:
