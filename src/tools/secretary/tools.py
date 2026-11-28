@@ -1283,7 +1283,7 @@ async def threads_list(
             from src.server.database.conversation.threads_read import get_workspace_threads
 
             threads, total = await get_workspace_threads(
-                workspace_id=workspace_id, limit=20
+                workspace_id=workspace_id, limit=20, viewer_user_id=user_id  # DALTON-HOOK(personal-integrations)
             )
         else:
             from src.server.database.conversation.threads_read import get_threads_for_user

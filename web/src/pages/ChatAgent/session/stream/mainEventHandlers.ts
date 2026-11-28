@@ -561,6 +561,32 @@ export function handleCliQueue({ assistantMessageId, event, order, setMessages }
   return queue;
 }
 
+// DALTON-HOOK(personal-integrations): handle live and replayed first-touch privacy notice once per turn reply
+export function handlePersonalIntegrationNotice({ assistantMessageId, event, order, setMessages }: {
+  assistantMessageId: string;
+  event: Record<string, unknown>;
+  order: number;
+  setMessages: SetMessages;
+}): boolean {
+  const message = typeof event.message === 'string' ? event.message.trim() : '';
+  if (!message) return false;
+  const service = typeof event.service === 'string' ? event.service : undefined;
+  const provider = typeof event.provider === 'string' ? event.provider : undefined;
+  setMessages((prev: MessageRecord[]) => prev.map((msg: MessageRecord) => {
+    if (msg.id !== assistantMessageId || msg.role !== 'assistant') return msg;
+    return appendNotificationSegmentOnce(
+      msg as AssistantMessage,
+      {
+        type: 'notification',
+        notice: { kind: 'personalIntegrationNotice', service, provider, message },
+        order,
+      },
+      (s) => s.notice?.kind === 'personalIntegrationNotice',
+    );
+  }));
+  return true;
+}
+
 /**
  * Handles artifact events with artifact_type: "html_widget" during streaming.
  * Creates a content segment for inline rendering of interactive HTML widgets.

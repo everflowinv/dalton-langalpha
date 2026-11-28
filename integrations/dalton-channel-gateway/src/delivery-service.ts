@@ -151,6 +151,8 @@ export interface ExecuteDeliveryOptions {
   linkFallbackOnDeliverableMismatch?: boolean;
   /** When true, emit web login deep links only (never download/upload binaries) for un-delivered DM deliverables. */
   forceLinkOnly?: boolean;
+  /** When true, `text` is only a companion preface for attached files; if all attachments fail, do not report `partial`. */
+  textIsAttachmentPreface?: boolean;
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
@@ -436,8 +438,9 @@ export class DeliveryService {
     const trimmedText = rawText.trim();
     const hasNonEmptyText = trimmedText.length > 0;
     const files = options.files ?? [];
+    const initialLinkOnlyFiles = options.linkOnlyFiles ?? [];
 
-    if (!hasNonEmptyText && files.length === 0) {
+    if (!hasNonEmptyText && files.length === 0 && initialLinkOnlyFiles.length === 0) {
       return {
         status: "failed",
         code: null,
@@ -477,7 +480,7 @@ export class DeliveryService {
       };
     }
 
-    const outboundText = hasNonEmptyText
+    let outboundText = hasNonEmptyText
       ? rewriteSandboxLinks(
           rawText,
           this.webBaseUrl,
@@ -485,8 +488,8 @@ export class DeliveryService {
           options.workspaceId ?? null,
         )
       : rawText;
-    const hasOutboundText = outboundText.trim().length > 0;
-    const linkOnlyFiles = options.linkOnlyFiles ?? [];
+    let hasOutboundText = outboundText.trim().length > 0;
+    let linkOnlyFiles = options.linkOnlyFiles ?? [];
 
     if (!hasOutboundText && files.length === 0 && linkOnlyFiles.length === 0) {
       return {
@@ -724,13 +727,24 @@ export class DeliveryService {
     }
 
     const isDmTarget = targetAddress.endsWith(":@me");
+    const isPersonalRedirectNotice = Boolean(
+      claim.personal_private_redirect_notice ||
+        (typeof claim.forced_text === "string" && claim.forced_text.trim().length > 0),
+    );
     const currentSessionWsId =
       (options.workspaceId ?? "").trim() ||
       (claim.workspace_id ?? "").trim() ||
       (claim.home_workspace_id ?? "").trim() ||
       null;
     const fileOutcomes: AgentSendFileOutcome[] = [];
-    let filesToSend: AgentSendFileRef[] = [...files];
+    let filesToSend: AgentSendFileRef[] = isPersonalRedirectNotice ? [] : [...files];
+    if (isPersonalRedirectNotice) {
+      outboundText =
+        (typeof claim.forced_text === "string" && claim.forced_text.trim()) ||
+        "本次结果含个人日历内容，已发送到你的私聊";
+      hasOutboundText = true;
+      linkOnlyFiles = [];
+    }
     const pendingLinkEntries: Array<{
       line: string;
       outcome: AgentSendFileOutcome;
@@ -2038,7 +2052,11 @@ export class DeliveryService {
       }
     }
 
-    const somethingSucceeded = sentChunks > 0 || anyFileSucceeded;
+    const hasRequestedAttachments = files.length > 0 || linkOnlyFiles.length > 0;
+    const somethingSucceeded =
+      options.textIsAttachmentPreface && hasRequestedAttachments
+        ? anyFileSucceeded
+        : sentChunks > 0 || anyFileSucceeded;
     let finalStatus: AgentSendResponse["status"];
     let finalCode: AgentSendResponse["code"] = null;
     let finalMessage: string;

@@ -44,6 +44,8 @@ import {
   handleMessageDiscarded,
   handleToolCalls, handleToolCallResult, handleToolCallChunks,
   handleHtmlWidget, handlePlanBilled, handleCliQueue,
+  // DALTON-HOOK(personal-integrations): live first-touch privacy notice handler
+  handlePersonalIntegrationNotice,
 } from './mainEventHandlers';
 // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
 import { createProvenanceFrameBuffer } from './provenanceBatch';
@@ -718,6 +720,19 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           setMessages: setMessagesForHandlers,
         });
         if (queue) rt.setTurnStatus({ cliQueue: queue.signal === 'waiting' ? queue.wait : null });
+      }
+      return;
+    }
+
+    // DALTON-HOOK(personal-integrations): display first-touch personal privacy notice live on its turn
+    if (eventType === 'personal_integration_notice') {
+      if (!isSubagent) {
+        handlePersonalIntegrationNotice({
+          assistantMessageId,
+          event,
+          order: eventOrder(event, nextCount),
+          setMessages: setMessagesForHandlers,
+        });
       }
       return;
     }

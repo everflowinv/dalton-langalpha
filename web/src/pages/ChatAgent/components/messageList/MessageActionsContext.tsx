@@ -17,6 +17,7 @@ import React from 'react';
 import type { FeedbackResult, SubagentInfo } from './types';
 import type { ThumbDownFollowUp, ThumbDownFollowUpOutcome } from '../../hooks/useChatFeedback';
 import type { PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
+import type { ToolApprovalDecisionExtra } from '../../session/interrupts/answerBoard'; // DALTON-HOOK(personal-integrations)
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import type { ChartTabSpec } from '../filePanel/types';
 import type { ArtifactCommentOpeners } from '../artifactComments/artifactCommentReply';
@@ -84,8 +85,9 @@ export interface MessageActions {
    *  sits, so it says rather than the hook looking it up. */
   /** `attemptId` rides along for a call the order gate keyed: the resume names
    *  it rather than trusting the slot, so a batch cannot misassign a verdict. */
-  onApproveToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string) => void;
-  onRejectToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string) => void;
+  // DALTON-HOOK(personal-integrations): allow passing L2 receipt & Google elicitation responses
+  onApproveToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string, extra?: ToolApprovalDecisionExtra) => void;
+  onRejectToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string, extra?: ToolApprovalDecisionExtra) => void;
   onEditMessage?: (messageId: string, content: string) => void;
   /** The session's open edit boxes, which outlive the bubbles a reload
    *  remounts. Without it a bubble keeps its own while it lives. */

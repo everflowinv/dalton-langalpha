@@ -1555,6 +1555,21 @@ async def require_thread_access(
         if not ws_owner:
             ws_owner = str(meta.get("workspace_owner_id") or "").strip()
 
+    # Personal integration private thread gate (§4.4 item 3): non-owners always get 404
+    # across both web and cos channels (read and write), even if workspace was later shared.
+    if uid != thread_owner:
+        from src.dalton.services.personal_integration_guard import (
+            enforce_personal_thread_owner_only,
+        )
+
+        await enforce_personal_thread_owner_only(
+            thread_id,
+            uid,
+            thread_owner=thread_owner,
+            meta=meta,
+            conn=conn,
+        )
+
     if _multiuser_auth_enabled():
         if uid != thread_owner or (ws_owner and ws_owner != uid):
             caller_tier = (

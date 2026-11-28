@@ -583,6 +583,8 @@ export const queryKeys = {
       symbolsKey,
     ],
     watchlistTierPolicies: () => [...queryKeys.dalton.all, 'watchlist', 'tier-policies'],
+    // DALTON-HOOK(personal-integrations): personal calendar & mail OAuth connections and active purges
+    personalIntegrations: () => [...queryKeys.dalton.all, 'personal-integrations'],
   },
   // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, shared documents, and company members
   daltonMonitors: {

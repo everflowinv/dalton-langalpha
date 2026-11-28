@@ -24,7 +24,8 @@ import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
 import { applyCallUsage } from '../tokenUsage';
 // DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
 import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
-import { handleCliQueue, handlePlanBilled } from '../stream/mainEventHandlers';
+// DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+import { handleCliQueue, handlePersonalIntegrationNotice, handlePlanBilled } from '../stream/mainEventHandlers';
 import { eventOrder } from '../eventOrder';
 import {
   handleHistoryUserMessage,
@@ -355,6 +356,20 @@ export async function loadConversationHistory(
         const msgId = activeReplyId();
         if (!isSubagent && msgId) {
           handleCliQueue({ assistantMessageId: msgId, event, order: eventOrder(event, nextCount), setMessages: setMessagesForHandlers });
+        }
+        return;
+      }
+
+      // DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+      if (eventType === 'personal_integration_notice') {
+        const msgId = activeReplyId();
+        if (!isSubagent && msgId) {
+          handlePersonalIntegrationNotice({
+            assistantMessageId: msgId,
+            event,
+            order: eventOrder(event, nextCount),
+            setMessages: setMessagesForHandlers,
+          });
         }
         return;
       }

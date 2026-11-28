@@ -23,6 +23,7 @@ from psycopg.rows import dict_row
 
 from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.conversations.search import format_conversation_locator
+from src.dalton.integrations.lock_guard import assert_no_advisory_lock_held
 from src.server.database.pool import get_db_connection
 from src.server.database.workspace_file import bulk_upsert_files, delete_file_rows
 
@@ -201,6 +202,7 @@ async def _resolve_workspace_backend(
             )
         workspace_manager = WorkspaceManager.get_instance(config=agent_config)
 
+    assert_no_advisory_lock_held("conversations.get_session_for_workspace")
     session = await workspace_manager.get_session_for_workspace(
         str(workspace_id), user_id=user_id
     )
@@ -235,6 +237,7 @@ async def write_conversation_file_to_backend(
             f"Cannot write conversation digest {rel_path}: no filesystem backend for workspace_id={workspace_id}"
         )
 
+    assert_no_advisory_lock_held("conversations.write_digest_sandbox")
     if hasattr(eff_backend, "awrite_text"):
         wrote = await eff_backend.awrite_text(rel_path, md_text)
         if wrote is False:
@@ -294,6 +297,7 @@ async def remove_conversation_file_from_backend(
     # fallback emptied the file while its row was deleted — a stale empty file
     # is worse than a failed delete, so no backend means an error.
     if hasattr(eff_backend, "aexecute"):
+        assert_no_advisory_lock_held("conversations.remove_digest_sandbox")
         target_path = rel_path
         if hasattr(eff_backend, "normalize_path"):
             norm = eff_backend.normalize_path(rel_path)

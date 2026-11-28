@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils';
 import { isNotFoundError } from '@/api/errors'; // DALTON-HOOK(external-share-guard)
 import { useCallerIdentity, type UseCallerIdentityOptions } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(settings-section)
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
+import { useHasPersonalIntegrations } from '@/lib/dalton/personalIntegrationsApi'; // DALTON-HOOK(personal-integrations)
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
 import { useWeixinExternalVisibility } from '../panels/dalton/useWeixinVisibility'; // DALTON-HOOK(weixin-multi-account)
 import { isDesktopShell } from '@/lib/desktop';
@@ -37,6 +38,8 @@ export function useDaltonSettingsVisibility(
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(hasColleagueSharing);
   // DALTON-HOOK(weixin-multi-account): delegate external WeChat entry visibility to Dalton hook
   const weixinAllowExternal = useWeixinExternalVisibility(identity.isExternal, hasCapability);
+  // DALTON-HOOK(personal-integrations): keep Integrations section visible when historical personal connections exist
+  const hasPersonalIntegrations = useHasPersonalIntegrations(identity.status === 'ready');
   const effectiveTier = identity.status === 'ready' ? identity.tier : null;
   return {
     canInvite: identity.canInvite,
@@ -50,6 +53,7 @@ export function useDaltonSettingsVisibility(
     coverageUnitsPending: hasColleagueSharing && coverageLoading,
     discordChannelsAdmin: identity.isAdmin,
     weixinAllowExternal,
+    hasPersonalIntegrations,
     capabilities,
     capabilitiesLoading,
   };

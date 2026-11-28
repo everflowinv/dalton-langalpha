@@ -134,11 +134,7 @@ def test_health_probe_is_a_short_list_events_call() -> None:
 
     tool_name, args = build_route_probe_spec("gcal", "research")
     assert tool_name == "research"
-    assert args["route"] == "gcal"
-    assert args["operation"] == "list_events"
-    assert args["limit"] == 1
-    assert "T00:00:00" in args["time_min"]
-    assert "T00:00:00" in args["time_max"]
+    assert args == {"route": "gcal", "operation": "health_check"}
     assert_valid_bridge_call(tool_name, args)
 
 

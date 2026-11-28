@@ -585,17 +585,24 @@ def _scan_failure(row: dict[str, Any]) -> dict[str, str]:
 def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     workspace = require_workspace(args.workspace_dir)
     day = today_et()
-    start, end = _day_bounds(day)
     calendar_ok = False
+    gcal_backend: str | None = None
     try:
         result = call_research(
             route="gcal",
-            operation="list_events",
-            time_min=start,
-            time_max=end,
-            limit=1,
+            operation="health_check",
         )
-        calendar_ok = isinstance(result, dict) and result.get("ok") is True
+        data = result.get("data") if isinstance(result, dict) else None
+        calendar_ok = (
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and isinstance(data, dict)
+            and data.get("calendar_ok") is True
+        )
+        if isinstance(data, dict):
+            raw_backend = data.get("backend")
+            if isinstance(raw_backend, str) and raw_backend.strip():
+                gcal_backend = raw_backend.strip()
     except Exception:  # noqa: BLE001 - self-test records calendar failure without the exception text
         calendar_ok = False
     try:
@@ -605,7 +612,7 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     except (OSError, ValueError):
         universe_ok = False
         universe_count = 0
-    return {
+    out: dict[str, Any] = {
         "ok": calendar_ok and universe_ok,
         "calendar_ok": calendar_ok,
         "universe_ok": universe_ok,
@@ -614,6 +621,9 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
         "report_run_id": report_run_id(day),
         "date": day.isoformat(),
     }
+    if gcal_backend is not None:
+        out["backend"] = gcal_backend
+    return out
 
 
 def cmd_list(args: argparse.Namespace) -> dict[str, Any]:

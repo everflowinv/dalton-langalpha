@@ -132,6 +132,19 @@ class HITLDecision(BaseModel):
         default=None,
         description="Confirmation token echoed back for Dalton notify approvals",
     )
+    # DALTON-HOOK(personal-integrations): L2 confirmation receipt and Google MCP form elicitation responses
+    second_confirm_acknowledged: Optional[bool] = Field(
+        default=None,
+        description="Explicit second confirmation checkbox acknowledgement for L2 personal integration actions",
+    )
+    confirmed_payload_sha256: Optional[str] = Field(
+        default=None,
+        description="SHA-256 digest of the payload presented to and confirmed by the user",
+    )
+    elicitation_responses: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Per-request-key responses mapped to Google Workspace MCP params.inputResponses",
+    )
 
 
 class HITLResponse(BaseModel):

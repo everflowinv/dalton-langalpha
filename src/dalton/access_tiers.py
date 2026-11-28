@@ -50,6 +50,7 @@ __all__ = [
     "classify_owner_tiers_batch",
     "evaluate_weixin_member_access",
     "get_primary_admin_user_id",
+    "get_primary_admin_user_id_strict",
     "get_primary_admin_user_id_sync",
     "get_user_tier",
     "is_admin_user",
@@ -301,6 +302,29 @@ def list_admin_user_ids_sync(*, include_config_defaults: bool = False) -> list[s
             if str(u).strip()
         ]
     return list(dalton_settings.get_configured_pm_user_ids())
+
+
+async def get_primary_admin_user_id_strict(*, conn: Any = None) -> str | None:
+    """Return the primary administrator ``user_id`` without swallowing database errors.
+
+    Returns ``None`` only when the database query succeeds and no primary administrator
+    is configured. Database errors in ``local`` mode propagate to the caller so callers
+    can distinguish ``owner_unconfigured`` from transient database failures.
+    """
+    if is_dalton_local_auth_enabled():
+        from src.dalton.auth.roles import (
+            get_credential_holder_id,
+            get_user_role,
+            list_admin_user_ids as _list_local_admins,
+        )
+
+        holder = await get_credential_holder_id(conn=conn)
+        if holder and await get_user_role(holder, conn=conn) == "admin":
+            return holder
+        admins = await _list_local_admins(conn=conn)
+        return admins[0] if admins else None
+    pm_ids = dalton_settings.get_configured_pm_user_ids()
+    return pm_ids[0] if pm_ids else None
 
 
 async def get_primary_admin_user_id(*, conn: Any = None) -> str | None:

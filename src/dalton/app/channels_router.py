@@ -177,12 +177,14 @@ def _reject_nested_company_user_ids(*containers: dict[str, Any] | None) -> None:
 class GatewayLeaseAcquireRequest(BaseModel):
     instance_id: str = Field(min_length=1, max_length=255)
     ttl_seconds: int = Field(default=45, ge=5, le=300)
+    feishu_app_id: str | None = Field(default=None, max_length=255)
 
 
 class GatewayLeaseHeartbeatRequest(BaseModel):
     instance_id: str = Field(min_length=1, max_length=255)
     epoch: int = Field(ge=1)
     ttl_seconds: int = Field(default=45, ge=5, le=300)
+    feishu_app_id: str | None = Field(default=None, max_length=255)
 
 
 class GatewayLeaseReleaseRequest(BaseModel):
@@ -667,10 +669,23 @@ async def internal_gateway_lease_acquire_endpoint(
     body: GatewayLeaseAcquireRequest,
 ) -> dict[str, Any]:
     """Acquire or renew the single-instance gateway lease."""
-    return await wx_db.acquire_gateway_lease(
+    res = await wx_db.acquire_gateway_lease(
         instance_id=body.instance_id,
         ttl_seconds=body.ttl_seconds,
     )
+    if res.get("granted") and body.feishu_app_id is not None:
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.upsert_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=int(res["epoch"]),
+                feishu_app_id=body.feishu_app_id,
+                expires_at=res["expires_at"],
+            )
+        except Exception:
+            logger.debug("Could not persist channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 @channels_router.post(
@@ -682,13 +697,26 @@ async def internal_gateway_lease_heartbeat_endpoint(
 ) -> Any:
     """Extend an active gateway lease; returns HTTP 409 `stale_gateway_epoch` if lost."""
     try:
-        return await wx_db.heartbeat_gateway_lease(
+        res = await wx_db.heartbeat_gateway_lease(
             instance_id=body.instance_id,
             epoch=body.epoch,
             ttl_seconds=body.ttl_seconds,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
+    if res.get("ok") and body.feishu_app_id is not None:
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.upsert_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=int(res["epoch"]),
+                feishu_app_id=body.feishu_app_id,
+                expires_at=res["expires_at"],
+            )
+        except Exception:
+            logger.debug("Could not update channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 @channels_router.post(
@@ -699,10 +727,21 @@ async def internal_gateway_lease_release_endpoint(
     body: GatewayLeaseReleaseRequest,
 ) -> dict[str, Any]:
     """Voluntarily release the gateway lease on clean shutdown."""
-    return await wx_db.release_gateway_lease(
+    res = await wx_db.release_gateway_lease(
         instance_id=body.instance_id,
         epoch=body.epoch,
     )
+    if res.get("released"):
+        try:
+            from src.dalton.database import user_integrations as ui_db
+
+            await ui_db.clear_channel_gateway_runtime(
+                instance_id=body.instance_id,
+                lease_epoch=body.epoch,
+            )
+        except Exception:
+            logger.debug("Could not clear channel gateway runtime feishu_app_id", exc_info=True)
+    return res
 
 
 # ---------------------------------------------------------------------------

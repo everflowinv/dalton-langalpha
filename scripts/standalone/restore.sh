@@ -1027,6 +1027,11 @@ fi
 # Step 3: Verify entire target PostgreSQL instance and object storage are empty
 # and validate postgres.dump before writing any data.
 info "3/7 Verifying target instance is empty and validating postgres.dump..."
+PERSONAL_INTEGRATIONS_RESET_SQL="${WORK_DIR}/scripts/dalton/sql/personal_integrations_restore_reset.sql"
+if [[ ! -f "$PERSONAL_INTEGRATIONS_RESET_SQL" || ! -r "$PERSONAL_INTEGRATIONS_RESET_SQL" || ! -s "$PERSONAL_INTEGRATIONS_RESET_SQL" ]]; then
+  err "Required personal-integration restore reset SQL is missing, unreadable, or empty: ${PERSONAL_INTEGRATIONS_RESET_SQL}"
+  exit 1
+fi
 if ! service_is_running postgres; then
   compose_cmd up -d postgres
 fi
@@ -1599,6 +1604,7 @@ info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
 
+<<<<<<< HEAD
 # Clear & restore terminal `asr-jobs` volume BEFORE post-restore convergence and BEFORE
 # starting backend or transcription services, so pre-restore directories can never be
 # auto-resumed by `recover_incomplete_jobs`.
@@ -1659,6 +1665,13 @@ if ! compose_cmd "${RECONCILE_RUN_ARGS[@]}" backend \
   exit 1
 fi
 ok "Post-restore inflight states converged."
+=======
+info "Clearing restored personal-integration tokens and transient OAuth state..."
+compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+  psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 \
+  < "$PERSONAL_INTEGRATIONS_RESET_SQL"
+ok "Restored personal-integration tokens cleared (existing connections marked needs_reauth)."
+>>>>>>> refs/lane/82
 
 # Verify every completed DB-referenced object exists in object storage; skip in-progress
 # 'uploading' records (incomplete at backup time) and report how many were skipped.

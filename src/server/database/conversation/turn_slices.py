@@ -139,7 +139,10 @@ async def get_slices_at(
             return [_stored(r) for r in await cur.fetchall()]
 
 
-async def _write_many(sql: str, params: list[tuple[Any, ...]], what: str) -> None:
+async def _write_many(sql: str, params: list[tuple[Any, ...]], what: str, *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
+    if thread_id is not None and expected_purge_gen is not None:  # DALTON-HOOK(personal-integrations)
+        from src.dalton.services.purge_fence import write_many_fenced
+        return await write_many_fenced(sql, params, what, thread_id=thread_id, expected_purge_gen=expected_purge_gen)
     async with pool.get_db_connection() as conn:
         async with conn.cursor() as cur:
             try:
@@ -179,7 +182,7 @@ _UPSERT_TURN = """
 """
 
 
-async def upsert_turn_slices(rows: list[TurnRow]) -> None:
+async def upsert_turn_slices(rows: list[TurnRow], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Store turns' slices, each with its lines and run claims when known."""
     if not rows:
         return
@@ -201,14 +204,17 @@ async def upsert_turn_slices(rows: list[TurnRow]) -> None:
             for r in rows
         ],
         "turn slice",
+        thread_id=thread_id or rows[0].thread_id, expected_purge_gen=expected_purge_gen,  # DALTON-HOOK(personal-integrations)
     )
 
 
-async def update_turns(rows: list[TurnUpdate]) -> None:
+async def update_turns(rows: list[TurnUpdate], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Set lines and run claims on stored slices."""
     if not rows:
         return
-    async with pool.get_db_connection() as conn:
+    async with pool.get_db_connection() as conn, conn.transaction():  # DALTON-HOOK(personal-integrations)
+        from src.dalton.services.purge_fence import check_writeback_fence_tx
+        if not await check_writeback_fence_tx(conn, thread_id, expected_purge_gen, label="turn lines"): return
         async with conn.cursor() as cur:
             await cur.executemany(
                 """UPDATE turn_slices
@@ -252,7 +258,7 @@ async def get_run_slices(thread_id: str, task_ids: list[str]) -> list[RunRow]:
             ]
 
 
-async def upsert_run_slices(rows: list[RunRow]) -> None:
+async def upsert_run_slices(rows: list[RunRow], *, thread_id: str | None = None, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
     """Store subagent runs' slices."""
     if not rows:
         return
@@ -283,4 +289,5 @@ async def upsert_run_slices(rows: list[RunRow]) -> None:
             for r in rows
         ],
         "run slice",
+        thread_id=thread_id or rows[0].thread_id, expected_purge_gen=expected_purge_gen,  # DALTON-HOOK(personal-integrations)
     )

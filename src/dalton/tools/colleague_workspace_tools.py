@@ -506,6 +506,14 @@ def create_colleague_workspace_tools() -> list[BaseTool]:
             target_ws_id = str((meta or {}).get("workspace_id") or "").strip()
             if not target_ws_id:
                 return error_command("thread not found", tool_call_id)
+            if bool((meta or {}).get("has_personal_integration_data")):
+                target_thread_owner = str(
+                    (meta or {}).get("thread_user_id")
+                    or (meta or {}).get("user_id")
+                    or ""
+                ).strip()
+                if any(str(uid) != target_thread_owner for uid in identities):
+                    return error_command("thread not found", tool_call_id)
             target_ws = await get_workspace(target_ws_id)
             if _is_disallowed_target_workspace(target_ws):
                 return error_command("thread not found", tool_call_id)

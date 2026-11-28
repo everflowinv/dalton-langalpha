@@ -269,4 +269,35 @@ describe('Settings sections & search capability gating', () => {
       expect(settingSearchText(notifyEntry!, tZh, ctx).toLowerCase()).not.toContain('微信');
     }
   });
+
+  // DALTON-HOOK(personal-integrations): verify Integrations section & search visibility for single personal capability or historical connections
+  it('shows Integrations section and personal integrations search entry on single personal capability or historical connections', () => {
+    // Core with all personal & channel capabilities off and no historical connections -> hidden
+    expect(sectionShown('integrations', coreAdminCtx)).toBe(false);
+    expect(
+      searchableSettings(false, coreAdminCtx).some((e) => e.anchor === 'dalton-personal-integrations'),
+    ).toBe(false);
+
+    // Core with single google_calendar capability enabled -> visible
+    const gcalOnlyCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      capabilities: new Set<CapabilityId>(['company_wiki', 'google_calendar']),
+    };
+    expect(sectionShown('integrations', gcalOnlyCtx)).toBe(true);
+    expect(
+      searchableSettings(false, gcalOnlyCtx).some((e) => e.anchor === 'dalton-personal-integrations'),
+    ).toBe(true);
+
+    // Core with all capabilities off but historical personal connections present -> visible for disconnect/cleanup
+    const historicalCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      hasPersonalIntegrations: true,
+    };
+    expect(sectionShown('integrations', historicalCtx)).toBe(true);
+    expect(
+      searchableSettings(false, historicalCtx).some(
+        (e) => e.anchor === 'dalton-personal-integrations',
+      ),
+    ).toBe(true);
+  });
 });

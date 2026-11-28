@@ -9,13 +9,18 @@ import { OrderApprovalCard } from './mcp/OrderApprovalCard';
 import { useDirectToolVendorLabel } from './mcp/useDirectToolVendor';
 import { SettledStep } from './SettledStep';
 import { PublishApprovalCard } from './dalton/PublishApprovalCard'; // DALTON-HOOK(publish-card)
+// DALTON-HOOK(personal-integrations): dedicated L1/L2 & Google MCP elicitation approval card
+import { PersonalIntegrationApprovalCard } from './dalton/PersonalIntegrationApprovalCard';
+import { DALTON_INTEGRATION_APPROVAL_TYPES } from '../session/interrupts/toolApprovalCard';
+import type { ToolApprovalDecisionExtra } from '../session/interrupts/answerBoard';
 import { ResolveSwap } from './decisionCardMotion';
 import { humanizeKey } from '../utils/structuredResult';
 
 interface ToolApprovalCardProps {
   data: ToolApprovalState | null;
-  onApprove?: () => void;
-  onReject?: (message?: string) => void;
+  // DALTON-HOOK(personal-integrations): allow forwarding L2 receipt & Google elicitation responses
+  onApprove?: (extra?: ToolApprovalDecisionExtra) => void;
+  onReject?: (message?: string, extra?: ToolApprovalDecisionExtra) => void;
   /** The approved call has not answered yet. Only meaningful for an order,
    *  whose card waits for its receipt rather than settling on the click. */
   resultPending?: boolean;
@@ -23,6 +28,8 @@ interface ToolApprovalCardProps {
    *  will ever state the outcome. Only meaningful for an order, whose end
    *  state the ledger still holds. */
   resultLost?: boolean;
+  // DALTON-HOOK(personal-integrations): raw tool_call_result content so unconfirmed calendar writes warn the user
+  toolResultContent?: unknown;
 }
 
 /**
@@ -37,7 +44,7 @@ interface ToolApprovalCardProps {
  * the person is deciding on a trade, not on whether a JSON frame is right, and
  * that card is drawn in the shape of the receipt the order becomes.
  */
-function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost }: ToolApprovalCardProps): React.ReactElement | null {
+function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost, toolResultContent }: ToolApprovalCardProps): React.ReactElement | null {
   const { t } = useTranslation();
   const [reason, setReason] = useState('');
   const vendorLabel = useDirectToolVendorLabel(data?.server || '');
@@ -60,6 +67,19 @@ function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost
   // DALTON-HOOK(publish-card): render dedicated publish receipt card for publish_report
   if (data.tool === 'publish_report') {
     return <PublishApprovalCard data={data} onApprove={onApprove} onReject={onReject} />;
+  }
+
+  // DALTON-HOOK(personal-integrations): render dedicated calendar/mail L1/L2 & Google MCP elicitation card
+  if (data.actionType && DALTON_INTEGRATION_APPROVAL_TYPES.has(data.actionType)) {
+    return (
+      <PersonalIntegrationApprovalCard
+        data={data}
+        onApprove={onApprove}
+        onReject={onReject}
+        resultLost={resultLost}
+        toolResultContent={toolResultContent}
+      />
+    );
   }
 
   const { status, server, tool, args } = data;

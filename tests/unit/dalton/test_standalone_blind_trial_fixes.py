@@ -301,6 +301,7 @@ class TestReleaseTarballGate:
             "scripts/dalton/docker_entrypoint_dalton.sh",
             "scripts/dalton/configure_minio.sh",
             "scripts/dalton/log_redaction.py",
+            "scripts/dalton/sql/personal_integrations_restore_reset.sql",
             "scripts/standalone/init.sh",
             "web/package.json",
             "docs-site/package.json",
@@ -308,7 +309,10 @@ class TestReleaseTarballGate:
         for rel in required_files:
             p = repo / rel
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("ok\n", encoding="utf-8")
+            if rel == "scripts/dalton/sql/personal_integrations_restore_reset.sql":
+                p.write_bytes((REPO_ROOT / rel).read_bytes())
+            else:
+                p.write_text("ok\n", encoding="utf-8")
 
         # Explicitly verify the target repo does NOT contain verify_release_tarball.py
         assert not (repo / "scripts/standalone/verify_release_tarball.py").exists()

@@ -215,7 +215,12 @@ def build_directory(
     header: dict[str, Any] | None = None,
     previous: dict[str, Any] | None = None,
     window: Window,
+<<<<<<< HEAD
     borrowed: int = 0,
+=======
+    # DALTON-HOOK(personal-integrations): 1-based first segment tainted by persisted personal-integration touch
+    first_personal_segment: int | None = None,
+>>>>>>> refs/lane/82
 ) -> Directory:
     """Render the segments that changed since ``previous``, the manifest the
     stored copy was rendered with, and carry the rest over from it.
@@ -237,8 +242,17 @@ def build_directory(
     forked from, so its own start at ``borrowed + 1`` (the manifest's
     ``first``) and ``window`` is never short of them.
     """
+<<<<<<< HEAD
     if window.runs < borrowed:
         raise ValueError(f"window at {window.runs} runs is short of {borrowed} borrowed")
+=======
+    # DALTON-HOOK(personal-integrations): propagate personal-integration taint across multi-turn segments
+    from src.dalton.services.personal_integration_trace import (
+        REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
+        run_contains_personal_integration_tool,
+    )
+
+>>>>>>> refs/lane/82
     held: list[Any] = []
     if (
         previous
@@ -251,9 +265,15 @@ def build_directory(
     rendered: dict[str, bytes] = {}
     shape = through = ""
     base = window.runs
+<<<<<<< HEAD
     trimmed = base - borrowed
     if trimmed:
         carried = held[:trimmed]
+=======
+    personal_tainted = False
+    if base:
+        carried = held[:base]
+>>>>>>> refs/lane/82
         if (
             len(carried) < trimmed
             or not all(
@@ -266,24 +286,66 @@ def build_directory(
         entries.extend(carried)
         # The key chains through every turn before it, the trimmed ones too.
         shape, through = carried[-1]["shape"], window.digest
+<<<<<<< HEAD
     elif borrowed:
         through = window.digest
+=======
+        # DALTON-HOOK(personal-integrations): propagate personal-integration taint from carried turns and DB first touch
+        personal_tainted = bool(carried[-1].get("personal_tainted")) or (
+            first_personal_segment is not None and first_personal_segment <= base
+        )
+>>>>>>> refs/lane/82
     for number, run in enumerate(split_runs(messages), start=base + 1):
-        shape = segment_shape(number, run, unit=unit, previous=shape, tool_names=names)
+        seg_tainted = personal_tainted or (
+            first_personal_segment is not None and number >= first_personal_segment
+        )
+        seg_has_personal_tool = run_contains_personal_integration_tool(run)
+        shape = segment_shape(
+            number,
+            run,
+            unit=unit,
+            previous=shape,
+            tool_names=names,
+            personal_tainted=seg_tainted,
+        )
         through = extend(through, run)
         own = number - borrowed
         entry = held[own - 1] if own <= len(held) else None
         if not _reusable(entry, unit, number, shape):
-            segment = render_segment(number, run, unit=unit, tool_names=names)
+            segment = render_segment(
+                number,
+                run,
+                unit=unit,
+                tool_names=names,
+                initially_tainted=seg_tainted,
+            )
             entry = _entry(segment, unit, shape, through)
+            if seg_tainted or seg_has_personal_tool:
+                entry["personal_tainted"] = True
             rendered[entry["file"]] = segment.data
         elif entry.get("through") != through:
             # Its render reads the same in messages that differ where no
             # render looks (reasoning, say), or it predates the field.
             entry = {**entry, "through": through}
+            if seg_tainted or seg_has_personal_tool:
+                entry["personal_tainted"] = True
+        personal_tainted = seg_tainted or seg_has_personal_tool or bool(
+            entry.get("personal_tainted")
+        )
         entries.append(entry)
+<<<<<<< HEAD
     first = {"first": borrowed + 1} if borrowed else {}
     manifest = {"schema": SCHEMA_VERSION, **(header or {}), **first, "segments": entries}
+=======
+    # DALTON-HOOK(personal-integrations): redact subagent manifest description when transcript carries personal integration data
+    manifest_header = dict(header or {})
+    if (
+        (personal_tainted or first_personal_segment is not None)
+        and manifest_header.get("description")
+    ):
+        manifest_header["description"] = REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER
+    manifest = {"schema": SCHEMA_VERSION, **manifest_header, "segments": entries}
+>>>>>>> refs/lane/82
     return Directory(
         manifest=dump_manifest(manifest),
         files={entry["file"]: (entry["sha256"], entry["bytes"]) for entry in entries},

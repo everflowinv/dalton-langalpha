@@ -42,6 +42,8 @@ class ThreadRows:
     workspace_owner_id: str | None = None
     # DALTON-HOOK(chat-large-upload): permanently failed main-thread steers for replay surfacing.
     failed_steers: list[dict[str, Any]] = field(default_factory=list)
+    # DALTON-HOOK(personal-integrations): purge generation captured before reading replay inputs.
+    expected_purge_gen: int | None = None
 
 
 async def get_branch_pointer(thread_id: str) -> tuple[str, list[Any]] | None:
@@ -79,10 +81,14 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         return None
 
     async with pool.get_db_connection() as conn:
+        # DALTON-HOOK(personal-integrations): capture purge generation before reading replay inputs
+        from src.dalton.services.purge_fence import read_expected_purge_generation
+        expected_purge_gen = await read_expected_purge_generation(thread_id, conn=conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             return await _read_thread_rows(cur, thread_id)
 
 
+<<<<<<< HEAD
 async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
     """``get_replay_thread_data`` on a cursor the caller holds, so a read
     can share its transaction."""
@@ -104,6 +110,28 @@ async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
         if owner_row
         else None
     )
+=======
+            # 2. Thread summary, with its newest run. Read before the rows and
+            # checkpoints the replay shows, so a run that starts during the
+            # read is never named as one the client has seen.
+            await cur.execute(
+                """SELECT conversation_thread_id, workspace_id, current_status,
+                          thread_index, latest_checkpoint_id, created_at, updated_at,
+                          -- DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+                          metadata->'personal_first_touch_event' AS personal_first_touch_event,
+                          (SELECT r.conversation_response_id
+                           FROM conversation_responses r
+                           WHERE r.conversation_thread_id = t.conversation_thread_id
+                           ORDER BY r.run_seq DESC
+                           LIMIT 1) AS latest_run_id
+                   FROM conversation_threads t
+                   WHERE conversation_thread_id = %s""",
+                (thread_id,),
+            )
+            thread = await cur.fetchone()
+            if thread is None:
+                return None
+>>>>>>> refs/lane/82
 
     if owner_id is None:
         return None
@@ -246,6 +274,7 @@ async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
         workspace_owner_id=workspace_owner_id,
         # DALTON-HOOK(chat-large-upload): pass failed_steers for replay surfacing.
         failed_steers=failed_steers,
+        expected_purge_gen=expected_purge_gen,  # DALTON-HOOK(personal-integrations)
     )
 
 

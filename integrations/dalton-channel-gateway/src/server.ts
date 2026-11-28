@@ -325,6 +325,7 @@ export function createGatewayApp(options: {
     }
   };
 
+  const activeFeishuAppId = adapters.get("feishu")?.getActiveAppId?.();
   const leaseManager = shouldUseLease
     ? (options.leaseManager ??
       new GatewayLeaseManager({
@@ -332,6 +333,7 @@ export function createGatewayApp(options: {
         ttlSeconds: options.leaseTtlSeconds,
         heartbeatIntervalMs: options.leaseHeartbeatIntervalMs,
         acquireRetryMs: options.leaseAcquireRetryMs,
+        ...(activeFeishuAppId ? { feishuAppId: activeFeishuAppId } : {}),
         onEpochAcquired: (epoch) => {
           backend.setGatewayEpoch?.(epoch);
         },

@@ -533,6 +533,10 @@ export interface I6AuthorizeAndClaimResponse {
   topic_initiator_platform_user_id?: string | null;
   topic_canonical_scope_key?: string | null;
   dm_recipient_platform_user_id?: string | null;
+  has_personal_integration_data?: boolean;
+  personal_private_redirect_notice?: boolean;
+  forced_text?: string | null;
+  redirect_dm_address?: string | null;
   prior_run_files?: Array<{
     workspace_id?: string | null;
     path: string;
@@ -886,6 +890,7 @@ export interface RecoverAutomationRunRow {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   entries: string[];
   status: "registered" | "finishing" | "finished";
@@ -942,6 +947,7 @@ export interface I8AutomationRunFinishResponse {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   finish_status: string | null;
   final_text: string | null;
@@ -956,6 +962,7 @@ export interface I8AutomationRunFinishResponse {
 export interface GatewayLeaseAcquireRequest {
   instance_id: string;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseAcquireResponse {
@@ -969,6 +976,7 @@ export interface GatewayLeaseHeartbeatRequest {
   instance_id: string;
   epoch: number;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseHeartbeatResponse {
@@ -1177,6 +1185,7 @@ export interface ThreadMessageDispatchPayload {
   external_thread_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
   steer_only?: boolean;
   hitl_response?: Record<string, { decisions: Array<Record<string, unknown>> }>;
@@ -1193,6 +1202,7 @@ export interface ThreadRetryPayload {
   checkpoint_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
 }
 
@@ -1650,6 +1660,13 @@ export interface BackendClient {
   authorizeAutomationNotificationPlan?(req: {
     delivery_id: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
+
+  forwardFeishuRevokedEvent?(payload: Record<string, unknown>): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }>;
 
   downloadDataTaskRunArtifact?(
     runId: string,
@@ -2988,6 +3005,33 @@ export class HttpBackendClient implements BackendClient {
     if (status >= 400) {
       throw new BackendHttpError(
         `lookupBotTopic failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async forwardFeishuRevokedEvent(
+    payload: Record<string, unknown>,
+  ): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }> {
+    const { status, data } = await this.jsonRequest<{
+      status: string;
+      event_id?: string | null;
+      reason?: string | null;
+      purge_ids?: string[];
+    }>("POST", "/api/v1/dalton/integrations/internal/feishu/events", {
+      body: payload,
+      timeoutMs: 15_000,
+    });
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `forwardFeishuRevokedEvent failed (${status})`,
         status,
         data,
       );

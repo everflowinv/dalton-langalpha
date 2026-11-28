@@ -540,4 +540,119 @@ describe('toolApprovalCard Dalton notify whitelist', () => {
     });
     expect('confirm_token' in otherEntry!.decisions[0]).toBe(false);
   });
+
+  // DALTON-HOOK(personal-integrations): verify L2 second confirmation and Google MCP <request_key> elicitation serialization
+  it('serializes personal integration L2 confirmation receipt and Google MCP elicitation responses (accept/decline/cancel)', () => {
+    const l2IntId = 'int-cal-l2';
+    const l2Req = {
+      type: 'dalton_calendar_create_event',
+      name: 'dalton_calendar',
+      approval_id: 'appr-cal-1',
+      confirm_token: 'ctok-cal-1',
+      payload_sha256: 'sha256-cal-payload',
+      requires_second_confirm: true,
+      risk_level: 'L2',
+      args: { provider: 'google', summary: 'External Sync', external_attendees: ['bob@ext.com'] },
+    };
+    const l2Cards = toolApprovalCards([l2Req], l2IntId, l2IntId);
+    expect(l2Cards[0].state.confirmToken).toBe('ctok-cal-1');
+    expect(l2Cards[0].state.requiresSecondConfirm).toBe(true);
+    expect(l2Cards[0].state.payloadSha256).toBe('sha256-cal-payload');
+
+    const l2Board = createAnswerBoard({
+      pendingIds: ref(new Set([l2IntId])),
+      sessionEpoch: ref(0),
+      setMessages: () => {},
+    });
+    const l2Entry = l2Board.decideToolCall(
+      l2IntId,
+      l2IntId,
+      { index: 0, count: 1 },
+      {
+        approved: true,
+        secondConfirmAcknowledged: true,
+        confirmedPayloadSha256: 'sha256-cal-payload',
+      },
+      'appr-cal-1',
+    );
+    expect(l2Entry?.decisions[0]).toEqual({
+      type: 'approve',
+      confirm_token: 'ctok-cal-1',
+      second_confirm_acknowledged: true,
+      confirmed_payload_sha256: 'sha256-cal-payload',
+    });
+
+    // Google MCP elicitation accept, decline, and cancel keyed by <request_key>
+    const elicIntId = 'int-google-elic';
+    const elicReq = {
+      type: 'dalton_google_mcp_elicitation',
+      name: 'dalton_calendar',
+      approval_id: 'appr-elic-1',
+      confirm_token: 'ctok-elic-1',
+      input_requests: {
+        approval_choice: {
+          method: 'elicitation/create',
+          params: {
+            mode: 'form',
+            message: 'Allow creating event?',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                approval_choice: { enum: ['ALLOW_ONCE', 'DENY_ONCE'] },
+              },
+            },
+          },
+        },
+      },
+    };
+    const elicCards = toolApprovalCards([elicReq], elicIntId, elicIntId);
+    expect(elicCards[0].state.inputRequests).toEqual(elicReq.input_requests);
+
+    const acceptBoard = createAnswerBoard({
+      pendingIds: ref(new Set([elicIntId])),
+      sessionEpoch: ref(0),
+      setMessages: () => {},
+    });
+    const acceptEntry = acceptBoard.decideToolCall(
+      elicIntId,
+      elicIntId,
+      { index: 0, count: 1 },
+      {
+        approved: true,
+        elicitationResponses: {
+          approval_choice: { action: 'accept', content: { approval_choice: 'ALLOW_ONCE' } },
+        },
+      },
+      'appr-elic-1',
+    );
+    expect(acceptEntry?.decisions[0]).toEqual({
+      type: 'approve',
+      confirm_token: 'ctok-elic-1',
+      elicitation_responses: {
+        approval_choice: { action: 'accept', content: { approval_choice: 'ALLOW_ONCE' } },
+      },
+    });
+
+    for (const action of ['decline', 'cancel'] as const) {
+      const decBoard = createAnswerBoard({
+        pendingIds: ref(new Set([elicIntId])),
+        sessionEpoch: ref(0),
+        setMessages: () => {},
+      });
+      const decEntry = decBoard.decideToolCall(
+        elicIntId,
+        elicIntId,
+        { index: 0, count: 1 },
+        {
+          approved: false,
+          elicitationResponses: { approval_choice: { action } },
+        },
+        'appr-elic-1',
+      );
+      expect(decEntry?.decisions[0]).toEqual({
+        type: 'reject',
+        elicitation_responses: { approval_choice: { action } },
+      });
+    }
+  });
 });

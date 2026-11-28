@@ -367,14 +367,29 @@ async def _after_settling(
                     run_id=run_id,  # DALTON-HOOK(channel-chart-snapshot)
                 )
         else:
-            delivery_result = await WebhookClient().fire_event(
-                policy.webhook, automation, execution_id, thread_id, workspace_id,
-                error=error, run_id=run_id, failure_reason=policy.failure_reason,
+            # DALTON-HOOK(personal-integrations): never forward personal integration thread results to external webhooks
+            from src.dalton.services.personal_integration_guard import (
+                is_thread_personal_private,
             )
-            if delivery_result is None and delivery is not None and not delivery.held:
-                # The messaging service didn't take the run and the webhook
-                # has nowhere to post: each entry went undelivered, and why.
-                delivery_result = automation_delivery.unsent(delivery) or None
+
+            is_personal_private = bool(
+                thread_id and await is_thread_personal_private(str(thread_id))
+            )
+            if is_personal_private:
+                delivery_result = (
+                    automation_delivery.unsent(delivery)
+                    if delivery is not None and not delivery.held
+                    else None
+                )
+            else:
+                delivery_result = await WebhookClient().fire_event(
+                    policy.webhook, automation, execution_id, thread_id, workspace_id,
+                    error=error, run_id=run_id, failure_reason=policy.failure_reason,
+                )
+                if delivery_result is None and delivery is not None and not delivery.held:
+                    # The messaging service didn't take the run and the webhook
+                    # has nowhere to post: each entry went undelivered, and why.
+                    delivery_result = automation_delivery.unsent(delivery) or None
             if delivery_result is not None:
                 await _record_delivery(execution_id, delivery_result)
     # DALTON-HOOK(dalton-notify): push completed Dalton automation results to the analyst via the channel gateway

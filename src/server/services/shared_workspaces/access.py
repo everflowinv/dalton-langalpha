@@ -364,6 +364,9 @@ async def thread_access(
             ):
                 raise _not_found("Thread")
         return Access(caller)
+    # DALTON-HOOK(personal-integrations): block non-owner access to threads with personal integration data
+    from src.dalton.services.personal_integration_guard import enforce_personal_thread_owner_only
+    await enforce_personal_thread_owner_only(thread_id, caller, thread_owner=str(owner), meta=meta, conn=conn)
     if not is_holder(owner):
         raise _forbidden()
     try:

@@ -27,6 +27,7 @@ export interface DaltonSettingVisibilityContext {
   coverageUnitsPending?: boolean;
   discordChannelsAdmin?: boolean;
   weixinAllowExternal?: boolean;
+  hasPersonalIntegrations?: boolean;
   capabilities?: ReadonlySet<CapabilityId>;
   capabilitiesLoading?: boolean;
 }

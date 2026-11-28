@@ -800,6 +800,9 @@ async def test_caller_identity_propagates_run_origin_automation_to_bridge(
         "workspace": "ws-auto-99999",
         "thread": "th-auto-1",
         "run_origin": "automation",
+        "run_id": "",
+        "turn_origin_automation_id": "auto-uuid-1",
+        "automation_execution_id": "",
         "exp": deadline_ts,
     }
     # Must NOT be signed directly with raw admin token (must use HKDF subkey).
@@ -902,11 +905,17 @@ async def test_caller_identity_propagates_run_origin_automation_to_bridge(
     seen_routing: list[tuple[str, bool]] = []
     orig_handle = bridge.handle_tools_call
 
-    async def _spy_handle(req_id, params, *, caller_identity=None, conn_id=None):
+    async def _spy_handle(
+        req_id, params, *, caller_identity=None, conn_id=None, raw_caller_token=None
+    ):
         ckey, _, is_auto = rb._resolve_caller_routing(caller_identity, conn_id=conn_id or "")
         seen_routing.append((ckey, is_auto))
         return await orig_handle(
-            req_id, params, caller_identity=caller_identity, conn_id=conn_id
+            req_id,
+            params,
+            caller_identity=caller_identity,
+            conn_id=conn_id,
+            raw_caller_token=raw_caller_token,
         )
 
     monkeypatch.setattr(bridge, "handle_tools_call", _spy_handle)
@@ -1692,11 +1701,17 @@ async def test_malformed_caller_token_in_http_handler_degrades_without_500(
     seen_routing: list[tuple[str, bool]] = []
     orig_handle = bridge.handle_tools_call
 
-    async def _spy_handle(req_id, params, *, caller_identity=None, conn_id=None):
+    async def _spy_handle(
+        req_id, params, *, caller_identity=None, conn_id=None, raw_caller_token=None
+    ):
         ckey, _, is_auto = rb._resolve_caller_routing(caller_identity, conn_id=conn_id or "")
         seen_routing.append((ckey, is_auto))
         return await orig_handle(
-            req_id, params, caller_identity=caller_identity, conn_id=conn_id
+            req_id,
+            params,
+            caller_identity=caller_identity,
+            conn_id=conn_id,
+            raw_caller_token=raw_caller_token,
         )
 
     monkeypatch.setattr(bridge, "handle_tools_call", _spy_handle)

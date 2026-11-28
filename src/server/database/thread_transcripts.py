@@ -191,9 +191,13 @@ ON_COMPUTER = Scope(f" AND {served_on_computer_sql('t')}")
 def own_thread(thread_id: str, sender: str) -> Scope:
     """One thread, for a turn whose sender keeps it private, while they still
     reach it."""
+    # DALTON-HOOK(personal-integrations): require creator identity for personal-integration threads
     return Scope(
-        f" AND t.conversation_thread_id = %s::uuid AND {reaches_sql('t', '%s')}",
-        (thread_id, sender),
+        f" AND t.conversation_thread_id = %s::uuid"
+        f" AND ((NOT COALESCE(t.has_personal_integration_data, FALSE) AND {reaches_sql('t', '%s')})"
+        f"  OR (COALESCE(t.has_personal_integration_data, FALSE)"
+        f"      AND COALESCE(t.created_by, t.user_id, (SELECT w.user_id FROM workspaces w WHERE w.workspace_id = t.workspace_id)) = %s))",
+        (thread_id, sender, sender),
     )
 
 
@@ -416,9 +420,7 @@ def _changed_rows(
     return rows
 
 
-async def save_stored(
-    thread_id: str, prefix: str, user_id: str, transcript: StoredTranscript
-) -> bool:
+async def save_stored(thread_id: str, prefix: str, user_id: str, transcript: StoredTranscript, *, conn: Any = None) -> bool:  # DALTON-HOOK(personal-integrations)
     """Replace one agent's stored copy unless a newer render already landed.
 
     Each copy's checkpoint is its own agent's (the thread's, or the task's
@@ -435,8 +437,8 @@ async def save_stored(
     carried over no longer matches its row.
     """
     try:
-        async with get_db_connection() as conn:
-            async with conn.transaction():
+        # DALTON-HOOK(personal-integrations): reuse caller's transaction when conn is supplied
+        async with get_db_connection(conn) as conn, conn.transaction():
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """

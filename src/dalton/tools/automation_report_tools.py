@@ -123,6 +123,14 @@ def create_automation_report_tools() -> list[BaseTool]:
 
             if await is_run_outbound_blocked(config):
                 return _refuse("submit", "colleague_outbound_blocked", OUTBOUND_GUARD_REFUSAL_MESSAGE)
+        from src.dalton.services.personal_integration_guard import is_thread_personal_private
+
+        if await is_thread_personal_private(identity["thread_id"]):
+            return _refuse(
+                "submit",
+                "personal_integration_private_only",
+                "该对话包含个人日历私密数据，不支持通过自动报告对外投递。",
+            )
         if not isinstance(material, str):
             return _refuse(
                 "submit",

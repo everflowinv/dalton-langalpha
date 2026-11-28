@@ -85,6 +85,8 @@ _CARDS: dict[str, frozenset[str] | None] = {
             "reset_tier_policy",
         }
     ),
+    # DALTON-HOOK(personal-integrations): dalton_calendar pauses on hitl_confirm for writes and Google MCP elicitation
+    "dalton_calendar": None,
 }
 
 

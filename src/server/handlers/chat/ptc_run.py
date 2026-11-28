@@ -1360,6 +1360,7 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
+<<<<<<< HEAD
         # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payloads read during HITL validation (fallback to checkpointer only when absent)
         approved_dispatch_payloads: dict[str, Any] | None = None
         if request.hitl_response:
@@ -1379,6 +1380,16 @@ async def astream_ptc_workflow(
                     checkpoint_id=request.checkpoint_id or base_checkpoint_id,
                     hitl_response=request.hitl_response,
                 )
+=======
+        # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag for LangSmith suppression on historical private threads
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        thread_is_personal_private = await is_thread_personal_private(
+            thread_id, meta=prior_thread
+        )
+>>>>>>> refs/lane/82
 
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
@@ -1387,6 +1398,11 @@ async def astream_ptc_workflow(
             "workspace_owner_id": workspace_owner_id,
             "origin_channel": origin_channel,
             **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
+            **(
+                {"has_personal_integration_data": True}
+                if thread_is_personal_private
+                else {}
+            ),
             # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag
@@ -1426,6 +1442,7 @@ async def astream_ptc_workflow(
             extra_configurable=extra_configurable,
             base_checkpoint_id=base_checkpoint_id,
             from_server=from_server,
+            unwatched=turn_context.unwatched,  # DALTON-HOOK(personal-integrations)
         )
         # Propagate run_id to LangGraph via the top-level config key; it
         # lands on ExecutionInfo.run_id and CheckpointMetadata.run_id so

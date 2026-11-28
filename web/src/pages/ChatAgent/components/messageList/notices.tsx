@@ -1,4 +1,5 @@
 import type React from 'react';
+import { NoticeLine } from '@/components/ui/error-banner';
 import type { NotificationSegment, SegmentNotice } from '@/types/chat';
 import { CliWaitNotice } from '../CliQueueNotice';
 import { NotificationDivider } from './NotificationDivider';
@@ -36,6 +37,15 @@ export const NOTICES: { readonly [K in NoticeKind]: NoticeSpec<K> } = {
   },
   planBilled: { retain: true, render: (notice) => <PlanBilledNotice billed={notice} /> },
   cliWait: { retain: true, render: (notice) => <CliWaitNotice wait={notice} /> },
+  // DALTON-HOOK(personal-integrations): keep first-touch privacy notice visible even when turn working is folded
+  personalIntegrationNotice: {
+    retain: true,
+    render: (notice) => (
+      <div data-testid="personal-integration-first-touch-notice">
+        <NoticeLine message={notice.message} className="py-1.5" />
+      </div>
+    ),
+  },
 };
 
 /** Whether a collapsed turn keeps this notification. */

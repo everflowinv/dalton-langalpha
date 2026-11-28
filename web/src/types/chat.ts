@@ -134,7 +134,9 @@ export type SegmentNotice =
   | ({ kind: 'planBilled' } & PlanBilled)
   /** A Claude Code turn that waited for one of its computer's CLIs: a notice
    *  line where in the reply the wait happened. */
-  | ({ kind: 'cliWait' } & CliWait);
+  | ({ kind: 'cliWait' } & CliWait)
+  // DALTON-HOOK(personal-integrations): persisted first-touch privacy notice on the turn that accessed personal calendar/mail
+  | { kind: 'personalIntegrationNotice'; service?: string; provider?: string; message: string };
 
 export interface NotificationSegment {
   type: 'notification';
@@ -413,6 +415,14 @@ export interface ToolApprovalState {
   reason?: string | null;
   // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
   confirmToken?: string;
+  // DALTON-HOOK(personal-integrations): personal integration L1/L2 & Google MCP elicitation metadata.
+  actionType?: string;
+  approvalId?: string;
+  payloadSha256?: string;
+  requiresSecondConfirm?: boolean;
+  riskLevel?: string;
+  inputRequests?: Record<string, unknown>;
+  webApprovalUrl?: string;
 }
 
 export interface UserQuestionState {

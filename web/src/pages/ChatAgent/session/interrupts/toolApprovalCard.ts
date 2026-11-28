@@ -17,10 +17,24 @@ export const DALTON_NOTIFY_APPROVAL_TYPES = new Set([
   'dalton_report_delivery_set',
 ]);
 
+// DALTON-HOOK(personal-integrations): personal calendar/mail writes & Google MCP form elicitation cards.
+export const DALTON_INTEGRATION_APPROVAL_TYPES = new Set([
+  'dalton_google_mcp_elicitation',
+  'dalton_calendar_create_event',
+  'dalton_calendar_update_event',
+  'dalton_calendar_delete_event',
+  'dalton_mail_create_draft',
+  'dalton_mail_send',
+]);
+
 const daltonConfirmTokens = new Map<string, string>();
 
 export function isDaltonNotifyApprovalRequest(request: ActionRequest | undefined): boolean {
   return !!request?.type && DALTON_NOTIFY_APPROVAL_TYPES.has(request.type);
+}
+
+export function isDaltonIntegrationApprovalRequest(request: ActionRequest | undefined): boolean {
+  return !!request?.type && DALTON_INTEGRATION_APPROVAL_TYPES.has(request.type);
 }
 
 export function getDaltonConfirmToken(
@@ -48,6 +62,7 @@ export function isToolApprovalRequest(request: ActionRequest | undefined): boole
   return (
     isDirectToolName(request.name)
     || isDaltonNotifyApprovalRequest(request)
+    || isDaltonIntegrationApprovalRequest(request) // DALTON-HOOK(personal-integrations)
     || !!request.attempt_id
     || !!request.order
   );
@@ -70,10 +85,14 @@ export function buildToolApprovalState(
   actionCount: number,
 ): ToolApprovalState {
   // DALTON-HOOK(notify-routes): use request.name for title, fallback to request.type, and keep confirm_token for Dalton notify cards.
+  // DALTON-HOOK(personal-integrations): also carry confirm_token and personal-integration L1/L2/elicitation metadata.
   const name = request.name || request.type || '';
   const parsed = parseDirectToolName(name) || { server: '', tool: name };
+  const isDaltonIntegration = isDaltonIntegrationApprovalRequest(request);
   const confirmToken =
-    isDaltonNotifyApprovalRequest(request) && typeof request.confirm_token === 'string' && request.confirm_token
+    (isDaltonNotifyApprovalRequest(request) || isDaltonIntegration)
+    && typeof request.confirm_token === 'string'
+    && request.confirm_token
       ? request.confirm_token
       : undefined;
   if (interruptId) {
@@ -104,6 +123,18 @@ export function buildToolApprovalState(
     status: 'pending',
     reason: null,
     ...(confirmToken ? { confirmToken } : {}), // DALTON-HOOK(notify-routes)
+    // DALTON-HOOK(personal-integrations): attach L1/L2/elicitation metadata onto ToolApprovalState
+    ...(isDaltonIntegration
+      ? {
+          actionType: request.type,
+          approvalId: request.approval_id,
+          payloadSha256: request.payload_sha256,
+          requiresSecondConfirm: request.requires_second_confirm,
+          riskLevel: request.risk_level,
+          inputRequests: request.input_requests,
+          webApprovalUrl: request.web_approval_url,
+        }
+      : {}),
   };
 }
 
@@ -136,8 +167,12 @@ export function toolApprovalCards(
 ): Array<{ proposalId: string; target: DecisionTarget; state: ToolApprovalState }> {
   const base = interruptId || fallbackId;
   // DALTON-HOOK(notify-routes): key Dalton notify requests so paused history replay arms the answer board.
+  // DALTON-HOOK(personal-integrations): key personal-integration requests by approval_id or type too.
   return actionRequests.map((request, index) => {
-    const attemptId = request.attempt_id || (isDaltonNotifyApprovalRequest(request) ? request.type : undefined);
+    const attemptId =
+      request.attempt_id
+      || (isDaltonNotifyApprovalRequest(request) ? request.type : undefined)
+      || (isDaltonIntegrationApprovalRequest(request) ? (request.approval_id || request.type) : undefined);
     const proposalId = actionRequests.length > 1 ? `${base}#${index}` : base;
     const state = buildToolApprovalState(request, interruptId, index, actionRequests.length);
     if (state.confirmToken) {

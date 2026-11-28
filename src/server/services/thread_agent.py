@@ -230,7 +230,8 @@ class AgentInputs:
                     identity.sender,
                     tuple(files.thread_id for files in borrowed),
                 )
-                if identity.shared and thread_id
+                # DALTON-HOOK(personal-integrations): also allow creator-verified ThreadHistory for personal-integration threads excluded from shared mount
+                if thread_id and (identity.shared or identity.sender)
                 else None
             ),
             transcript_borrowed=borrowed,

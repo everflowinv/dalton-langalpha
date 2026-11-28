@@ -53,7 +53,11 @@ def key_specs() -> tuple[KeySpec, ...]:
         KeySpec(name=key, group="sandbox", provider=kind)
         for kind, key in SANDBOX_KEYS.items()
     )
-    return (KeySpec(name=FMP_KEY, group="data", provider="fmp"), *web, *sandbox)
+    base = (KeySpec(name=FMP_KEY, group="data", provider="fmp"), *web, *sandbox)
+    # DALTON-HOOK(deployment-credentials): merge Dalton deployment credential KeySpecs before first snapshot
+    from src.dalton.deployment_credentials.catalog import merge_dalton_key_specs
+
+    return merge_dalton_key_specs(base)
 
 
 def key_names() -> frozenset[str]:

@@ -4467,7 +4467,11 @@ def test_dalton_migration_graph_has_a_single_head() -> None:
         revisions[mod.revision] = mod.down_revision
     parents = {down for down in revisions.values() if down}
     heads = sorted(rev for rev in revisions if rev not in parents)
+<<<<<<< HEAD
     assert heads == ["d061"], heads
+=======
+    assert heads == ["d06X"], heads
+>>>>>>> refs/lane/82
 
 
 @pytest.mark.asyncio

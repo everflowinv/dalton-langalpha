@@ -73,7 +73,10 @@ class McpSecretsMixin:
         if not user_id:
             return None, {}, ""
         secrets, fingerprint = await get_user_vault_snapshot(user_id)
-        return user_id, secrets, fingerprint
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys from sandbox vault sync
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+        return user_id, strip_sandbox_excluded_vault_secrets(secrets) or {}, fingerprint
 
     async def _settle_vault(
         self,
@@ -98,13 +101,18 @@ class McpSecretsMixin:
             get_user_vault_fingerprint,
             get_user_vault_snapshot,
         )
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys during vault settle
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
 
+        secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
         if not published:
             await publish_vault_secrets(sandbox, secrets)
         for _ in range(_VAULT_SETTLE_ATTEMPTS):
             if await get_user_vault_fingerprint(user_id) == fingerprint:
                 return secrets
             secrets, fingerprint = await get_user_vault_snapshot(user_id)
+            # DALTON-HOOK(deployment-credentials): strip dedicated Feishu keys on settle re-read
+            secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
             await publish_vault_secrets(sandbox, secrets)
         logger.warning(
             f"[vault] still changing after {_VAULT_SETTLE_ATTEMPTS} republishes; "
@@ -197,6 +205,10 @@ class McpSecretsMixin:
         from src.server.database.user_vault_secrets import get_user_vault_snapshot
 
         secrets, fingerprint = await get_user_vault_snapshot(user_id)
+        # DALTON-HOOK(deployment-credentials): exclude dedicated Feishu keys from sandbox vault push
+        from src.dalton.deployment_credentials.sandbox_scrub import strip_sandbox_excluded_vault_secrets
+
+        secrets = strip_sandbox_excluded_vault_secrets(secrets) or {}
         reached = 0
         for computer_id, sandbox in sandboxes.items():
             try:

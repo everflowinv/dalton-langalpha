@@ -402,7 +402,7 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
 
 ## 6. 备份、恢复与平滑升级
 
-> **适用范围（外部数据库说明）**：`backup.sh`、`restore.sh` 与 `upgrade.sh` 仅管理 Compose 编排的 `postgres` 容器（`.env` 中 `DB_HOST=postgres`）。如果部署接入了外部 PostgreSQL 实例，请直接使用 `pg_dump` / `pg_restore` 自行备份与恢复数据库。
+> **适用范围（外部数据库说明）**：`backup.sh`、`restore.sh` 与 `upgrade.sh` 仅管理 Compose 编排的 `postgres` 容器（`.env` 中 `DB_HOST=postgres`）。如果部署接入了外部 PostgreSQL 实例，请直接使用 `pg_dump` / `pg_restore` 自行备份与恢复数据库；自行 `pg_restore` 并完成数据库迁移后、启动 `backend` 前，请使用 `psql -v ON_ERROR_STOP=1 -f scripts/dalton/sql/personal_integrations_restore_reset.sql` 执行同一份前置清空 SQL，清空恢复库中的个人集成令牌与临时授权状态并将既有连接置为待重新授权。
 
 ### 6.1 正式备份（在线执行）
 

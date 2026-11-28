@@ -213,6 +213,13 @@ async def start_run(
     }
     if thread_id:
         body["thread_id"] = str(thread_id)
+        # DALTON-HOOK(personal-integrations): inform gateway when thread carries personal integration data so group targets redirect to verified 1:1 DM
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        if await is_thread_personal_private(str(thread_id)):
+            body["has_personal_integration_data"] = True
     answer = await _ask_start(automation["user_id"], body)
     if _asks_again(answer):
         logger.warning(
@@ -599,6 +606,13 @@ async def finish_run(
     body: Dict[str, Any] = {"status": status}
     if thread_id:
         body["thread_id"] = str(thread_id)
+        # DALTON-HOOK(personal-integrations): inform gateway when thread carries personal integration data so group targets redirect to verified 1:1 DM
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        if await is_thread_personal_private(str(thread_id)):
+            body["has_personal_integration_data"] = True
     # DALTON-HOOK(channel-chart-snapshot): include run_id in automation finish request body
     if run_id:
         body["run_id"] = str(run_id)

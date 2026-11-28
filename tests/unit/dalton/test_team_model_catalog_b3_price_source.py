@@ -994,7 +994,11 @@ def test_d054_single_alembic_head_and_upgrade_downgrade_sql() -> None:
     cfg.set_main_option("script_location", str(REPO_ROOT / "src/dalton/migrations"))
     script_dir = ScriptDirectory.from_config(cfg)
     heads = script_dir.get_heads()
+<<<<<<< HEAD
     assert heads == ["d061"]
+=======
+    assert heads == ["d06X"]
+>>>>>>> refs/lane/82
 
     mod = importlib.import_module("src.dalton.migrations.versions.d055_drop_model_price_alerts")
     assert mod.revision == "d055"

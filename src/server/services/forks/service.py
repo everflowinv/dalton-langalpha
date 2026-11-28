@@ -108,6 +108,9 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
     await thread_access(req.source_thread_id, req.user_id, meta=source)
     # DALTON-HOOK(colleague-dispatch): reject fork before copying when caller lost write access to a colleague's workspace
     await check_colleague_workspace_write(source, req.user_id)
+    # DALTON-HOOK(personal-integrations): capture purge generation before reading any fork inputs
+    from src.dalton.services.purge_fence import assert_fork_source_not_purging_tx, read_expected_purge_generation
+    expected_purge_gen = await read_expected_purge_generation(req.source_thread_id)
     snapshot = await take_snapshot(req.source_thread_id, req.cut, req.kind)
     subagents_allowed = await threads_read.read_thread_subagents_allowed(req.source_thread_id)
 
@@ -134,6 +137,8 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                 # Again under the lock, which holds off a delete or compaction
                 # from here on: one may have landed since the plan was read.
                 await thread_fork.check_source(conn, **_source_check(snapshot))
+                # DALTON-HOOK(personal-integrations): reject fork while personal data purge is active or generation moved
+                await assert_fork_source_not_purging_tx(conn, req.source_thread_id, cut_turn_index=req.cut.turn_index, expected_purge_gen=expected_purge_gen)
                 async with _checkpoint_connection(conn) as cp:
                     await _write_checkpoints(cp, req.source_thread_id, thread_id, cut, plan)
                 await _write_thread(conn, req, lineage, plan, source, subagents_allowed, thread_id)
@@ -350,6 +355,9 @@ async def _write_thread(
     await thread_fork.finish_thread(
         conn, thread_id, checkpoint_id=lineage.checkpoint_id, llm_model=source.get("llm_model")
     )
+    # DALTON-HOOK(personal-integrations): inherit private flag, clipped purged ranges, and remapped touches on fork
+    from src.dalton.services.purge_fence import copy_personal_integration_state_for_fork_tx
+    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=snapshot.turn_indexes, run_map=plan.run_map)
 
 
 async def _drop_unclaimed(thread_id: str) -> None:

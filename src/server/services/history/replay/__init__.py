@@ -191,7 +191,8 @@ async def build_replay_page(
         raise CheckpointReplayUnavailable("no checkpoint turns found")
     inputs, anchored, tip_id = branch
     # DALTON-HOOK(team-sharing): forward persist flag to cold.Policy
-    policy = cold.Policy(turn_fallback=turn_fallback, persist=persist)
+    # DALTON-HOOK(personal-integrations): forward expected_purge_gen captured before replay reads
+    policy = cold.Policy(turn_fallback=turn_fallback, persist=persist, expected_purge_gen=rows.expected_purge_gen if persist else None)
 
     lost: list[Any] = []
 
@@ -454,7 +455,8 @@ async def project_turns(
         inputs,
         anchored,
         selected,
-        cold.Policy(claims_pass=claims_pass),
+        # DALTON-HOOK(personal-integrations): forward expected_purge_gen captured before replay reads
+        cold.Policy(claims_pass=claims_pass, expected_purge_gen=rows.expected_purge_gen),
     )
 
 

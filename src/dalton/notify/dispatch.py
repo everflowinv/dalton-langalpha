@@ -2452,6 +2452,127 @@ def _split_target_channel(raw_target: str) -> tuple[str, str]:
     return ("unknown", cleaned)
 
 
+def _is_personal_dm_notify_target(raw_target: str) -> bool:
+    """True when ``raw_target`` is a personal DM target (``feishu:user:``, ``discord:user:``, ``weixin:user:``)."""
+    from src.dalton.llm.model_prefs import is_valid_dalton_personal_target
+
+    cleaned = (raw_target or "").strip()
+    if not cleaned:
+        return False
+    if is_valid_dalton_personal_target(cleaned):
+        return True
+    lowered = cleaned.lower()
+    return (
+        lowered.startswith("feishu:user:")
+        or lowered.startswith("discord:user:")
+        or lowered.startswith("weixin:user:")
+        or lowered.endswith(":@me")
+    )
+
+
+def _is_group_notify_target(raw_target: str) -> bool:
+    """True when ``raw_target`` is a group/channel target (``feishu:chat:``, ``discord:channel:``)."""
+    from src.dalton.llm.model_prefs import (
+        is_dalton_chat_target,
+        is_dalton_discord_channel_target,
+    )
+
+    cleaned = (raw_target or "").strip()
+    if not cleaned or _is_personal_dm_notify_target(cleaned):
+        return False
+    if is_dalton_chat_target(cleaned) or is_dalton_discord_channel_target(cleaned):
+        return True
+    lowered = cleaned.lower()
+    if lowered.startswith("feishu:chat:") or lowered.startswith("discord:channel:"):
+        return True
+    return ":" in cleaned
+
+
+def _build_feishu_personal_redirect_notice_card(notice_text: str) -> dict[str, Any]:
+    """Build a minimal Feishu Card 2.0 notice without any private body or thread link."""
+    return {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": "个人日程相关结果已转至私聊",
+            },
+            "template": "blue",
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": notice_text,
+                }
+            ],
+        },
+    }
+
+
+async def _evaluate_personal_private_delivery_target(
+    *,
+    row: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    target: str,
+) -> tuple[bool, str | None, bool, bool]:
+    """Enforce personal-private redirect & current DM binding verification for a delivery row.
+
+    Returns ``(allowed, skip_reason, allow_personal_dm_redirect, is_group_notice)``.
+    Shared between initial settlement and retry so both apply the exact same
+    redirect-to-owner-DM rule and verify the thread creator's current channel
+    binding before every send attempt.
+    """
+    from src.dalton.services.personal_integration_guard import (
+        get_thread_creator_user_id,
+        is_thread_personal_private,
+        verify_personal_dm_target_bound,
+    )
+
+    row_thread_id = (
+        str(
+            payload.get("thread_id")
+            or payload.get("conversation_thread_id")
+            or row.get("conversation_thread_id")
+            or row.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
+    is_group_notice = bool(payload.get("personal_private_group_notice"))
+    is_dm_redirect = bool(payload.get("personal_private_dm_redirect"))
+    thread_is_personal_private = bool(
+        row_thread_id and await is_thread_personal_private(row_thread_id)
+    )
+    if not (thread_is_personal_private or is_group_notice or is_dm_redirect):
+        return (True, None, False, False)
+
+    _, cleaned_tgt = _split_target_channel(target)
+    if is_group_notice:
+        if not _is_group_notify_target(cleaned_tgt):
+            return (False, "invalid_notice_target", False, True)
+        return (True, None, False, True)
+
+    if not _is_personal_dm_notify_target(cleaned_tgt):
+        return (False, "personal_integration_private_only", False, False)
+
+    thread_creator_id = (
+        await get_thread_creator_user_id(row_thread_id) if row_thread_id else None
+    )
+    if not thread_creator_id or not await verify_personal_dm_target_bound(
+        thread_creator_id, cleaned_tgt
+    ):
+        return (False, "personal_dm_recipient_unverified", False, False)
+
+    return (True, None, True, False)
+
+
 def _verdict_payoff_assessment(
     verdict_row: Mapping[str, Any] | None,
 ) -> Mapping[str, Any] | None:
@@ -2628,6 +2749,7 @@ async def evaluate_user_notify_eligibility(
     *,
     target: str | None = None,
     include_chat_targets: bool | None = None,
+    allow_personal_dm_redirect: bool = False,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -2747,6 +2869,12 @@ async def evaluate_user_notify_eligibility(
     if target is not None:
         cleaned_target = _split_target_channel(target)[1]
         if cleaned_target not in effective_targets:
+            if (
+                allow_personal_dm_redirect
+                and _is_personal_dm_notify_target(cleaned_target)
+                and any(_is_group_notify_target(t) for t in effective_targets)
+            ):
+                return (True, None, effective_targets)
             return (False, "target_removed", effective_targets)
 
     return (True, None, effective_targets)
@@ -5140,11 +5268,44 @@ async def retry_failed_notify_deliveries(
                     )
                     continue
 
+                (
+                    personal_ok,
+                    personal_skip_reason,
+                    allow_personal_dm_redirect,
+                    is_personal_group_notice_row,
+                ) = await _evaluate_personal_private_delivery_target(
+                    row=row,
+                    payload=payload,
+                    target=tgt,
+                )
+                if not personal_ok:
+                    skipped_updated = await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="skipped",
+                        reason=personal_skip_reason or "personal_integration_private_only",
+                        error_code=personal_skip_reason or "personal_integration_private_only",
+                        expected_status=skip_expected_status,
+                        expected_attempt_count=attempt_count,
+                        expected_updated_at=row_updated_at,
+                        exclude_uncertain_data_task=True,
+                    )
+                    if skipped_updated:
+                        logger.info(
+                            "[DALTON_NOTIFY] Skipped retry delivery for execution_id=%s (reason=%s)",
+                            exec_id,
+                            personal_skip_reason or "personal_integration_private_only",
+                        )
+                    continue
+
                 allowed, skip_reason, _ = await evaluate_user_notify_eligibility(
                     user_id,
                     automation_info,
                     target=tgt,
                     include_chat_targets=gate_include_chats,
+                    allow_personal_dm_redirect=allow_personal_dm_redirect,
                     resolve_enabled_fn=resolve_enabled_fn,
                     resolve_overrides_fn=resolve_overrides_fn,
                     resolve_targets_fn=resolve_targets_fn,
@@ -5384,12 +5545,26 @@ async def retry_failed_notify_deliveries(
                     )
                     break
 
-                text = str(payload.get("text") or "")
-                card = (
-                    payload.get("card")
-                    if isinstance(payload.get("card"), dict)
-                    else None
-                )
+                if is_personal_group_notice_row:
+                    from src.dalton.services.personal_integration_guard import (
+                        PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                    )
+
+                    text = PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                    card = (
+                        _build_feishu_personal_redirect_notice_card(
+                            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                        )
+                        if ch == "feishu"
+                        else None
+                    )
+                else:
+                    text = str(payload.get("text") or "")
+                    card = (
+                        payload.get("card")
+                        if isinstance(payload.get("card"), dict)
+                        else None
+                    )
                 wait_for_timeout_s = (
                     request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
@@ -6633,6 +6808,105 @@ async def on_automation_settled(
         if not targets:
             return False
 
+        from src.dalton.services.personal_integration_guard import (
+            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+            get_thread_creator_user_id,
+            is_thread_personal_private,
+            list_bound_personal_dm_targets,
+            verify_personal_dm_target_bound,
+        )
+
+        is_personal_private_thread = bool(
+            thread_id and await is_thread_personal_private(str(thread_id))
+        )
+        thread_creator_id: str | None = None
+        dm_targets: list[str] = []
+        group_redirect_targets: list[str] = []
+        if is_personal_private_thread:
+            thread_creator_id = await get_thread_creator_user_id(str(thread_id))
+            if not thread_creator_id:
+                logger.info(
+                    "[DALTON_NOTIFY] Skipping private completion notify for execution_id=%s: unable to verify thread creator",
+                    execution_id,
+                )
+                return False
+            seen_dm: set[str] = set()
+            seen_group: set[str] = set()
+            dm_channels_present: set[str] = set()
+            for tgt in targets:
+                ch, cleaned_tgt = _split_target_channel(tgt)
+                if _is_personal_dm_notify_target(cleaned_tgt):
+                    if (
+                        cleaned_tgt not in seen_dm
+                        and await verify_personal_dm_target_bound(
+                            thread_creator_id, cleaned_tgt
+                        )
+                    ):
+                        dm_targets.append(cleaned_tgt)
+                        seen_dm.add(cleaned_tgt)
+                        dm_channels_present.add(ch)
+                elif _is_group_notify_target(cleaned_tgt):
+                    if cleaned_tgt not in seen_group:
+                        group_redirect_targets.append(cleaned_tgt)
+                        seen_group.add(cleaned_tgt)
+
+            if group_redirect_targets:
+                missing_group_channels = {
+                    _split_target_channel(gt)[0]
+                    for gt in group_redirect_targets
+                    if _split_target_channel(gt)[0] not in dm_channels_present
+                }
+                if missing_group_channels or not dm_targets:
+                    try:
+                        personal_candidates = await resolve_targets_fn(thread_creator_id)
+                    except Exception:
+                        personal_candidates = []
+                    try:
+                        bound_candidates = await list_bound_personal_dm_targets(
+                            thread_creator_id
+                        )
+                    except Exception:
+                        bound_candidates = []
+                    enabled_personal_dms: list[tuple[str, str]] = []
+                    seen_cand: set[str] = set()
+                    for cand in personal_candidates or []:
+                        cand_ch, cleaned_cand = _split_target_channel(cand)
+                        if (
+                            cleaned_cand not in seen_cand
+                            and _is_personal_dm_notify_target(cleaned_cand)
+                            and is_channel_target_enabled(cleaned_cand)
+                            and await verify_personal_dm_target_bound(
+                                thread_creator_id, cleaned_cand
+                            )
+                        ):
+                            seen_cand.add(cleaned_cand)
+                            enabled_personal_dms.append((cand_ch, cleaned_cand))
+                    for cand in bound_candidates or []:
+                        cand_ch, cleaned_cand = _split_target_channel(cand)
+                        if (
+                            cleaned_cand not in seen_cand
+                            and _is_personal_dm_notify_target(cleaned_cand)
+                            and is_channel_target_enabled(cleaned_cand)
+                        ):
+                            seen_cand.add(cleaned_cand)
+                            enabled_personal_dms.append((cand_ch, cleaned_cand))
+                    # First match the same platform as the group target(s).
+                    for cand_ch, cleaned_cand in enabled_personal_dms:
+                        if cand_ch in missing_group_channels and cleaned_cand not in seen_dm:
+                            dm_targets.append(cleaned_cand)
+                            seen_dm.add(cleaned_cand)
+                            dm_channels_present.add(cand_ch)
+                    # If still no DM target at all, fall back to any enabled verified DM target of the thread creator.
+                    if not dm_targets:
+                        for cand_ch, cleaned_cand in enabled_personal_dms:
+                            if cleaned_cand not in seen_dm:
+                                dm_targets.append(cleaned_cand)
+                                seen_dm.add(cleaned_cand)
+                                dm_channels_present.add(cand_ch)
+
+            if not dm_targets:
+                return False
+
         if classification is None:
             auto_name = str(automation.get("name") or "").strip() or "定时任务"
             classification = NotifyClassification(
@@ -6729,170 +7003,263 @@ async def on_automation_settled(
             str(automation.get("automation_id") or "").strip() or None
         )
 
-        claimed_targets: list[tuple[str, str, str | None, bool]] = []
-        if claim_execution_fn is not None:
-            if await claim_execution_fn(execution_id):
-                for tgt in targets:
+        feishu_redirect_card = (
+            _build_feishu_personal_redirect_notice_card(
+                PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+            )
+            if is_personal_private_thread and group_redirect_targets
+            else None
+        )
+        execution_claimed = False
+
+        async def _claim_and_dispatch(
+            target_batch: Sequence[str],
+            *,
+            is_group_notice: bool,
+        ) -> tuple[bool, set[str], bool]:
+            nonlocal execution_claimed
+            claimed_targets: list[tuple[str, str, str | None, bool]] = []
+            if claim_execution_fn is not None:
+                if not execution_claimed:
+                    if not await claim_execution_fn(execution_id):
+                        return False, set(), False
+                    execution_claimed = True
+                for tgt in target_batch:
                     ch, cleaned_tgt = _split_target_channel(tgt)
                     claimed_targets.append((ch, cleaned_tgt, None, False))
-        else:
-            for tgt in targets:
-                ch, cleaned_tgt = _split_target_channel(tgt)
-                target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway
-                target_payload = {
-                    **base_payload_record,
-                    "transport": "gateway" if target_via_gateway else "bridge",
-                }
-                if target_via_gateway:
-                    claim_res = await claim_target_delivery_with_attempt(
-                        execution_id,
-                        ch,
-                        cleaned_tgt,
-                        user_id=user_id,
-                        automation_id=automation_id_str,
-                        payload=target_payload,
-                    )
-                    if not claim_res[0]:
-                        continue
-                    if not claim_res.delivery_id:
-                        await _invoke_mark_delivery(
-                            mark_target_fn,
+            else:
+                for tgt in target_batch:
+                    ch, cleaned_tgt = _split_target_channel(tgt)
+                    target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway
+                    if is_group_notice:
+                        target_payload = {
+                            **base_payload_record,
+                            "text": PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                            "card": feishu_redirect_card if ch == "feishu" else None,
+                            "personal_private_group_notice": True,
+                            "transport": "gateway" if target_via_gateway else "bridge",
+                        }
+                    else:
+                        target_payload = {
+                            **base_payload_record,
+                            **(
+                                {"personal_private_dm_redirect": True}
+                                if is_personal_private_thread
+                                else {}
+                            ),
+                            "transport": "gateway" if target_via_gateway else "bridge",
+                        }
+                    if target_via_gateway:
+                        claim_res = await claim_target_delivery_with_attempt(
                             execution_id,
                             ch,
                             cleaned_tgt,
-                            status="failed",
-                            error_code="missing_delivery_id",
-                            expected_status="pending",
+                            user_id=user_id,
+                            automation_id=automation_id_str,
+                            payload=target_payload,
                         )
-                        continue
-                    claimed_targets.append((ch, cleaned_tgt, claim_res.delivery_id, True))
-                    pending_targets.append((ch, cleaned_tgt))
-                else:
-                    if await claim_target_fn(
-                        execution_id,
-                        ch,
-                        cleaned_tgt,
-                        user_id=user_id,
-                        automation_id=automation_id_str,
-                        payload=target_payload,
-                    ):
-                        claimed_targets.append((ch, cleaned_tgt, None, False))
-                        pending_targets.append((ch, cleaned_tgt))
-
-        if not claimed_targets:
-            logger.info(
-                "[DALTON_NOTIFY] Skipping duplicate notify for execution_id=%s",
-                execution_id,
-            )
-            return False
-
-        any_sent = False
-        for ch, cleaned_tgt, delivery_id, target_via_gateway in claimed_targets:
-            try:
-                if target_via_gateway:
-                    bridge_res = await post_automation_gateway_notify(
-                        str(delivery_id),
-                        target=cleaned_tgt,
-                    )
-                else:
-                    bridge_res = await _invoke_post_notify(
-                        post_notify_fn,
-                        [cleaned_tgt],
-                        message_text,
-                        card_dict,
-                    )
-            except asyncio.CancelledError:
-                if target_via_gateway:
-                    await _shielded_mark_uncertain(
-                        mark_target_fn,
-                        execution_id,
-                        ch,
-                        cleaned_tgt,
-                        error_code="delivery_uncertain",
-                        expected_status="pending",
-                    )
-                    if (ch, cleaned_tgt) in pending_targets:
-                        pending_targets.remove((ch, cleaned_tgt))
-                raise
-            except Exception as post_exc:
-                status_code = getattr(
-                    getattr(post_exc, "response", None), "status_code", None
-                )
-                err_code = (
-                    f"http_{status_code}"
-                    if status_code
-                    else type(post_exc).__name__
-                )
-                if claim_execution_fn is None:
-                    try:
-                        await _invoke_mark_delivery(
-                            mark_target_fn,
-                            execution_id,
-                            ch,
-                            cleaned_tgt,
-                            status="failed",
-                            error_code=err_code,
-                            expected_status="pending",
-                        )
-                    except asyncio.CancelledError:
-                        for rem_ch, rem_tgt in list(pending_targets):
-                            await _shielded_mark_failed(
+                        if not claim_res[0]:
+                            continue
+                        if not claim_res.delivery_id:
+                            await _invoke_mark_delivery(
                                 mark_target_fn,
                                 execution_id,
-                                rem_ch,
-                                rem_tgt,
-                                error_code=err_code,
+                                ch,
+                                cleaned_tgt,
+                                status="failed",
+                                error_code="missing_delivery_id",
                                 expected_status="pending",
                             )
-                        pending_targets.clear()
-                        raise
-                    except Exception:
-                        pass
-                    if (ch, cleaned_tgt) in pending_targets:
-                        pending_targets.remove((ch, cleaned_tgt))
-                logger.error(
-                    "[DALTON_NOTIFY] Notification dispatch failed for execution_id=%s: error_type=%s status_code=%s",
-                    execution_id,
-                    type(post_exc).__name__,
-                    status_code,
-                )
-                continue
+                            continue
+                        claimed_targets.append((ch, cleaned_tgt, claim_res.delivery_id, True))
+                        pending_targets.append((ch, cleaned_tgt))
+                    else:
+                        if await claim_target_fn(
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            user_id=user_id,
+                            automation_id=automation_id_str,
+                            payload=target_payload,
+                        ):
+                            claimed_targets.append((ch, cleaned_tgt, None, False))
+                            pending_targets.append((ch, cleaned_tgt))
 
-            if target_via_gateway:
-                skip_code = _notify_result_skip_code(cleaned_tgt, bridge_res)
-                if skip_code is not None:
-                    try:
+            if not claimed_targets:
+                return False, set(), False
+
+            batch_any_sent = False
+            sent_channels: set[str] = set()
+            for ch, cleaned_tgt, delivery_id, target_via_gateway in claimed_targets:
+                if (
+                    is_personal_private_thread
+                    and not is_group_notice
+                    and (
+                        not thread_creator_id
+                        or not await verify_personal_dm_target_bound(
+                            thread_creator_id, cleaned_tgt
+                        )
+                    )
+                ):
+                    if claim_execution_fn is None:
                         await _invoke_mark_delivery(
                             mark_target_fn,
                             execution_id,
                             ch,
                             cleaned_tgt,
                             status="skipped",
-                            reason=skip_code,
-                            error_code=skip_code,
+                            reason="personal_dm_recipient_unverified",
+                            error_code="personal_dm_recipient_unverified",
                             expected_status="pending",
                         )
-                    except Exception as mark_exc:
-                        logger.warning(
-                            "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
-                            execution_id,
-                            type(mark_exc).__name__,
-                        )
-                    if (ch, cleaned_tgt) in pending_targets:
-                        pending_targets.remove((ch, cleaned_tgt))
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
                     continue
-                uncertain_code = extract_target_uncertain_code(
-                    cleaned_tgt, bridge_res
-                )
-                if uncertain_code is not None:
-                    try:
+                try:
+                    if target_via_gateway:
+                        bridge_res = await post_automation_gateway_notify(
+                            str(delivery_id),
+                            target=cleaned_tgt,
+                        )
+                    else:
+                        bridge_res = await _invoke_post_notify(
+                            post_notify_fn,
+                            [cleaned_tgt],
+                            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                            if is_group_notice
+                            else message_text,
+                            (feishu_redirect_card if ch == "feishu" else None)
+                            if is_group_notice
+                            else card_dict,
+                        )
+                except asyncio.CancelledError:
+                    if target_via_gateway:
                         await _shielded_mark_uncertain(
                             mark_target_fn,
                             execution_id,
                             ch,
                             cleaned_tgt,
-                            error_code=uncertain_code,
+                            error_code="delivery_uncertain",
                             expected_status="pending",
+                        )
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                    raise
+                except Exception as post_exc:
+                    status_code = getattr(
+                        getattr(post_exc, "response", None), "status_code", None
+                    )
+                    err_code = (
+                        f"http_{status_code}"
+                        if status_code
+                        else type(post_exc).__name__
+                    )
+                    if claim_execution_fn is None:
+                        try:
+                            await _invoke_mark_delivery(
+                                mark_target_fn,
+                                execution_id,
+                                ch,
+                                cleaned_tgt,
+                                status="failed",
+                                error_code=err_code,
+                                expected_status="pending",
+                            )
+                        except asyncio.CancelledError:
+                            for rem_ch, rem_tgt in list(pending_targets):
+                                await _shielded_mark_failed(
+                                    mark_target_fn,
+                                    execution_id,
+                                    rem_ch,
+                                    rem_tgt,
+                                    error_code=err_code,
+                                    expected_status="pending",
+                                )
+                            pending_targets.clear()
+                            raise
+                        except Exception:
+                            pass
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                    logger.error(
+                        "[DALTON_NOTIFY] Notification dispatch failed for execution_id=%s: error_type=%s status_code=%s",
+                        execution_id,
+                        type(post_exc).__name__,
+                        status_code,
+                    )
+                    continue
+
+                if target_via_gateway:
+                    skip_code = _notify_result_skip_code(cleaned_tgt, bridge_res)
+                    if skip_code is not None:
+                        try:
+                            await _invoke_mark_delivery(
+                                mark_target_fn,
+                                execution_id,
+                                ch,
+                                cleaned_tgt,
+                                status="skipped",
+                                reason=skip_code,
+                                error_code=skip_code,
+                                expected_status="pending",
+                            )
+                        except Exception as mark_exc:
+                            logger.warning(
+                                "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
+                                execution_id,
+                                type(mark_exc).__name__,
+                            )
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                        continue
+                    uncertain_code = extract_target_uncertain_code(
+                        cleaned_tgt, bridge_res
+                    )
+                    if uncertain_code is not None:
+                        try:
+                            await _shielded_mark_uncertain(
+                                mark_target_fn,
+                                execution_id,
+                                ch,
+                                cleaned_tgt,
+                                error_code=uncertain_code,
+                                expected_status="pending",
+                            )
+                        except Exception as mark_exc:
+                            logger.warning(
+                                "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
+                                execution_id,
+                                type(mark_exc).__name__,
+                            )
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                        continue
+
+                outcomes, batch_err = _evaluate_target_results(
+                    [cleaned_tgt], bridge_res
+                )
+                ok = outcomes.get(cleaned_tgt, False)
+                if ok:
+                    batch_any_sent = True
+                    sent_channels.add(ch)
+                if claim_execution_fn is None:
+                    if target_via_gateway and not ok:
+                        recorded_error = _extract_retry_target_error_code(
+                            cleaned_tgt,
+                            bridge_res,
+                            batch_err,
+                            use_gateway_transport=True,
+                        )
+                    else:
+                        recorded_error = None if ok else (batch_err or "target_failed")
+                    try:
+                        await _invoke_mark_delivery(
+                            mark_target_fn,
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="sent" if ok else "failed",
+                            error_code=recorded_error,
                         )
                     except Exception as mark_exc:
                         logger.warning(
@@ -6902,42 +7269,43 @@ async def on_automation_settled(
                         )
                     if (ch, cleaned_tgt) in pending_targets:
                         pending_targets.remove((ch, cleaned_tgt))
-                    continue
 
-            outcomes, batch_err = _evaluate_target_results(
-                [cleaned_tgt], bridge_res
+            return batch_any_sent, sent_channels, True
+
+        if is_personal_private_thread:
+            dm_any_sent, dm_sent_channels, dm_had_claims = await _claim_and_dispatch(
+                dm_targets, is_group_notice=False
             )
-            ok = outcomes.get(cleaned_tgt, False)
-            if ok:
-                any_sent = True
-            if claim_execution_fn is None:
-                if target_via_gateway and not ok:
-                    recorded_error = _extract_retry_target_error_code(
-                        cleaned_tgt,
-                        bridge_res,
-                        batch_err,
-                        use_gateway_transport=True,
+            if not dm_had_claims:
+                logger.info(
+                    "[DALTON_NOTIFY] Skipping duplicate notify for execution_id=%s",
+                    execution_id,
+                )
+                return False
+            any_sent = dm_any_sent
+            if dm_any_sent and group_redirect_targets:
+                dm_target_channels = {_split_target_channel(t)[0] for t in dm_targets}
+                eligible_groups = [
+                    gt
+                    for gt in group_redirect_targets
+                    if (
+                        _split_target_channel(gt)[0] in dm_sent_channels
+                        or _split_target_channel(gt)[0] not in dm_target_channels
                     )
-                else:
-                    recorded_error = None if ok else (batch_err or "target_failed")
-                try:
-                    await _invoke_mark_delivery(
-                        mark_target_fn,
-                        execution_id,
-                        ch,
-                        cleaned_tgt,
-                        status="sent" if ok else "failed",
-                        error_code=recorded_error,
-                    )
-                except Exception as mark_exc:
-                    logger.warning(
-                        "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
-                        execution_id,
-                        type(mark_exc).__name__,
-                    )
-                if (ch, cleaned_tgt) in pending_targets:
-                    pending_targets.remove((ch, cleaned_tgt))
+                ]
+                if eligible_groups:
+                    await _claim_and_dispatch(eligible_groups, is_group_notice=True)
+            return any_sent
 
+        any_sent, _, had_claims = await _claim_and_dispatch(
+            targets, is_group_notice=False
+        )
+        if not had_claims:
+            logger.info(
+                "[DALTON_NOTIFY] Skipping duplicate notify for execution_id=%s",
+                execution_id,
+            )
+            return False
         return any_sent
     except asyncio.CancelledError:
         if claim_execution_fn is None and pending_targets:
