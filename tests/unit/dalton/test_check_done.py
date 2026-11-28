@@ -6251,6 +6251,14 @@ class _FcRunHost:
                 "summary": "bound v01",
                 "next_path": "model/META-model-v01.xlsx",
             }
+        if label == "核验候选落盘":
+            return {
+                "path": "model/META-model-v01.xlsx",
+                "exists": True,
+                "readable": True,
+                "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "run_matched": True,
+            }
         if label == "完整覆盖页签核验":
             return {
                 "path": "model/META-model-v01.xlsx",

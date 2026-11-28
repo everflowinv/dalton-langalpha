@@ -263,13 +263,18 @@ async function _mReadLiveRunId(progressPath, phaseTitle) {
     `只读读取本轮工作流运行 ID（不修改任何文件）。`,
     `在 Bash 执行：\`${_mProgressReadCmd(progressPath)}\`，将输出的非空字符串作为 JSON 的 run_id 字段原样回传（输出为空则回传 null）。`,
   ].join('\n')
-  const res = await _mSafeAgent(prompt, {
+  const readOpts = {
     agentType: 'general-purpose',
     label: '读取运行ID',
     phase: phaseTitle || '读取运行ID',
     schema: _MODEL_RUN_ID_SCHEMA,
     checkFiles: false,
-  })
+  }
+  let res = await _mSafeAgent(prompt, readOpts)
+  if (!res || typeof res.run_id !== 'string' || !res.run_id.trim()) {
+    log('[modeling] 读取运行ID首次失败或返回空，重试一次')
+    res = await _mSafeAgent(prompt, readOpts)
+  }
   if (res && typeof res.run_id === 'string' && res.run_id.trim()) {
     return res.run_id.trim()
   }
@@ -299,7 +304,14 @@ async function _mResolveNextModelPath(W, T, baselinePath, recordPath, phaseTitle
   return _mNormPath(res.next_path, W)
 }
 
-async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expectedRunId = null) {
+async function _mProbeCandidateOnDisk(
+  candidatePath,
+  W,
+  phaseTitle,
+  label,
+  expectedRunId = null,
+  requireReceipt = true
+) {
   const norm = _mNormPath(candidatePath, W)
   const wantRunId = typeof expectedRunId === 'string' && expectedRunId.trim() ? expectedRunId.trim() : ''
   if (!norm) {
@@ -309,7 +321,19 @@ async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expec
       exists: false,
       readable: false,
       model_sha256: null,
-      run_matched: !wantRunId,
+      run_matched: false,
+      receipt_run_id: null,
+    }
+  }
+  if (requireReceipt && !wantRunId) {
+    log(`[modeling] ${label || '核验候选落盘'}缺少本轮 run_id，按未核验处理，不采纳候选`)
+    return {
+      verified: false,
+      status: 'unverified',
+      exists: false,
+      readable: false,
+      model_sha256: null,
+      run_matched: false,
       receipt_run_id: null,
     }
   }
@@ -371,7 +395,7 @@ async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label, expec
   const ex = Boolean(res.exists)
   const rd = ex && Boolean(res.readable)
   const sha = rd ? _mValidSha(res.model_sha256) : null
-  const runMatched = wantRunId ? res.run_matched === true : true
+  const runMatched = Boolean(wantRunId && res.run_matched === true)
   return {
     verified: true,
     status: !ex ? 'missing' : (rd && sha ? 'readable' : 'unreadable'),
@@ -439,7 +463,7 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `rsha = hashlib.sha256(rp.read_bytes()).hexdigest() if ex else None`,
     `path_re = re.compile(r'(?<![A-Za-z0-9_./\\\\-])(?:\\./)?' + re.escape(mp) + r'(?![A-Za-z0-9_./\\\\-])')`,
     `def _md_synced(raw):`,
-    `    clean = re.sub(r'<!--.*?-->', '', raw, flags=re.S)`,
+    `    clean = re.sub(r'<!--.*?-->', '', raw, flags=re.S).split('<!--', 1)[0]`,
     `    refs = [re.sub(r'^(?:\\./)+', '', r) for r in re.findall(r'model:([^\\s!#()\\[\\]<>\"\\x27\\x60]+\\.xlsx)[!#]', clean, re.I)]`,
     `    return all(r == mp for r in refs) and (bool(refs) or bool(path_re.search(clean)))`,
     `synced = False`,
@@ -910,35 +934,29 @@ async function runModelingPipeline(ctx) {
     phase: p2,
     schema: _MODEL_STAGE2A_SCHEMA,
   })
-  const stage2aCand = stage2a ? _mNormPath(stage2a.candidate_path, W) : null
-  const stage2aSha = stage2a ? _mValidSha(stage2a.model_sha256) : null
   let candidatePath = null
   let modelSha = null
-  if (
-    stage2a &&
-    stage2aCand === plannedCandPath &&
-    stage2aSha &&
-    _mHasPath(stage2a.files, plannedCandPath, W)
-  ) {
+  // 无论子任务是否回传成功，更新 candidatePath 之前一律按预绑路径与本轮 run_id 独立核验盘上可读性、哈希与发布回执
+  const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
+  if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
     candidatePath = plannedCandPath
-    modelSha = stage2aSha
-    if (stage2a.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
-  } else {
-    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径与本轮 run_id 独立实测盘上可读性与发布记录
-    const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘', runId)
-    if (diskProbe.verified && diskProbe.readable && diskProbe.model_sha256 && diskProbe.run_matched) {
-      candidatePath = plannedCandPath
-      modelSha = diskProbe.model_sha256
-      if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
-        _mPushUnique(failedStages, 'recalc')
-      }
-      if (!stage2a) {
-        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已由本轮落盘且可读，按 recalc 降级继续后续阶段`)
-      }
+    modelSha = diskProbe.model_sha256
+    if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
+      _mPushUnique(failedStages, 'recalc')
+    }
+    if (!stage2a) {
+      log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已由本轮落盘且可读，按 recalc 降级继续后续阶段`)
     }
   }
   if (!candidatePath) {
-    return failUnusable('模型构建与落盘阶段未产出可读候选模型', [...failedStages, 'model'], {
+    const failReason = !diskProbe.verified
+      ? (runId
+          ? '模型构建与落盘阶段候选核验超时（未核验），不采纳候选模型'
+          : '缺少本轮 run_id，模型构建与落盘阶段候选按未核验处理，不采纳候选模型')
+      : (diskProbe.exists && !diskProbe.run_matched
+          ? '模型构建与落盘阶段预绑路径文件发布回执不匹配本轮 run_id，不采纳候选模型'
+          : '模型构建与落盘阶段未产出可读候选模型')
+    return failUnusable(failReason, [...failedStages, 'model'], {
       baseline_path: baselinePath,
       baseline_sha256: baselineSha,
       consensus_path: consensusPath,
@@ -1134,9 +1152,24 @@ async function runModelingPipeline(ctx) {
         schema: _MODEL_FIX_SCHEMA,
       })
 
-      const fixCand = fixRes ? _mNormPath(fixRes.candidate_path, W) : null
-      if (!fixRes || !fixCand || !_mHasPath(fixRes.files, fixCand, W)) {
+      const rawFixCand = fixRes ? _mNormPath(fixRes.candidate_path, W) : null
+      const fixCand = rawFixCand ? _mValidModelOutPath(rawFixCand, baselinePath, W) : null
+      const fixProbe =
+        fixRes && fixCand && _mHasPath(fixRes.files, fixCand, W)
+          ? await _mProbeCandidateOnDisk(fixCand, W, fixPhase, '核验候选落盘', runId)
+          : null
+      const fixVerified = Boolean(
+        fixProbe && fixProbe.verified && fixProbe.readable && fixProbe.model_sha256 && fixProbe.run_matched
+      )
+      if (!fixVerified) {
         _mPushUnique(failedStages, 'fix')
+        const fixFailReason = !fixProbe
+          ? `第 ${fixRounds} 轮模型修改超时或返回空，已保留上一可读候选并降级交付`
+          : (!fixProbe.verified
+              ? `第 ${fixRounds} 轮模型修改候选未核验（${runId ? '核验超时' : '缺少本轮 run_id'}），不采纳新候选，已保留上一可读候选并降级交付`
+              : (fixProbe.exists && !fixProbe.run_matched
+                  ? `第 ${fixRounds} 轮模型修改候选发布回执不匹配本轮 run_id，不采纳新候选，已保留上一可读候选并降级交付`
+                  : `第 ${fixRounds} 轮模型修改未产出可读候选，已保留上一可读候选并降级交付`))
         const fb = await writeFallbackLedger({
           workspaceDir: W,
           ticker: T,
@@ -1150,7 +1183,7 @@ async function runModelingPipeline(ctx) {
           failedStages,
           runId,
           fixRounds,
-          reason: `第 ${fixRounds} 轮模型修改超时或返回空，已保留上一可读候选并降级交付`,
+          reason: fixFailReason,
           phaseLabel: fixPhase,
         })
         runId = fb.run_id || runId
@@ -1174,7 +1207,7 @@ async function runModelingPipeline(ctx) {
       }
 
       candidatePath = fixCand
-      modelSha = _mValidSha(fixRes.model_sha256) || modelSha
+      modelSha = fixProbe.model_sha256
       if (fixRes.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
       if (fixRes.consensus_diff_generated === false) _mPushUnique(failedStages, 'consensus')
       if (_mHasPath(fixRes.files, consensusMdPath, W)) _mPushUnique(artifacts, consensusMdPath)
@@ -1442,16 +1475,20 @@ async function reviseModelForReport(ctx) {
       log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已由本轮落盘且可读，按已确认新候选继续`)
     }
   } else if (!diskProbe.verified) {
-    // 核验子任务重试后仍无返回：按「未核验」处理，交由降级账本命令自己读盘，不提前终止报告修订
+    // 核验子任务重试后仍无返回或缺少本轮 run_id：按「未核验」处理，交由降级账本命令自己读盘，不提前终止报告修订
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模新候选核验子任务超时未核验，保留当前模型并由降级账本命令直接读盘确认',
-      '报告联动改模新候选核验子任务超时（未核验）'
+      runId
+        ? '报告联动改模新候选核验子任务超时未核验，保留当前模型并由降级账本命令直接读盘确认'
+        : '缺少本轮 run_id，报告联动改模新候选按未核验处理且不采纳，保留当前模型并由降级账本命令直接读盘确认',
+      runId
+        ? '报告联动改模新候选核验子任务超时（未核验）'
+        : '缺少本轮 run_id，报告联动改模新候选未核验'
     )
   } else if (editRes && !editRes.changed && (!diskProbe.exists || (diskProbe.readable && !diskProbe.run_matched))) {
     // 本轮未在预绑路径发布新候选且子任务声称未改：读盘实测当前模型可读性与哈希，绝不采用自报哈希
-    const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘')
+    const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘', null, false)
     if (!curProbe.verified) {
       // 核验当前模型的子任务重试后仍超时：按「未核验」处理，由降级账本命令直接读盘确认当前模型，不提前终止报告修订
       _mPushUnique(failedStages, 'report_revision')

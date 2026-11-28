@@ -5118,6 +5118,14 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
                 "model_sha256": "a" * 64,
                 "recalc_status": "ok",
             }
+        if label == "核验候选落盘":
+            return {
+                "path": "model/PDD-model-v01.xlsx",
+                "exists": True,
+                "readable": True,
+                "model_sha256": "a" * 64,
+                "run_matched": True,
+            }
         if label == "一致预期对照":
             return {
                 "files": [
@@ -5161,6 +5169,7 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
         "建模准备",
         "读取运行ID",
         "模型构建与落盘",
+        "核验候选落盘",
         "一致预期对照",
         "模型本轮范围检查",
     ]
@@ -5173,6 +5182,8 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
             return {"run_id": "run-cm-2r"}
         if label == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": "2" * 64, "recalc_status": "ok"}
+        if label == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": "2" * 64, "run_matched": True}
         if label == "一致预期对照":
             return {
                 "files": [
@@ -5231,6 +5242,14 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
                 "candidate_path": "model/PDD-model-v01.xlsx",
                 "model_sha256": cand_sha,
                 "recalc_status": "ok",
+            }
+        if label == "核验候选落盘":
+            return {
+                "path": "model/PDD-model-v01.xlsx",
+                "exists": True,
+                "readable": True,
+                "model_sha256": cand_sha,
+                "run_matched": True,
             }
         if label == "一致预期对照":
             return {
@@ -5419,6 +5438,16 @@ async def test_p0b_earnings_deep_update_timeout_before_model_delta_and_report_re
                 "candidate_path": "model/PDD-model-v02.xlsx",
                 "model_sha256": mfp.file_sha256(v2_p),
                 "recalc_status": "ok",
+            }
+        if label == "核验候选落盘":
+            v2_p = ws / "model" / "PDD-model-v02.xlsx"
+            ok_v2 = v2_p.is_file() and medit.model_readable.check_workbook_readable(v2_p)[0]
+            return {
+                "path": "model/PDD-model-v02.xlsx",
+                "exists": v2_p.is_file(),
+                "readable": ok_v2,
+                "model_sha256": mfp.file_sha256(v2_p) if ok_v2 else None,
+                "run_matched": ok_v2,
             }
         if label == "一致预期对照":
             return {
@@ -6125,6 +6154,16 @@ async def test_p0b_r2_fix_round_incremental_preserves_stage2_values_and_expanded
                 "model_sha256": mfp.file_sha256(v2_p),
                 "recalc_status": "ok",
             }
+        if label == "核验候选落盘":
+            v2_p = ws / "model" / "PDD-model-v02.xlsx"
+            ok_v2 = v2_p.is_file() and medit.model_readable.check_workbook_readable(v2_p)[0]
+            return {
+                "path": "model/PDD-model-v02.xlsx",
+                "exists": v2_p.is_file(),
+                "readable": ok_v2,
+                "model_sha256": mfp.file_sha256(v2_p) if ok_v2 else None,
+                "run_matched": ok_v2,
+            }
         if label == "一致预期对照":
             m_d = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_consensus\.py diff [^`]+)`", prompt)
             assert m_d
@@ -6289,6 +6328,8 @@ async def test_p0b_r2_downgrade_misjudgment_guards(tmp_path: Path) -> None:
             return {"run_id": "run-2b-to"}
         if label == "模型构建与落盘":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "recalc_status": "ok"}
+        if label == "核验候选落盘":
+            return {"path": "model/PDD-model-v01.xlsx", "exists": True, "readable": True, "model_sha256": "a" * 64, "run_matched": True}
         if label == "一致预期对照":
             return None  # Consensus step timed out after candidate was already persisted!
         if label == "模型本轮范围检查":
@@ -6324,6 +6365,8 @@ async def test_p0b_r2_downgrade_misjudgment_guards(tmp_path: Path) -> None:
             return {"run_id": "run-fb-empty"}
         if label == "模型构建与落盘":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "recalc_status": "ok"}
+        if label == "核验候选落盘":
+            return {"path": "model/PDD-model-v01.xlsx", "exists": True, "readable": True, "model_sha256": "a" * 64, "run_matched": True}
         if label == "一致预期对照":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "ok", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "consensus_diff_generated": False}
         if label in ("模型本轮范围检查", "写入降级账本"):
@@ -6562,6 +6605,8 @@ async def test_p0b_r2_full_coverage_missing_required_sheets_blocks_before_draft(
             return {"run_id": "run-fc-sheets"}
         if label == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": chk_upd["candidate_sha256"], "recalc_status": "ok"}
+        if label == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": chk_upd["candidate_sha256"], "run_matched": True}
         if label == "一致预期对照":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": chk_upd["candidate_sha256"], "consensus_diff_generated": False}
         if label == "完整覆盖页签核验":
@@ -6750,6 +6795,17 @@ async def test_p0b_r2_sector_two_companies_serial_pdd_then_jd_real_cli_and_check
                     "candidate_path": cand_rel,
                     "model_sha256": res_e["candidate_sha256"],
                     "recalc_status": "ok",
+                }
+            if label == "核验候选落盘":
+                cand_rel = cand_rel_box["path"]
+                cand_p_real = ws / cand_rel
+                ok_c = cand_p_real.is_file() and medit.model_readable.check_workbook_readable(cand_p_real)[0]
+                return {
+                    "path": cand_rel,
+                    "exists": cand_p_real.is_file(),
+                    "readable": ok_c,
+                    "model_sha256": mfp.file_sha256(cand_p_real) if ok_c else None,
+                    "run_matched": ok_c,
                 }
             if label == "一致预期对照":
                 m_d = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_consensus\.py diff [^`]+)`", prompt)
@@ -7178,6 +7234,8 @@ async def test_p0b_r3_full_coverage_independent_sheet_gate_complete_missing_unve
             return {"run_id": "run-fc-r3"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": sha_a, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v01.xlsx", "exists": True, "readable": True, "model_sha256": sha_a, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "cons", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": sha_a, "consensus_diff_generated": False}
         return None
@@ -8040,6 +8098,8 @@ async def test_p0b_r4_sheet_gate_real_cli_schema_complete_reaches_draft_and_miss
             return {"run_id": "run-fc-r4-ok"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": sha_ok, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": sha_ok, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": sha_ok, "consensus_diff_generated": True}
         if lbl == "模型本轮范围检查":
@@ -8110,6 +8170,8 @@ async def test_p0b_r4_sheet_gate_real_cli_schema_complete_reaches_draft_and_miss
             return {"run_id": "run-fc-r4-miss"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": sha_miss, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": sha_miss, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "cons failed", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": sha_miss, "consensus_diff_generated": False}
         if lbl == "模型本轮范围检查":
@@ -8280,6 +8342,8 @@ async def test_p0b_r4_full_coverage_build_mode_propagates_to_report_revision_and
             return {"run_id": "run-fc-build-r4"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": v1_sha, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v01.xlsx", "exists": True, "readable": True, "model_sha256": v1_sha, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v01.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": v1_sha, "consensus_diff_generated": True}
         if lbl == "模型本轮范围检查":
@@ -8826,6 +8890,14 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
                 "model_sha256": state_box["h1"],
                 "recalc_status": "ok",
             }
+        if label == "核验候选落盘":
+            return {
+                "path": cand_rel,
+                "exists": cand_p.is_file(),
+                "readable": cand_p.is_file(),
+                "model_sha256": mfp.file_sha256(cand_p),
+                "run_matched": True,
+            }
         if label == "一致预期对照":
             # 1) Real write-snapshot (H1 -> H2)
             rc_s = mcons.main(
@@ -8873,6 +8945,14 @@ async def test_p0b_r4_real_workflow_resume_after_snapshot_and_inplace_rework_pre
     def _run2_handler(label: str, prompt: str) -> Any:
         if label == "读取运行ID":
             return {"run_id": "run-r4-2"}
+        if label == "核验候选落盘":
+            return {
+                "path": cand_rel,
+                "exists": cand_p.is_file(),
+                "readable": cand_p.is_file(),
+                "model_sha256": mfp.file_sha256(cand_p),
+                "run_matched": True,
+            }
         if label == "模型构建与落盘":
             raise AssertionError("Stage 2a MUST be replayed from journal + receipt, NEVER re-dispatched!")
         if label == "一致预期对照":
@@ -9297,6 +9377,8 @@ async def test_p0b_r5_1_revise_model_probes_prebound_first_disk_checks_unchanged
             return {"run_id": "run-r5-deep"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": v2_sha, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "consensus_diff_generated": True}
         if lbl == "模型本轮范围检查":
@@ -10346,6 +10428,8 @@ async def test_p0b_r6_4_probe_timeout_retries_once_and_degrades_without_aborting
             return {"run_id": "run-r6-4-deep"}
         if lbl == "模型构建与落盘":
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": v2_sha, "run_matched": True}
         if lbl == "一致预期对照":
             return {"files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "consensus_diff_generated": True}
         if lbl == "模型本轮范围检查":
@@ -10598,3 +10682,477 @@ def test_p0b_r6_7_cos_verbatim_urlsplit_valueerror_and_entity_casing_roundtrip()
         assert _unescape_closing_tag(escaped) == s, (s, escaped, _unescape_closing_tag(escaped))
     assert _escape_closing_tag("&LT;/user_verbatim_request&GT;") == "&amp;LT;/user_verbatim_request&GT;"
     assert _escape_closing_tag("&AMP;Lt;/User_Verbatim_Request&Gt;") == "&amp;AMP;Lt;/User_Verbatim_Request&Gt;"
+
+
+# ===========================================================================
+# P0-b Round 7 fixes (Items 1-2)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_p0b_r7_1_candidate_requires_current_run_receipt_and_run_id_retry(
+    tmp_path: Path,
+) -> None:
+    """R7 #1:
+    1) Initial modeling (`模型构建与落盘`) ALWAYS verifies the publish receipt (path, sha256,
+       run_id) via real disk probe before adopting `candidatePath`: when Run A published v02
+       and Run B's subtask returns success JSON pointing to v02, Run B rejects it (`run_matched=False`);
+    2) Targeted fix round (`模型修改 1`) verifies the publish receipt before updating `candidatePath`:
+       returning a foreign run's candidate is rejected and keeps the previous verified candidate;
+    3) Reading `run_id` retries once on failure; when `run_id` remains empty, both initial modeling
+       and report revision treat the candidate as unverified (never `run_matched=True`) and refuse
+       to adopt it."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    ws = tmp_path / "ws_r7_1"
+    r_rel = "research/2026-11-27-model-PDD"
+    (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+    scripts_src = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
+
+    v1 = ws / "model" / "PDD-model-v01.xlsx"
+    v2 = ws / "model" / "PDD-model-v02.xlsx"
+    v3 = ws / "model" / "PDD-model-v03.xlsx"
+    v1_sha = _write_simple_valid_model(v1)
+    fp_v1 = mfp.build_fingerprint(v1, ticker="PDD")
+
+    # Run A legitimately publishes v02 with run_id="run-r7-A" (writes real .publish-receipt.json)
+    res_a = medit.apply_edit_plan(
+        baseline_path=v1,
+        ticker="PDD",
+        plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 2026}]},
+        output_path=v2,
+        workspace_dir=ws,
+        fingerprint=fp_v1,
+        skip_recalc=True,
+        run_id="run-r7-A",
+    )
+    v2_sha_a = res_a["candidate_sha256"]
+
+    # Run C legitimately publishes v03 with run_id="run-r7-C"
+    res_c = medit.apply_edit_plan(
+        baseline_path=v1,
+        ticker="PDD",
+        plan={"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 3033}]},
+        output_path=v3,
+        workspace_dir=ws,
+        fingerprint=fp_v1,
+        skip_recalc=True,
+        run_id="run-r7-C",
+    )
+    v3_sha_c = res_c["candidate_sha256"]
+
+    def _run_real_probe(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, prompt
+        cmd = m.group(1).replace("python3 ", f"{sys.executable} ")
+        proc = subprocess.run(["bash", "-c", cmd], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return json.loads(proc.stdout.strip())
+
+    cm_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+    cm_params = {
+        "ticker": "PDD",
+        "company": "PDD Holdings",
+        "workspace_dir": ".",
+        "as_of": "2026-11-27",
+        "model_path": "model/PDD-model-v01.xlsx",
+        "progress_path": f"{r_rel}/.progress.json",
+    }
+
+    # --- Case 1: Two runs competing for v02 — Run B's subtask returns SUCCESS JSON for v02,
+    #     but the publish receipt on disk belongs to Run A -> MUST NOT adopt! ---
+    labels_b: list[str] = []
+    probes_b: list[dict[str, Any]] = []
+    spec_host_b = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent_run_b(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        labels_b.append(lbl)
+        if lbl == "建模准备":
+            return {
+                "files": [f"{r_rel}/model_dump/PDD-fingerprint.json"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": "model/PDD-model-v01.xlsx",
+                "baseline_sha256": v1_sha,
+                "planned_output_path": "model/PDD-model-v02.xlsx",
+            }
+        if lbl == "读取运行ID":
+            return {"run_id": "run-r7-B"}
+        if lbl == "模型构建与落盘":
+            # Subtask falsely returns success JSON pointing to Run A's v02 with matching SHA & files!
+            return {
+                "files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/coord_map.json"],
+                "summary": "claimed v02 ok",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": v2_sha_a,
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            probes_b.append(out)
+            return out
+        raise AssertionError(f"Run B must stop before {lbl!r} after foreign receipt rejection")
+
+    spec_host_b.agent.side_effect = _agent_run_b
+    spec_host_b.phase.side_effect = lambda _t: None
+    spec_host_b.log.side_effect = lambda _m: None
+    out_b = await run_workflow_script(cm_script, cm_params, spec_host_b, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert out_b.status == "completed", out_b.error
+    assert len(probes_b) == 1
+    assert probes_b[0]["exists"] is True and probes_b[0]["readable"] is True
+    assert probes_b[0]["run_matched"] is False and probes_b[0]["receipt_run_id"] == "run-r7-A"
+    assert out_b.result["ok"] is False
+    assert out_b.result["status"] == "failed_unusable"
+    assert out_b.result["candidate_path"] is None
+    assert "一致预期对照" not in labels_b and "模型本轮范围检查" not in labels_b
+
+    # --- Case 2: Targeted fix round (`模型修改 1`) returns foreign Run A's v02 ->
+    #     rejected by real receipt probe; keeps Run C's verified v03 and writes fallback ledger! ---
+    labels_c: list[str] = []
+    probes_c: list[dict[str, Any]] = []
+    fb_prompts_c: list[str] = []
+    spec_host_c = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent_fix_foreign(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        labels_c.append(lbl)
+        if lbl == "建模准备":
+            return {
+                "files": [f"{r_rel}/model_dump/PDD-fingerprint.json"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": "model/PDD-model-v01.xlsx",
+                "baseline_sha256": v1_sha,
+                "planned_output_path": "model/PDD-model-v03.xlsx",
+            }
+        if lbl == "读取运行ID":
+            return {"run_id": "run-r7-C"}
+        if lbl == "模型构建与落盘":
+            return {
+                "files": ["model/PDD-model-v03.xlsx"],
+                "summary": "v03 ok",
+                "candidate_path": "model/PDD-model-v03.xlsx",
+                "model_sha256": v3_sha_c,
+                "recalc_status": "ok",
+            }
+        if lbl == "核验候选落盘":
+            out = _run_real_probe(prompt)
+            probes_c.append(out)
+            return out
+        if lbl == "一致预期对照":
+            return {
+                "files": ["model/PDD-model-v03.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"],
+                "summary": "cons ok",
+                "candidate_path": "model/PDD-model-v03.xlsx",
+                "model_sha256": v3_sha_c,
+                "consensus_diff_generated": True,
+            }
+        if lbl == "模型本轮范围检查":
+            return {
+                "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "1 actionable",
+                "readable": True,
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": v3_sha_c,
+                "actionable_count": 1,
+                "actionable_issues": ["[C03] forecast constant"],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
+            }
+        if lbl == "模型修改 1":
+            # Fix subtask returns Run A's v02 instead of Run C's receipted workbook!
+            return {
+                "files": ["model/PDD-model-v02.xlsx"],
+                "summary": "pointed to foreign v02",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": v2_sha_a,
+                "recalc_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if lbl == "写入降级账本":
+            fb_prompts_c.append(prompt)
+            return {
+                "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "fallback on v03",
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": v3_sha_c,
+                "run_id": "run-r7-C",
+            }
+        raise AssertionError(f"unexpected label in fix-foreign case: {lbl!r}")
+
+    spec_host_c.agent.side_effect = _agent_fix_foreign
+    spec_host_c.phase.side_effect = lambda _t: None
+    spec_host_c.log.side_effect = lambda _m: None
+    out_c = await run_workflow_script(cm_script, cm_params, spec_host_c, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert out_c.status == "completed", out_c.error
+    assert len(probes_c) == 2
+    assert probes_c[0]["run_matched"] is True  # initial v03 matched run-r7-C
+    assert probes_c[1]["run_matched"] is False and probes_c[1]["receipt_run_id"] == "run-r7-A"  # fix v02 rejected
+    assert out_c.result["candidate_path"] == "model/PDD-model-v03.xlsx"
+    assert "fix" in out_c.result["failed_stages"]
+    assert fb_prompts_c and '--candidate "model/PDD-model-v03.xlsx"' in fb_prompts_c[0]
+
+    # --- Case 3a: Reading run_id fails once then succeeds on retry -> adopts verified Run A candidate ---
+    rid_calls_retry = {"n": 0}
+    spec_host_retry = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent_rid_retry_ok(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        if lbl == "建模准备":
+            return {
+                "files": [f"{r_rel}/model_dump/PDD-fingerprint.json"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": "model/PDD-model-v01.xlsx",
+                "baseline_sha256": v1_sha,
+                "planned_output_path": "model/PDD-model-v02.xlsx",
+            }
+        if lbl == "读取运行ID":
+            rid_calls_retry["n"] += 1
+            return None if rid_calls_retry["n"] == 1 else {"run_id": "run-r7-A"}
+        if lbl == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha_a, "recalc_status": "ok"}
+        if lbl == "核验候选落盘":
+            return _run_real_probe(prompt)
+        if lbl == "一致预期对照":
+            return {"files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha_a, "consensus_diff_generated": True}
+        if lbl == "模型本轮范围检查":
+            return {"files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json"], "summary": "pass", "readable": True, "final_status": "pass", "model_sha256": v2_sha_a, "actionable_count": 0, "missing_required_sheets": []}
+        raise AssertionError(lbl)
+
+    spec_host_retry.agent.side_effect = _agent_rid_retry_ok
+    spec_host_retry.phase.side_effect = lambda _t: None
+    spec_host_retry.log.side_effect = lambda _m: None
+    out_retry = await run_workflow_script(cm_script, cm_params, spec_host_retry, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert out_retry.status == "completed", out_retry.error
+    assert rid_calls_retry["n"] == 2
+    assert out_retry.result["ok"] is True and out_retry.result["candidate_path"] == "model/PDD-model-v02.xlsx"
+    assert out_retry.result["run_id"] == "run-r7-A"
+
+    # --- Case 3b: Reading run_id fails BOTH times -> empty runId treated as unverified, NEVER adopts ---
+    rid_calls_empty = {"n": 0}
+    labels_empty: list[str] = []
+    spec_host_empty = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent_rid_empty(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        labels_empty.append(lbl)
+        if lbl == "建模准备":
+            return {
+                "files": [f"{r_rel}/model_dump/PDD-fingerprint.json"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": "model/PDD-model-v01.xlsx",
+                "baseline_sha256": v1_sha,
+                "planned_output_path": "model/PDD-model-v02.xlsx",
+            }
+        if lbl == "读取运行ID":
+            rid_calls_empty["n"] += 1
+            return None if rid_calls_empty["n"] == 1 else {"run_id": None}
+        if lbl == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha_a, "recalc_status": "ok"}
+        raise AssertionError(f"Empty run_id must treat candidate as unverified without reaching {lbl!r}")
+
+    spec_host_empty.agent.side_effect = _agent_rid_empty
+    spec_host_empty.phase.side_effect = lambda _t: None
+    spec_host_empty.log.side_effect = lambda _m: None
+    out_empty = await run_workflow_script(cm_script, cm_params, spec_host_empty, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert out_empty.status == "completed", out_empty.error
+    assert rid_calls_empty["n"] == 2
+    assert out_empty.result["ok"] is False and out_empty.result["status"] == "failed_unusable"
+    assert out_empty.result["candidate_path"] is None
+    assert "一致预期对照" not in labels_empty
+
+    # --- Case 3c: reviseModelForReport with empty runId -> treated as unverified, does NOT adopt v02 ---
+    stages_src = (REPO_ROOT / "workflows" / "_shared" / "modeling_stages.js").read_text(encoding="utf-8")
+    rev_harness_js = f"{stages_src}\nreturn await reviseModelForReport(args)\n"
+    rev_labels: list[str] = []
+    spec_host_rev = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent_rev_empty_rid(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        rev_labels.append(lbl)
+        if lbl == "读取运行ID":
+            return None
+        if lbl == "计算联动新路径":
+            return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v02", "next_path": "model/PDD-model-v02.xlsx"}
+        if lbl == "模型联动修订":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "changed": True, "model_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha_a, "recalc_status": "ok"}
+        if lbl == "写入降级账本":
+            return {
+                "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "fb on v01",
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": v1_sha,
+                "run_id": None,
+            }
+        raise AssertionError(f"Empty run_id in reviseModelForReport must not reach {lbl!r}")
+
+    spec_host_rev.agent.side_effect = _agent_rev_empty_rid
+    spec_host_rev.phase.side_effect = lambda _t: None
+    spec_host_rev.log.side_effect = lambda _m: None
+    out_rev = await run_workflow_script(
+        rev_harness_js,
+        {
+            "workspaceDir": ".",
+            "ticker": "PDD",
+            "researchDir": r_rel,
+            "progressPath": f"{r_rel}/.progress.json",
+            "workflow": "earnings-deep-update",
+            "mode": "update",
+            "currentModelPath": "model/PDD-model-v01.xlsx",
+            "currentModelSha256": v1_sha,
+            "currentStatus": "pass",
+            "currentArtifacts": [],
+            "consensusPath": "data/consensus/snap.json",
+            "priorFailedStages": [],
+            "runId": None,
+            "reportPath": "drafts/2026-11-27-deep-FY26Q3.md",
+            "reviewFeedback": {"verdict": "revise", "must_fix": ["update"]},
+            "phaseLabel": "审稿",
+        },
+        spec_host_rev,
+        WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0),
+    )
+    assert out_rev.status == "completed", out_rev.error
+    assert rev_labels.count("读取运行ID") == 2
+    assert out_rev.result["changed"] is False
+    assert out_rev.result["modelPath"] == "model/PDD-model-v01.xlsx"
+    assert "写入降级账本" in rev_labels
+    assert "模型联动报告同步" not in rev_labels
+
+
+@pytest.mark.asyncio
+async def test_p0b_r7_2_report_sync_probe_ignores_unclosed_html_comment_to_eof(
+    tmp_path: Path,
+) -> None:
+    """R7 #2: Unclosed `<!--` in report / extra markdown notes is ignored through EOF,
+    so a new model path appearing only after an unclosed `<!--` never passes sync."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+
+    stages_src = (REPO_ROOT / "workflows" / "_shared" / "modeling_stages.js").read_text(encoding="utf-8")
+    rev_harness_js = f"{stages_src}\nreturn await reviseModelForReport(args)\n"
+
+    ws = tmp_path / "ws_r7_2"
+    r_rel = "research/2026-11-27-fc"
+    (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+    (ws / "drafts").mkdir(parents=True, exist_ok=True)
+    v2 = ws / "model" / "PDD-model-v02.xlsx"
+    v3 = ws / "model" / "PDD-model-v03.xlsx"
+    v2_sha = _write_simple_valid_model(v2)
+    v3_sha = _write_simple_valid_model(v3)
+    memo_p = ws / "drafts" / "2026-11-27-memo.md"
+    meta_p = ws / r_rel / ".memo-model.json"
+
+    def _run_real_probe(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, prompt
+        proc = subprocess.run(["bash", "-c", m.group(1)], cwd=ws, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return json.loads(proc.stdout.strip())
+
+    async def _run_sync(body_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        memo_p.write_text(body_text, encoding="utf-8")
+        meta_p.write_text(json.dumps({"path": "model/PDD-model-v03.xlsx", "sha256": v3_sha}), encoding="utf-8")
+        probes: list[dict[str, Any]] = []
+        spec_host = create_autospec(WorkflowHost, instance=True)
+
+        async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+            lbl = str(opts.get("label") or "")
+            if lbl == "计算联动新路径":
+                return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
+            if lbl == "模型联动修订":
+                return {"files": ["model/PDD-model-v03.xlsx"], "summary": "v03", "changed": True, "model_path": "model/PDD-model-v03.xlsx", "model_sha256": v3_sha, "recalc_status": "ok"}
+            if lbl == "核验联动候选落盘":
+                return {"path": "model/PDD-model-v03.xlsx", "exists": True, "readable": True, "model_sha256": v3_sha, "run_matched": True}
+            if lbl == "模型联动差异刷新":
+                return {"files": [f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "diff", "consensus_diff_generated": True}
+            if lbl == "核验差异表落盘":
+                return {"path": f"{r_rel}/model_dump/consensus-diff.json", "json_ok": True, "md_ok": True, "matched": True}
+            if lbl == "模型联动报告同步":
+                return {"files": ["drafts/2026-11-27-memo.md"], "summary": "sync", "report_sha256": "0" * 64}
+            if lbl == "核验报告同步落盘":
+                res = _run_real_probe(prompt)
+                probes.append(res)
+                return res
+            if lbl == "模型联动修订检查":
+                has_rs = "report_sync" in prompt
+                return {
+                    "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                    "summary": "chk",
+                    "readable": True,
+                    "final_status": "delivered_with_open_issues" if has_rs else "pass",
+                    "model_sha256": v3_sha,
+                    "actionable_count": 0,
+                    "actionable_issues": [],
+                    "missing_required_sheets": [],
+                    "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md" if has_rs else None,
+                }
+            raise AssertionError(lbl)
+
+        spec_host.agent.side_effect = _agent
+        spec_host.phase.side_effect = lambda _t: None
+        spec_host.log.side_effect = lambda _m: None
+        out = await run_workflow_script(
+            rev_harness_js,
+            {
+                "workspaceDir": ".",
+                "ticker": "PDD",
+                "researchDir": r_rel,
+                "progressPath": f"{r_rel}/.progress.json",
+                "workflow": "full-coverage",
+                "mode": "update",
+                "currentModelPath": "model/PDD-model-v02.xlsx",
+                "currentModelSha256": v2_sha,
+                "currentStatus": "pass",
+                "currentArtifacts": [],
+                "consensusPath": "data/consensus/snap.json",
+                "priorFailedStages": [],
+                "runId": "run-r7-2",
+                "reportPath": "drafts/2026-11-27-memo.md",
+                "extraSyncPaths": [f"{r_rel}/.memo-model.json"],
+                "reviewFeedback": {"verdict": "revise", "must_fix": ["sync"]},
+                "phaseLabel": "修订",
+            },
+            spec_host,
+            WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0),
+        )
+        assert out.status == "completed", out.error
+        return out.result, probes[0]
+
+    # 1. Unclosed HTML comment at EOF containing new path & model: ref -> synced=False!
+    res_unclosed, probe_unclosed = await _run_sync(
+        "# 备忘录\n正文仍用旧模型 model/PDD-model-v02.xlsx。\n<!-- model/PDD-model-v03.xlsx\nmodel:model/PDD-model-v03.xlsx!Valuation!C12\n"
+    )
+    assert probe_unclosed["synced"] is False, probe_unclosed
+    assert "report_sync" in res_unclosed["failedStages"]
+
+    # 2. Closed comment followed by visible old text then unclosed comment -> synced=False!
+    res_mixed, probe_mixed = await _run_sync(
+        "# 备忘录\n<!-- 注释 -->\n正文未更新。\n<!-- 待改至 model/PDD-model-v03.xlsx"
+    )
+    assert probe_mixed["synced"] is False, probe_mixed
+    assert "report_sync" in res_mixed["failedStages"]
+
+    # 3. Visible new path BEFORE an unclosed trailing comment -> synced=True!
+    res_before, probe_before = await _run_sync(
+        "# 备忘录\n估值已切换至 model/PDD-model-v03.xlsx。\n<!-- 末尾草稿注释 model/PDD-model-v02.xlsx"
+    )
+    assert probe_before["synced"] is True, probe_before
+    assert "report_sync" not in res_before["failedStages"]

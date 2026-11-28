@@ -177,6 +177,12 @@ class ScriptedHost:
             }
         if label == "读取运行ID":
             return {"run_id": "run-test-1"}
+        if label == "核验候选落盘":
+            m_cand = re.search(r"核验候选模型 (\S+?\.xlsx)", prompt)
+            cand = m_cand.group(1) if m_cand else "model/META-model-v01.xlsx"
+            if "模型构建与落盘" in self.fail_labels:
+                return {"path": cand, "exists": False, "readable": False, "model_sha256": None, "run_matched": False}
+            return {"path": cand, "exists": True, "readable": True, "model_sha256": "a" * 64, "run_matched": True}
         if label == "模型构建与落盘":
             cand = "model/META-model-v02.xlsx" if "模式：update" in prompt else "model/META-model-v01.xlsx"
             m_cm = re.search(r'--coord-map-out "([^"]+)"', prompt)
@@ -715,6 +721,10 @@ class CapturingHost:
             }
         if label == "读取运行ID":
             return {"run_id": "run-cap-1"}
+        if label == "核验候选落盘":
+            m_cand = re.search(r"核验候选模型 (\S+?\.xlsx)", prompt)
+            cand = m_cand.group(1) if m_cand else "model/META-model-v01.xlsx"
+            return {"path": cand, "exists": True, "readable": True, "model_sha256": "a" * 64, "run_matched": True}
         if label == "模型构建与落盘":
             return {
                 "files": ["model/META-model-v01.xlsx"],
