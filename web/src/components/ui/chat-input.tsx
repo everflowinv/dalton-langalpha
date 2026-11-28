@@ -33,8 +33,9 @@ import { isLargePaste, getModelDisplayName, MAX_FILES, sameMention } from './cha
 import { useToast } from './use-toast';
 import { effortOptions, isCodexModel, resolveEffort } from '@/lib/modelTuning';
 // DALTON-HOOK(antigravity-series): series display name, effort switching, collapsed picker wiring, and modelPickSeq forwarding
+// DALTON-HOOK(model-picker-races): attach displayed model & Antigravity series metadata on composer options
 import { inspectSavedAntigravityModel, sameAntigravitySeries } from '@/lib/antigravitySeries';
-import { attachComposerModelPickSeq } from '@/lib/dalton/threadModelDalton';
+import { attachComposerModelPickSeq, withDaltonComposerMeta } from '@/lib/dalton/threadModelDalton';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
   ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
@@ -714,14 +715,18 @@ function ChatInput({
   useImperativeHandle(ref, () => ({
     getModelOptions() {
       // DALTON-HOOK(antigravity-series): attach active manual pick sequence for Dalton HITL/composer readers
-      return attachComposerModelPickSeq({
+      // DALTON-HOOK(model-picker-races): attach displayed pillModel & Antigravity series id for queued-send comparison
+      return attachComposerModelPickSeq(withDaltonComposerMeta({
         model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
         ...ownOverrides,
-      }, { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
+      }, {
+        displayModel: pillModel,
+        antigravitySeriesId: pillSeriesMatch?.series.series_id ?? null,
+      }), { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
     },
     // DALTON-HOOK(automation-effort): omit saved composer effort (and unsent Antigravity effort variant) on retry unless explicitly picked for this retry
     getRetryModelOptions() {
@@ -856,7 +861,7 @@ function ChatInput({
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, hostSendModelSeq, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
+  }), [sentModel, hostSendModelSeq, pillModel, pillSeriesMatch, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -1153,7 +1158,7 @@ function ChatInput({
         mentions: heldMentions,
         commands: slashCommands,
         message: finalMessage,
-        modelOptions: {
+        modelOptions: withDaltonComposerMeta({
           model: sentModel,
           reasoningEffort: sentEffort,
           fastMode: resolvedFastMode,
@@ -1165,7 +1170,10 @@ function ChatInput({
           onHandedOff,
           onNotTaken: onRestore,
           onReturnedUnsent: onHostReturned,
-        },
+        }, {
+          displayModel: pillModel,
+          antigravitySeriesId: pillSeriesMatch?.series.series_id ?? null,
+        }),
       }),
       // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
       { filesWithheld: readyAttachments.length < totalBeforeTake },
@@ -1188,7 +1196,7 @@ function ChatInput({
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
   }, [hasContent, disabled, sendHeld, filesHold, message, effectiveMarketWatch, draftSubagents, attachedFiles.length, reservedAttachmentSlots, discardFiles, takeFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
-    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, toast, clearCurrentDraft, submitWithDraft]);
+    sentModel, pillModel, pillSeriesMatch, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, toast, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
     holdsRef.current = filesHold;
     sendRef.current = () => {

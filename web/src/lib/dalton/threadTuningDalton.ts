@@ -15,14 +15,20 @@ export interface DeferredTuningPick<V> {
 
 /**
  * True when an unresolved-permission deferred tuning pick is still eligible to
- * flush: returns false if the cached thread row already moved away from the
- * value observed when the deferred pick was staged.
+ * flush:
+ * - In Dalton builds, if the thread detail had not loaded when the pick was
+ *   staged (`!pick.hasExpected`), cancels automatic flush so we never issue an
+ *   unconditional PATCH over a newer write from another tab.
+ * - Also returns false if the cached thread row already moved away from the
+ *   value observed when the deferred pick was staged.
  */
 export function shouldFlushDeferredTuningPick<V>(
   pick: DeferredTuningPick<V>,
   rowValue: V | undefined,
 ): boolean {
-  if (!isDaltonBuild || !pick.hasExpected || rowValue === undefined) return true;
+  if (!isDaltonBuild) return true;
+  if (!pick.hasExpected) return false;
+  if (rowValue === undefined) return true;
   return rowValue === pick.expected;
 }
 

@@ -809,6 +809,11 @@ async def update_thread_endpoint(
             updates["reasoning_effort"] = request.reasoning_effort
         if "fast_mode" in provided:
             updates["fast_mode"] = request.fast_mode
+        # DALTON-HOOK(model-picker-races): atomically clear standard reasoning_effort in the same SQL UPDATE when switching to a built-in Antigravity variant
+        if "llm_model" in provided and request.llm_model is not None:
+            from src.dalton.llm.thread_model_dalton import apply_antigravity_effort_clear
+
+            await apply_antigravity_effort_clear(x_user_id, request.llm_model, updates)
         # DALTON-HOOK(model-picker-races): forward optional expected-value CAS guards for background auto-saves
         cas_guards: dict = {}
         if "expected_llm_model" in provided:

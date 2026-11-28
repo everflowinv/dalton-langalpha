@@ -26,6 +26,22 @@ export function isDaltonBackgroundConflict(
   return apiErrorStatus(error) === 409;
 }
 
+/**
+ * True when a background repatch failed transiently (network error / timeout /
+ * 429 / 5xx — never 409 conflict or permanent 4xx rejection). In that case the
+ * client preserves the user's unsent model pick & `sendModel` instead of
+ * reverting to the old turn's model.
+ */
+export function isDaltonTransientRepatchError(
+  background: ThreadFieldSaveBackground | undefined,
+  error: unknown,
+): boolean {
+  if (!isDaltonBuild || background !== 'repatch') return false;
+  const status = apiErrorStatus(error);
+  if (status == null) return true;
+  return status >= 500 || status === 408 || status === 429;
+}
+
 const confirmedEffortByClient = new WeakMap<
   QueryClient,
   Map<string, Thread['reasoning_effort']>

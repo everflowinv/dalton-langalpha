@@ -10,6 +10,11 @@ import { queryKeys } from '@/lib/queryKeys';
 import type { CustomModelEntry, ProviderModelsData } from '@/components/model/types';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  isDaltonBuild: true,
+}));
+
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
   getModelMetadata: vi.fn().mockResolvedValue({}),
@@ -349,9 +354,11 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     expect(modelPill).toHaveTextContent('Gemini 4 Neon');
     expect(modelPill).toHaveTextContent('Low');
 
-    // getModelOptions() must report reasoningEffort: null (variant key itself carries 'low').
+    // getModelOptions() must report reasoningEffort: null (variant key itself carries 'low') plus displayModel & antigravitySeriesId.
     expect(inputRef.current?.getModelOptions()).toMatchObject({
       model: 'gemini-4-neon-low-oauth',
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
       reasoningEffort: null,
     });
 
@@ -362,8 +369,29 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     expect(onSend).toHaveBeenCalledTimes(1);
     expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({
       model: 'gemini-4-neon-low-oauth',
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
       reasoningEffort: null,
     });
     expect(onSend.mock.calls[0][0].modelOptions).not.toHaveProperty('reasoningEffortOverride');
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-H3 — getModelOptions() exposes displayModel even when sendModel is null (following thread row) so queued Antigravity sends never inherit a standard model's effort
+  it('exposes displayModel and null antigravitySeriesId on getModelOptions() when following a standard model row with sendModel=null', () => {
+    const inputRef = { current: null as import('../chat-input').ChatInputHandle | null };
+    renderComposer({
+      ref: inputRef,
+      model: 'gpt-6.2-sol',
+      sendModel: null,
+      tuning: { reasoningEffort: 'high', fastMode: false },
+    });
+
+    expect(inputRef.current?.getModelOptions()).toMatchObject({
+      model: null,
+      displayModel: 'gpt-6.2-sol',
+      antigravitySeriesId: null,
+      reasoningEffort: 'high',
+      fastMode: false,
+    });
   });
 });

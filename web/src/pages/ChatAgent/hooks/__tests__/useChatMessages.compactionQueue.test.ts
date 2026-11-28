@@ -9,7 +9,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, waitFor } from '@testing-library/react';
-import { renderHookWithProviders } from '@/test/utils';
+import { renderHookWithProviders, createTestQueryClient } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
 
 // ---------------------------------------------------------------------------
 // Mocks – declared before any imports that depend on them
@@ -682,14 +683,17 @@ describe('useChatMessages – queued send during compaction', () => {
     expect(result.current.activeTurnModel).toBeNull();
   });
 
-  // DALTON-HOOK(model-picker-races): Report Medium #5 — compaction-queued message reads live composer reasoningEffort/fastMode on flush instead of enqueue-time snapshot
+  // DALTON-HOOK(model-picker-races): Report Medium #5 — compaction-queued message reads live composer reasoningEffort/fastMode on flush in Dalton builds
   it('reads latest composer reasoningEffort when flushing a compaction-queued message', async () => {
+    brandMock.isDaltonBuild = true;
     let liveEffort: string | null = 'high';
     let liveFast: boolean | null = true;
     const { result } = renderHookWithProviders(() =>
       useChatMessages('ws-test', 'thread-q-effort', {
         readComposerOptions: () => ({
           model: null,
+          displayModel: 'gpt-6.2-sol',
+          antigravitySeriesId: null,
           reasoningEffort: liveEffort,
           fastMode: liveFast,
         }),
@@ -704,6 +708,8 @@ describe('useChatMessages – queued send during compaction', () => {
     await act(async () => {
       void result.current.handleSendMessage('queued during compact', null, null, {
         model: null,
+        displayModel: 'gpt-6.2-sol',
+        antigravitySeriesId: null,
         reasoningEffort: 'high',
         fastMode: true,
       });
@@ -722,6 +728,217 @@ describe('useChatMessages – queued send during compaction', () => {
     expect(mockSendStream.mock.calls[0][0]).toBe('queued during compact');
     expect(mockSendStream.mock.calls[0][3]).toMatchObject({
       reasoningEffort: 'low',
+      fastMode: false,
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-M2 — when VITE_DALTON_UI is disabled (isDaltonBuild === false), compaction flush keeps original enqueue-time tuning
+  it('preserves enqueue-time reasoningEffort and fastMode on compaction flush when VITE_DALTON_UI is disabled', async () => {
+    brandMock.isDaltonBuild = false;
+    let liveEffort: string | null = 'high';
+    let liveFast: boolean | null = true;
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-test', 'thread-q-nondalton', {
+        readComposerOptions: () => ({
+          model: null,
+          reasoningEffort: liveEffort,
+          fastMode: liveFast,
+        }),
+      }),
+    );
+
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued core off', null, null, {
+        model: null,
+        reasoningEffort: 'high',
+        fastMode: true,
+      });
+    });
+
+    liveEffort = 'low';
+    liveFast = false;
+
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      reasoningEffort: 'high',
+      fastMode: true,
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Grok-M1 — intra-series Antigravity effort switch (High -> Low) while compaction-queued flushes with the latest variant (Low) and null standard effort; cross-series keeps queued snapshot
+  it('uses latest Antigravity variant when user switches effort within same series during compaction, and preserves snapshot across series', async () => {
+    brandMock.isDaltonBuild = true;
+    let liveOptions = {
+      model: 'gemini-4-neon-high-oauth' as string | null,
+      modelPickSeq: 1 as number | null,
+      displayModel: 'gemini-4-neon-high-oauth' as string | null,
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon' as string | null,
+      reasoningEffort: null as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-test', 'thread-q-ag-series', {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    // 1) Same Antigravity series: Neon High -> Neon Low while queued during compaction.
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued neon high->low', null, null, {
+        ...liveOptions,
+      });
+    });
+    liveOptions = {
+      model: 'gemini-4-neon-low-oauth',
+      modelPickSeq: 2,
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+      fastMode: true,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      llmModel: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+      fastMode: true,
+    });
+
+    // 2) Cross-series Antigravity: queued Neon High, composer switches to Carbon Low -> keeps Neon High & null effort.
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued cross-series', null, null, {
+        model: 'gemini-4-neon-high-oauth',
+        displayModel: 'gemini-4-neon-high-oauth',
+        antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+        reasoningEffort: null,
+        fastMode: false,
+      });
+    });
+    liveOptions = {
+      model: 'gemini-4-carbon-low-oauth',
+      modelPickSeq: 3,
+      displayModel: 'gemini-4-carbon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-carbon',
+      reasoningEffort: null,
+      fastMode: true,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2));
+    expect(mockSendStream.mock.calls[1][3]).toMatchObject({
+      llmModel: 'gemini-4-neon-high-oauth',
+      reasoningEffort: null,
+      fastMode: false,
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-H3 — queued Neon Low must NEVER inherit standard reasoningEffort='high' when composer refreshes to Tab B's standard model (sendModel === null)
+  it('never leaks standard reasoningEffort onto a compaction-queued Antigravity Low message when composer follows another tab standard model', async () => {
+    brandMock.isDaltonBuild = true;
+    let liveOptions = {
+      model: 'gemini-4-neon-low-oauth' as string | null,
+      displayModel: 'gemini-4-neon-low-oauth' as string | null,
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon' as string | null,
+      reasoningEffort: null as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-test', 'thread-q-ag-leak', {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued neon low', null, null, {
+        model: 'gemini-4-neon-low-oauth',
+        displayModel: 'gemini-4-neon-low-oauth',
+        antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+        reasoningEffort: null,
+        fastMode: false,
+      });
+    });
+
+    // Tab B switches thread to standard gpt-6.2-sol + high; Tab A refreshes so sendModel is null while displayModel is gpt-6.2-sol.
+    liveOptions = {
+      model: null,
+      displayModel: 'gpt-6.2-sol',
+      antigravitySeriesId: null,
+      reasoningEffort: 'high',
+      fastMode: true,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      llmModel: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+      fastMode: false,
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-M2 — when useCapabilities() reports native_oauth_sync disabled (Core), *-oauth keys are not treated as Antigravity series
+  it('respects useCapabilities() native_oauth_sync=false so *-oauth keys do not trigger Antigravity series substitution', async () => {
+    brandMock.isDaltonBuild = true;
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['company_wiki'],
+    });
+    let liveOptions = {
+      model: 'gemini-4-neon-high-oauth' as string | null,
+      reasoningEffort: 'high' as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(
+      () =>
+        useChatMessages('ws-test', 'thread-q-core-caps', {
+          readComposerOptions: () => liveOptions,
+        }),
+      { queryClient },
+    );
+
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued core oauth', null, null, { ...liveOptions });
+    });
+
+    liveOptions = {
+      model: 'gemini-4-neon-low-oauth',
+      reasoningEffort: 'low',
+      fastMode: true,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    // With native_oauth_sync disabled, distinct model ids stay distinct (original queued snapshot preserved).
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      llmModel: 'gemini-4-neon-high-oauth',
+      reasoningEffort: 'high',
       fastMode: false,
     });
   });

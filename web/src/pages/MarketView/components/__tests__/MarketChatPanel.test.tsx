@@ -1462,13 +1462,13 @@ describe('MarketChatPanel', () => {
       await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
       await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('home-ws'));
 
-      // Switch Home thread to Antigravity before thread detail arrives -> waits for detail confirmation.
+      // Switch Home thread to Antigravity before thread detail arrives -> permissions are unresolved and detail is unread.
       await act(async () => {
         await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
       });
       expect(api.updateThread).not.toHaveBeenCalled();
 
-      // Thread detail arrives with a saved reasoning_effort -> flushes one PATCH carrying reasoning_effort: null.
+      // DALTON-HOOK(model-picker-races): Codex-H2 — thread detail arrives late with server values; because server values were unknown at pick time, cancel automatic flush instead of unconditionally overwriting the arrived row.
       await act(async () => {
         resolveThread({
           thread_id: 'thread-xyz',
@@ -1480,6 +1480,16 @@ describe('MarketChatPanel', () => {
         });
       });
 
+      await vi.waitFor(() => {
+        expect(ci.props!.model).toBe('claude-sonnet-4');
+      });
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // Once detail and permissions are resolved, a direct manual pick unconditionally sends PATCH with reasoning_effort: null.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
       await vi.waitFor(() => {
         expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
           llm_model: 'gemini-4-neon-medium-oauth',

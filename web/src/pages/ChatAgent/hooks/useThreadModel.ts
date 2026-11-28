@@ -15,6 +15,7 @@ import {
   recordDaltonTurnPick,
   settleDeferredSharedPick,
   shouldFlushDeferredModelPick,
+  shouldRepatchFirstTurnPick,
   shouldRepatchPreservedPick,
   type ActiveTurnModelInfo,
   type DeferredSharedPick,
@@ -22,7 +23,7 @@ import {
   type RepatchExpectedModel,
   type TrackedTurnPick,
 } from '@/lib/dalton/threadModelDalton';
-import { isDaltonBackgroundConflict } from '@/lib/dalton/threadFieldSaveDalton'; // DALTON-HOOK(model-picker-races)
+import { isDaltonTransientRepatchError } from '@/lib/dalton/threadFieldSaveDalton'; // DALTON-HOOK(model-picker-races)
 import { isCreatedThreadTransition } from '@/lib/dalton/threadTuningDalton';
 import {
   formatAntigravityVariantLabel,
@@ -336,8 +337,8 @@ export function useThreadModel({
     // there is nothing to move, so the held pick is put back directly, unless
     // the model has moved on since for another reason.
     onFailed: ({ threadId: failedThreadId, value, background }, error) => {
-      // DALTON-HOOK(model-picker-races): on transient network/5xx failure of a background repatch (not 409), keep the user's unsent manualPick & sendModel intact instead of reverting to the old turn's model
-      if (isDaltonBuild && background === 'repatch' && !isDaltonBackgroundConflict(background, error)) {
+      // DALTON-HOOK(model-picker-races): on transient network/5xx failure of a background repatch (not 409 or 4xx), keep the user's unsent manualPick & sendModel intact instead of reverting to the old turn's model
+      if (isDaltonTransientRepatchError(background, error)) {
         if (pendingRef.current === value) {
           pendingRef.current = null;
           createdHereRef.current = false;
@@ -466,12 +467,7 @@ export function useThreadModel({
       settleDeferredSharedPick(prevDeferred, false);
     }
     // DALTON-HOOK(agent-switch-model): mark as manually picked for the upcoming send
-    // DALTON-HOOK(model-picker-races): capture pre-pick server row model for 409-adopted unknown-model repatch matching
-    const nextPick: ManualModelPick = {
-      model: picked,
-      seq,
-      beforeRowModel: thread !== undefined ? (thread.llm_model ?? null) : previous,
-    };
+    const nextPick: ManualModelPick = { model: picked, seq };
     manualPickRef.current = nextPick;
     setManualPick(nextPick);
     setModel(picked);
@@ -538,7 +534,7 @@ export function useThreadModel({
       return;
     }
     const { threadId: targetThreadId, picked, before, seq } = deferredSharedPick;
-    // DALTON-HOOK(model-picker-races): abandon deferred flush if another tab already updated the thread row while permissions were unresolved
+    // DALTON-HOOK(model-picker-races): abandon deferred flush if server row was unread at pick time or already moved away while permissions were unresolved
     if (!shouldFlushDeferredModelPick(deferredSharedPick, thread)) {
       deferredSharedPickRef.current = null;
       setDeferredSharedPick(null);
@@ -546,12 +542,7 @@ export function useThreadModel({
         manualPickRef.current = null;
         setManualPick(null);
       }
-      const latestModel = resolveComposerModel(
-        thread?.llm_model || null,
-        startsOn,
-        catalogModelNames,
-      ).seed;
-      setModel(latestModel);
+      setModel(seed);
       settleDeferredSharedPick(deferredSharedPick, false);
       return;
     }
@@ -564,7 +555,7 @@ export function useThreadModel({
     setDeferredSharedPick(null);
     pendingRef.current = picked;
     setPending(picked);
-    const nextPick: ManualModelPick = { model: picked, seq, beforeRowModel: deferredSharedPick.expectedModel };
+    const nextPick: ManualModelPick = { model: picked, seq };
     manualPickRef.current = nextPick;
     setManualPick(nextPick);
     setModel(picked);
@@ -590,8 +581,7 @@ export function useThreadModel({
     rawMetadata,
     customModels,
     thread,
-    startsOn,
-    catalogModelNames,
+    seed,
     saveModel,
     setModel,
   ]);
@@ -682,20 +672,65 @@ export function useThreadModel({
           return;
         }
         // DALTON-HOOK(antigravity-series): preserve an unsent pre-id pick on shared/unresolved workspaces without issuing PATCH, and forward deferred PATCH settlement to onSettled
+        // DALTON-HOOK(model-picker-races): gate first-turn repatch on server still holding first-send model, carry CAS guards & background: 'repatch' so 409 follows server and 5xx preserves the unsent pick
         if (createdHere && currentPending !== firstSendModelRef.current) {
           const settled = pendingSettledRef.current.take(currentPending);
           if (!isSharedOrUnresolvedRef.current) {
+            if (!shouldRepatchFirstTurnPick(freshModel, firstSendModelRef.current)) {
+              pendingRef.current = null;
+              setPending(null);
+              setManualPick(null);
+              const nextModel = resolveComposerModel(
+                freshModel,
+                startsOnRef.current,
+                catalogModelNamesRef.current,
+              ).seed;
+              setModel(nextModel);
+              if (isDaltonBuild) settled?.(false);
+              return;
+            }
             const shouldClearEffort = isDaltonBuild
               && Boolean(inspectSavedAntigravityModel(currentPending, seriesOptsRef.current))
               && fresh.reasoning_effort != null;
+            if (isDaltonBuild) {
+              const nextSeq = manualPickRef.current?.model === currentPending
+                ? manualPickRef.current.seq
+                : ++pickSeqRef.current;
+              if (manualPickRef.current?.model !== currentPending) {
+                const nextPick: ManualModelPick = { model: currentPending, seq: nextSeq };
+                manualPickRef.current = nextPick;
+                setManualPick(nextPick);
+              }
+              preservedUnsentSeqRef.current = nextSeq;
+            }
             void saveModel({
               threadId: id,
               value: currentPending,
               before: freshModel ?? firstSendModelRef.current,
               ...(shouldClearEffort ? { extraUpdates: { reasoning_effort: null } } : {}),
+              ...(isDaltonBuild ? {
+                conditions: {
+                  expected_llm_model: freshModel,
+                  ...(shouldClearEffort ? { expected_reasoning_effort: fresh.reasoning_effort ?? null } : {}),
+                },
+                background: 'repatch' as const,
+              } : {}),
             }).then((saved) => {
               if (isDaltonBuild) settled?.(saved);
             });
+            return;
+          }
+          if (isSharedUnresolvedRef.current && !shouldRepatchFirstTurnPick(freshModel, firstSendModelRef.current)) {
+            pendingRef.current = null;
+            setPending(null);
+            setManualPick(null);
+            const nextModel = resolveComposerModel(
+              freshModel,
+              startsOnRef.current,
+              catalogModelNamesRef.current,
+            ).seed;
+            setModel(nextModel);
+            if (isDaltonBuild) settled?.(false);
             return;
           }
           const nextSeq = manualPickRef.current?.model === currentPending

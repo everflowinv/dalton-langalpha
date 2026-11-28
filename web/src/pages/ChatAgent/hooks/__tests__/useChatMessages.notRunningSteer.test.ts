@@ -18,6 +18,15 @@ import { renderHookWithProviders } from '@/test/utils';
 // Mocks, declared before any imports that depend on them
 // ---------------------------------------------------------------------------
 
+// DALTON-HOOK(model-picker-races): configurable Dalton build flag for queued-send tuning tests
+const brandMock = vi.hoisted(() => ({ isDaltonBuild: false }));
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return brandMock.isDaltonBuild;
+  },
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }));
@@ -103,6 +112,7 @@ describe('useChatMessages: a steer the server refuses as not_running', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     textContentCalls.length = 0;
+    brandMock.isDaltonBuild = false;
   });
 
   it('goes out again as a send under its key once the ended turn lets go, and opens its own turn', async () => {
@@ -810,14 +820,77 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     expect(mockSendStream.mock.lastCall?.[3]).toMatchObject({ additionalContext: FILES });
   });
 
-  // DALTON-HOOK(model-picker-races): Report Medium #5 — a not_running-queued follow-up reads live composer reasoningEffort at flush time instead of enqueue-time snapshot
+  // DALTON-HOOK(model-picker-races): Report Medium #5 — a not_running-queued follow-up reads live composer reasoningEffort at flush time in Dalton builds
   it('reads latest composer reasoningEffort when flushing a not_running queued message', async () => {
+    brandMock.isDaltonBuild = true;
     const firstHang = deferred<{ disconnected: boolean }>();
     mockSendStream.mockImplementation(
       async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
         const call = mockSendStream.mock.calls.length;
         if (call === 1) {
           onEvent({ event: 'thread_id', thread_id: 'thread-nr-effort' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return { disconnected: false };
+      },
+    );
+
+    let liveEffort: string | null = 'high';
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-nr', null, {
+        readComposerOptions: () => ({
+          model: null,
+          displayModel: 'gpt-6.2-sol',
+          antigravitySeriesId: null,
+          reasoningEffort: liveEffort,
+          fastMode: null,
+        }),
+      }),
+    );
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    // Follow-up steer sent with reasoningEffort: 'high' gets refused as not_running and queued.
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up effort', null, null, {
+        model: null,
+        displayModel: 'gpt-6.2-sol',
+        antigravitySeriesId: null,
+        reasoningEffort: 'high',
+      });
+    });
+    expect(mockSendStream).toHaveBeenCalledTimes(2);
+
+    // Before the old turn finishes and the queue flushes, user lowers composer effort to 'low'.
+    liveEffort = 'low';
+
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up effort');
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      reasoningEffort: 'low',
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-M2 — when VITE_DALTON_UI is disabled (isDaltonBuild === false), not_running flush preserves enqueue-time tuning
+  it('preserves enqueue-time reasoningEffort on not_running flush when VITE_DALTON_UI is disabled', async () => {
+    brandMock.isDaltonBuild = false;
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-nondalton' });
           return firstHang.promise;
         }
         if (call === 2) throw notRunning();
@@ -843,17 +916,76 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     });
     await waitFor(() => expect(result.current.isLoading).toBe(true));
 
-    // Follow-up steer sent with reasoningEffort: 'high' gets refused as not_running and queued.
     await act(async () => {
-      await result.current.handleSendMessage('follow-up effort', null, null, {
+      await result.current.handleSendMessage('follow-up core off', null, null, {
         model: null,
         reasoningEffort: 'high',
       });
     });
-    expect(mockSendStream).toHaveBeenCalledTimes(2);
 
-    // Before the old turn finishes and the queue flushes, user lowers composer effort to 'low'.
     liveEffort = 'low';
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      reasoningEffort: 'high',
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Grok-M1 & Codex-H3 — not_running flush adopts intra-series Antigravity High->Low switch, and never leaks standard high onto queued Neon Low
+  it('uses latest intra-series Antigravity variant on not_running flush and never leaks standard effort onto queued Neon Low', async () => {
+    brandMock.isDaltonBuild = true;
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-ag' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return { disconnected: false };
+      },
+    );
+
+    let liveOptions = {
+      model: 'gemini-4-neon-high-oauth' as string | null,
+      modelPickSeq: 1 as number | null,
+      displayModel: 'gemini-4-neon-high-oauth' as string | null,
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon' as string | null,
+      reasoningEffort: null as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-nr', null, {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    // Queued while Neon High.
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up neon high->low', null, null, { ...liveOptions });
+    });
+
+    // User switches Neon High -> Neon Low before turn ends.
+    liveOptions = {
+      model: 'gemini-4-neon-low-oauth',
+      modelPickSeq: 2,
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+      fastMode: false,
+    };
 
     firstHang.resolve({ disconnected: false });
     await act(async () => {
@@ -861,9 +993,73 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
     });
 
     await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
-    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up effort');
+    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up neon high->low');
     expect(mockSendStream.mock.calls[2][3]).toMatchObject({
-      reasoningEffort: 'low',
+      llmModel: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+    });
+  });
+
+  // DALTON-HOOK(model-picker-races): R2 Codex-H3 — not_running-queued Neon Low must never inherit standard reasoningEffort='high' when composer refreshes to Tab B's standard model (model=null)
+  it('never leaks standard reasoningEffort onto a not_running-queued Antigravity Low message when composer refreshes to another tab standard model', async () => {
+    brandMock.isDaltonBuild = true;
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-ag-leak' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return { disconnected: false };
+      },
+    );
+
+    let liveOptions = {
+      model: 'gemini-4-neon-low-oauth' as string | null,
+      displayModel: 'gemini-4-neon-low-oauth' as string | null,
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon' as string | null,
+      reasoningEffort: null as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-nr', null, {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up neon low', null, null, { ...liveOptions });
+    });
+
+    // Tab B switches to standard gpt-6.2-sol + high; Tab A refreshes so sendModel is null while displayModel is gpt-6.2-sol.
+    liveOptions = {
+      model: null,
+      displayModel: 'gpt-6.2-sol',
+      antigravitySeriesId: null,
+      reasoningEffort: 'high',
+      fastMode: true,
+    };
+
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up neon low');
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      llmModel: 'gemini-4-neon-low-oauth',
+      reasoningEffort: null,
+      fastMode: false,
     });
   });
 });

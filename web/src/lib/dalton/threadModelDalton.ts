@@ -1,12 +1,15 @@
-import type { MutableRefObject } from 'react';
+import { useCallback, type MutableRefObject } from 'react';
 import { isDaltonBuild } from '@/config/brand';
+import { useAllModels } from '@/hooks/useAllModels';
+import { useCapabilities } from '@/hooks/useCapabilities';
+import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
 import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
+import type { ClearLocalHandle } from '@/lib/dalton/threadTuningDalton';
 import type { Thread } from '@/types/api';
 
 export interface ManualModelPick {
   model: string;
   seq: number;
-  beforeRowModel?: string | null;
 }
 
 export interface DeferredSharedPick {
@@ -206,25 +209,18 @@ export interface TurnPickRecordingRefs {
 /**
  * Computes the server `llm_model` value that the ending turn itself is expected
  * to have left on the thread row when an unsent newer pick is being protected.
- * A background repatch only fires if the reread row still holds this exact model.
+ * Only when the ending turn explicitly carried a known model (`turnModel.model !== null`
+ * and `!turnModel.modelUnknown`) can we confirm that the old turn wrote it;
+ * otherwise returns `{ known: false, model: null }` so another tab's write is
+ * never mistaken for the old turn's write.
  */
 export function resolveRepatchExpectedModel(
   turnModel: ActiveTurnModelInfo | null,
-  currentPick: ManualModelPick | null,
-  snapshot: { thread: Thread | undefined; updatedAt: number },
 ): RepatchExpectedModel {
-  if (!turnModel) return { known: false, model: null };
-  if (turnModel.model !== null) return { known: true, model: turnModel.model };
-  if (turnModel.modelUnknown) {
-    if (currentPick && 'beforeRowModel' in currentPick) {
-      return { known: true, model: currentPick.beforeRowModel ?? null };
-    }
+  if (!turnModel || turnModel.modelUnknown || turnModel.model === null) {
     return { known: false, model: null };
   }
-  if (snapshot.thread !== undefined) {
-    return { known: true, model: snapshot.thread.llm_model ?? null };
-  }
-  return { known: false, model: null };
+  return { known: true, model: turnModel.model };
 }
 
 /**
@@ -250,11 +246,7 @@ export function recordDaltonTurnPick(
   if (preserveUnsentSeq !== null) {
     refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
     if (refs.repatchExpectedRef) {
-      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(
-        turnModel,
-        refs.manualPickRef.current,
-        snapshot,
-      );
+      refs.repatchExpectedRef.current = resolveRepatchExpectedModel(turnModel);
     }
   }
   return consumedPick;
@@ -274,15 +266,34 @@ export function shouldRepatchPreservedPick(
 }
 
 /**
+ * True when a pre-id pick made during a new thread's first turn may still
+ * background-repatch on first-turn reread: in Dalton builds, only while the
+ * server row still holds the model written by the first send.
+ */
+export function shouldRepatchFirstTurnPick(
+  freshModel: string | null,
+  firstSendModel: string | null,
+): boolean {
+  if (!isDaltonBuild) return true;
+  return freshModel === firstSendModel;
+}
+
+/**
  * True when an unresolved-permission deferred model pick is still eligible to
- * flush: returns false if the cached thread row already moved away from the
- * model observed when the deferred pick was staged.
+ * flush:
+ * - In Dalton builds, if the thread detail had not loaded when the pick was
+ *   staged (`!pick.hasExpectedModel`), cancels automatic flush so we never
+ *   issue an unconditional PATCH over a newer write from another tab.
+ * - Also returns false if the cached thread row already moved away from the
+ *   model observed when the deferred pick was staged.
  */
 export function shouldFlushDeferredModelPick(
   pick: DeferredSharedPick,
   thread: Thread | undefined,
 ): boolean {
-  if (!isDaltonBuild || !pick.hasExpectedModel || thread === undefined) return true;
+  if (!isDaltonBuild) return true;
+  if (!pick.hasExpectedModel) return false;
+  if (thread === undefined) return true;
   return (thread.llm_model ?? null) === (pick.expectedModel ?? null);
 }
 
@@ -304,42 +315,117 @@ export function buildDeferredModelConditions(
   return Object.keys(conditions).length > 0 ? conditions : undefined;
 }
 
+const ANTIGRAVITY_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+function fallbackAntigravitySeriesId(modelKey: string | null | undefined): string | null {
+  if (!modelKey || !modelKey.endsWith('-oauth')) return null;
+  const stem = modelKey.slice(0, -'-oauth'.length);
+  if (!stem) return null;
+  for (const effort of ANTIGRAVITY_EFFORT_LEVELS) {
+    const suffix = `-${effort}`;
+    if (stem.endsWith(suffix) && stem.length > suffix.length) {
+      return `antigravity-oauth:${stem.slice(0, -suffix.length)}`;
+    }
+  }
+  return null;
+}
+
+export interface QueuedTuningOptions {
+  model?: string | null;
+  modelPickSeq?: number | null;
+  displayModel?: string | null;
+  antigravitySeriesId?: string | null;
+  reasoningEffort?: string | null;
+  fastMode?: boolean | null;
+}
+
+function resolveQueuedModelAndSeries(
+  opts: QueuedTuningOptions,
+  antigravityEnabled: boolean,
+): { effectiveModel: string | null; seriesId: string | null } {
+  const effectiveModel = opts.displayModel ?? opts.model ?? null;
+  if (!antigravityEnabled) {
+    return { effectiveModel, seriesId: null };
+  }
+  if (opts.antigravitySeriesId !== undefined) {
+    return { effectiveModel, seriesId: opts.antigravitySeriesId };
+  }
+  return { effectiveModel, seriesId: fallbackAntigravitySeriesId(effectiveModel) };
+}
+
 /**
- * Refreshes a queued message's reasoningEffort / fastMode from the live composer
- * at flush time instead of sending the stale snapshot captured when it was queued.
+ * Refreshes a queued message's tuning (and intra-series Antigravity variant)
+ * from the live composer at flush time instead of sending the stale snapshot
+ * captured when it was queued.
  *
- * - If the queued message explicitly targets a different model than the composer
- *   now shows (e.g. a queued Antigravity High turn after the user switched the
- *   composer to a standard model), keeps the queued message's own tuning.
- * - Otherwise, when live composer options are available, adopts their latest
- *   `reasoningEffort` and `fastMode`.
+ * - Disabled when `isDaltonBuild` (`VITE_DALTON_UI`) is false: returns
+ *   `queuedOptions` unchanged.
+ * - Compares displayed models (`displayModel ?? model`) and Antigravity series:
+ *   - Same Antigravity series (e.g. `…-high-oauth` -> `…-low-oauth`): adopts
+ *     the live composer's current variant (`model`, `modelPickSeq`, `displayModel`,
+ *     `antigravitySeriesId`), always clears standard `reasoningEffort` to `null`,
+ *     and adopts live `fastMode`.
+ *   - Different Antigravity series or Antigravity <-> standard: preserves the
+ *     queued message's model snapshot and always clears standard `reasoningEffort`
+ *     to `null` when the queued message targets an Antigravity variant.
+ *   - Different standard models: preserves the queued message's snapshot.
+ *   - Same standard model: adopts live `reasoningEffort` and `fastMode`.
  * - When no composer reader is mounted (headless caller), clears the stale
  *   enqueue-time snapshot so the server reads the thread row's latest tuning.
  */
-export function mergeLatestQueuedTuning<
-  T extends {
-    model?: string | null;
-    reasoningEffort?: string | null;
-    fastMode?: boolean | null;
-  },
->(
+export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
   queuedOptions: T,
-  latestComposerOptions:
-    | {
-        model?: string | null;
-        reasoningEffort?: string | null;
-        fastMode?: boolean | null;
-      }
-    | undefined,
+  latestComposerOptions: QueuedTuningOptions | undefined,
+  { antigravityEnabled = true }: { antigravityEnabled?: boolean } = {},
 ): T {
+  if (!isDaltonBuild) return queuedOptions;
+  const queued = resolveQueuedModelAndSeries(queuedOptions, antigravityEnabled);
+
   if (latestComposerOptions !== undefined) {
+    const latest = resolveQueuedModelAndSeries(latestComposerOptions, antigravityEnabled);
+
+    if (queued.seriesId !== null) {
+      if (latest.seriesId !== null && latest.seriesId === queued.seriesId) {
+        const nextModel = latestComposerOptions.model !== undefined
+          ? latestComposerOptions.model
+          : queuedOptions.model;
+        const nextPickSeq = latestComposerOptions.modelPickSeq !== undefined
+          ? latestComposerOptions.modelPickSeq
+          : (nextModel === queuedOptions.model ? queuedOptions.modelPickSeq : undefined);
+        return {
+          ...queuedOptions,
+          model: nextModel,
+          ...(nextPickSeq !== undefined ? { modelPickSeq: nextPickSeq } : { modelPickSeq: undefined }),
+          ...(latestComposerOptions.displayModel !== undefined
+            ? { displayModel: latestComposerOptions.displayModel }
+            : {}),
+          ...(latestComposerOptions.antigravitySeriesId !== undefined
+            ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+            : {}),
+          reasoningEffort: null,
+          ...(latestComposerOptions.fastMode !== undefined
+            ? { fastMode: latestComposerOptions.fastMode }
+            : {}),
+        };
+      }
+      return {
+        ...queuedOptions,
+        reasoningEffort: null,
+      };
+    }
+
+    if (latest.seriesId !== null) {
+      return queuedOptions;
+    }
+
     if (
-      queuedOptions.model
-      && latestComposerOptions.model
-      && queuedOptions.model !== latestComposerOptions.model
+      queued.effectiveModel
+      && latest.effectiveModel
+      && queued.effectiveModel !== latest.effectiveModel
     ) {
       return queuedOptions;
     }
+
     return {
       ...queuedOptions,
       reasoningEffort: latestComposerOptions.reasoningEffort ?? null,
@@ -348,11 +434,114 @@ export function mergeLatestQueuedTuning<
         : {}),
     };
   }
+
   return {
     ...queuedOptions,
-    reasoningEffort: undefined,
+    reasoningEffort: queued.seriesId !== null ? null : undefined,
     fastMode: undefined,
   };
+}
+
+/**
+ * Strips standard `reasoningEffort` when assembling a send payload targeting a
+ * built-in Antigravity variant (whose effort is encoded in the model key).
+ */
+export function sanitizeDaltonSendEffort(
+  options: {
+    model?: string | null;
+    displayModel?: string | null;
+    antigravitySeriesId?: string | null;
+    reasoningEffort?: string | null;
+  },
+  { antigravityEnabled = true }: { antigravityEnabled?: boolean } = {},
+): string | null {
+  const effort = options.reasoningEffort || null;
+  if (!isDaltonBuild || !antigravityEnabled || effort === null) return effort;
+  const effectiveModel = options.model ?? options.displayModel ?? null;
+  const seriesId = options.antigravitySeriesId !== undefined
+    ? options.antigravitySeriesId
+    : fallbackAntigravitySeriesId(effectiveModel);
+  if (seriesId !== null) return null;
+  return effort;
+}
+
+/**
+ * Dalton hook for `useChatMessages`: reads `native_oauth_sync` via
+ * `useCapabilities()` and exposes queued-send tuning merger + send effort
+ * sanitizer so upstream `useChatMessages.ts` only carries thin hook calls.
+ */
+export function useDaltonQueuedSendTuning() {
+  const { hasCapability } = useCapabilities({ enabled: isDaltonBuild });
+  const antigravityEnabled = hasCapability('native_oauth_sync');
+
+  const resolveQueuedOptions = useCallback(
+    <T extends QueuedTuningOptions>(
+      queuedOptions: T,
+      latestComposerOptions: QueuedTuningOptions | undefined,
+    ): T => mergeLatestQueuedTuning(queuedOptions, latestComposerOptions, { antigravityEnabled }),
+    [antigravityEnabled],
+  );
+
+  const sanitizeSendEffort = useCallback(
+    (options: {
+      model?: string | null;
+      displayModel?: string | null;
+      antigravitySeriesId?: string | null;
+      reasoningEffort?: string | null;
+    }): string | null => sanitizeDaltonSendEffort(options, { antigravityEnabled }),
+    [antigravityEnabled],
+  );
+
+  return { resolveQueuedOptions, sanitizeSendEffort };
+}
+
+/**
+ * Attaches displayed-model & Antigravity series metadata to composer options
+ * in Dalton builds so queued-send flushes can compare displayed models & series
+ * even when `sendModel` is `null` (following the thread row).
+ */
+export function withDaltonComposerMeta<T extends object>(
+  options: T,
+  meta: { displayModel: string | null; antigravitySeriesId: string | null },
+): T & { displayModel?: string | null; antigravitySeriesId?: string | null } {
+  if (!isDaltonBuild) return options;
+  return {
+    ...options,
+    displayModel: meta.displayModel,
+    antigravitySeriesId: meta.antigravitySeriesId,
+  };
+}
+
+/**
+ * Dalton hook wrapping `pickModel` + `clearLocalEffort` for surfaces like
+ * `MarketView` mobile FAB so switching to an Antigravity variant atomically
+ * clears local standard reasoning effort and rolls back on failure.
+ */
+export function useDaltonModelPickerWithEffortClear(
+  pickModel: (model: string, options?: { onSettled?: (saved: boolean) => void }) => Promise<boolean>,
+  clearLocalEffort: () => ClearLocalHandle,
+): (nextModel: string) => Promise<boolean> {
+  const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  return useCallback((nextModel: string) => {
+    const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
+    const isAntigravity = Boolean(
+      inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels }),
+    );
+    if (!isDaltonBuild) {
+      if (isAntigravity) clearLocalEffort();
+      return pickModel(nextModel);
+    }
+    const effortClear = isAntigravity ? clearLocalEffort() : null;
+    return pickModel(nextModel, effortClear ? {
+      onSettled: (saved) => {
+        if (saved) effortClear.confirm();
+        else effortClear();
+      },
+    } : undefined).catch((err: unknown) => {
+      effortClear?.();
+      throw err;
+    });
+  }, [clearLocalEffort, customModels, modelMetadata, pickModel, rawApiResponse, seriesCatalog]);
 }
 
 /**

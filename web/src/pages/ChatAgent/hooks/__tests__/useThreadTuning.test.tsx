@@ -607,5 +607,46 @@ describe('useThreadTuning', () => {
       expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.reasoning_effort).toBe('low');
       expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.llm_model).toBe('gpt-6');
     });
+
+    // DALTON-HOOK(model-picker-races): R2 Codex-H2 — when thread detail was still unread at pick time during unresolved permissions, cancel automatic effort & fast_mode flush instead of overwriting Tab B
+    it('cancels unresolved deferred effort and fast_mode flush when thread detail arrives after user selection', async () => {
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = true;
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = false;
+
+      let resolveDetail!: (t: Thread) => void;
+      const slowDetail = new Promise<Thread>((res) => { resolveDetail = res; });
+      const queryClient = createTestQueryClient();
+      mocks.getThread.mockReturnValueOnce(slowDetail);
+
+      const { result, rerender } = renderHookWithProviders(
+        (p: { threadId: string; workspaceId: string } = { threadId: THREAD, workspaceId: 'ws-personal' }) =>
+          useThreadTuning(p),
+        { queryClient },
+      );
+
+      // Detail is still loading (undefined) while permissions are unresolved; User A picks effort='high' and fast_mode=true.
+      expect(result.current.tuning.reasoningEffort).toBeUndefined();
+      expect(result.current.tuning.fastMode).toBeUndefined();
+      await act(async () => {
+        await result.current.setReasoningEffort('high');
+        await result.current.setFastMode(true);
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      // Detail returns late with Tab B's effort='low' & fast_mode=false, then permissions resolve to personal.
+      const tabBRow = { thread_id: THREAD, llm_model: 'gpt-6', reasoning_effort: 'low', fast_mode: false } as unknown as Thread;
+      await act(async () => {
+        resolveDetail(tabBRow);
+        await slowDetail;
+      });
+      mocks.sharedWorkspaces = [];
+      rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+
+      await waitFor(() => expect(result.current.tuning.reasoningEffort).toBe('low'));
+      expect(result.current.tuning.fastMode).toBe(false);
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
   });
 });

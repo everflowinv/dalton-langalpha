@@ -22,9 +22,7 @@ import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRou
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 // DALTON-HOOK(model-picker-races): clear local standard reasoning effort when mobile FAB switches to an Antigravity variant
-import { isDaltonBuild } from '@/config/brand';
-import { useAllModels } from '@/hooks/useAllModels';
-import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
+import { useDaltonModelPickerWithEffortClear } from '@/lib/dalton/threadModelDalton';
 import type { Workspace } from '@/types/api';
 import type { StockSearchHit } from '@/lib/marketUtils';
 import type { Freshness } from '@/types/market';
@@ -246,29 +244,7 @@ function MarketViewInner() {
   // The thread's own effort and fast mode, held here for the same reason.
   const tuning = useThreadTuning({ threadId: null });
   // DALTON-HOOK(model-picker-races): mirror ChatView/MarketChatPanel — clear local standard effort when mobile FAB picks an Antigravity variant
-  const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
-  const { pickModel: pickMobileThreadModel } = threadModel;
-  const { clearLocalEffort: clearMobileLocalEffort } = tuning;
-  const handlePickMobileModel = useCallback((nextModel: string) => {
-    const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
-    const isAntigravity = Boolean(
-      inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels }),
-    );
-    if (!isDaltonBuild) {
-      if (isAntigravity) clearMobileLocalEffort();
-      return pickMobileThreadModel(nextModel);
-    }
-    const effortClear = isAntigravity ? clearMobileLocalEffort() : null;
-    return pickMobileThreadModel(nextModel, effortClear ? {
-      onSettled: (saved) => {
-        if (saved) effortClear.confirm();
-        else effortClear();
-      },
-    } : undefined).catch((err: unknown) => {
-      effortClear?.();
-      throw err;
-    });
-  }, [clearMobileLocalEffort, customModels, modelMetadata, pickMobileThreadModel, rawApiResponse, seriesCatalog]);
+  const handlePickMobileModel = useDaltonModelPickerWithEffortClear(threadModel.pickModel, tuning.clearLocalEffort);
   // What the FAB's composer says about its next send, as every thread host's does.
   const notices = useComposerNotices({
     threadId: null,

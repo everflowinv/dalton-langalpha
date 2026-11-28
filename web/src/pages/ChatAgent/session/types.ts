@@ -162,6 +162,9 @@ interface ModelOptions {
   model?: string | null;
   // DALTON-HOOK(antigravity-series): monotonic sequence of the local manual model pick carried by this send (Dalton builds only)
   modelPickSeq?: number | null;
+  // DALTON-HOOK(model-picker-races): composer's displayed model & resolved Antigravity series id (Dalton builds only, never sent over wire)
+  displayModel?: string | null;
+  antigravitySeriesId?: string | null;
   reasoningEffort?: string | null;
   fastMode?: boolean | null;
   /**

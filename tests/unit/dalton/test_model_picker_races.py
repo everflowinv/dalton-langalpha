@@ -100,6 +100,7 @@ async def test_switch_thread_model_to_antigravity_clears_reasoning_effort_and_pu
     with (
         patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
         patch(f"{SVC_MOD}.user_models.get_model_preference", new=get_pref),
+        patch.object(user_models, "get_model_preference", new=get_pref),
         patch(f"{SVC_MOD}.threads_read.get_thread_auth_meta", new=meta_mock),
         patch(f"{SVC_MOD}.threads_write.update_thread_fields", new=update_spy),
         patch.object(thread_lifecycle_feed, "publish_thread_model", new=pub_model),
@@ -166,6 +167,7 @@ async def test_switch_thread_model_to_standard_model_keeps_effort_and_publishes_
     with (
         patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
         patch(f"{SVC_MOD}.user_models.get_model_preference", new=get_pref),
+        patch.object(user_models, "get_model_preference", new=get_pref),
         patch(f"{SVC_MOD}.threads_read.get_thread_auth_meta", new=meta_mock),
         patch(f"{SVC_MOD}.threads_write.update_thread_fields", new=update_spy),
         patch.object(thread_lifecycle_feed, "publish_thread_model", new=pub_model),
@@ -347,3 +349,150 @@ async def test_patch_thread_background_cas_null_expected_returns_409_and_missing
                 json={"reasoning_effort": "low", "expected_reasoning_effort": "medium"},
             )
     assert resp_gone.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# R2 Codex-H4: server-side atomic reasoning_effort clear on PATCH llm_model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_patch_thread_manual_antigravity_switch_atomically_clears_effort_without_client_field():
+    """Codex-H4: even when browser cache was stale (reasoning_effort: null) so the
+    client omits reasoning_effort on a manual PATCH to a built-in Antigravity
+    variant, the server unconditionally writes llm_model AND reasoning_effort=None
+    in one SQL UPDATE and publishes both thread_model and thread_tuning."""
+    from src.server.app.threads import router
+
+    catalog = _make_catalog(
+        {
+            "gpt-6.2-sol": {"visible": True, "provider": "openai"},
+            "gemini-4-neon-low-oauth": {"visible": True, "provider": "antigravity-oauth"},
+        }
+    )
+    app = create_test_app(router)
+    app.dependency_overrides[get_current_user_id] = lambda: USER_ID
+
+    updated_row = _thread_row(
+        llm_model="gemini-4-neon-low-oauth",
+        reasoning_effort=None,
+        fast_mode=False,
+    )
+    update_spy = create_autospec(crud_mod.update_thread_fields, return_value=updated_row)
+    pub_model = create_autospec(thread_lifecycle_feed.publish_thread_model)
+    pub_tuning = create_autospec(thread_lifecycle_feed.publish_thread_tuning)
+    get_pref = create_autospec(user_models.get_model_preference, return_value={})
+
+    with (
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(user_models, "get_model_preference", new=get_pref),
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER_ID))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=create_autospec(crud_mod.get_thread_auth_meta, return_value={"llm_model": "gpt-6.2-sol", "reasoning_effort": "high", "workspace_id": WS_ID})),
+        patch.object(crud_mod, "update_thread_fields", new=update_spy),
+        patch.object(crud_mod, "publish_thread_model", new=pub_model),
+        patch.object(crud_mod, "publish_thread_tuning", new=pub_tuning),
+        patch("src.server.handlers.thread_maintenance.hand_off_on_switch", new=AsyncMock(return_value=False)),
+        patch("src.server.services.llm.thread_model.next_turn_runs_claude_code", new=AsyncMock(return_value=False)),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.patch(
+                f"/api/v1/threads/{THREAD_ID}",
+                json={"llm_model": "gemini-4-neon-low-oauth"},
+            )
+
+    assert resp.status_code == 200
+    # Unconditional manual write (no expected_*), clearing reasoning_effort in the same SQL UPDATE.
+    update_spy.assert_awaited_once_with(
+        THREAD_ID,
+        llm_model="gemini-4-neon-low-oauth",
+        reasoning_effort=None,
+    )
+    pub_model.assert_awaited_once_with(
+        user_id=USER_ID,
+        thread_id=THREAD_ID,
+        workspace_id=WS_ID,
+        llm_model="gemini-4-neon-low-oauth",
+    )
+    pub_tuning.assert_awaited_once_with(
+        user_id=USER_ID,
+        thread_id=THREAD_ID,
+        workspace_id=WS_ID,
+        reasoning_effort=None,
+        fast_mode=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_patch_thread_manual_standard_and_shadowed_custom_models_do_not_clear_effort():
+    """Codex-H4 guard: standard models and user custom models shadowing an
+    Antigravity key must NOT auto-clear reasoning_effort on PATCH."""
+    from src.server.app.threads import router
+
+    catalog = _make_catalog(
+        {
+            "gpt-6.2-sol": {"visible": True, "provider": "openai"},
+            "gemini-4-neon-low-oauth": {"visible": True, "provider": "antigravity-oauth"},
+        }
+    )
+    app = create_test_app(router)
+    app.dependency_overrides[get_current_user_id] = lambda: USER_ID
+
+    # 1) Standard model keeps reasoning_effort untouched.
+    update_std = create_autospec(
+        crud_mod.update_thread_fields,
+        return_value=_thread_row(llm_model="gpt-6.2-sol", reasoning_effort="high"),
+    )
+    pub_tuning_std = create_autospec(thread_lifecycle_feed.publish_thread_tuning)
+    with (
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value={})),
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER_ID))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=create_autospec(crud_mod.get_thread_auth_meta, return_value={"llm_model": "gemini-4-neon-low-oauth", "workspace_id": WS_ID})),
+        patch.object(crud_mod, "update_thread_fields", new=update_std),
+        patch.object(crud_mod, "publish_thread_model", new=create_autospec(thread_lifecycle_feed.publish_thread_model)),
+        patch.object(crud_mod, "publish_thread_tuning", new=pub_tuning_std),
+        patch("src.server.handlers.thread_maintenance.hand_off_on_switch", new=AsyncMock(return_value=False)),
+        patch("src.server.services.llm.thread_model.next_turn_runs_claude_code", new=AsyncMock(return_value=False)),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.patch(
+                f"/api/v1/threads/{THREAD_ID}",
+                json={"llm_model": "gpt-6.2-sol"},
+            )
+    assert resp.status_code == 200
+    update_std.assert_awaited_once_with(THREAD_ID, llm_model="gpt-6.2-sol")
+    pub_tuning_std.assert_not_awaited()
+
+    # 2) Custom model shadowing an Antigravity key keeps reasoning_effort untouched.
+    custom_pref = {
+        "custom_models": [
+            {"name": "gemini-4-neon-low-oauth", "provider": "openai", "model_id": "custom"}
+        ]
+    }
+    update_custom = create_autospec(
+        crud_mod.update_thread_fields,
+        return_value=_thread_row(llm_model="gemini-4-neon-low-oauth", reasoning_effort="high"),
+    )
+    pub_tuning_custom = create_autospec(thread_lifecycle_feed.publish_thread_tuning)
+    with (
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value=custom_pref)),
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER_ID))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=create_autospec(crud_mod.get_thread_auth_meta, return_value={"llm_model": "gpt-6.2-sol", "workspace_id": WS_ID})),
+        patch.object(crud_mod, "update_thread_fields", new=update_custom),
+        patch.object(crud_mod, "publish_thread_model", new=create_autospec(thread_lifecycle_feed.publish_thread_model)),
+        patch.object(crud_mod, "publish_thread_tuning", new=pub_tuning_custom),
+        patch("src.server.handlers.thread_maintenance.hand_off_on_switch", new=AsyncMock(return_value=False)),
+        patch("src.server.services.llm.thread_model.next_turn_runs_claude_code", new=AsyncMock(return_value=False)),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp2 = await c.patch(
+                f"/api/v1/threads/{THREAD_ID}",
+                json={"llm_model": "gemini-4-neon-low-oauth"},
+            )
+    assert resp2.status_code == 200
+    update_custom.assert_awaited_once_with(THREAD_ID, llm_model="gemini-4-neon-low-oauth")
+    pub_tuning_custom.assert_not_awaited()
