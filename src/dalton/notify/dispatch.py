@@ -2654,6 +2654,19 @@ async def evaluate_user_notify_eligibility(
     if is_excluded_automation_for_notify(automation):
         return (False, "toggle_off", [])
 
+    from src.dalton.database.automation_reports import held_delivery_configured
+
+    if isinstance(automation, Mapping) and held_delivery_configured(
+        automation.get("delivery_config")
+    ):
+        logger.info(
+            "[DALTON_NOTIFY] Skipping Dalton notify for automation_id=%s name=%r: "
+            "delivery_config.methods is already configured",
+            str(automation.get("automation_id") or "").strip(),
+            str(automation.get("name") or "").strip(),
+        )
+        return (False, "held_delivery_configured", [])
+
     if not await resolve_enabled_fn(cleaned_uid):
         return (False, "toggle_off", [])
 
@@ -6579,6 +6592,7 @@ async def on_automation_settled(
         from src.dalton.database.automation_reports import (
             automation_has_validated_report_profile,
             ensure_report_failure_alert,
+            held_delivery_configured,
             read_execution_report_confirmed,
         )
 
@@ -6598,6 +6612,16 @@ async def on_automation_settled(
                     exc_info=True,
                 )
             return confirmed
+
+        if held_delivery_configured(automation.get("delivery_config")):
+            logger.info(
+                "[DALTON_NOTIFY] Skipping Dalton notify on settlement for execution_id=%s "
+                "automation_id=%s name=%r: delivery_config.methods is already configured",
+                execution_id,
+                str(automation.get("automation_id") or "").strip(),
+                str(automation.get("name") or "").strip(),
+            )
+            return False
 
         classification = classify_automation_for_notify(automation)
 

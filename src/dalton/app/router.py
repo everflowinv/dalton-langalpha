@@ -3565,7 +3565,6 @@ async def global_search_endpoint(
     user_id: CurrentUserId,
     q: str = Query(default=""),
     limit: int = Query(default=20, ge=1, le=50),
-    include_conversations: bool = Query(default=True),
     workspace_id: str | None = Query(default=None),
     include_content: bool = Query(default=True),
 ) -> dict[str, Any]:
@@ -3594,7 +3593,6 @@ async def global_search_endpoint(
         user_id,
         cleaned_q,
         limit=limit,
-        include_conversations=include_conversations,
         workspace_id=canonical_workspace_id,
         include_content=include_content,
     )

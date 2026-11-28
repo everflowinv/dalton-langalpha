@@ -1403,11 +1403,16 @@ async def _validate_report_automation_route_entries(
     )
     from src.server.database import automation as auto_db
 
+    from src.dalton.notify.delivery_mutex import check_route_held_delivery_conflict
+
     validated_changes: list[tuple[Any, dict[str, Any]]] = []
     for aid, targets, old_targets in changed_entries:
         auto = await auto_db.get_automation(aid, cleaned_uid)
         if not auto:
             continue
+        delivery_conflict = check_route_held_delivery_conflict(auto, targets)
+        if delivery_conflict:
+            raise HTTPException(status_code=409, detail=delivery_conflict)
         if not (
             automation_has_validated_report_profile(auto)
             or instruction_uses_report_skill(auto.get("instruction"))

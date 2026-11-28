@@ -728,6 +728,17 @@ async def create_automation(
         delivery = DeliveryConfig(methods=methods)
         data = data.model_copy(update={"delivery_config": delivery})
 
+    # DALTON-HOOK(dalton-notify): refuse enabling delivery_config.methods alongside Dalton notify
+    if data.delivery_config:
+        from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
+
+        await assert_no_automation_delivery_notify_conflict(
+            user_id=user_id,
+            automation={"name": data.name, "metadata": data.metadata},
+            delivery_config=data.delivery_config.model_dump(),
+            model_pref=model_pref,
+        )
+
     # DALTON-HOOK(coverage-units): generic creation never writes replaced_by_tracker; serialize managed writes FOR SHARE
     if isinstance(data.metadata, Mapping) and "replaced_by_tracker" in data.metadata:
         raise TargetRefused(
@@ -1002,6 +1013,30 @@ async def prepare_owned_automation_update(
         methods = await check_delivery(user_id, delivery["methods"], stored=stored)
         update_kwargs["delivery_config"] = {**delivery, "methods": methods}
 
+    # DALTON-HOOK(dalton-notify): refuse enabling delivery_config.methods alongside Dalton notify
+    if (
+        "delivery_config" in update_kwargs
+        or "name" in update_kwargs
+        or "metadata" in update_kwargs
+    ):
+        from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
+
+        effective_delivery = (
+            update_kwargs["delivery_config"]
+            if "delivery_config" in update_kwargs
+            else current.get("delivery_config")
+        )
+        await assert_no_automation_delivery_notify_conflict(
+            user_id=user_id,
+            automation={
+                "automation_id": automation_id,
+                "name": update_kwargs.get("name", current.get("name")),
+                "metadata": update_kwargs.get("metadata", current.get("metadata")),
+            },
+            delivery_config=effective_delivery,
+            model_pref=model_pref,
+        )
+
     # Recalculate next_run_at if cron expression or timezone changed. Only an
     # active row gets one: a paused or disabled cron keeps the none that pause
     # left it, and resume computes it from the edited expression and zone.
@@ -1190,6 +1225,33 @@ async def recheck_locked_automation_update(
             )
         else:
             effective_kwargs.pop("next_run_at", None)
+
+    # DALTON-HOOK(dalton-notify): recheck delivery/notify conflict if locked row changed
+    if (
+        "delivery_config" in effective_kwargs
+        or "name" in effective_kwargs
+        or "metadata" in effective_kwargs
+    ) and (
+        locked_row.get("delivery_config") != current.get("delivery_config")
+        or locked_row.get("name") != current.get("name")
+        or locked_row.get("metadata") != current.get("metadata")
+    ):
+        from src.dalton.notify.delivery_mutex import assert_no_automation_delivery_notify_conflict
+
+        await assert_no_automation_delivery_notify_conflict(
+            user_id=user_id,
+            automation={
+                "automation_id": str(locked_row.get("automation_id") or current.get("automation_id") or ""),
+                "name": effective_kwargs.get("name", locked_row.get("name")),
+                "metadata": effective_kwargs.get("metadata", locked_row.get("metadata")),
+            },
+            delivery_config=(
+                effective_kwargs["delivery_config"]
+                if "delivery_config" in effective_kwargs
+                else locked_row.get("delivery_config")
+            ),
+            model_pref=pref_for_lock,
+        )
 
 
 def pause_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
