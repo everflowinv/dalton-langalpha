@@ -1571,7 +1571,7 @@ class TestCommunityExecutors:
                                                     "xueqiu",
                                                     "employee",
                                                     "last30days",
-                                                    "agent-reach",
+                                                    "x-search",
                                                     "x-timeline",
                                                 ],
                                             }
@@ -1590,7 +1590,7 @@ class TestCommunityExecutors:
                         {"id": "xueqiu", "kind": "skill", "category": "community", "operations": []},
                         {"id": "employee", "kind": "skill", "category": "community", "operations": []},
                         {"id": "last30days", "kind": "skill", "category": "community", "operations": []},
-                        {"id": "agent-reach", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "x-search", "kind": "agent_tool", "category": "community", "operations": []},
                     ],
                 }
                 return [
@@ -1624,6 +1624,7 @@ class TestCommunityExecutors:
         cat_resp = await bridge.handle_tools_call(20, {"name": "catalog", "arguments": {}})
         cat_body = json.loads(cat_resp["result"]["content"][0]["text"])
         by_id = {r["id"]: r for r in cat_body["routes"]}
+        assert "x-search" not in by_id
         assert "agent-reach" not in by_id
         assert by_id["xueqiu"]["operations"] == ["posts", "post", "comments", "search", "user"]
         assert "ticker" in by_id["xueqiu"]["parameters"]
