@@ -2331,17 +2331,6 @@ async def resolve_thread_media_bindings(
     if registry is None:
         return None
 
-    # Merge steering_delivered items from the current page (e.g., cold-projected before turn_slices persist).
-    for item in item_list:
-        if isinstance(item, Mapping) and item.get("event") == "steering_delivered":
-            data = item.get("data")
-            if isinstance(data, Mapping):
-                _register_steering_messages_into_registry(
-                    data.get("messages"),
-                    registry,
-                    default_owner_id=owner_id,
-                )
-
     bindings: dict[str, tuple[str, str]] = {}
 
     async def _register_upstream_url(

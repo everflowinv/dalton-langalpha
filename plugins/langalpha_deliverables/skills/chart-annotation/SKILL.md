@@ -1,6 +1,6 @@
 ---
 name: chart-annotation
-description: Drawing on the user's chart from Python with chartkit, as one chart layer per analysis (levels, lines, zones, indicators, channels, fibs, projections, trade setups). Also answering a comment the user leaves on a chart.
+description: Drawing on the user's chart from Python with chartkit, as one chart layer per analysis (levels, lines, zones, indicators, channels, fibs, projections, trade setups).<!-- DALTON_CAP:artifact_comments --> Also answering a comment the user leaves on a chart.<!-- /DALTON_CAP -->
 ---
 
 # Drawing on the chart

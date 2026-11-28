@@ -1724,7 +1724,15 @@ async def test_authenticated_fork_replay_rewrites_and_serves_borrowed_screenshot
 def test_chart_annotation_skill_gates_reply_to_comment_on_artifact_comments_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Item 7a: chart-annotation SKILL.md omits reply_to_comment guidance when artifact comments are off."""
+    """Item 7a + r3 #4: chart-annotation SKILL.md body, frontmatter description, and registry description follow the switch."""
+    import yaml
+
+    from ptc_agent.agent.middleware.skills.registry import (
+        get_skill,
+        get_skill_registry,
+        list_skills,
+    )
+
     skill_fp = (
         REPO_ROOT / "plugins" / "langalpha_deliverables" / "skills" / "chart-annotation" / "SKILL.md"
     )
@@ -1733,19 +1741,39 @@ def test_chart_annotation_skill_gates_reply_to_comment_on_artifact_comments_swit
     off_text = content_assembly.read_assembled_text(skill_fp)
     assert "reply_to_comment" not in off_text
     assert "## A comment on the chart" not in off_text
+    assert "comment the user leaves on a chart" not in off_text
     assert "DALTON-HOOK" not in off_text
     assert "DALTON_CAP" not in off_text
+    off_fm = yaml.safe_load(off_text.split("---\n", 2)[1])
+    off_reg = get_skill("chart-annotation")
+    assert off_reg is not None
+    assert off_fm["description"] == off_reg.description
+    assert get_skill_registry()["chart-annotation"].description == off_reg.description
+    off_listed = {s["name"]: s["description"] for s in list_skills()}
+    assert off_listed["chart-annotation"] == off_reg.description
+    assert "comment" not in off_reg.description.lower()
+    assert "DALTON_CAP" not in off_reg.description
 
     monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
     on_text = content_assembly.read_assembled_text(skill_fp)
     assert "## A comment on the chart" in on_text
     assert "reply_to_comment" in on_text
+    assert "Also answering a comment the user leaves on a chart." in on_text
     assert "DALTON-HOOK" not in on_text
     assert "DALTON_CAP" not in on_text
+    on_fm = yaml.safe_load(on_text.split("---\n", 2)[1])
+    on_reg = get_skill("chart-annotation")
+    assert on_reg is not None
+    assert on_fm["description"] == on_reg.description
+    assert get_skill_registry()["chart-annotation"].description == on_reg.description
+    on_listed = {s["name"]: s["description"] for s in list_skills()}
+    assert on_listed["chart-annotation"] == on_reg.description
+    assert "Also answering a comment the user leaves on a chart." in on_reg.description
+    assert "DALTON_CAP" not in on_reg.description
 
 
 def test_channel_routing_fact_prunes_unsupported_apps_and_follows_channel_caps() -> None:
-    """Item 7b: channel-routing.md omits Slack/Telegram/iMessage and renders only enabled Dalton channels."""
+    """Item 7b + r3 #3: channel-routing.md omits Slack/Telegram/iMessage, follows channel caps, and matches Dalton gateway rules."""
     from src.dalton.capabilities import CapabilityId
 
     routing_fp = LANGALPHA_DOC_DIR / "facts" / "channel-routing.md"
@@ -1759,9 +1787,27 @@ def test_channel_routing_fact_prunes_unsupported_apps_and_follows_channel_caps()
         }
     )
     everflow_text = content_assembly.read_assembled_text(routing_fp, capabilities=everflow_caps)
-    for expected in ("## Feishu", "## Discord", "## Personal WeChat"):
+    for expected in (
+        "## Feishu",
+        "## Discord",
+        "## Personal WeChat",
+        "Send `/new` by itself",
+        "Send `/stop` by itself",
+        "Messages from the same sender reuse one active conversation (`feishu:@me`)",
+        "`/workspace`",
+        "`/main`",
+    ):
         assert expected in everflow_text
-    for forbidden in ("Slack", "Telegram", "iMessage", "DALTON-HOOK", "DALTON_CAP"):
+    for forbidden in (
+        "Slack",
+        "Telegram",
+        "iMessage",
+        "DALTON-HOOK",
+        "DALTON_CAP",
+        "/new <text>",
+        "There is no command to stop an answer",
+        "Each topic is a conversation, one per person, in a DM too",
+    ):
         assert forbidden not in everflow_text
 
     core_text = content_assembly.read_assembled_text(routing_fp, capabilities=frozenset())
@@ -1773,5 +1819,144 @@ def test_channel_routing_fact_prunes_unsupported_apps_and_follows_channel_caps()
         capabilities=frozenset({CapabilityId.CHANNEL_GATEWAY, CapabilityId.CHANNEL_DISCORD}),
     )
     assert "## Discord" in discord_only
+    assert "Send `/stop` by itself" in discord_only
     for forbidden in ("Slack", "Telegram", "iMessage", "Feishu", "WeChat", "DALTON-HOOK", "DALTON_CAP"):
         assert forbidden not in discord_only
+
+
+@pytest.mark.asyncio
+async def test_live_steering_attachment_without_saved_slice_emits_no_404_media_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 #1: in-memory steering_delivered attachments whose turn_slices are not persisted yet never get signed links that 404."""
+    src_tid = str(uuid.uuid4())
+    fork_tid = str(uuid.uuid4())
+    viewer_id = "owner-live-1"
+    staged_att_url = "https://cdn.example.com/private-media/attachments/att-live-1/report.pdf"
+    live_upload_id = "up-live-steer-1"
+
+    fork_dict = _make_lineage(source_thread_id=src_tid, turn_base=1, by=viewer_id, snapshot=True)
+    src_rows = _make_thread_rows(
+        thread_id=src_tid,
+        owner_id=viewer_id,
+        workspace_id="ws-src",
+        turn_indexes=[0],
+    )
+    fork_rows = _make_thread_rows(
+        thread_id=fork_tid,
+        owner_id=viewer_id,
+        workspace_id="ws-fork",
+        turn_indexes=[1],
+        fork_dict=fork_dict,
+    )
+    steer_item = {
+        "event": "steering_delivered",
+        "data": {
+            "thread_id": src_tid,
+            "turn_index": 0,
+            "messages": [
+                {
+                    "user_id": viewer_id,
+                    "content": f"Check {staged_att_url}",
+                    "attachments": [
+                        {"name": "report.pdf", "url": staged_att_url},
+                        {"name": "deck.pdf", "upload_id": live_upload_id},
+                    ],
+                }
+            ],
+        },
+    }
+    src_part_lines = [
+        *_make_turn_lines(src_tid, 0, user_text="Initial Q0", assistant_text="Running A0"),
+        line_of(steer_item),
+    ]
+    fork_part_lines = _make_turn_lines(fork_tid, 1, user_text="Fork Q1", assistant_text="Fork A1")
+    page = borrowed_mod.ThreadPage(
+        parts=[
+            borrowed_mod.PagePart(src_tid, viewer_id, src_part_lines, rows=src_rows),
+            borrowed_mod.PagePart(fork_tid, viewer_id, fork_part_lines, rows=fork_rows),
+        ],
+        first_turn_index=0,
+        has_more=False,
+        source="checkpoint",
+        divider=line_of(
+            {
+                "event": "fork_divider",
+                "data": {"source_thread_id": src_tid, "turn_base": 1, "state": "shown"},
+            }
+        ),
+    )
+
+    # DB has no persisted turn_slices row for the live steering yet -> empty ThreadMediaRegistry.
+    monkeypatch.setattr(
+        share_media,
+        "_load_thread_media_registry_from_db",
+        create_autospec(
+            share_media._load_thread_media_registry_from_db,
+            return_value=share_media.ThreadMediaRegistry(),
+        ),
+    )
+    monkeypatch.setattr(
+        share_media,
+        "_is_url_from_configured_storage",
+        create_autospec(
+            share_media._is_url_from_configured_storage,
+            side_effect=lambda u: str(u).startswith("https://cdn.example.com/"),
+        ),
+    )
+    fetch_uploads_mock = create_autospec(
+        share_media._fetch_ready_chat_uploads,
+        return_value={
+            live_upload_id: {
+                "upload_id": live_upload_id,
+                "user_id": viewer_id,
+                "workspace_id": "ws-src",
+            }
+        },
+    )
+    monkeypatch.setattr(share_media, "_fetch_ready_chat_uploads", fetch_uploads_mock)
+
+    # 1. Logged-in owner replay: no signed /media/ link is minted for unsaved steering attachments;
+    # raw storage URLs are replaced with placeholder / stripped.
+    rewritten_owner_lines, _ = await share_media.prepare_owner_replay_media(
+        None,
+        fork_rows,
+        page.lines(),
+        thread_id=fork_tid,
+        viewer_id=viewer_id,
+        page=page,
+    )
+    owner_steer = [
+        ln.item()["data"]
+        for ln in rewritten_owner_lines
+        if ln.event == "steering_delivered"
+    ][0]
+    owner_msg = owner_steer["messages"][0]
+    assert "/media/" not in owner_msg["content"]
+    assert staged_att_url not in owner_msg["content"]
+    assert "[media-unavailable]" in owner_msg["content"]
+    assert "url" not in owner_msg["attachments"][0]
+    assert "url" not in owner_msg["attachments"][1]
+    fetch_uploads_mock.assert_not_awaited()
+
+    # 2. Public share replay (allow_files=True): same DB-only binding check -> no 404 link emitted.
+    public_bindings = await share_media.resolve_thread_media_bindings(
+        {"conversation_thread_id": src_tid, "workspace_id": "ws-src", "user_id": viewer_id},
+        src_rows.queries,
+        [steer_item],
+    )
+    assert public_bindings == {}
+    public_rewritten = share_media.rewrite_items_for_public_media(
+        [steer_item],
+        thread_id=fork_tid,
+        share_token="tok-live-steer",
+        bindings=public_bindings,
+        source_segment_index=0,
+        source_thread_id=src_tid,
+    )
+    pub_msg = public_rewritten[0]["data"]["messages"][0]
+    assert "/media/" not in pub_msg["content"]
+    assert staged_att_url not in pub_msg["content"]
+    assert "[media-unavailable]" in pub_msg["content"]
+    assert "url" not in pub_msg["attachments"][0]
+    assert "url" not in pub_msg["attachments"][1]

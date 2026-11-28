@@ -271,6 +271,14 @@ function MarketViewInner() {
   // The workspace the chat runs in: Home under the Chief of Staff, the selected
   // one otherwise. The chart shows the agent's layers drawn in it.
   const activeWorkspaceId = scope === 'all' ? homeWorkspace?.workspace_id ?? null : selectedWorkspaceId;
+  // DALTON-HOOK(team-sharing): pass the loaded Home or selected workspace record to MarketChart.
+  const activeWorkspace = useMemo(
+    () =>
+      scope === 'all'
+        ? (homeWorkspace ?? null)
+        : (workspaces.find((ws) => ws.workspace_id === selectedWorkspaceId) ?? null),
+    [scope, homeWorkspace, workspaces, selectedWorkspaceId],
+  );
 
   // A comment being written on the chart belongs to this workspace's chart,
   // and goes when the chart moves to another, so a move that takes the chart
@@ -732,6 +740,7 @@ function MarketViewInner() {
               symbol={selectedStock}
               interval={selectedInterval}
               workspaceId={activeWorkspaceId}
+              workspace={activeWorkspace}
               onIntervalChange={handleIntervalChange}
               onCapture={handleCaptureChart}
               onStockMeta={handleStockMeta as any}
@@ -884,6 +893,7 @@ function MarketViewInner() {
                   symbol={selectedStock}
                   interval={selectedInterval}
                   workspaceId={activeWorkspaceId}
+                  workspace={activeWorkspace}
                   onIntervalChange={handleIntervalChange}
                   onCapture={handleCaptureChart}
                   onStockMeta={handleStockMeta as any}

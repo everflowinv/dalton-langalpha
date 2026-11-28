@@ -81,6 +81,13 @@ interface MarketChartProps {
   interval?: string;
   /** Active workspace — scopes which agent-drawn chart instance is shown. */
   workspaceId?: string | null;
+  // DALTON-HOOK(team-sharing): optional loaded workspace record so chart comments can verify ownership without waiting on detail cache.
+  workspace?: {
+    user_id?: string | null;
+    name?: string | null;
+    effective_web_access?: string | null;
+    colleague_dispatch_enabled?: boolean | null;
+  } | null;
   onIntervalChange?: (interval: string) => void;
   onCapture?: () => void;
   onStockMeta?: (meta: unknown) => void;
@@ -184,6 +191,7 @@ const MarketChart = React.memo(function MarketChart({
   symbol,
   interval = '1day',
   workspaceId,
+  workspace,
   onIntervalChange,
   onCapture: _onCapture,
   onStockMeta,
@@ -434,7 +442,7 @@ const MarketChart = React.memo(function MarketChart({
   const layerChartKey = chartKeyFor(workspaceId, symbol, interval);
   // Comments are kept on the chart its layers are drawn on, and only the Light chart draws them.
   const chartId = chartIdFor(symbol, interval);
-  const chartComments = useChartComments(comments, isCustom, { workspaceId, chartId });
+  const chartComments = useChartComments(comments, isCustom, { workspaceId, chartId, workspace });
   // What the chart plots itself, so a layer's copy of it is not drawn twice.
   const layerBuiltins = useMemo(() => ({ rsiPeriod, maPeriods: enabledMaPeriods, volume: true }), [rsiPeriod, enabledMaPeriods]);
   const layerDrawing = useChartLayerDrawing({

@@ -34,7 +34,20 @@ export interface ChartCommentsWiring {
 export function useChartComments(
   host: ChartCommentsHost | null,
   isCustom: boolean,
-  { workspaceId, chartId }: { workspaceId: string | null | undefined; chartId: string | null },
+  {
+    workspaceId,
+    chartId,
+    workspace,
+  }: {
+    workspaceId: string | null | undefined;
+    chartId: string | null;
+    workspace?: {
+      user_id?: string | null;
+      name?: string | null;
+      effective_web_access?: string | null;
+      colleague_dispatch_enabled?: boolean | null;
+    } | null;
+  },
 ): ChartCommentsWiring {
   const { t } = useTranslation();
   // DALTON-HOOK(artifact-publishing-off): chart comments ride the deployment's
@@ -42,7 +55,7 @@ export function useChartComments(
   // ownership checks (external/unconfirmed callers and colleague workspaces get no entry).
   const { artifactCommentsEnabled } = useCapabilities();
   const identity = useCallerIdentity(); // DALTON-HOOK(external-share-guard)
-  const teamReadOnly = useTeamReadOnly(workspaceId); // DALTON-HOOK(team-sharing)
+  const teamReadOnly = useTeamReadOnly(workspaceId, workspace); // DALTON-HOOK(team-sharing)
   const canComment =
     artifactCommentsEnabled
     && identity.canActAsOwner

@@ -168,6 +168,7 @@ export type ResourceTier = 'standard' | 'performance' | 'max' | 'xlarge';
 
 export interface Workspace {
   workspace_id: string;
+  user_id?: string | null;
   name: string;
   /** Lifecycle of the workspace's computer. Home reads `'unbound'` until its
    *  first start or turn puts it on one. */

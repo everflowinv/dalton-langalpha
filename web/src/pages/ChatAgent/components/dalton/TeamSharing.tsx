@@ -22,6 +22,7 @@ import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
 import { shortMonthDay } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
+import { cachedHomeRow, workspaceDetailQuery } from '@/pages/ChatAgent/utils/workspaceQueries';
 import { cn } from '@/lib/utils';
 
 const FALLBACK_QUERY_CLIENT: QueryClientType = new QueryClient({
@@ -132,6 +133,19 @@ export function useTeamReadOnly(
   const identity = useCallerIdentity({ enabled: teamAccessActive });
   const { user: currentUser } = useUser({ enabled: teamAccessActive });
   const { data: teamData } = useTeamWorkspaces(teamAccessActive);
+  // DALTON-HOOK(team-sharing): subscribe to workspace detail when callers omit workspaceRecord
+  // so an empty detail cache resolves ownership instead of staying stuck in fail-closed read-only.
+  const cachedHome = contextClient ? cachedHomeRow(queryClient, workspaceId) ?? null : null;
+  const shouldFetchDetail =
+    teamAccessActive && Boolean(contextClient) && !workspaceRecord && !cachedHome?.user_id;
+  const { data: queriedWorkspaceRecord } = useQuery(
+    {
+      ...workspaceDetailQuery(workspaceId ?? ''),
+      enabled: shouldFetchDetail,
+      retry: false,
+    },
+    queryClient,
+  );
   const callerTier = identity.isPlatform
     ? null
     : identity.status === 'ready'
@@ -154,6 +168,8 @@ export function useTeamReadOnly(
 
   const resolvedWorkspaceRecord =
     workspaceRecord ??
+    queriedWorkspaceRecord ??
+    cachedHome ??
     (contextClient
       ? queryClient.getQueryData<{
           user_id?: string | null;
