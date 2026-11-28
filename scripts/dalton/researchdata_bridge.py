@@ -8456,15 +8456,17 @@ class ResearchDataBridge:
             self._concurrency.automation_reserved,
         )
 
+    _RETIRED_HANDOFF_ROUTES: frozenset[str] = frozenset({"agent-reach"})
+
     def handoff_routes(self) -> set[str]:
-        """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
+        """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes (always rejecting retired `agent-reach`)."""
         try:
             raw = json.loads(
                 self.cfg.data_sources_json.read_text(encoding="utf-8")
             )
             routes = raw.get("routes") if isinstance(raw, dict) else []
             if not isinstance(routes, list):
-                return set()
+                return set(self._RETIRED_HANDOFF_ROUTES)
             return {
                 str(r["id"])
                 for r in routes
@@ -8472,7 +8474,7 @@ class ResearchDataBridge:
                 and r.get("id")
                 and r.get("kind") in ("agent_tool", "skill")
                 and str(r["id"]) not in BRIDGE_COMMUNITY_ROUTES
-            }
+            } | set(self._RETIRED_HANDOFF_ROUTES)
         except Exception as exc:
             logger.warning("Failed to load data_sources.json: %s", type(exc).__name__)
             return {

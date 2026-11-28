@@ -16,7 +16,6 @@ from scripts.dalton import researchdata_bridge as bridge_mod
 from src.dalton.conversations import render as render_mod
 from src.dalton.conversations import search as search_mod
 from src.dalton.database import conversations as db_conv
-from src.dalton.settings import get_dalton_bridge_embed_url
 from src.dalton.tools import build_dalton_tools
 
 
@@ -456,11 +455,6 @@ async def test_researchdata_bridge_embed_security_and_limits(
     res_no_key = await bridge_no_key._run_company_wiki_embed(["test"], "RETRIEVAL_QUERY")
     assert res_no_key["ok"] is False
     assert "GEMINI_API_KEY" in res_no_key["error"]
-
-    # URL builder in settings never puts token in URL path
-    url = get_dalton_bridge_embed_url("127.0.0.1")
-    assert url == "http://127.0.0.1:8960/embed"
-    assert "token" not in url
 
 
 def test_integration_conftest_sessionstart_test_db_guard(

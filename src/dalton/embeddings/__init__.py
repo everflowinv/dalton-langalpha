@@ -62,8 +62,6 @@ from src.dalton.embeddings.metadata import (
     parse_vector_dimensions,
     resolve_locked_embedding_dimensions,
     upsert_embedding_metadata,
-    validate_bridge_embedding_match,
-    validate_bridge_task_types,
     validate_embedding_metadata_match,
 )
 
@@ -112,8 +110,6 @@ __all__ = [
     "resolve_locked_embedding_dimensions",
     "resolve_max_direct_concurrency",
     "upsert_embedding_metadata",
-    "validate_bridge_embedding_match",
-    "validate_bridge_task_types",
     "validate_embedding_metadata_match",
     "validate_embedding_task_type",
 ]

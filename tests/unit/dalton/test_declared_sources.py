@@ -1639,6 +1639,123 @@ class TestCommunityExecutors:
         assert "去重" in xtl_rules
 
     @pytest.mark.asyncio
+    async def test_legacy_upstream_agent_reach_filtered_even_with_new_data_sources_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even when data_sources.json loads cleanly without `agent-reach`, an upstream MCP
+        that still emits `agent-reach` has it stripped from `tools/list` and `catalog`, and
+        direct calls are rejected with `handoff_filtered`."""
+        ds_file = tmp_path / "new_data_sources.json"
+        ds_file.write_text(
+            json.dumps(
+                {
+                    "routes": [
+                        {"id": "xueqiu", "kind": "skill"},
+                        {"id": "employee", "kind": "skill"},
+                        {"id": "last30days", "kind": "skill"},
+                        {"id": "x-timeline", "kind": "skill"},
+                        {"id": "x-search", "kind": "agent_tool"},
+                        {"id": "web-news", "kind": "agent_tool"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        bridge.cfg.data_sources_json = ds_file
+
+        async def _legacy_responder(
+            reqs: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            if req["method"] == "initialize":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "researchdata", "version": "1.0.0"},
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/list":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "community",
+                                    "description": "Community sources.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "xueqiu",
+                                                    "employee",
+                                                    "last30days",
+                                                    "agent-reach",
+                                                    "x-timeline",
+                                                ],
+                                            }
+                                        },
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/call" and req["params"]["name"] == "catalog":
+                cat_payload = {
+                    "ok": True,
+                    "status": "ok",
+                    "routes": [
+                        {"id": "xueqiu", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "agent-reach", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "x-timeline", "kind": "skill", "category": "community", "operations": []},
+                    ],
+                }
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(cat_payload)}]
+                        },
+                    }
+                ], 0
+            raise AssertionError(f"Unexpected method: {req}")
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_legacy_responder)
+        )
+
+        assert "agent-reach" in bridge.handoff_routes()
+
+        tools = await bridge.get_filtered_tools()
+        comm_tool = next(t for t in tools if t["name"] == "community")
+        enum_vals = comm_tool["inputSchema"]["properties"]["route"]["enum"]
+        assert "agent-reach" not in enum_vals
+        assert enum_vals == ["xueqiu", "employee", "last30days", "x-timeline"]
+
+        cat_resp = await bridge.handle_tools_call(21, {"name": "catalog", "arguments": {}})
+        cat_body = json.loads(cat_resp["result"]["content"][0]["text"])
+        cat_ids = {r["id"] for r in cat_body["routes"]}
+        assert "agent-reach" not in cat_ids
+
+        call_resp = await bridge.handle_tools_call(
+            22,
+            {"name": "community", "arguments": {"route": "agent-reach"}},
+        )
+        call_body = json.loads(call_resp["result"]["content"][0]["text"])
+        assert call_body["ok"] is False
+        assert call_body["status"] == "handoff_filtered"
+
+    @pytest.mark.asyncio
     async def test_parameter_whitelist_and_injection_rejection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

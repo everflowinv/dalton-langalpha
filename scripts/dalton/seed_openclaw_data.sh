@@ -10,16 +10,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+SUBCOMMAND=""
 MODE="dry-run"
 TARGET_DIR="${REPO_ROOT}/var/dalton/openclaw-data"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dalton/seed_openclaw_data.sh [--dry-run | --apply] [--target <dir>]
+Usage: scripts/dalton/seed_openclaw_data.sh [cleanup-retired-cos] [--dry-run | --apply] [--target <dir>]
+
+Subcommands:
+  cleanup-retired-cos  Targeted release cleanup: remove retired COS files
+                       (scripts/sentiment_dashboard_cos_upload.py,
+                        skills/kweb-dashboard/scripts/kweb_cos_upload.py,
+                        state/sentiment-dashboard/cos-venv/) inside --target
+                       and sync the updated skills/kweb-dashboard/scripts/kweb_dashboard_cli.py.
+                       Defaults to dry-run (prints paths only); pass --apply to delete and sync.
 
 Options:
-  --dry-run          Preview asset deployment without writing (default).
-  --apply            Install Dalton data assets into the target directory.
+  --dry-run          Preview asset deployment or cleanup without writing (default).
+  --apply            Install Dalton data assets (or execute cleanup-retired-cos).
   --target <dir>     Target Dalton data root directory (default: <repo>/var/dalton/openclaw-data).
   -h, --help         Show this help message.
 EOF
@@ -27,6 +36,15 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    cleanup-retired-cos)
+      if [[ -n "${SUBCOMMAND}" ]]; then
+        echo "ERROR: Duplicate subcommand: $1" >&2
+        usage >&2
+        exit 2
+      fi
+      SUBCOMMAND="cleanup-retired-cos"
+      shift
+      ;;
     --dry-run)
       MODE="dry-run"
       shift
@@ -107,6 +125,135 @@ EVERFLOW_ONLY_LIST="${ASSETS_DIR}/everflow_only.txt"
 ANTIGRAVITY_SERIES_MODULE_SRC="${REPO_ROOT}/src/dalton/llm/antigravity_series.py"
 ANTIGRAVITY_SERIES_MODULE_REL="skills/model-usage-cost/scripts/antigravity_series.py"
 ANTIGRAVITY_SERIES_JSON_REL="skills/model-usage-cost/references/antigravity_series.json"
+
+run_cleanup_retired_cos() {
+  local py_bin="python3"
+  if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    py_bin="${REPO_ROOT}/.venv/bin/python"
+  fi
+  local kweb_cli_src="${ASSETS_DIR}/skills/kweb-dashboard/scripts/kweb_dashboard_cli.py"
+  "${py_bin}" - "${TARGET_DIR}" "${kweb_cli_src}" "${MODE}" <<'PY'
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+target_raw, kweb_cli_src_raw, mode = sys.argv[1:4]
+apply_changes = mode == "apply"
+target_path = Path(target_raw)
+kweb_cli_src = Path(kweb_cli_src_raw)
+
+RETIRED_TARGETS: tuple[tuple[str, str], ...] = (
+    ("scripts/sentiment_dashboard_cos_upload.py", "file"),
+    ("skills/kweb-dashboard/scripts/kweb_cos_upload.py", "file"),
+    ("state/sentiment-dashboard/cos-venv", "dir"),
+)
+KWEB_CLI_REL = "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py"
+
+if not kweb_cli_src.is_file():
+    print(f"ERROR: missing source asset: {kweb_cli_src}", file=sys.stderr)
+    sys.exit(1)
+
+if not target_path.exists():
+    if apply_changes:
+        print(f"ERROR: target data volume directory does not exist: {target_path}", file=sys.stderr)
+        sys.exit(1)
+    root_real = os.path.abspath(str(target_path))
+else:
+    if not target_path.is_dir():
+        print(f"ERROR: target path is not a directory: {target_path}", file=sys.stderr)
+        sys.exit(1)
+    root_real = os.path.realpath(str(target_path))
+
+
+def _ensure_inside_root(candidate_rel: str) -> str:
+    cand_norm = os.path.normpath(os.path.join(root_real, candidate_rel))
+    if os.path.commonpath([root_real, cand_norm]) != root_real or cand_norm == root_real:
+        raise RuntimeError(f"Refusing path outside target directory ({root_real}): {cand_norm}")
+    # Verify every existing ancestor up to root_real does not symlink-escape root_real.
+    parent = os.path.dirname(cand_norm)
+    probe = parent
+    while True:
+        if os.path.exists(probe) or os.path.islink(probe):
+            probe_real = os.path.realpath(probe)
+            if os.path.commonpath([root_real, probe_real]) != root_real:
+                raise RuntimeError(
+                    f"Refusing path with ancestor symlink outside target ({root_real}): {probe} -> {probe_real}"
+                )
+            break
+        next_probe = os.path.dirname(probe)
+        if next_probe == probe:
+            break
+        probe = next_probe
+    if os.path.lexists(cand_norm) and not os.path.islink(cand_norm):
+        cand_real = os.path.realpath(cand_norm)
+        if os.path.commonpath([root_real, cand_real]) != root_real or cand_real == root_real:
+            raise RuntimeError(f"Refusing resolved path outside target ({root_real}): {cand_real}")
+    return cand_norm
+
+
+mode_label = "APPLY" if apply_changes else "DRY-RUN (pass --apply to delete and sync)"
+print(f"[seed_openclaw_data] Subcommand: cleanup-retired-cos")
+print(f"[seed_openclaw_data] Mode: {mode_label}")
+print(f"[seed_openclaw_data] Target: {root_real}/")
+
+try:
+    resolved_items: list[tuple[str, str, str]] = []
+    for rel, kind in RETIRED_TARGETS:
+        resolved_items.append((rel, kind, _ensure_inside_root(rel)))
+    kweb_dst = _ensure_inside_root(KWEB_CLI_REL)
+except RuntimeError as exc:
+    print(f"ERROR: [seed_openclaw_data] {exc}", file=sys.stderr)
+    sys.exit(1)
+
+for rel, kind, abs_path in resolved_items:
+    exists = os.path.lexists(abs_path)
+    if not apply_changes:
+        status = "would remove" if exists else "absent"
+        print(f"[seed_openclaw_data] DRY-RUN {status} ({kind}): {abs_path}")
+        continue
+    if not exists:
+        print(f"[seed_openclaw_data] Already absent ({kind}): {abs_path}")
+        continue
+    if os.path.islink(abs_path):
+        os.unlink(abs_path)
+        print(f"[seed_openclaw_data] Removed symlink: {abs_path}")
+    elif os.path.isdir(abs_path):
+        if kind != "dir":
+            print(f"ERROR: expected file but found directory: {abs_path}", file=sys.stderr)
+            sys.exit(1)
+        shutil.rmtree(abs_path)
+        print(f"[seed_openclaw_data] Removed dir: {abs_path}")
+    else:
+        os.unlink(abs_path)
+        print(f"[seed_openclaw_data] Removed file: {abs_path}")
+
+if not apply_changes:
+    print(f"[seed_openclaw_data] DRY-RUN sync asset: {kweb_cli_src} -> {kweb_dst}")
+else:
+    dst_parent = os.path.dirname(kweb_dst)
+    os.makedirs(dst_parent, exist_ok=True)
+    if os.path.commonpath([root_real, os.path.realpath(dst_parent)]) != root_real:
+        print(f"ERROR: destination parent escaped target directory: {dst_parent}", file=sys.stderr)
+        sys.exit(1)
+    fd, tmp_name = tempfile.mkstemp(prefix=".kweb_dashboard_cli.py.", dir=dst_parent)
+    os.close(fd)
+    try:
+        shutil.copy2(str(kweb_cli_src), tmp_name)
+        os.replace(tmp_name, kweb_dst)
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+    print(f"[seed_openclaw_data] Synced asset: {kweb_cli_src} -> {kweb_dst}")
+PY
+}
+
+if [[ "${SUBCOMMAND}" == "cleanup-retired-cos" ]]; then
+  run_cleanup_retired_cos
+  exit 0
+fi
 
 resolve_deployment_profile() {
   local py_bin="python3"

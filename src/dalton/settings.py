@@ -1936,27 +1936,6 @@ def get_dalton_public_app_url() -> str:
     return ""
 
 
-def get_dalton_bridge_embed_url(host: str | None = None) -> str:
-    """Return the host bridge `/embed` URL, or ``""`` when bridge capability is off."""
-    from src.dalton.capabilities import CapabilityId, has_capability
-
-    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
-        return ""
-    resolved_host = host or HOST_IP or "host.docker.internal"
-    explicit = os.getenv("DALTON_BRIDGE_EMBED_URL", "").strip()
-    if explicit:
-        url = explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
-        if "/embed/" in url:
-            url = url.split("/embed/", 1)[0] + "/embed"
-        return url
-    rd_url = get_dalton_researchdata_url()
-    origin = _extract_bridge_origin_from_url(rd_url, host_override=host)
-    if origin:
-        return f"{origin}/embed"
-    port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
-    return f"http://{resolved_host}:{port}/embed"
-
-
 def get_sec_user_agent() -> str:
     """Return ``SEC_USER_AGENT`` / ``EDGAR_IDENTITY`` from env, or a neutral placeholder."""
     return resolve_sec_user_agent()[0]

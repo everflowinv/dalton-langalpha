@@ -675,6 +675,28 @@ def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
     assert warn_result["upload_skipped"] is True
 
 
+def test_kweb_deploy_without_no_upload_refuses_before_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_kweb_cli_for_test(tmp_path, monkeypatch)
+    out_html = tmp_path / "research-outputs" / "kweb-dashboard" / "index.html"
+    build_spy = create_autospec(cli.build)
+    monkeypatch.setattr(cli, "build", build_spy)
+
+    rc = cli.main(["deploy", "--output", str(out_html), "--json"])
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "--no-upload" in payload["error"]
+    build_spy.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="--no-upload"):
+        cli.deploy(out_html)
+    build_spy.assert_not_called()
+
+
 def _load_kweb_cli_for_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     import importlib.util
     import types

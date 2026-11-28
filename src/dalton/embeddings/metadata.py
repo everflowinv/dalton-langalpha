@@ -19,7 +19,6 @@ from src.dalton.embeddings.config import (
     DEFAULT_TASK_TYPE_QUERY,
     MAX_EMBEDDING_DIMENSIONS,
     EmbeddingConfig,
-    resolve_api_model_name,
     validate_embedding_task_type,
 )
 from src.server.database.pool import get_db_connection
@@ -178,87 +177,6 @@ def validate_embedding_metadata_match(
     if mismatches:
         raise EmbeddingMetadataMismatchError(
             f"Embedding configuration mismatch for scope={locked.scope!r}: "
-            + "; ".join(mismatches)
-        )
-
-
-def validate_bridge_task_types(
-    *,
-    task_type_doc: str | None,
-    task_type_query: str | None,
-    scope: str = DEFAULT_EMBEDDING_SCOPE,
-) -> None:
-    """Reject host-bridge embedding unless doc/query task types match the legacy bridge contract.
-
-    The legacy ``researchdata_bridge /embed`` endpoint sends ``RETRIEVAL_QUERY``
-    for queries and accepts only ``RETRIEVAL_DOCUMENT`` / ``RETRIEVAL_QUERY`` for
-    documents (coercing any other value to ``RETRIEVAL_DOCUMENT``).
-    """
-    norm_doc = str(task_type_doc or "").strip().upper()
-    norm_query = str(task_type_query or "").strip().upper()
-    mismatches: list[str] = []
-    if norm_doc != DEFAULT_TASK_TYPE_DOC:
-        mismatches.append(
-            f"task_type_doc={norm_doc or task_type_doc!r} != bridge-supported {DEFAULT_TASK_TYPE_DOC!r}"
-        )
-    if norm_query != DEFAULT_TASK_TYPE_QUERY:
-        mismatches.append(
-            f"task_type_query={norm_query or task_type_query!r} != bridge-supported {DEFAULT_TASK_TYPE_QUERY!r}"
-        )
-    if mismatches:
-        raise EmbeddingMetadataMismatchError(
-            f"Bridge embedding task_type mismatch for scope={scope!r}: "
-            + "; ".join(mismatches)
-            + ". Host bridge rollback only supports RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY."
-        )
-
-
-def validate_bridge_embedding_match(
-    model_used: str | None,
-    dimensions: int | None,
-    locked: EmbeddingMetadata,
-    *,
-    task_type_doc: str = DEFAULT_TASK_TYPE_DOC,
-    task_type_query: str = DEFAULT_TASK_TYPE_QUERY,
-) -> None:
-    """Validate that a bridge-returned embedding vector, provider, model, and task types match locked metadata."""
-    if dimensions is not None and int(dimensions) != locked.dimensions:
-        raise EmbeddingDimensionMismatchError(
-            f"Bridge embedding dimension mismatch for scope={locked.scope!r}: "
-            f"returned dimensions={dimensions}, locked dimensions={locked.dimensions} "
-            f"(provider={locked.provider!r}, model_label={locked.model_label!r})."
-        )
-    mismatches: list[str] = []
-    if locked.provider != DEFAULT_EVERFLOW_PROVIDER:
-        mismatches.append(
-            f"provider bridge={DEFAULT_EVERFLOW_PROVIDER!r} != locked={locked.provider!r}"
-        )
-    cleaned_model = str(model_used or "").strip()
-    resolved_api = resolve_api_model_name(cleaned_model)
-    model_matches = bool(cleaned_model) and (
-        cleaned_model == locked.model_label
-        or (cleaned_model == locked.api_model_name and resolved_api == locked.api_model_name)
-    )
-    if not model_matches:
-        mismatches.append(
-            f"returned model={cleaned_model!r} (api_model={resolved_api!r}) != "
-            f"locked model_label={locked.model_label!r} / api_model_name={locked.api_model_name!r}"
-        )
-    norm_doc = str(task_type_doc or "").strip().upper()
-    norm_query = str(task_type_query or "").strip().upper()
-    if norm_doc != DEFAULT_TASK_TYPE_DOC or locked.task_type_doc != norm_doc:
-        mismatches.append(
-            f"task_type_doc bridge={norm_doc!r} vs locked={locked.task_type_doc!r} "
-            f"(bridge requires {DEFAULT_TASK_TYPE_DOC!r})"
-        )
-    if norm_query != DEFAULT_TASK_TYPE_QUERY or locked.task_type_query != norm_query:
-        mismatches.append(
-            f"task_type_query bridge={norm_query!r} vs locked={locked.task_type_query!r} "
-            f"(bridge requires {DEFAULT_TASK_TYPE_QUERY!r})"
-        )
-    if mismatches:
-        raise EmbeddingMetadataMismatchError(
-            f"Bridge embedding metadata mismatch for scope={locked.scope!r}: "
             + "; ".join(mismatches)
         )
 

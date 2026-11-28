@@ -264,3 +264,113 @@ def test_guidepoint_proxy_run_sh_resolves_env_and_python_override(tmp_path: Path
     assert res.returncode == 0, res.stderr
     assert f"script={RESEARCH_SCRIPTS / 'guidepoint_mcp_proxy.py'}" in res.stdout
     assert "has_id=1 has_sec=1" in res.stdout
+
+
+def test_guidepoint_preflight_and_launcher_resolve_identical_paths(tmp_path: Path) -> None:
+    """Preflight (`resolve_legacy_proxy_effective_paths`) and launcher (`guidepoint_mcp_proxy_run.sh`
+    + `guidepoint_lock.resolve_guidepoint_tokens_file`) derive identical config and token paths,
+    including when a legacy plist only sets `DALTON_OCW_ROOT`."""
+    import plistlib
+
+    bse = _load_module("test_gp_bse_mod", REPO_ROOT / "scripts" / "dalton" / "bridge_subprocess_env.py")
+    run_sh = RESEARCH_SCRIPTS / "guidepoint_mcp_proxy_run.sh"
+
+    fake_home = (tmp_path / "home").resolve()
+    default_rh = fake_home / "Library" / "Application Support" / "Everflow" / "research"
+    custom_rh = (tmp_path / "custom_research_home").resolve()
+    legacy_ocw = (tmp_path / "legacy_ocw_root").resolve()
+    explicit_dir = (tmp_path / "explicit_cfg").resolve()
+    for d in (default_rh / "config", custom_rh / "config", legacy_ocw / "config", explicit_dir):
+        d.mkdir(parents=True)
+
+    (default_rh / "config" / "guidepoint_mcp.env").write_text(
+        "GP_ENV_SOURCE=default\n", encoding="utf-8"
+    )
+    (custom_rh / "config" / "guidepoint_mcp.env").write_text(
+        "GP_ENV_SOURCE=custom\n", encoding="utf-8"
+    )
+    (legacy_ocw / "config" / "guidepoint_mcp.env").write_text(
+        "GP_ENV_SOURCE=legacy_ocw\n", encoding="utf-8"
+    )
+    explicit_tokens = explicit_dir / "custom_tokens.json"
+    explicit_env_file = explicit_dir / "override.env"
+    explicit_env_file.write_text(
+        f'GP_ENV_SOURCE=explicit\nGUIDEPOINT_TOKENS_FILE="{explicit_tokens}"\n',
+        encoding="utf-8",
+    )
+
+    probe_py = tmp_path / "probe_tokens.py"
+    probe_py.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'scripts' / 'dalton' / 'research_runtime')!r})\n"
+        "from guidepoint_lock import resolve_guidepoint_tokens_file\n"
+        'print(json.dumps({"env_source": os.environ.get("GP_ENV_SOURCE", ""), '
+        '"tokens_file": str(resolve_guidepoint_tokens_file(environ=os.environ))}))\n',
+        encoding="utf-8",
+    )
+    stub_py = tmp_path / "probe_py.sh"
+    stub_py.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{probe_py}"\n',
+        encoding="utf-8",
+    )
+    stub_py.chmod(0o755)
+
+    cases: list[tuple[str, dict[str, str], str, Path, Path]] = [
+        (
+            "dalton_research_home",
+            {"HOME": str(fake_home), "DALTON_RESEARCH_HOME": str(custom_rh)},
+            "custom",
+            custom_rh / "config" / "guidepoint_mcp.env",
+            custom_rh / "config" / "guidepoint_mcp_tokens.json",
+        ),
+        (
+            "legacy_ocw_root_only",
+            {"HOME": str(fake_home), "DALTON_OCW_ROOT": str(legacy_ocw)},
+            "default",
+            default_rh / "config" / "guidepoint_mcp.env",
+            default_rh / "config" / "guidepoint_mcp_tokens.json",
+        ),
+        (
+            "explicit_env_and_tokens",
+            {
+                "HOME": str(fake_home),
+                "DALTON_RESEARCH_HOME": str(custom_rh),
+                "GUIDEPOINT_ENV_FILE": str(explicit_env_file),
+            },
+            "explicit",
+            explicit_env_file,
+            explicit_tokens,
+        ),
+    ]
+
+    for name, plist_env, expected_src, expected_env_path, expected_tokens_path in cases:
+        plist_path = tmp_path / f"{name}.plist"
+        plist_path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.dalton.guidepoint-mcp-proxy",
+                    "ProgramArguments": ["/bin/bash", str(run_sh)],
+                    "EnvironmentVariables": plist_env,
+                }
+            )
+        )
+        preflight_res = bse.resolve_legacy_proxy_effective_paths(
+            repo_root=REPO_ROOT,
+            home_dir=fake_home,
+            existing_proxy_plist_path=plist_path,
+        )
+        proc = subprocess.run(
+            ["/bin/bash", str(run_sh)],
+            env={**plist_env, "PATH": "/usr/bin:/bin", "GUIDEPOINT_PYTHON": str(stub_py)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"{name}: {proc.stderr}"
+        launcher_res = json.loads(proc.stdout.strip())
+
+        assert Path(preflight_res["guidepoint_env_file"]).resolve() == expected_env_path.resolve(), name
+        assert Path(preflight_res["tokens_file"]).resolve() == expected_tokens_path.resolve(), name
+        assert launcher_res["env_source"] == expected_src, name
+        assert Path(launcher_res["tokens_file"]).resolve() == Path(preflight_res["tokens_file"]).resolve(), name
+        assert preflight_res["effective_env"].get("GP_ENV_SOURCE") == launcher_res["env_source"], name

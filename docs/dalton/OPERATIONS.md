@@ -234,6 +234,16 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
     - `evidence.sqlite`（权限 `0600`，本地技术计量账本）
     - `collector-status.json`（权限 `0600`，原子写入 `ok`、`collected_at`、`last_ok_at`、`consecutive_failures` 等状态）
     - `collector.lock`（采集互斥锁文件）
+- **部署与刷新命令**：
+  ```bash
+  # 1. 校验采集器 Python，预览指针、账本大小与标签状态
+  bash scripts/dalton/ops/usage_collector_switch.sh --plan
+
+  # 2. 写入指针、加载 com.dalton.usage-collector 并等待首次 ok:true（最多 300 秒）
+  bash scripts/dalton/ops/usage_collector_switch.sh --apply
+  # 若目标目录已存在 evidence.sqlite 且需以指定源覆盖（原文件将重命名为 evidence.sqlite.pre-apply.<时间戳> 保留）：
+  bash scripts/dalton/ops/usage_collector_switch.sh --apply --force
+  ```
 - **排查位置**：
   - `launchd` 服务状态：`launchctl print gui/$(id -u)/com.dalton.usage-collector`
   - 当前指针指向：`cat ~/.config/dalton/usage-state-dir`

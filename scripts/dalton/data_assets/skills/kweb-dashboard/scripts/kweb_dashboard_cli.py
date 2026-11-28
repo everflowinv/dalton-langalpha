@@ -1684,10 +1684,14 @@ def self_test() -> dict[str, Any]:
 def deploy(
     output: Path,
     allow_warnings: bool = False,
-    no_upload: bool = True,
+    no_upload: bool = False,
 ) -> dict[str, Any]:
-    """先 build（含推进虚拟组合），仅在本地生成页面（no_upload 为兼容空参数）。"""
-    _ = no_upload
+    """先 build（含推进虚拟组合）；COS 上传已停用，必须显式传入 no_upload=True（--no-upload）。"""
+    if not no_upload:
+        raise RuntimeError(
+            "COS 上传已停用（看板统一在 Everflow 监控面板查看，不再上传 eve.lumos.space）；"
+            "请显式传入 `deploy --no-upload` 以仅生成本地页面并更新虚拟组合。"
+        )
     result = build(output, load_config(), update_portfolio=True)
     blockers = list(result.get("warnings", [])) + list(result.get("overlong_notes", []))
     if blockers and not allow_warnings:
@@ -1740,7 +1744,7 @@ def main(argv: list[str] | None = None) -> int:
     aum_cmd.add_argument("--as-of", required=True, help="导出表的数据日期 YYYY-MM-DD")
     deploy_cmd = sub.add_parser(
         "deploy",
-        help="build（含更新虚拟组合）",
+        help="build（含更新虚拟组合）；请显式传 --no-upload（未传时拒绝）",
         parents=[common],
     )
     deploy_cmd.add_argument("--output", default=str(DEFAULT_OUTPUT))
@@ -1752,7 +1756,7 @@ def main(argv: list[str] | None = None) -> int:
     deploy_cmd.add_argument(
         "--no-upload",
         action="store_true",
-        help="兼容保留参数（deploy 默认仅本地生成页面）",
+        help="只做 build(update_portfolio=True)，不上传（必传）",
     )
 
     args = parser.parse_args(argv)
@@ -1778,7 +1782,7 @@ def main(argv: list[str] | None = None) -> int:
             result = deploy(
                 Path(args.output).expanduser(),
                 allow_warnings=getattr(args, "allow_warnings", False),
-                no_upload=True,
+                no_upload=getattr(args, "no_upload", False),
             )
         else:
             result = build(Path(args.output).expanduser(), load_config())

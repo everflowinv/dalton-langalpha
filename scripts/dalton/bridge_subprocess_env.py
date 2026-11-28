@@ -28,7 +28,6 @@ from urllib.parse import urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 DEFAULT_SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-DEFAULT_HOST_EMBED_URL = "http://127.0.0.1:8960/embed"
 DEFAULT_NO_PROXY_HOSTS: tuple[str, ...] = (
     "localhost",
     "127.0.0.1",
@@ -757,19 +756,6 @@ def _merge_no_proxy(existing: str | None) -> str:
     return ",".join(items)
 
 
-def _validate_host_embed_url(url_val: str) -> str | None:
-    raw = str(url_val or "").strip()
-    if not raw:
-        return "missing required key DALTON_BRIDGE_EMBED_URL"
-    try:
-        parsed = urlparse(raw)
-    except ValueError:
-        return "invalid key DALTON_BRIDGE_EMBED_URL (malformed URL)"
-    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != 8960:
-        return "invalid key DALTON_BRIDGE_EMBED_URL (must point to http://127.0.0.1:8960)"
-    return None
-
-
 def scrub_post_dotenv_import_env(
     target_env: MutableMapping[str, str],
     pre_import_env: Mapping[str, str] | None = None,
@@ -796,7 +782,7 @@ def scrub_post_dotenv_import_env(
         | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
         | set(DIRECT_EMBEDDING_CONFIG_KEYS)
         | set(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
-        | {"DALTON_BRIDGE_ADMIN_TOKEN", "DALTON_BRIDGE_EMBED_URL", "no_proxy", "DALTON_OCW_AGENTS_ROOT"}
+        | {"DALTON_BRIDGE_ADMIN_TOKEN", "no_proxy", "DALTON_OCW_AGENTS_ROOT"}
     )
 
     if extra_preserve_keys:
@@ -823,14 +809,6 @@ def scrub_post_dotenv_import_env(
         pre_val = str(pre_raw or "").strip()
         if pre_val:
             target_env[key] = pre_val
-
-    pre_embed = str(pre_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
-    if pre_embed and _validate_host_embed_url(pre_embed) is None:
-        target_env["DALTON_BRIDGE_EMBED_URL"] = pre_embed
-    elif "DALTON_BRIDGE_EMBED_URL" in target_env:
-        cur_embed = str(target_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
-        if not cur_embed or "host.docker.internal" in cur_embed:
-            target_env["DALTON_BRIDGE_EMBED_URL"] = DEFAULT_HOST_EMBED_URL
 
     if "no_proxy" in pre_env or "no_proxy" in target_env:
         target_env["no_proxy"] = _merge_no_proxy(
@@ -1867,7 +1845,7 @@ def resolve_legacy_proxy_effective_paths(
       1. Inherit `EnvironmentVariables` from `com.dalton.guidepoint-mcp-proxy.plist`.
       2. Initialize launcher shell variables before `source "$ENV_FILE"`:
          - `SCRIPT_DIR` (directory of the launcher script)
-         - `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > `$HOME/Library/Application Support/Everflow/research`)
+         - `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `$HOME/Library/Application Support/Everflow/research`)
          - `ENV_FILE` (`GUIDEPOINT_ENV_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp.env`)
          - `PYTHON_BIN` (`GUIDEPOINT_PYTHON` > `/opt/homebrew/bin/python3.12`)
       3. `source "$ENV_FILE"` (overrides any keys inherited from the plist, with variable
@@ -1899,17 +1877,13 @@ def resolve_legacy_proxy_effective_paths(
     )
 
     # Match `guidepoint_mcp_proxy_run.sh`: when an existing plist is present, launcher only reads
-    # plist env (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default); bridge_env_vals is only a
+    # plist env (`DALTON_RESEARCH_HOME` > default); bridge_env_vals is only a
     # fallback default when rendering fresh without an existing plist.
     if existing_plist_found:
-        raw_rh = (
-            str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
-            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
-        )
+        raw_rh = str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
     else:
         raw_rh = (
             str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
-            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
             or str(bvals.get("DALTON_RESEARCH_HOME") or "").strip()
         )
     research_home_abs = (
@@ -1950,7 +1924,7 @@ def resolve_legacy_proxy_effective_paths(
         # `source "$ENV_FILE"` overwrites same-named plist variables!
         eff_env.update(sourced_vals)
 
-    if not eff_env.get("DALTON_RESEARCH_HOME") and not eff_env.get("DALTON_OCW_ROOT"):
+    if not eff_env.get("DALTON_RESEARCH_HOME"):
         eff_env["DALTON_RESEARCH_HOME"] = str(research_home_abs)
 
     # Effective tokens path follows exact `guidepoint_lock.resolve_guidepoint_tokens_file()` priority:
@@ -1967,10 +1941,7 @@ def resolve_legacy_proxy_effective_paths(
             key="GUIDEPOINT_TOKENS_FILE",
         )
     else:
-        final_rh_raw = (
-            str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
-            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
-        )
+        final_rh_raw = str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
         final_rh = (
             _require_abs_proxy_path(
                 final_rh_raw,
