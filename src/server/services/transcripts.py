@@ -158,17 +158,14 @@ class _Job:
     window: Window
     #: A task's render from the checkpoint: the run it read.
     run: TaskRun | None = None
-<<<<<<< HEAD
     #: The window at the thread's start (``ThreadStart.head``): its runs
     #: are files of the chats it was forked from, and its own number on
     #: from there. Empty for an ordinary thread and for a task.
     head: Window = Window()
-=======
     # DALTON-HOOK(personal-integrations): purge generation read before checkpoints for FOR SHARE writeback fence
     expected_purge_gen: int | None = None
     # DALTON-HOOK(personal-integrations): 1-based first segment tainted by personal-integration data across turns
     first_personal_segment: int | None = None
->>>>>>> refs/lane/82
 
     def render(self, *, inline: bool, full: bool = False) -> _Rendered:
         """The copy, each file named by digest. Only the segments that changed
@@ -184,11 +181,8 @@ class _Job:
             header=self.header,
             previous=None if full else load_manifest(self.previous),
             window=self.window,
-<<<<<<< HEAD
             borrowed=self.head.runs,
-=======
             first_personal_segment=self.first_personal_segment,
->>>>>>> refs/lane/82
         )
         copy = StoredTranscript(
             self.fingerprint, self.checkpoint_id, directory.manifest, run=self.run
@@ -367,14 +361,10 @@ async def _render_own(
         _fingerprint(thread.checkpoint_id),
         rendered_at,
         own.manifest if own is not None else None,
-<<<<<<< HEAD
         window,
         head=start.head,
-=======
-        Window.of(values),
         expected_purge_gen=expected_purge_gen,
         first_personal_segment=first_personal_segment,
->>>>>>> refs/lane/82
     )
     return await _render_and_save(target, job)
 
@@ -677,12 +667,9 @@ async def save_live(
         checkpoint_id,
         stored.manifest if stored is not None else None,
         window,
-<<<<<<< HEAD
         head=start.head,
-=======
         expected_purge_gen=expected_purge_gen,
         first_personal_segment=first_personal_segment,
->>>>>>> refs/lane/82
     )
     rendered = await _render_job(job, inline=target.inline)
     if stored is None or rendered.copy.manifest != stored.manifest:

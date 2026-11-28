@@ -1,7 +1,7 @@
 """Real PostgreSQL integration tests for Personal Calendar & Mail Batch 1 (r1).
 
 Covers:
-- Alembic migration d06X upgrade head / downgrade roundtrip
+- Alembic migration d064 upgrade head / downgrade roundtrip
 - Phase 1 atomic registration, crash recovery via startup resume, dual generation bump, immediate unblock on local commit
 - Account switch in-place replacement (keeps new connection connected; sibling not_applicable vs sole pending; missing refresh_token refused)
 - Bounded deletion by auth_epoch_upto (reconnection during purge with higher auth_epoch survives)
@@ -521,16 +521,16 @@ async def _seed_real_turn_checkpoints(
 # ---------------------------------------------------------------------------
 
 
-def test_d06X_migration_upgrade_head_and_downgrade_roundtrip(dalton_schema, test_db_uri: str):
+def test_d064_migration_upgrade_head_and_downgrade_roundtrip(dalton_schema, test_db_uri: str):
     cfg = _dalton_alembic_cfg(test_db_uri)
-    command.downgrade(cfg, "d057")
+    command.downgrade(cfg, "d063")
     with psycopg.connect(test_db_uri) as conn:
         row = conn.execute("SELECT to_regclass('public.dalton_user_integrations')").fetchone()
         assert row is not None and row[0] is None
     command.upgrade(cfg, "head")
     with psycopg.connect(test_db_uri) as conn:
         ver = conn.execute("SELECT version_num FROM alembic_version_dalton").fetchone()
-        assert ver is not None and ver[0] == "d06X"
+        assert ver is not None and ver[0] == "d064"
         for tbl in (
             "dalton_user_integrations",
             "dalton_user_integration_oauth_states",

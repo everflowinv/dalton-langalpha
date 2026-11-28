@@ -1864,8 +1864,8 @@ class TestCosForeignWorkspaceThreadIsolation:
 
         def _filter_rows_by_sql(sql: str, params: Any) -> list[dict[str, Any]]:
             assert "AND (w.user_id = %s OR w.workspace_id = ANY(%s::uuid[]))" in sql
-            uid = str(params[3])
-            cos_ids = set(params[4])
+            uid = str(params[4])
+            cos_ids = set(params[5])
             return [
                 r
                 for r in list_rows
@@ -2124,9 +2124,9 @@ class TestCosForeignWorkspaceThreadIsolation:
                 uid = str(params[2])
                 cos_ids = set(params[3])
             else:
-                # get_threads_for_user: params = (user_id, user_id, user_id, user_id, cos_ws_ids, ...)
-                uid = str(params[3])
-                cos_ids = set(params[4])
+                # get_threads_for_user: params = (user_id, user_id, user_id, user_id, user_id, cos_ws_ids, ...)
+                uid = str(params[4])
+                cos_ids = set(params[5])
             return [
                 r
                 for r in all_rows
@@ -2187,8 +2187,8 @@ class TestCosForeignWorkspaceThreadIsolation:
         assert len(executed_sql) == 2
         for sql, params in executed_sql:
             assert "AND (w.user_id = %s OR w.workspace_id = ANY(%s::uuid[]))" in sql
-            assert params[3] == "u-chao"
-            assert params[4] == []
+            assert params[4] == "u-chao"
+            assert params[5] == []
 
         # 2. Colleague B cos_rw_enabled=True: B's workspace thread appears on page 1, total == 26
         executed_sql.clear()
@@ -2203,8 +2203,8 @@ class TestCosForeignWorkspaceThreadIsolation:
         assert payload_on["threads"][0]["conversation_thread_id"] == colleague_row["conversation_thread_id"]
         for sql, params in executed_sql:
             assert "AND (w.user_id = %s OR w.workspace_id = ANY(%s::uuid[]))" in sql
-            assert params[3] == "u-chao"
-            assert params[4] == [colleague_ws_id]
+            assert params[4] == "u-chao"
+            assert params[5] == [colleague_ws_id]
 
         # 3. <activity> via read_activity / get_recent_threads_for_user:
         monkeypatch.setattr(

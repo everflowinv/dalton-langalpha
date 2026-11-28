@@ -85,11 +85,17 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         from src.dalton.services.purge_fence import read_expected_purge_generation
         expected_purge_gen = await read_expected_purge_generation(thread_id, conn=conn)
         async with conn.cursor(row_factory=dict_row) as cur:
-            return await _read_thread_rows(cur, thread_id)
+            return await _read_thread_rows(
+                cur, thread_id, expected_purge_gen=expected_purge_gen
+            )
 
 
-<<<<<<< HEAD
-async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
+async def _read_thread_rows(
+    cur: Any,
+    thread_id: str,
+    *,
+    expected_purge_gen: int | None = None,
+) -> ThreadRows | None:
     """``get_replay_thread_data`` on a cursor the caller holds, so a read
     can share its transaction."""
     # 1. Owner check (join threads -> workspaces)
@@ -110,28 +116,6 @@ async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
         if owner_row
         else None
     )
-=======
-            # 2. Thread summary, with its newest run. Read before the rows and
-            # checkpoints the replay shows, so a run that starts during the
-            # read is never named as one the client has seen.
-            await cur.execute(
-                """SELECT conversation_thread_id, workspace_id, current_status,
-                          thread_index, latest_checkpoint_id, created_at, updated_at,
-                          -- DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
-                          metadata->'personal_first_touch_event' AS personal_first_touch_event,
-                          (SELECT r.conversation_response_id
-                           FROM conversation_responses r
-                           WHERE r.conversation_thread_id = t.conversation_thread_id
-                           ORDER BY r.run_seq DESC
-                           LIMIT 1) AS latest_run_id
-                   FROM conversation_threads t
-                   WHERE conversation_thread_id = %s""",
-                (thread_id,),
-            )
-            thread = await cur.fetchone()
-            if thread is None:
-                return None
->>>>>>> refs/lane/82
 
     if owner_id is None:
         return None
@@ -143,6 +127,8 @@ async def _read_thread_rows(cur: Any, thread_id: str) -> ThreadRows | None:
         """SELECT conversation_thread_id, workspace_id, current_status,
                   thread_index, latest_checkpoint_id, created_at, updated_at,
                   metadata->'fork' AS fork,
+                  -- DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+                  metadata->'personal_first_touch_event' AS personal_first_touch_event,
                   (SELECT r.conversation_response_id
                    FROM conversation_responses r
                    WHERE r.conversation_thread_id = t.conversation_thread_id

@@ -1,10 +1,11 @@
 #!/bin/bash
-<<<<<<< HEAD
 # Wait until backend work is idle.
 #
 # Default (no arguments):
-#   Unchanged routine-deploy behavior: polls `conversation_threads` and
-#   `subagent_runs` up to 720 times x 60s, requiring 2 consecutive idle checks.
+#   Routine-deploy behavior: polls `conversation_threads` (using the shared
+#   `backend_busy_threads.sql` query so stale >15m automation threads whose
+#   executions are all terminal and have no live response do not block deploy)
+#   and `subagent_runs` up to 720 times x 60s, requiring 2 consecutive idle checks.
 #
 # Maintenance mode (any explicit flag):
 #   --max-wait-seconds N     Total wait budget in seconds (default: 600)
@@ -14,21 +15,34 @@
 #   (host + container tasks) in the 2-consecutive-zero idle check.
 #   Every `docker exec psql`, HTTP probe, and sleep shares one monotonic deadline;
 #   returning idle re-checks the deadline first and fails on any overrun.
-#   Self-contained (does not source external files) so it can run from recovery-bin/.
+#   Self-contained fallback when run from recovery-bin/ without backend_busy_threads.sql.
 
 DOCKER_CMD="${DOCKER_BIN:-docker}"
-PG_CONTAINER="${DALTON_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}"
+PG_CONTAINER="${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-${DALTON_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+THREAD_BUSY_SQL_FILE="${WAIT_BACKEND_IDLE_SQL_FILE:-${SCRIPT_DIR}/backend_busy_threads.sql}"
+# The production entry copies only this script and deploy_main.sh to a temp dir; read the shared
+# query from the repo then.
+if [ ! -f "$THREAD_BUSY_SQL_FILE" ] && [ -z "${WAIT_BACKEND_IDLE_SQL_FILE:-}" ] && [ -n "${DALTON_REPO_ROOT:-}" ]; then
+  THREAD_BUSY_SQL_FILE="${DALTON_REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql"
+fi
 
 # ---------------------------------------------------------------------------
 # Routine no-argument mode (preserve exact existing behavior & output strings)
 # ---------------------------------------------------------------------------
 if [ "$#" -eq 0 ]; then
-  default_rounds="${WAIT_IDLE_DEFAULT_MAX_ROUNDS:-720}"
-  default_poll_s="${WAIT_IDLE_DEFAULT_POLL_S:-60}"
+  if [ ! -f "$THREAD_BUSY_SQL_FILE" ]; then
+    echo "ERROR: missing ${THREAD_BUSY_SQL_FILE}" >&2
+    exit 1
+  fi
+  THREAD_BUSY_SQL="$(tr '\n' ' ' < "$THREAD_BUSY_SQL_FILE" | sed 's/  */ /g; s/^ //; s/ $//')"
+  SUBAGENT_BUSY_SQL="SELECT count(*) FROM subagent_runs WHERE status='in_progress'"
+  default_rounds="${WAIT_BACKEND_IDLE_MAX_CHECKS:-${WAIT_IDLE_DEFAULT_MAX_ROUNDS:-720}}"
+  default_poll_s="${WAIT_BACKEND_IDLE_SLEEP_SECONDS:-${WAIT_IDLE_DEFAULT_POLL_S:-60}}"
   ok=0
   for i in $(seq 1 "$default_rounds"); do
-    t=$("$DOCKER_CMD" exec "$PG_CONTAINER" psql -U postgres -d postgres -Atc "select count(*) from conversation_threads where current_status='in_progress'")
-    s=$("$DOCKER_CMD" exec "$PG_CONTAINER" psql -U postgres -d postgres -Atc "select count(*) from subagent_runs where status='in_progress'")
+    t=$("$DOCKER_CMD" exec "$PG_CONTAINER" psql -U postgres -d postgres -Atc "$THREAD_BUSY_SQL")
+    s=$("$DOCKER_CMD" exec "$PG_CONTAINER" psql -U postgres -d postgres -Atc "$SUBAGENT_BUSY_SQL")
     if [ "$t" = "0" ] && [ "$s" = "0" ]; then ok=$((ok+1)); else ok=0; fi
     if [ $ok -ge 2 ]; then echo "idle after $i min ($(date))"; exit 0; fi
     [ $((i % 30)) -eq 1 ] && echo "$(date '+%T') threads=$t subagents=$s"
@@ -51,11 +65,17 @@ BRIDGE_URL="${DALTON_BRIDGE_LOCAL_URL:-${BRIDGE_URL:-http://127.0.0.1:8960}}"
 BRIDGE_ENV_FILE="${DALTON_BRIDGE_ENV_FILE:-${HOME:-}/.config/dalton/researchdata-bridge.env}"
 PY_CMD="${PYTHON_BIN:-python3}"
 
+if [ -f "$THREAD_BUSY_SQL_FILE" ]; then
+  MAINT_THREAD_BUSY_SQL="$(tr '\n' ' ' < "$THREAD_BUSY_SQL_FILE" | sed 's/  */ /g; s/^ //; s/ $//')"
+else
+  MAINT_THREAD_BUSY_SQL="select count(*) from conversation_threads where current_status='in_progress'"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: wait_backend_idle.sh [--max-wait-seconds N] [--check-bridge-healthz] [--check-bridge-drain]
 
-Without arguments, runs legacy routine deploy idle wait (720 x 60s).
+Without arguments, runs routine deploy idle wait (720 x 60s) using backend_busy_threads.sql.
 With any flag, enters maintenance mode and also waits for claimed dalton_data_task_slot
 and active dalton_data_task_runs (host & container tasks) to drain to 0 twice in a row.
 EOF
@@ -93,36 +113,6 @@ while [ "$#" -gt 0 ]; do
       exit 2
       ;;
   esac
-=======
-# Wait until no chat turn and no subagent run is in progress (host archive runs are ignored:
-# a backend restart does not touch them). Needs 2 consecutive idle checks 60s apart.
-# Stale automation threads (>15m since last update whose associated automation executions are
-# all in terminal status and have no live conversation_responses row) do not count as busy.
-SLEEP_SECONDS="${WAIT_BACKEND_IDLE_SLEEP_SECONDS:-60}"
-MAX_CHECKS="${WAIT_BACKEND_IDLE_MAX_CHECKS:-720}"
-POSTGRES_CONTAINER="${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-THREAD_BUSY_SQL_FILE="${WAIT_BACKEND_IDLE_SQL_FILE:-${SCRIPT_DIR}/backend_busy_threads.sql}"
-# The production entry copies only this script and deploy_main.sh to a temp dir; read the shared
-# query from the repo then.
-if [ ! -f "$THREAD_BUSY_SQL_FILE" ] && [ -z "${WAIT_BACKEND_IDLE_SQL_FILE:-}" ] && [ -n "${DALTON_REPO_ROOT:-}" ]; then
-  THREAD_BUSY_SQL_FILE="${DALTON_REPO_ROOT}/scripts/dalton/ops/prod/backend_busy_threads.sql"
-fi
-if [ ! -f "$THREAD_BUSY_SQL_FILE" ]; then
-  echo "ERROR: missing ${THREAD_BUSY_SQL_FILE}" >&2
-  exit 1
-fi
-THREAD_BUSY_SQL="$(tr '\n' ' ' < "$THREAD_BUSY_SQL_FILE" | sed 's/  */ /g; s/^ //; s/ $//')"
-SUBAGENT_BUSY_SQL="SELECT count(*) FROM subagent_runs WHERE status='in_progress'"
-ok=0
-for i in $(seq 1 "$MAX_CHECKS"); do
-  t=$(docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -Atc "$THREAD_BUSY_SQL")
-  s=$(docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -Atc "$SUBAGENT_BUSY_SQL")
-  if [ "$t" = "0" ] && [ "$s" = "0" ]; then ok=$((ok+1)); else ok=0; fi
-  if [ $ok -ge 2 ]; then echo "idle after $i min ($(date))"; exit 0; fi
-  [ $((i % 30)) -eq 1 ] && echo "$(date '+%T') threads=$t subagents=$s"
-  sleep "$SLEEP_SECONDS"
->>>>>>> refs/lane/106
 done
 
 case "$MAX_WAIT_SECONDS" in
@@ -141,7 +131,8 @@ PYTHONDONTWRITEBYTECODE=1 "$PY_CMD" -B - \
   "$MAX_WAIT_SECONDS" \
   "$POLL_S" \
   "$CHECK_BRIDGE_HEALTHZ" \
-  "$CHECK_BRIDGE_DRAIN" <<'PY'
+  "$CHECK_BRIDGE_DRAIN" \
+  "$MAINT_THREAD_BUSY_SQL" <<'PY'
 import json
 import os
 import subprocess
@@ -159,7 +150,8 @@ import time
     poll_s_raw,
     check_healthz_raw,
     check_drain_raw,
-) = sys.argv[1:10]
+    sql_threads,
+) = sys.argv[1:11]
 
 max_wait_seconds = int(max_wait_raw)
 try:
@@ -172,7 +164,7 @@ except ValueError:
 check_bridge_healthz = check_healthz_raw == "1"
 check_bridge_drain = check_drain_raw == "1"
 
-SQL_THREADS = "select count(*) from conversation_threads where current_status='in_progress'"
+SQL_THREADS = sql_threads
 SQL_SUBAGENTS = "select count(*) from subagent_runs where status='in_progress'"
 SQL_DATA_SLOTS = "select count(*) from dalton_data_task_slot where slot_state <> 'idle' or active_run_id is not null"
 SQL_DATA_RUNS = "select count(*) from dalton_data_task_runs where status in ('starting', 'running')"

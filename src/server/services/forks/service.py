@@ -141,7 +141,16 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                 await assert_fork_source_not_purging_tx(conn, req.source_thread_id, cut_turn_index=req.cut.turn_index, expected_purge_gen=expected_purge_gen)
                 async with _checkpoint_connection(conn) as cp:
                     await _write_checkpoints(cp, req.source_thread_id, thread_id, cut, plan)
-                await _write_thread(conn, req, lineage, plan, source, subagents_allowed, thread_id)
+                await _write_thread(
+                    conn,
+                    req,
+                    lineage,
+                    plan,
+                    source,
+                    subagents_allowed,
+                    thread_id,
+                    kept_turn_indexes=snapshot.turn_indexes,
+                )
                 # Last, under the source row's lock, so the fork commits only
                 # while its maker can still read the source: its starter may
                 # have made it private since the copy began.
@@ -312,6 +321,8 @@ async def _write_thread(
     source: dict[str, Any],
     subagents_allowed: Optional[bool],
     thread_id: str,
+    *,
+    kept_turn_indexes: tuple[int, ...] = (),
 ) -> None:
     # In a shared workspace the fork is its maker's, private until they share
     # it, whoever started the source.
@@ -357,7 +368,7 @@ async def _write_thread(
     )
     # DALTON-HOOK(personal-integrations): inherit private flag, clipped purged ranges, and remapped touches on fork
     from src.dalton.services.purge_fence import copy_personal_integration_state_for_fork_tx
-    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=snapshot.turn_indexes, run_map=plan.run_map)
+    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=kept_turn_indexes, run_map=plan.run_map)
 
 
 async def _drop_unclaimed(thread_id: str) -> None:

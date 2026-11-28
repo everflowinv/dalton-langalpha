@@ -25,7 +25,7 @@
 	header_up -X-User-Id
 }
 
-# Redact ?token=<jwt> / ?dl_token= / ?ticket= and path share tokens
+# Redact ?token=<jwt> / ?dl_token= / ?ticket= / ?code= / ?state= and path share tokens
 # (/api/v1/public/shared/<token>, /s/<token>, /a/<token>, /og-meta?path=/s/<token>)
 # in a single filter layer (Caddy 2.9.1 nested filters do not receive full
 # request>uri / request>headers>Referer field paths), delete sensitive
@@ -38,17 +38,8 @@
 		format filter {
 			wrap json
 			fields {
-<<<<<<< HEAD
-				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket)=)[^&#]+` `${1}${2}REDACTED`
-				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket)=)[^&#]+` `${1}${2}REDACTED`
-=======
-				request>uri query {
-					replace token REDACTED
-					replace ticket REDACTED
-					replace code REDACTED
-					replace state REDACTED
-				}
->>>>>>> refs/lane/82
+				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
+				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete
 				request>headers>X-Dalton-Relay-Token delete

@@ -1623,6 +1623,8 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "SetupSettings": CORE_CAPABILITY,
         # Prod Audit 2 Batch 1: per-worker Redis diagnostics flush + PG leader sampler
         "RedisDiagnosticsService": CORE_CAPABILITY,
+        # Durable failure-notice receipt sweeper (self-gates on is_failure_notice_enabled)
+        "FailureNoticeSweeper": CORE_CAPABILITY,
     }
 )
 
@@ -1901,7 +1903,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         # --- deployment_credentials/router.py (shared Core & Everflow admin settings) ---
         ("deployment_credentials/router.py", "get_deployment_settings_endpoint"): CORE_CAPABILITY,
         ("deployment_credentials/router.py", "put_deployment_settings_endpoint"): CORE_CAPABILITY,
-<<<<<<< HEAD
+        ("deployment_credentials/router.py", "test_deployment_settings_endpoint"): CORE_CAPABILITY,
         # --- integrations_router.py (per-service single-capability gating in handlers, §6 item 1) ---
         ("integrations_router.py", "list_personal_integrations_endpoint"): CORE_CAPABILITY,
         ("integrations_router.py", "authorize_personal_integration_endpoint"): CORE_CAPABILITY,
@@ -1915,9 +1917,6 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("integrations_router.py", "feishu_integration_internal_events_endpoint"): CORE_CAPABILITY,
         # --- tracker_calendar_router.py (Everflow earnings tracker gate, §5.3, §6 item 2) ---
         ("tracker_calendar_router.py", "tracker_calendar_mcp_endpoint"): CapabilityId.FUND_AUTOMATIONS,
-=======
-        ("deployment_credentials/router.py", "test_deployment_settings_endpoint"): CORE_CAPABILITY,
->>>>>>> refs/lane/84
     }
 )
 

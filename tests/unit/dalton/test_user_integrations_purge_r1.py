@@ -1,5 +1,5 @@
 """Unit tests for Personal Calendar & Mail Batch 1 (r1):
-migration d06X, data layer, 2A purger, purge fence, remote revoke state machine,
+migration d064, data layer, 2A purger, purge fence, remote revoke state machine,
 archive/memory skip, restore reset SQL, and 4-layer callback query redaction.
 """
 
@@ -45,7 +45,7 @@ from src.dalton.database.user_integrations import (
     revoke_lock_key,
     touch_user_lock_key,
 )
-from src.dalton.migrations.versions import d06X_user_integrations as d06x_mod
+from src.dalton.migrations.versions import d064_user_integrations as d064_mod
 from src.dalton.services import integration_data_purge as purge_mod
 from src.dalton.services import integration_revoke as revoke_mod
 from src.dalton.services import purge_fence
@@ -160,21 +160,21 @@ class _FakeConn:
 
 
 # ---------------------------------------------------------------------------
-# 1. Migration d06X structure & reversibility
+# 1. Migration d064 structure & reversibility
 # ---------------------------------------------------------------------------
 
 
-def test_d06X_migration_revisions_and_sql_objects():
-    assert d06x_mod.revision == "d06X"
-    assert d06x_mod.down_revision == "d06W"
+def test_d064_migration_revisions_and_sql_objects():
+    assert d064_mod.revision == "d064"
+    assert d064_mod.down_revision == "d063"
 
     upgrade_sqls: list[str] = []
     downgrade_sqls: list[str] = []
 
-    with patch.object(d06x_mod.op, "execute", side_effect=upgrade_sqls.append):
-        d06x_mod.upgrade()
-    with patch.object(d06x_mod.op, "execute", side_effect=downgrade_sqls.append):
-        d06x_mod.downgrade()
+    with patch.object(d064_mod.op, "execute", side_effect=upgrade_sqls.append):
+        d064_mod.upgrade()
+    with patch.object(d064_mod.op, "execute", side_effect=downgrade_sqls.append):
+        d064_mod.downgrade()
 
     up_joined = "\n".join(upgrade_sqls)
     down_joined = "\n".join(downgrade_sqls)
@@ -1045,13 +1045,27 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
 
 
 def test_four_layer_callback_query_redaction():
-    # Layer 1 & 2: Caddyfiles
+    import re
+
+    # Layer 1 & 2: Caddyfiles (single-layer request>uri regexp redacts OAuth code/state + ticket)
     standalone_caddy = (REPO_ROOT / "deploy" / "standalone" / "Caddyfile").read_text(encoding="utf-8")
     dalton_caddy = (REPO_ROOT / "deploy" / "dalton" / "Caddyfile").read_text(encoding="utf-8")
+    sample_uri = "/api/v1/dalton/integrations/google/callback?code=4/0AsecretCode123&state=opaqueState999&ticket=tktSecret777"
     for caddy_name, text in (("standalone", standalone_caddy), ("dalton", dalton_caddy)):
-        assert "replace code REDACTED" in text, f"{caddy_name} Caddyfile missing code redaction"
-        assert "replace state REDACTED" in text, f"{caddy_name} Caddyfile missing state redaction"
-        assert "replace ticket REDACTED" in text, f"{caddy_name} Caddyfile missing ticket redaction"
+        uri_match = re.search(
+            r"request>uri regexp `([^`]+)` `\$\{1\}\$\{2\}REDACTED`", text
+        )
+        assert uri_match is not None, f"{caddy_name} Caddyfile missing single-layer request>uri regexp"
+        uri_re = re.compile(uri_match.group(1))
+        redacted_uri = uri_re.sub(
+            lambda m: f"{m.group(1) or ''}{m.group(2) or ''}REDACTED", sample_uri
+        )
+        assert "4/0AsecretCode123" not in redacted_uri, f"{caddy_name} Caddyfile missing code redaction"
+        assert "opaqueState999" not in redacted_uri, f"{caddy_name} Caddyfile missing state redaction"
+        assert "tktSecret777" not in redacted_uri, f"{caddy_name} Caddyfile missing ticket redaction"
+        assert "code=REDACTED" in redacted_uri
+        assert "state=REDACTED" in redacted_uri
+        assert "ticket=REDACTED" in redacted_uri
         assert "resp_headers>Location delete" in text, f"{caddy_name} Caddyfile missing Location header strip"
 
     # Layer 3: Uvicorn SensitiveQueryLogFilter (success & error callbacks)

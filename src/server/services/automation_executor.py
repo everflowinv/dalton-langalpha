@@ -1566,10 +1566,10 @@ class AutomationExecutor:
                     exc_info=True,
                 )
                 excerpt = None
-<<<<<<< HEAD
             # DALTON-HOOK(dalton-notify): persist original settlement parameters if settle rolls back
             # (e.g. transient failure-notice enqueue SQL error) so abandoned-firing recovery retries
             # with the exact same outcome, failure_reason, quota flag, and one-shot schedule policy.
+            # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically in the settlement transaction
             eff_workspace_id = firing.workspace_id or automation.get("workspace_id")
             try:
                 settled = await settle(
@@ -1578,6 +1578,7 @@ class AutomationExecutor:
                     workspace_id=eff_workspace_id,
                     error=error_msg, delivery=firing.delivery, excerpt=excerpt,
                     release_pre_start_signals=True,
+                    reset_prestart_thread_status=True,
                 )
             except Exception:
                 from src.dalton.notify.failure_receipts import (
@@ -1605,17 +1606,6 @@ class AutomationExecutor:
                     ),
                 )
                 raise
-=======
-            # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status atomically in the settlement transaction
-            settled = await settle(
-                firing.automation, execution_id, outcome,
-                thread_id=firing.thread_id,
-                workspace_id=firing.workspace_id or automation.get("workspace_id"),
-                error=error_msg, delivery=firing.delivery, excerpt=excerpt,
-                release_pre_start_signals=True,
-                reset_prestart_thread_status=True,
-            )
->>>>>>> refs/lane/106
             _exec_span.set_attribute(
                 "status",
                 "settled_elsewhere" if not settled

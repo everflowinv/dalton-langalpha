@@ -967,15 +967,11 @@ class MachineLifecycleMixin:
             )
             # A bare start syncs no project, so the browser settings are
             # handed here rather than left to the next project sync.
-<<<<<<< HEAD
             await self._after_machine_sync(binding, session.sandbox)
-=======
-            await self._keep_browser_settings(binding, session.sandbox)
             # DALTON-HOOK(deployment-credentials): scrub legacy Feishu Vault keys before publishing running
             from src.dalton.deployment_credentials.sandbox_scrub import scrub_sandbox_on_ready
 
             await scrub_sandbox_on_ready(binding, session)
->>>>>>> refs/lane/82
 
             restored_projects: list[ComputerBinding] = []
             if not reconnected:

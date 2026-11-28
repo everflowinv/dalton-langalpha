@@ -56,6 +56,7 @@ CORE_SCRIPTS_DALTON_ALLOWED: frozenset[str] = frozenset(
         "configure_minio.sh",
         "log_redaction.py",
         "seed_openclaw_data.sh",
+        "sql/personal_integrations_restore_reset.sql",
         "data_assets/scripts",
         "data_assets/everflow_only.txt",
     }

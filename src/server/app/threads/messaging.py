@@ -277,19 +277,16 @@ async def _admit(
     from_path: bool = False,
 ) -> AdmittedTurn:
     body = _client_body(body, raw_request)
-<<<<<<< HEAD
     # DALTON-HOOK(maintenance-gate): block new turns during maintenance window (503 maintenance_in_progress)
     from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
 
     await enforce_maintenance_admission_for_thread(
         workspace_id=body.workspace_id, thread_id=thread_id, context="thread_message"
     )
-=======
     # DALTON-HOOK(personal-integrations): fast-reject HTTP sends while personal data purge is active (409 + Retry-After: 3)
     from src.dalton.services.purge_fence import check_thread_not_purging_fast
 
     await check_thread_not_purging_fast(thread_id)
->>>>>>> refs/lane/82
     checked = await cli_approval.admit_turn(
         raw_request, principal, body, thread_id, from_path=from_path
     )

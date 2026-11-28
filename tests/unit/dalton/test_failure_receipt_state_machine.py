@@ -640,7 +640,7 @@ def test_d062_migration_single_head_and_offline_sql_dalton_only() -> None:
     cfg = AlembicConfig(str(alembic_ini))
     cfg.set_main_option("script_location", str(REPO_ROOT / "src" / "dalton" / "migrations"))
     script_dir = ScriptDirectory.from_config(cfg)
-    assert script_dir.get_heads() == ["d062"]
+    assert script_dir.get_heads() == ["d064"]
     rev = script_dir.get_revision("d062")
     assert rev is not None and rev.down_revision == "d061"
 

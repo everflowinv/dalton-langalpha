@@ -1605,14 +1605,15 @@ async def test_settle_abandoned_without_run_enables_prestart_thread_reset() -> N
     """Abandoned executions that never created a conversation_response row enable
     reset_prestart_thread_status=True in the settlement transaction."""
     settle_spy = create_autospec(settle_mod.settle, return_value=True)
+    recent_now = datetime.now(timezone.utc)
     abandoned_running = {
         "automation_execution_id": _EXEC,
         "automation_id": _AUTO,
         "status": "running",
         "conversation_thread_id": _THREAD,
         "conversation_response_id": None,
-        "started_at": _NOW,
-        "created_at": _NOW,
+        "started_at": recent_now,
+        "created_at": recent_now,
         "delivery": None,
         "user_id": _USER,
         "workspace_id": _HOME,

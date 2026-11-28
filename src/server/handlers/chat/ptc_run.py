@@ -1360,7 +1360,6 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
-<<<<<<< HEAD
         # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payloads read during HITL validation (fallback to checkpointer only when absent)
         approved_dispatch_payloads: dict[str, Any] | None = None
         if request.hitl_response:
@@ -1380,7 +1379,6 @@ async def astream_ptc_workflow(
                     checkpoint_id=request.checkpoint_id or base_checkpoint_id,
                     hitl_response=request.hitl_response,
                 )
-=======
         # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag for LangSmith suppression on historical private threads
         from src.dalton.services.personal_integration_guard import (
             is_thread_personal_private,
@@ -1389,7 +1387,6 @@ async def astream_ptc_workflow(
         thread_is_personal_private = await is_thread_personal_private(
             thread_id, meta=prior_thread
         )
->>>>>>> refs/lane/82
 
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {

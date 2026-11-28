@@ -11414,7 +11414,6 @@ export class ChannelGatewayOrchestrator {
     toolCallMessageIds?: Record<string, string>;
   }): Promise<boolean> {
     let needsPartialNotice = false;
-<<<<<<< HEAD
     const deliverAgentSendImageCorrections = async (): Promise<boolean> => {
       if (params.hasUnresolvedCurrentAgentSendImages !== true) {
         return true;
@@ -11480,11 +11479,7 @@ export class ChannelGatewayOrchestrator {
         return false;
       }
     } else if (params.sentToCurrentCount === 0) {
-      const deliveryRes = await this.deliveryService.executeDelivery({
-=======
-    if (params.sentToCurrentCount === 0) {
       let deliveryRes = await this.deliveryService.executeDelivery({
->>>>>>> refs/lane/82
         deliveryKey: params.fallbackDeliveryKey,
         kind: "fallback",
         userId: params.userId,

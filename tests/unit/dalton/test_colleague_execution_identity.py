@@ -707,13 +707,19 @@ async def test_thread_maintenance_summarize_uses_workspace_owner_for_session_and
         "_resolver",
         create_autospec(thread_maintenance._resolver, return_value=None),
     )
-    # #875: the agent build reads the thread's fork lineage.
+    # #875: the agent build reads the thread's fork lineage and private_to reachability.
+    from src.server.database.conversation import thread_reach as _thread_reach
     from src.server.database.conversation import threads_read as _threads_read
 
     monkeypatch.setattr(
         _threads_read,
         "get_thread_metadata",
         create_autospec(_threads_read.get_thread_metadata, return_value={}),
+    )
+    monkeypatch.setattr(
+        _thread_reach,
+        "private_to",
+        create_autospec(_thread_reach.private_to, return_value=None),
     )
 
     async def _fake_resolve_turn_config(
@@ -1106,7 +1112,7 @@ async def test_round4_item8_item13_item14_execution_entry_and_preflight_drift(
 
         async def execute(self, sql, params=None):
             q = " ".join(str(sql).split())
-            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+            if "WITH target AS" not in q and "AND NOT (" in q and "UPDATE automation_executions e" in q:
                 self._r = None
             elif "SELECT a.workspace_id" in q:
                 attempt_state["probes"] += 1
@@ -1854,7 +1860,7 @@ async def test_round7_item1_item2_window_execution_entry_and_notify_reject_stale
         async def execute(self, sql, params=None):
             q = " ".join(str(sql).split())
             queries.append((q, params))
-            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+            if "WITH target AS" not in q and "AND NOT (" in q and "UPDATE automation_executions e" in q:
                 self._r = None
             elif "SELECT a.workspace_id" in q:
                 self._r = {

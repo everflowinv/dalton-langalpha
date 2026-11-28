@@ -2776,14 +2776,7 @@ async def evaluate_user_notify_eligibility(
     *,
     target: str | None = None,
     include_chat_targets: bool | None = None,
-<<<<<<< HEAD
     allow_personal_dm_redirect: bool = False,
-    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
-    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
-    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
-    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
-    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
-=======
     conn: Any = None,
     cached: bool = True,
     resolve_enabled_fn: Callable[..., Awaitable[bool]] = resolve_dalton_notify_enabled,
@@ -2791,7 +2784,6 @@ async def evaluate_user_notify_eligibility(
     resolve_targets_fn: Callable[..., Awaitable[list[str]]] = resolve_dalton_notify_targets,
     resolve_routes_fn: Callable[..., Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
     is_admin_fn: Callable[..., Awaitable[bool]] | None = None,
->>>>>>> refs/lane/105
     resolve_active_weixin_targets_fn: Callable[
         ..., Awaitable[AbstractSet[str] | None]
     ]

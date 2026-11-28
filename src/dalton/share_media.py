@@ -2677,11 +2677,12 @@ def rewrite_items_for_public_media(
     """
     if bindings is None:
         return [_strip_raw_storage_urls_from_item(it) for it in items]
-<<<<<<< HEAD
-
-    def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
+    def _build_maps(
+        turn_idx: int | None,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         u_map: dict[str, str] = {}
         up_map: dict[str, str] = {}
+        obj_map: dict[str, str] = {}
         for key, (backend, ref_id) in bindings.items():
             ref = mint_public_media_ref(
                 thread_id=thread_id,
@@ -2694,49 +2695,36 @@ def rewrite_items_for_public_media(
             controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
             if key.startswith("upload_id:"):
                 up_map[key[len("upload_id:") :]] = controlled
+            elif key.startswith("object_key:"):
+                obj_map[key[len("object_key:") :]] = controlled
             else:
                 u_map[key] = controlled
-        return u_map, up_map
+        return u_map, up_map, obj_map
 
     if source_segment_index is None:
-        url_map, upload_id_map = _build_maps(None)
+        url_map, upload_id_map, object_key_map = _build_maps(None)
         out: list[dict[str, Any]] = []
         for it in items:
             rewritten = (
-                _rewrite_item_urls(it, url_map, upload_id_map)
-                if (url_map or upload_id_map)
+                _rewrite_item_urls(it, url_map, upload_id_map, object_key_map)
+                if (url_map or upload_id_map or object_key_map)
                 else it
             )
             out.append(_strip_raw_storage_urls_from_item(rewritten))
         return out
 
-    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
+    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str], dict[str, str]]] = {}
     out = []
-=======
-    url_map: dict[str, str] = {}
-    upload_id_map: dict[str, str] = {}
-    object_key_map: dict[str, str] = {}
-    for key, (backend, ref_id) in bindings.items():
-        ref = mint_public_media_ref(thread_id=thread_id, backend=backend, ref_id=ref_id)
-        controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
-        if key.startswith("upload_id:"):
-            upload_id_map[key[len("upload_id:") :]] = controlled
-        elif key.startswith("object_key:"):
-            object_key_map[key[len("object_key:") :]] = controlled
-        else:
-            url_map[key] = controlled
-    out: list[dict[str, Any]] = []
->>>>>>> refs/lane/83
     for it in items:
         turn_idx = _extract_item_turn_index(it)
         if turn_idx is None:
             out.append(_strip_raw_storage_urls_from_item(it))
             continue
-        pair = maps_by_turn.get(turn_idx)
-        if pair is None:
-            pair = _build_maps(turn_idx)
-            maps_by_turn[turn_idx] = pair
-        url_map, upload_id_map = pair
+        triple = maps_by_turn.get(turn_idx)
+        if triple is None:
+            triple = _build_maps(turn_idx)
+            maps_by_turn[turn_idx] = triple
+        url_map, upload_id_map, object_key_map = triple
         rewritten = (
             _rewrite_item_urls(it, url_map, upload_id_map, object_key_map)
             if (url_map or upload_id_map or object_key_map)
@@ -2769,32 +2757,13 @@ def rewrite_lines_for_owner_media(
 
     if bindings is None:
         return _strip_raw_storage_urls_from_lines(lines)
-<<<<<<< HEAD
-=======
-    url_map: dict[str, str] = {}
-    upload_id_map: dict[str, str] = {}
-    object_key_map: dict[str, str] = {}
-    for key, (backend, ref_id) in bindings.items():
-        tok = mint_owner_media_token(
-            thread_id=thread_id,
-            viewer_id=viewer_id,
-            backend=backend,
-            ref_id=ref_id,
-            sid_hash=sid_hash,
-            origin_hash=origin_hash,
-        )
-        controlled = f"/api/v1/threads/{thread_id}/media/{tok}"
-        if key.startswith("upload_id:"):
-            upload_id_map[key[len("upload_id:") :]] = controlled
-        elif key.startswith("object_key:"):
-            object_key_map[key[len("object_key:") :]] = controlled
-        else:
-            url_map[key] = controlled
->>>>>>> refs/lane/83
 
-    def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
+    def _build_maps(
+        turn_idx: int | None,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         u_map: dict[str, str] = {}
         up_map: dict[str, str] = {}
+        obj_map: dict[str, str] = {}
         for key, (backend, ref_id) in bindings.items():
             tok = mint_owner_media_token(
                 thread_id=thread_id,
@@ -2810,12 +2779,14 @@ def rewrite_lines_for_owner_media(
             controlled = f"/api/v1/threads/{thread_id}/media/{tok}"
             if key.startswith("upload_id:"):
                 up_map[key[len("upload_id:") :]] = controlled
+            elif key.startswith("object_key:"):
+                obj_map[key[len("object_key:") :]] = controlled
             else:
                 u_map[key] = controlled
-        return u_map, up_map
+        return u_map, up_map, obj_map
 
     if source_segment_index is None:
-        url_map, upload_id_map = _build_maps(None)
+        url_map, upload_id_map, object_key_map = _build_maps(None)
         out: list[Any] = []
         for ln in lines:
             if not isinstance(ln, Line):
@@ -2824,16 +2795,19 @@ def rewrite_lines_for_owner_media(
             if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
                 out.append(ln)
                 continue
-            needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
-                bool(upload_id_map) and '"upload_id"' in ln.data_json
+            needs_rewrite = (
+                (bool(url_map) and any(u in ln.data_json for u in url_map))
+                or (bool(upload_id_map) and '"upload_id"' in ln.data_json)
+                or (bool(object_key_map) and '"object_key"' in ln.data_json)
             )
-            has_http = "http" in ln.data_json.lower()
-            if not needs_rewrite and not has_http:
+            low_json = ln.data_json.lower()
+            has_raw = "http" in low_json or "private-media/" in low_json or '"object_key"' in ln.data_json
+            if not needs_rewrite and not has_raw:
                 out.append(ln)
                 continue
             raw_item = ln.item()
             rewritten = (
-                _rewrite_item_urls(raw_item, url_map, upload_id_map)
+                _rewrite_item_urls(raw_item, url_map, upload_id_map, object_key_map)
                 if needs_rewrite
                 else raw_item
             )
@@ -2841,9 +2815,12 @@ def rewrite_lines_for_owner_media(
             out.append(line_of(cleaned) if cleaned is not raw_item else ln)
         return out
 
-    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
-    has_binding_urls = any(not k.startswith("upload_id:") for k in bindings)
+    maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str], dict[str, str]]] = {}
+    has_binding_urls = any(
+        not k.startswith(("upload_id:", "object_key:")) for k in bindings
+    )
     has_binding_uploads = any(k.startswith("upload_id:") for k in bindings)
+    has_binding_object_keys = any(k.startswith("object_key:") for k in bindings)
     out = []
     for ln in lines:
         if not isinstance(ln, Line):
@@ -2852,20 +2829,11 @@ def rewrite_lines_for_owner_media(
         if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
             out.append(ln)
             continue
-<<<<<<< HEAD
-        has_http = "http" in ln.data_json.lower()
-        maybe_upload = has_binding_uploads and '"upload_id"' in ln.data_json
-        if not has_http and not maybe_upload and not has_binding_urls:
-=======
-        needs_rewrite = (
-            (url_map and any(u in ln.data_json for u in url_map))
-            or (bool(upload_id_map) and '"upload_id"' in ln.data_json)
-            or (bool(object_key_map) and '"object_key"' in ln.data_json)
-        )
         low_json = ln.data_json.lower()
         has_raw = "http" in low_json or "private-media/" in low_json or '"object_key"' in ln.data_json
-        if not needs_rewrite and not has_raw:
->>>>>>> refs/lane/83
+        maybe_upload = has_binding_uploads and '"upload_id"' in ln.data_json
+        maybe_object_key = has_binding_object_keys and '"object_key"' in ln.data_json
+        if not has_raw and not maybe_upload and not maybe_object_key and not has_binding_urls:
             out.append(ln)
             continue
         raw_item = ln.item()
@@ -2874,15 +2842,17 @@ def rewrite_lines_for_owner_media(
             cleaned = _strip_raw_storage_urls_from_item(raw_item)
             out.append(line_of(cleaned) if cleaned is not raw_item else ln)
             continue
-        pair = maps_by_turn.get(turn_idx)
-        if pair is None:
-            pair = _build_maps(turn_idx)
-            maps_by_turn[turn_idx] = pair
-        url_map, upload_id_map = pair
-        needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
-            bool(upload_id_map) and '"upload_id"' in ln.data_json
+        triple = maps_by_turn.get(turn_idx)
+        if triple is None:
+            triple = _build_maps(turn_idx)
+            maps_by_turn[turn_idx] = triple
+        url_map, upload_id_map, object_key_map = triple
+        needs_rewrite = (
+            (bool(url_map) and any(u in ln.data_json for u in url_map))
+            or (bool(upload_id_map) and '"upload_id"' in ln.data_json)
+            or (bool(object_key_map) and '"object_key"' in ln.data_json)
         )
-        if not needs_rewrite and not has_http:
+        if not needs_rewrite and not has_raw:
             out.append(ln)
             continue
         rewritten = (

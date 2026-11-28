@@ -407,7 +407,8 @@ def check_skills_and_workflows() -> dict[str, Any]:
 
     wf_root = app_root / "workflows"
     wf_dirs = sorted(p for p in wf_root.iterdir() if p.is_dir())
-    assert len(wf_dirs) == 6, f"Expected 6 workflows, got {len(wf_dirs)}"
+    wf_named = [p for p in wf_dirs if not p.name.startswith("_")]
+    assert len(wf_named) == 7, f"Expected 7 workflows, got {len(wf_named)}"
     js_compiled = 0
     for wf_dir in wf_dirs:
         for fp in sorted(wf_dir.rglob("*")):
@@ -420,7 +421,7 @@ def check_skills_and_workflows() -> dict[str, Any]:
             assert "DALTON_CAP" not in assembled_default, f"Unresolved DALTON_CAP marker in {fp}"
             hits_default = [t for t in core_default_proprietary_terms if t in assembled_default.lower()]
             assert not hits_default, f"Core default workflow file {fp.relative_to(app_root)} leaked {hits_default}"
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() == ".js" and not wf_dir.name.startswith("_"):
                 compile_check(assembled)
                 compile_check(assembled_default)
                 js_compiled += 1

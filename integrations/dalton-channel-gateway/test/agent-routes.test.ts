@@ -486,18 +486,19 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
     const origClaim = vi.mocked(h.backend.authorizeAndClaimDelivery).getMockImplementation();
     vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
       if (seenKeys.has(req.delivery_key)) {
+        const targetAddress = req.target ?? "";
         return {
           claim_status: "already_completed",
           status: "sent",
           platform: "feishu",
-          target_address: req.target_address,
+          target_address: targetAddress,
           is_current: true,
           first_response_json: {
             status: "sent",
             code: null,
-            address: req.target_address,
+            address: targetAddress,
             current: true,
-            message: `Delivered to ${req.target_address}.`,
+            message: `Delivered to ${targetAddress}.`,
             files: [],
           },
         };

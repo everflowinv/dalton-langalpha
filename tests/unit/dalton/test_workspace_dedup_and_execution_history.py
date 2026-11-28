@@ -2128,7 +2128,8 @@ def _build_sqlite_execution_history_db(
             reasoning_effort TEXT,
             fast_mode INTEGER DEFAULT 0,
             title TEXT,
-            created_at TEXT
+            created_at TEXT,
+            has_personal_integration_data INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE automation_executions (
             automation_execution_id TEXT PRIMARY KEY,

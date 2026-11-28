@@ -12,7 +12,7 @@
 	# open an empty gzip stream before handle_errors falls back to static index.html.
 	request_header @share_pages -Accept-Encoding
 
-	# Redact sensitive query params (?token=, ?dl_token=) and path share tokens
+	# Redact sensitive query params (?token=, ?dl_token=, ?ticket=, ?code=, ?state=) and path share tokens
 	# (/api/v1/public/shared/<token>, /s/<token>, /a/<token>, /og-meta?path=/s/<token>)
 	# in access logs in a single filter layer (Caddy 2.9.1 nested filters do not see
 	# full request>uri / request>headers>Referer field paths) while preserving
@@ -22,18 +22,9 @@
 		format filter {
 			wrap json
 			fields {
-<<<<<<< HEAD
-				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token)=)[^&#]+` `${1}${2}REDACTED`
-				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token)=)[^&#]+` `${1}${2}REDACTED`
-=======
-				request>uri query {
-					replace token REDACTED
-					replace ticket REDACTED
-					replace code REDACTED
-					replace state REDACTED
-				}
+				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
+				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket|code|state)=)[^&#]+` `${1}${2}REDACTED`
 				resp_headers>Location delete
->>>>>>> refs/lane/82
 			}
 		}
 	}

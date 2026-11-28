@@ -4877,7 +4877,7 @@ async def _bind_identity_in_tx(
         )
         if platform == "feishu":
             # Record binding-owned Feishu App ID (from active gateway runtime or get_credential_group)
-            # inside a savepoint so pre-d06X schemas stay compatible.
+            # inside a savepoint so pre-d064 schemas stay compatible.
             try:
                 from src.dalton.database import user_integrations as ui_db
                 from src.dalton.deployment_credentials.catalog import FEISHU_APP_ID_KEY
@@ -9832,7 +9832,6 @@ async def _lock_weixin_account_for_key_share_in_tx(
         )
 
 
-<<<<<<< HEAD
 async def _can_clear_bt2_run_fallback_pending_in_tx(
     cur: Any,
     *,
@@ -11021,7 +11020,8 @@ async def _authorize_and_claim_bt2_links_delivery_once(
                     "root_message_id": auth_meta.get("root_message_id"),
                     "first_reply_message_id": auth_meta.get("first_reply_message_id"),
                 }
-=======
+
+
 async def _read_thread_personal_privacy_in_tx(
     cur: Any,
     thread_id: str | None,
@@ -11046,7 +11046,6 @@ async def _read_thread_personal_privacy_in_tx(
         return False, None
     owner = str(row.get("owner_user_id") or "").strip() or None
     return bool(row.get("has_personal_integration_data")), owner
->>>>>>> refs/lane/82
 
 
 async def authorize_and_claim_delivery(
@@ -11650,13 +11649,10 @@ async def authorize_and_claim_delivery(
                 resolved_wx_bot_id: str | None = None
                 resolved_wx_bot_gen: int | None = None
                 verified_source_row: dict[str, Any] | None = None
-<<<<<<< HEAD
                 resolved_auth_mode: str = "current_conversation"
                 resolved_verified_ws_id: str | None = None
-=======
                 resolved_privacy_thread_id: str | None = norm_tid
                 forced_personal_redirect_notice = False
->>>>>>> refs/lane/82
 
                 # Scenario A1: Direct notice replying to an inbound event
                 if cleaned_kind == "notice" and cleaned_inbound_mid and cleaned_platform:
@@ -12719,7 +12715,55 @@ async def authorize_and_claim_delivery(
                     reject_company_system_auth(resolved_user_id)
                 require_channel_platform_capability(resolved_platform)
 
-<<<<<<< HEAD
+                # Personal integration egress guard (backend enforcement):
+                # Once a thread carries personal integration data, actual replies,
+                # automation summaries, fallbacks, and retries may ONLY go to the
+                # owner's verified 1:1 DM. Non-DM targets only permit the sanitized
+                # redirect notice (`:personal_redirect_notice`) with forced safe text.
+                if (
+                    not resolved_privacy_thread_id
+                    and isinstance(verified_source_row, dict)
+                    and verified_source_row.get("thread_id")
+                ):
+                    resolved_privacy_thread_id = normalize_uuid(
+                        verified_source_row.get("thread_id")
+                    )
+                if resolved_privacy_thread_id:
+                    (
+                        priv_thread,
+                        priv_owner,
+                    ) = await _read_thread_personal_privacy_in_tx(
+                        cur, resolved_privacy_thread_id
+                    )
+                    if priv_thread:
+                        if priv_owner and str(resolved_user_id or "").strip() != priv_owner:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "personal_integration_private_only",
+                                "has_personal_integration_data": True,
+                                "message": "该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
+                            }
+                        if not _is_dm_address(
+                            str(resolved_platform or ""),
+                            str(resolved_target_address or ""),
+                        ):
+                            if cleaned_key.endswith(
+                                ":personal_redirect_notice"
+                            ) and cleaned_kind in ("automation", "fallback", "notice"):
+                                forced_personal_redirect_notice = True
+                            else:
+                                return {
+                                    "claim_status": "denied",
+                                    "status": "failed",
+                                    "code": "personal_integration_private_only",
+                                    "has_personal_integration_data": True,
+                                    "redirect_dm_address": f"{resolved_platform}:@me"
+                                    if resolved_platform
+                                    else None,
+                                    "message": "该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                                }
+
                 cleaned_payload_digest = (
                     str(payload_digest).strip()
                     if isinstance(payload_digest, str) and payload_digest.strip()
@@ -12853,56 +12897,6 @@ async def authorize_and_claim_delivery(
                             "discord_body_phase": _delivery_discord_body_phase(prior_match),
                             "delivery_attempt": _delivery_attempt(prior_match),
                         }
-=======
-                # Personal integration egress guard (backend enforcement):
-                # Once a thread carries personal integration data, actual replies,
-                # automation summaries, fallbacks, and retries may ONLY go to the
-                # owner's verified 1:1 DM. Non-DM targets only permit the sanitized
-                # redirect notice (`:personal_redirect_notice`) with forced safe text.
-                if (
-                    not resolved_privacy_thread_id
-                    and isinstance(verified_source_row, dict)
-                    and verified_source_row.get("thread_id")
-                ):
-                    resolved_privacy_thread_id = normalize_uuid(
-                        verified_source_row.get("thread_id")
-                    )
-                if resolved_privacy_thread_id:
-                    (
-                        priv_thread,
-                        priv_owner,
-                    ) = await _read_thread_personal_privacy_in_tx(
-                        cur, resolved_privacy_thread_id
-                    )
-                    if priv_thread:
-                        if priv_owner and str(resolved_user_id or "").strip() != priv_owner:
-                            return {
-                                "claim_status": "denied",
-                                "status": "failed",
-                                "code": "personal_integration_private_only",
-                                "has_personal_integration_data": True,
-                                "message": "该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
-                            }
-                        if not _is_dm_address(
-                            str(resolved_platform or ""),
-                            str(resolved_target_address or ""),
-                        ):
-                            if cleaned_key.endswith(
-                                ":personal_redirect_notice"
-                            ) and cleaned_kind in ("automation", "fallback", "notice"):
-                                forced_personal_redirect_notice = True
-                            else:
-                                return {
-                                    "claim_status": "denied",
-                                    "status": "failed",
-                                    "code": "personal_integration_private_only",
-                                    "has_personal_integration_data": True,
-                                    "redirect_dm_address": f"{resolved_platform}:@me"
-                                    if resolved_platform
-                                    else None,
-                                    "message": "该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
-                                }
->>>>>>> refs/lane/82
 
                 # Multi-account Weixin authorization, source generation check, and token resolution (§3.2 #4, D18, Codex ①)
                 if resolved_platform == "weixin":
@@ -18482,17 +18476,16 @@ async def _recover_channel_state_once(
                     auto_row["chart_snapshots"] = auto_snaps
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
-<<<<<<< HEAD
-<<<<<<< HEAD
-                    from src.dalton.settings import is_strict_deliverable_text_enabled
-=======
                     from src.dalton.settings import (
                         is_failure_notice_enabled,
                         is_strict_deliverable_text_enabled,
                     )
->>>>>>> refs/lane/105
                     auto_row["strict_deliverable_text_enabled"] = is_strict_deliverable_text_enabled()
                     auto_row["failure_notice_enabled"] = is_failure_notice_enabled()
+                    auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                        cur, eff_tid
+                    )
+                    auto_row["has_personal_integration_data"] = bool(auto_is_priv)
 
                 (
                     bt2_link_recoveries,
@@ -18503,20 +18496,10 @@ async def _recover_channel_state_once(
                     cur, enabled_platforms=enabled_platforms
                 )
 
-<<<<<<< HEAD
-                from src.dalton.settings import is_strict_deliverable_text_enabled
-=======
-                    auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
-                        cur, eff_tid
-                    )
-                    auto_row["has_personal_integration_data"] = bool(auto_is_priv)
->>>>>>> refs/lane/82
-=======
                 from src.dalton.settings import (
                     is_failure_notice_enabled,
                     is_strict_deliverable_text_enabled,
                 )
->>>>>>> refs/lane/105
 
                 return {
                     "mode": "startup",
@@ -19335,15 +19318,9 @@ async def finish_automation_run(
                     "finish_status": updated.get("finish_status"),
                     "final_text": updated.get("final_text"),
                     "targets": enriched_targets,
-<<<<<<< HEAD
                     "strict_deliverable_text_enabled": is_strict_deliverable_text_enabled(),
-<<<<<<< HEAD
-=======
-                    "has_personal_integration_data": bool(auto_is_priv),
->>>>>>> refs/lane/82
-=======
                     "failure_notice_enabled": is_failure_notice_enabled(),
->>>>>>> refs/lane/105
+                    "has_personal_integration_data": bool(auto_is_priv),
                 }
 
 

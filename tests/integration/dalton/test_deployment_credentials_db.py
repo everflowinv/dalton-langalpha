@@ -1,4 +1,4 @@
-"""Real PostgreSQL integration tests for deployment credentials migration d06X, audit trigger, and concurrency.
+"""Real PostgreSQL integration tests for deployment credentials migration d063, audit trigger, and concurrency.
 
 Run outside the sandbox against a temporary *_test PostgreSQL database (serially, no -n):
   env TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_NAME=lane84_test \
@@ -92,11 +92,11 @@ def _test_env(monkeypatch: pytest.MonkeyPatch):
     dc_snapshot.reset_active_snapshot_for_test()
 
 
-async def test_migration_d06x_tables_initial_revision_and_append_only_audit_trigger(
+async def test_migration_d063_tables_initial_revision_and_append_only_audit_trigger(
     dalton_schema,
     test_db_uri: str,
 ) -> None:
-    """Verify d06X created all 3 tables, initialized meta revision=0, and blocks UPDATE/DELETE/TRUNCATE."""
+    """Verify d063 created all 3 tables, initialized meta revision=0, and blocks UPDATE/DELETE/TRUNCATE."""
     extract_effective_test_db_name(test_db_uri, source="test_db_uri")
     async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
         async with conn.cursor() as cur:

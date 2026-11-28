@@ -174,10 +174,8 @@ async def settle(
     release_pre_start_signals: bool = False,
     # DALTON-HOOK(coverage-units): allow caller to narrow/specify source statuses without relaxing policy defaults
     from_statuses: Optional[tuple[ExecutionStatus, ...]] = None,
-<<<<<<< HEAD
     # DALTON-HOOK(dalton-notify): honor persisted one-shot schedule action during rollback recovery
     schedule_override: Optional[exec_db.ScheduleAction] = None,
-=======
     # DALTON-HOOK(automation-capacity-retry): in-lock capacity guards, capacity-pending skip, in-tx thread reset, and durable failure notification
     expected_wait_reason: Optional[str] = None,
     expected_claim_token: Any = exec_db.UNSET_CLAIM_TOKEN,
@@ -191,7 +189,6 @@ async def settle(
             Awaitable[Optional[automation_delivery.Delivery]],
         ]
     ] = None,
->>>>>>> refs/lane/106
 ) -> bool:
     """End a firing as ``outcome``; False when it was no longer in a state
     that outcome can end, because someone else settled it first.
@@ -216,14 +213,10 @@ async def settle(
     failure_notify_left = False  # DALTON-HOOK(automation-capacity-retry)
 
     async def leave_finish(conn: Any, settled: Dict[str, Any]) -> None:
-<<<<<<< HEAD
-        nonlocal finish_left
+        nonlocal finish_left, failure_notify_left
         settled_tid, settled_rid, settled_delivery = _settled_as(
             settled, execution_id, thread_id, run_id, delivery
         )
-=======
-        nonlocal finish_left, failure_notify_left
->>>>>>> refs/lane/106
         finish_left = await _leave_finish(
             conn, policy, automation, execution_id,
             settled_tid, settled_rid, settled_delivery,

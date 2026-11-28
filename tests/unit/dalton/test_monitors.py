@@ -4803,7 +4803,7 @@ def _setup_legacy_migration_db(
                 return
             if (
                 "FROM SHARE_LINKS L" in upper
-                and "WHERE L.ARTIFACT_ID = %(ARTIFACT_ID)S AND L.KIND = 'FILE'" in upper
+                and "WHERE L.ARTIFACT_ID = %(ARTIFACT_ID)S AND L.KIND" in upper
             ):
                 aid = params["artifact_id"]
                 link = share_links.get(aid)

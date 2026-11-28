@@ -504,7 +504,6 @@ export function settingSearchText(
         ? `通知目标 自动推送 消息提醒 notify targets 推送总开关 总开关 推送开关 ${channelTokens.join(' ')}`.trim()
         : `账号绑定 绑定码 私聊 机器人 bind code account ${channelTokens.join(' ')}`.trim();
   }
-<<<<<<< HEAD
   // DALTON-HOOK(personal-integrations): include provider search tokens only for enabled personal capabilities
   if (entry.anchor === 'dalton-personal-integrations') {
     const tokens = ['个人日历 个人邮箱 外部账号连接 personal calendar mail'];
@@ -515,11 +514,10 @@ export function settingSearchText(
       tokens.push('飞书 feishu 飞书日历 飞书邮箱');
     }
     keywords = tokens.join(' ');
-=======
+  }
   // DALTON-HOOK(deployment-credentials): delegate dynamic capability-gated search keywords to Dalton helper
   if (entry.anchor === 'dalton-deployment-credentials') {
     keywords = buildDeploymentCredentialsSearchKeywords(keywords, ctx);
->>>>>>> refs/lane/84
   }
   return [
     t(labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)

@@ -22,13 +22,10 @@ from src.dalton.deployment_credentials.router import (
 )
 # DALTON-HOOK(monitors): mount monitor panel endpoints under /api/v1/dalton/monitors
 from src.dalton.monitors.router import router as _monitors_router
-<<<<<<< HEAD
 from src.dalton.download_ticket import install_download_ticket_log_filter
-=======
 # DALTON-HOOK(personal-integrations): mount personal calendar/mail OAuth & revocation endpoints
 from src.dalton.app.integrations_router import router as _integrations_router
 from src.dalton.app.tracker_calendar_router import router as _tracker_calendar_router
->>>>>>> refs/lane/82
 from src.dalton.profile import is_core_profile
 from src.dalton.settings import log_dalton_startup_warnings
 

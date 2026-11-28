@@ -1032,40 +1032,26 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
         async with conn.cursor() as cur:
             if stamp is not None:
                 # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
-<<<<<<< HEAD
                 # DALTON-HOOK(dalton-notify): preserve pending_settlement marker across delivery re-stamps
-                await cur.execute(f"""
-                    UPDATE automation_executions
-                    SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'pending_settlement' THEN
-                            %s::jsonb || jsonb_build_object(
-                                'subscription_fallback', delivery->'subscription_fallback',
-                                'pending_settlement', delivery->'pending_settlement'
-                            )
-                        WHEN delivery ? 'subscription_fallback' THEN
-                            %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
-                        WHEN delivery ? 'pending_settlement' THEN
-                            %s::jsonb || jsonb_build_object('pending_settlement', delivery->'pending_settlement')
-=======
                 # DALTON-HOOK(automation-capacity-retry): preserve capacity_retry and delivery_meta state across delivery re-stamps
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' AND (delivery ? 'capacity_retry' OR delivery ? 'delivery_meta') THEN
+                        WHEN delivery ? 'subscription_fallback'
+                          AND (delivery ? 'pending_settlement' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta') THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback') || (
                                 SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
                                 FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
-                                WHERE k IN ('capacity_retry', 'delivery_meta')
+                                WHERE k IN ('pending_settlement', 'capacity_retry', 'delivery_meta')
                             )
                         WHEN delivery ? 'subscription_fallback' THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
-                        WHEN delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
+                        WHEN delivery ? 'pending_settlement' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
                             %s::jsonb || (
                                 SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
                                 FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
-                                WHERE k IN ('capacity_retry', 'delivery_meta')
+                                WHERE k IN ('pending_settlement', 'capacity_retry', 'delivery_meta')
                             )
->>>>>>> refs/lane/106
                         ELSE %s::jsonb
                     END
                     WHERE automation_execution_id = %s
@@ -1073,32 +1059,20 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
                 """, (Json(stamp), Json(stamp), Json(stamp), Json(stamp), execution_id))
             else:
                 # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
-<<<<<<< HEAD
                 # DALTON-HOOK(dalton-notify): keep pending_settlement marker when clearing delivery targets
-                await cur.execute(f"""
-                    UPDATE automation_executions
-                    SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'pending_settlement' THEN
-                            jsonb_build_object(
-                                'subscription_fallback', delivery->'subscription_fallback',
-                                'pending_settlement', delivery->'pending_settlement'
-                            )
-                        WHEN delivery ? 'subscription_fallback' THEN
-                            jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
-                        WHEN delivery ? 'pending_settlement' THEN
-                            jsonb_build_object('pending_settlement', delivery->'pending_settlement')
-=======
                 # DALTON-HOOK(automation-capacity-retry): keep capacity_retry and delivery_meta state even when clearing delivery targets
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
-                        WHEN delivery ? 'subscription_fallback' OR delivery ? 'capacity_retry' OR delivery ? 'delivery_meta' THEN
+                        WHEN delivery ? 'subscription_fallback'
+                          OR delivery ? 'pending_settlement'
+                          OR delivery ? 'capacity_retry'
+                          OR delivery ? 'delivery_meta' THEN
                             (
                                 SELECT COALESCE(jsonb_object_agg(k, v), '{{}}'::jsonb)
                                 FROM jsonb_each(COALESCE(delivery, '{{}}'::jsonb)) AS t(k, v)
-                                WHERE k IN ('subscription_fallback', 'capacity_retry', 'delivery_meta')
+                                WHERE k IN ('subscription_fallback', 'pending_settlement', 'capacity_retry', 'delivery_meta')
                             )
->>>>>>> refs/lane/106
                         ELSE NULL
                     END
                     WHERE automation_execution_id = %s

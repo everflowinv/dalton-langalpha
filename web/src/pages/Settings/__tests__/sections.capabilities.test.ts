@@ -270,7 +270,6 @@ describe('Settings sections & search capability gating', () => {
     }
   });
 
-<<<<<<< HEAD
   // DALTON-HOOK(personal-integrations): verify Integrations section & search visibility for single personal capability or historical connections
   it('shows Integrations section and personal integrations search entry on single personal capability or historical connections', () => {
     // Core with all personal & channel capabilities off and no historical connections -> hidden
@@ -300,7 +299,8 @@ describe('Settings sections & search capability gating', () => {
         (e) => e.anchor === 'dalton-personal-integrations',
       ),
     ).toBe(true);
-=======
+  });
+
   it('gates deploymentCredentials by admin tier in multi-user mode, allows OSS static view, and keeps Core search neutral', () => {
     // Multi-user admin sees deploymentCredentials
     expect(sectionShown('deploymentCredentials', coreAdminCtx)).toBe(true);
@@ -346,6 +346,5 @@ describe('Settings sections & search capability gating', () => {
     expect(feishuCredText).toContain('feishu');
     expect(feishuCredText).not.toContain('discord');
     expect(feishuCredText).not.toContain('微信');
->>>>>>> refs/lane/84
   });
 });

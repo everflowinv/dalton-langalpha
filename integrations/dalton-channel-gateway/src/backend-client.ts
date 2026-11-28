@@ -1666,19 +1666,17 @@ export interface BackendClient {
     delivery_id: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
 
-<<<<<<< HEAD
   forwardFeishuRevokedEvent?(payload: Record<string, unknown>): Promise<{
     status: string;
     event_id?: string | null;
     reason?: string | null;
     purge_ids?: string[];
   }>;
-=======
+
   authorizeFailureNoticePlan?(req: {
     target_receipt_id: string;
     claim_token: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
->>>>>>> refs/lane/105
 
   downloadDataTaskRunArtifact?(
     runId: string,

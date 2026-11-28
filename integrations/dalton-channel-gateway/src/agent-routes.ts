@@ -55,7 +55,6 @@ import {
   personalChannelBindingsUrl,
 } from "./commands.js";
 
-<<<<<<< HEAD
 export const PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE =
   "本次结果含个人日历内容，已发送到你的私聊";
 
@@ -73,7 +72,8 @@ function platformFromAddress(address: string | null | undefined): ChannelPlatfor
     return "weixin";
   }
   return null;
-=======
+}
+
 export interface PendingAutomationFinalizeRecord {
   executionId: string;
   userId: string;
@@ -100,7 +100,6 @@ function isTransientFinishBackendError(err: unknown): boolean {
     );
   }
   return true;
->>>>>>> refs/lane/105
 }
 
 export class AgentRoutesHandler {
@@ -966,8 +965,10 @@ export class AgentRoutesHandler {
     // Shape B check: if another caller in this gateway process is already finishing `executionId`,
     // never enter execution or write `finished`; return a retryable response while in flight
     // (or Shape C if the first caller already transitioned the row to `finished`).
-<<<<<<< HEAD
-    if (this.activeFinishExecutors.has(executionId)) {
+    if (
+      this.activeFinishExecutors.has(lockExecutionId) ||
+      this.activeFinishExecutors.has(executionId)
+    ) {
       let current: Awaited<ReturnType<BackendClient["finishAutomationRun"]>>;
       try {
         current = await this.backend.finishAutomationRun(
@@ -994,23 +995,6 @@ export class AgentRoutesHandler {
         }
         throw err;
       }
-=======
-    if (
-      this.activeFinishExecutors.has(lockExecutionId) ||
-      this.activeFinishExecutors.has(executionId)
-    ) {
-      const current = await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: body.status,
-          thread_id: body.thread_id ?? null,
-          run_id: body.run_id ?? null,
-          final_text: body.final_text ?? null,
-          mark_finished: false,
-        },
-        userId,
-      );
->>>>>>> refs/lane/106
       if (current.status === 404 || !current.data) {
         return { status: 404, data: { detail: "Unknown execution_id" } };
       }
@@ -1247,9 +1231,9 @@ export class AgentRoutesHandler {
         error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
       }));
     }
-<<<<<<< HEAD
     let detailed = await this.executeAutomationRunFinishDetailed({
       ...params,
+      executionId: canonicalId,
       failureNoticeEnabled: params.failureNoticeEnabled === true,
       isRecovery: true,
       forceSealNoticeFailure: false,
@@ -1264,6 +1248,7 @@ export class AgentRoutesHandler {
       }
       detailed = await this.executeAutomationRunFinishDetailed({
         ...params,
+        executionId: canonicalId,
         failureNoticeEnabled: params.failureNoticeEnabled === true,
         isRecovery: true,
         forceSealNoticeFailure: true,
@@ -1277,14 +1262,8 @@ export class AgentRoutesHandler {
       if (delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
-      await this.retryPendingFinalization(params.executionId);
+      await this.retryPendingFinalization(canonicalId);
     }
-=======
-    const detailed = await this.executeAutomationRunFinishDetailed({
-      ...params,
-      executionId: canonicalId,
-    });
->>>>>>> refs/lane/106
     return detailed.targets;
   }
 

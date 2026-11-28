@@ -1488,7 +1488,7 @@ def test_d058_single_head_and_no_business_imports() -> None:
     alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "src" / "dalton" / "migrations"))
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
-    assert heads == ["d062"], f"Expected single head ['d062'], got {heads}"
+    assert heads == ["d064"], f"Expected single head ['d064'], got {heads}"
     rev = script.get_revision("d058")
     assert rev is not None
     assert rev.down_revision == "d057"

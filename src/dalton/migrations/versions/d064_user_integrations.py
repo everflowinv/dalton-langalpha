@@ -1,4 +1,4 @@
-"""Dalton d06X: personal calendar & mail integrations foundation tables, sequence, and thread purge columns.
+"""Dalton d064: personal calendar & mail integrations foundation tables, sequence, and thread purge columns.
 
 Creates:
 - Sequence ``dalton_integration_auth_epoch_seq``
@@ -13,8 +13,8 @@ Creates:
   ``has_personal_integration_data``, ``personal_purge_in_progress``,
   ``personal_purge_generation``, ``personal_purged_turn_ranges``
 
-Revision ID: d06X
-Revises: d06W
+Revision ID: d064
+Revises: d063
 Create Date: 2026-11-26
 """
 
@@ -24,8 +24,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "d06X"
-down_revision: str | None = "d06W"
+revision: str = "d064"
+down_revision: str | None = "d063"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

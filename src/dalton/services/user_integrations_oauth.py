@@ -1012,7 +1012,8 @@ async def _verify_original_session_for_callback(
         return
 
     if auth_mode == "oss":
-        if user_id != LOCAL_DEV_USER_ID:
+        expected_oss_owner = str(LOCAL_DEV_USER_ID)
+        if user_id != expected_oss_owner:
             raise OAuthSessionInvalidError(
                 "OAuth state owner does not match the active OSS principal.",
                 code="session_user_mismatch",

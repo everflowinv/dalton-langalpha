@@ -565,7 +565,6 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
-<<<<<<< HEAD
   # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
   # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
   "share-redaction"
@@ -589,7 +588,6 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
-<<<<<<< HEAD
   # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
   # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
   "xlsx-preserve-calcpr"
@@ -600,7 +598,6 @@ ALLOWED_HOOKS=(
   # Modeling v2 P0-b: per-workspace exclusive modeling lock at RunWorkflow / WorkflowDriver
   # entry for company-model, earnings-deep-update (with model_path), and full-coverage.
   "modeling-lock"
-=======
   # Personal calendar & mail integrations Batch 1 (r1): START/HTTP/Fork purge gates,
   # FOR SHARE dual-generation writeback fences (replay, search, transcripts), closed-range
   # search guard & truncate/fork clipping, startup purge resume, and callback query redaction.
@@ -608,13 +605,10 @@ ALLOWED_HOOKS=(
   # Deployment credentials Batch 1: setup_settings thin hooks, vault invalidation sync,
   # and deployment secret redaction.
   "deployment-credentials"
->>>>>>> refs/lane/82
-=======
   # Production fix: defer and retry automation capacity failures (WriterGuardUnavailable,
   # quota burst 429, credit-gate 503) in Postgres via wait_reason='capacity_limit' up to 15m,
   # and reset conversation_threads.current_status on pre-START automation failure/exit.
   "automation-capacity-retry"
->>>>>>> refs/lane/106
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

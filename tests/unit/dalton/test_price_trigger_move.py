@@ -1177,7 +1177,7 @@ async def test_price_trigger_unbound_executing_not_skipped_and_bound_nonlead_rea
         async def execute(self, sql, params=None):
             q = " ".join(str(sql).split())
             seen_sql.append(q)
-            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+            if "WITH target AS" not in q and "AND NOT (" in q and "UPDATE automation_executions e" in q:
                 # Simulate managed candidate: fast path returns None so managed path runs
                 self._row = None
             elif "SELECT a.workspace_id" in q:

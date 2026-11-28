@@ -137,23 +137,14 @@ async def close_ws_ticket_redis_client() -> None:
             pass
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
-<<<<<<< HEAD
-    r"([?&](?:ticket|token|dl_token)=)[^&\s\"'<>#]+",
-=======
-    r"([?&](?:ticket|token|code|state)=)[^&\s\"'<>#]+",
->>>>>>> refs/lane/82
+    r"([?&](?:ticket|token|dl_token|code|state)=)[^&\s\"'<>#]+",
     re.IGNORECASE,
 )
 
 
 def redact_sensitive_query_params(value: Any) -> Any:
-<<<<<<< HEAD
-    """Drop download-ticket route queries and redact ``ticket=`` / ``token=`` / ``dl_token=`` and path share tokens."""
+    """Drop download-ticket route queries and redact ``ticket=`` / ``token=`` / ``dl_token=`` / ``code=`` / ``state=`` and path share tokens."""
     if not isinstance(value, str) or not value:
-=======
-    """Redact ``ticket=``, ``token=``, ``code=``, and ``state=`` query values from log strings."""
-    if not isinstance(value, str) or "?" not in value:
->>>>>>> refs/lane/82
         return value
     cleaned = value
     if "?" in cleaned:

@@ -1,4 +1,4 @@
-"""Dalton d06X: deployment settings revision metadata, append-only audit log, and sandbox scrub state.
+"""Dalton d063: deployment settings revision metadata, append-only audit log, and sandbox scrub state.
 
 Adds three Dalton-owned tables alongside upstream migration 148's ``deployment_settings``:
 - ``dalton_deployment_settings_meta``: single-row monotonically increasing revision counter
@@ -8,8 +8,8 @@ Adds three Dalton-owned tables alongside upstream migration 148's ``deployment_s
 - ``dalton_sandbox_feishu_vault_scrub``: per-computer status table for online cleanup of
   dedicated Feishu Vault credentials from sandbox disks (used in Batch 1 Step 2).
 
-Revision ID: d06W
-Revises: d057
+Revision ID: d063
+Revises: d062
 Create Date: 2026-11-26
 """
 
@@ -19,8 +19,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "d06W"
-down_revision: str | None = "d057"
+revision: str = "d063"
+down_revision: str | None = "d062"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
