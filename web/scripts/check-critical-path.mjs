@@ -47,7 +47,10 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // #457 在 zh-CN 文案目录（首屏必载）加了投递状态文案，生产构建实测 560.1 kB，上调到 562
 // sync11 (#482) 合并上游后生产构建实测 574.4 kB（2026-11-23 部署时的检查结果），上调到 580
 // sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); Dalton measured 475.0 kB, lowered ceiling to 490 (~15 kB headroom).
-const MAX_EAGER_KB = 490
+// D6 (sync14 S1 + calendar / credentials / storage strings): measured 492.0 kB; upstream raised its
+// own ceiling to 500 kB in #898. Dalton follows at 500 (~8 kB headroom); trimming the eager zh-CN
+// catalog is tracked in FOLLOWUPS.
+const MAX_EAGER_KB = 500
 
 // DALTON-HOOK(frontend-release-dir): fall back to DALTON_VITE_OUT_DIR so shared `pnpm build` checks the staged release dir
 const outDir = process.argv[2] || (process.env.DALTON_VITE_OUT_DIR || '').trim() || 'dist'
