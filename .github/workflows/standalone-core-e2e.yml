@@ -101,6 +101,8 @@ jobs:
             export BUILD_GIT_SHA
             export BUILD_GIT_DIRTY="false"
             cleanup_customer_stack() {
+              docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps -a || true
+              docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env logs --tail=200 backend migrate || true
               docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v --remove-orphans || true
             }
             trap cleanup_customer_stack EXIT
