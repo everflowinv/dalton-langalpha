@@ -50,6 +50,7 @@ import http.client
 import importlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -1507,21 +1508,83 @@ def check_backup_script(
     return latest_backup
 
 
-def _prepare_clean_restore_dir(src_work_dir: Path, dst_dir: Path) -> None:
-    """Copy only the deployment skeleton (no .env, no backups, no ci-artifacts) for empty-host restore."""
+_RESTORE_STAGE_FILES: tuple[str, ...] = (
+    "docker-compose.yml",
+    "docker-compose.core.yml",
+    "Dockerfile.sandbox",
+    "agent_config.yaml",
+    "agent_config.core.yaml",
+    "config.yaml",
+    "config.core.yaml",
+    ".env.example",
+    ".env.core.example",
+    ".release_git_sha",
+    "src/__init__.py",
+    "src/dalton/__init__.py",
+    "src/dalton/pg_config.py",
+    "scripts/dalton/sql/personal_integrations_restore_reset.sql",
+)
+
+_RESTORE_STAGE_DIRS: tuple[str, ...] = (
+    "deploy/standalone",
+    "scripts/standalone",
+)
+
+
+def _extract_release_tar_into(release_tar: Path, dst_dir: Path) -> None:
+    """Extract a packaged release tarball into ``dst_dir`` (matching customer empty-host restore)."""
+    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="b6-release-stage-", dir=str(dst_dir.parent)) as stage:
+        stage_path = Path(stage)
+        _run_cmd(
+            ["tar", "-xzf", str(release_tar), "-C", str(stage_path)],
+            cwd=stage_path,
+            timeout=120,
+        )
+        if (stage_path / "docker-compose.core.yml").is_file():
+            release_src = stage_path
+        else:
+            top_dirs = [p for p in stage_path.iterdir() if p.is_dir()]
+            assert len(top_dirs) == 1 and (top_dirs[0] / "docker-compose.core.yml").is_file(), (
+                f"Invalid release tarball {release_tar}: docker-compose.core.yml not found at archive root"
+            )
+            release_src = top_dirs[0]
+        if release_src == stage_path:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for item in stage_path.iterdir():
+                shutil.move(str(item), str(dst_dir / item.name))
+        else:
+            if dst_dir.exists():
+                shutil.rmtree(dst_dir)
+            shutil.move(str(release_src), str(dst_dir))
+
+
+def _prepare_clean_restore_dir(
+    src_work_dir: Path,
+    dst_dir: Path,
+    *,
+    release_tar: Path | None = None,
+) -> None:
+    """Prepare a clean empty-host deployment directory (no .env, no backups, no ci-artifacts).
+
+    Customers restore on a clean host by unpacking the full release tarball
+    (``STANDALONE-DEPLOY.md`` §6.2). When ``release_tar`` is provided, unpack it directly
+    into ``dst_dir``; otherwise copy the release files/directories required by
+    ``restore.sh`` (including ``src/dalton/pg_config.py`` and
+    ``scripts/dalton/sql/personal_integrations_restore_reset.sql``) from ``src_work_dir``.
+    """
+    if release_tar is not None:
+        _extract_release_tar_into(release_tar, dst_dir)
+        return
+
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for rel_file in (
-        "docker-compose.yml",
-        "docker-compose.core.yml",
-        "Dockerfile.sandbox",
-        "agent_config.yaml",
-        "agent_config.core.yaml",
-        "config.core.yaml",
-    ):
+    for rel_file in _RESTORE_STAGE_FILES:
         src = src_work_dir / rel_file
         if src.is_file():
-            shutil.copy2(src, dst_dir / rel_file)
-    for rel_dir in ("deploy/standalone", "scripts/standalone"):
+            target = dst_dir / rel_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+    for rel_dir in _RESTORE_STAGE_DIRS:
         src = src_work_dir / rel_dir
         dst = dst_dir / rel_dir
         if src.is_dir():
@@ -1790,7 +1853,11 @@ def check_restore_on_clean_stack(
         tmp_root = Path(tmpdir)
         restore_dir = tmp_root / "stack"
         restore_backup_dir = tmp_root / "backup-isolated"
-        _prepare_clean_restore_dir(ctx.work_dir, restore_dir)
+        env_release_tar = os.environ.get("STANDALONE_RELEASE_TAR", "").strip()
+        release_tar = Path(env_release_tar) if env_release_tar else None
+        if release_tar is not None:
+            assert release_tar.is_file(), f"STANDALONE_RELEASE_TAR does not exist: {release_tar}"
+        _prepare_clean_restore_dir(ctx.work_dir, restore_dir, release_tar=release_tar)
         assert not (restore_dir / ".env").exists(), "Restore target dir should start without .env"
 
         restore_owner_secret = (
@@ -1859,7 +1926,8 @@ def check_restore_on_clean_stack(
         try:
             # 5a. Restore onto the brand-new empty stack (decrypting env.enc atomically);
             #     an in-progress 'uploading' record is present in the snapshot and MUST be
-            #     skipped with the skipped count reported while restore still succeeds.
+            #     converged to 'aborted' by reconcile-restored-inflight-states before
+            #     object verification and service startup.
             restore_5a_proc = _run_cmd(
                 [
                     "bash",
@@ -1880,8 +1948,10 @@ def check_restore_on_clean_stack(
                 timeout=360,
             )
             restore_5a_stdout = restore_5a_proc.stdout or ""
-            assert "skipped 1" in restore_5a_stdout.lower() and "uploading" in restore_5a_stdout.lower(), (
-                f"Expected restore.sh to report skipping 1 'uploading' record, got stdout:\n{restore_5a_stdout[-1200:]}"
+            assert re.search(r'"chat_uploads_aborted"\s*:\s*1\b', restore_5a_stdout), (
+                "Expected restore.sh (reconcile-restored-inflight-states) to converge 1 "
+                "in-progress 'uploading' chat upload record (chat_uploads_aborted=1), "
+                f"got stdout:\n{restore_5a_stdout[-1200:]}"
             )
             restored_env_file = restore_dir / ".env"
             assert restored_env_file.is_file(), "restore.sh did not write .env"
@@ -1890,6 +1960,31 @@ def check_restore_on_clean_stack(
             )
             assert not list(restore_dir.glob(".env.tmp-*")), (
                 "restore.sh left behind temporary .env.tmp-* file(s)"
+            )
+            uploading_restored_state = subprocess.check_output(
+                [
+                    *restore_compose_cmd,
+                    "--env-file",
+                    str(restored_env_file),
+                    "exec",
+                    "-T",
+                    "postgres",
+                    "psql",
+                    "-U",
+                    ctx.db_user,
+                    "-d",
+                    ctx.db_name,
+                    "-Atqc",
+                    f"SELECT state FROM dalton_chat_file_uploads WHERE upload_id = '{sentinel['uploading_id']}';",
+                ],
+                cwd=str(restore_dir),
+                env=restore_env,
+                text=True,
+                timeout=30,
+            ).strip()
+            assert uploading_restored_state == "aborted", (
+                f"Expected in-progress upload {sentinel['uploading_id']} to be converged to 'aborted' "
+                f"after restore, got {uploading_restored_state!r}"
             )
             restored_bucket = _lib.load_env_file(restored_env_file).get(
                 "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", ""

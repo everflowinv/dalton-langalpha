@@ -869,3 +869,136 @@ def test_run_checks_refuses_existing_project_containers_or_volumes(tmp_path: Pat
     assert "existing-prod-stack" in res.stderr
     logged = call_log.read_text(encoding="utf-8")
     assert "down" not in logged, f"run_checks.sh must never call compose down on existing project: {logged}"
+
+
+def _load_b6_module():
+    b6_path = CHECKS_DIR / "b6_tls_backup_upgrade.py"
+    spec = importlib.util.spec_from_file_location("b6_tls_backup_upgrade_under_test", b6_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_b6_prepare_clean_restore_dir_supports_storage_config_and_restore_preflight(
+    tmp_path: Path,
+) -> None:
+    b6 = _load_b6_module()
+    restore_dir = tmp_path / "stack"
+    b6._prepare_clean_restore_dir(REPO_ROOT, restore_dir)
+
+    assert not (restore_dir / ".env").exists()
+    for rel in (
+        "docker-compose.yml",
+        "docker-compose.core.yml",
+        "scripts/standalone/restore.sh",
+        "scripts/standalone/env_tokens.sh",
+        "scripts/standalone/storage_config.py",
+        "scripts/dalton/sql/personal_integrations_restore_reset.sql",
+        "src/__init__.py",
+        "src/dalton/__init__.py",
+        "src/dalton/pg_config.py",
+        "deploy/standalone/Caddyfile",
+    ):
+        assert (restore_dir / rel).is_file(), f"Missing staged restore file: {rel}"
+
+    sample_env = tmp_path / "candidate.env"
+    sample_env.write_text(
+        "DB_HOST=postgres\nDB_USER=dalton\nDB_PASSWORD=secret_pass\nDB_NAME=dalton_db\n",
+        encoding="utf-8",
+    )
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(restore_dir / "scripts" / "standalone" / "storage_config.py"),
+            "resolve-pg-config",
+            "--env-file",
+            str(sample_env),
+            "--default-host",
+            "postgres",
+            "--check-conflict",
+            "--caller",
+            "restore",
+        ],
+        cwd=str(restore_dir),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, f"storage_config.py failed in clean restore dir: {proc.stderr}"
+    payload = json.loads(proc.stdout)
+    assert payload["host"] == "postgres"
+    assert payload["user"] == "dalton"
+    assert payload["dbname"] == "dalton_db"
+
+    help_proc = subprocess.run(
+        ["bash", str(restore_dir / "scripts" / "standalone" / "restore.sh"), "--help"],
+        cwd=str(restore_dir),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert help_proc.returncode == 0, f"staged restore.sh --help failed: {help_proc.stderr}"
+
+
+def test_b6_prepare_clean_restore_dir_extracts_packaged_release_tarball(tmp_path: Path) -> None:
+    b6 = _load_b6_module()
+    tar_path = tmp_path / "dalton-core-deadbeef0.tar.gz"
+    top = "dalton-core-deadbeef0"
+    with tarfile.open(tar_path, mode="w:gz") as tf:
+        for rel in (
+            "docker-compose.yml",
+            "docker-compose.core.yml",
+            "scripts/standalone/restore.sh",
+            "scripts/standalone/env_tokens.sh",
+            "scripts/standalone/storage_config.py",
+            "scripts/dalton/sql/personal_integrations_restore_reset.sql",
+            "src/__init__.py",
+            "src/dalton/__init__.py",
+            "src/dalton/pg_config.py",
+            "deploy/standalone/Caddyfile",
+        ):
+            tf.add(REPO_ROOT / rel, arcname=f"{top}/{rel}")
+
+    restore_dir = tmp_path / "unpacked-stack"
+    b6._prepare_clean_restore_dir(REPO_ROOT, restore_dir, release_tar=tar_path)
+
+    assert not (restore_dir / ".env").exists()
+    assert not (restore_dir / top).exists()
+    assert (restore_dir / "docker-compose.core.yml").is_file()
+    assert (restore_dir / "src" / "dalton" / "pg_config.py").is_file()
+    assert (
+        restore_dir / "scripts" / "dalton" / "sql" / "personal_integrations_restore_reset.sql"
+    ).is_file()
+
+    sample_env = tmp_path / "candidate.env"
+    sample_env.write_text("DB_HOST=postgres\nDB_USER=postgres\nDB_NAME=postgres\n", encoding="utf-8")
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(restore_dir / "scripts" / "standalone" / "storage_config.py"),
+            "resolve-pg-config",
+            "--env-file",
+            str(sample_env),
+            "--default-host",
+            "postgres",
+            "--check-conflict",
+            "--caller",
+            "restore",
+        ],
+        cwd=str(restore_dir),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, f"storage_config.py failed in unpacked release dir: {proc.stderr}"
+    assert json.loads(proc.stdout)["host"] == "postgres"
