@@ -994,6 +994,13 @@ async def _serve_from_live_sandbox(
                 status_code=404, detail=not_found_detail
             ) from None
 
+        # Refuse what no branch can serve before hashing it: a file over the stream cap
+        # would be read in full only to be turned away.
+        if too_large.size > RELAY_MAX_BYTES:
+            raise HTTPException(
+                status_code=404, detail=not_found_detail
+            ) from None
+
         live_version = await read_live_file_version(
             sandbox,
             too_large.canonical,
