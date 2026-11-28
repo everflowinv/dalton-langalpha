@@ -822,6 +822,12 @@ async def update_thread_endpoint(
             cas_guards["expected_reasoning_effort"] = request.expected_reasoning_effort
         if "expected_fast_mode" in provided:
             cas_guards["expected_fast_mode"] = request.expected_fast_mode
+        if cas_guards and "reasoning_effort" in updates:
+            from src.dalton.llm.thread_model_dalton import (
+                enforce_conditional_effort_clear_guard,
+            )
+
+            enforce_conditional_effort_clear_guard(updates, cas_guards)
         if not updates and member_pin is None:
             raise HTTPException(
                 status_code=400, detail="No updatable fields provided"

@@ -39,7 +39,7 @@ interface UseThreadFieldSaveOptions<F extends ThreadField> {
   /** Puts the composer back after that failure, called only while it still shows the thread. */
   onFailed: (save: ThreadFieldSave<FieldValue<F>>, error?: unknown) => void;
   /** Hears the server's answer to each save that lands. */
-  onSaved?: (saved: Thread) => void;
+  onSaved?: (saved: Thread, save: ThreadFieldSave<FieldValue<F>>) => void;
 }
 
 /** What the server is known to hold, or null when no row was cached to restore. */
@@ -147,7 +147,8 @@ export function useThreadFieldSave<F extends ThreadField>({
       writeField(id, value, extraUpdates as Partial<Thread> | undefined);
       return { previous };
     },
-    onSuccess: (saved, { threadId: id, value, extraUpdates }) => {
+    onSuccess: (saved, save) => {
+      const { threadId: id, value, extraUpdates } = save;
       const priorExtra = isDaltonBuild ? confirmedRef.current.get(id)?.extra : undefined;
       const extraSaved: Partial<Thread> | undefined = saved && extraUpdates
         ? Object.fromEntries(
@@ -181,7 +182,7 @@ export function useThreadFieldSave<F extends ThreadField>({
         }
       }
       confirmedRef.current.set(id, { value: confirmedValue, ...(mergedExtra ? { extra: mergedExtra } : {}) });
-      if (saved) onSaved?.(saved);
+      if (saved) onSaved?.(saved, save);
     },
     onError: (error, save, context) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, field) }) !== 1) return;

@@ -683,6 +683,8 @@ async def resolve_llm_config(
     role: AgentRole = "analyst",
     # DALTON-HOOK(workspace-dedup): ignore user custom models/providers so built-in catalog entries win.
     ignore_custom_models: bool = False,
+    # DALTON-HOOK(model-picker-races): keep an explicitly requested built-in Antigravity variant instead of remapping it with raw reasoning_effort
+    preserve_antigravity_variant: bool = False,
 ):
     """Resolve the final LLM config for one turn: which model runs, how it is
     tuned, what it is allowed to reach, and every client it can call.
@@ -809,11 +811,20 @@ async def resolve_llm_config(
                 else None
             )
             if isinstance(_ag_entry, dict) and _ag_entry.get("provider") == ANTIGRAVITY_PROVIDER:
-                _ag_mapped = resolve_antigravity_effort_model(
-                    selection.effective_model,
-                    reasoning_effort,
-                    model_config=_ag_mc,
-                    allowed_filter=lambda m: policy_refuses(policy, model_pref, m) is None,
+                # DALTON-HOOK(model-picker-races): when the caller explicitly selected a built-in Antigravity variant (web picker / queued send), preserve that variant's tier instead of remapping it with raw reasoning_effort
+                _ag_mapped = (
+                    None
+                    if (
+                        preserve_antigravity_variant
+                        and request_model is not None
+                        and selection.effective_model == request_model
+                    )
+                    else resolve_antigravity_effort_model(
+                        selection.effective_model,
+                        reasoning_effort,
+                        model_config=_ag_mc,
+                        allowed_filter=lambda m: policy_refuses(policy, model_pref, m) is None,
+                    )
                 )
                 if _ag_mapped is not None:
                     _ag_target = _ag_mapped[0]

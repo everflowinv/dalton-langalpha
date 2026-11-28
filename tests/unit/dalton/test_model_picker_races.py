@@ -496,3 +496,240 @@ async def test_patch_thread_manual_standard_and_shadowed_custom_models_do_not_cl
     assert resp2.status_code == 200
     update_custom.assert_awaited_once_with(THREAD_ID, llm_model="gemini-4-neon-low-oauth")
     pub_tuning_custom.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# R3 Codex #1: conditional Antigravity PATCH must guard reasoning_effort (even None)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_patch_thread_conditional_antigravity_guards_null_reasoning_effort_against_concurrent_high():
+    """R3 Codex #1: when a background conditional PATCH switches to a built-in
+    Antigravity variant (clearing reasoning_effort=None), it must guard
+    expected_reasoning_effort (including explicit None) so a concurrent writer's
+    reasoning_effort='high' returns 409 instead of being wiped."""
+    from src.server.app.threads import router
+
+    catalog = _make_catalog(
+        {
+            "gpt-6.2-sol": {"visible": True, "provider": "openai"},
+            "gemini-4-neon-low-oauth": {"visible": True, "provider": "antigravity-oauth"},
+        }
+    )
+    app = create_test_app(router)
+    app.dependency_overrides[get_current_user_id] = lambda: USER_ID
+
+    # Case 1: client sends explicit expected_reasoning_effort=None -> forwarded & 409 on conflict.
+    update_explicit = create_autospec(crud_mod.update_thread_fields, return_value=None)
+    pub_model_1 = create_autospec(thread_lifecycle_feed.publish_thread_model)
+    pub_tuning_1 = create_autospec(thread_lifecycle_feed.publish_thread_tuning)
+    with (
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value={})),
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER_ID))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=create_autospec(crud_mod.get_thread_auth_meta, return_value={"llm_model": "gpt-6.2-sol", "reasoning_effort": "high", "workspace_id": WS_ID})),
+        patch.object(crud_mod, "update_thread_fields", new=update_explicit),
+        patch.object(crud_mod, "publish_thread_model", new=pub_model_1),
+        patch.object(crud_mod, "publish_thread_tuning", new=pub_tuning_1),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.patch(
+                f"/api/v1/threads/{THREAD_ID}",
+                json={
+                    "llm_model": "gemini-4-neon-low-oauth",
+                    "expected_llm_model": "gpt-6.2-sol",
+                    "expected_reasoning_effort": None,
+                },
+            )
+    assert resp.status_code == 409
+    update_explicit.assert_awaited_once_with(
+        THREAD_ID,
+        llm_model="gemini-4-neon-low-oauth",
+        reasoning_effort=None,
+        expected_llm_model="gpt-6.2-sol",
+        expected_reasoning_effort=None,
+    )
+    pub_model_1.assert_not_awaited()
+    pub_tuning_1.assert_not_awaited()
+
+    # Case 2: defense-in-depth — even if a conditional caller only sends expected_llm_model,
+    # server auto-guards expected_reasoning_effort=None when clearing effort for Antigravity.
+    update_implicit = create_autospec(crud_mod.update_thread_fields, return_value=None)
+    pub_tuning_2 = create_autospec(thread_lifecycle_feed.publish_thread_tuning)
+    with (
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value={})),
+        patch.object(crud_mod, "_authorize_thread_write", new=create_autospec(crud_mod._authorize_thread_write, return_value=Access(USER_ID))),
+        patch.object(crud_mod, "require_selectable_model", new=create_autospec(crud_mod.require_selectable_model)),
+        patch.object(crud_mod, "get_thread_auth_meta", new=create_autospec(crud_mod.get_thread_auth_meta, return_value={"llm_model": "gpt-6.2-sol", "reasoning_effort": "high", "workspace_id": WS_ID})),
+        patch.object(crud_mod, "update_thread_fields", new=update_implicit),
+        patch.object(crud_mod, "publish_thread_tuning", new=pub_tuning_2),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp2 = await c.patch(
+                f"/api/v1/threads/{THREAD_ID}",
+                json={
+                    "llm_model": "gemini-4-neon-low-oauth",
+                    "expected_llm_model": "gpt-6.2-sol",
+                },
+            )
+    assert resp2.status_code == 409
+    update_implicit.assert_awaited_once_with(
+        THREAD_ID,
+        llm_model="gemini-4-neon-low-oauth",
+        reasoning_effort=None,
+        expected_llm_model="gpt-6.2-sol",
+        expected_reasoning_effort=None,
+    )
+    pub_tuning_2.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# R3 Codex #2: thread_resolver + resolve_llm_config preserve explicit variant & avoid row effort leak
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thread_resolver_and_resolve_llm_config_preserve_explicit_variant_and_prevent_row_effort_leak():
+    """R3 Codex #2:
+    1) Queued request naming gemini-4-neon-low-oauth (omitting reasoning_effort) when
+       thread row holds gpt-6.2-sol + reasoning_effort='high' resolves to Neon Low
+       (NOT remapped to Neon High).
+    2) Web request naming gemini-4-neon-low-oauth with preserve_antigravity_variant=True
+       keeps Neon Low even if raw reasoning_effort='high' is supplied.
+    3) Service dispatch (preserve_antigravity_variant=False, e.g. delegate_to_analyst)
+       with explicit reasoning_effort='high' still maps Neon Low -> Neon High.
+    4) Queued request naming another standard model (claude-opus-4-6) without effort
+       does NOT inherit gpt-6.2-sol's thread reasoning_effort='high'.
+    """
+    import copy
+    from types import SimpleNamespace
+    from ptc_agent.config.agent import LLMConfig
+    from src.server.app import setup as setup_mod
+    from src.server.services import thread_agent
+    from src.server.services.llm import config as llm_cfg
+    from src.server.services.shared_workspaces.turn import TurnIdentity
+    from src.server.services.turn_runtime import TurnRoute
+
+    catalog = _make_catalog(
+        {
+            "gpt-6.2-sol": {"visible": True, "provider": "openai"},
+            "claude-opus-4-6": {"visible": True, "provider": "anthropic"},
+            "gemini-4-neon-low-oauth": {"visible": True, "provider": "antigravity-oauth"},
+            "gemini-4-neon-high-oauth": {"visible": True, "provider": "antigravity-oauth"},
+        }
+    )
+
+    class _BaseCfg:
+        def __init__(self):
+            self.llm = LLMConfig(name="gpt-6.2-sol")
+            self.llm_client = None
+            self.compaction = SimpleNamespace(
+                native=True, cold_compact_tokens=None, profile="expansive", token_threshold=100_000
+            )
+            self.subagents = SimpleNamespace(resolved=None, enabled=(), definitions=None)
+            self.subsidiary_llm_clients = {}
+            self.role_prompt_guidance = {}
+            self.claude_code = False
+            self.claude_code_admitted = None
+            self.claude_code_pins = None
+            self.search_api = "tavily"
+            self.search_depth = "basic"
+
+        def model_copy(self, *, deep: bool = False):
+            return copy.deepcopy(self) if deep else copy.copy(self)
+
+    resolved_clients_calls: list[tuple[str, str | None]] = []
+
+    async def _record_resolve_clients(_cfg, _uid, effective_model, _pref, _roles, **kwargs):
+        resolved_clients_calls.append((effective_model, kwargs.get("reasoning_effort")))
+
+    from src.server.services.policy import Policy
+
+    def _fake_policy():
+        return Policy()
+
+    route = TurnRoute(workspace_id=WS_ID, role="analyst", owner_id=USER_ID)
+    identity = TurnIdentity(sender=USER_ID, owner=USER_ID, recorded_as=USER_ID)
+    thread_row = {"llm_model": "gpt-6.2-sol", "reasoning_effort": "high", "fast_mode": False}
+
+    with (
+        patch.object(setup_mod, "agent_config", _BaseCfg()),
+        patch("src.llms.llm.LLM.get_model_config", return_value=catalog),
+        patch.object(llm_cfg, "require_policy", new=create_autospec(llm_cfg.require_policy, return_value=_fake_policy())),
+        patch.object(llm_cfg, "policy_refuses", new=create_autospec(llm_cfg.policy_refuses, return_value=None)),
+        patch.object(user_models, "get_model_preference", new=create_autospec(user_models.get_model_preference, return_value={})),
+        patch.object(llm_cfg, "gate_models_by_policy", new=create_autospec(llm_cfg.gate_models_by_policy, side_effect=lambda _u, pref, _rm, **_kw: pref)),
+        patch.object(llm_cfg, "gate_models_by_plan", new=create_autospec(llm_cfg.gate_models_by_plan, side_effect=lambda _b, _u, pref, _rm, **_kw: pref)),
+        patch.object(llm_cfg, "plan_covers", new=create_autospec(llm_cfg.plan_covers, return_value=True)),
+        patch.object(llm_cfg, "load_user_context", new=create_autospec(llm_cfg.load_user_context, return_value=None)),
+        patch.object(llm_cfg, "gate_capabilities", new=create_autospec(llm_cfg.gate_capabilities, return_value=None)),
+        patch.object(llm_cfg, "check_model_available", new=create_autospec(llm_cfg.check_model_available, return_value=False)),
+        patch.object(llm_cfg, "read_user_subagents", new=create_autospec(llm_cfg.read_user_subagents, return_value=([], {}, {}))),
+        patch.object(llm_cfg, "resolve_clients", new=create_autospec(llm_cfg.resolve_clients, side_effect=_record_resolve_clients)),
+    ):
+        # 1) Queued Neon Low (reasoning_effort omitted) while thread row has gpt-6.2-sol + high -> stays Neon Low.
+        resolver_queued_ag = thread_agent.thread_resolver(
+            USER_ID,
+            THREAD_ID,
+            route,
+            identity=identity,
+            thread=thread_row,
+            is_byok=False,
+            reasoning_effort=None,
+            preserve_antigravity_variant=True,
+        )
+        cfg_queued_ag = await resolver_queued_ag("gemini-4-neon-low-oauth")
+        assert cfg_queued_ag.llm.name == "gemini-4-neon-low-oauth"
+        assert resolved_clients_calls[-1] == ("gemini-4-neon-low-oauth", None)
+
+        # 2) Explicit web Neon Low with preserve_antigravity_variant=True keeps Neon Low even if raw reasoning_effort='high' arrives.
+        resolver_web_explicit = thread_agent.thread_resolver(
+            USER_ID,
+            THREAD_ID,
+            route,
+            identity=identity,
+            thread=thread_row,
+            is_byok=False,
+            reasoning_effort="high",
+            preserve_antigravity_variant=True,
+        )
+        cfg_web_explicit = await resolver_web_explicit("gemini-4-neon-low-oauth")
+        assert cfg_web_explicit.llm.name == "gemini-4-neon-low-oauth"
+        assert resolved_clients_calls[-1] == ("gemini-4-neon-low-oauth", None)
+
+        # 3) Service dispatch (preserve_antigravity_variant=False) with explicit effort='high' still maps Neon Low -> Neon High.
+        resolver_service = thread_agent.thread_resolver(
+            USER_ID,
+            THREAD_ID,
+            route,
+            identity=identity,
+            thread=thread_row,
+            is_byok=False,
+            reasoning_effort="high",
+            preserve_antigravity_variant=False,
+        )
+        cfg_service = await resolver_service("gemini-4-neon-low-oauth")
+        assert cfg_service.llm.name == "gemini-4-neon-high-oauth"
+        assert resolved_clients_calls[-1] == ("gemini-4-neon-high-oauth", None)
+
+        # 4) Queued different standard model (claude-opus-4-6, effort omitted) does NOT inherit gpt-6.2-sol's 'high'.
+        resolver_std_other = thread_agent.thread_resolver(
+            USER_ID,
+            THREAD_ID,
+            route,
+            identity=identity,
+            thread=thread_row,
+            is_byok=False,
+            reasoning_effort=None,
+        )
+        cfg_std_other = await resolver_std_other("claude-opus-4-6")
+        assert cfg_std_other.llm.name == "claude-opus-4-6"
+        assert resolved_clients_calls[-1] == ("claude-opus-4-6", None)
+
+        # 5) Following the thread's own standard model (gpt-6.2-sol, effort omitted) still inherits row's 'high'.
+        cfg_std_same = await resolver_std_other("gpt-6.2-sol")
+        assert cfg_std_same.llm.name == "gpt-6.2-sol"
+        assert resolved_clients_calls[-1] == ("gpt-6.2-sol", "high")

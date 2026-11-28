@@ -62,6 +62,50 @@ async def apply_antigravity_effort_clear(
     return should_clear
 
 
+def enforce_conditional_effort_clear_guard(
+    updates: Mapping[str, Any],
+    cas_guards: dict[str, Any],
+) -> None:
+    """Ensure any conditional PATCH that clears ``reasoning_effort`` guards it.
+
+    Unconditional manual clicks have empty ``cas_guards`` and are untouched.
+    When a background conditional PATCH (e.g. carrying ``expected_llm_model``)
+    also writes ``reasoning_effort`` (including server-side Antigravity clear)
+    without an explicit ``expected_reasoning_effort``, default the guard to
+    ``None`` so a concurrent writer's non-null effort is never wiped silently.
+    """
+    if (
+        cas_guards
+        and "reasoning_effort" in updates
+        and "expected_reasoning_effort" not in cas_guards
+    ):
+        cas_guards["expected_reasoning_effort"] = None
+
+
+async def resolve_thread_row_effort_for_model(
+    user_id: str,
+    *,
+    model: str | None,
+    row_model: str | None,
+    row_effort: str | None,
+) -> str | None:
+    """Decide whether a thread row's stored ``reasoning_effort`` applies to ``model``.
+
+    When a request omits ``reasoning_effort``, never inherit the thread row's
+    stored effort onto a different explicitly requested model (e.g. a queued
+    message naming ``Neon Low`` or another standard model after another tab
+    updated the thread row to ``gpt-6.2-sol`` + ``high``) or onto any built-in
+    Antigravity variant (whose effort is encoded in the model key).
+    """
+    if row_effort is None:
+        return None
+    if model is not None and model != row_model:
+        return None
+    if model is not None and await resolve_antigravity_effort_clear(user_id, model):
+        return None
+    return row_effort
+
+
 async def publish_thread_model_switch_events(
     *,
     user_id: str,

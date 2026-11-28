@@ -942,4 +942,75 @@ describe('useChatMessages – queued send during compaction', () => {
       fastMode: false,
     });
   });
+
+  // DALTON-HOOK(model-picker-races): R3 Codex #2 — a thread-following compaction-queued message (model: null, standard high) must NOT carry old 'high' onto a new thread model (Antigravity Neon Low or another standard model)
+  it('R3 Codex #2: drops stale standard high effort when a thread-following compaction-queued message flushes after thread switches to Antigravity Neon Low or another standard model', async () => {
+    brandMock.isDaltonBuild = true;
+    let liveOptions = {
+      model: null as string | null,
+      displayModel: 'gpt-6.2-sol' as string | null,
+      antigravitySeriesId: null as string | null,
+      reasoningEffort: 'high' as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-test', 'thread-q-rev-switch', {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    // 1) Standard (model: null, high) -> thread switches to Antigravity Neon Low.
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued follows thread -> ag', null, null, { ...liveOptions });
+    });
+    liveOptions = {
+      model: null,
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+      fastMode: false,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    expect(mockSendStream.mock.calls[0][3]).toMatchObject({
+      llmModel: null,
+      reasoningEffort: null,
+    });
+
+    // 2) Standard gpt-6.2-sol (model: null, high) -> thread switches to claude-opus-4-6 (low).
+    liveOptions = {
+      model: null,
+      displayModel: 'gpt-6.2-sol',
+      antigravitySeriesId: null,
+      reasoningEffort: 'high',
+      fastMode: false,
+    };
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      void result.current.handleSendMessage('queued follows thread -> claude', null, null, { ...liveOptions });
+    });
+    liveOptions = {
+      model: null,
+      displayModel: 'claude-opus-4-6',
+      antigravitySeriesId: null,
+      reasoningEffort: 'low',
+      fastMode: true,
+    };
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2));
+    expect(mockSendStream.mock.calls[1][3]).toMatchObject({
+      llmModel: null,
+      reasoningEffort: 'low',
+      fastMode: true,
+    });
+  });
 });

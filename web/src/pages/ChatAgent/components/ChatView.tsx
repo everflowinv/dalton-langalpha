@@ -482,13 +482,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const activeThreadId =
     currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
   // DALTON-HOOK(antigravity-series): pass workspaceId, activeTurnModel, and createdThreadId for shared guard, queued-send safety, and creation binding
+  // DALTON-HOOK(model-picker-races): always forward activeTurnModel so first-turn pre-admission failures preserve picks in Core builds too
   const threadModel = useThreadModel({
     threadId: activeThreadId,
     isLoading,
     initialModel: navModel,
     chiefOfStaff: isHome,
     workspaceId,
-    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel, createdThreadId: chat.createdThreadId } : {}),
+    activeTurnModel: chat.activeTurnModel,
+    ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   threadModelSeqRef.current = threadModel;
   const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
@@ -571,10 +573,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   });
   const { toSend: subagentsToSend } = threadSubagents;
   // DALTON-HOOK(antigravity-series): pass workspaceId & createdThreadId to useThreadTuning for shared local-only mode and null-origin handle binding
+  // DALTON-HOOK(model-picker-races): forward createdTuning baseline for conditional post-create tuning repatch (both Dalton and Core builds)
   const threadTuning = useThreadTuning({
     threadId: currentThreadId,
     landing: tuningLanding,
     workspaceId,
+    createdTuning: chat.createdThreadTuning,
     ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;

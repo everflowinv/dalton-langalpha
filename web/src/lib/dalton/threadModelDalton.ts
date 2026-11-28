@@ -2,7 +2,7 @@ import { useCallback, type MutableRefObject } from 'react';
 import { isDaltonBuild } from '@/config/brand';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useCapabilities } from '@/hooks/useCapabilities';
-import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
+import { inspectSavedAntigravityModel, type InspectAntigravityOptions } from '@/lib/antigravitySeries';
 import type { ThreadFieldSaveConditions } from '@/lib/dalton/threadFieldSaveDalton';
 import type { ClearLocalHandle } from '@/lib/dalton/threadTuningDalton';
 import type { Thread } from '@/types/api';
@@ -253,6 +253,23 @@ export function recordDaltonTurnPick(
 }
 
 /**
+ * True when `model` is a built-in Antigravity variant whose server-side PATCH
+ * will atomically clear `reasoning_effort = null`, so conditional background
+ * saves must guard `expected_reasoning_effort` (including explicit `null`).
+ */
+export function isAntigravityVariantForClear(
+  model: string | null | undefined,
+  seriesOpts: InspectAntigravityOptions,
+): boolean {
+  if (!model) return false;
+  if (inspectSavedAntigravityModel(model, seriesOpts)) return true;
+  const hasLoadedSeries = Boolean(seriesOpts.seriesCatalog && seriesOpts.seriesCatalog.series.length > 0);
+  if (hasLoadedSeries) return false;
+  if (seriesOpts.customModels?.some((cm) => cm.name === model)) return false;
+  return fallbackAntigravitySeriesId(model) !== null;
+}
+
+/**
  * True only when the reread row still matches the model written by the old turn
  * that just finished. If another tab or `switch_thread_model` moved the thread
  * to a different model, returns false so the client abandons repatching.
@@ -261,55 +278,96 @@ export function shouldRepatchPreservedPick(
   freshModel: string | null,
   repatchExpected: RepatchExpectedModel | null | undefined,
 ): boolean {
-  if (!isDaltonBuild || !repatchExpected?.known) return false;
+  if (!repatchExpected?.known) return false;
   return freshModel === repatchExpected.model;
+}
+
+export type FirstTurnRepatchAction = 'repatch' | 'keep_local' | 'follow_server';
+
+/**
+ * Decides what first-turn reread should do with a pre-id model pick made while
+ * the new thread was being created (applies in both Dalton and Core builds):
+ * - `turnAdmitted === true`: the first send ran `keep_named_model(firstSendModel)`,
+ *   so repatch only while `freshModel === firstSendModel`; otherwise another tab
+ *   changed it -> `'follow_server'`.
+ * - `turnAdmitted === false`: the first send failed before admission (e.g. 503),
+ *   so the row still holds `null` (or `firstSendModel` if the server admitted
+ *   before disconnect). Repatch with `expected_llm_model: freshModel` when
+ *   `freshModel === null || freshModel === firstSendModel`; otherwise another
+ *   tab wrote a different model -> `'follow_server'`.
+ * - `turnAdmitted === null` (indeterminate): repatch if `freshModel === firstSendModel`,
+ *   keep the user's unsent pick locally without PATCH when `freshModel === null`
+ *   (cannot distinguish pre-admission failure from another tab resetting to null),
+ *   and follow server when `freshModel` is a different non-null model.
+ */
+export function resolveFirstTurnRepatchAction(
+  freshModel: string | null,
+  firstSendModel: string | null,
+  turnAdmitted: boolean | null,
+): FirstTurnRepatchAction {
+  if (turnAdmitted === true) {
+    return freshModel === firstSendModel ? 'repatch' : 'follow_server';
+  }
+  if (turnAdmitted === false) {
+    return freshModel === null || freshModel === firstSendModel ? 'repatch' : 'follow_server';
+  }
+  if (freshModel === firstSendModel) return 'repatch';
+  if (freshModel === null && firstSendModel !== null) return 'keep_local';
+  return 'follow_server';
 }
 
 /**
  * True when a pre-id pick made during a new thread's first turn may still
- * background-repatch on first-turn reread: in Dalton builds, only while the
- * server row still holds the model written by the first send.
+ * background-repatch on first-turn reread.
  */
 export function shouldRepatchFirstTurnPick(
   freshModel: string | null,
   firstSendModel: string | null,
 ): boolean {
-  if (!isDaltonBuild) return true;
-  return freshModel === firstSendModel;
+  return resolveFirstTurnRepatchAction(freshModel, firstSendModel, true) === 'repatch';
 }
 
 /**
  * True when an unresolved-permission deferred model pick is still eligible to
  * flush:
- * - In Dalton builds, if the thread detail had not loaded when the pick was
- *   staged (`!pick.hasExpectedModel`), cancels automatic flush so we never
- *   issue an unconditional PATCH over a newer write from another tab.
+ * - If the thread detail had not loaded when the pick was staged
+ *   (`!pick.hasExpectedModel`, or `willClearEffort && !pick.hasExpectedEffort`),
+ *   cancels automatic flush so we never issue an unconditional PATCH over a
+ *   newer write from another tab.
  * - Also returns false if the cached thread row already moved away from the
- *   model observed when the deferred pick was staged.
+ *   model (or reasoning_effort when the write clears effort) observed when the
+ *   deferred pick was staged.
  */
 export function shouldFlushDeferredModelPick(
   pick: DeferredSharedPick,
   thread: Thread | undefined,
+  willClearEffort = false,
 ): boolean {
-  if (!isDaltonBuild) return true;
   if (!pick.hasExpectedModel) return false;
+  if (willClearEffort && !pick.hasExpectedEffort) return false;
   if (thread === undefined) return true;
-  return (thread.llm_model ?? null) === (pick.expectedModel ?? null);
+  if ((thread.llm_model ?? null) !== (pick.expectedModel ?? null)) return false;
+  if (willClearEffort && (thread.reasoning_effort ?? null) !== (pick.expectedEffort ?? null)) {
+    return false;
+  }
+  return true;
 }
 
 /**
  * Builds the optional CAS guard fields sent on a deferred model flush.
+ * Whenever `willClearEffort` is true (including built-in Antigravity variants
+ * where `expectedEffort` is `null`), explicitly attaches
+ * `expected_reasoning_effort` (including `null`).
  */
 export function buildDeferredModelConditions(
   pick: DeferredSharedPick,
-  shouldClearEffort: boolean,
+  willClearEffort: boolean,
 ): ThreadFieldSaveConditions | undefined {
-  if (!isDaltonBuild) return undefined;
   const conditions: ThreadFieldSaveConditions = {};
   if (pick.hasExpectedModel) {
     conditions.expected_llm_model = pick.expectedModel ?? null;
   }
-  if (shouldClearEffort && pick.hasExpectedEffort) {
+  if (willClearEffort && pick.hasExpectedEffort) {
     conditions.expected_reasoning_effort = pick.expectedEffort ?? null;
   }
   return Object.keys(conditions).length > 0 ? conditions : undefined;
@@ -379,13 +437,18 @@ export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
   { antigravityEnabled = true }: { antigravityEnabled?: boolean } = {},
 ): T {
   if (!isDaltonBuild) return queuedOptions;
+  const hasExplicitModel = typeof queuedOptions.model === 'string' && queuedOptions.model.length > 0;
   const queued = resolveQueuedModelAndSeries(queuedOptions, antigravityEnabled);
 
   if (latestComposerOptions !== undefined) {
     const latest = resolveQueuedModelAndSeries(latestComposerOptions, antigravityEnabled);
 
-    if (queued.seriesId !== null) {
-      if (latest.seriesId !== null && latest.seriesId === queued.seriesId) {
+    // 1) Queued message follows the thread's model (`model` is null/omitted):
+    //    its final target model is whatever the thread/composer now holds, so
+    //    adopt the live target model's tuning and NEVER carry an old model's
+    //    `reasoningEffort` onto a new model (especially an Antigravity variant).
+    if (!hasExplicitModel) {
+      if (queued.seriesId !== null && latest.seriesId !== null && latest.seriesId === queued.seriesId) {
         const nextModel = latestComposerOptions.model !== undefined
           ? latestComposerOptions.model
           : queuedOptions.model;
@@ -395,7 +458,48 @@ export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
         return {
           ...queuedOptions,
           model: nextModel,
-          ...(nextPickSeq !== undefined ? { modelPickSeq: nextPickSeq } : { modelPickSeq: undefined }),
+          modelPickSeq: nextPickSeq,
+          ...(latestComposerOptions.displayModel !== undefined
+            ? { displayModel: latestComposerOptions.displayModel }
+            : {}),
+          ...(latestComposerOptions.antigravitySeriesId !== undefined
+            ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+            : {}),
+          reasoningEffort: null,
+          ...(latestComposerOptions.fastMode !== undefined
+            ? { fastMode: latestComposerOptions.fastMode }
+            : {}),
+        };
+      }
+      return {
+        ...queuedOptions,
+        ...(latestComposerOptions.displayModel !== undefined
+          ? { displayModel: latestComposerOptions.displayModel }
+          : {}),
+        ...(latestComposerOptions.antigravitySeriesId !== undefined
+          ? { antigravitySeriesId: latestComposerOptions.antigravitySeriesId }
+          : {}),
+        reasoningEffort: latest.seriesId !== null ? null : (latestComposerOptions.reasoningEffort ?? null),
+        ...(latestComposerOptions.fastMode !== undefined
+          ? { fastMode: latestComposerOptions.fastMode }
+          : {}),
+      };
+    }
+
+    // 2) Queued message carries an explicit `model`:
+    if (queued.seriesId !== null) {
+      if (latest.seriesId !== null && latest.seriesId === queued.seriesId) {
+        const nextModel = latestComposerOptions.model
+          ?? (latestComposerOptions.displayModel && latest.seriesId === queued.seriesId
+            ? latestComposerOptions.displayModel
+            : queuedOptions.model);
+        const nextPickSeq = latestComposerOptions.modelPickSeq !== undefined
+          ? latestComposerOptions.modelPickSeq
+          : (nextModel === queuedOptions.model ? queuedOptions.modelPickSeq : undefined);
+        return {
+          ...queuedOptions,
+          model: nextModel,
+          modelPickSeq: nextPickSeq,
           ...(latestComposerOptions.displayModel !== undefined
             ? { displayModel: latestComposerOptions.displayModel }
             : {}),
@@ -435,9 +539,16 @@ export function mergeLatestQueuedTuning<T extends QueuedTuningOptions>(
     };
   }
 
+  if (hasExplicitModel) {
+    return {
+      ...queuedOptions,
+      ...(queued.seriesId !== null ? { reasoningEffort: null } : {}),
+    };
+  }
+
   return {
     ...queuedOptions,
-    reasoningEffort: queued.seriesId !== null ? null : undefined,
+    reasoningEffort: undefined,
     fastMode: undefined,
   };
 }

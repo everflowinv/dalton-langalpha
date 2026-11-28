@@ -476,6 +476,7 @@ async def test_patch_thread_model_publishes_event_and_background_cas_returns_409
         llm_model="gemini-4-neon-low-oauth",
         reasoning_effort=None,
         expected_llm_model="gemini-4-neon-high-oauth",
+        expected_reasoning_effort=None,
     )
     pub_model_2.assert_not_awaited()
     pub_tuning_2.assert_not_awaited()

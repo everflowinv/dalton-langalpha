@@ -1572,7 +1572,8 @@ describe('MarketChatPanel', () => {
         reasoning_effort: 'high',
         fast_mode: null,
       });
-      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('500'), { response: { status: 500 } }));
+      // DALTON-HOOK(model-picker-races): permanent 400 refusal on deferred flush restores pre-switch model & effort (transient 5xx preserves the unsent pick)
+      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('400'), { response: { status: 400 } }));
 
       const deferredView = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
       await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'high', fastMode: null }));

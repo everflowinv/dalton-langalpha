@@ -20,7 +20,8 @@ import {
   type ActiveTurnModel,
 } from '@/lib/dalton/turnAdmission';
 // DALTON-HOOK(antigravity-series): created-thread detection for first-send model/tuning carry-over
-import { createdThreadIdFromSend } from '@/lib/dalton/threadTuningDalton';
+// DALTON-HOOK(model-picker-races): track create-request tuning baseline for conditional post-create tuning repatch
+import { createdThreadIdForTuning, createdThreadIdFromSend, type CreatedThreadTuning } from '@/lib/dalton/threadTuningDalton';
 // DALTON-HOOK(model-picker-races): resolve live composer tuning/Antigravity variant on queued sends and sanitize Antigravity effort via useCapabilities()
 import { useDaltonQueuedSendTuning } from '@/lib/dalton/threadModelDalton';
 import { queryKeys } from '@/lib/queryKeys';
@@ -257,8 +258,11 @@ export function useChatMessages(
   });
   const [isLoading, setIsLoading] = useState(false);
   // DALTON-HOOK(antigravity-series): track active turn model, created thread id, & per-requestKey first-submitted pick in Dalton builds
+  // DALTON-HOOK(model-picker-races): track createdThreadTuning baseline for conditional post-create tuning repatch (both Dalton and Core builds)
   const [activeTurnModel, setActiveTurnModel] = useState<ActiveTurnModel | null>(null);
   const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+  const [createdThreadTuning, setCreatedThreadTuning] = useState<CreatedThreadTuning | null>(null);
+  const precreatedTuningIdRef = useRef<string | null>(null);
   const renderedThreadIdRef = useRef(threadId);
   renderedThreadIdRef.current = threadId;
   const turnModelTrackerRef = useRef(createTurnModelTracker());
@@ -266,6 +270,10 @@ export function useChatMessages(
     const resolved = typeof next === 'function' ? next(renderedThreadIdRef.current) : next;
     const created = createdThreadIdFromSend(renderedThreadIdRef.current, resolved); // DALTON-HOOK(antigravity-series)
     if (created) setCreatedThreadId(created);
+    const createdForTuning = createdThreadIdForTuning(renderedThreadIdRef.current, resolved);
+    if (createdForTuning && precreatedTuningIdRef.current !== createdForTuning) {
+      setCreatedThreadTuning({ threadId: createdForTuning, reasoningEffort: null, fastMode: null });
+    }
     setThreadId(resolved);
   }, []);
   useEffect(() => {
@@ -1047,6 +1055,9 @@ export function useChatMessages(
         }
         // DALTON-HOOK(antigravity-series): clear createdThreadId when navigation/workspace change switches threads
         if (isDaltonBuild) setCreatedThreadId(null);
+        // DALTON-HOOK(model-picker-races): clear createdThreadTuning when leaving or switching threads
+        setCreatedThreadTuning(null);
+        precreatedTuningIdRef.current = null;
         setThreadId(newThreadId);
       }
 
@@ -3086,15 +3097,13 @@ export function useChatMessages(
     }
 
     // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this turn (admitted flips true only once the server confirms the run started)
+    // DALTON-HOOK(model-picker-races): track activeTurnModel admission in Core builds too so first-turn pre-admission failures (e.g. 503) never discard the user's later pick
     const confirmActiveTurnModel = () => {
-      if (!isDaltonBuild) return;
       setActiveTurnModel((prev) => (
         prev && !prev.admitted ? { ...prev, admitted: true } : prev
       ));
     };
-    if (isDaltonBuild) {
-      setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null, admitted: false });
-    }
+    setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null, admitted: false });
     setIsLoading(true);
     setMessageError(null);
     setFallbackSuggestion(null);
@@ -3159,6 +3168,11 @@ export function useChatMessages(
       threadIdRef,
       // DALTON-HOOK(antigravity-series): record createdThreadId when ensureThreadId mints the first thread
       setThreadId: setThreadIdFromSend,
+      // DALTON-HOOK(model-picker-races): capture tuning values stored by POST /threads for conditional post-create tuning repatch
+      onThreadCreated: (info) => {
+        precreatedTuningIdRef.current = info.threadId;
+        setCreatedThreadTuning(info);
+      },
       wasStoppedRef,
       signal: abortController.signal,
     }).finally(releaseCreate);
@@ -4701,8 +4715,10 @@ export function useChatMessages(
     threadModels,
     isLoading,
     // DALTON-HOOK(antigravity-series): expose activeTurnModel & createdThreadId for Dalton turn-pick & tuning handle binding
+    // DALTON-HOOK(model-picker-races): expose createdThreadTuning baseline for conditional post-create tuning repatch
     activeTurnModel,
     createdThreadId,
+    createdThreadTuning,
     marketWatch,
     hasActiveSubagents,
     awaitingReportBack,

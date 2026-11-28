@@ -1062,4 +1062,67 @@ describe('useChatMessages: a send naming staged files while a turn runs', () => 
       fastMode: false,
     });
   });
+
+  // DALTON-HOOK(model-picker-races): R3 Codex #2 — a thread-following queued steer (model: null, standard high) must NOT carry stale 'high' onto a thread that switched to Antigravity Neon Low or another standard model
+  it('R3 Codex #2: drops stale standard high effort when a thread-following not_running steer flushes after thread switched to Antigravity Neon Low', async () => {
+    brandMock.isDaltonBuild = true;
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-rev-switch' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return { disconnected: false };
+      },
+    );
+
+    let liveOptions = {
+      model: null as string | null,
+      displayModel: 'gpt-6.2-sol' as string | null,
+      antigravitySeriesId: null as string | null,
+      reasoningEffort: 'high' as string | null,
+      fastMode: false as boolean | null,
+    };
+    const { result } = renderHookWithProviders(() =>
+      useChatMessages('ws-nr', null, {
+        readComposerOptions: () => liveOptions,
+      }),
+    );
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    // Queued while following thread's standard model (model: null) with high effort.
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up follows thread', null, null, { ...liveOptions });
+    });
+
+    // Thread switches to Antigravity Neon Low before turn ends.
+    liveOptions = {
+      model: null,
+      displayModel: 'gemini-4-neon-low-oauth',
+      antigravitySeriesId: 'antigravity-oauth:gemini-4-neon',
+      reasoningEffort: null,
+      fastMode: false,
+    };
+
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.calls[2][0]).toBe('follow-up follows thread');
+    expect(mockSendStream.mock.calls[2][3]).toMatchObject({
+      llmModel: null,
+      reasoningEffort: null,
+    });
+  });
 });

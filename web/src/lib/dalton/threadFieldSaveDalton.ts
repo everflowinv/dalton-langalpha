@@ -14,29 +14,32 @@ export type ThreadFieldSaveConditions = Pick<
 >;
 
 /**
- * True when a background conditional save (turn-end repatch or unresolved-permission
- * deferred flush) was rejected with HTTP 409 because another writer already updated
- * the thread row. In that case the client silently yields to the server's newer value.
+ * True when a background conditional save (turn-end repatch, post-create
+ * tuning repatch, or unresolved-permission deferred flush) was rejected with
+ * HTTP 409 because another writer already updated the thread row. In that case
+ * the client silently yields to the server's newer value (applies regardless of
+ * `VITE_DALTON_UI`).
  */
 export function isDaltonBackgroundConflict(
   background: ThreadFieldSaveBackground | undefined,
   error: unknown,
 ): boolean {
-  if (!isDaltonBuild || !background) return false;
+  if (!background) return false;
   return apiErrorStatus(error) === 409;
 }
 
 /**
- * True when a background repatch failed transiently (network error / timeout /
- * 429 / 5xx — never 409 conflict or permanent 4xx rejection). In that case the
- * client preserves the user's unsent model pick & `sendModel` instead of
- * reverting to the old turn's model.
+ * True when a background conditional save (`repatch` or `deferred`) failed
+ * transiently (network error / timeout / 408 / 429 / 5xx — never 409 conflict
+ * or permanent 4xx rejection). In that case the client preserves the user's
+ * unsent local pick instead of reverting to the server's older value (applies
+ * regardless of `VITE_DALTON_UI`).
  */
 export function isDaltonTransientRepatchError(
   background: ThreadFieldSaveBackground | undefined,
   error: unknown,
 ): boolean {
-  if (!isDaltonBuild || background !== 'repatch') return false;
+  if (!background) return false;
   const status = apiErrorStatus(error);
   if (status == null) return true;
   return status >= 500 || status === 408 || status === 429;

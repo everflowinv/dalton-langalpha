@@ -485,8 +485,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
+    activeTurnModel: chat.activeTurnModel,
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
-    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel, createdThreadId: chat.createdThreadId } : {}),
+    ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   threadModelSeqRef.current = threadModel;
   const { pickModel: pickThreadModel } = threadModel;
@@ -494,6 +495,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const { toSend: subagentsToSend } = threadSubagents;
   const threadTuning = useThreadTuning({
     threadId,
+    createdTuning: chat.createdThreadTuning,
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
     ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
