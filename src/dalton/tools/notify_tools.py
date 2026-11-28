@@ -503,6 +503,12 @@ async def _handle_set_route(
         return error_command(resolve_err or "推送目标校验失败", tool_call_id)
     initial_targets = list(resolved_targets)
 
+    from src.dalton.notify.delivery_mutex import check_route_held_delivery_conflict
+
+    delivery_conflict = check_route_held_delivery_conflict(matched, initial_targets)
+    if delivery_conflict:
+        return error_command(delivery_conflict, tool_call_id)
+
     confirm_token = _compute_confirm_token(
         action="set_route",
         user_id=user_id,
@@ -632,6 +638,9 @@ async def _handle_set_route(
         )
 
     final_targets = list(current_targets)
+    delivery_conflict_now = check_route_held_delivery_conflict(matched_now, final_targets)
+    if delivery_conflict_now:
+        return error_command(delivery_conflict_now, tool_call_id)
     final_displays = [
         _format_target_display(t, personal_labels_now, groups_now)
         for t in final_targets

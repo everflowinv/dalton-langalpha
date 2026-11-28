@@ -44,6 +44,7 @@
   "deliveryDefaultUnavailable": "Unavailable. Try again shortly.",
   "deliveryDefaultFailed": "Couldn't set the default.",
   "deliveryNamedProblem": "{{name}}: {{message}}",
+  "deliveryManagedByDaltonNotify": "Delivery for this task is managed in Dalton notification settings.",
   "marketIndex": "Index",
   "priceSymbol": "Symbol",
   "priceCondition": "Condition",

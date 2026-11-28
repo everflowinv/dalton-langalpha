@@ -931,6 +931,7 @@ async def update_preferences(
                     discovered_groups=prefetched_feishu_groups,
                     expected_stored_routes=expected_stored_routes,
                     via_rest=True,
+                    conn=conn,  # DALTON-HOOK(dalton-notify): recheck delivery_config mutex inside preference lock tx
                 )
             if sets_structured:
                 # Every value outside its vocabulary, in any column, in one

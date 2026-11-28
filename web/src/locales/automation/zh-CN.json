@@ -44,6 +44,7 @@
   "deliveryDefaultUnavailable": "暂不可用，请稍后重试。",
   "deliveryDefaultFailed": "无法设为默认。",
   "deliveryNamedProblem": "{{name}}：{{message}}",
+  "deliveryManagedByDaltonNotify": "此任务的推送由 Dalton 通知设置管理",
   "marketIndex": "指数",
   "priceSymbol": "代码",
   "priceCondition": "条件",

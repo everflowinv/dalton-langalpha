@@ -1160,11 +1160,11 @@ class TestDaltonRoutesRegistrationGate:
         assert "channel_gateway" in ef_body["capabilities"]
         assert "transcription" not in ef_body["capabilities"]
 
-    def test_global_search_preserves_user_own_conversations_in_core(
+    def test_global_search_preserves_document_search_in_core(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Item 7 (codex high 3): GET /api/v1/dalton/search keeps include_conversations for user's own threads."""
+        """GET /api/v1/dalton/search remains available in Core for personal memo & workspace file search."""
         _clean_cap_env(monkeypatch, app_env="core")
         assert has_capability(CapabilityId.CONVERSATION_ARCHIVE) is False
 
@@ -1175,7 +1175,6 @@ class TestDaltonRoutesRegistrationGate:
             query: str,
             limit: int = 20,
             *,
-            include_conversations: bool = True,
             workspace_id: str | None = None,
             include_content: bool = True,
             conn: Any = None,
@@ -1184,26 +1183,27 @@ class TestDaltonRoutesRegistrationGate:
                 {
                     "user_id": user_id,
                     "query": query,
-                    "include_conversations": include_conversations,
+                    "include_content": include_content,
                 }
             )
             return {
-                "conversations": [{"kind": "conversation", "thread_id": "t-1", "title": "NVDA notes"}],
-                "documents": [],
+                "documents": [{"kind": "memo", "memo_key": "nvda.md", "title": "NVDA notes"}],
             }
 
         spy_search = create_autospec(search_db_mod.global_search, side_effect=_fake_global_search)
         monkeypatch.setattr(search_db_mod, "global_search", spy_search)
 
         client = TestClient(_make_dalton_test_app())
-        resp = client.get("/api/v1/dalton/search?q=NVDA&include_conversations=true")
+        resp = client.get("/api/v1/dalton/search?q=NVDA")
         assert resp.status_code == 200
-        assert observed == [{"user_id": "test-user-1", "query": "NVDA", "include_conversations": True}]
-        assert len(resp.json()["conversations"]) == 1
+        assert observed == [{"user_id": "test-user-1", "query": "NVDA", "include_content": True}]
+        body = resp.json()
+        assert "conversations" not in body
+        assert len(body["documents"]) == 1
 
-        resp_off = client.get("/api/v1/dalton/search?q=NVDA&include_conversations=false")
+        resp_off = client.get("/api/v1/dalton/search?q=NVDA&include_content=false")
         assert resp_off.status_code == 200
-        assert observed[-1]["include_conversations"] is False
+        assert observed[-1]["include_content"] is False
 
 
 # ---------------------------------------------------------------------------

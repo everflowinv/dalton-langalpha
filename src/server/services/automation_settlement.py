@@ -446,6 +446,7 @@ async def _after_settling(
 
     parent_id = str(automation.get("automation_id") or "")
     deleted = bool(parent_id) and await automation_is_soft_deleted(parent_id)
+    upstream_webhook_result: list | None = None  # DALTON-HOOK(dalton-notify): track webhook delivery for this execution
     if failure_notify_left:
         # DALTON-HOOK(automation-capacity-retry): immediately claim & deliver the durable failure-notification task;
         # if this process exits before finishing, sweep_capacity_parked retries it across workers/restarts.
@@ -495,6 +496,7 @@ async def _after_settling(
                     policy.webhook, automation, execution_id, thread_id, workspace_id,
                     error=error, run_id=run_id, failure_reason=policy.failure_reason,
                 )
+                upstream_webhook_result = delivery_result  # DALTON-HOOK(dalton-notify)
                 if delivery_result is None and delivery is not None and not delivery.held:
                     # The messaging service didn't take the run and the webhook
                     # has nowhere to post: each entry went undelivered, and why.
@@ -505,6 +507,21 @@ async def _after_settling(
     if not deleted and outcome is Outcome.COMPLETED:
         from src.dalton.notify.dispatch import on_automation_settled
 
+        # DALTON-HOOK(dalton-notify): judge mutual exclusion by this execution's recorded upstream delivery
+        exec_delivery = (
+            delivery
+            if delivery is not None
+            else (
+                automation_delivery.read_stamp(row.get("delivery"), execution_id)
+                if isinstance(row, dict)
+                else None
+            )
+        )
+        exec_delivery_result = (
+            upstream_webhook_result
+            if upstream_webhook_result is not None
+            else (row.get("delivery_result") if isinstance(row, dict) else None)
+        )
         # DALTON-HOOK(coverage-units): forward execution-entry unit stamp and version to notify dispatch
         await on_automation_settled(
             automation=automation,
@@ -515,6 +532,8 @@ async def _after_settling(
             final_text=final_text or (row.get("result_excerpt") if isinstance(row, dict) else None),
             coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
             coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
+            execution_delivery=exec_delivery,
+            execution_delivery_result=exec_delivery_result,
         )
     # DALTON-HOOK(dalton-notify): wake failure-notice dispatcher after failed settle commits
     if not deleted and policy.status == "failed":

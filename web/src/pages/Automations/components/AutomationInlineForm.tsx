@@ -200,9 +200,11 @@ export default function AutomationInlineForm({
             deliveryProblems={refused}
             // DALTON-HOOK(automation-model): pass server model error to MoreOptions
             // DALTON-HOOK(automation-effort): track explicit "Follow default" selection on create
+            // DALTON-HOOK(dalton-notify): pass original automation for built-in dalton-* notify detection
             modelError={modelError}
             onExplicitDefaultEffort={setExplicitNullEffort}
             omitDelivery={omitDelivery}
+            automation={opened.automation}
           />
         </div>
 

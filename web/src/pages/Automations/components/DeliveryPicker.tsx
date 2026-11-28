@@ -104,6 +104,9 @@ interface DeliveryPickerProps {
   /** What the last save was refused over, by entry. */
   problems: DeliveryProblem[];
   labelledBy: string;
+  // DALTON-HOOK(dalton-notify): disable picker and explain when Dalton notify settings manage this task
+  disabled?: boolean;
+  disabledReason?: string | null;
 }
 
 /**
@@ -121,6 +124,8 @@ export default function DeliveryPicker({
   names,
   problems,
   labelledBy,
+  disabled = false,
+  disabledReason = null,
 }: DeliveryPickerProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -186,6 +191,8 @@ export default function DeliveryPicker({
 
   return (
     <div className="automation-delivery">
+      {/* DALTON-HOOK(dalton-notify): positive notice when Dalton notify settings manage this task */}
+      {disabledReason && <p className="automation-form-readout mt-0">{disabledReason}</p>}
       {methods.length > 0 && (
         <ul className="automation-delivery-chips">
           {methods.map((entry) => {
@@ -204,7 +211,7 @@ export default function DeliveryPicker({
                 <AppMark app={app} />
                 {actions.length > 0 ? (
                   <MenuTrigger>
-                    <AriaButton className="automation-delivery-chip-label" isDisabled={setDefault.isPending}>
+                    <AriaButton className="automation-delivery-chip-label" isDisabled={disabled || setDefault.isPending}>
                       <span className="truncate">{label}</span>
                       {isDefault && (
                         <Pin className="size-3 shrink-0" aria-label={t('automation:deliveryViaWorkspace')} />
@@ -230,6 +237,7 @@ export default function DeliveryPicker({
                     <span className="truncate">{label}</span>
                   </span>
                 )}
+                {/* DALTON-HOOK(dalton-notify): keep chip removal enabled while adding is disabled so conflicting channels can be cleared */}
                 <button
                   type="button"
                   className="automation-delivery-chip-remove"
@@ -245,28 +253,31 @@ export default function DeliveryPicker({
       )}
 
       {apps.length === 0 ? (
-        <p className="automation-form-readout mt-0">
-          {t('automation:deliveryNoApps')}
-          {/* A new tab or window, so the form being filled in stays put. */}
-          {INTEGRATIONS_URL && (
-            <>
-              {' · '}
-              <a
-                href={INTEGRATIONS_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline underline-offset-2 hover:text-(--color-text-primary)"
-              >
-                {t('automation:deliveryConnectApp')}
-              </a>
-            </>
-          )}
-        </p>
+        !disabled && (
+          <p className="automation-form-readout mt-0">
+            {t('automation:deliveryNoApps')}
+            {/* A new tab or window, so the form being filled in stays put. */}
+            {INTEGRATIONS_URL && (
+              <>
+                {' · '}
+                <a
+                  href={INTEGRATIONS_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline underline-offset-2 hover:text-(--color-text-primary)"
+                >
+                  {t('automation:deliveryConnectApp')}
+                </a>
+              </>
+            )}
+          </p>
+        )
       ) : (
         <Select
           selectionMode="multiple"
           aria-labelledby={labelledBy}
           value={selected}
+          isDisabled={disabled}
           onChange={(keys) => onChange(mergeDeliverySelection(methods, known, keys.map(String)))}
           className="inline-flex"
         >
