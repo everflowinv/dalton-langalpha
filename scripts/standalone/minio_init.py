@@ -25,17 +25,25 @@ try:
     from src.dalton.storage_bucket_rules import (
         BucketRuleVerificationError,
         ROLE_MAIN,
+        ROLE_SECONDARY,
+        RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
         build_bucket_policy,
+        merge_lifecycle_rules,
         normalize_key_prefix,
         verify_bucket_policy,
+        verify_lifecycle_rules,
     )
 except ImportError:
     from dalton.storage_bucket_rules import (  # type: ignore[no-redef]
         BucketRuleVerificationError,
         ROLE_MAIN,
+        ROLE_SECONDARY,
+        RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
         build_bucket_policy,
+        merge_lifecycle_rules,
         normalize_key_prefix,
         verify_bucket_policy,
+        verify_lifecycle_rules,
     )
 
 
@@ -45,6 +53,27 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
         if val:
             return val
     return default
+
+
+def _format_sdk_error(exc: BaseException, *, operation: str) -> str:
+    """Format an S3/Botocore exception using safe metadata only (never raw SDK text/body)."""
+    parts = [f"op={operation}", f"type={type(exc).__name__}"]
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        err = resp.get("Error")
+        if isinstance(err, dict):
+            code = str(err.get("Code") or "").strip()
+            if code:
+                parts.append(f"code={code}")
+        meta = resp.get("ResponseMetadata")
+        if isinstance(meta, dict):
+            http_status = meta.get("HTTPStatusCode")
+            if http_status is not None and str(http_status).strip():
+                parts.append(f"http_status={http_status}")
+            req_id = str(meta.get("RequestId") or "").strip()
+            if req_id:
+                parts.append(f"request_id={req_id}")
+    return ", ".join(parts)
 
 
 def _ensure_private_bucket(
@@ -64,11 +93,30 @@ def _ensure_private_bucket(
             create_kwargs: dict[str, object] = {"Bucket": bucket}
             if region and region != "us-east-1":
                 create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-            client.create_bucket(**create_kwargs)  # type: ignore[attr-defined]
+            try:
+                client.create_bucket(**create_kwargs)  # type: ignore[attr-defined]
+            except Exception as create_exc:
+                print(
+                    f"[minio-init] ERROR creating bucket '{bucket}': "
+                    f"{_format_sdk_error(create_exc, operation='CreateBucket')}",
+                    file=sys.stderr,
+                )
+                return 1
             print(f"[minio-init] Created bucket '{bucket}'.", flush=True)
         else:
-            print(f"[minio-init] ERROR checking bucket '{bucket}': {exc}", file=sys.stderr)
+            print(
+                f"[minio-init] ERROR checking bucket '{bucket}': "
+                f"{_format_sdk_error(exc, operation='HeadBucket')}",
+                file=sys.stderr,
+            )
             return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR checking bucket '{bucket}': "
+            f"{_format_sdk_error(exc, operation='HeadBucket')}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Ensure no anonymous public policy is attached.
     try:
@@ -77,18 +125,28 @@ def _ensure_private_bucket(
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code != "NoSuchBucketPolicy":
             print(
-                f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+                f"[minio-init] ERROR clearing bucket policy on '{bucket}': "
+                f"{_format_sdk_error(exc, operation='DeleteBucketPolicy')}",
                 file=sys.stderr,
             )
             return 1
     except Exception as exc:
         print(
-            f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR clearing bucket policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='DeleteBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
 
-    client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    try:
+        client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR verifying bucket '{bucket}': "
+            f"{_format_sdk_error(exc, operation='HeadBucket')}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
     return 0
 
@@ -111,7 +169,8 @@ def _ensure_main_avatars_policy(
         )
     except Exception as exc:
         print(
-            f"[minio-init] ERROR setting avatars read-only policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR setting avatars read-only policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='PutBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
@@ -120,7 +179,8 @@ def _ensure_main_avatars_policy(
         resp = client.get_bucket_policy(Bucket=bucket)  # type: ignore[attr-defined]
     except Exception as exc:
         print(
-            f"[minio-init] ERROR verifying avatars read-only policy on '{bucket}': {exc}",
+            f"[minio-init] ERROR verifying avatars read-only policy on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketPolicy')}",
             file=sys.stderr,
         )
         return 1
@@ -140,6 +200,96 @@ def _ensure_main_avatars_policy(
     print(
         f"[minio-init] Verified avatars read-only policy on main bucket '{bucket}' "
         f"(prefix='{prefix}') at {endpoint}.",
+        flush=True,
+    )
+    return 0
+
+
+def _ensure_secondary_lifecycle(
+    client: object,
+    *,
+    bucket: str,
+    key_prefix: str,
+    endpoint: str,
+) -> int:
+    """Apply and read-back verify managed secondary lifecycle rules on ``bucket``."""
+    prefix = normalize_key_prefix(key_prefix)
+    try:
+        resp = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("NoSuchLifecycleConfiguration", "404"):
+            resp = {}
+        else:
+            print(
+                f"[minio-init] ERROR reading lifecycle rules on '{bucket}': "
+                f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR reading lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing_rules = (
+        list(resp.get("Rules"))
+        if isinstance(resp, dict) and isinstance(resp.get("Rules"), list)
+        else []
+    )
+    merged_rules, _preserved, _removed = merge_lifecycle_rules(
+        existing_rules,
+        role=ROLE_SECONDARY,
+        key_prefix=prefix,
+    )
+    try:
+        client.put_bucket_lifecycle_configuration(  # type: ignore[attr-defined]
+            Bucket=bucket,
+            LifecycleConfiguration={"Rules": merged_rules},
+        )
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR setting lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='PutBucketLifecycleConfiguration')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        verify_resp = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR verifying lifecycle rules on '{bucket}': "
+            f"{_format_sdk_error(exc, operation='GetBucketLifecycleConfiguration')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if isinstance(verify_resp, dict):
+        actual_rules = (
+            list(verify_resp.get("Rules"))
+            if isinstance(verify_resp.get("Rules"), list)
+            else []
+        )
+        try:
+            verify_lifecycle_rules(
+                actual_rules,
+                role=ROLE_SECONDARY,
+                key_prefix=prefix,
+            )
+        except BucketRuleVerificationError as exc:
+            print(
+                f"[minio-init] ERROR lifecycle verification failed on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"[minio-init] Verified secondary lifecycle rules (including '{RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE}') "
+        f"on bucket '{bucket}' (prefix='{prefix}') at {endpoint}.",
         flush=True,
     )
     return 0
@@ -221,11 +371,13 @@ def main() -> int:
     # except current-version anonymous s3:GetObject on <STORAGE_KEY_PREFIX>avatars/*.
     storage_provider = (os.getenv("STORAGE_PROVIDER") or "").strip().lower()
     storage_bucket = _resolve_main_storage_bucket() if storage_provider != "none" else ""
+    main_bucket_on_endpoint = ""
     if storage_bucket:
         storage_endpoint = _env(
             "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default=endpoint
         ).rstrip("/")
         if storage_endpoint == endpoint:
+            main_bucket_on_endpoint = storage_bucket
             if (storage_endpoint, storage_bucket) not in initialized:
                 storage_region = _env("STORAGE_REGION", "S3_REGION", default=region)
                 rc = _ensure_private_bucket(
@@ -251,14 +403,24 @@ def main() -> int:
     asr_bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME")
     if asr_bucket:
         asr_endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if asr_endpoint == endpoint and (asr_endpoint, asr_bucket) not in initialized:
-            asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
-            rc = _ensure_private_bucket(
-                client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
-            )
-            if rc != 0:
-                return rc
-            initialized.add((asr_endpoint, asr_bucket))
+        if asr_endpoint == endpoint:
+            if (asr_endpoint, asr_bucket) not in initialized:
+                asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
+                rc = _ensure_private_bucket(
+                    client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
+                )
+                if rc != 0:
+                    return rc
+                initialized.add((asr_endpoint, asr_bucket))
+            if asr_bucket != main_bucket_on_endpoint:
+                rc = _ensure_secondary_lifecycle(
+                    client,
+                    bucket=asr_bucket,
+                    key_prefix=os.getenv("DALTON_ASR_STORAGE_KEY_PREFIX", ""),
+                    endpoint=asr_endpoint,
+                )
+                if rc != 0:
+                    return rc
 
     return 0
 

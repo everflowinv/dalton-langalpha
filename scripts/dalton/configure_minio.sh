@@ -10,12 +10,14 @@
 #      NOTE: Once Bucket Versioning is enabled on a bucket, it can only be suspended
 #      (`Suspended`) and cannot be turned off completely.
 #   4. Configure and read-back verify per-role S3 Lifecycle rules (merging with and
-#      preserving any unmanaged rule IDs):
+#      preserving any unmanaged rule IDs, except replacing an unmanaged rule on
+#      `secondary` that is equivalent to `dalton-transcription-audio-expire`):
 #      - `main`: `dalton-uploads-expire` (`<prefix>uploads/` 1-2d),
 #        `dalton-noncurrent-expire` (30d), `dalton-expired-delete-marker`.
-#      - `secondary`: `dalton-noncurrent-expire` (30d) and
-#        `dalton-expired-delete-marker` only (removes any `dalton-uploads-expire`
-#        so legitimate `uploads/{ws}/` transcription audio is preserved).
+#      - `secondary`: `dalton-transcription-audio-expire` (`<prefix>transcriptions/` 7d),
+#        `dalton-noncurrent-expire` (30d), and `dalton-expired-delete-marker`
+#        (removes any `dalton-uploads-expire` so legacy `uploads/{ws}/` audio is
+#        preserved and chat attachments remain permanent).
 #   5. Verify MinIO `api.stale_uploads_expiry` (default 24h) and
 #      `api.stale_uploads_cleanup_interval` (default 6h).
 #   6. Verify CORS when required (`secondary`, or `main` with
@@ -44,8 +46,10 @@ Idempotently provision and verify a Dalton MinIO / S3-compatible bucket:
     `secondary`: strictly private).
   - Enables and verifies Bucket Versioning (`Status=Enabled`).
     IMPORTANT: Bucket Versioning cannot be disabled once enabled (only suspended).
-  - Merges and verifies per-role Lifecycle rules (preserves unmanaged rule IDs;
-    `uploads/` expiration is configured ONLY on `main` and removed from `secondary`).
+  - Merges and verifies per-role Lifecycle rules (preserves unmanaged rule IDs,
+    replaces equivalent unmanaged `transcriptions/` 7d rule on `secondary` with
+    `dalton-transcription-audio-expire`; `uploads/` expiration is configured ONLY
+    on `main` and removed from `secondary`).
   - Verifies MinIO `api` stale multipart upload cleanup (`MINIO_API_STALE_UPLOADS_EXPIRY=24h`).
   - Verifies CORS preflight on `secondary`, or on `main` only when
     `STORAGE_BROWSER_UPLOADS` is truthy (`1/true/yes/on`).
@@ -119,6 +123,7 @@ export STORAGE_SECRET_ACCESS_KEY="${STORAGE_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASS
 export STORAGE_REGION="${STORAGE_REGION:-${S3_REGION:-us-east-1}}"
 export STORAGE_ADDRESSING_STYLE="${STORAGE_ADDRESSING_STYLE:-path}"
 export STORAGE_KEY_PREFIX="${STORAGE_KEY_PREFIX:-}"
+export DALTON_ASR_STORAGE_KEY_PREFIX="${DALTON_ASR_STORAGE_KEY_PREFIX:-}"
 export STORAGE_BROWSER_UPLOADS="${STORAGE_BROWSER_UPLOADS:-false}"
 export DALTON_CORS_ALLOWED_ORIGINS="${DALTON_CORS_ALLOWED_ORIGINS:-${MINIO_API_CORS_ALLOW_ORIGIN:-${CORS_ALLOWED_ORIGINS:-}}}"
 export DALTON_UPLOADS_EXPIRE_DAYS="${DALTON_UPLOADS_EXPIRE_DAYS:-2}"
@@ -235,10 +240,18 @@ PY
 unset API_CFG_OUT
 
 # 4. S3 API policy, Bucket Versioning (Enabled), and per-role Lifecycle merge & read-back verification
+# Unified transcription prefix: secondary role always scopes lifecycle rules by
+# DALTON_ASR_STORAGE_KEY_PREFIX (matching scripts/standalone/minio_init.py and runtime storage);
+# main role scopes by STORAGE_KEY_PREFIX.
+if [[ "$ROLE" == "secondary" ]]; then
+  TARGET_KEY_PREFIX="$DALTON_ASR_STORAGE_KEY_PREFIX"
+else
+  TARGET_KEY_PREFIX="$STORAGE_KEY_PREFIX"
+fi
 PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -m src.dalton.storage_bucket_rules apply \
   --bucket "$TARGET_BUCKET" \
   --role "$ROLE" \
-  --prefix "$STORAGE_KEY_PREFIX" \
+  --prefix "$TARGET_KEY_PREFIX" \
   --uploads-expire-days "$DALTON_UPLOADS_EXPIRE_DAYS"
 
 # 5. CORS preflight verification (required on secondary; on main only when STORAGE_BROWSER_UPLOADS is truthy)

@@ -17,15 +17,23 @@ Roles:
 
 - ``secondary`` (e.g. ``dalton-asr`` / ``chat-uploads``):
   - Versioning: ``Status=Enabled``.
-  - Lifecycle rules: ONLY ``dalton-noncurrent-expire`` (30 days) and
-    ``dalton-expired-delete-marker``. Any pre-existing ``dalton-uploads-expire``
-    rule is explicitly removed (secondary buckets hold legitimate transcription
-    audio under ``uploads/{ws}/``).
+  - Lifecycle rules (scoped by ``<STORAGE_KEY_PREFIX>``):
+    1. ``dalton-transcription-audio-expire``: ``<prefix>transcriptions/`` current
+       versions expire after 7 days (saves space on ASR source audio while chat
+       attachments remain permanent).
+    2. ``dalton-noncurrent-expire``: ``<prefix>`` noncurrent versions expire after 30 days.
+    3. ``dalton-expired-delete-marker``: ``<prefix>`` clean up expired object delete markers.
+    Any pre-existing ``dalton-uploads-expire`` rule is explicitly removed (secondary
+    buckets may hold legacy transcription audio under ``uploads/{ws}/``).
   - Bucket policy: strictly private (no bucket policy statements).
 
 Merge policy:
 - Existing lifecycle rules with IDs outside this module's managed set are
-  preserved verbatim and reported back.
+  preserved verbatim and reported back, EXCEPT that on ``secondary`` an
+  unmanaged rule equivalent to ``dalton-transcription-audio-expire`` (same
+  ``<prefix>transcriptions/`` prefix and same 7-day current-version expiration,
+  with no extra filter predicates or extra actions) is replaced by the managed
+  rule.
 - All policy, versioning, and lifecycle configurations are read back and
   verified; any mismatch raises :class:`BucketRuleVerificationError`.
 """
@@ -45,17 +53,22 @@ ROLE_SECONDARY = "secondary"
 VALID_ROLES = frozenset({ROLE_MAIN, ROLE_SECONDARY})
 
 RULE_ID_UPLOADS_EXPIRE = "dalton-uploads-expire"
+RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE = "dalton-transcription-audio-expire"
 RULE_ID_NONCURRENT_EXPIRE = "dalton-noncurrent-expire"
 RULE_ID_EXPIRED_DELETE_MARKER = "dalton-expired-delete-marker"
 MANAGED_RULE_IDS = frozenset(
     {
         RULE_ID_UPLOADS_EXPIRE,
+        RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
         RULE_ID_NONCURRENT_EXPIRE,
         RULE_ID_EXPIRED_DELETE_MARKER,
     }
 )
 
 NONCURRENT_EXPIRE_DAYS = 30
+TRANSCRIPTION_AUDIO_PREFIX = "transcriptions/"
+TRANSCRIPTION_AUDIO_EXPIRE_DAYS = 7
+TRANSCRIPTION_AUDIO_EXPIRE_ROLES = frozenset({ROLE_SECONDARY})
 VALID_UPLOADS_EXPIRE_DAYS = frozenset({1, 2})
 AVATARS_POLICY_SID = "DaltonAvatarsPublicRead"
 
@@ -80,6 +93,7 @@ class BucketRuleApplyResult:
     preserved_rules: tuple[dict[str, Any], ...]
     removed_secondary_uploads_rule: bool
     policy_verified: bool
+    replaced_equivalent_rules: tuple[dict[str, Any], ...] = ()
 
 
 def normalize_role(role: str) -> str:
@@ -94,6 +108,43 @@ def normalize_role(role: str) -> str:
 def normalize_key_prefix(raw_prefix: str | None) -> str:
     cleaned = (raw_prefix or "").strip().strip("/")
     return f"{cleaned}/" if cleaned else ""
+
+
+def managed_transcription_audio_expire_prefix(key_prefix: str = "") -> str:
+    """Return the managed lifecycle prefix for transcription audio expiration."""
+    return f"{normalize_key_prefix(key_prefix)}{TRANSCRIPTION_AUDIO_PREFIX}"
+
+
+def is_key_covered_by_transcription_audio_expire_rule(
+    object_key: str,
+    *,
+    bucket_role: str | None,
+    key_prefix: str = "",
+) -> bool:
+    """Return True iff ``object_key`` sits under the managed 7-day transcription rule's bucket role and prefix.
+
+    Shared single source of truth with ``src/dalton/storage_refs.py`` so backup
+    exemption only applies to keys covered by ``dalton-transcription-audio-expire``
+    (a ``secondary`` bucket + ``<key_prefix>transcriptions/<non-empty>``).
+    Returns ``False`` whenever bucket role is unknown/None, ``main``, or the key
+    falls outside ``transcriptions/`` (e.g. legacy ``uploads/``).
+    """
+    if not bucket_role:
+        return False
+    norm_role = str(bucket_role).strip().lower()
+    if norm_role not in TRANSCRIPTION_AUDIO_EXPIRE_ROLES:
+        return False
+    cleaned_key = str(object_key or "").strip().lstrip("/")
+    if not cleaned_key:
+        return False
+    prefix = normalize_key_prefix(key_prefix)
+    full_key = (
+        cleaned_key
+        if (not prefix or cleaned_key.startswith(prefix))
+        else f"{prefix}{cleaned_key}"
+    )
+    rule_prefix = managed_transcription_audio_expire_prefix(prefix)
+    return full_key.startswith(rule_prefix) and len(full_key) > len(rule_prefix)
 
 
 def validate_uploads_expire_days(days: int) -> int:
@@ -125,6 +176,15 @@ def build_lifecycle_rules(
                 "Expiration": {"Days": days},
             }
         )
+    elif norm_role == ROLE_SECONDARY:
+        rules.append(
+            {
+                "ID": RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
+                "Status": "Enabled",
+                "Filter": {"Prefix": f"{prefix}{TRANSCRIPTION_AUDIO_PREFIX}"},
+                "Expiration": {"Days": TRANSCRIPTION_AUDIO_EXPIRE_DAYS},
+            }
+        )
 
     rules.append(
         {
@@ -145,39 +205,6 @@ def build_lifecycle_rules(
     return rules
 
 
-def merge_lifecycle_rules(
-    existing_rules: Sequence[dict[str, Any]],
-    *,
-    role: str,
-    key_prefix: str = "",
-    uploads_expire_days: int = 2,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-    """Merge managed rules with existing rules, preserving unmanaged rule IDs.
-
-    Returns ``(merged_rules, preserved_other_rules, removed_secondary_uploads_rule)``.
-    """
-    norm_role = normalize_role(role)
-    preserved: list[dict[str, Any]] = []
-    removed_secondary_uploads = False
-
-    for rule in existing_rules:
-        if not isinstance(rule, dict):
-            continue
-        rule_id = rule.get("ID")
-        if rule_id in MANAGED_RULE_IDS:
-            if norm_role == ROLE_SECONDARY and rule_id == RULE_ID_UPLOADS_EXPIRE:
-                removed_secondary_uploads = True
-            continue
-        preserved.append(dict(rule))
-
-    managed = build_lifecycle_rules(
-        role=norm_role,
-        key_prefix=key_prefix,
-        uploads_expire_days=uploads_expire_days,
-    )
-    return [*preserved, *managed], preserved, removed_secondary_uploads
-
-
 def _rule_prefix(rule: dict[str, Any]) -> str:
     filt = rule.get("Filter")
     if isinstance(filt, dict):
@@ -191,6 +218,128 @@ def _rule_prefix(rule: dict[str, Any]) -> str:
     return ""
 
 
+def _rule_has_only_prefix_filter(rule: dict[str, Any]) -> bool:
+    filt = rule.get("Filter")
+    if filt is None:
+        return True
+    if not isinstance(filt, dict):
+        return False
+    if "And" in filt:
+        for key, val in filt.items():
+            if key != "And" and val not in (None, "", [], {}):
+                return False
+        and_clause = filt.get("And")
+        if not isinstance(and_clause, dict):
+            return False
+        for key, val in and_clause.items():
+            if key != "Prefix" and val not in (None, "", [], {}):
+                return False
+        return True
+    for key, val in filt.items():
+        if key != "Prefix" and val not in (None, "", [], {}):
+            return False
+    return True
+
+
+def is_equivalent_transcription_audio_expire_rule(
+    rule: dict[str, Any],
+    *,
+    key_prefix: str = "",
+    expire_days: int = TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+) -> bool:
+    """Return True iff ``rule`` is semantically equivalent to ``dalton-transcription-audio-expire``."""
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("Status") != "Enabled":
+        return False
+    if not _rule_has_only_prefix_filter(rule):
+        return False
+    expected_prefix = f"{normalize_key_prefix(key_prefix)}{TRANSCRIPTION_AUDIO_PREFIX}"
+    if _rule_prefix(rule) != expected_prefix:
+        return False
+    exp = rule.get("Expiration")
+    if not isinstance(exp, dict):
+        return False
+    days = exp.get("Days")
+    if isinstance(days, bool) or days != expire_days:
+        return False
+    if exp.get("Date") is not None or exp.get("ExpiredObjectDeleteMarker"):
+        return False
+    for extra_action in (
+        "NoncurrentVersionExpiration",
+        "Transitions",
+        "NoncurrentVersionTransitions",
+        "AbortIncompleteMultipartUpload",
+    ):
+        if rule.get(extra_action):
+            return False
+    return True
+
+
+def _merge_lifecycle_rules_detailed(
+    existing_rules: Sequence[dict[str, Any]],
+    *,
+    role: str,
+    key_prefix: str = "",
+    uploads_expire_days: int = 2,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, list[dict[str, Any]]]:
+    norm_role = normalize_role(role)
+    prefix = normalize_key_prefix(key_prefix)
+    preserved: list[dict[str, Any]] = []
+    replaced_equivalent: list[dict[str, Any]] = []
+    removed_secondary_uploads = False
+
+    for rule in existing_rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_id = rule.get("ID")
+        if rule_id in MANAGED_RULE_IDS:
+            if norm_role == ROLE_SECONDARY and rule_id == RULE_ID_UPLOADS_EXPIRE:
+                removed_secondary_uploads = True
+            continue
+        if norm_role == ROLE_SECONDARY and is_equivalent_transcription_audio_expire_rule(
+            rule,
+            key_prefix=prefix,
+            expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+        ):
+            replaced_equivalent.append(dict(rule))
+            continue
+        preserved.append(dict(rule))
+
+    managed = build_lifecycle_rules(
+        role=norm_role,
+        key_prefix=prefix,
+        uploads_expire_days=uploads_expire_days,
+    )
+    return [*preserved, *managed], preserved, removed_secondary_uploads, replaced_equivalent
+
+
+def merge_lifecycle_rules(
+    existing_rules: Sequence[dict[str, Any]],
+    *,
+    role: str,
+    key_prefix: str = "",
+    uploads_expire_days: int = 2,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Merge managed rules with existing rules, preserving unmanaged rule IDs.
+
+    On ``secondary``, unmanaged rules equivalent to
+    ``dalton-transcription-audio-expire`` (same prefix and expiration days) are
+    replaced by the managed rule; all other unmanaged rules are preserved.
+
+    Returns ``(merged_rules, preserved_other_rules, removed_secondary_uploads_rule)``.
+    """
+    merged, preserved, removed_secondary_uploads, _replaced = (
+        _merge_lifecycle_rules_detailed(
+            existing_rules,
+            role=role,
+            key_prefix=key_prefix,
+            uploads_expire_days=uploads_expire_days,
+        )
+    )
+    return merged, preserved, removed_secondary_uploads
+
+
 def verify_lifecycle_rules(
     actual_rules: Sequence[dict[str, Any]],
     *,
@@ -200,9 +349,10 @@ def verify_lifecycle_rules(
 ) -> None:
     """Verify read-back lifecycle rules match all managed rules for ``role``."""
     norm_role = normalize_role(role)
+    prefix = normalize_key_prefix(key_prefix)
     expected = build_lifecycle_rules(
         role=norm_role,
-        key_prefix=key_prefix,
+        key_prefix=prefix,
         uploads_expire_days=uploads_expire_days,
     )
     by_id: dict[str, dict[str, Any]] = {}
@@ -214,6 +364,26 @@ def verify_lifecycle_rules(
         raise BucketRuleVerificationError(
             f"Secondary bucket must not retain lifecycle rule {RULE_ID_UPLOADS_EXPIRE!r}"
         )
+    if norm_role == ROLE_MAIN and RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE in by_id:
+        raise BucketRuleVerificationError(
+            f"Main bucket must not retain lifecycle rule {RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE!r}"
+        )
+    if norm_role == ROLE_SECONDARY:
+        for rule in actual_rules:
+            if not isinstance(rule, dict):
+                continue
+            rid = rule.get("ID")
+            if rid in MANAGED_RULE_IDS:
+                continue
+            if is_equivalent_transcription_audio_expire_rule(
+                rule,
+                key_prefix=prefix,
+                expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+            ):
+                raise BucketRuleVerificationError(
+                    "Secondary bucket still contains an unmanaged lifecycle rule "
+                    f"equivalent to {RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE!r}: ID={rid!r}"
+                )
 
     for exp in expected:
         rid = exp["ID"]
@@ -226,6 +396,11 @@ def verify_lifecycle_rules(
             raise BucketRuleVerificationError(
                 f"Lifecycle rule {rid!r} has Status={got.get('Status')!r}, expected 'Enabled'"
             )
+        if not _rule_has_only_prefix_filter(got):
+            raise BucketRuleVerificationError(
+                f"Lifecycle rule {rid!r} has extra filter conditions "
+                f"(Filter={got.get('Filter')!r}); expected prefix-only filter"
+            )
         exp_prefix = _rule_prefix(exp)
         got_prefix = _rule_prefix(got)
         if got_prefix != exp_prefix:
@@ -234,12 +409,21 @@ def verify_lifecycle_rules(
             )
 
         if "Expiration" in exp:
-            got_exp = got.get("Expiration") or {}
+            got_exp = got.get("Expiration")
+            if not isinstance(got_exp, dict):
+                raise BucketRuleVerificationError(
+                    f"Lifecycle rule {rid!r} missing Expiration block"
+                )
             if "Days" in exp["Expiration"]:
-                if got_exp.get("Days") != exp["Expiration"]["Days"]:
+                got_days = got_exp.get("Days")
+                if isinstance(got_days, bool) or got_days != exp["Expiration"]["Days"]:
                     raise BucketRuleVerificationError(
-                        f"Lifecycle rule {rid!r} Expiration.Days={got_exp.get('Days')!r}, "
+                        f"Lifecycle rule {rid!r} Expiration.Days={got_days!r}, "
                         f"expected {exp['Expiration']['Days']!r}"
+                    )
+                if got_exp.get("Date") is not None or got_exp.get("ExpiredObjectDeleteMarker"):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} Expiration has unexpected extra fields: {got_exp!r}"
                     )
             if "ExpiredObjectDeleteMarker" in exp["Expiration"]:
                 if got_exp.get("ExpiredObjectDeleteMarker") is not True:
@@ -247,15 +431,53 @@ def verify_lifecycle_rules(
                         f"Lifecycle rule {rid!r} Expiration.ExpiredObjectDeleteMarker="
                         f"{got_exp.get('ExpiredObjectDeleteMarker')!r}, expected True"
                     )
+                if got_exp.get("Days") is not None or got_exp.get("Date") is not None:
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} Expiration has unexpected extra fields: {got_exp!r}"
+                    )
+            for extra_action in (
+                "NoncurrentVersionExpiration",
+                "Transitions",
+                "NoncurrentVersionTransitions",
+                "AbortIncompleteMultipartUpload",
+            ):
+                if got.get(extra_action):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} has unexpected extra action {extra_action!r}"
+                    )
 
         if "NoncurrentVersionExpiration" in exp:
-            got_nc = got.get("NoncurrentVersionExpiration") or {}
+            got_nc = got.get("NoncurrentVersionExpiration")
+            if not isinstance(got_nc, dict):
+                raise BucketRuleVerificationError(
+                    f"Lifecycle rule {rid!r} missing NoncurrentVersionExpiration block"
+                )
             exp_days = exp["NoncurrentVersionExpiration"]["NoncurrentDays"]
-            if got_nc.get("NoncurrentDays") != exp_days:
+            got_nc_days = got_nc.get("NoncurrentDays")
+            if isinstance(got_nc_days, bool) or got_nc_days != exp_days:
                 raise BucketRuleVerificationError(
                     f"Lifecycle rule {rid!r} NoncurrentVersionExpiration.NoncurrentDays="
-                    f"{got_nc.get('NoncurrentDays')!r}, expected {exp_days!r}"
+                    f"{got_nc_days!r}, expected {exp_days!r}"
                 )
+            for extra_action in (
+                "Expiration",
+                "Transitions",
+                "NoncurrentVersionTransitions",
+                "AbortIncompleteMultipartUpload",
+            ):
+                if got.get(extra_action):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} has unexpected extra action {extra_action!r}"
+                    )
+
+        if rid == RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE and not is_equivalent_transcription_audio_expire_rule(
+            got,
+            key_prefix=prefix,
+            expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+        ):
+            raise BucketRuleVerificationError(
+                f"Lifecycle rule {rid!r} does not match managed transcription audio expire rule: {got!r}"
+            )
 
 
 def build_bucket_policy(
@@ -452,9 +674,15 @@ def apply_bucket_rules(
             f"Bucket {bucket!r} versioning read-back Status={ver_status!r}, expected 'Enabled'"
         )
 
-    # 3. Lifecycle rules (merge with unmanaged IDs, remove uploads-expire on secondary, verify)
+    # 3. Lifecycle rules (merge with unmanaged IDs, replace equivalent unmanaged
+    #    transcription rule & remove uploads-expire on secondary, verify)
     existing_rules = _read_lifecycle_rules_or_empty(client, bucket)
-    merged_rules, preserved_rules, removed_secondary_uploads = merge_lifecycle_rules(
+    (
+        merged_rules,
+        preserved_rules,
+        removed_secondary_uploads,
+        replaced_equivalent_rules,
+    ) = _merge_lifecycle_rules_detailed(
         existing_rules,
         role=norm_role,
         key_prefix=prefix,
@@ -489,6 +717,7 @@ def apply_bucket_rules(
         preserved_rules=tuple(preserved_rules),
         removed_secondary_uploads_rule=removed_secondary_uploads,
         policy_verified=True,
+        replaced_equivalent_rules=tuple(replaced_equivalent_rules),
     )
 
 
@@ -556,8 +785,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     apply_p.add_argument(
         "--prefix",
-        default=os.environ.get("STORAGE_KEY_PREFIX", ""),
-        help="Optional key prefix (default: STORAGE_KEY_PREFIX).",
+        default=None,
+        help=(
+            "Optional key prefix (defaults to DALTON_ASR_STORAGE_KEY_PREFIX for "
+            "role=secondary, STORAGE_KEY_PREFIX for role=main)."
+        ),
     )
     apply_p.add_argument(
         "--uploads-expire-days",
@@ -569,11 +801,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "apply":
         client = _build_s3_client_from_env()
+        effective_prefix = (
+            args.prefix
+            if args.prefix is not None
+            else (
+                os.environ.get("DALTON_ASR_STORAGE_KEY_PREFIX", "")
+                if normalize_role(args.role) == ROLE_SECONDARY
+                else os.environ.get("STORAGE_KEY_PREFIX", "")
+            )
+        )
         result = apply_bucket_rules(
             client,
             bucket=args.bucket.strip(),
             role=args.role,
-            key_prefix=args.prefix,
+            key_prefix=effective_prefix,
             uploads_expire_days=args.uploads_expire_days,
         )
         print(
@@ -588,6 +829,12 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"[minio-config] Removed '{RULE_ID_UPLOADS_EXPIRE}' from secondary bucket "
                 f"'{result.bucket}' (preserves uploads/{{ws}}/ transcription sources)."
+            )
+        for replaced in result.replaced_equivalent_rules:
+            print(
+                f"[minio-config] Replaced equivalent unmanaged lifecycle rule on '{result.bucket}' "
+                f"with '{RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE}': "
+                f"ID={replaced.get('ID')!r}"
             )
         for other in result.preserved_rules:
             print(

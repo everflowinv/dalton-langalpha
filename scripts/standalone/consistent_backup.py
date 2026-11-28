@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import json
+import logging
 import os
 import shutil
 import sys
@@ -255,12 +257,60 @@ def _start_pg_dump(snapshot_id: str, out_path: Path, *, dsn: str) -> PgDumpProce
     return start_pg_dump_process(cmd, out_path, cmd_label="pg_dump")
 
 
+def _emit_standalone_missing_alert(
+    code: str,
+    message: str,
+    *,
+    default_alerts_file: Path | None = None,
+) -> None:
+    """Append a single-line WARN alert to ``DALTON_BACKUP_ALERTS_FILE`` (or ``default_alerts_file``)."""
+    alerts_raw = (os.getenv("DALTON_BACKUP_ALERTS_FILE") or "").strip()
+    if alerts_raw:
+        target = Path(os.path.expanduser(alerts_raw))
+    elif default_alerts_file is not None:
+        target = Path(default_alerts_file)
+    else:
+        return
+    if target.suffix.lower() == ".json":
+        return
+    ts = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    clean_msg = " ".join(message.splitlines()).strip()
+    line = f"{ts} [WARN] [standalone_consistent_backup] [{code}] {clean_msg}\n"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def _format_missing_sample_keys(
+    missing_objects: Any,
+    *,
+    max_sample: int = 10,
+) -> tuple[int, list[str]]:
+    """Return ``(unique_count, first_max_sample_keys)`` without emitting the full list."""
+    seen: set[tuple[str, str]] = set()
+    sample: list[str] = []
+    for item in missing_objects:
+        b = str(getattr(item, "bucket", "") or "").strip()
+        k = str(getattr(item, "key", "") or "").strip().lstrip("/")
+        if not b or not k or (b, k) in seen:
+            continue
+        seen.add((b, k))
+        if len(sample) < max_sample:
+            sample.append(f"{b}/{k}")
+    return len(seen), sample
+
+
 def _cmd_backup(
     args: argparse.Namespace,
     *,
     conn_opener: Callable[[str], Any] = open_standalone_session_connection,
     pg_dump_starter: Callable[..., Any] = _start_pg_dump,
     bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
+    alert_fn: Callable[[str, str], Any] | None = _emit_standalone_missing_alert,
 ) -> int:
     from src.dalton.consistent_backup import TarGzObjectSink, run_consistent_backup
 
@@ -282,6 +332,16 @@ def _cmd_backup(
         manifest_extra=_standalone_manifest_extra(specs, os.environ),
     )
 
+    eff_alert_fn: Callable[[str, str], Any] | None
+    if alert_fn is _emit_standalone_missing_alert:
+        eff_alert_fn = lambda code, msg: _emit_standalone_missing_alert(  # noqa: E731
+            code,
+            msg,
+            default_alerts_file=out_dir / "backup-alerts.log",
+        )
+    else:
+        eff_alert_fn = alert_fn
+
     async def _execute():
         conn = await conn_opener(dsn)
         try:
@@ -297,6 +357,7 @@ def _cmd_backup(
                 pg_dump_timeout_s=args.pg_dump_timeout_s,
                 mirror_timeout_s=args.mirror_timeout_s,
                 snapshot_import_timeout_s=args.snapshot_import_timeout_s,
+                alert_fn=eff_alert_fn,
             )
         finally:
             await conn.close()
@@ -310,6 +371,10 @@ def _cmd_backup(
                 "minio_archive": str(minio_tar),
                 "asr_archive": str(res.asr_archive.archive_path) if res.asr_archive else None,
                 "object_count": len(res.manifest_objects),
+                "missing_referenced_objects": [m.to_dict() for m in res.missing_referenced_objects],
+                "missing_referenced_count": len(res.missing_referenced_objects),
+                "expired_by_rule_objects": [e.to_dict() for e in res.expired_by_rule_objects],
+                "expired_by_rule_count": len(res.expired_by_rule_objects),
                 "warnings": list(res.warnings),
                 "reconcile": res.reconcile_report.to_dict(),
             },
@@ -326,6 +391,7 @@ def _cmd_compose_backup(
     conn_opener: Callable[[str], Any] = open_standalone_session_connection,
     bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
     terminate_pg_dump_hook: Callable[[str], None] | None = None,
+    alert_fn: Callable[[str, str], Any] | None = None,
 ) -> int:
     """Coordinate consistent snapshot backup with host-driven ``docker compose exec postgres pg_dump``.
 
@@ -419,6 +485,8 @@ def _cmd_compose_backup(
                     pg_dump_timeout_s=args.pg_dump_timeout_s,
                     mirror_timeout_s=args.mirror_timeout_s,
                     snapshot_import_timeout_s=args.snapshot_import_timeout_s,
+                    alert_fn=alert_fn,
+                    log_missing_summary=False,
                 )
             finally:
                 await conn.close()
@@ -439,14 +507,20 @@ def _cmd_compose_backup(
                 shutil.copyfileobj(fh, sys.stdout.buffer, length=1024 * 1024)
             sys.stdout.buffer.flush()
 
+        missing_unique_count, missing_sample = _format_missing_sample_keys(
+            res.missing_referenced_objects,
+            max_sample=10,
+        )
         summary_payload = {
             "snapshot_id": res.snapshot_id,
             "object_count": len(res.manifest_objects),
+            "missing_referenced_count": missing_unique_count,
+            "missing_referenced_sample": missing_sample,
+            "expired_by_rule_count": len(res.expired_by_rule_objects),
             "asr_job_count": len(res.asr_archive.included_job_ids) if res.asr_archive else 0,
             "asr_archive_included": bool(
                 res.asr_archive is not None and res.asr_archive.archive_path.is_file()
             ),
-            "warnings": list(res.warnings),
             "reconcile_ok": res.reconcile_report.ok,
             "checked_refs": res.reconcile_report.checked_refs,
         }
@@ -558,6 +632,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            stream=sys.stderr,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+        )
     args = build_arg_parser().parse_args(argv)
     return int(args.func(args))
 

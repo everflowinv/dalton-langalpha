@@ -1704,9 +1704,58 @@ if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
     ")"
   fi
   if [[ -n "$DB_OBJ_REFS" ]]; then
+    KNOWN_MISSING_JSON="[]"
+    if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
+      KNOWN_MISSING_JSON="$(python3 - "$MINIO_MANIFEST_TMP" "${BACKUP_DIR}/manifest.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+present_in_manifest = set()
+minio_p = Path(sys.argv[1])
+if minio_p.is_file():
+    try:
+        mdata = json.loads(minio_p.read_text(encoding="utf-8"))
+        if isinstance(mdata, dict) and isinstance(mdata.get("objects"), list):
+            for obj in mdata["objects"]:
+                if isinstance(obj, dict):
+                    ob = str(obj.get("bucket") or "").strip()
+                    ok = str(obj.get("key") or "").strip().lstrip("/")
+                    if ob and ok:
+                        present_in_manifest.add((ob, ok))
+    except Exception:
+        pass
+
+out = []
+seen = set()
+for raw_path in sys.argv[1:]:
+    p = Path(raw_path)
+    if not p.is_file():
+        continue
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    items = data.get("missing_referenced_objects")
+    if not isinstance(items, list):
+        continue
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        b = str(item.get("bucket") or "").strip()
+        k = str(item.get("key") or "").strip().lstrip("/")
+        c = str(item.get("consumer") or "").strip()
+        if b and k and (b, k) not in present_in_manifest and (b, k) not in seen:
+            seen.add((b, k))
+            out.append({"bucket": b, "key": k, "consumer": c})
+print(json.dumps(out, ensure_ascii=False))
+PY
+)"
+    fi
     MISSING_CHECK_PY='
 from __future__ import annotations
-import os, sys
+import json, os, sys
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -1719,6 +1768,17 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 skipped_uploading = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
+known_missing_raw = sys.argv[2] if len(sys.argv) > 2 else "[]"
+known_missing_pairs: set[tuple[str, str]] = set()
+try:
+    for km in json.loads(known_missing_raw or "[]"):
+        if isinstance(km, dict):
+            kb = str(km.get("bucket") or "").strip()
+            kk = str(km.get("key") or "").strip().lstrip("/")
+            if kb and kk:
+                known_missing_pairs.add((kb, kk))
+except Exception:
+    pass
 
 dedicated_ok = all(
     (os.getenv(k) or "").strip()
@@ -1760,7 +1820,20 @@ client = boto3.client(
     ),
 )
 
+def _is_not_found_client_error(exc: ClientError) -> bool:
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return False
+    code = str((resp.get("Error") or {}).get("Code") or "").strip()
+    try:
+        status = int((resp.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    return status == 404 or code in ("404", "NoSuchKey", "NotFound")
+
 missing: list[str] = []
+check_errors: list[str] = []
+known_missing_hits: list[str] = []
 checked = 0
 for line in sys.stdin:
     line = line.strip()
@@ -1776,8 +1849,37 @@ for line in sys.stdin:
     checked += 1
     try:
         client.head_object(Bucket=bucket, Key=full_key)
-    except ClientError:
-        missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+    except ClientError as exc:
+        if _is_not_found_client_error(exc):
+            if (bucket, full_key) in known_missing_pairs:
+                known_missing_hits.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+            else:
+                missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+        else:
+            resp = getattr(exc, "response", None) if isinstance(getattr(exc, "response", None), dict) else {}
+            err_code = str((resp.get("Error") or {}).get("Code") or "unknown")
+            http_status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode") or "unknown"
+            check_errors.append(
+                f"{kind}:{ref_id} -> {bucket}/{full_key} (HTTP {http_status}, Code={err_code})"
+            )
+
+if known_missing_hits:
+    print(
+        f"[restore] WARN: {len(known_missing_hits)}/{checked} DB-referenced object(s) are registered as known missing in backup manifest (not treated as restore failure):",
+        file=sys.stderr,
+    )
+    for item in known_missing_hits[:10]:
+        print(f"[restore] WARN:   known missing: {item}", file=sys.stderr)
+    if len(known_missing_hits) > 10:
+        print(f"[restore] WARN:   ... (+{len(known_missing_hits) - 10} more)", file=sys.stderr)
+
+if check_errors:
+    print(
+        f"[restore] ERROR: {len(check_errors)}/{checked} DB-referenced object(s) failed storage verification (non-404 error, never matched as known missing):",
+        file=sys.stderr,
+    )
+    for item in check_errors:
+        print(f"[restore] ERROR:   storage error: {item}", file=sys.stderr)
 
 if missing:
     print(f"[restore] ERROR: {len(missing)}/{checked} DB-referenced object(s) missing from object storage:", file=sys.stderr)
@@ -1787,15 +1889,17 @@ if missing:
         "[restore] ERROR: Note on online backup consistency window: backup.sh snapshots PostgreSQL first and streams object storage immediately afterward; objects deleted or still in flight during that online backup window (or an inconsistent bucket/key prefix) can leave DB references missing from object storage.",
         file=sys.stderr,
     )
+
+if missing or check_errors:
     sys.exit(1)
 else:
     print(
-        f"[restore] OK: All {checked} completed DB-referenced object(s) present in MinIO bucket {bucket!r} "
-        f"(skipped {skipped_uploading} in-progress \x27uploading\x27 record(s))."
+        f"[restore] OK: All {checked - len(known_missing_hits)}/{checked} present DB-referenced object(s) verified in MinIO bucket {bucket!r} "
+        f"(known_missing={len(known_missing_hits)}, skipped {skipped_uploading} in-progress \x27uploading\x27 record(s))."
     )
 '
     printf '%s\n' "$DB_OBJ_REFS" | compose_cmd run --rm -T --no-deps backend \
-      uv run --no-sync python -c "$MISSING_CHECK_PY" "$SKIPPED_UPLOADING_COUNT"
+      uv run --no-sync python -c "$MISSING_CHECK_PY" "$SKIPPED_UPLOADING_COUNT" "$KNOWN_MISSING_JSON"
   else
     ok "No active completed DB object references to verify (skipped ${SKIPPED_UPLOADING_COUNT} in-progress 'uploading' record(s))."
   fi

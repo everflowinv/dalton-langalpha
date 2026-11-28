@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -44,15 +45,25 @@ import tarfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
+from src.dalton.storage_bucket_rules import (
+    ROLE_MAIN,
+    ROLE_SECONDARY,
+    RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
+    TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+    is_key_covered_by_transcription_audio_expire_rule,
+)
 from src.dalton.storage_keys import storage_user_id
 from src.server.database.pool import get_db_connection, open_session_connection
 from src.utils.storage import is_storage_enabled
 
 logger = logging.getLogger(__name__)
+
+STRICT_MAIN_BUCKET_NAME = "dalton-main"
 
 STARTUP_STATEMENT_TIMEOUT = "5s"
 STARTUP_COUNT_CAP = 1000
@@ -2045,7 +2056,12 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 TERMINAL_ASR_ARCHIVE_STATUSES: frozenset[str] = frozenset(
     {"succeeded", "failed", "cancelled"}
 )
-ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
+# Terminal ASR statuses that have produced a result and whose source audio expires
+# on the secondary bucket after ``TRANSCRIPTION_AUDIO_EXPIRE_DAYS`` (7 days).
+TERMINAL_ASR_RESULT_STATUSES: frozenset[str] = frozenset({"succeeded"})
+# Non-terminal ASR statuses (in-flight + indeterminate) whose source audio MUST
+# still exist in the ASR bucket regardless of age.
+INFLIGHT_ASR_STATUSES: frozenset[str] = frozenset(
     {
         "queued",
         "downloading",
@@ -2054,10 +2070,147 @@ ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
         "submitting",
         "transcribing",
         "assembling",
-        "succeeded",
         "indeterminate",
     }
 )
+ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = (
+    INFLIGHT_ASR_STATUSES | TERMINAL_ASR_RESULT_STATUSES
+)
+
+
+def _coerce_utc_datetime(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return (
+            val.replace(tzinfo=timezone.utc)
+            if val.tzinfo is None
+            else val.astimezone(timezone.utc)
+        )
+    if isinstance(val, str):
+        raw = val.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (
+            parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None
+            else parsed.astimezone(timezone.utc)
+        )
+    return None
+
+
+def _normalize_endpoint_identity(url: str | None) -> str:
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        has_scheme = "://" in raw
+        parts = urlsplit(raw if has_scheme else f"//{raw}")
+        if parts.hostname is not None:
+            host = parts.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            port = parts.port
+            netloc = f"{host}:{port}" if port is not None else host
+            path = parts.path.rstrip("/") if not (parts.query or parts.fragment) else parts.path
+            if has_scheme:
+                return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, parts.fragment))
+            return urlunsplit(("", netloc, path, parts.query, parts.fragment)).lstrip("/")
+    except Exception:
+        pass
+    return raw.lower()
+
+
+def _resolve_asr_expire_bucket_context(
+    env: Mapping[str, str] | None = None,
+    *,
+    asr_bucket_target: tuple[str, str] | None = None,
+    asr_bucket_role: str | None = None,
+) -> tuple[str, str, str | None]:
+    """Resolve ``(asr_bucket, asr_key_prefix, managed_bucket_role)`` for transcription audio expiration.
+
+    Returns ``managed_bucket_role=ROLE_SECONDARY`` only when the ASR bucket is known
+    and distinct from the physical primary/main bucket ``(endpoint, bucket)``.
+    Returns ``ROLE_MAIN`` when ASR shares the physical primary bucket, or ``None``
+    when the target bucket cannot be determined (conservative: never exempt).
+    """
+    if asr_bucket_target is not None or asr_bucket_role is not None:
+        b_name = str(asr_bucket_target[0]).strip() if asr_bucket_target else ""
+        k_prefix = str(asr_bucket_target[1]).strip().strip("/") if asr_bucket_target else ""
+        role = str(asr_bucket_role).strip().lower() if asr_bucket_role else None
+        if not b_name or role not in (ROLE_MAIN, ROLE_SECONDARY):
+            return b_name, k_prefix, None
+        return b_name, k_prefix, role
+
+    from src.dalton.storage_config import resolve as resolve_storage_config
+
+    em = os.environ if env is None else env
+    asr_bucket = (em.get("DALTON_ASR_STORAGE_BUCKET_NAME") or "").strip()
+    asr_prefix = (em.get("DALTON_ASR_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+    if not asr_bucket:
+        return "", asr_prefix, None
+
+    if asr_bucket == STRICT_MAIN_BUCKET_NAME:
+        return asr_bucket, asr_prefix, ROLE_MAIN
+
+    asr_ep = _normalize_endpoint_identity(
+        em.get("DALTON_ASR_STORAGE_ENDPOINT_URL") or "http://minio:9000"
+    )
+    cfg = resolve_storage_config(env=em)
+    if cfg.is_storage_enabled and cfg.bucket_name:
+        main_bucket = cfg.bucket_name.strip()
+        main_ep = _normalize_endpoint_identity(cfg.endpoint_url or "")
+        if asr_bucket == main_bucket and (not main_ep or not asr_ep or asr_ep == main_ep):
+            return asr_bucket, asr_prefix, ROLE_MAIN
+
+    return asr_bucket, asr_prefix, ROLE_SECONDARY
+
+
+def is_terminal_asr_source_audio_expired(
+    *,
+    status: str,
+    source_object_key: str = "",
+    completed_at: Any = None,
+    upload_completed_at: Any = None,
+    upload_completed: bool = False,
+    bucket_role: str | None = None,
+    key_prefix: str = "",
+    now: datetime | None = None,
+    expire_days: int = TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+) -> bool:
+    """Return True iff a terminal result-bearing ASR job's source audio is covered by
+    the managed secondary-bucket 7-day rule and has exceeded ``expire_days`` relative
+    to the backup snapshot time ``now``.
+
+    - Never uses ``created_at`` or ``updated_at``: requires a verifiable upload
+      completion timestamp (``upload_completed_at`` when ``upload_completed=True``)
+      or job completion timestamp (``completed_at``).
+    - Only exempts keys confirmed to sit under a secondary bucket covered by the
+      managed 7-day rule AND the ``<key_prefix>transcriptions/`` prefix (shared with
+      ``src.dalton.storage_bucket_rules``).
+    - Whenever bucket coverage, prefix coverage, or trustworthy timestamp cannot be
+      determined, returns ``False`` so the reference is checked as usual.
+    """
+    st_s = str(status or "").strip().lower()
+    if st_s not in TERMINAL_ASR_RESULT_STATUSES:
+        return False
+    if not is_key_covered_by_transcription_audio_expire_rule(
+        source_object_key,
+        bucket_role=bucket_role,
+        key_prefix=key_prefix,
+    ):
+        return False
+    upload_ts = _coerce_utc_datetime(upload_completed_at) if upload_completed else None
+    job_done_ts = _coerce_utc_datetime(completed_at)
+    ref_ts = upload_ts if upload_ts is not None else job_done_ts
+    if ref_ts is None:
+        return False
+    effective_now = _coerce_utc_datetime(now) or datetime.now(timezone.utc)
+    return (effective_now - ref_ts) > timedelta(days=expire_days)
 
 
 def parse_skill_content_hash(content_hash: str | None) -> str:
@@ -2455,6 +2608,38 @@ def extract_attachment_object_key(
 
 
 @dataclass(frozen=True)
+class ExpiredByRuleObject:
+    """One referenced object exempted because it exceeded a managed bucket lifecycle rule."""
+
+    bucket: str
+    key: str
+    consumer: str
+    rule_id: str = RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE
+    row_id: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        out = {
+            "bucket": self.bucket,
+            "key": self.key,
+            "consumer": self.consumer,
+            "rule_id": self.rule_id,
+        }
+        if self.row_id:
+            out["row_id"] = self.row_id
+        return out
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ExpiredByRuleObject:
+        return cls(
+            bucket=str(data.get("bucket") or "").strip(),
+            key=str(data.get("key") or "").strip().lstrip("/"),
+            consumer=str(data.get("consumer") or "").strip(),
+            rule_id=str(data.get("rule_id") or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE).strip(),
+            row_id=str(data.get("row_id") or "").strip(),
+        )
+
+
+@dataclass(frozen=True)
 class ObjectReference:
     """One live object-storage reference enumerated from a PostgreSQL snapshot."""
 
@@ -2466,9 +2651,10 @@ class ObjectReference:
     expected_sha256: str | None = None
     check_mode: str = "strict"  # "strict" | "exists_only" | "exists_warn_size" | "invalid"
     invalid_reason: str | None = None
+    require_present: bool = False  # True = never tolerated under secondary missing-ref threshold
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "consumer": self.consumer,
             "bucket_role": self.bucket_role,
             "object_key": self.object_key,
@@ -2478,6 +2664,9 @@ class ObjectReference:
             "check_mode": self.check_mode,
             "invalid_reason": self.invalid_reason,
         }
+        if self.require_present:
+            out["require_present"] = True
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ObjectReference:
@@ -2496,6 +2685,7 @@ class ObjectReference:
             invalid_reason=(
                 str(data["invalid_reason"]) if data.get("invalid_reason") is not None else None
             ),
+            require_present=bool(data.get("require_present", False)),
         )
 
 
@@ -2507,6 +2697,8 @@ class SnapshotRefInventory:
     terminal_asr_job_ids: list[str] = field(default_factory=list)
     succeeded_asr_job_ids: list[str] = field(default_factory=list)
     skipped_pending: dict[str, int] = field(default_factory=dict)
+    skipped_expired: dict[str, int] = field(default_factory=dict)
+    expired_by_rule_objects: list[ExpiredByRuleObject] = field(default_factory=list)
     skipped_missing_tables: list[str] = field(default_factory=list)
 
     def keys_by_bucket_role(self) -> dict[str, set[str]]:
@@ -2517,13 +2709,18 @@ class SnapshotRefInventory:
         return out
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "references": [r.to_dict() for r in self.references],
             "terminal_asr_job_ids": list(self.terminal_asr_job_ids),
             "succeeded_asr_job_ids": list(self.succeeded_asr_job_ids),
             "skipped_pending": dict(self.skipped_pending),
             "skipped_missing_tables": list(self.skipped_missing_tables),
         }
+        if self.skipped_expired:
+            out["skipped_expired"] = dict(self.skipped_expired)
+        if self.expired_by_rule_objects:
+            out["expired_by_rule_objects"] = [x.to_dict() for x in self.expired_by_rule_objects]
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SnapshotRefInventory:
@@ -2538,6 +2735,14 @@ class SnapshotRefInventory:
             skipped_pending={
                 str(k): int(v) for k, v in (data.get("skipped_pending") or {}).items()
             },
+            skipped_expired={
+                str(k): int(v) for k, v in (data.get("skipped_expired") or {}).items()
+            },
+            expired_by_rule_objects=[
+                ExpiredByRuleObject.from_dict(item)
+                for item in (data.get("expired_by_rule_objects") or [])
+                if isinstance(item, Mapping)
+            ],
             skipped_missing_tables=[str(x) for x in (data.get("skipped_missing_tables") or [])],
         )
 
@@ -2572,6 +2777,8 @@ class ReconcileReport:
     errors: tuple[ReconcileIssue, ...] = ()
     warnings: tuple[ReconcileIssue, ...] = ()
     skipped_pending: dict[str, int] = field(default_factory=dict)
+    known_missing: tuple[ReconcileIssue, ...] = ()
+    expired_by_rule: tuple[ReconcileIssue, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2580,9 +2787,13 @@ class ReconcileReport:
             "checked_asr_jobs": self.checked_asr_jobs,
             "error_count": len(self.errors),
             "warning_count": len(self.warnings),
+            "known_missing_count": len(self.known_missing),
+            "expired_by_rule_count": len(self.expired_by_rule),
             "skipped_pending": dict(self.skipped_pending),
             "errors": [e.to_dict() for e in self.errors],
             "warnings": [w.to_dict() for w in self.warnings],
+            "known_missing": [k.to_dict() for k in self.known_missing],
+            "expired_by_rule": [e.to_dict() for e in self.expired_by_rule],
         }
 
 
@@ -2610,6 +2821,10 @@ async def enumerate_snapshot_refs(
     serde: Any | None = None,
     include_main: bool = True,
     include_aux: bool = True,
+    now: datetime | None = None,
+    asr_bucket_target: tuple[str, str] | None = None,
+    asr_bucket_role: str | None = None,
+    skip_expired_asr: bool = True,
 ) -> SnapshotRefInventory:
     """Enumerate all live object references and terminal ASR job IDs inside the caller's DB snapshot.
 
@@ -2618,6 +2833,12 @@ async def enumerate_snapshot_refs(
     """
     inv = SnapshotRefInventory()
     blob_registry: dict[tuple[str, str], int] = {}
+    effective_now = _coerce_utc_datetime(now) or datetime.now(timezone.utc)
+    asr_bucket, asr_prefix, effective_asr_bucket_role = _resolve_asr_expire_bucket_context(
+        env=env,
+        asr_bucket_target=asr_bucket_target,
+        asr_bucket_role=asr_bucket_role,
+    )
 
     async with conn.cursor() as cur:
         # 1. workspace_file_blobs (live rows: condemned_at IS NULL)
@@ -3356,12 +3577,35 @@ async def enumerate_snapshot_refs(
             if await _table_exists(cur, "public.dalton_transcription_jobs"):
                 await cur.execute(
                     "SELECT job_id, status, source_object_key, source_size_bytes, "
-                    "source_sha256, usage FROM dalton_transcription_jobs "
+                    "source_sha256, usage, created_at, completed_at, updated_at "
+                    "FROM dalton_transcription_jobs "
                     "ORDER BY created_at ASC, job_id ASC"
                 )
                 pending_asr = 0
+                expired_asr = 0
                 for row in await cur.fetchall():
-                    jid, st, okey, sz, sha, usage = _extract_tuple(row, 6)
+                    if isinstance(row, Mapping):
+                        jid = row.get("job_id")
+                        st = row.get("status")
+                        okey = row.get("source_object_key")
+                        sz = row.get("source_size_bytes")
+                        sha = row.get("source_sha256")
+                        usage = row.get("usage")
+                        completed_at = row.get("completed_at")
+                    else:
+                        raw_vals = tuple(row)
+                        padded = raw_vals + (None,) * max(0, 9 - len(raw_vals))
+                        (
+                            jid,
+                            st,
+                            okey,
+                            sz,
+                            sha,
+                            usage,
+                            _created_at,
+                            completed_at,
+                            _updated_at,
+                        ) = padded[:9]
                     jid_s = str(jid)
                     st_s = str(st or "").strip().lower()
                     if isinstance(usage, str):
@@ -3375,9 +3619,14 @@ async def enumerate_snapshot_refs(
                         else {}
                     )
                     upload_completed = upload_meta.get("completed") is True
+                    upload_completed_at = (
+                        upload_meta.get("completed_at")
+                        or upload_meta.get("uploaded_at")
+                    )
                     submit_attempted = (
                         isinstance(usage, dict) and usage.get("submit_attempted") is True
                     )
+                    clean_okey = str(okey or "").strip().lstrip("/")
 
                     if st_s in TERMINAL_ASR_ARCHIVE_STATUSES:
                         inv.terminal_asr_job_ids.append(jid_s)
@@ -3387,14 +3636,41 @@ async def enumerate_snapshot_refs(
                     if st_s == "awaiting_upload" and not (upload_completed or submit_attempted):
                         pending_asr += 1
                         continue
-                    if st_s in ACTIVE_OR_SUBMITTED_ASR_STATUSES or (
-                        st_s == "awaiting_upload" and (upload_completed or submit_attempted)
+                    if skip_expired_asr and is_terminal_asr_source_audio_expired(
+                        status=st_s,
+                        source_object_key=clean_okey,
+                        completed_at=completed_at,
+                        upload_completed_at=upload_completed_at,
+                        upload_completed=upload_completed,
+                        bucket_role=effective_asr_bucket_role,
+                        key_prefix=asr_prefix,
+                        now=effective_now,
+                        expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
                     ):
+                        expired_asr += 1
+                        inv.expired_by_rule_objects.append(
+                            ExpiredByRuleObject(
+                                bucket=asr_bucket,
+                                key=_apply_bucket_prefix(clean_okey, asr_prefix),
+                                consumer="dalton_transcription_jobs",
+                                rule_id=RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
+                                row_id=jid_s,
+                            )
+                        )
+                        continue
+                    must_exist_strict = (
+                        st_s in INFLIGHT_ASR_STATUSES
+                        or (
+                            st_s == "awaiting_upload"
+                            and (upload_completed or submit_attempted)
+                        )
+                    )
+                    if must_exist_strict or st_s in TERMINAL_ASR_RESULT_STATUSES:
                         inv.references.append(
                             ObjectReference(
                                 consumer="dalton_transcription_jobs",
                                 bucket_role="asr",
-                                object_key=str(okey or "").strip().lstrip("/"),
+                                object_key=clean_okey,
                                 row_id=jid_s,
                                 expected_size=int(sz) if sz is not None else None,
                                 expected_sha256=(
@@ -3403,10 +3679,13 @@ async def enumerate_snapshot_refs(
                                     else None
                                 ),
                                 check_mode="strict",
+                                require_present=must_exist_strict,
                             )
                         )
                 if pending_asr:
                     inv.skipped_pending["dalton_transcription_jobs"] = pending_asr
+                if expired_asr:
+                    inv.skipped_expired["dalton_transcription_jobs"] = expired_asr
             else:
                 inv.skipped_missing_tables.append("public.dalton_transcription_jobs")
 
@@ -3531,6 +3810,322 @@ def _load_tar_members_bytes(tar_path: Path) -> dict[str, bytes]:
     return members
 
 
+def _index_known_missing_objects(
+    known_missing_objects: Sequence[Any] | None,
+) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    if not known_missing_objects:
+        return out
+    for item in known_missing_objects:
+        bucket = ""
+        key = ""
+        if isinstance(item, Mapping):
+            bucket = str(item.get("bucket") or "").strip()
+            key = str(item.get("key") or "").strip().lstrip("/")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            bucket = str(item[0] or "").strip()
+            key = str(item[1] or "").strip().lstrip("/")
+        elif hasattr(item, "bucket") and hasattr(item, "key"):
+            bucket = str(getattr(item, "bucket") or "").strip()
+            key = str(getattr(item, "key") or "").strip().lstrip("/")
+        if bucket and key:
+            out.add((bucket, key))
+    return out
+
+
+def _query_target_bucket_objects(
+    s3_client: Any,
+    bucket: str,
+    prefixes: Sequence[str] = ("",),
+) -> dict[str, int | None]:
+    """List current objects in ``bucket`` via ``list_objects_v2`` and return ``key -> size``."""
+    norm_prefixes = [str(p or "").strip().strip("/") for p in prefixes]
+    query_prefixes = [""] if (not norm_prefixes or "" in norm_prefixes) else sorted(set(norm_prefixes))
+    present: dict[str, int | None] = {}
+    for pref in query_prefixes:
+        kwargs: dict[str, Any] = {"Bucket": bucket}
+        if pref:
+            kwargs["Prefix"] = f"{pref}/"
+        while True:
+            resp = s3_client.list_objects_v2(**kwargs) or {}
+            for item in resp.get("Contents") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                k = str(item.get("Key") or "").strip().lstrip("/")
+                if not k:
+                    continue
+                sz = item.get("Size")
+                present[k] = int(sz) if sz is not None else None
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+            if not token:
+                break
+            kwargs["ContinuationToken"] = token
+    return present
+
+
+def _build_target_s3_clients_for_reconcile(
+    *,
+    targets: Mapping[str, tuple[str, str]],
+    manifest_objects: Sequence[Mapping[str, Any]],
+    env: Mapping[str, str] | None = None,
+    rewrite_container_minio: bool = False,
+) -> dict[str, Any]:
+    """Resolve S3 clients by bucket name for querying restore target buckets."""
+    from src.dalton.consistent_backup import resolve_runtime_bucket_specs
+
+    specs = resolve_runtime_bucket_specs(
+        env=env,
+        apply_core_defaults=False,
+        rewrite_container_minio=rewrite_container_minio,
+    )
+    clients_by_bucket: dict[str, Any] = {}
+    clients_by_role: dict[str, Any] = {}
+    for spec in specs:
+        if spec.bucket and spec.s3_client is not None:
+            clients_by_bucket.setdefault(spec.bucket, spec.s3_client)
+        for role in spec.roles:
+            if spec.s3_client is not None:
+                clients_by_role.setdefault(role, spec.s3_client)
+
+    for role, (bucket_name, _pref) in targets.items():
+        clean_b = str(bucket_name or "").strip()
+        if not clean_b or clean_b in clients_by_bucket:
+            continue
+        if role in clients_by_role:
+            clients_by_bucket[clean_b] = clients_by_role[role]
+        elif role == "chat_upload" and "asr" in clients_by_role:
+            clients_by_bucket[clean_b] = clients_by_role["asr"]
+        elif role == "asr" and "chat_upload" in clients_by_role:
+            clients_by_bucket[clean_b] = clients_by_role["chat_upload"]
+        elif len(clients_by_bucket) == 1:
+            clients_by_bucket[clean_b] = next(iter(clients_by_bucket.values()))
+
+    for entry in manifest_objects:
+        if not isinstance(entry, Mapping):
+            continue
+        mb = str(entry.get("bucket") or "").strip()
+        if mb and mb not in clients_by_bucket and len(clients_by_bucket) == 1:
+            clients_by_bucket[mb] = next(iter(clients_by_bucket.values()))
+
+    return clients_by_bucket
+
+
+def _validate_and_extract_known_missing(
+    *,
+    manifest_path: Path,
+    manifest_data: Mapping[str, Any],
+    backup_set_path: Path | None = None,
+) -> list[dict[str, str]]:
+    """Return actual known-missing objects strictly from this backup set's manifest.
+
+    Validates that ``backup_set_path`` (when provided) matches ``manifest_path``
+    (same ``backup_set_id``, ``snapshot_id``, ``manifest_sha256``, and no extra
+    foreign ``missing_referenced_objects``) and excludes any object actually
+    present in ``manifest_data['objects']``.
+    """
+    raw_manifest_objects = manifest_data.get("objects")
+    manifest_present_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_objects, list):
+        for entry in raw_manifest_objects:
+            if not isinstance(entry, Mapping):
+                continue
+            b = str(entry.get("bucket") or "").strip()
+            k = str(entry.get("key") or "").strip().lstrip("/")
+            if b and k:
+                manifest_present_pairs.add((b, k))
+
+    raw_manifest_km = manifest_data.get("missing_referenced_objects")
+    manifest_km_list: list[dict[str, str]] = []
+    manifest_km_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_km, list):
+        for item in raw_manifest_km:
+            if not isinstance(item, Mapping):
+                continue
+            b = str(item.get("bucket") or "").strip()
+            k = str(item.get("key") or "").strip().lstrip("/")
+            c = str(item.get("consumer") or "").strip()
+            if not b or not k:
+                continue
+            if (b, k) in manifest_present_pairs:
+                # Present in manifest -> NOT an actual missing object from this backup set
+                continue
+            if (b, k) not in manifest_km_pairs:
+                manifest_km_pairs.add((b, k))
+                manifest_km_list.append({"bucket": b, "key": k, "consumer": c})
+
+    if backup_set_path is not None:
+        set_data = json.loads(backup_set_path.read_text(encoding="utf-8"))
+        if not isinstance(set_data, dict):
+            raise ValueError("backup-set JSON must be an object")
+
+        expected_sha = str(set_data.get("manifest_sha256") or "").strip().lower()
+        if expected_sha:
+            actual_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest().lower()
+            if actual_sha != expected_sha:
+                raise ValueError(
+                    f"backup-set manifest_sha256 mismatch: expected {expected_sha}, got {actual_sha}"
+                )
+
+        set_id = str(set_data.get("backup_set_id") or "").strip()
+        mf_id = str(manifest_data.get("backup_set_id") or "").strip()
+        if set_id and mf_id and set_id != mf_id:
+            raise ValueError(
+                f"backup-set backup_set_id={set_id!r} does not match manifest backup_set_id={mf_id!r}"
+            )
+
+        set_snap = str(set_data.get("snapshot_id") or "").strip()
+        mf_snap = str(manifest_data.get("snapshot_id") or "").strip()
+        if set_snap and mf_snap and set_snap != mf_snap:
+            raise ValueError(
+                f"backup-set snapshot_id={set_snap!r} does not match manifest snapshot_id={mf_snap!r}"
+            )
+
+        raw_set_km = set_data.get("missing_referenced_objects")
+        if isinstance(raw_set_km, list):
+            set_km_pairs = _index_known_missing_objects(raw_set_km)
+            extra_in_set = sorted(set_km_pairs - manifest_km_pairs)
+            if extra_in_set:
+                sample = ", ".join(f"{b}/{k}" for b, k in extra_in_set[:5])
+                raise ValueError(
+                    "backup-set missing_referenced_objects contains entries not registered as "
+                    f"actual missing in manifest: {sample}"
+                )
+
+    return manifest_km_list
+
+
+def _format_s3_exception_summary(exc: BaseException, *, operation: str = "") -> str:
+    """Format an S3/Botocore exception using safe metadata only (never raw SDK text or body)."""
+    parts: list[str] = []
+    if operation:
+        parts.append(f"op={operation}")
+    parts.append(f"type={type(exc).__name__}")
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, Mapping):
+        err = resp.get("Error")
+        if isinstance(err, Mapping):
+            code = str(err.get("Code") or "").strip()
+            if code:
+                parts.append(f"code={code}")
+        meta = resp.get("ResponseMetadata")
+        if isinstance(meta, Mapping):
+            http_status = meta.get("HTTPStatusCode")
+            if http_status is not None and str(http_status).strip():
+                parts.append(f"http_status={http_status}")
+            req_id = str(meta.get("RequestId") or "").strip()
+            if req_id:
+                parts.append(f"request_id={req_id}")
+    return ", ".join(parts)
+
+
+def _is_sdk_exception(exc: BaseException) -> bool:
+    mod = type(exc).__module__ or ""
+    if mod.startswith(("botocore", "boto3")):
+        return True
+    return isinstance(getattr(exc, "response", None), Mapping)
+
+
+def _index_expired_by_rule_objects(
+    expired_by_rule_objects: Sequence[Any] | None,
+) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+    """Index expired-by-rule entries by ``(bucket, key) -> [(consumer, row_id, rule_id), ...]``."""
+    out: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    if not expired_by_rule_objects:
+        return out
+    for item in expired_by_rule_objects:
+        bucket = ""
+        key = ""
+        consumer = ""
+        row_id = ""
+        rule_id = RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE
+        if isinstance(item, Mapping):
+            bucket = str(item.get("bucket") or "").strip()
+            key = str(item.get("key") or "").strip().lstrip("/")
+            consumer = str(item.get("consumer") or "").strip()
+            row_id = str(item.get("row_id") or "").strip()
+            rule_id = str(item.get("rule_id") or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE).strip()
+        elif hasattr(item, "bucket") and hasattr(item, "key"):
+            bucket = str(getattr(item, "bucket") or "").strip()
+            key = str(getattr(item, "key") or "").strip().lstrip("/")
+            consumer = str(getattr(item, "consumer", "") or "").strip()
+            row_id = str(getattr(item, "row_id", "") or "").strip()
+            rule_id = str(
+                getattr(item, "rule_id", RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE)
+                or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE
+            ).strip()
+        if bucket and key:
+            out.setdefault((bucket, key), []).append((consumer, row_id, rule_id))
+    return out
+
+
+def _validate_and_extract_expired_by_rule(
+    *,
+    manifest_path: Path,
+    manifest_data: Mapping[str, Any],
+    backup_set_path: Path | None = None,
+) -> list[dict[str, str]]:
+    """Return expired-by-rule objects strictly from this backup set's manifest.
+
+    Excludes any object actually present in ``manifest_data['objects']`` and verifies
+    that ``backup_set_path`` (when provided) does not inject extra foreign entries.
+    """
+    raw_manifest_objects = manifest_data.get("objects")
+    manifest_present_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_objects, list):
+        for entry in raw_manifest_objects:
+            if not isinstance(entry, Mapping):
+                continue
+            b = str(entry.get("bucket") or "").strip()
+            k = str(entry.get("key") or "").strip().lstrip("/")
+            if b and k:
+                manifest_present_pairs.add((b, k))
+
+    raw_manifest_exp = manifest_data.get("expired_by_rule_objects")
+    manifest_exp_list: list[dict[str, str]] = []
+    manifest_exp_seen: set[tuple[str, str, str, str]] = set()
+    manifest_exp_pairs: set[tuple[str, str]] = set()
+    if isinstance(raw_manifest_exp, list):
+        for item in raw_manifest_exp:
+            if not isinstance(item, Mapping):
+                continue
+            b = str(item.get("bucket") or "").strip()
+            k = str(item.get("key") or "").strip().lstrip("/")
+            c = str(item.get("consumer") or "").strip()
+            rid = str(item.get("row_id") or "").strip()
+            rule_id = str(item.get("rule_id") or RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE).strip()
+            if not b or not k:
+                continue
+            if (b, k) in manifest_present_pairs:
+                continue
+            dedup = (b, k, c, rid)
+            if dedup not in manifest_exp_seen:
+                manifest_exp_seen.add(dedup)
+                manifest_exp_pairs.add((b, k))
+                rec = {"bucket": b, "key": k, "consumer": c, "rule_id": rule_id}
+                if rid:
+                    rec["row_id"] = rid
+                manifest_exp_list.append(rec)
+
+    if backup_set_path is not None:
+        set_data = json.loads(backup_set_path.read_text(encoding="utf-8"))
+        if not isinstance(set_data, dict):
+            raise ValueError("backup-set JSON must be an object")
+        raw_set_exp = set_data.get("expired_by_rule_objects")
+        if isinstance(raw_set_exp, list):
+            set_exp_pairs = _index_known_missing_objects(raw_set_exp)
+            extra_in_set = sorted(set_exp_pairs - manifest_exp_pairs)
+            if extra_in_set:
+                sample = ", ".join(f"{b}/{k}" for b, k in extra_in_set[:5])
+                raise ValueError(
+                    "backup-set expired_by_rule_objects contains entries not registered in "
+                    f"manifest: {sample}"
+                )
+
+    return manifest_exp_list
+
+
 def reconcile_inventory_against_manifest(
     inventory: SnapshotRefInventory,
     manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
@@ -3540,6 +4135,11 @@ def reconcile_inventory_against_manifest(
     asr_jobs_dir: Path | None = None,
     source_asr_jobs_dir: Path | None = None,
     require_raw_response_job_ids: set[str] | frozenset[str] | None = None,
+    known_missing_objects: Sequence[Any] | None = None,
+    expired_by_rule_objects: Sequence[Any] | None = None,
+    target_s3_clients: Mapping[str, Any] | None = None,
+    target_bucket_objects: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    verify_target_buckets: bool = False,
     target_logger: logging.Logger | None = None,
 ) -> ReconcileReport:
     """Reconcile all snapshot consumer references against the archived object manifest & ASR jobs archive.
@@ -3550,11 +4150,26 @@ def reconcile_inventory_against_manifest(
     - ``provenance_result_bodies`` checks existence only; size mismatch logs WARNING and passes.
     - ``succeeded`` ASR jobs check ``<job_id>/state.json`` (status='succeeded'), ``result.json``,
       and ``raw_response.json`` whenever the job writes it.
+    - Objects registered in ``known_missing_objects`` (already absent at backup snapshot time
+      and NOT present in ``manifest_objects``) are recorded as ``known_missing_object``
+      warnings rather than reconciliation errors.
+    - When ``verify_target_buckets=True`` (or ``target_s3_clients`` / ``target_bucket_objects``
+      is supplied), also queries the restore target bucket(s) and fails if ANY object present
+      in ``manifest_objects`` is missing or size-mismatched in the target bucket.
     """
     log = target_logger or logger
     index, duplicate_pairs = _index_manifest_objects_with_duplicates(manifest_objects)
+    # Only actual missing objects (not present in manifest_objects) can ever count as known missing
+    known_missing_set = _index_known_missing_objects(known_missing_objects) - set(index.keys())
+    expired_by_rule_index = {
+        pair: entries
+        for pair, entries in _index_expired_by_rule_objects(expired_by_rule_objects).items()
+        if pair not in index
+    }
     errors: list[ReconcileIssue] = []
     warnings: list[ReconcileIssue] = []
+    known_missing_issues: list[ReconcileIssue] = []
+    expired_by_rule_issues: list[ReconcileIssue] = []
     checked_refs = 0
 
     for dup_bucket, dup_key in duplicate_pairs:
@@ -3568,6 +4183,76 @@ def reconcile_inventory_against_manifest(
             )
         )
 
+    check_target_buckets = bool(
+        verify_target_buckets
+        or target_s3_clients is not None
+        or target_bucket_objects is not None
+    )
+    target_present: dict[tuple[str, str], int | None] = {}
+    errored_target_buckets: set[str] = set()
+    if check_target_buckets:
+        if target_bucket_objects is not None:
+            for (tb, tk), meta in target_bucket_objects.items():
+                sz = meta.get("size") if isinstance(meta, Mapping) else None
+                target_present[(str(tb).strip(), str(tk).strip().lstrip("/"))] = (
+                    int(sz) if sz is not None else None
+                )
+        else:
+            prefixes_by_bucket: dict[str, set[str]] = {}
+            for mb, _mk in index:
+                prefixes_by_bucket.setdefault(mb, set())
+            for ref in inventory.references:
+                t = bucket_targets.get(ref.bucket_role)
+                if t and t[0]:
+                    prefixes_by_bucket.setdefault(t[0], set()).add(t[1].strip().strip("/"))
+            # Ensure prefixes cover every manifest key for each bucket; otherwise list full bucket.
+            for mb, mk in index:
+                prefs = prefixes_by_bucket.setdefault(mb, set())
+                if not prefs or "" in prefs:
+                    prefs.add("")
+                elif not any(mk.startswith(f"{p}/") for p in prefs if p):
+                    prefs.add("")
+
+            clients_map = target_s3_clients or {}
+            for tb in sorted(prefixes_by_bucket):
+                client = clients_map.get(tb)
+                if client is None:
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="restore_target_bucket",
+                            code="missing_target_bucket_client",
+                            row_id=tb,
+                            object_key=tb,
+                            detail=f"No S3 client configured to verify restore target bucket {tb!r}",
+                        )
+                    )
+                    errored_target_buckets.add(tb)
+                    continue
+                try:
+                    listed = _query_target_bucket_objects(
+                        client,
+                        tb,
+                        prefixes=sorted(prefixes_by_bucket[tb]),
+                    )
+                except Exception as exc:
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="restore_target_bucket",
+                            code="target_bucket_query_error",
+                            row_id=tb,
+                            object_key=tb,
+                            detail=(
+                                f"Failed querying restore target bucket {tb!r}: "
+                                f"{_format_s3_exception_summary(exc, operation='ListObjectsV2')}"
+                            ),
+                        )
+                    )
+                    errored_target_buckets.add(tb)
+                    continue
+                for lk, lsz in listed.items():
+                    target_present[(tb, lk)] = lsz
+
+    checked_target_pairs: set[tuple[str, str]] = set()
     for ref in inventory.references:
         checked_refs += 1
         if ref.check_mode == "invalid":
@@ -3599,6 +4284,46 @@ def reconcile_inventory_against_manifest(
         full_key = _apply_bucket_prefix(ref.object_key, key_prefix)
         entry = index.get((bucket_name, full_key))
         if entry is None:
+            if (bucket_name, full_key) in known_missing_set:
+                km_issue = ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="known_missing_object",
+                    row_id=ref.row_id,
+                    object_key=f"{bucket_name}/{full_key}",
+                    detail=(
+                        "Referenced object was missing at backup snapshot time "
+                        "(registered in manifest missing_referenced_objects)"
+                    ),
+                )
+                warnings.append(km_issue)
+                known_missing_issues.append(km_issue)
+                continue
+            if not ref.require_present and (bucket_name, full_key) in expired_by_rule_index:
+                matched_rule_id = next(
+                    (
+                        exp_rule_id
+                        for exp_consumer, exp_row_id, exp_rule_id in expired_by_rule_index[
+                            (bucket_name, full_key)
+                        ]
+                        if (not exp_consumer or exp_consumer == ref.consumer)
+                        and (not exp_row_id or exp_row_id == ref.row_id)
+                    ),
+                    None,
+                )
+                if matched_rule_id is not None:
+                    expired_by_rule_issues.append(
+                        ReconcileIssue(
+                            consumer=ref.consumer,
+                            code="expired_by_rule_object",
+                            row_id=ref.row_id,
+                            object_key=f"{bucket_name}/{full_key}",
+                            detail=(
+                                f"Referenced object was expired by managed rule {matched_rule_id!r} "
+                                "at backup snapshot time (registered in manifest expired_by_rule_objects)"
+                            ),
+                        )
+                    )
+                    continue
             errors.append(
                 ReconcileIssue(
                     consumer=ref.consumer,
@@ -3609,6 +4334,40 @@ def reconcile_inventory_against_manifest(
                 )
             )
             continue
+
+        if check_target_buckets and bucket_name not in errored_target_buckets:
+            checked_target_pairs.add((bucket_name, full_key))
+            if (bucket_name, full_key) not in target_present:
+                errors.append(
+                    ReconcileIssue(
+                        consumer=ref.consumer,
+                        code="missing_in_target_bucket",
+                        row_id=ref.row_id,
+                        object_key=f"{bucket_name}/{full_key}",
+                        detail=(
+                            "Referenced object is present in backup manifest but missing "
+                            "from restore target bucket"
+                        ),
+                    )
+                )
+            elif (
+                ref.check_mode == "strict"
+                and entry.get("size") is not None
+                and target_present[(bucket_name, full_key)] is not None
+                and int(target_present[(bucket_name, full_key)]) != int(entry["size"])
+            ):
+                errors.append(
+                    ReconcileIssue(
+                        consumer=ref.consumer,
+                        code="target_size_mismatch",
+                        row_id=ref.row_id,
+                        object_key=f"{bucket_name}/{full_key}",
+                        detail=(
+                            "Restore target bucket object size mismatch "
+                            f"(target={target_present[(bucket_name, full_key)]}, manifest={entry['size']})"
+                        ),
+                    )
+                )
 
         if ref.check_mode == "exists_only":
             continue
@@ -3665,6 +4424,40 @@ def reconcile_inventory_against_manifest(
                         detail=(
                             f"Object SHA-256 mismatch "
                             f"(archived_sha256={actual_sha!r}, expected={ref.expected_sha256.lower()!r})"
+                        ),
+                    )
+                )
+
+    # When verifying restore target buckets, ALSO check any manifest objects that were not
+    # directly covered by inventory.references (every object in the manifest MUST be restored).
+    if check_target_buckets:
+        for (mb, mk), entry in sorted(index.items()):
+            if mb in errored_target_buckets or (mb, mk) in checked_target_pairs:
+                continue
+            if (mb, mk) not in target_present:
+                errors.append(
+                    ReconcileIssue(
+                        consumer="restore_target_bucket",
+                        code="missing_in_target_bucket",
+                        row_id=f"{mb}/{mk}",
+                        object_key=f"{mb}/{mk}",
+                        detail="Object present in backup manifest is missing from restore target bucket",
+                    )
+                )
+            elif (
+                entry.get("size") is not None
+                and target_present[(mb, mk)] is not None
+                and int(target_present[(mb, mk)]) != int(entry["size"])
+            ):
+                errors.append(
+                    ReconcileIssue(
+                        consumer="restore_target_bucket",
+                        code="target_size_mismatch",
+                        row_id=f"{mb}/{mk}",
+                        object_key=f"{mb}/{mk}",
+                        detail=(
+                            "Restore target bucket object size mismatch "
+                            f"(target={target_present[(mb, mk)]}, manifest={entry['size']})"
                         ),
                     )
                 )
@@ -3825,6 +4618,8 @@ def reconcile_inventory_against_manifest(
         errors=tuple(errors),
         warnings=tuple(warnings),
         skipped_pending=dict(inventory.skipped_pending),
+        known_missing=tuple(known_missing_issues),
+        expired_by_rule=tuple(expired_by_rule_issues),
     )
 
 
@@ -4031,6 +4826,21 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Override aux bucket key prefix.",
     )
+    reconcile_p.add_argument(
+        "--backup-set",
+        default="",
+        help="Optional backup-set JSON file (validated against --manifest for the same backup set).",
+    )
+    reconcile_p.add_argument(
+        "--verify-target-buckets",
+        action="store_true",
+        help="Query restore target S3/MinIO bucket(s) and fail on any manifest object missing there.",
+    )
+    reconcile_p.add_argument(
+        "--rewrite-container-minio",
+        action="store_true",
+        help="Rewrite container-internal MinIO hostnames (minio/minio-s3) to host loopback when querying target buckets.",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "check":
@@ -4062,7 +4872,19 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_CHECK_FAILED
     if args.command == "reconcile":
         try:
-            manifest_data = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+            from src.dalton.consistent_backup import (
+                UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE,
+                UnsupportedStorageTopologyError,
+                validate_env_storage_topology,
+            )
+
+            validate_env_storage_topology(
+                os.environ,
+                rewrite_container_minio=bool(args.rewrite_container_minio),
+            )
+
+            manifest_path = Path(args.manifest)
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
             objects = (
                 manifest_data.get("objects")
                 if isinstance(manifest_data, dict)
@@ -4070,18 +4892,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not isinstance(objects, list):
                 raise ValueError("manifest JSON must contain an 'objects' list")
-            if args.refs_json:
-                refs_data = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
-                inventory = SnapshotRefInventory.from_dict(refs_data)
-            else:
-                async def _enum() -> SnapshotRefInventory:
-                    conn = await _open_cli_readonly_connection()
-                    try:
-                        return await enumerate_snapshot_refs(conn)
-                    finally:
-                        await conn.close()
-
-                inventory = asyncio.run(_enum())
 
             targets = resolve_bucket_targets_from_env()
             if args.main_bucket:
@@ -4089,6 +4899,60 @@ def main(argv: list[str] | None = None) -> int:
             if args.aux_bucket:
                 targets["asr"] = (args.aux_bucket, args.aux_prefix.strip("/"))
                 targets["chat_upload"] = (args.aux_bucket, args.aux_prefix.strip("/"))
+
+            main_target_bucket = targets.get("main", ("", ""))[0].strip()
+            if main_target_bucket:
+                shared_aux = [
+                    role
+                    for role in ("asr", "chat_upload")
+                    if targets.get(role, ("", ""))[0].strip() == main_target_bucket
+                ]
+                if shared_aux:
+                    raise UnsupportedStorageTopologyError(
+                        f"{UNSUPPORTED_STORAGE_TOPOLOGY_MESSAGE}：主桶与辅存储 ({', '.join(shared_aux)}) "
+                        f"位于同一桶名 ({main_target_bucket})；仅支持单一 MinIO 端点且主桶与辅桶名称不同的布局"
+                    )
+
+            if args.refs_json:
+                refs_data = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
+                inventory = SnapshotRefInventory.from_dict(refs_data)
+            else:
+                async def _enum() -> SnapshotRefInventory:
+                    conn = await _open_cli_readonly_connection()
+                    try:
+                        # Do NOT recompute 7-day transcription expiration against restore day;
+                        # reconcile strictly against this backup set's recorded expired_by_rule_objects.
+                        return await enumerate_snapshot_refs(conn, skip_expired_asr=False)
+                    finally:
+                        await conn.close()
+
+                inventory = asyncio.run(_enum())
+
+            known_missing_entries: list[dict[str, str]] = []
+            expired_by_rule_entries: list[dict[str, str]] = []
+            if isinstance(manifest_data, dict):
+                known_missing_entries = _validate_and_extract_known_missing(
+                    manifest_path=manifest_path,
+                    manifest_data=manifest_data,
+                    backup_set_path=Path(args.backup_set) if args.backup_set else None,
+                )
+                expired_by_rule_entries = _validate_and_extract_expired_by_rule(
+                    manifest_path=manifest_path,
+                    manifest_data=manifest_data,
+                    backup_set_path=Path(args.backup_set) if args.backup_set else None,
+                )
+            elif args.backup_set:
+                raise ValueError("--backup-set requires a dict manifest JSON from the same backup set")
+
+            target_clients: dict[str, Any] | None = None
+            if args.verify_target_buckets:
+                target_clients = _build_target_s3_clients_for_reconcile(
+                    targets=targets,
+                    manifest_objects=objects,
+                    env=os.environ,
+                    rewrite_container_minio=bool(args.rewrite_container_minio),
+                )
+
             report = reconcile_inventory_against_manifest(
                 inventory,
                 objects,
@@ -4096,11 +4960,21 @@ def main(argv: list[str] | None = None) -> int:
                 asr_jobs_archive=Path(args.asr_archive) if args.asr_archive else None,
                 asr_jobs_dir=Path(args.asr_dir) if args.asr_dir else None,
                 source_asr_jobs_dir=Path(args.source_asr_dir) if args.source_asr_dir else None,
+                known_missing_objects=known_missing_entries,
+                expired_by_rule_objects=expired_by_rule_entries,
+                target_s3_clients=target_clients,
+                verify_target_buckets=bool(args.verify_target_buckets),
             )
             print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
             return EXIT_CLEAN if report.ok else EXIT_REFERENCES_FOUND
         except Exception as exc:
-            print(f"[storage_refs] ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if _is_sdk_exception(exc):
+                print(
+                    f"[storage_refs] ERROR: {_format_s3_exception_summary(exc)}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[storage_refs] ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
             return EXIT_CHECK_FAILED
     return EXIT_CHECK_FAILED
 
