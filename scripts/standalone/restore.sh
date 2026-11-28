@@ -1710,6 +1710,21 @@ if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
 import json, sys
 from pathlib import Path
 
+present_in_manifest = set()
+minio_p = Path(sys.argv[1])
+if minio_p.is_file():
+    try:
+        mdata = json.loads(minio_p.read_text(encoding="utf-8"))
+        if isinstance(mdata, dict) and isinstance(mdata.get("objects"), list):
+            for obj in mdata["objects"]:
+                if isinstance(obj, dict):
+                    ob = str(obj.get("bucket") or "").strip()
+                    ok = str(obj.get("key") or "").strip().lstrip("/")
+                    if ob and ok:
+                        present_in_manifest.add((ob, ok))
+    except Exception:
+        pass
+
 out = []
 seen = set()
 for raw_path in sys.argv[1:]:
@@ -1731,7 +1746,7 @@ for raw_path in sys.argv[1:]:
         b = str(item.get("bucket") or "").strip()
         k = str(item.get("key") or "").strip().lstrip("/")
         c = str(item.get("consumer") or "").strip()
-        if b and k and (b, k) not in seen:
+        if b and k and (b, k) not in present_in_manifest and (b, k) not in seen:
             seen.add((b, k))
             out.append({"bucket": b, "key": k, "consumer": c})
 print(json.dumps(out, ensure_ascii=False))
@@ -1805,7 +1820,19 @@ client = boto3.client(
     ),
 )
 
+def _is_not_found_client_error(exc: ClientError) -> bool:
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return False
+    code = str((resp.get("Error") or {}).get("Code") or "").strip()
+    try:
+        status = int((resp.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    return status == 404 or code in ("404", "NoSuchKey", "NotFound")
+
 missing: list[str] = []
+check_errors: list[str] = []
 known_missing_hits: list[str] = []
 checked = 0
 for line in sys.stdin:
@@ -1822,11 +1849,19 @@ for line in sys.stdin:
     checked += 1
     try:
         client.head_object(Bucket=bucket, Key=full_key)
-    except ClientError:
-        if (bucket, full_key) in known_missing_pairs:
-            known_missing_hits.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+    except ClientError as exc:
+        if _is_not_found_client_error(exc):
+            if (bucket, full_key) in known_missing_pairs:
+                known_missing_hits.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+            else:
+                missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
         else:
-            missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
+            resp = getattr(exc, "response", None) if isinstance(getattr(exc, "response", None), dict) else {}
+            err_code = str((resp.get("Error") or {}).get("Code") or "unknown")
+            http_status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode") or "unknown"
+            check_errors.append(
+                f"{kind}:{ref_id} -> {bucket}/{full_key} (HTTP {http_status}, Code={err_code})"
+            )
 
 if known_missing_hits:
     print(
@@ -1838,6 +1873,14 @@ if known_missing_hits:
     if len(known_missing_hits) > 10:
         print(f"[restore] WARN:   ... (+{len(known_missing_hits) - 10} more)", file=sys.stderr)
 
+if check_errors:
+    print(
+        f"[restore] ERROR: {len(check_errors)}/{checked} DB-referenced object(s) failed storage verification (non-404 error, never matched as known missing):",
+        file=sys.stderr,
+    )
+    for item in check_errors:
+        print(f"[restore] ERROR:   storage error: {item}", file=sys.stderr)
+
 if missing:
     print(f"[restore] ERROR: {len(missing)}/{checked} DB-referenced object(s) missing from object storage:", file=sys.stderr)
     for item in missing:
@@ -1846,6 +1889,8 @@ if missing:
         "[restore] ERROR: Note on online backup consistency window: backup.sh snapshots PostgreSQL first and streams object storage immediately afterward; objects deleted or still in flight during that online backup window (or an inconsistent bucket/key prefix) can leave DB references missing from object storage.",
         file=sys.stderr,
     )
+
+if missing or check_errors:
     sys.exit(1)
 else:
     print(

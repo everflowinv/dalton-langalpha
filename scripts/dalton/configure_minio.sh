@@ -123,6 +123,7 @@ export STORAGE_SECRET_ACCESS_KEY="${STORAGE_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASS
 export STORAGE_REGION="${STORAGE_REGION:-${S3_REGION:-us-east-1}}"
 export STORAGE_ADDRESSING_STYLE="${STORAGE_ADDRESSING_STYLE:-path}"
 export STORAGE_KEY_PREFIX="${STORAGE_KEY_PREFIX:-}"
+export DALTON_ASR_STORAGE_KEY_PREFIX="${DALTON_ASR_STORAGE_KEY_PREFIX:-}"
 export STORAGE_BROWSER_UPLOADS="${STORAGE_BROWSER_UPLOADS:-false}"
 export DALTON_CORS_ALLOWED_ORIGINS="${DALTON_CORS_ALLOWED_ORIGINS:-${MINIO_API_CORS_ALLOW_ORIGIN:-${CORS_ALLOWED_ORIGINS:-}}}"
 export DALTON_UPLOADS_EXPIRE_DAYS="${DALTON_UPLOADS_EXPIRE_DAYS:-2}"
@@ -239,10 +240,18 @@ PY
 unset API_CFG_OUT
 
 # 4. S3 API policy, Bucket Versioning (Enabled), and per-role Lifecycle merge & read-back verification
+# Unified transcription prefix: secondary role always scopes lifecycle rules by
+# DALTON_ASR_STORAGE_KEY_PREFIX (matching scripts/standalone/minio_init.py and runtime storage);
+# main role scopes by STORAGE_KEY_PREFIX.
+if [[ "$ROLE" == "secondary" ]]; then
+  TARGET_KEY_PREFIX="$DALTON_ASR_STORAGE_KEY_PREFIX"
+else
+  TARGET_KEY_PREFIX="$STORAGE_KEY_PREFIX"
+fi
 PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -m src.dalton.storage_bucket_rules apply \
   --bucket "$TARGET_BUCKET" \
   --role "$ROLE" \
-  --prefix "$STORAGE_KEY_PREFIX" \
+  --prefix "$TARGET_KEY_PREFIX" \
   --uploads-expire-days "$DALTON_UPLOADS_EXPIRE_DAYS"
 
 # 5. CORS preflight verification (required on secondary; on main only when STORAGE_BROWSER_UPLOADS is truthy)

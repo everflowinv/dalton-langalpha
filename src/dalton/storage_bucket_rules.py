@@ -68,6 +68,7 @@ MANAGED_RULE_IDS = frozenset(
 NONCURRENT_EXPIRE_DAYS = 30
 TRANSCRIPTION_AUDIO_PREFIX = "transcriptions/"
 TRANSCRIPTION_AUDIO_EXPIRE_DAYS = 7
+TRANSCRIPTION_AUDIO_EXPIRE_ROLES = frozenset({ROLE_SECONDARY})
 VALID_UPLOADS_EXPIRE_DAYS = frozenset({1, 2})
 AVATARS_POLICY_SID = "DaltonAvatarsPublicRead"
 
@@ -107,6 +108,43 @@ def normalize_role(role: str) -> str:
 def normalize_key_prefix(raw_prefix: str | None) -> str:
     cleaned = (raw_prefix or "").strip().strip("/")
     return f"{cleaned}/" if cleaned else ""
+
+
+def managed_transcription_audio_expire_prefix(key_prefix: str = "") -> str:
+    """Return the managed lifecycle prefix for transcription audio expiration."""
+    return f"{normalize_key_prefix(key_prefix)}{TRANSCRIPTION_AUDIO_PREFIX}"
+
+
+def is_key_covered_by_transcription_audio_expire_rule(
+    object_key: str,
+    *,
+    bucket_role: str | None,
+    key_prefix: str = "",
+) -> bool:
+    """Return True iff ``object_key`` sits under the managed 7-day transcription rule's bucket role and prefix.
+
+    Shared single source of truth with ``src/dalton/storage_refs.py`` so backup
+    exemption only applies to keys covered by ``dalton-transcription-audio-expire``
+    (a ``secondary`` bucket + ``<key_prefix>transcriptions/<non-empty>``).
+    Returns ``False`` whenever bucket role is unknown/None, ``main``, or the key
+    falls outside ``transcriptions/`` (e.g. legacy ``uploads/``).
+    """
+    if not bucket_role:
+        return False
+    norm_role = str(bucket_role).strip().lower()
+    if norm_role not in TRANSCRIPTION_AUDIO_EXPIRE_ROLES:
+        return False
+    cleaned_key = str(object_key or "").strip().lstrip("/")
+    if not cleaned_key:
+        return False
+    prefix = normalize_key_prefix(key_prefix)
+    full_key = (
+        cleaned_key
+        if (not prefix or cleaned_key.startswith(prefix))
+        else f"{prefix}{cleaned_key}"
+    )
+    rule_prefix = managed_transcription_audio_expire_prefix(prefix)
+    return full_key.startswith(rule_prefix) and len(full_key) > len(rule_prefix)
 
 
 def validate_uploads_expire_days(days: int) -> int:
@@ -358,6 +396,11 @@ def verify_lifecycle_rules(
             raise BucketRuleVerificationError(
                 f"Lifecycle rule {rid!r} has Status={got.get('Status')!r}, expected 'Enabled'"
             )
+        if not _rule_has_only_prefix_filter(got):
+            raise BucketRuleVerificationError(
+                f"Lifecycle rule {rid!r} has extra filter conditions "
+                f"(Filter={got.get('Filter')!r}); expected prefix-only filter"
+            )
         exp_prefix = _rule_prefix(exp)
         got_prefix = _rule_prefix(got)
         if got_prefix != exp_prefix:
@@ -366,12 +409,21 @@ def verify_lifecycle_rules(
             )
 
         if "Expiration" in exp:
-            got_exp = got.get("Expiration") or {}
+            got_exp = got.get("Expiration")
+            if not isinstance(got_exp, dict):
+                raise BucketRuleVerificationError(
+                    f"Lifecycle rule {rid!r} missing Expiration block"
+                )
             if "Days" in exp["Expiration"]:
-                if got_exp.get("Days") != exp["Expiration"]["Days"]:
+                got_days = got_exp.get("Days")
+                if isinstance(got_days, bool) or got_days != exp["Expiration"]["Days"]:
                     raise BucketRuleVerificationError(
-                        f"Lifecycle rule {rid!r} Expiration.Days={got_exp.get('Days')!r}, "
+                        f"Lifecycle rule {rid!r} Expiration.Days={got_days!r}, "
                         f"expected {exp['Expiration']['Days']!r}"
+                    )
+                if got_exp.get("Date") is not None or got_exp.get("ExpiredObjectDeleteMarker"):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} Expiration has unexpected extra fields: {got_exp!r}"
                     )
             if "ExpiredObjectDeleteMarker" in exp["Expiration"]:
                 if got_exp.get("ExpiredObjectDeleteMarker") is not True:
@@ -379,15 +431,53 @@ def verify_lifecycle_rules(
                         f"Lifecycle rule {rid!r} Expiration.ExpiredObjectDeleteMarker="
                         f"{got_exp.get('ExpiredObjectDeleteMarker')!r}, expected True"
                     )
+                if got_exp.get("Days") is not None or got_exp.get("Date") is not None:
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} Expiration has unexpected extra fields: {got_exp!r}"
+                    )
+            for extra_action in (
+                "NoncurrentVersionExpiration",
+                "Transitions",
+                "NoncurrentVersionTransitions",
+                "AbortIncompleteMultipartUpload",
+            ):
+                if got.get(extra_action):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} has unexpected extra action {extra_action!r}"
+                    )
 
         if "NoncurrentVersionExpiration" in exp:
-            got_nc = got.get("NoncurrentVersionExpiration") or {}
+            got_nc = got.get("NoncurrentVersionExpiration")
+            if not isinstance(got_nc, dict):
+                raise BucketRuleVerificationError(
+                    f"Lifecycle rule {rid!r} missing NoncurrentVersionExpiration block"
+                )
             exp_days = exp["NoncurrentVersionExpiration"]["NoncurrentDays"]
-            if got_nc.get("NoncurrentDays") != exp_days:
+            got_nc_days = got_nc.get("NoncurrentDays")
+            if isinstance(got_nc_days, bool) or got_nc_days != exp_days:
                 raise BucketRuleVerificationError(
                     f"Lifecycle rule {rid!r} NoncurrentVersionExpiration.NoncurrentDays="
-                    f"{got_nc.get('NoncurrentDays')!r}, expected {exp_days!r}"
+                    f"{got_nc_days!r}, expected {exp_days!r}"
                 )
+            for extra_action in (
+                "Expiration",
+                "Transitions",
+                "NoncurrentVersionTransitions",
+                "AbortIncompleteMultipartUpload",
+            ):
+                if got.get(extra_action):
+                    raise BucketRuleVerificationError(
+                        f"Lifecycle rule {rid!r} has unexpected extra action {extra_action!r}"
+                    )
+
+        if rid == RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE and not is_equivalent_transcription_audio_expire_rule(
+            got,
+            key_prefix=prefix,
+            expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+        ):
+            raise BucketRuleVerificationError(
+                f"Lifecycle rule {rid!r} does not match managed transcription audio expire rule: {got!r}"
+            )
 
 
 def build_bucket_policy(
@@ -695,8 +785,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     apply_p.add_argument(
         "--prefix",
-        default=os.environ.get("STORAGE_KEY_PREFIX", ""),
-        help="Optional key prefix (default: STORAGE_KEY_PREFIX).",
+        default=None,
+        help=(
+            "Optional key prefix (defaults to DALTON_ASR_STORAGE_KEY_PREFIX for "
+            "role=secondary, STORAGE_KEY_PREFIX for role=main)."
+        ),
     )
     apply_p.add_argument(
         "--uploads-expire-days",
@@ -708,11 +801,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "apply":
         client = _build_s3_client_from_env()
+        effective_prefix = (
+            args.prefix
+            if args.prefix is not None
+            else (
+                os.environ.get("DALTON_ASR_STORAGE_KEY_PREFIX", "")
+                if normalize_role(args.role) == ROLE_SECONDARY
+                else os.environ.get("STORAGE_KEY_PREFIX", "")
+            )
+        )
         result = apply_bucket_rules(
             client,
             bucket=args.bucket.strip(),
             role=args.role,
-            key_prefix=args.prefix,
+            key_prefix=effective_prefix,
             uploads_expire_days=args.uploads_expire_days,
         )
         print(

@@ -603,6 +603,7 @@ def test_missing_referenced_on_main_bucket_always_fails(
 
 def test_restore_verification_accepts_known_missing_and_rejects_unregistered_missing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Restore verification in backup_lib, storage_refs, and consistent_backup handles known missing."""
@@ -703,7 +704,26 @@ def test_restore_verification_accepts_known_missing_and_rejects_unregistered_mis
     assert len(report_fail.unexpected_missing) == 1
     assert report_fail.unexpected_missing[0].key == unregistered_missing_key
 
-    # 2. backup_lib CLI `verify-restored-refs` -> exit 0 on known missing, exit 1 on unregistered
+    # 2. backup_lib CLI `verify-restored-refs` -> queries restore target bucket,
+    #    exit 0 on known missing, exit 1 on unregistered or missing-from-target-bucket
+    target_bucket_s3 = _make_autospec_s3_client(
+        versioning_by_bucket={"dalton-asr": False},
+        objects_by_bucket={
+            "dalton-asr": {
+                "chat-uploads/ws-ok/up-ok/present.xlsx": present_chat,
+                "transcriptions/ws-ok/job-ok/source/present.mp3": present_asr,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        storage_refs,
+        "_build_target_s3_clients_for_reconcile",
+        create_autospec(
+            storage_refs._build_target_s3_clients_for_reconcile,
+            return_value={"dalton-asr": target_bucket_s3},
+        ),
+    )
+
     inv_known = storage_refs.SnapshotRefInventory(
         references=[
             storage_refs.ObjectReference(

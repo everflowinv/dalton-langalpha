@@ -1689,6 +1689,7 @@ DALTON_BACKUP_PG_DSN="$PG_TARGET_DSN" compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}
 CONSISTENT_BACKEND_PID=$!
 
 SNAPSHOT_ID=""
+BACKUP_SUMMARY_JSON=""
 while true; do
   NOW_TS="$(date +%s)"
   if (( NOW_TS >= SNAP_READY_DEADLINE )); then
@@ -1851,7 +1852,7 @@ if [[ -n "$PG_DUMP_PID" ]]; then
           exit 1
           ;;
         "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
-          info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+          BACKUP_SUMMARY_JSON="${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
           ;;
         "@@DALTON_CTL@@ "*)
           ;;
@@ -1906,7 +1907,7 @@ while kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; do
     ctl_line="$CTL_LINE"
     case "$ctl_line" in
       "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
-        info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+        BACKUP_SUMMARY_JSON="${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
         ;;
       "@@DALTON_CTL@@ "*)
         ;;
@@ -1931,7 +1932,7 @@ while read_ctl_err_line; do
   ctl_line="$CTL_LINE"
   case "$ctl_line" in
     "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
-      info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+      BACKUP_SUMMARY_JSON="${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
       ;;
     "@@DALTON_CTL@@ "*)
       ;;
@@ -1959,6 +1960,60 @@ fi
 if [[ "$bundle_tar_rc" -ne 0 ]] || [[ ! -s "${STAGE_DIR}/minio-objects.tar.gz" ]]; then
   err "Failed extracting consistent backup archive bundle (tar_rc=${bundle_tar_rc})."
   exit 1
+fi
+
+if [[ -n "$BACKUP_SUMMARY_JSON" ]]; then
+  CONCISE_SUMMARY="$(python3 - "$BACKUP_SUMMARY_JSON" <<'PY'
+import json, sys
+
+raw = sys.argv[1]
+try:
+    data = json.loads(raw)
+except Exception:
+    print(raw)
+    raise SystemExit(0)
+if not isinstance(data, dict):
+    print(raw)
+    raise SystemExit(0)
+
+sample = data.get("missing_referenced_sample")
+if not isinstance(sample, list):
+    raw_objs = data.get("missing_referenced_objects")
+    if isinstance(raw_objs, list):
+        sample = []
+        seen = set()
+        for item in raw_objs:
+            if isinstance(item, dict):
+                b = str(item.get("bucket") or "").strip()
+                k = str(item.get("key") or "").strip().lstrip("/")
+                if b and k and (b, k) not in seen:
+                    seen.add((b, k))
+                    sample.append(f"{b}/{k}")
+    else:
+        sample = []
+
+clean_sample = [str(x) for x in sample[:10]]
+miss_count = int(data.get("missing_referenced_count") or 0)
+if not miss_count and isinstance(data.get("missing_referenced_objects"), list):
+    miss_count = len(data["missing_referenced_objects"])
+
+compact = {
+    "snapshot_id": data.get("snapshot_id"),
+    "object_count": data.get("object_count"),
+    "missing_referenced_count": miss_count,
+    "expired_by_rule_count": int(data.get("expired_by_rule_count") or 0),
+    "reconcile_ok": data.get("reconcile_ok"),
+}
+if data.get("checked_refs") is not None:
+    compact["checked_refs"] = data.get("checked_refs")
+if miss_count > 0:
+    compact["missing_referenced_sample"] = clean_sample
+    if miss_count > len(clean_sample):
+        compact["missing_referenced_more"] = miss_count - len(clean_sample)
+print(json.dumps(compact, ensure_ascii=False))
+PY
+)"
+  info "Consistent backup reconciled: ${CONCISE_SUMMARY}"
 fi
 
 if [[ ! -s "${STAGE_DIR}/postgres.dump" ]]; then
@@ -1993,6 +2048,69 @@ tar -xOzf "${STAGE_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MAN
 MINIO_BUCKET_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bucket_count"])' "$MINIO_MANIFEST_FILE")"
 MINIO_OBJECT_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["object_count"])' "$MINIO_MANIFEST_FILE")"
 MINIO_TOTAL_BYTES="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["total_bytes"])' "$MINIO_MANIFEST_FILE")"
+
+# Persist missing-referenced-objects alert once on the host (never inside the ephemeral container).
+HOST_ALERTS_FILE="${DALTON_BACKUP_ALERTS_FILE:-}"
+if [[ -z "$HOST_ALERTS_FILE" && -f "$ENV_FILE" ]]; then
+  HOST_ALERTS_FILE="$(read_env_file_var "$ENV_FILE" "DALTON_BACKUP_ALERTS_FILE" "")"
+fi
+if [[ -z "$HOST_ALERTS_FILE" || "$HOST_ALERTS_FILE" == *.json || "$HOST_ALERTS_FILE" == *.JSON ]]; then
+  HOST_ALERTS_FILE="${OUTPUT_DIR}/backup-alerts.log"
+fi
+MISSING_ALERT_WRITTEN="$(python3 - "$MINIO_MANIFEST_FILE" "$HOST_ALERTS_FILE" "$BACKUP_NAME" <<'PY'
+import datetime as dt
+import json
+import os
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+alerts_path = Path(os.path.expanduser(sys.argv[2]))
+backup_name = sys.argv[3]
+
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+raw_missing = data.get("missing_referenced_objects") if isinstance(data, dict) else None
+if not isinstance(raw_missing, list) or not raw_missing:
+    print("0")
+    raise SystemExit(0)
+
+seen = set()
+unique_items = []
+for item in raw_missing:
+    if not isinstance(item, dict):
+        continue
+    b = str(item.get("bucket") or "").strip()
+    k = str(item.get("key") or "").strip().lstrip("/")
+    c = str(item.get("consumer") or "").strip()
+    if not b or not k or (b, k) in seen:
+        continue
+    seen.add((b, k))
+    unique_items.append((b, k, c))
+
+if not unique_items:
+    print("0")
+    raise SystemExit(0)
+
+total = len(unique_items)
+sample_items = unique_items[:10]
+sample = ", ".join(f"{b}/{k}" + (f" [{c}]" if c else "") for b, k, c in sample_items)
+suffix = f" (+{total - len(sample_items)} more)" if total > len(sample_items) else ""
+ts = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+line = (
+    f"{ts} [WARN] [standalone_backup] [MISSING_REFERENCED_OBJECTS] "
+    f"backup={backup_name} Tolerated {total} missing snapshot-referenced object(s) "
+    f"(full list in manifest.json): {sample}{suffix}\n"
+)
+alerts_path.parent.mkdir(parents=True, exist_ok=True)
+fd = os.open(alerts_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+with os.fdopen(fd, "a", encoding="utf-8") as fh:
+    fh.write(line)
+print(str(total))
+PY
+)"
+if [[ "$MISSING_ALERT_WRITTEN" =~ ^[0-9]+$ ]] && (( MISSING_ALERT_WRITTEN > 0 )); then
+  warn "Recorded MISSING_REFERENCED_OBJECTS alert (${MISSING_ALERT_WRITTEN} object(s)) to ${HOST_ALERTS_FILE}; full list stays in manifest.json."
+fi
 
 if [[ "$VERIFY" -eq 1 ]]; then
   ARCHIVED_OBJECT_COUNT="$(tar -tzf "${STAGE_DIR}/minio-objects.tar.gz" | awk '/^objects\// && !/\/$/ { c++ } END { print c+0 }')"
@@ -2305,6 +2423,9 @@ with open(minio_manifest_path, encoding="utf-8") as mfh:
 missing_refs = minio_meta.get("missing_referenced_objects")
 if not isinstance(missing_refs, list):
     missing_refs = []
+expired_by_rule = minio_meta.get("expired_by_rule_objects")
+if not isinstance(expired_by_rule, list):
+    expired_by_rule = []
 
 manifest = {
     "schema_version": 2,
@@ -2331,6 +2452,8 @@ manifest = {
     },
     "missing_referenced_objects": missing_refs,
     "missing_referenced_count": len(missing_refs),
+    "expired_by_rule_objects": expired_by_rule,
+    "expired_by_rule_count": len(expired_by_rule),
     "asr_jobs": (
         {
             "file": "asr-jobs.tar.gz",

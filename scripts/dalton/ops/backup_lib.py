@@ -2388,6 +2388,41 @@ def load_known_missing_objects(
     return tuple(out)
 
 
+def _load_manifest_present_object_pairs(
+    manifest_or_set: Mapping[str, Any] | Path,
+) -> set[tuple[str, str]]:
+    """Return ``(bucket, key)`` pairs actually archived in the backup set's manifest."""
+    if isinstance(manifest_or_set, Path):
+        data = json.loads(manifest_or_set.read_text(encoding="utf-8"))
+    else:
+        data = manifest_or_set
+    if not isinstance(data, Mapping):
+        return set()
+    raw_objs = data.get("objects")
+    if not isinstance(raw_objs, Sequence) or isinstance(raw_objs, (str, bytes)):
+        mpath_raw = str(data.get("manifest_path") or "").strip()
+        if mpath_raw:
+            mpath = Path(mpath_raw)
+            if mpath.is_file():
+                try:
+                    mdata = json.loads(mpath.read_text(encoding="utf-8"))
+                    if isinstance(mdata, Mapping):
+                        raw_objs = mdata.get("objects")
+                except Exception:
+                    raw_objs = None
+    if not isinstance(raw_objs, Sequence) or isinstance(raw_objs, (str, bytes)):
+        return set()
+    out: set[tuple[str, str]] = set()
+    for item in raw_objs:
+        if not isinstance(item, Mapping):
+            continue
+        b = str(item.get("bucket") or "").strip()
+        k = str(item.get("key") or "").strip().lstrip("/")
+        if b and k:
+            out.add((b, k))
+    return out
+
+
 def verify_restored_references(
     referenced_objects: Sequence[Mapping[str, Any] | tuple[str, str] | tuple[str, str, str]],
     present_objects: Iterable[Mapping[str, Any] | tuple[str, str]],
@@ -2399,7 +2434,9 @@ def verify_restored_references(
     """Verify restored bucket objects against referenced keys, treating manifest-registered missing items as known missing.
 
     - Registered items in ``known_missing_objects`` (or loaded from ``manifest_or_set``) are
-      reported in ``known_missing`` and via ``log_fn``, and do NOT fail verification (``ok=True``).
+      reported in ``known_missing`` and via ``log_fn``, and do NOT fail verification (``ok=True``),
+      EXCEPT that any object actually archived in the manifest's ``objects`` list is expected
+      to exist in the restored bucket and ALWAYS fails as ``unexpected_missing`` if absent.
     - Any unregistered missing object is reported in ``unexpected_missing`` and fails verification
       (``ok=False``).
     """
@@ -2416,10 +2453,13 @@ def verify_restored_references(
         if b and k:
             present_pairs.add((b, k))
 
+    manifest_expected_pairs: set[tuple[str, str]] = set()
     known_pairs: dict[tuple[str, str], str] = {}
     if manifest_or_set is not None:
+        manifest_expected_pairs = _load_manifest_present_object_pairs(manifest_or_set)
         for km in load_known_missing_objects(manifest_or_set):
-            known_pairs[(km.bucket, km.key)] = km.consumer
+            if (km.bucket, km.key) not in manifest_expected_pairs:
+                known_pairs[(km.bucket, km.key)] = km.consumer
     for item in known_missing_objects:
         if isinstance(item, KnownMissingObject):
             b, k, c = item.bucket.strip(), item.key.strip().lstrip("/"), item.consumer.strip()
@@ -2433,7 +2473,7 @@ def verify_restored_references(
             c = str(item[2] or "").strip() if len(item) >= 3 else ""
         else:
             continue
-        if b and k:
+        if b and k and (b, k) not in manifest_expected_pairs:
             known_pairs.setdefault((b, k), c)
 
     present_count = 0
@@ -2517,7 +2557,9 @@ def _cmd_verify_restored_refs(args: argparse.Namespace) -> int:
         print("verify-restored-refs requires --manifest or --backup-set with manifest_path", file=sys.stderr)
         return 2
 
-    sub_argv = ["reconcile", "--manifest", manifest_path]
+    sub_argv = ["reconcile", "--manifest", manifest_path, "--verify-target-buckets"]
+    if not Path("/.dockerenv").exists():
+        sub_argv.append("--rewrite-container-minio")
     if backup_set_path:
         sub_argv.extend(["--backup-set", backup_set_path])
     if args.refs_json:

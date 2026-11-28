@@ -51,6 +51,7 @@ from src.dalton.consistent_backup import (
     run_consistent_backup,
     start_pg_dump_process,
 )
+from src.dalton.storage_refs import ExpiredByRuleObject
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ class PublishedBackupSet:
     reconcile_ok: bool
     manifest_sha256: str = ""
     missing_referenced_objects: tuple[MissingReferencedObject, ...] = ()
+    expired_by_rule_objects: tuple[ExpiredByRuleObject, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -153,6 +155,8 @@ class PublishedBackupSet:
             "reconcile_ok": self.reconcile_ok,
             "missing_referenced_objects": [m.to_dict() for m in self.missing_referenced_objects],
             "missing_referenced_count": len(self.missing_referenced_objects),
+            "expired_by_rule_objects": [e.to_dict() for e in self.expired_by_rule_objects],
+            "expired_by_rule_count": len(self.expired_by_rule_objects),
         }
         if self.manifest_sha256:
             out["manifest_sha256"] = self.manifest_sha256
@@ -254,6 +258,20 @@ def _normalize_missing_referenced_objects(
     return tuple(out)
 
 
+def _normalize_expired_by_rule_objects(
+    items: Sequence[ExpiredByRuleObject | Mapping[str, Any]] | None,
+) -> tuple[ExpiredByRuleObject, ...]:
+    if not items:
+        return ()
+    out: list[ExpiredByRuleObject] = []
+    for item in items:
+        if isinstance(item, ExpiredByRuleObject):
+            out.append(item)
+        elif isinstance(item, Mapping):
+            out.append(ExpiredByRuleObject.from_dict(item))
+    return tuple(out)
+
+
 def emit_missing_referenced_alert(
     code: str,
     message: str,
@@ -307,6 +325,7 @@ def publish_local_backup_set(
     asr_summary: AsrArchiveSummary | None,
     reconcile_ok: bool,
     missing_referenced_objects: Sequence[MissingReferencedObject | Mapping[str, Any]] = (),
+    expired_by_rule_objects: Sequence[ExpiredByRuleObject | Mapping[str, Any]] = (),
     created_at: str | None = None,
 ) -> PublishedBackupSet:
     """Atomically promote a verified staged backup set on the same external volume (§3.1 step 4).
@@ -361,6 +380,7 @@ def publish_local_backup_set(
 
         ts_iso = created_at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         norm_missing = _normalize_missing_referenced_objects(missing_referenced_objects)
+        norm_expired = _normalize_expired_by_rule_objects(expired_by_rule_objects)
         manifest_path = sets_dir / f"minio-manifest-{backup_set_id}.json"
         _atomic_write_json(
             manifest_path,
@@ -373,6 +393,8 @@ def publish_local_backup_set(
                 "objects": [r.to_dict() for r in manifest_objects],
                 "missing_referenced_objects": [m.to_dict() for m in norm_missing],
                 "missing_referenced_count": len(norm_missing),
+                "expired_by_rule_objects": [e.to_dict() for e in norm_expired],
+                "expired_by_rule_count": len(norm_expired),
             },
         )
 
@@ -396,6 +418,7 @@ def publish_local_backup_set(
             reconcile_ok=True,
             manifest_sha256=manifest_sha,
             missing_referenced_objects=norm_missing,
+            expired_by_rule_objects=norm_expired,
         )
         _atomic_write_json(set_path, published.to_dict())
         _atomic_write_json(sets_dir / "latest-verified-set.json", published.to_dict())
@@ -665,6 +688,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 asr_summary=result.asr_archive,
                 reconcile_ok=result.reconcile_report.ok,
                 missing_referenced_objects=result.missing_referenced_objects,
+                expired_by_rule_objects=result.expired_by_rule_objects,
             )
             prune_stats = prune_local_backup_sets_and_pool(
                 backups_root,

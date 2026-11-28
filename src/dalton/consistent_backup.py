@@ -45,14 +45,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from src.dalton.storage_bucket_rules import ROLE_MAIN, ROLE_SECONDARY
 from src.dalton.storage_config import resolve as resolve_storage_config
 from src.dalton.storage_refs import (
+    STRICT_MAIN_BUCKET_NAME,
     TERMINAL_ASR_ARCHIVE_STATUSES,
+    ExpiredByRuleObject,
     ReconcileReport,
     SnapshotRefInventory,
     _apply_bucket_prefix,
     _extract_first_value,
     _extract_tuple,
+    _normalize_endpoint_identity,
     _table_exists,
     enumerate_snapshot_refs,
     reconcile_inventory_against_manifest,
@@ -69,7 +73,6 @@ DEFAULT_LOCK_PHASE_TIMEOUT_S = 7200.0
 DEFAULT_MIRROR_TIMEOUT_S = 14400.0
 DEFAULT_MAX_MISSING_REFERENCED_OBJECTS = 50
 MISSING_REFERENCED_OBJECTS_ENV = "DALTON_BACKUP_MAX_MISSING_REFS"
-STRICT_MAIN_BUCKET_NAME = "dalton-main"
 MISSING_REFERENCED_OBJECTS_ALERT_CODE = "MISSING_REFERENCED_OBJECTS"
 STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 
@@ -270,14 +273,19 @@ class BucketArchiveSpec:
 
 
 def _spec_endpoint_identity(spec: BucketArchiveSpec) -> str:
-    """Normalize endpoint identity for deduplicating overlapping specs against one bucket."""
-    ep = (spec.endpoint or "").strip().rstrip("/").lower()
+    """Normalize endpoint identity for deduplicating overlapping specs and identifying physical buckets."""
+    ep = _normalize_endpoint_identity(spec.endpoint)
     if ep:
         return ep
     client_ep = getattr(getattr(spec.s3_client, "_endpoint", None), "host", None)
     if isinstance(client_ep, str) and client_ep.strip():
-        return client_ep.strip().rstrip("/").lower()
+        return _normalize_endpoint_identity(client_ep)
     return ""
+
+
+def _physical_bucket_identity(spec: BucketArchiveSpec) -> tuple[str, str]:
+    """Identify a physical bucket by normalized ``(endpoint, bucket_name)``."""
+    return (_spec_endpoint_identity(spec), spec.bucket.strip())
 
 
 def deduplicate_selections(
@@ -315,6 +323,7 @@ class ConsistentBackupResult:
     reconcile_report: ReconcileReport
     warnings: tuple[str, ...] = ()
     missing_referenced_objects: tuple[MissingReferencedObject, ...] = ()
+    expired_by_rule_objects: tuple[ExpiredByRuleObject, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1000,7 @@ def select_bucket_object_versions(
     snapshot_referenced_keys: Iterable[str],
     versioning_enabled: bool = True,
     allow_missing: bool = False,
+    strict_required_keys: Iterable[str] | None = None,
     target_logger: logging.Logger | None = None,
 ) -> VersionSelectionResult:
     """Apply the §3.1 Step 3 two-rule version selection over ``bucket``.
@@ -1003,12 +1013,17 @@ def select_bucket_object_versions(
     - Any snapshot-referenced key with no non-delete-marker version raises
       :class:`MissingReferencedObjectsError` unless ``allow_missing=True``, in which case
       the missing keys are returned in :attr:`VersionSelectionResult.missing_keys`.
+    - Any key in ``strict_required_keys`` that is missing ALWAYS raises
+      :class:`MissingReferencedObjectsError`, even when ``allow_missing=True``.
     - When ``versioning_enabled=False``, emits a ``WARNING`` and selects current objects
       without ``VersionId``, still failing on any missing snapshot-referenced key unless
       ``allow_missing=True``.
     """
     log = target_logger or logger
     snap_keys = {str(k).strip().lstrip("/") for k in snapshot_referenced_keys if str(k).strip()}
+    strict_keys = {
+        str(k).strip().lstrip("/") for k in (strict_required_keys or ()) if str(k).strip()
+    }
 
     if not versioning_enabled:
         warn_msg = (
@@ -1025,6 +1040,9 @@ def select_bucket_object_versions(
             if key not in by_key or item.get("IsLatest"):
                 by_key[key] = item
         missing = sorted(k for k in snap_keys if k not in by_key)
+        strict_missing = sorted(k for k in missing if k in strict_keys)
+        if strict_missing:
+            raise MissingReferencedObjectsError(bucket, strict_missing)
         if missing and not allow_missing:
             raise MissingReferencedObjectsError(bucket, missing)
         selected = tuple(
@@ -1137,6 +1155,9 @@ def select_bucket_object_versions(
                 missing_keys.append(key)
 
     sorted_missing = tuple(sorted(set(missing_keys)))
+    strict_missing = tuple(k for k in sorted_missing if k in strict_keys)
+    if strict_missing:
+        raise MissingReferencedObjectsError(bucket, strict_missing)
     if sorted_missing and not allow_missing:
         raise MissingReferencedObjectsError(bucket, sorted_missing)
 
@@ -1591,6 +1612,7 @@ class TarGzObjectSink:
         self._tf = tarfile.open(self._tmp_tar, "w:gz", format=tarfile.PAX_FORMAT)
         self._manifest_extra = dict(manifest_extra or {})
         self._missing_referenced_objects: list[dict[str, str]] = []
+        self._expired_by_rule_objects: list[dict[str, str]] = []
         self.records: list[ArchivedObjectRecord] = []
         self._seen_pairs: set[tuple[str, str]] = set()
         self._closed = False
@@ -1606,6 +1628,18 @@ class TarGzObjectSink:
             elif isinstance(item, Mapping):
                 normalized.append(MissingReferencedObject.from_dict(item).to_dict())
         self._missing_referenced_objects = normalized
+
+    def set_expired_by_rule_objects(
+        self,
+        items: Sequence[ExpiredByRuleObject | Mapping[str, Any]],
+    ) -> None:
+        normalized: list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, ExpiredByRuleObject):
+                normalized.append(item.to_dict())
+            elif isinstance(item, Mapping):
+                normalized.append(ExpiredByRuleObject.from_dict(item).to_dict())
+        self._expired_by_rule_objects = normalized
 
     def archive_object(
         self,
@@ -1681,11 +1715,14 @@ class TarGzObjectSink:
         self,
         *,
         missing_referenced_objects: Sequence[MissingReferencedObject | Mapping[str, Any]] | None = None,
+        expired_by_rule_objects: Sequence[ExpiredByRuleObject | Mapping[str, Any]] | None = None,
     ) -> tuple[ArchivedObjectRecord, ...]:
         if self._closed:
             return tuple(self.records)
         if missing_referenced_objects is not None:
             self.set_missing_referenced_objects(missing_referenced_objects)
+        if expired_by_rule_objects is not None:
+            self.set_expired_by_rule_objects(expired_by_rule_objects)
         seen: set[tuple[str, str]] = set()
         for rec in self.records:
             pair = (str(rec.bucket), str(rec.key).lstrip("/"))
@@ -1703,6 +1740,8 @@ class TarGzObjectSink:
             "objects": [r.to_dict() for r in self.records],
             "missing_referenced_objects": list(self._missing_referenced_objects),
             "missing_referenced_count": len(self._missing_referenced_objects),
+            "expired_by_rule_objects": list(self._expired_by_rule_objects),
+            "expired_by_rule_count": len(self._expired_by_rule_objects),
         }
         for k, v in self._manifest_extra.items():
             if k not in (
@@ -1712,6 +1751,8 @@ class TarGzObjectSink:
                 "total_bytes",
                 "missing_referenced_objects",
                 "missing_referenced_count",
+                "expired_by_rule_objects",
+                "expired_by_rule_count",
             ):
                 manifest_payload[k] = v
         if "buckets" in self._manifest_extra:
@@ -2014,12 +2055,14 @@ async def run_consistent_backup(
     mirror_timeout_s: float | None = None,
     snapshot_import_timeout_s: float | None = None,
     max_missing_referenced_objects: int | None = None,
+    snapshot_time: dt.datetime | None = None,
     env: Mapping[str, str] | None = None,
     after_snapshot_commit_hook: Callable[[str, SnapshotRefInventory], Any] | None = None,
     wait_pg_dump_imported_fn: Callable[[Any], Any] | None = None,
     wait_pg_dump_finished_fn: Callable[[Any], Any] | None = None,
     terminate_pg_dump_fn: Callable[[Any], Any] | None = None,
     alert_fn: Callable[[str, str], Any] | None = None,
+    log_missing_summary: bool = True,
     target_logger: logging.Logger | None = None,
 ) -> ConsistentBackupResult:
     """Execute the full §3.1 Steps 1-4 consistent backup protocol with hard deadlines.
@@ -2182,6 +2225,29 @@ async def run_consistent_backup(
             timeout=_remaining_or_raise(lock_deadline, "begin_exported_snapshot"),
         )
         snapshot_open = True
+        eff_snapshot_time = snapshot_time or dt.datetime.now(dt.timezone.utc)
+
+        # Identify physical primary bucket(s) by (endpoint, bucket_name): ALL prefixes on a
+        # physical primary bucket (including prefixes shared with secondary configs) are zero-tolerance,
+        # and are NOT covered by the managed secondary-bucket 7-day transcription expiration rule.
+        primary_physical_buckets: set[tuple[str, str]] = {
+            _physical_bucket_identity(spec)
+            for spec in bucket_specs
+            if "main" in spec.roles or spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
+        }
+        asr_spec = next((spec for spec in bucket_specs if "asr" in spec.roles), None)
+        asr_bucket_target: tuple[str, str] | None = None
+        asr_bucket_role: str | None = None
+        if asr_spec is not None and asr_spec.bucket.strip():
+            asr_bucket_target = (
+                asr_spec.bucket.strip(),
+                asr_spec.key_prefix.strip().strip("/"),
+            )
+            asr_bucket_role = (
+                ROLE_MAIN
+                if _physical_bucket_identity(asr_spec) in primary_physical_buckets
+                else ROLE_SECONDARY
+            )
 
         # Enumerate ALL live DB references unconditionally (independent of bucket_specs)
         watchdog.set_phase("enumerate_snapshot_refs")
@@ -2191,6 +2257,9 @@ async def run_consistent_backup(
                 env=env,
                 include_main=True,
                 include_aux=True,
+                now=eff_snapshot_time,
+                asr_bucket_target=asr_bucket_target,
+                asr_bucket_role=asr_bucket_role,
             ),
             timeout=_remaining_or_raise(lock_deadline, "enumerate_snapshot_refs"),
         )
@@ -2265,16 +2334,23 @@ async def run_consistent_backup(
         # Step 3a: list_object_versions per bucket & select versions under the two rules
         # Run blocking S3 calls in worker threads so the asyncio loop stays responsive to the watchdog.
         keys_by_role = inventory.keys_by_bucket_role()
+        strict_keys_by_role: dict[str, set[str]] = {}
+        for ref in inventory.references:
+            if ref.require_present and ref.object_key:
+                strict_keys_by_role.setdefault(ref.bucket_role, set()).add(ref.object_key)
         bucket_targets: dict[str, tuple[str, str]] = {}
         selections: list[tuple[BucketArchiveSpec, VersionSelectionResult]] = []
 
         for spec in bucket_specs:
             _remaining_or_raise(lock_deadline, f"select_versions({spec.bucket})")
             snap_keys_for_bucket: set[str] = set()
+            strict_keys_for_bucket: set[str] = set()
             for role in spec.roles:
                 bucket_targets[role] = (spec.bucket, spec.key_prefix.strip("/"))
                 for logical_key in keys_by_role.get(role, ()):
                     snap_keys_for_bucket.add(_apply_bucket_prefix(logical_key, spec.key_prefix))
+                for logical_key in strict_keys_by_role.get(role, ()):
+                    strict_keys_for_bucket.add(_apply_bucket_prefix(logical_key, spec.key_prefix))
 
             if spec.versioning_enabled is not None:
                 ver_enabled = spec.versioning_enabled
@@ -2305,7 +2381,9 @@ async def run_consistent_backup(
                 dms = []
 
             is_strict_main_bucket = (
-                "main" in spec.roles or spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
+                _physical_bucket_identity(spec) in primary_physical_buckets
+                or "main" in spec.roles
+                or spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
             )
             sel = select_bucket_object_versions(
                 bucket=spec.bucket,
@@ -2314,6 +2392,7 @@ async def run_consistent_backup(
                 snapshot_referenced_keys=snap_keys_for_bucket,
                 versioning_enabled=ver_enabled,
                 allow_missing=(not is_strict_main_bucket and eff_max_missing > 0),
+                strict_required_keys=strict_keys_for_bucket,
                 target_logger=log,
             )
             if sel.warning:
@@ -2321,9 +2400,11 @@ async def run_consistent_backup(
             selections.append((spec, sel))
 
         # Collect tolerated missing referenced objects across non-main buckets and enforce
-        # strict failure rules: never tolerate main-bucket missing objects or > eff_max_missing.
+        # strict failure rules: never tolerate physical primary-bucket missing objects,
+        # strict require_present references (e.g. active/uploaded/submitted/indeterminate ASR),
+        # or > eff_max_missing.
         consumers_by_bucket_key: dict[tuple[str, str], set[str]] = {}
-        main_role_pairs: set[tuple[str, str]] = set()
+        strict_role_pairs: set[tuple[str, str]] = set()
         for ref in inventory.references:
             target = bucket_targets.get(ref.bucket_role)
             if target is None or not target[0] or not ref.object_key:
@@ -2331,18 +2412,24 @@ async def run_consistent_backup(
             b_name, k_prefix = target
             full_k = _apply_bucket_prefix(ref.object_key, k_prefix)
             consumers_by_bucket_key.setdefault((b_name, full_k), set()).add(ref.consumer)
-            if ref.bucket_role == "main" or b_name == STRICT_MAIN_BUCKET_NAME:
-                main_role_pairs.add((b_name, full_k))
+            if (
+                ref.bucket_role == "main"
+                or ref.require_present
+                or b_name == STRICT_MAIN_BUCKET_NAME
+            ):
+                strict_role_pairs.add((b_name, full_k))
 
         missing_pairs_by_bucket: dict[str, set[str]] = {}
         for spec, sel in selections:
+            spec_is_primary = (
+                _physical_bucket_identity(spec) in primary_physical_buckets
+                or spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
+            )
             for mkey in sel.missing_keys:
                 clean_k = str(mkey).strip().lstrip("/")
                 if not clean_k:
                     continue
-                if (spec.bucket, clean_k) in main_role_pairs or (
-                    spec.bucket.strip() == STRICT_MAIN_BUCKET_NAME
-                ):
+                if spec_is_primary or (spec.bucket, clean_k) in strict_role_pairs:
                     raise MissingReferencedObjectsError(spec.bucket, [clean_k])
                 missing_pairs_by_bucket.setdefault(spec.bucket, set()).add(clean_k)
 
@@ -2473,8 +2560,10 @@ async def run_consistent_backup(
                     deadline=mirror_deadline,
                 )
 
+        expired_records = tuple(inventory.expired_by_rule_objects)
         if isinstance(object_sink, TarGzObjectSink):
             object_sink.set_missing_referenced_objects(missing_records)
+            object_sink.set_expired_by_rule_objects(expired_records)
         manifest_records = object_sink.finalize()
     except BaseException as exc:
         # Close DB session FIRST without waiting for ROLLBACK or pg_advisory_unlock so
@@ -2519,7 +2608,8 @@ async def run_consistent_backup(
 
     if missing_records:
         missing_summary = format_missing_referenced_summary(missing_records, max_sample=10)
-        log.warning("%s", missing_summary)
+        if log_missing_summary:
+            log.warning("%s", missing_summary)
         warnings.append(missing_summary)
         if alert_fn is not None:
             try:
@@ -2538,6 +2628,7 @@ async def run_consistent_backup(
         reconcile_report=reconcile_report,
         warnings=tuple(warnings),
         missing_referenced_objects=missing_records,
+        expired_by_rule_objects=expired_records,
     )
 
 

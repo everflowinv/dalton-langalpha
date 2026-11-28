@@ -239,15 +239,15 @@ def test_storage_refs_transcription_source_audio_expiration_and_inflight_retenti
             created_at=now - dt.timedelta(days=8),
             completed_at=now - dt.timedelta(days=8) + dt.timedelta(minutes=5),
         ),
-        # Terminal succeeded just past 7d boundary (+1s) -> exempt
+        # Terminal succeeded just past 7d boundary (+1s by completed_at) -> exempt
         _row(
             "job-succeeded-7d-1s",
             "succeeded",
             usage=done_usage,
-            created_at=now - dt.timedelta(days=7, seconds=1),
-            completed_at=now - dt.timedelta(days=7),
+            created_at=now - dt.timedelta(days=7, minutes=5),
+            completed_at=now - dt.timedelta(days=7, seconds=1),
         ),
-        # Terminal succeeded with created_at=None, completed_at > 7d -> fallback works -> exempt
+        # Terminal succeeded with created_at=None, completed_at > 7d -> exempt
         _row(
             "job-succeeded-fallback-10d",
             "succeeded",
@@ -314,7 +314,11 @@ def test_storage_refs_transcription_source_audio_expiration_and_inflight_retenti
     conn = _make_autospec_async_db_conn(_query_handler)
     inv = asyncio.run(
         storage_refs.enumerate_snapshot_refs(
-            conn, include_main=False, include_aux=True, now=now
+            conn,
+            env={"DALTON_ASR_STORAGE_BUCKET_NAME": "dalton-asr"},
+            include_main=False,
+            include_aux=True,
+            now=now,
         )
     )
 
