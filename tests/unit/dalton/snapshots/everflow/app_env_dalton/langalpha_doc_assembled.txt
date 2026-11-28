@@ -53,7 +53,7 @@ How messages sent on connected chat apps (Feishu, Discord, personal WeChat) map 
 - While an answer is running, a follow-up message sent in the same conversation joins that thread; `/stop` cancels the active run.
 - A result handed off to an Analyst returns to the chat or topic where the request started.
 - A user links their chat account first to start chatting: generate a bind code in Settings → Messaging & Channels and send `/bind <CODE>` in a DM on Feishu or Discord (send `/unbind` to disconnect); scan the QR code in Settings → Messaging & Channels to link personal WeChat (send `/unbind` to disconnect).
-- In a Feishu or Discord group, each linked internal member has their own conversation scope.
+- In a group chat, each linked internal member has their own conversation scope.
 
 ## Feishu
 

@@ -14,7 +14,7 @@
 - While an answer is running, a follow-up message sent in the same conversation joins that thread; `/stop` cancels the active run.
 - A result handed off to an Analyst returns to the chat or topic where the request started.
 - A user links their chat account first to start chatting: <!-- DALTON_CAP:channel_feishu|channel_discord -->generate a bind code in Settings → Messaging & Channels and send `/bind <CODE>` in a DM on <!-- DALTON_CAP:channel_feishu -->Feishu<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_discord --> or <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_discord -->Discord<!-- /DALTON_CAP --> (send `/unbind` to disconnect)<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_weixin|channel_discord,channel_weixin -->; <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_weixin -->scan the QR code in Settings → Messaging & Channels to link personal WeChat (send `/unbind` to disconnect)<!-- /DALTON_CAP -->.
-<!-- DALTON_CAP:channel_feishu|channel_discord -->- In a Feishu or Discord group, each linked internal member has their own conversation scope.
+<!-- DALTON_CAP:channel_feishu|channel_discord -->- In a group chat, each linked internal member has their own conversation scope.
 <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu -->
 ## Feishu
 
