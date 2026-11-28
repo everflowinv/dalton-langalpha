@@ -41,6 +41,7 @@ MESSAGE = (
 
 def _gated() -> set:
     from src.dalton.app import transcriptions  # DALTON-HOOK(dalton-auth)
+    from src.dalton.deployment_credentials import auth as deployment_auth  # DALTON-HOOK(deployment-credentials)
     from src.server.app import drive_mount, livefs
 
     return {
@@ -54,6 +55,8 @@ def _gated() -> set:
         drive_mount._caller,
         # DALTON-HOOK(dalton-auth): transcription routes admit session or task-ticket callers.
         transcriptions._transcription_caller_gate,
+        # DALTON-HOOK(deployment-credentials): the admin session resolver calls admit_caller.
+        deployment_auth.require_deployment_admin_session,
     }
 
 
@@ -176,6 +179,12 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/internal/llm/complete"),
     ("POST", "/api/v1/dalton/internal/model-availability/check"),
     ("PUT", "/api/v1/dalton/channels/internal/settings"),
+    # DALTON-HOOK(user-integrations): a personal connector sign-in's return, bound to
+    # the state its start minted; Feishu's signed event push; and the gateway's
+    # forward of it behind X-Service-Token.
+    ("GET", "/api/v1/dalton/integrations/{provider}/callback"),
+    ("POST", "/api/v1/dalton/integrations/feishu/events"),
+    ("POST", "/api/v1/dalton/integrations/internal/feishu/events"),
 }
 
 

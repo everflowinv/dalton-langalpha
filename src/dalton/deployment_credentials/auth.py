@@ -30,7 +30,7 @@ from src.dalton.settings import get_configured_pm_user_ids, get_dalton_auth_mode
 from src.server.auth import oauth_resource, pats
 from src.server.database.shared_workspaces import is_holder
 from src.server.services import cli_tokens
-from src.server.utils.api import caller_of, note_caller
+from src.server.utils.api import admit_caller, caller_of, note_caller
 
 _optional_bearer = HTTPBearer(auto_error=False)
 
@@ -104,6 +104,7 @@ async def require_deployment_admin_session(
                 "Interactive web session authentication is required.",
             )
         await require_catalog_admin_async(user_id)
+        await admit_caller(request, user_id)
         return user_id
 
     if mode == "supabase":
@@ -123,6 +124,7 @@ async def require_deployment_admin_session(
                 "admin_required",
                 "Administrator privileges are required.",
             )
+        await admit_caller(request, user_id)
         return user_id
 
     raise HTTPException(
