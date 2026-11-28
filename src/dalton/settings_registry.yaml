@@ -1,0 +1,1124 @@
+# Dalton 用户可调设置登记表（Chief of Staff 能力守卫清单）
+#
+# 新增或调整任何用户可调设置时，在此登记并明确研究总监（Chief of Staff）的处理方式：
+# - tool:<工具名或虚拟文件>  已支持通过研究总监工具或虚拟数据文件修改
+# - missing                  应由研究总监支持修改，当前尚未提供工具
+# - excluded:<原因>          有意不由研究总监代改（如凭据、账单/预算、管理员配置、安全授权、前端视觉偏好）
+#
+# 形态（profiles）取值来自 src.dalton.profile.DeploymentProfile（everflow / core）；
+# 能力门控（capability）取值来自 src.dalton.capabilities.CapabilityId。
+# 守卫测试：tests/unit/dalton/test_settings_registry.py
+
+version: 1
+
+settings:
+  # ===========================================================================
+  # 1. 用户资料（users 表，UserUpdate）
+  # ===========================================================================
+  - key: user.name
+    stored_in: users.name
+    web_entry: 设置 → 个人资料 → 姓名
+    cos: tool:edit_file(.agents/user/profile/user.json)
+    profiles: [everflow, core]
+
+  - key: user.timezone
+    stored_in: users.timezone
+    web_entry: 设置 → 通用与外观 → 时区
+    cos: tool:edit_file(.agents/user/profile/user.json)
+    profiles: [everflow, core]
+
+  - key: user.locale
+    stored_in: users.locale
+    web_entry: 设置 → 通用与外观 → 语言
+    cos: tool:edit_file(.agents/user/profile/user.json)
+    profiles: [everflow, core]
+
+  - key: user.onboarding_completed
+    stored_in: users.onboarding_completed
+    web_entry: 首次登录引导流程（系统自动更新）
+    cos: tool:edit_file(.agents/user/profile/user.json)
+    profiles: [everflow, core]
+
+  - key: user.email
+    stored_in: users.email
+    web_entry: 设置 → 个人资料 → 邮箱（Dalton 认证模式下只读）
+    cos: excluded:账号登录标识，由认证体系维护
+    profiles: [everflow, core]
+
+  - key: user.avatar_url
+    stored_in: users.avatar_url
+    web_entry: 设置 → 个人资料 → 头像
+    cos: excluded:需通过浏览器上传头像图片文件，由用户在设置页操作
+    profiles: [everflow, core]
+
+  - key: user.personalization_completed
+    stored_in: users.personalization_completed
+    web_entry: 个人资料访谈引导（系统流程标记）
+    cos: excluded:引导流程内部状态标记，由引导流程自动维护
+    profiles: [everflow, core]
+
+  - key: user.computer_choice
+    stored_in: users.computer_choice
+    web_entry: 桌面端首次启动引导（选择云端或本机运行）
+    cos: excluded:运行宿主架构选择，涉及本机配对流程，由用户在端上选择
+    profiles: [everflow, core]
+
+  - key: user.font_size
+    stored_in: 浏览器 localStorage（fontScale，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 字体大小
+    cos: excluded:设备本地显示比例，仅在浏览器设置页调整
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 2. 用户偏好 — 投资画像与助手风格（risk / investment / agent_preference）
+  # ===========================================================================
+  - key: user_preferences.risk_preference.risk_level
+    stored_in: user_preferences.risk_preference.risk_level
+    web_entry: 设置 → 投资画像 → 风险偏好
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.risk_preference.risk_tolerance
+    stored_in: user_preferences.risk_preference.risk_tolerance
+    web_entry: 设置 → 投资画像（自由文本兼容字段）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.investor_type
+    stored_in: user_preferences.investment_preference.investor_type
+    web_entry: 设置 → 投资画像 → 投资者类型
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.experience
+    stored_in: user_preferences.investment_preference.experience
+    web_entry: 设置 → 投资画像 → 投资年限
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.help_with
+    stored_in: user_preferences.investment_preference.help_with
+    web_entry: 设置 → 投资画像 → 希望助手协助的方向
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.familiar_instruments
+    stored_in: user_preferences.investment_preference.familiar_instruments
+    web_entry: 设置 → 投资画像（历史交易品种字段）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.markets
+    stored_in: user_preferences.investment_preference.markets
+    web_entry: 设置 → 投资画像 → 关注市场
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.asset_classes
+    stored_in: user_preferences.investment_preference.asset_classes
+    web_entry: 设置 → 投资画像 → 关注资产类别
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.approaches
+    stored_in: user_preferences.investment_preference.approaches
+    web_entry: 设置 → 投资画像 → 分析方法
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.styles
+    stored_in: user_preferences.investment_preference.styles
+    web_entry: 设置 → 投资画像 → 投资风格
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.horizon
+    stored_in: user_preferences.investment_preference.horizon
+    web_entry: 设置 → 投资画像 → 持有周期
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.sectors
+    stored_in: user_preferences.investment_preference.sectors
+    web_entry: 设置 → 投资画像 → 关注行业
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.brokerages
+    stored_in: user_preferences.investment_preference.brokerages
+    web_entry: 设置 → 投资画像 → 常用券商
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.company_interest
+    stored_in: user_preferences.investment_preference.company_interest
+    web_entry: 设置 → 投资画像（自由文本兼容字段）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.holding_period
+    stored_in: user_preferences.investment_preference.holding_period
+    web_entry: 设置 → 投资画像（自由文本兼容字段）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.investment_preference.analysis_focus
+    stored_in: user_preferences.investment_preference.analysis_focus
+    web_entry: 设置 → 投资画像（自由文本兼容字段）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.research_depth
+    stored_in: user_preferences.agent_preference.research_depth
+    web_entry: 设置 → 对话与助手 → 研究深度
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.proactivity
+    stored_in: user_preferences.agent_preference.proactivity
+    web_entry: 设置 → 对话与助手 → 主动沟通频率
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.output_style
+    stored_in: user_preferences.agent_preference.output_style
+    web_entry: 设置 → 对话与助手（自由文本输出风格）
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.output_format
+    stored_in: user_preferences.agent_preference.output_format
+    web_entry: 设置 → 对话与助手 → 输出格式优先级
+    cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 3. 用户偏好 — 模型与路由（user_preferences.model_preference）
+  # ===========================================================================
+  - key: user_preferences.model_preference.preferred_model
+    stored_in: user_preferences.model_preference.preferred_model
+    web_entry: 设置 → 模型 → 默认模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.preferred_background_model
+    stored_in: user_preferences.model_preference.preferred_background_model
+    web_entry: 设置 → 模型 → 后台模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.default_model_scope
+    stored_in: user_preferences.model_preference.default_model_scope
+    web_entry: 设置 → 模型 → 更改默认模型时
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.background_follows
+    stored_in: user_preferences.model_preference.background_follows
+    web_entry: 设置 → 模型 → 后台模型（跟随策略）
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.reasoning_effort
+    stored_in: user_preferences.model_preference.reasoning_effort
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 思考强度
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.prompt_guidance
+    stored_in: user_preferences.model_preference.prompt_guidance
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 提示词详细程度
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.fast_mode
+    stored_in: user_preferences.model_preference.fast_mode
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 快速模式
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.compaction_profile
+    stored_in: user_preferences.model_preference.compaction_profile
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 压缩预设
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.native_compaction
+    stored_in: user_preferences.model_preference.native_compaction
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 原生压缩
+    cos: excluded:底层供应商上下文压缩机制开关，由用户在高级模型设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.cold_compaction
+    stored_in: user_preferences.model_preference.cold_compaction
+    web_entry: 设置 → 模型 → 高级模型设置 → 账户默认值 → 闲置压缩
+    cos: excluded:底层缓存过期冷压缩机制开关，由用户在高级模型设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.profiles
+    stored_in: user_preferences.model_preference.profiles
+    web_entry: 设置 → 模型 → 高级模型设置 → 按模型设置
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.fallback_models
+    stored_in: user_preferences.model_preference.fallback_models
+    web_entry: 设置 → 模型 → 高级模型设置 → 路由 → 备用模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.compaction_model
+    stored_in: user_preferences.model_preference.compaction_model
+    web_entry: 设置 → 模型 → 高级模型设置 → 路由 → 上下文压缩模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.summarization_model
+    stored_in: user_preferences.model_preference.summarization_model
+    web_entry: 设置 → 模型 → 高级模型设置 → 路由 → 摘要模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.fetch_model
+    stored_in: user_preferences.model_preference.fetch_model
+    web_entry: 设置 → 模型 → 高级模型设置 → 路由 → 网页抓取模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.custom_models
+    stored_in: user_preferences.model_preference.custom_models
+    web_entry: 设置 → 模型 → 模型访问（自定义模型）
+    cos: excluded:关联个人自定义端点与 BYOK 凭据配置，由用户在网页端管理
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.custom_providers
+    stored_in: user_preferences.model_preference.custom_providers
+    web_entry: 设置 → 模型 → 模型访问（自定义供应商）
+    cos: excluded:涉及自定义供应商端点与 API 凭据，由用户在网页端管理
+    profiles: [everflow, core]
+
+  # --- Dalton 专属后台任务模型与推送设置（存储在 model_preference） ---
+  - key: user_preferences.model_preference.dalton_audit_model
+    stored_in: user_preferences.model_preference.dalton_audit_model（默认见 src/dalton/dalton.yaml publish.audit_model）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 数据核验模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_language_model
+    stored_in: user_preferences.model_preference.dalton_language_model（默认见 src/dalton/dalton.yaml publish.language_model）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 文字审校模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_audit_fallback_models
+    stored_in: user_preferences.model_preference.dalton_audit_fallback_models（默认见 src/dalton/dalton.yaml publish.audit_fallback_models）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 数据核验备用模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_audit_timeout_s
+    stored_in: user_preferences.model_preference.dalton_audit_timeout_s（默认见 src/dalton/dalton.yaml publish.audit_timeout_s）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 单次核验超时
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_assist_model
+    stored_in: user_preferences.model_preference.dalton_assist_model（默认见 src/dalton/dalton.yaml models.assist_model）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 轻量后台任务模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_assist_fallback_models
+    stored_in: user_preferences.model_preference.dalton_assist_fallback_models（默认见 src/dalton/dalton.yaml models.assist_fallback_model）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 轻量后台任务备用模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_reviewer_models
+    stored_in: user_preferences.model_preference.dalton_reviewer_models（默认见 src/dalton/dalton.yaml publish.reviewer_models）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 独立复核候选模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.model_preference.dalton_extract_model
+    stored_in: user_preferences.model_preference.dalton_extract_model（默认见 src/dalton/dalton.yaml conversations.extractor_model）
+    web_entry: 设置 → 模型 → 高级模型设置 → 后台任务使用的模型 → 研究记忆整理模型
+    cos: missing
+    profiles: [everflow]
+    capability: conversation_archive
+
+  - key: user_preferences.model_preference.dalton_notify_enabled
+    stored_in: user_preferences.model_preference.dalton_notify_enabled
+    web_entry: 设置 → 消息与渠道 → 自动推送与接收账号 → 自动推送总开关
+    cos: missing
+    profiles: [everflow]
+    capability: channel_gateway
+
+  - key: user_preferences.model_preference.dalton_notify_targets
+    stored_in: user_preferences.model_preference.dalton_notify_targets
+    web_entry: 设置 → 消息与渠道 → 自动推送与接收账号 → 默认个人收件人
+    cos: tool:dalton_notify_settings
+    profiles: [everflow]
+    capability: channel_gateway
+    note: 当前工具支持确认后新增个人目标（add_personal_target），删除目标在网页设置页完成
+
+  - key: user_preferences.model_preference.dalton_notify_overrides
+    stored_in: user_preferences.model_preference.dalton_notify_overrides
+    web_entry: 设置 → 消息与渠道 → 自动推送与接收账号（及自动化任务推送开关）
+    cos: tool:dalton_notify_settings
+    profiles: [everflow]
+    capability: channel_gateway
+
+  - key: user_preferences.model_preference.dalton_notify_target_labels
+    stored_in: user_preferences.model_preference.dalton_notify_target_labels
+    web_entry: 设置 → 消息与渠道 → 自动推送与接收账号 → 个人目标名称
+    cos: tool:dalton_notify_settings
+    profiles: [everflow]
+    capability: channel_gateway
+
+  - key: user_preferences.model_preference.dalton_notify_routes
+    stored_in: user_preferences.model_preference.dalton_notify_routes
+    web_entry: 自动化任务详情 → 推送路由（及消息与渠道设置）
+    cos: tool:dalton_notify_settings
+    profiles: [everflow]
+    capability: channel_gateway
+
+  # ===========================================================================
+  # 4. 用户偏好 — 其他偏好（user_preferences.other_preference）
+  # ===========================================================================
+  - key: user_preferences.other_preference.starred_models
+    stored_in: user_preferences.other_preference.starred_models
+    web_entry: 设置 → 模型 → 收藏的模型
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.search_provider
+    stored_in: user_preferences.other_preference.search_provider
+    web_entry: 设置 → 对话与助手 → 网络搜索引擎
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.search_depth
+    stored_in: user_preferences.other_preference.search_depth
+    web_entry: 设置 → 对话与助手 → 搜索深度
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.subagents_default
+    stored_in: user_preferences.other_preference.subagents_default
+    web_entry: 设置 → 对话与助手 → 子 Agent 默认开关
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.auto_approve_handoffs
+    stored_in: user_preferences.other_preference.auto_approve_handoffs
+    web_entry: 设置 → 对话与助手 → 交给分析师前不再询问
+    cos: excluded:安全授权开关，须由本人在设置页明确开启或关闭，避免智能体绕过人工确认
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.auto_approve_workspace_creation
+    stored_in: user_preferences.other_preference.auto_approve_workspace_creation
+    web_entry: 设置 → 对话与助手 → 创建工作区前不再询问
+    cos: excluded:安全授权开关，须由本人在设置页明确开启或关闭，避免智能体绕过人工确认
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.own_context_in_shared_workspaces
+    stored_in: user_preferences.other_preference.own_context_in_shared_workspaces
+    web_entry: 设置 → 对话与助手 → 在共享工作区使用个人记忆与偏好
+    cos: excluded:共享工作区个人隐私与上下文隔离边界，由本人在网页端切换
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.claude_code_plan_out
+    stored_in: user_preferences.other_preference.claude_code_plan_out
+    web_entry: 设置 → 模型 → 模型访问 → Claude Code 额度用尽后的处理
+    cos: excluded:涉及订阅额度用尽后是否扣减付费信用点（账单边界），由本人在网页端选择
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.feature_overrides
+    stored_in: user_preferences.other_preference.feature_overrides（通过 PUT /api/v1/features/{key} 写入）
+    web_entry: 实验特性入口（Dalton 构建默认隐藏，含服务端 grant 授权）
+    cos: excluded:服务端特性门控与内部授权覆盖，由服务端接口控制
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.account_setup_completed_at
+    stored_in: user_preferences.other_preference.account_setup_completed_at
+    web_entry: 托管引导完成时间（服务端只读标记）
+    cos: excluded:服务端记录的账户引导完成时间戳，仅由服务端写入
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.dalton_team_base_url_classes
+    stored_in: user_preferences.other_preference.dalton_team_base_url_classes
+    web_entry: 团队凭据端点外联策略（本地认证模式自动维护）
+    cos: excluded:服务端外联安全策略元数据，由凭据管理接口维护
+    profiles: [core]
+
+  - key: user_preferences.other_preference.theme
+    stored_in: user_preferences.other_preference.theme
+    web_entry: 设置 → 通用与外观 → 主题（浅色/深色/跟随系统）
+    cos: excluded:前端界面外观偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.card_style
+    stored_in: user_preferences.other_preference.card_style
+    web_entry: 设置 → 通用与外观 → 卡片样式
+    cos: excluded:前端界面外观偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.turn_display
+    stored_in: user_preferences.other_preference.turn_display
+    web_entry: 设置 → 对话与助手 → 回复过程展示
+    cos: excluded:前端对话界面显示方式，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.response_streaming_mode
+    stored_in: user_preferences.other_preference.response_streaming_mode
+    web_entry: 设置 → 对话与助手 → 回复流式输出方式
+    cos: excluded:前端对话界面流式渲染习惯，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.tool_call_layout
+    stored_in: user_preferences.other_preference.tool_call_layout
+    web_entry: 设置 → 对话与助手 → 工具调用展示样式
+    cos: excluded:前端对话界面布局偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.turn_end_scroll
+    stored_in: user_preferences.other_preference.turn_end_scroll
+    web_entry: 设置 → 对话与助手 → 回复结束滚动位置
+    cos: excluded:前端对话界面滚动习惯，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.composer_tray
+    stored_in: user_preferences.other_preference.composer_tray
+    web_entry: 设置 → 对话与助手 → 输入框工具栏位置
+    cos: excluded:前端输入框布局偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.voice_input_enabled
+    stored_in: user_preferences.other_preference.voice_input_enabled
+    web_entry: 设置 → 对话与助手 → 语音输入
+    cos: excluded:前端麦克风交互开关，依赖浏览器权限，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.artifact_comment_destination
+    stored_in: user_preferences.other_preference.artifact_comment_destination
+    web_entry: 设置 → 对话与助手 → 评论去向
+    cos: excluded:前端文档划词评论交互偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.artifact_comment_enter
+    stored_in: user_preferences.other_preference.artifact_comment_enter
+    web_entry: 设置 → 对话与助手 → 评论框回车行为
+    cos: excluded:前端键盘快捷键偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.artifact_answers
+    stored_in: user_preferences.other_preference.artifact_answers
+    web_entry: 设置 → 对话与助手 → 评论回答展示位置
+    cos: excluded:前端文档评论回复展示偏好，仅在设置页调整
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.onboarding
+    stored_in: user_preferences.other_preference.onboarding
+    web_entry: 设置 → 通用与外观 → 新手引导与页面提示
+    cos: excluded:前端新手引导内部状态记录，由前端引导流程维护
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.dashboard
+    stored_in: user_preferences.other_preference.dashboard
+    web_entry: 仪表盘页面 → 卡片拖拽布局
+    cos: excluded:前端仪表盘可视化网格布局，仅在仪表盘页面操作
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.custom_dashboards
+    stored_in: user_preferences.other_preference.custom_dashboards
+    web_entry: 仪表盘页面 → 自定义看板切换与列表
+    cos: excluded:前端仪表盘展示列表，由用户在仪表盘页面管理
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.claude_sign_in_notice_dismissed
+    stored_in: user_preferences.other_preference.claude_sign_in_notice_dismissed
+    web_entry: 前端公告提示条关闭状态
+    cos: excluded:前端提示条已读记录，属于界面内部状态
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.hidden_quick_access_models
+    stored_in: user_preferences.other_preference.hidden_quick_access_models
+    web_entry: 设置 → 模型 → 收藏的模型（历史兼容字段）
+    cos: excluded:历史快捷模型迁移兼容字段，由前端自动维护
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.favorites_starred_only
+    stored_in: user_preferences.other_preference.favorites_starred_only
+    web_entry: 设置 → 模型 → 收藏的模型（迁移标记）
+    cos: excluded:前端收藏列表迁移标记，由首次编辑自动写入
+    profiles: [everflow, core]
+
+  - key: user_preferences.other_preference.skills
+    stored_in: user_preferences.other_preference.skills.command_overrides
+    web_entry: 侧栏「插件」→ 技能命令覆盖设置
+    cos: excluded:技能命令别名覆盖配置，由插件与技能页面维护
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 5. 对话线程设置（conversation_threads，ThreadUpdateRequest 等）
+  # ===========================================================================
+  - key: thread.llm_model
+    stored_in: conversation_threads.llm_model
+    web_entry: 对话输入区 → 当前对话模型选择器
+    cos: tool:switch_thread_model
+    profiles: [everflow, core]
+
+  - key: thread.title
+    stored_in: conversation_threads.title
+    web_entry: 侧栏对话列表 → 重命名对话
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.is_pinned
+    stored_in: conversation_threads.is_pinned
+    web_entry: 侧栏对话列表 → 置顶/取消置顶
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.archived
+    stored_in: conversation_threads.archived_at
+    web_entry: 侧栏对话列表 → 归档/取消归档对话
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.reasoning_effort
+    stored_in: conversation_threads.reasoning_effort
+    web_entry: 对话输入区 → 单对话思考强度
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.fast_mode
+    stored_in: conversation_threads.fast_mode
+    web_entry: 对话输入区 → 单对话快速模式
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.subagents_allowed
+    stored_in: conversation_threads.subagents_allowed
+    web_entry: 对话输入区 → 单对话子 Agent 开关
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: thread.shared_with_workspace
+    stored_in: conversation_threads.shared_with_workspace
+    web_entry: 共享工作区对话输入区隐私切换 / 聊天顶部隐私栏
+    cos: excluded:共享工作区对话对他人可见性边界，须由本人在界面切换
+    profiles: [everflow, core]
+
+  - key: thread.is_shared
+    stored_in: conversation_threads.is_shared
+    web_entry: 对话右上角 → 分享对话面板
+    cos: excluded:外部分享开关涉及公开访问安全边界，须由本人在分享面板操作
+    profiles: [everflow, core]
+
+  - key: thread.share_permissions
+    stored_in: conversation_threads.share_permissions（audience / allow_files / allow_download / root_path）
+    web_entry: 对话右上角 → 分享对话面板（受众与文件权限）
+    cos: excluded:分享链接受众与文件浏览下载权限涉及数据泄露边界，须由本人在分享面板操作
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 6. 自动化任务设置（automations，AutomationCreate / AutomationUpdate / CompanyScriptUpdate）
+  # ===========================================================================
+  - key: automation.name
+    stored_in: automations.name
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 名称
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.description
+    stored_in: automations.description
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 描述
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_type
+    stored_in: automations.trigger_type
+    web_entry: 侧栏「自动化」→ 新建任务 → 触发方式（cron / once / price）
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.cron_expression
+    stored_in: automations.cron_expression（脚本任务存于 dalton_data_task_defs.cron_expression）
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 定时表达式
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+    note: 个人任务经自动化 JSON 文件编辑，受管财报任务经 dalton_schedule_automation，公司数据脚本经 dalton_system_jobs
+
+  - key: automation.next_run_at
+    stored_in: automations.next_run_at
+    web_entry: 侧栏「自动化」→ 新建/编辑单次任务 → 运行时间
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config
+    stored_in: automations.trigger_config
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 价格条件与复触发设置
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.timezone
+    stored_in: automations.timezone（脚本任务存于 dalton_data_task_defs.timezone）
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 时区
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.instruction
+    stored_in: automations.instruction
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 任务指令
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.workspace_id
+    stored_in: automations.workspace_id
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 运行工作区
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.llm_model
+    stored_in: automations.llm_model
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 模型覆盖
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+    note: 个人任务经自动化 JSON 文件编辑，受管任务经 dalton_schedule_automation
+
+  - key: automation.reasoning_effort
+    stored_in: automations.reasoning_effort
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 思考强度覆盖
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+    note: 个人任务经自动化 JSON 文件编辑，受管任务经 dalton_schedule_automation
+
+  - key: automation.thread_strategy
+    stored_in: automations.thread_strategy
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 对话线程策略
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.conversation_thread_id
+    stored_in: automations.conversation_thread_id
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 固定续聊线程
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.max_failures
+    stored_in: automations.max_failures
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 连续失败停用阈值
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.delivery_config
+    stored_in: automations.delivery_config
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 结果投递渠道
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.metadata
+    stored_in: automations.metadata（定时报告投递对象为 metadata.report_profile）
+    web_entry: 侧栏「自动化」→ 定时报告任务详情 → 报告发送对象
+    cos: tool:dalton_report_delivery
+    profiles: [everflow, core]
+    note: 报告发送对象（report_profile）通过 dalton_report_delivery 配置，其余服务端审计与覆盖单元元数据由服务端管理
+
+  - key: automation.additional_context
+    stored_in: automations.additional_context
+    web_entry: 侧栏「自动化」→ 新建/编辑任务 → 附加上下文与附件
+    cos: excluded:包含前端上传的多模态附件、图表快照与上下文结构，需在网页自动化表单中附加
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 7. 工作区与电脑设置（workspaces / computers）
+  # ===========================================================================
+  - key: workspace.name
+    stored_in: workspaces.name
+    web_entry: 工作区菜单 → 编辑工作区 → 名称
+    cos: tool:manage_workspaces
+    profiles: [everflow, core]
+
+  - key: workspace.description
+    stored_in: workspaces.description
+    web_entry: 工作区菜单 → 编辑工作区 → 描述
+    cos: tool:manage_workspaces
+    profiles: [everflow, core]
+
+  - key: workspace.is_pinned
+    stored_in: workspaces.is_pinned
+    web_entry: 工作区列表 → 置顶/取消置顶工作区
+    cos: missing
+    profiles: [everflow, core]
+
+  - key: workspace.dalton_auto_ingest
+    stored_in: workspaces.config.dalton_auto_ingest
+    web_entry: 对应工作区对话列表顶部 → 自动入库开关
+    cos: missing
+    profiles: [everflow]
+    capability: researchdata_bridge
+
+  - key: computer.name
+    stored_in: computers.name
+    web_entry: 设置 → 电脑 → 重命名电脑（Dalton 构建隐藏电脑页）
+    cos: excluded:电脑设备标识与运行时管理，由所有者在设备面板操作
+    profiles: [everflow, core]
+
+  - key: computer.resource_tier
+    stored_in: computers.resource_tier
+    web_entry: 设置 → 电脑 / 沙箱设置面板 → 算力规格
+    cos: excluded:涉及云端沙箱算力档位与成本配额，由所有者在网页端操作
+    profiles: [everflow, core]
+
+  - key: computer.is_always_on
+    stored_in: computers.is_always_on
+    web_entry: 设置 → 电脑 / 沙箱设置面板 → 保持运行（Always-On）
+    cos: excluded:涉及常驻沙箱配额与成本计费，由所有者在网页端操作
+    profiles: [everflow, core]
+
+  - key: computer.files_backup
+    stored_in: computers.files_backup
+    web_entry: 设置 → 电脑 → 自动备份工作区文件
+    cos: excluded:宿主机文件备份与云端存储策略，由所有者在设备面板操作
+    profiles: [everflow, core]
+
+  - key: computer.browser.quality
+    stored_in: computers.config.browser_quality
+    web_entry: 设置 → 电脑 → 浏览器实时画面清晰度
+    cos: excluded:沙箱浏览器视频流编码画质配置，由所有者在设备面板操作
+    profiles: [everflow, core]
+
+  - key: computer.browser.window
+    stored_in: computers.config.browser_window
+    web_entry: 设置 → 电脑 → 在 Mac 屏幕显示浏览器窗口
+    cos: excluded:本机桌面窗口显示选项，仅由本机所有者在桌面端操作
+    profiles: [everflow, core]
+
+  - key: computer.browser.signins
+    stored_in: computers.config.browser_signins
+    web_entry: 设置 → 电脑 → 保留浏览器登录态 / 退出全部站点
+    cos: excluded:涉及浏览器 Cookie 与第三方站点登录凭据保留，禁止智能体代改
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 8. Dalton 专属设置接口（src/dalton/app/* 与 src/dalton/monitors/router.py）
+  # ===========================================================================
+  - key: dalton.budget
+    stored_in: dalton_user_budgets（daily_cap_usd / default_task_cap_usd / timezone）
+    web_entry: 设置 → 用量与预算 → 个人每日美元预算
+    cos: excluded:涉及个人每日美元花费上限与成本风控，不由智能体自行调整
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/budget
+
+  - key: dalton.budget.task_caps
+    stored_in: dalton_task_caps（scope_kind / scope_id / cap_usd）
+    web_entry: 设置 → 用量与预算 → 个人每日美元预算 → 按工作区覆盖单任务上限
+    cos: excluded:涉及单任务美元花费上限与成本风控，不由智能体自行调整
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}
+
+  - key: dalton.workspace.sharing
+    stored_in: dalton_workspace_sharing（cos_access / web_access）
+    web_entry: 对应工作区对话列表顶部 → 共享设置 → 访问级别
+    cos: excluded:跨成员工作区读写与可见权限边界，须由工作区所有者在网页端授权
+    profiles: [everflow]
+    capability: colleague_sharing
+    routes:
+      - PUT /api/v1/dalton/workspaces/{workspace_id}/sharing
+
+  - key: dalton.workspace.team_memory
+    stored_in: dalton_workspace_settings.team_memory_enabled
+    web_entry: 对应工作区对话列表顶部 → 共享设置 → 团队记忆
+    cos: missing
+    profiles: [everflow]
+    capability: conversation_archive
+    routes:
+      - PUT /api/v1/dalton/workspaces/{workspace_id}/settings
+
+  - key: dalton.sharing.cos_rw_enabled
+    stored_in: dalton_user_sharing_settings.cos_rw_enabled
+    web_entry: 设置 → 对话与助手 → 工作区协同共享
+    cos: excluded:允许同事研究总监向本人工作区派活的安全授权开关，须由本人在设置页切换
+    profiles: [everflow]
+    capability: colleague_sharing
+    routes:
+      - PUT /api/v1/dalton/sharing/user-settings
+
+  - key: dalton.user.home_team_memory
+    stored_in: dalton_user_settings.home_team_memory_enabled
+    web_entry: 设置 → 对话与助手 → 共享团队历史研究记录
+    cos: missing
+    profiles: [everflow]
+    capability: conversation_archive
+    routes:
+      - PUT /api/v1/dalton/user-settings
+
+  - key: dalton.automation.managed
+    stored_in: automations 表（受覆盖单元管理的 dalton-* 自动化任务）
+    web_entry: 侧栏「自动化」→「研究跟踪」
+    cos: tool:dalton_schedule_automation
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/automations/{name}
+
+  - key: dalton.earnings.calendar_mirror
+    stored_in: dalton_user_earnings_calendar_mirrors
+    web_entry: 个人财报日历自动镜像同步
+    cos: tool:dalton_publish_earnings_calendar
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/earnings/calendar/mirror
+
+  - key: dalton.feishu.read_scopes
+    stored_in: dalton_feishu_read_scopes
+    web_entry: 设置 → 团队管理 → 成员与权限 → 飞书读取权限
+    cos: excluded:管理员专用飞书文档读取白名单，涉及团队资料访问安全边界
+    profiles: [everflow]
+    capability: feishu_docs
+    routes:
+      - PUT /api/v1/dalton/feishu/read-scopes
+
+  - key: dalton.team_models.model
+    stored_in: dalton_team_model_catalog
+    web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录
+    cos: excluded:管理员专用团队模型目录配置，涉及定价、评分、退役与全员可用性
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/team-models/{model_key}
+
+  - key: dalton.team_models.provider_variant
+    stored_in: dalton_team_model_provider_variants
+    web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（供应商变体）
+    cos: excluded:管理员专用模型供应商变体与路由配置
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/team-models/provider-variants/{provider_slug}
+
+  - key: dalton.team_models.curated
+    stored_in: dalton_team_model_curated_setup
+    web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（入门推荐模型）
+    cos: excluded:管理员专用入门推荐模型列表配置
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/team-models/curated
+
+  - key: dalton.watchlist.tier_policy
+    stored_in: dalton_watchlist_tier_policies（core / watch / radar 各档监控策略）
+    web_entry: 设置 → 覆盖结构 → 各档监控策略
+    cos: tool:dalton_coverage
+    profiles: [everflow, core]
+    routes:
+      - PUT /api/v1/dalton/watchlist/tier-policies/{tier}
+
+  - key: dalton.coverage_unit
+    stored_in: dalton_coverage_units（行业/公司覆盖单元与工作区绑定）
+    web_entry: 设置 → 覆盖结构 → 团队覆盖结构
+    cos: tool:dalton_coverage_unit
+    profiles: [everflow]
+    capability: colleague_sharing
+
+  - key: dalton.system_jobs
+    stored_in: dalton_data_task_defs（公司公共数据任务定时排期与启停开关）
+    web_entry: 设置 → 团队管理 → 团队渠道与运维 → 自动巡检与团队公共任务（及自动化 → 公司公共任务）
+    cos: tool:dalton_system_jobs
+    profiles: [everflow]
+    capability: data_jobs
+
+  - key: dalton.monitors.settings
+    stored_in: dalton_monitors（标题、可见范围与发布设置）
+    web_entry: 侧栏「监控面板」→ 面板设置
+    cos: tool:dalton_monitor
+    profiles: [everflow, core]
+    routes:
+      - PATCH /api/v1/dalton/monitors/{slug}
+
+  - key: dalton.monitors.shared_document
+    stored_in: dalton_monitors（工作区分享文档元数据与可见范围）
+    web_entry: 工作区文件发布/分享面板
+    cos: excluded:公开与团队分享文档可见范围边界，须由用户在分享面板操作
+    profiles: [everflow, core]
+    routes:
+      - PATCH /api/v1/dalton/monitors/shared-documents/by-artifact/{artifact_id}
+
+  # ===========================================================================
+  # 9. 渠道与外部集成（channels / integrations）
+  # ===========================================================================
+  - key: channels.settings
+    stored_in: dalton_channel_user_settings（default / chats / preferred / automation_output / agent_messages）
+    web_entry: 设置 → 消息与渠道（默认工作区、首选会话、自动化输出与允许主动发送的群）
+    cos: tool:edit_file(.agents/user/channels/channels.json)
+    profiles: [everflow]
+    capability: channel_gateway
+    routes:
+      - PUT /api/v1/dalton/channels/settings
+      - PUT /api/v1/dalton/channels/internal/settings
+
+  - key: channels.weixin.admin_config
+    stored_in: dalton_weixin_channel_config（enabled / allow_external）
+    web_entry: 设置 → 团队管理 → 团队渠道与运维 → 团队微信渠道管理
+    cos: excluded:管理员专用团队微信接入开关与外部成员接入策略
+    profiles: [everflow]
+    capability: channel_weixin
+    routes:
+      - PUT /api/v1/dalton/channels/weixin/admin/config
+
+  - key: channels.weixin.binding
+    stored_in: dalton_weixin_accounts（个人微信 iLink 扫码绑定与登录态）
+    web_entry: 设置 → 消息与渠道 → 我的微信绑定
+    cos: excluded:涉及个人微信扫码鉴权与会话令牌，须由本人在网页端扫码绑定或解绑
+    profiles: [everflow]
+    capability: channel_weixin
+
+  - key: channels.feishu_discord.binding
+    stored_in: dalton_channel_bindings（飞书与 Discord 个人账号绑定）
+    web_entry: 设置 → 消息与渠道 → 飞书与 Discord 账号绑定
+    cos: excluded:涉及绑定码身份核验与账号解绑，须由本人在网页端完成
+    profiles: [everflow]
+    capability: channel_gateway
+
+  - key: channels.feishu.groups
+    stored_in: dalton_channel_feishu_groups（团队飞书群绑定与报告接收权限）
+    web_entry: 设置 → 团队管理 → 团队渠道与运维 → 飞书团队群
+    cos: excluded:团队共享群绑定管理，由内部成员或管理员在网页端维护
+    profiles: [everflow]
+    capability: channel_feishu
+
+  - key: channels.discord.channels
+    stored_in: dalton_channel_discord_channels（团队 Discord 频道绑定与报告接收权限）
+    web_entry: 设置 → 团队管理 → 团队渠道与运维 → Discord 频道
+    cos: excluded:管理员专用团队 Discord 频道绑定配置
+    profiles: [everflow]
+    capability: channel_discord
+
+  - key: integrations.trading_permission
+    stored_in: user_trading_permissions（Dalton 构建锁定为 no_trading）
+    web_entry: 当前版本不开放交易权限设置页
+    cos: excluded:涉及实盘交易自动下单授权协议且当前版本禁用，严禁智能体修改
+    profiles: [everflow, core]
+
+  - key: integrations.user_api_keys
+    stored_in: user_api_keys（加密存储）
+    web_entry: 设置 → 模型 → 模型访问（自带 API Key）
+    cos: excluded:用户私有 API 密钥凭据，禁止经对话上下文读写
+    profiles: [everflow, core]
+
+  - key: integrations.user_oauth_tokens
+    stored_in: user_oauth_tokens（加密存储）
+    web_entry: 设置 → 模型 → 模型访问（订阅账号 OAuth 登录）
+    cos: excluded:第三方账号 OAuth 登录凭据，须由本人在浏览器完成授权
+    profiles: [everflow, core]
+
+  - key: integrations.vault_secrets
+    stored_in: user_vault_secrets（加密存储）
+    web_entry: 侧栏「插件」→ 密钥（Vault）
+    cos: excluded:敏感密钥保管库，禁止智能体通过对话工具写入或导出
+    profiles: [everflow, core]
+
+  - key: integrations.mcp_servers
+    stored_in: user_mcp_servers / workspace_mcp_servers
+    web_entry: 侧栏「插件」→ 连接器（以及工作区 Sandbox Settings → MCP）
+    cos: excluded:涉及外部 MCP 端点 URL、认证头与命令执行权限，由用户在插件页管理
+    profiles: [everflow, core]
+
+  - key: integrations.plugins
+    stored_in: user_plugins
+    web_entry: 侧栏「插件」→ 插件启停与安装
+    cos: excluded:账户级插件安装与启用状态，由用户在插件页管理
+    profiles: [everflow, core]
+
+  - key: integrations.skills
+    stored_in: user_skills
+    web_entry: 侧栏「插件」→ 技能（以及工作区 Sandbox Settings → Skills）
+    cos: excluded:账户与工作区技能安装及启停，由用户在插件页或沙箱面板管理
+    profiles: [everflow, core]
+
+  - key: integrations.subagents
+    stored_in: user_subagents（.agents/user/agents/*.md）
+    web_entry: 侧栏「插件」→ 子 Agent
+    cos: tool:edit_file(.agents/user/agents/*.md)
+    profiles: [everflow, core]
+
+  # ===========================================================================
+  # 10. 自部署服务端配置（deployment_settings 表，src/server/services/setup_settings/catalog.py）
+  # ===========================================================================
+  - key: deployment_settings.SANDBOX_PROVIDER
+    stored_in: deployment_settings（name = 'SANDBOX_PROVIDER'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 代码运行环境
+    cos: excluded:部署级沙箱运行时选择，仅限自部署管理员在服务器设置页配置
+    profiles: [core]
+
+  - key: deployment_settings.LOCAL_INSTALL_GROUPS
+    stored_in: deployment_settings（name = 'LOCAL_INSTALL_GROUPS'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 本地安装组件组
+    cos: excluded:部署级本地依赖安装组配置，仅限自部署管理员在服务器设置页配置
+    profiles: [core]
+
+  - key: deployment_settings.SETUP_COMPLETED
+    stored_in: deployment_settings（name = 'SETUP_COMPLETED'，pgcrypto 加密）
+    web_entry: 自部署首次配置向导完成标记
+    cos: excluded:部署级初始化完成标记，仅由首次配置向导写入
+    profiles: [core]
+
+  - key: deployment_settings.FMP_API_KEY
+    stored_in: deployment_settings（name = 'FMP_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 市场数据密钥
+    cos: excluded:部署级第三方数据供应商 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.TAVILY_API_KEY
+    stored_in: deployment_settings（name = 'TAVILY_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.SERPER_API_KEY
+    stored_in: deployment_settings（name = 'SERPER_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.BOCHA_API_KEY
+    stored_in: deployment_settings（name = 'BOCHA_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.EXA_API_KEY
+    stored_in: deployment_settings（name = 'EXA_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.PARALLEL_API_KEY
+    stored_in: deployment_settings（name = 'PARALLEL_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级网络搜索 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.DEEPSEEK_API_KEY
+    stored_in: deployment_settings（name = 'DEEPSEEK_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网络搜索密钥
+    cos: excluded:部署级第三方 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.FIRECRAWL_API_KEY
+    stored_in: deployment_settings（name = 'FIRECRAWL_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 网页抓取密钥
+    cos: excluded:部署级网页抓取 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.DAYTONA_API_KEY
+    stored_in: deployment_settings（name = 'DAYTONA_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 云沙箱密钥
+    cos: excluded:部署级云沙箱供应商 API 密钥，禁止智能体读写
+    profiles: [core]
+
+  - key: deployment_settings.E2B_API_KEY
+    stored_in: deployment_settings（name = 'E2B_API_KEY'，pgcrypto 加密）
+    web_entry: 自部署引导 / 设置 → 服务器 → 云沙箱密钥
+    cos: excluded:部署级云沙箱供应商 API 密钥，禁止智能体读写
+    profiles: [core]
