@@ -213,9 +213,9 @@ edition's output directory and refuses a parent holding several.
 | `src/downloads.js` | gives a download a visible ending, since a frameless window has no download shelf |
 | `src/notify.js` | the dock bounce that says a file landed, and posting thread notifications: whether to, and where a click goes |
 | `src/outage.js` | what replaces a blank window when the network does not answer |
-| `src/updater.js` | auto-update, gated on a feed actually existing |
+| `src/updater.js` | auto-update, gated on a feed actually existing; the update state the page's button shows, and the channel |
 | `src/probe.js` | "is anything answering", shared by the picker and the outage page |
-| `src/store.js` | a small JSON file: `serverUrl` (the user's own server, never the stack's origin), `stackMode`, `stackPort`, `reachedApp`, `appChrome`, `platformChrome`, `theme`, `updateNotifiedVersion`, `desktop` (the desktop settings: `notifications`, `menubar`, `panel`, `openAtLogin`, `shortcut`, `keepRunningInTray`), `trayNoticeShown` |
+| `src/store.js` | a small JSON file: `serverUrl` (the user's own server, never the stack's origin), `stackMode`, `stackPort`, `reachedApp`, `appChrome`, `platformChrome`, `theme`, `updateNotifiedVersion`, `updateChannel`, `desktop` (the desktop settings: `notifications`, `menubar`, `panel`, `openAtLogin`, `shortcut`, `keepRunningInTray`), `trayNoticeShown` |
 | `src/stack/` | the bundled stack's supervisor: `plan.js` decides, **pure**, like `policy`; `children.js` runs a process with its guard; `logs.js` rotates; `dataFolder.js` keeps the data folder, its snapshot and its restore; `supervisor.js` is the service table, the order and the restarts, with no Electron in it; `index.js` binds it to this install. Left out of the hosted package |
 | `setup/` | the OSS first-run page: the choice, the server form, the stack's progress and its failure, in its own window with its own preload |
 | `outage/` | the outage page, a local file so it renders when nothing else can |
@@ -540,17 +540,23 @@ register.
 - `menubar`: `enabled`, `items` (what sits beside the icon, in order: `{ kind: 'portfolio' }`
   or a quote `{ symbol, kind: 'index' | 'stock' }`, an index bare as `GSPC`; deduplicated,
   at most 8), `style` (`rotate` or `side`), `rotateSeconds` (2 to 30), `show` (`change`,
-  `price` or `both`), `extendedHours`.
+  `price` or `both`), `extendedHours`, `logo` (macOS only, `support.trayLogo`).
 - `panel`: `sections` (all four of `market`, `portfolio`, `watchlist`, `agent` exactly once,
   in display order, each with `visible`), `tiles` (at most 4 quotes), `watchlistId` (null
   for the default list), `watchlistRows` (1 to 10).
+- `badge`: `count`, `dot` or `off`, the app icon's badge for what `setAttention` counts.
+  Each platform draws the nearest it can (`shownBadge`, by the `badge` trait): the Dock all
+  three (the dot is a `•` badge), a Windows overlay a dot or nothing, the Unity launcher
+  a number or nothing. Electron draws no other Linux badge, so none is offered there.
+  `support.badge` lists what it can draw, and the view's `badge` is the one drawn, so a
+  Windows view of `count` reads `dot`.
 
 Lists are repaired rather than refused: a bad or repeated entry goes, a section left out
 is put back where the previous settings had it, a number out of range is clamped. A patch
 is one level deep and replaces whole arrays (`items`, `sections`, `tiles`).
 
 **The lines beside the icon.** The menu bar page formats each item as a line
-(`NVDA ▼5.60%`, `Port ▲0.42%`) and hands the shell the list (`setTrayItems(items,
+(`NVDA −5.60%`, `Port +0.42%`) and hands the shell the list (`setTrayItems(items,
 { refreshMs })`); the shell lays them out (`layout` in `tray.js`, pure) by the settings'
 `menubar.style` and `menubar.rotateSeconds`, never by anything the page sends. On macOS `rotate` is one slot turning
 every `rotateSeconds`, each frame padded to the longest line and drawn in the monospaced
@@ -562,7 +568,10 @@ timers are throttled to once a minute: a four-second slot would sit for sixty. A
 that brings new lines keeps the slot and its timer running rather than restarting them.
 Both timers stop when the icon is hidden and at quit. With nothing chosen in
 `menubar.items` the icon stands alone whatever the page sends, and a settings change
-re-lays or clears the lines at once rather than when the page next reports.
+re-lays or clears the lines at once rather than when the page next reports. With
+`menubar.logo` off the lines stand alone (an empty image, and no leading space), but only
+while there are lines: a status item with neither image nor title is a sliver nobody can
+find to click, so the logo returns whenever the title is empty.
 
 **The icon's menu** (a right-click on macOS and Windows; the icon's only menu on Linux):
 Open LangAlpha; "In the menu bar" and each item, checked, a click removing it; "With more
@@ -610,7 +619,7 @@ platform's answers directly. Any platform other than macOS and Windows is treate
 | Icon | template image; click opens the panel under it, right-click the menu | the app's colours; click opens the panel beside it, whichever edge the taskbar is on, right-click the menu | a menu only (the lines, Open Market Glance…, Open, the menu's settings, Quit), since an AppIndicator reports no clicks; Market Glance is the same page in an ordinary window |
 | Menu bar text | beside the icon: one slot rotating every `rotateSeconds`, padded and monospaced, or the first three side by side | the tooltip: the app's name, then a line each, as many as fit in 127 characters | disabled items heading the icon's menu |
 | Notifications | replaced by id, subtitle, Open / Mark as read | replaced by id, subtitle folded into the body, Open / Mark as read; the AppUserModelID is the bundle id, which the installer's shortcut carries | title, body and click; no replace, so a run's start is not shown |
-| Badge | Dock badge, and a Dock menu of New Thread, Market Glance and up to five threads | an overlay dot on the taskbar button, and a jump list New Thread (`--command=new-thread`, read from the launch's own argv and in `second-instance`) | `setBadgeCount`, where the desktop shows one |
+| Badge | Dock badge, and a Dock menu of New Thread, Market Glance and up to five threads | an overlay dot on the taskbar button, and a jump list New Thread (`--command=new-thread`, read from the launch's own argv and in `second-instance`) | `setBadgeCount`, under Unity only |
 | Last window closed | keeps running | keeps running in the tray when the icon is on and `keepRunningInTray` (telling the user once), else quits | quits |
 | Open at login | the login item; a login launch opens no window | the Run key with `--hidden` | an XDG autostart entry with `--hidden`, pointing at the AppImage when there is one |
 | Global shortcut | toggles the panel | toggles the panel | X11 only: Wayland lets no app grab a key outside its windows |
@@ -798,11 +807,64 @@ without the other is a silent no-op.
 A bundled OSS build updates like any other, through `DESKTOP_UPDATE_FEED`, with the zip
 at about the size of the installer and migrations run by the launch that follows.
 
-The workflow in this repository (`.github/workflows/desktop-release.yml`) builds
-and publishes the OSS edition. What it signs, notarizes and publishes to comes from
-its `desktop-release` environment, whose secrets and variables the workflow's header
-lists, so the environment's branch rule and required review stand between any other
-workflow and those credentials. Each part is optional: without a certificate the
+**An update is offered in the page, not in a dialog.** Once one has downloaded (or, in
+notify mode, been found), `updater.js` sends `shell:update-state` to every window
+showing the app, and the sidebar shows Update ready above the account (`AppUpdate.tsx`
+in the web app). Its panel says what a restart does before doing it: with the bundled
+stack (`stopsServer`) the running turns, background tasks and commands on this computer
+that it pauses, read from `GET /api/v1/users/me/running-work`, and against a server
+elsewhere that the turns keep going. A page asking `shell:get-update-state` is what
+marks its window as showing the button, so the native prompt still appears where the
+loaded web app predates it. A page that takes the button down (`shell:hide-updates`, as
+its phone layout does when zoom narrows the window, and as the sidebar does while it is
+hidden) gets the native prompt once per
+update, unless a page shows the button again within a second, as a sidebar collapsing
+to its rail does; a new document in that window gets five seconds to boot and ask. The
+panel links the version's release when the build was
+given a releases page (`DESKTOP_RELEASES_PAGE`, read as `releasesPage`): the tag
+`desktop-oss-v<version>`, or `desktop-oss-nightly` for a nightly. A turn the restart
+stops is resumed by the next launch, as after any graceful server restart (`restart_drain.py`).
+
+**Automatic updates can be turned off** (`automaticUpdates` in the desktop settings, on by
+default), from Settings or from the switch in the update panel, both writing the same
+setting through `shell:set-desktop-settings`. Off, the timed check still runs and the
+sidebar offers what it finds as Update available; nothing downloads until the person
+clicks Download (`downloading`, then `ready`), and only that update installs on quit.
+One that downloaded before they turned it off waits for a restart they choose
+(`installsOnQuit: false`), except on a Mac, where Squirrel.Mac took it as it landed and
+it still installs on quit, which the panel then says. Turned on again, an update already offered starts downloading.
+The row shows only in a build that downloads its own updates (`support.automaticUpdates`),
+never in notify mode.
+
+**The OSS feed carries two channels, stable (`latest*.yml`) and nightly (`nightly*.yml`).**
+A nightly is `<stable patch + 1>-nightly.<UTC yyyymmddHHMM>`, above the release it follows
+and below the next. Version order has to be commit order too, so a nightly builds only a
+commit at or past the last stable release and the last nightly, and a stable release
+publishes only from one at or past the nightly. An install follows the channel its running version came from until
+the person picks the other under Update Channel in the menu (`updater.pickChannel`,
+stored as `updateChannel`). **No channel move ever downgrades**: electron-updater's
+`channel` setter turns `allowDowngrade` on, and `applyChannel` turns it back off, because
+an older backend cannot run on a database a newer one has migrated. A nightly moved to
+stable stays until a stable release passes it. A pick holds back an update the other
+channel downloaded, except on a Mac: electron-updater hands a download to Squirrel.Mac
+as it lands, and nothing takes that back, so the pick says that update still installs on
+quit. A release candidate (`-rc.N`) follows its own `rc*.yml` until someone picks a channel.
+
+Two workflows in this repository publish the OSS edition, both building through
+`.github/workflows/desktop-build.yml`: `desktop-release.yml` a versioned release, by
+hand, and `desktop-nightly.yml` each night's build of the newest main commit whose tests
+passed. What they sign, notarize and publish to comes from the `desktop-release` and
+`desktop-nightly` environments, whose secrets and variables the workflows' headers list,
+so each environment's branch rule (and, for a release, its required review) stands
+between any other workflow and those credentials. Both environments set
+`DESKTOP_UPDATE_FEED` to the same address: picking a channel changes which manifest an
+install reads, never where it reads it, so a nightly on a feed of its own is one no
+install can move to or from. The nightly's commit is the `desktop-oss-nightly` tag, moved
+before the feed's manifests so it never trails them and never moved back; a stable release
+likewise tags its commit before its manifests go up, while the release is still a draft. Both workflows read these tags
+through `scripts/nightly-refs.sh`, which stops them when the nightly tag is gone but the feed
+still serves a nightly. Their feed steps are shared scripts,
+`scripts/feed-*`. Each part is optional: without a certificate the
 builds are unsigned, without a feed they never update themselves, and the notes it
 writes say which. That is what keeps it useful to a fork, which sets whichever it has.
 The hosted edition is released separately from this same source, so a change here

@@ -46,7 +46,11 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import httpx
 
+<<<<<<< HEAD
 from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
+=======
+from ptc_agent.agent.middleware.runtime_context.surface import CHAT_APP_NAMES
+>>>>>>> db284da5a
 from src.tools.messaging import tools as messaging
 
 logger = logging.getLogger(__name__)
@@ -87,13 +91,6 @@ FINISH_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0)
 # other status is an answer, and asking again would get the same one.
 _PASSING_STATUSES = frozenset({502, 503, 504})
 
-_APP_NAMES = {
-    "slack": "Slack",
-    "discord": "Discord",
-    "telegram": "Telegram",
-    "imessage": "iMessage",
-    "feishu": "Feishu",
-}
 _VIAS = frozenset({"agent", "fallback", "notice"})
 _UNCONFIRMED = "Delivery couldn't be confirmed."
 
@@ -453,7 +450,7 @@ def unsent(delivery: Delivery) -> list[Dict[str, Any]]:
 def app_name(address: str) -> str:
     """The app an address or a bare app name is on, as the user knows it."""
     app = address.split(":", 1)[0].lower()
-    return _APP_NAMES.get(app, app.capitalize())
+    return CHAT_APP_NAMES.get(app, app.capitalize())
 
 
 def _is_dm(address: str) -> bool:

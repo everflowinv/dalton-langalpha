@@ -2,7 +2,7 @@
 
 // The user's desktop settings: which notifications to post, the menu bar icon
 // and what sits beside it, the panel's sections, open at login, the global
-// shortcut. The page edits them in the app's Settings and the shell keeps them,
+// shortcut, whether updates install by themselves. The page edits them in the app's Settings and the shell keeps them,
 // because the shell is what acts on every one, and a notification has to be
 // filtered by a window that may not have the app's own preferences loaded at
 // all.
@@ -14,6 +14,7 @@
 const NOTIFICATION_KINDS = ['turn', 'needs_input', 'wakeup', 'automation', 'started']
 const MENUBAR_STYLES = ['rotate', 'side']
 const MENUBAR_SHOW = ['change', 'price', 'both']
+const BADGES = ['count', 'dot', 'off']
 // The panel's sections in their default order, with the name the icon's menu
 // gives each.
 const PANEL_SECTIONS = Object.freeze({ market: 'Market', portfolio: 'Portfolio', watchlist: 'Watchlist', agent: 'Agent' })
@@ -40,6 +41,7 @@ const DEFAULTS = Object.freeze({
     rotateSeconds: 4,
     show: 'change',
     extendedHours: true,
+    logo: true,
   }),
   panel: Object.freeze({
     sections: Object.freeze(SECTION_IDS.map((id) => Object.freeze({ id, visible: true }))),
@@ -47,9 +49,11 @@ const DEFAULTS = Object.freeze({
     watchlistId: null,
     watchlistRows: 5,
   }),
+  badge: 'count',
   openAtLogin: false,
   shortcut: '',
   keepRunningInTray: true,
+  automaticUpdates: true,
 })
 
 // Tickers as the data providers spell them: `BRK.B`, `^GSPC`, `BTC-USD`,
@@ -186,6 +190,7 @@ function normalize(raw, base = DEFAULTS) {
       rotateSeconds: clampInt(m.rotateSeconds, LIMITS.rotateSeconds, base.menubar.rotateSeconds),
       show: oneOf(MENUBAR_SHOW, m.show, base.menubar.show),
       extendedHours: bool(m.extendedHours, base.menubar.extendedHours),
+      logo: bool(m.logo, base.menubar.logo),
     },
     panel: {
       sections: sections(p.sections, base.panel.sections.map((s) => ({ ...s }))),
@@ -193,9 +198,11 @@ function normalize(raw, base = DEFAULTS) {
       watchlistId: watchlistId(p.watchlistId, base.panel.watchlistId),
       watchlistRows: clampInt(p.watchlistRows, LIMITS.watchlistRows, base.panel.watchlistRows),
     },
+    badge: oneOf(BADGES, r.badge, base.badge),
     openAtLogin: bool(r.openAtLogin, base.openAtLogin),
     shortcut: shortcut(r.shortcut, base.shortcut),
     keepRunningInTray: bool(r.keepRunningInTray, base.keepRunningInTray),
+    automaticUpdates: bool(r.automaticUpdates, base.automaticUpdates),
   }
 }
 
@@ -217,6 +224,15 @@ function merge(current, patch) {
   return normalize(next, base)
 }
 
+// What each kind of badge can show, besides nothing.
+const BADGE_FORMS = Object.freeze({ dock: ['count', 'dot'], overlay: ['dot'], launcher: ['count'] })
+
+/** The badge `traits` draws for the `badge` setting: the choice where it can, else the one form it has. */
+function shownBadge(badge, traits) {
+  const forms = BADGE_FORMS[traits.badge] ?? []
+  return badge === 'off' || forms.includes(badge) ? badge : (forms[0] ?? 'off')
+}
+
 /**
  * What this platform can do with each setting, so the page offers only the
  * switches that work here: `traits` (platformTraits.js) as the page reads it.
@@ -225,6 +241,11 @@ function support(traits) {
   return {
     menubarPanel: Boolean(traits.panel),
     trayTitle: traits.trayTitle,
+    // Only where text sits beside it: elsewhere the logo is all the icon is.
+    trayLogo: traits.trayTitle,
+    // The badges this platform draws differently: a Windows overlay is a dot
+    // whatever the count, so it offers no number. None where nothing is drawn.
+    badge: traits.badge ? [...new Set(BADGES.map((b) => shownBadge(b, traits)))] : undefined,
     openAtLogin: Boolean(traits.loginItem),
     shortcut: traits.globalShortcut,
     keepRunningInTray: traits.lastWindowClosed === 'tray',
@@ -232,9 +253,20 @@ function support(traits) {
   }
 }
 
-/** What the page is shown: the settings, what works here, and a shortcut that would not register. */
-function view(settings, { traits, shortcutError } = {}) {
-  const out = { ...normalize(settings), support: support(traits) }
+/**
+ * What the page is shown: the settings, what works here, and a shortcut that
+ * would not register. The badge is the one drawn, so a choice this platform
+ * cannot draw shows as what it gets instead. `updates` says this build downloads
+ * its own updates, the only kind automatic updates can be turned off for; a
+ * build that never downloads one has nothing to turn off.
+ */
+function view(settings, { traits, shortcutError, updates = false } = {}) {
+  const read = normalize(settings)
+  const out = {
+    ...read,
+    badge: shownBadge(read.badge, traits),
+    support: { ...support(traits), automaticUpdates: Boolean(updates) },
+  }
   if (shortcutError) out.shortcutError = shortcutError
   return out
 }
@@ -249,6 +281,7 @@ module.exports = {
   merge,
   itemKey,
   clampInt,
+  shownBadge,
   support,
   view,
 }

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from 'react';
 import { chartIdFor } from '@/lib/bars/chartId';
-import type { CommentFocus } from '../viewers/html/comments/useCommentUi';
+import type { CommentAsk } from '../viewers/html/comments/useCommentUi';
 import type { PanelTarget } from './types';
 import type { FileTabsApi } from './useFileTabs';
 import type { PreviewsApi } from './usePreviews';
@@ -23,7 +23,7 @@ interface PanelTargetArgs {
   onTargetMemoHandled?: (seq?: number) => void;
   teamReadOnly?: boolean;
   /** A file or chart ask that names a comment: its comment layer shows it once its pin is placed. */
-  onCommentFocus?: (focus: CommentFocus) => void;
+  onCommentFocus?: (ask: CommentAsk) => void;
 }
 
 /**
@@ -60,8 +60,7 @@ export function usePanelTarget({
         }
         if (target.path) {
           void openFileRef(target.path, { location: target.location ?? null, pin: !!target.pin });
-          // Keyed by the ask, so a second click on the same comment shows it again.
-          if (target.comment) onCommentFocus?.({ kind: 'file', path: target.path, commentId: target.comment, key: target.seq ?? 0 });
+          if (target.comment) onCommentFocus?.({ kind: 'file', path: target.path, commentId: target.comment });
         }
         onTargetHandled?.(target.seq);
         return;
@@ -82,7 +81,7 @@ export function usePanelTarget({
         cancelPending();
         tabs.openChart(target);
         const chart = target.comment ? chartIdFor(target.symbol, target.timeframe) : null;
-        if (chart && target.comment) onCommentFocus?.({ kind: 'chart', path: chart, commentId: target.comment, key: target.seq });
+        if (chart && target.comment) onCommentFocus?.({ kind: 'chart', path: chart, commentId: target.comment });
         onTargetHandled?.(target.seq);
         return;
       }

@@ -36,6 +36,7 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // deliberately thin, so routine growth shows up here instead of being quietly
 // absorbed. Raise it only for a measured cause, and put that cause in the commit
 // message that raises it; the line's history is the record of why it moved.
+<<<<<<< HEAD
 // DALTON-HOOK(critical-path-budget): Dalton ships zh-CN as the default locale with its own
 // UI strings (the largest catalog, always counted) and Dalton-only entry code; measured
 // 511.1 kB gz on the sync5 merge (703606e63) against upstream's 500 (505 in batch 3). Raised to 525 for
@@ -48,6 +49,9 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // sync11 (#482) 合并上游后生产构建实测 574.4 kB（2026-11-23 部署时的检查结果），上调到 580
 // sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); Dalton measured 475.0 kB, lowered ceiling to 490 (~15 kB headroom).
 const MAX_EAGER_KB = 490
+=======
+const MAX_EAGER_KB = 452
+>>>>>>> db284da5a
 
 // DALTON-HOOK(frontend-release-dir): fall back to DALTON_VITE_OUT_DIR so shared `pnpm build` checks the staged release dir
 const outDir = process.argv[2] || (process.env.DALTON_VITE_OUT_DIR || '').trim() || 'dist'

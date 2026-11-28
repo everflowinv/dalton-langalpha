@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
-import { NAV_ITEMS, type NavItem } from './navItems';
+import { NAV_ITEMS, NEW_CHAT_ITEM, type NavItem } from './navItems';
 
 /**
  * The primary nav items this user can see, in NAV_ITEMS order.
@@ -23,4 +23,13 @@ export function useNavItems(): NavItem[] {
       }),
     [daltonMode, features],
   );
+}
+
+/**
+ * The places the desktop offers, in one order for the sidebar and the new-tab
+ * menu: a new chat first, where the chat item would be, then the other pages.
+ */
+export function useDesktopNavItems(): NavItem[] {
+  const items = useNavItems();
+  return useMemo(() => [NEW_CHAT_ITEM, ...items.filter((item) => item.key !== NEW_CHAT_ITEM.key)], [items]);
 }

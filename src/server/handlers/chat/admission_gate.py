@@ -212,6 +212,7 @@ async def wait_or_steer(
     steer_only: bool = False,
     can_steer: bool = True,
     platform: str | None = None,
+    device: str | None = None,
     request_key: str | None = None,
     workspace_id: str | None = None,
     steer_job_id: str | None = None,
@@ -343,11 +344,60 @@ async def wait_or_steer(
                         detail=await another_member_detail(running_sender),
                     )
 
+<<<<<<< HEAD
             # DALTON-HOOK(chat-large-upload): persist ordered inline + chat_upload batch before durable steer acceptance
             if not staged_once and additional_context is not None:
                 from src.dalton.services.chat_uploads import (
                     build_chat_upload_history_metadata,
                     stage_request_attachments_for_steer,
+=======
+            raise HTTPException(
+                status_code=409, detail=await another_member_detail(running_sender)
+            )
+
+        active_run_id = str(active_row["conversation_response_id"])
+        payload = steer_payload(
+            user_input,
+            user_id,
+            sender=agent.sender if agent else "user",
+            workspace_id=workspace_id,
+            platform=platform,
+            device=device,
+            request_key=request_key,
+            origin=agent.origin if agent else None,
+            artifact_comments=artifact_comments,
+            member=user_id if shared else None,
+            written_by=written_by,
+            checked_computer_id=checked_computer_id,
+            llm_model=on_model,
+        )
+        if agent is not None:
+            idempotency_key = agent.idempotency_key
+        elif request_key:
+            idempotency_key = steer_idempotency_key(request_key)
+        else:
+            idempotency_key = f"steer:{uuid4()}"
+        result = await outbox_db.admit_steer(
+            thread_id=thread_id,
+            run_id=active_run_id,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            origin_stamp=agent.origin_stamp if agent else None,
+        )
+        if result["state"] == "accepted" and agent is not None:
+            from src.server.handlers.chat.request_prep import HandOffSteered
+
+            return False, HandOffSteered(active_run_id, result["job_id"])
+        if result["state"] == "accepted":
+            accepted = {
+                "thread_id": thread_id,
+                "content": payload["content"],
+                "position": result["position"],
+            }
+            if artifact_comments is not None:
+                accepted["artifact_comments"] = artifact_comments.model_dump(
+                    mode="json"
+>>>>>>> db284da5a
                 )
 
                 staged_descriptors, staged_inline_ids = (

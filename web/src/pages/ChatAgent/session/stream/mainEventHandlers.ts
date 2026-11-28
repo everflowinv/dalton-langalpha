@@ -9,7 +9,7 @@ import { ownerOfToolCall } from '../toolCallOwner';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
-import type { AssistantMessage, ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TurnStop, TextSegment } from '@/types/chat';
+import type { AssistantMessage, ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TurnStop, TextSegment, WidgetDraft } from '@/types/chat';
 import { readPlanBilled } from '@/lib/claudeCodePlan';
 import { readCliQueue, type CliQueueFrame, type CliQueueSignal } from '@/lib/claudeCodeQueue';
 import { appendNotificationSegmentOnce } from '../../hooks/utils/messageFinalizers';
@@ -17,7 +17,8 @@ import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
 // DALTON-HOOK(provenance-batch): single-copy provenance record merge helper
 import { mergeProvenanceRecords } from './provenanceBatch';
 import { appendTextChunk } from './textChunks';
-import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from './toolCallChunks';
+import { addToolCallChunk, feedWidgetDraft, hasPreparing, landWidgetDraft, removeLandedToolCall, withoutPending, withoutStreamDrafts, withoutWidgetDraft } from './toolCallChunks';
+import { widgetSegmentId } from './widgetIds';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
 
 /**
@@ -199,12 +200,13 @@ export function handleTextContent({ assistantMessageId, content, finishReason, s
       // (synthetic from a user stop, live or replayed) also stamps the message
       // so the per-message "⏹ Stopped" chip renders. Either way the model call
       // is over, so any in-flight tool-call chunks go and the preparing row
-      // stops shimmering (the partial tool call never completed).
+      // stops shimmering (the partial tool call never completed), as does a
+      // widget still waiting on its artifact.
       const isStopped = finishReason === 'stopped';
       setMessages((prev: MessageRecord[]) =>
         prev.map((msg: MessageRecord) =>
           msg.id === assistantMessageId
-            ? { ...withoutPending(msg), isStreaming: false, ...(isStopped ? { stopped: stop } : {}) }
+            ? { ...withoutStreamDrafts(msg), isStreaming: false, ...(isStopped ? { stopped: stop } : {}) }
             : msg
         )
       );
@@ -331,13 +333,21 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
             applyTaskSegment(derived, toolCallId, contentSegments, subagentTasks);
           }
 
+          const pendingToolCallChunks = removeLandedToolCall(
+            (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {}, toolCallId, firstLanding);
+          // A landed ShowWidget call keeps drawing its widget, now from its
+          // complete arguments, until the artifact takes its place
+          // (`handleHtmlWidget`) or the call ends without one.
+          const drafts = (msg.widgetDrafts as Record<string, WidgetDraft> | undefined) ?? {};
+          const drawn = !!(msg.htmlWidgetProcesses as Record<string, unknown> | undefined)?.[widgetSegmentId(toolCallId)];
+          const widgetDrafts = landWidgetDraft(drafts, pendingToolCallChunks, { ...toolCall, id: toolCallId }, drawn);
           return {
             ...msg,
             contentSegments,
             toolCallProcesses,
             subagentTasks,
-            pendingToolCallChunks: removeLandedToolCall(
-              (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {}, toolCallId, firstLanding),
+            pendingToolCallChunks,
+            ...(widgetDrafts !== drafts ? { widgetDrafts } : {}),
           };
         })
       );
@@ -345,6 +355,13 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
   });
 
   return true;
+}
+
+/** `msg` without the widget draft of `toolCallId`, and itself when it has none. */
+function withoutDraftOf(msg: MessageRecord, toolCallId: string): MessageRecord {
+  const drafts = msg.widgetDrafts as Record<string, WidgetDraft> | undefined;
+  const next = drafts && withoutWidgetDraft(drafts, toolCallId);
+  return next === drafts ? msg : { ...msg, widgetDrafts: next };
 }
 
 /**
@@ -421,7 +438,9 @@ export function handleToolCallResult({ assistantMessageId, toolCallId, result, r
         subagentTasks[toolCallId] = applyLaunchReply(subagentTasks[toolCallId], result);
       }
 
-      return { ...msg, toolCallProcesses, subagentTasks };
+      // A widget's artifact comes ahead of its result, so a draft still here
+      // is a widget that was not shown ("Widget not shown: ..."): it goes.
+      return withoutDraftOf({ ...msg, toolCallProcesses, subagentTasks }, toolCallId);
     });
   });
 
@@ -567,7 +586,7 @@ export function handleHtmlWidget({ assistantMessageId, artifactType, artifactId,
   }
 
   const { html, title } = payload;
-  const segmentId = `widget-${artifactId}`;
+  const segmentId = widgetSegmentId(artifactId);
   const currentOrder = eventId != null ? eventId : ++contentOrderCounterRef.current;
 
   setMessages((prev: MessageRecord[]) => {
@@ -579,7 +598,7 @@ export function handleHtmlWidget({ assistantMessageId, artifactType, artifactId,
 
       // Prevent duplicates (e.g. on SSE reconnect replay)
       const segmentExists = contentSegments.some((s: Record<string, unknown>) => s.widgetId === segmentId);
-      if (segmentExists) return msg;
+      if (segmentExists) return withoutDraftOf(msg, artifactId);
 
       contentSegments.push({
         type: 'html_widget',
@@ -596,11 +615,13 @@ export function handleHtmlWidget({ assistantMessageId, artifactType, artifactId,
       }
       htmlWidgetProcesses[segmentId] = widgetEntry;
 
-      return {
+      // The artifact's id is its call's, so it takes the place of the
+      // preview drawn from that call's arguments.
+      return withoutDraftOf({
         ...msg,
         contentSegments,
         htmlWidgetProcesses,
-      };
+      }, artifactId);
     });
     return updated;
   });
@@ -629,8 +650,11 @@ export function handleToolCallChunks({ assistantMessageId, chunks, setMessages }
     setMessages((prev: MessageRecord[]) =>
       prev.map((msg: MessageRecord) => {
         if (msg.id !== assistantMessageId) return msg;
-        const pending = (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {};
-        return { ...msg, pendingToolCallChunks: addToolCallChunk(pending, chunk, seenAt) };
+        const pending = addToolCallChunk(
+          (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {}, chunk, seenAt);
+        const drafts = (msg.widgetDrafts as Record<string, WidgetDraft> | undefined) ?? {};
+        const widgetDrafts = feedWidgetDraft(drafts, pending, chunk);
+        return { ...msg, pendingToolCallChunks: pending, ...(widgetDrafts !== drafts ? { widgetDrafts } : {}) };
       })
     );
   });

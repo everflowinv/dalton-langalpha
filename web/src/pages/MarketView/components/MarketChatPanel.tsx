@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useNavigate, useSearchParams } from 'react-router';
+import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, RefreshCw, MessageSquare } from 'lucide-react';
@@ -11,6 +11,7 @@ import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
 import { MAX_FILES } from '@/components/ui/chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import { toast } from '@/components/ui/use-toast';
 import type { ComposerScope, ComposerSend } from '@/components/ui/chat-input.types';
+import { useEditSearchParams } from '@/hooks/useEditSearchParams';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
 // DALTON-HOOK(team-sharing): gate the seen cursor on workspace ownership
@@ -26,7 +27,10 @@ import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
 import { LiveMessageList } from '../../ChatAgent/components/MessageList';
-import { MessageActionsProvider, type MessageActions } from '../../ChatAgent/components/messageList/MessageActionsContext';
+import { MessageActionsProvider } from '../../ChatAgent/components/messageList/MessageActionsContext';
+import { useMessageActionBundles } from '../../ChatAgent/components/chatView/useMessageActionBundles';
+import { useWidgetPromptActions } from '../../ChatAgent/components/chatView/useWidgetPromptActions';
+import { newThreadCarry } from '../../ChatAgent/components/chatView/newThreadCarry';
 import { usePublishFile } from '../../ChatAgent/components/chatView/usePublishFile';
 import { useComposerGiveBack } from '../../ChatAgent/components/chatView/useComposerGiveBack';
 import { SubagentTelemetryContext, useHistoryTelemetry } from '../../ChatAgent/components/SubagentTelemetryContext';
@@ -51,15 +55,21 @@ import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
+<<<<<<< HEAD
 import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
+=======
+import { attachmentSendParts, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
+import type { WidgetSendParts } from '../../ChatAgent/utils/widgetPrompt';
+import type { SendOptions } from '../../ChatAgent/session/types';
+>>>>>>> db284da5a
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
 import type { Workspace } from '@/types/api';
 import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
-import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
-import { readMarketViewRoute } from '../utils/marketRoute';
+import { setMarketThreadId } from '../utils/threadPersistence';
+import { useMarketThreadRoute, type WidgetFirstSend } from '../hooks/useMarketThreadRoute';
 import { buildMarketSendContexts } from '../utils/marketSend';
 import { layerAskContext } from '../utils/layerAsk';
 // DALTON-HOOK(composer-drafts): clear new-chat draft on explicit New Chat action
@@ -177,6 +187,7 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   const computers = useComputerRoots({ enabled: !!activeWorkspace });
   const folders = useMemo(() => computerFolders(activeWorkspace, null, computers), [activeWorkspace, computers]);
 
+<<<<<<< HEAD
   // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
   // (workspace, symbol), then a new chat. This state determines which thread
   // mounts on the keyed `<ChatBody>` — changing it forces a remount so the SSE
@@ -249,6 +260,11 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
       return next;
     }, { replace: true });
   }, [activeWorkspaceId, symbol, setSearchParams]);
+=======
+  // The thread the keyed `<ChatBody>` mounts on: a change remounts it, so the
+  // SSE engine re-initialises on the other thread.
+  const route = useMarketThreadRoute(activeWorkspaceId, symbol);
+>>>>>>> db284da5a
 
   if (scope === 'workspace' && !activeWorkspaceId) {
     return (
@@ -265,12 +281,14 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   return (
     <WorkspaceProvider workspaceId={activeWorkspaceId} downloadFile={null} folders={folders}>
       <ChatBody
-        key={`${activeWorkspaceId}:${activeThreadInit}`}
+        key={`${activeWorkspaceId}:${route.key}`}
         {...props}
         activeWorkspaceId={activeWorkspaceId}
-        initialThreadId={activeThreadInit.split('#')[0]}
-        onSelectThread={handleSelectThread}
-        onStartNewChat={handleStartNewChat}
+        initialThreadId={route.threadId}
+        onSelectThread={route.selectThread}
+        onStartNewChat={route.startNewChat}
+        onStartThread={route.startThread}
+        firstSend={route.firstSend}
       />
     </WorkspaceProvider>
   );
@@ -281,6 +299,10 @@ interface ChatBodyProps extends MarketChatPanelProps {
   initialThreadId: string;
   onSelectThread: (threadId: string) => void;
   onStartNewChat: () => void;
+  /** Opens a new chat that sends `first` as its first message. */
+  onStartThread: (first: WidgetFirstSend) => void;
+  /** What this chat was opened to send first. */
+  firstSend?: WidgetFirstSend;
 }
 
 function ChatBody(props: ChatBodyProps): React.ReactElement {
@@ -312,6 +334,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     initialThreadId,
     onSelectThread,
     onStartNewChat,
+    onStartThread,
+    firstSend,
   } = props;
 
   const { t } = useTranslation();
@@ -319,7 +343,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { preferences } = usePreferences();
-  const [, setSearchParams] = useSearchParams();
+  const editSearchParams = useEditSearchParams();
   const [dialogPayload, setDialogPayload] = useState<DialogPayload | null>(null);
   // Port of the preview currently shown — guards against a late URL resolution
   // reopening a dialog the user already closed (or switched away from).
@@ -524,15 +548,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useEffect(() => {
     if (!threadId || threadId === '__default__') return;
     setMarketThreadId(activeWorkspaceId, symbol, threadId);
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      if (next.get('thread') !== threadId) {
-        next.set('thread', threadId);
-      }
-      return next;
-    }, { replace: true });
+    editSearchParams((params) => params.set('thread', threadId), { replace: true });
     queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(activeWorkspaceId) });
-  }, [threadId, symbol, activeWorkspaceId, setSearchParams, queryClient]);
+  }, [threadId, symbol, activeWorkspaceId, editSearchParams, queryClient]);
 
   const showTranscript = messages.length > 0 || isLoading || isLoadingHistory;
   const follow = useStreamFollow(messagesContainer, transcript, { live: isLoading, loading: isLoadingHistory });
@@ -754,6 +772,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     setDialogPayload({ type: 'toolcall', toolCallId });
   }, []);
 
+<<<<<<< HEAD
   // The panel's transcript action surface. Each member is useStableHandler'd
   // so the context value survives every streamed chunk — the chat engine
   // rebuilds its handlers per render, and a fresh value here would re-render
@@ -798,10 +817,13 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       chatInputRef.current?.getRetryModelOptions?.()
       ?? chatInputRef.current?.getModelOptions?.(),
     ));
+=======
+>>>>>>> db284da5a
   // Steering the agent finished without reading, edit text whose message is
   // gone, and the files of a send a stop held back come back to the composer,
   // beside whatever was typed there since.
   useComposerGiveBack(chatInputRef, chat);
+<<<<<<< HEAD
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
   const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
@@ -809,9 +831,38 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
     const opts = buildWidgetPromptModelOptions(chatInputRef.current?.getModelOptions?.()?.model, threadModel);
     handleSendMessage(text, null, null, opts);
+=======
+  // A widget's prompt calls send as the box's send would, with the chart's
+  // skill and views; a new chat opens in the panel, as its "new chat" does.
+  const sendFromWidget = (text: string, parts: WidgetSendParts, options: SendOptions) => {
+    const market = buildMarketSendContexts(symbol, interval, collectViews());
+    return handleSendMessage(text, [market.skill, ...parts.contexts], null, {
+      ...options, ...parts.options, ...(market.chartViews.length > 0 ? { chartViews: market.chartViews } : {}),
+    });
+  };
+  const widgetPrompts = useWidgetPromptActions({
+    chatInputRef,
+    send: (text, parts) => sendFromWidget(text, parts, { ...readComposerOptions(), subagentsAllowed: subagentsToSend, ...tuningToSend }),
+    openThread: (text, parts, carry) => onStartThread({ text, parts, options: carry }),
+    readCarry: () => newThreadCarry(readComposerOptions(), threadSubagents, threadTuning.tuning),
+>>>>>>> db284da5a
   });
+  // The first message of a chat a widget's startThread opened, once its
+  // engine has mounted. The guard is set when it goes, so a strict-mode
+  // remount reschedules rather than drops it.
+  const firstSentRef = useRef(false);
+  const sendFirst = useStableHandler((first: WidgetFirstSend) => {
+    firstSentRef.current = true;
+    sendFromWidget(first.text, first.parts, first.options);
+  });
+  useEffect(() => {
+    if (!firstSend || firstSentRef.current) return;
+    const timer = setTimeout(() => sendFirst(firstSend), 100);
+    return () => clearTimeout(timer);
+  }, [firstSend, sendFirst]);
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
+<<<<<<< HEAD
   // DALTON-HOOK(external-share-guard)/(team-sharing): the market transcript's
   // file cards offer Publish to the workspace's own owner only — a colleague
   // (rw or ro) or an external/unknown member gets no entry; the server refuses them.
@@ -841,15 +892,41 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
+=======
+  // The panel's transcript action surface, identity-stable across streamed
+  // chunks: the chat engine rebuilds its handlers per render, and a fresh
+  // value here would re-render every settled bubble in the panel.
+  const { messageActions } = useMessageActionBundles({
+    onOpenArtifactComment: commentOpeners,
+    onOpenSubagentTask: handleOpenSubagentTask,
+    onToolCallDetailClick: handleToolCallDetailClick,
+    onAnswerQuestion: handleAnswerQuestion,
+    onSkipQuestion: handleSkipQuestion,
+    onApproveCreateWorkspace: handleApproveCreateWorkspace,
+    onRejectCreateWorkspace: handleRejectCreateWorkspace,
+    onApproveStartQuestion: handleApproveStartQuestion,
+    onRejectStartQuestion: handleRejectStartQuestion,
+    onApprovePTCAgent: handleApprovePTCAgent,
+    onRejectPTCAgent: handleRejectPTCAgent,
+    onApproveSecretaryAction: handleApproveSecretaryAction,
+    onRejectSecretaryAction: handleRejectSecretaryAction,
+    onResumeCreditPause: handleResumeCreditPause,
+    onApproveToolCall: handleApproveToolCall,
+    onRejectToolCall: handleRejectToolCall,
+    onEditMessage: handleEditMessage,
+    onRegenerate: handleRegenerate,
+    onRetry: handleRetry,
+>>>>>>> db284da5a
     editDrafts,
-    onThumbUp: stableThumbUp,
-    onThumbDown: stableThumbDown,
-    onThumbDownFollowUp: stableThumbDownFollowUp,
-    onWidgetSendPrompt: stableWidgetSendPrompt,
+    onThumbUp: handleThumbUp,
+    onThumbDown: handleThumbDown,
+    onThumbDownFollowUp: handleThumbDownFollowUp,
+    widgetPrompts,
     onRevealMessage: follow.reveal,
     ...(publishAllowed ? { onPublishFile } : {}), // DALTON-HOOK(external-share-guard)
     // A thread the server has named, so a failed turn's banner can offer "Report this".
     reportThreadId: realThreadId,
+<<<<<<< HEAD
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
@@ -861,6 +938,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, realThreadId, // DALTON-HOOK(external-share-guard)
     commentOpeners,
   ]);
+=======
+    chatInputRef,
+  });
+>>>>>>> db284da5a
 
   // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
   // proposal so its "open in chat" deep-link lands back here. Null in a

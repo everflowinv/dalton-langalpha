@@ -54,7 +54,7 @@ export interface PageAnchorItem {
  * parts, so it answers only the theme, the scroll and the address.
  */
 export type ViewerToPage =
-  /** The app's CSS variables, as `resolveThemeVars()` writes them. */
+  /** The app's CSS variables, as `paletteCss(readThemePalette())` writes them. */
   | { type: 'page:theme'; css: string }
   /** Where the reader was on the document this one replaced. */
   | { type: 'page:restore-scroll'; x: number; y: number }
@@ -657,6 +657,19 @@ export type PageReadyWire =
  * bridge's version, which the viewer does not read.
  */
 export type PageToViewerWire = PageReadyWire | z.input<typeof pageToViewer>;
+
+/** Any spot a comment being written is on: a pick, an area or selected words, with its box. */
+const draftSpot = z.object({ anchor: z.union([pickAnchor, areaAnchor, textAnchor]), rect: frameRect });
+
+/**
+ * A spot kept with a comment being written between visits, held to the same
+ * rules as one the page reports, or null for one not to trust: anything on
+ * the origin can write browser storage.
+ */
+export function parseDraftSpot(data: unknown): { anchor: ArtifactCommentAnchor; rect: FrameRect } | null {
+  const read = draftSpot.safeParse(data);
+  return read.success ? read.data : null;
+}
 
 /** A message from the document, or null for one not to trust. */
 export function parsePageMessage(data: unknown): PageToViewer | null {

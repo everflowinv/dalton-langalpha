@@ -1,53 +1,51 @@
 """Server-side HTML→PDF rendering via headless Chromium (Playwright).
 
-Renders a workspace HTML document — loaded from the server's own loopback
-``/api/v1/wsfiles/...`` route — into PDF bytes. Playwright is imported lazily
-inside functions so this module never fails to import without the ``pdf`` extra;
-callers map ``PdfRenderUnavailable`` to a 501.
-
-SSRF containment: every subresource request is gated by ``_is_request_allowed``,
-which permits the workspace's own serve prefix and any https host at a public
-address, and a redirect is followed only hop by hop through the same gate
-(``_fetch_gated``). Agent-authored HTML therefore loads what it loads in the
-viewer, and cannot reach services or cloud metadata endpoints on the server's
-own network. A stylesheet or framed document that redirected reaches the page
-as an import of, or a refresh to, where it landed, so its relative URLs
-resolve there and that request meets the gate too (``_stand_in``).
+Renders a workspace HTML document, loaded from the server's own loopback
+``/api/v1/wsfiles/...`` route, into PDF bytes, in the browser and behind the
+request gate of ``headless_browser``: the document loads what it loads in the
+viewer and nothing only the server's network can reach. Playwright is
+imported lazily, so this module imports without the ``pdf`` extra; callers
+map ``PdfRenderUnavailable`` to a 501.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
-import html
 import re
-from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import parse_qsl, urljoin, urlparse
 
-import httpx
+from src.server.services.headless_browser import (
+    BrowserError,
+    BrowserUnavailable,
+    RequestGate,
+    close_browser,
+    gated_context,
+    use_browser,
+)
 
-from src.server.utils.egress_guard import EgressBlockedError, resolve_public_ips
-from src.tools.web.inhouse.guard import GuardedAsyncTransport
-
-logger = logging.getLogger(__name__)
+__all__ = [
+    "PDF_SCALE_MAX",
+    "PDF_SCALE_MIN",
+    "PdfRenderError",
+    "PdfRenderTimeout",
+    "PdfRenderUnavailable",
+    "close_browser",
+    "render_workspace_pdf",
+]
 
 
 # --- Error taxonomy --------------------------------------------------------
 
-
-class PdfRenderError(Exception):
-    """Rendering failed for a reason other than timeout/unavailability."""
-
-
-class PdfRenderUnavailable(PdfRenderError):
-    """Playwright or its Chromium binary is not installed."""
+# The browser's own failures, under the names this module's callers catch.
+PdfRenderError = BrowserError
+PdfRenderUnavailable = BrowserUnavailable
 
 
 class PdfRenderTimeout(PdfRenderError):
     """Rendering exceeded the allotted time budget."""
 
 
+<<<<<<< HEAD
 # --- SSRF gate -------------------------------------------------------------
 
 
@@ -336,6 +334,9 @@ async def _answer_request(
 
 
 # --- Browser lifecycle -----------------------------------------------------
+=======
+# --- The render ------------------------------------------------------------
+>>>>>>> db284da5a
 
 # Cap concurrent renders: each holds a Chromium context + page.
 # DALTON-HOOK(concurrency-startup-log): the cap is a named constant so the
@@ -541,6 +542,7 @@ def _footer_template(branding: bool, page_numbers: bool, date_str: str) -> str:
         "</div>"
     )
 
+<<<<<<< HEAD
 _EXECUTABLE_MISSING_HINT = "executable doesn't exist"
 
 _browser = None
@@ -633,6 +635,8 @@ async def _get_browser():
         _browser = browser
         return _browser
 
+=======
+>>>>>>> db284da5a
 
 async def render_workspace_pdf(
     internal_url: str,
@@ -645,7 +649,7 @@ async def render_workspace_pdf(
     """Render a workspace HTML URL to PDF bytes in headless Chromium.
 
     ``internal_url`` is the server's own loopback wsfiles URL; subresource
-    requests are SSRF-gated (``_is_request_allowed``). ``scale`` (clamped to 0.5 to 2.0) shrinks/enlarges the whole
+    requests pass the render gate (``headless_browser.RequestGate``). ``scale`` (clamped to 0.5 to 2.0) shrinks/enlarges the whole
     rendering; ``branding`` (default on) stamps "LangAlpha · <date>" in the
     footer and ``page_numbers`` adds ``N / total`` beside it. Raises
     ``PdfRenderUnavailable`` / ``PdfRenderTimeout`` / ``PdfRenderError`` for
@@ -654,78 +658,56 @@ async def render_workspace_pdf(
     from playwright.async_api import Error as PlaywrightError
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-    browser = await _get_browser()
-
-    async with _RENDER_SEMAPHORE:
-        context = None
+    async with use_browser() as browser, _RENDER_SEMAPHORE:
         try:
             # new_context / new_page / route / emulate_media can all raise a
-            # PlaywrightError (e.g. the browser died after _get_browser); keep
+            # PlaywrightError (e.g. the browser died after get_browser); keep
             # them inside the mapped try so none escapes as a raw 500.
-            context = await browser.new_context(viewport=_PRINT_VIEWPORT)
-            budget = _Budget()
+            async with gated_context(
+                browser, RequestGate(workspace_serve_prefix), viewport=_PRINT_VIEWPORT
+            ) as context:
+                page = await context.new_page()
+                # Lay out with print CSS from the first paint so charts size for
+                # paper instead of re-rendering during the print reflow.
+                await page.emulate_media(media="print")
 
-            async def _route_handler(route, request):
-                await _answer_request(route, request, workspace_serve_prefix, budget)
-
-            async def _ws_route_handler(ws_route):
-                # WebSockets are not covered by page.route, so gate them
-                # separately. A report rendered once has no use for a live feed,
-                # so every WS is closed unconditionally, which seals the one
-                # channel the HTTP guard misses (e.g. ws://169.254.169.254,
-                # ws://127.0.0.1). There is deliberately no connect path.
-                await ws_route.close()
-
-            page = await context.new_page()
-            await page.route("**/*", _route_handler)
-            await page.route_web_socket("**/*", _ws_route_handler)
-            # Lay out with print CSS from the first paint so charts size for
-            # paper instead of re-rendering during the print reflow.
-            await page.emulate_media(media="print")
-
-            async def _render() -> bytes:
-                try:
-                    await page.goto(
-                        internal_url,
-                        wait_until="networkidle",
-                        timeout=_GOTO_TIMEOUT_MS,
+                async def _render() -> bytes:
+                    try:
+                        await page.goto(
+                            internal_url,
+                            wait_until="networkidle",
+                            timeout=_GOTO_TIMEOUT_MS,
+                        )
+                    except PlaywrightTimeoutError:
+                        # Networkidle never settled (a long-polling asset, etc.).
+                        # Re-navigate with wait_until="load": the second goto often
+                        # completes where the first stalled, now that CDN assets are
+                        # warm in the browser cache.
+                        await page.goto(internal_url, wait_until="load", timeout=_GOTO_FALLBACK_TIMEOUT_MS)
+                    declared_size = await page.evaluate(_PAGE_SIZE_PROBE_JS)
+                    viewport = _viewport_from_page_size(declared_size) if declared_size else None
+                    if viewport and viewport != _PRINT_VIEWPORT:
+                        await page.set_viewport_size(viewport)
+                    await page.evaluate(_SETTLE_JS)
+                    await page.add_style_tag(content=_CANVAS_CLAMP_CSS)
+                    await page.evaluate(
+                        "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
                     )
-                except PlaywrightTimeoutError:
-                    # Networkidle never settled (a long-polling asset, etc.).
-                    # Re-navigate with wait_until="load": the second goto often
-                    # completes where the first stalled, now that CDN assets are
-                    # warm in the browser cache.
-                    await page.goto(internal_url, wait_until="load", timeout=_GOTO_FALLBACK_TIMEOUT_MS)
-                declared_size = await page.evaluate(_PAGE_SIZE_PROBE_JS)
-                viewport = _viewport_from_page_size(declared_size) if declared_size else None
-                if viewport and viewport != _PRINT_VIEWPORT:
-                    await page.set_viewport_size(viewport)
-                await page.evaluate(_SETTLE_JS)
-                await page.add_style_tag(content=_CANVAS_CLAMP_CSS)
-                await page.evaluate(
-                    "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
-                )
-                pdf_kwargs: dict = {"print_background": True, "prefer_css_page_size": True}
-                if scale is not None:
-                    pdf_kwargs["scale"] = min(PDF_SCALE_MAX, max(PDF_SCALE_MIN, scale))
-                if branding or page_numbers:
-                    pdf_kwargs["display_header_footer"] = True
-                    pdf_kwargs["header_template"] = _PDF_HEADER_TEMPLATE
-                    pdf_kwargs["footer_template"] = _footer_template(
-                        branding, page_numbers, datetime.now().strftime("%Y-%m-%d")
-                    )
-                return await page.pdf(**pdf_kwargs)
+                    pdf_kwargs: dict = {"print_background": True, "prefer_css_page_size": True}
+                    if scale is not None:
+                        pdf_kwargs["scale"] = min(PDF_SCALE_MAX, max(PDF_SCALE_MIN, scale))
+                    if branding or page_numbers:
+                        pdf_kwargs["display_header_footer"] = True
+                        pdf_kwargs["header_template"] = _PDF_HEADER_TEMPLATE
+                        pdf_kwargs["footer_template"] = _footer_template(
+                            branding, page_numbers, datetime.now().strftime("%Y-%m-%d")
+                        )
+                    return await page.pdf(**pdf_kwargs)
 
-            return await asyncio.wait_for(_render(), timeout=_RENDER_TIMEOUT_MS / 1000)
+                return await asyncio.wait_for(_render(), timeout=_RENDER_TIMEOUT_MS / 1000)
         except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
             raise PdfRenderTimeout("PDF rendering timed out") from exc
         except PdfRenderError:
             raise
         except PlaywrightError as exc:
             raise PdfRenderError(f"PDF rendering failed: {exc}") from exc
-        finally:
-            if context is not None:
-                try:
-                    await context.close()
-                except Exception:
-                    pass

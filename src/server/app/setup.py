@@ -37,7 +37,9 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
@@ -70,6 +72,7 @@ from src.server.services.preview_base import (
     check_preview_proxy_config,
     preview_proxy_requirements,
 )
+from src.server.utils.pg_sanitize import drop_non_finite
 from src.server.utils.error_sanitization import (
     COMPUTER_UNREACHABLE_HEADER,
     sandbox_failure_http,
@@ -279,6 +282,11 @@ async def lifespan(app: FastAPI):
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
+    logger.info(f"Event loop: {type(asyncio.get_running_loop()).__module__}")
+    # Before anything starts a child: MCP servers below, CLIs and commands later.
+    from src.server.utils.child_fds import keep_descriptors_from_children
+
+    keep_descriptors_from_children()
 
     # Phase 2 of the OTel bootstrap (see module-top init_otel comment). Runs
     # per-worker so BatchSpanProcessor / PeriodicExportingMetricReader daemon
@@ -1715,11 +1723,13 @@ app.add_middleware(
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
     # A ranged file download is read by script, which sees only these past the
     # safelisted few when the app is served from another origin; the file panel
-    # words an unreachable computer's 503 from the last.
+    # words an unreachable computer's 503 from the last, and the Drive waits
+    # as long as ``Retry-After`` says for a text still being read out.
     expose_headers=[
         "Content-Range",
         "Accept-Ranges",
         "ETag",
+        "Retry-After",
         COMPUTER_UNREACHABLE_HEADER,
         # DALTON-HOOK(team-model-catalog): expose catalog revision header for cross-origin browsers
         "X-Dalton-Catalog-Revision",
@@ -1779,6 +1789,20 @@ async def _sandbox_failure_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
+async def _request_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """FastAPI's own 422, with any non-finite number it quotes back as null.
+
+    A body is read by Python's JSON, which takes a raw ``NaN`` or
+    ``Infinity``, and an error that quotes the value it refused cannot be
+    written as JSON with one in it: the 422 would end as a 500."""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": drop_non_finite(jsonable_encoder(exc.errors()))},
+    )
+
+
 async def _policy_denied_handler(request: Request, exc: PolicyDenied):
     """Answer a refusal by policy exactly as any ``HTTPException`` is answered,
     recording it first in the organization's activity log: every route's
@@ -1789,6 +1813,7 @@ async def _policy_denied_handler(request: Request, exc: PolicyDenied):
 
 
 app.add_exception_handler(PolicyDenied, _policy_denied_handler)
+app.add_exception_handler(RequestValidationError, _request_validation_handler)
 app.add_exception_handler(SandboxGoneError, _sandbox_failure_handler)
 app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
 # A refusal a caller let through unwrapped, which would otherwise answer 500.
@@ -1851,6 +1876,7 @@ from src.server.app.orders import router as orders_router
 from src.server.app.activity import router as activity_router
 from src.server.app.org_library import router as org_library_router
 from src.server.app.drive import router as drive_router
+from src.server.app.drive_memo import router as drive_memo_router
 from src.server.app.shared_workspaces import router as shared_workspaces_router
 from src.server.app.public import router as public_router
 from src.server.app.share_links import (
@@ -2019,6 +2045,7 @@ app.include_router(
     org_library_router
 )  # /api/v1/org-library - The organization library (flag org_library)
 app.include_router(drive_router)  # /api/v1/drive/* - The user's Drive (flag drive)
+app.include_router(drive_memo_router)  # /api/v1/drive/* - Its memos, records and undo
 app.include_router(
     shared_workspaces_router
 )  # /api/v1/shared-workspaces, /api/v1/workspaces/{id}/members (flag shared_workspaces)

@@ -6,6 +6,7 @@ import type {
   AutomationRunReadQuery,
 } from '@/types/automation';
 import type { SearchKind } from '@/api/search';
+import type { DriveMemoQuery } from '@/types/drive';
 
 /**
  * Hierarchical query key factory for React Query, plus the query `meta`
@@ -22,6 +23,8 @@ export const queryKeys = {
     all:         ['user'],
     me:          () => [...queryKeys.user.all, 'me'],
     preferences: () => [...queryKeys.user.all, 'preferences'],
+    // What a restart of the server would pause, asked as the update panel opens.
+    runningWork: () => [...queryKeys.user.all, 'running-work'],
     apiKeys:     () => [...queryKeys.user.all, 'api-keys'],
     claudeCodeCustody: () => [...queryKeys.user.all, 'claude-code-custody'],
     // Its own entry, not part of preferences: the server keeps it apart so the
@@ -129,6 +132,9 @@ export const queryKeys = {
     // A chart's record, among its workspace's reads so its events reach it. An
     // object, so no file's path can spell the same key.
     byChart:     (wsId: string, chart: string) => [...queryKeys.artifacts.pathsIn(wsId), { chart }],
+    // Every timeframe's record of one ticker, among the same reads, so a
+    // comment written or read on any of them reads the counts again.
+    chartsOf:    (wsId: string, symbol: string) => [...queryKeys.artifacts.pathsIn(wsId), { symbol }],
     // The owner's get-or-create of a file's record. Beside the reads by path,
     // not under them, so an event that reads those again never makes one.
     ensured:     (wsId: string, path: string) => [...queryKeys.artifacts.all, 'ensured', wsId, path],
@@ -429,6 +435,19 @@ export const queryKeys = {
     trash:    (space: string) => [...queryKeys.drive.space(space), 'trash'],
     trashPage: (space: string, limit: number) => [...queryKeys.drive.trash(space), limit],
     body:     (space: string, entryId: string, sha: string, mode: string) => [...queryKeys.drive.all, 'body', space, entryId, sha, mode],
+    // A memo list per sort and filter, under the space so every change reads it again.
+    memos:    (space: string, params: DriveMemoQuery) => [...queryKeys.drive.space(space), 'memos', params],
+    record:   (space: string, entryId: string) => [...queryKeys.drive.space(space), 'record', entryId],
+    // A version's text and a head's attribution are fixed by the version they
+    // came from, so they sit outside the space and a save never reads them
+    // again. A clear takes versions away, so it drops the entry's (`…Of`).
+    // A text is keyed by the file's name too, which picks the reader for bytes
+    // saved with no type that says; the sha stays last, where its reader looks.
+    versionTextOf: (space: string, entryId: string) => [...queryKeys.drive.all, 'text', space, entryId],
+    versionText: (space: string, entryId: string, name: string, seq: number, sha: string) => [...queryKeys.drive.versionTextOf(space, entryId), name, seq, sha],
+    attributions: (space: string) => [...queryKeys.drive.all, 'attribution', space],
+    attributionOf: (space: string, entryId: string) => [...queryKeys.drive.attributions(space), entryId],
+    attribution: (space: string, entryId: string, seq: number, sha: string) => [...queryKeys.drive.attributionOf(space, entryId), seq, sha],
     /** Apart from the space's own keys, so reading the space again does not ask the feed again. */
     changes:  (space: string) => [...queryKeys.drive.all, 'changes', space],
   },

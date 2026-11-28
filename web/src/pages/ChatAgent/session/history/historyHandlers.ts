@@ -21,8 +21,12 @@ import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { wakeTurnOpener } from '../wakeupEvents';
 import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+<<<<<<< HEAD
 // DALTON-HOOK(chat-large-upload): normalize persisted attachment metadata on replayed turns
 import { normalizeAttachments } from '../../hooks/utils/messageHelpers';
+=======
+import { widgetSegmentId } from '../stream/widgetIds';
+>>>>>>> db284da5a
 
 
 /** Shape of an SSE history event. */
@@ -1005,7 +1009,7 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
   }
 
   const { html, title } = payload;
-  const segmentId = `widget-${artifactId}`;
+  const segmentId = widgetSegmentId(artifactId);
   const currentOrder = eventId != null ? eventId : ++pairState.contentOrderCounter;
 
   setMessages((prev: MessageRecord[]) => {

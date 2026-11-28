@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react';
+<<<<<<< HEAD
 import { resolveThemeVars } from './buildHtmlSrcDoc';
 // DALTON-HOOK(mobile-web): import PageReadyPathState for tri-state bridge location tracking
 import { parsePageMessage, type PageReadyPathState, type PageToViewer, type ViewerToPage } from './pageProtocol';
+=======
+import { paletteCss, readThemePalette } from './frameTheme';
+import { parsePageMessage, type PageToViewer, type ViewerToPage } from './pageProtocol';
+>>>>>>> db284da5a
 
 /** The viewer's end of the bridge, handed to whatever draws over the frame. */
 export interface PageBridge {
@@ -116,7 +121,7 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     [ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe],
   );
 
-  const pushTheme = useCallback(() => post({ type: 'page:theme', css: resolveThemeVars() }), [post]);
+  const pushTheme = useCallback(() => post({ type: 'page:theme', css: paletteCss(readThemePalette()) }), [post]);
 
   const onMessage = useEffectEvent((e: MessageEvent) => {
     const win = frameRef.current?.contentWindow;

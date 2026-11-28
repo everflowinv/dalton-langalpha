@@ -52,6 +52,10 @@
         "title": "仪表盘",
         "description": "仪表盘上显示的内容。"
       },
+      "layout": {
+        "title": "布局",
+        "description": "应用窗口的排布方式。"
+      },
       "other": {
         "title": "其他",
         "description": "更多可以试用的功能。"
@@ -141,7 +145,19 @@
     },
     "claude_oauth": {
       "label": "Claude 登录（旧版）",
+<<<<<<< HEAD
       "description": "通过登录你的 Claude 账户使用 Claude Pro 或 Max 套餐，由 {{brand}} 直接调用 Claude。Claude Code 模式将取代它。"
+=======
+      "description": "通过登录你的 Claude 账户使用 Claude Pro 或 Max 套餐，由 LangAlpha 直接调用 Claude。Claude Code 模式将取代它。"
+    },
+    "page_tabs": {
+      "label": "页面标签",
+      "description": "把打开的页面作为标签排在窗口顶部，不用侧边栏也能在对话、行情和仪表盘之间切换。",
+      "on_if": "你常同时开着几个页面来回切换，而且经常隐藏侧边栏。",
+      "off_if": "你习惯用侧边栏切换页面，想让窗口顶部保持清爽。",
+      "cost": "不产生额外费用",
+      "good_to_know": "标签记住的是所在的页面，不是滚动到的位置。所有标签共用一套后退和前进记录，并且只保存在这台设备上。"
+>>>>>>> db284da5a
     }
   },
   "theme": "主题",
@@ -216,7 +232,7 @@
   "ownContext": "在共享工作区中使用我的偏好和记忆",
   "ownContextDesc": "你在共享工作区发消息时，Agent 会按你的回答偏好作答，并可读取你的记忆。在与工作区共享的对话中，它的回答对工作区成员可见。",
   "resetPreferences": "重置偏好",
-  "resetConfirmMsg": "这将清除您所有的偏好设置：风险偏好、投资风格、Agent 设置、默认模型及其他模型设置（自定义模型与服务商、快速切换模型、按模型设置），以及仪表盘布局。已有对话会继续使用各自的模型。您可以随时在设置中或通过 Agent 重新设置。确定吗？",
+  "resetConfirmMsg": "这将清除您的风险偏好、投资风格、Agent 设置和仪表盘布局。您的模型、模型设置和 API 密钥保持不变。您可以随时在设置中或通过 Agent 重新设置。确定吗？",
   "resetting": "重置中...",
   "completeProfile": "设置投资画像",
   "completeProfileDesc": "回答几个问题，让 Agent 更了解你的投资习惯，提供更适合你的研究。",
@@ -451,7 +467,7 @@
   "nameDesc": "显示在账户菜单中。",
   "logoutDesc": "退出后需要重新登录才能使用 {{brand}}。",
   "investingAnswers": "你的回答",
-  "resetPreferencesDesc": "清除你的投资回答、默认模型和其他模型设置。已有对话保留各自使用的模型。",
+  "resetPreferencesDesc": "清除你的投资回答和 Agent 设置。模型和 API 密钥保持不变。",
   "regionGroup": "语言和地区",
   "localeDesc": "{{brand}} 界面显示的语言。",
   "timezoneDesc": "日期和时间按此时区显示。",
@@ -547,6 +563,11 @@
     "notifyAutomationDesc": "自动化完成一次运行时。",
     "notifyStarted": "后台任务开始时也通知",
     "notifyStartedDesc": "价格提醒或自动化开始时静默显示一条通知，完成后替换为结果。唤醒只在有发现时通知你。",
+    "badge": "应用图标角标",
+    "badgeDesc": "有新回复或等待你回应的对话。",
+    "badgeCount": "数字",
+    "badgeDot": "圆点",
+    "badgeOff": "关闭",
     "menubarGroup": "菜单栏",
     "menubarIcon": "在菜单栏显示图标",
     "menubarIconDesc": "行情、持仓和 Agent 动态，一键可见。",
@@ -565,6 +586,8 @@
     "menubarStyleRotate": "轮播",
     "menubarStyleSide": "并排",
     "rotateEvery": "轮播间隔",
+    "menubarLogo": "显示 LangAlpha 标志",
+    "menubarLogoDesc": "关闭后菜单栏只显示你选的项目。没有可显示的内容时，标志会保留，方便点击。",
     "rotateSeconds_other": "每 {{count}} 秒",
     "menubarShow": "显示",
     "menubarShowDesc": "每一项显示的内容。",
@@ -604,6 +627,9 @@
     "openAtLoginWindowDesc": "登录这台电脑时打开 {{brand}} 窗口。开启图标后，改为在后台启动。",
     "keepRunning": "关闭窗口后在托盘中继续运行",
     "keepRunningDesc": "关闭窗口后，通知和托盘图标仍会继续工作。",
+    "updatesGroup": "更新",
+    "automaticUpdates": "自动安装更新",
+    "automaticUpdatesDesc": "新版本会在后台下载，并在下次退出时安装。关闭后，侧边栏会提示每个新版本，由你决定何时下载。",
     "unavailable": "桌面应用没有响应，请重启后再试。"
   },
   "computers": {

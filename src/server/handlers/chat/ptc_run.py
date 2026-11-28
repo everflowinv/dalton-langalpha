@@ -367,6 +367,7 @@ async def astream_ptc_workflow(
             if request.artifact_comment_ids:
                 from src.dalton.settings import is_artifact_publishing_enabled
 
+<<<<<<< HEAD
                 if not is_artifact_publishing_enabled():
                     raise HTTPException(
                         status_code=409,
@@ -375,6 +376,68 @@ async def astream_ptc_workflow(
                             "message": "File comments are disabled on this deployment.",
                         },
                     )
+=======
+            # A send held behind a thread mutation (a /compact, the hand-off at a
+            # model switch) is told why it waits, as a cold start is. Not a
+            # dispatch's primer or a steer probe, which read the first frame as
+            # their answer.
+            held_by = (
+                None
+                if dispatched or request.steer_only
+                else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
+            )
+            # Who wrote this send, fixed now: the turn it opens and the steer
+            # it may become both name them by it.
+            written_by = await identity.message_sender(request)
+            # Admit a fresh turn, steer the running one, or 409 — see
+            # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
+            admit = partial(
+                wait_or_steer,
+                manager,
+                thread_id,
+                user_input,
+                user_id,
+                steer_only=request.steer_only,
+                platform=request.platform,
+                device=request.device,
+                request_key=request.request_key,
+                workspace_id=workspace_id,
+                steer_job_id=request.steer_job_id,
+                # A hand-off into a running turn answers the dispatch primer
+                # with ``HandOffSteered``: that run's id and the steer's.
+                agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
+                can_steer=steer_allowed(
+                    request, dispatched=dispatched, steerable=steerable
+                ),
+                artifact_comments=request.artifact_comments,
+                shared=identity.shared,
+                written_by=written_by,
+                checked_computer_id=request.checked_computer_id,
+                on_model=(request.llm_model or None) if dispatched else None,
+            )
+            if held_by is None:
+                ready, steering_event = await admit()
+            else:
+                yield _turn_held({"status": "held", "reason": held_by})
+                ready, steering_event = await admit()
+                yield _turn_held({"status": "released"})
+            if not ready:
+                # Steered: the running turn, or the turn it becomes, has it.
+                # A hand-off naming a model steers only a turn running on
+                # it, so the thread keeps that model as a turn it started
+                # would.
+                if dispatched and steering_event:
+                    await keep_named_model(thread_id, named_model)
+                await comments.admitted()
+                await scope.release_slot()
+                # Release admission immediately — no workflow will register
+                # under this lock, so holding it would needlessly block any
+                # follow-up POST.
+                scope.release_admission()
+                if steering_event:
+                    yield steering_event
+                return
+>>>>>>> db284da5a
 
             # File comments go out as this send's message, taken under its key
             # here because admission needs the message; the scope gives them back
