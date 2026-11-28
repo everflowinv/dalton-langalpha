@@ -1652,6 +1652,19 @@ def _is_url_from_configured_storage(url: str) -> bool:
     return bool(norm and norm in origins)
 
 
+def _is_private_media_ref(ref: str) -> bool:
+    """Return True iff ``ref`` is an internal ``private-media/...`` logical key reference."""
+    if not isinstance(ref, str):
+        return False
+    cleaned = ref.strip()
+    if not cleaned or "://" in cleaned or cleaned.startswith("/"):
+        return False
+    if not cleaned.lower().startswith(PRIVATE_MEDIA_PREFIX):
+        return False
+    key = extract_upstream_key_from_url(cleaned)
+    return bool(key and _is_safe_object_key(key))
+
+
 def _is_thread_prefixed_upstream_key(thread_id: str, key: str) -> bool:
     """Return True iff ``key`` is directly scoped under ``{prefix}/{thread_id}/...``."""
     if not thread_id or not _is_safe_object_key(key):
@@ -1670,6 +1683,7 @@ class ThreadMediaRegistry:
     attachment_keys: set[str] = field(default_factory=set)
     attachment_ids: set[str] = field(default_factory=set)
     attachment_urls: set[str] = field(default_factory=set)
+    attachment_object_keys: set[str] = field(default_factory=set)
     attachment_owners: dict[str, set[str]] = field(default_factory=dict)
     upload_id_owners: dict[str, set[str]] = field(default_factory=dict)
     captured_image_keys: set[str] = field(default_factory=set)
@@ -1695,6 +1709,21 @@ def _register_attachment_mapping(
             if allowed_users:
                 registry.attachment_owners.setdefault(cleaned, set()).update(allowed_users)
             if cleaned.startswith("attachments/"):
+                parts = cleaned.split("/")
+                if len(parts) >= 3 and parts[1]:
+                    registry.attachment_ids.add(parts[1])
+                    if allowed_users:
+                        registry.attachment_owners.setdefault(parts[1], set()).update(allowed_users)
+    raw_okey = att.get("object_key")
+    if isinstance(raw_okey, str) and raw_okey.strip():
+        clean_okey = raw_okey.strip().lstrip("/")
+        if _is_safe_object_key(clean_okey):
+            cleaned = strip_private_media_prefix(clean_okey)
+            if cleaned.startswith("attachments/"):
+                registry.attachment_object_keys.add(clean_okey)
+                registry.attachment_keys.add(cleaned)
+                if allowed_users:
+                    registry.attachment_owners.setdefault(cleaned, set()).update(allowed_users)
                 parts = cleaned.split("/")
                 if len(parts) >= 3 and parts[1]:
                     registry.attachment_ids.add(parts[1])
@@ -1818,8 +1847,19 @@ def _collect_thread_media_registry(
         facts = container.get("replay_facts") if "replay_facts" in container else container
         if not isinstance(facts, Mapping):
             continue
+        img_urls: list[Any] = []
         imgs = facts.get("images")
-        img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
+        if isinstance(imgs, Mapping):
+            img_urls.extend(imgs.values())
+        elif isinstance(imgs, list):
+            img_urls.extend(imgs)
+        imgs_by_msg = facts.get("images_by_message")
+        if isinstance(imgs_by_msg, Mapping):
+            for per_msg in imgs_by_msg.values():
+                if isinstance(per_msg, Mapping):
+                    img_urls.extend(per_msg.values())
+                elif isinstance(per_msg, list):
+                    img_urls.extend(per_msg)
         for u in img_urls:
             if not isinstance(u, str) or not u.strip():
                 continue
@@ -2156,19 +2196,27 @@ async def _is_chat_upload_bound_to_thread(
 
 
 _RAW_URL_SCAN_RE = re.compile(r"https?://[^\s<>'\"`)\]]+", re.IGNORECASE)
+_RAW_PRIVATE_MEDIA_REF_RE = re.compile(
+    r"(?<![A-Za-z0-9_.:/@-])private-media/(?:response-images|attachments|widgets)/[^\s<>'\"`)\]]+",
+    re.IGNORECASE,
+)
 
 
 def _strip_configured_storage_urls_from_text(text: str) -> str:
-    if not text or "http" not in text.lower():
+    if not text:
         return text
+    out = text
+    if "http" in out.lower():
+        def _repl(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            if _is_url_from_configured_storage(raw):
+                return "[media-unavailable]"
+            return raw
 
-    def _repl(match: re.Match[str]) -> str:
-        raw = match.group(0)
-        if _is_url_from_configured_storage(raw):
-            return "[media-unavailable]"
-        return raw
-
-    return _RAW_URL_SCAN_RE.sub(_repl, text)
+        out = _RAW_URL_SCAN_RE.sub(_repl, out)
+    if "private-media/" in out.lower():
+        out = _RAW_PRIVATE_MEDIA_REF_RE.sub("[media-unavailable]", out)
+    return out
 
 
 def _strip_configured_storage_urls_from_attachments(atts: list[Any]) -> tuple[list[Any], bool]:
@@ -2180,8 +2228,13 @@ def _strip_configured_storage_urls_from_attachments(atts: list[Any]) -> tuple[li
             continue
         att_copy = dict(att)
         old_u = att_copy.get("url")
-        if isinstance(old_u, str) and old_u.strip() and _is_url_from_configured_storage(old_u):
+        if isinstance(old_u, str) and old_u.strip() and (
+            _is_url_from_configured_storage(old_u) or _is_private_media_ref(old_u)
+        ):
             att_copy.pop("url", None)
+            changed = True
+        if "object_key" in att_copy:
+            att_copy.pop("object_key", None)
             changed = True
         out.append(att_copy)
     return out, changed
@@ -2266,7 +2319,8 @@ def _strip_raw_storage_urls_from_lines(lines: list[Any]) -> list[Any]:
         if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
             out.append(ln)
             continue
-        if "http" not in ln.data_json.lower():
+        low_json = ln.data_json.lower()
+        if "http" not in low_json and "private-media/" not in low_json and '"object_key"' not in ln.data_json:
             out.append(ln)
             continue
         raw_item = ln.item()
@@ -2342,7 +2396,7 @@ async def resolve_thread_media_bindings(
     ) -> None:
         if not isinstance(u, str) or not u.strip():
             return
-        if not _is_url_from_configured_storage(u):
+        if not (_is_url_from_configured_storage(u) or _is_private_media_ref(u)):
             return
         key = extract_upstream_key_from_url(u)
         if not key or not _is_safe_object_key(key):
@@ -2386,6 +2440,31 @@ async def resolve_thread_media_bindings(
             att_owner_ids=allowed_owners,
         )
 
+    # 1b. Private-mode attachment object_key references (public_bucket_urls=false)
+    for att_okey in registry.attachment_object_keys:
+        if not _is_safe_object_key(att_okey):
+            continue
+        cleaned = strip_private_media_prefix(att_okey)
+        if not cleaned.startswith("attachments/"):
+            continue
+        parts = cleaned.split("/")
+        att_id = parts[1] if len(parts) >= 3 else ""
+        allowed_owners = (
+            registry.attachment_owners.get(cleaned)
+            or registry.attachment_owners.get(att_id)
+            or None
+        )
+        if cleaned.startswith(f"attachments/{thread_id}/"):
+            bindings[f"object_key:{att_okey}"] = ("upstream", att_okey)
+        elif await _is_attachment_bound_to_thread(
+            thread_id,
+            att_okey,
+            owner_id=owner_id,
+            allowed_owner_ids=allowed_owners,
+            registry=registry,
+        ):
+            bindings[f"object_key:{att_okey}"] = ("upstream", att_okey)
+
     # 2. Server-recorded captured sandbox images from DB replay_facts ONLY (never free-text scan)
     for img_url in registry.captured_image_urls:
         await _register_upstream_url(
@@ -2422,18 +2501,28 @@ def _rewrite_attachment_list(
     atts: list[Any],
     url_map: Mapping[str, str],
     upload_id_map: Mapping[str, str],
+    object_key_map: Mapping[str, str] | None = None,
 ) -> tuple[list[Any], bool]:
     new_atts: list[Any] = []
     att_changed = False
+    okey_map = object_key_map or {}
     for att in atts:
         if not isinstance(att, dict):
             new_atts.append(att)
             continue
         att_copy = dict(att)
         old_u = att_copy.get("url")
+        raw_okey = att_copy.pop("object_key", None)
+        if raw_okey is not None:
+            att_changed = True
         if isinstance(old_u, str) and old_u in url_map:
             att_copy["url"] = url_map[old_u]
             att_changed = True
+        elif not att_copy.get("url") and isinstance(raw_okey, str) and raw_okey.strip():
+            clean_okey = raw_okey.strip().lstrip("/")
+            if clean_okey in okey_map:
+                att_copy["url"] = okey_map[clean_okey]
+                att_changed = True
         elif not att_copy.get("url") and att_copy.get("upload_id"):
             uid = str(att_copy["upload_id"])
             if uid in upload_id_map:
@@ -2447,8 +2536,9 @@ def _rewrite_item_urls(
     item: dict[str, Any],
     url_map: Mapping[str, str],
     upload_id_map: Mapping[str, str],
+    object_key_map: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    if not url_map and not upload_id_map:
+    if not url_map and not upload_id_map and not object_key_map:
         return item
     data = item.get("data")
     if not isinstance(data, dict):
@@ -2470,7 +2560,7 @@ def _rewrite_item_urls(
     meta = new_data.get("metadata")
     if isinstance(meta, dict) and isinstance(meta.get("attachments"), list):
         new_atts, att_changed = _rewrite_attachment_list(
-            meta["attachments"], url_map, upload_id_map
+            meta["attachments"], url_map, upload_id_map, object_key_map
         )
         if att_changed:
             new_data["metadata"] = {**meta, "attachments": new_atts}
@@ -2478,7 +2568,7 @@ def _rewrite_item_urls(
 
     if isinstance(new_data.get("attachments"), list):
         new_top_atts, top_changed = _rewrite_attachment_list(
-            new_data["attachments"], url_map, upload_id_map
+            new_data["attachments"], url_map, upload_id_map, object_key_map
         )
         if top_changed:
             new_data["attachments"] = new_top_atts
@@ -2505,7 +2595,7 @@ def _rewrite_item_urls(
                     m_changed = True
             if isinstance(msg_copy.get("attachments"), list):
                 rewritten_m_atts, r_changed = _rewrite_attachment_list(
-                    msg_copy["attachments"], url_map, upload_id_map
+                    msg_copy["attachments"], url_map, upload_id_map, object_key_map
                 )
                 if r_changed:
                     msg_copy["attachments"] = rewritten_m_atts
@@ -2513,7 +2603,7 @@ def _rewrite_item_urls(
             m_meta = msg_copy.get("metadata")
             if isinstance(m_meta, dict) and isinstance(m_meta.get("attachments"), list):
                 rewritten_mm_atts, rm_changed = _rewrite_attachment_list(
-                    m_meta["attachments"], url_map, upload_id_map
+                    m_meta["attachments"], url_map, upload_id_map, object_key_map
                 )
                 if rm_changed:
                     msg_copy["metadata"] = {**m_meta, "attachments": rewritten_mm_atts}
@@ -2577,7 +2667,7 @@ def rewrite_items_for_public_media(
     source_segment_index: int | None = None,
     source_thread_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
+    """Rewrite stored URLs, ``object_key`` refs, and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
 
     Fail-closed: when ``bindings is None`` or any configured-storage URL could
     not be signed into a controlled media ref, that raw object URL is erased
@@ -2587,6 +2677,7 @@ def rewrite_items_for_public_media(
     """
     if bindings is None:
         return [_strip_raw_storage_urls_from_item(it) for it in items]
+<<<<<<< HEAD
 
     def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
         u_map: dict[str, str] = {}
@@ -2621,6 +2712,21 @@ def rewrite_items_for_public_media(
 
     maps_by_turn: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
     out = []
+=======
+    url_map: dict[str, str] = {}
+    upload_id_map: dict[str, str] = {}
+    object_key_map: dict[str, str] = {}
+    for key, (backend, ref_id) in bindings.items():
+        ref = mint_public_media_ref(thread_id=thread_id, backend=backend, ref_id=ref_id)
+        controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
+        if key.startswith("upload_id:"):
+            upload_id_map[key[len("upload_id:") :]] = controlled
+        elif key.startswith("object_key:"):
+            object_key_map[key[len("object_key:") :]] = controlled
+        else:
+            url_map[key] = controlled
+    out: list[dict[str, Any]] = []
+>>>>>>> refs/lane/83
     for it in items:
         turn_idx = _extract_item_turn_index(it)
         if turn_idx is None:
@@ -2632,8 +2738,8 @@ def rewrite_items_for_public_media(
             maps_by_turn[turn_idx] = pair
         url_map, upload_id_map = pair
         rewritten = (
-            _rewrite_item_urls(it, url_map, upload_id_map)
-            if (url_map or upload_id_map)
+            _rewrite_item_urls(it, url_map, upload_id_map, object_key_map)
+            if (url_map or upload_id_map or object_key_map)
             else it
         )
         out.append(_strip_raw_storage_urls_from_item(rewritten))
@@ -2651,7 +2757,7 @@ def rewrite_lines_for_owner_media(
     source_segment_index: int | None = None,
     source_thread_id: str | None = None,
 ) -> list[Any]:
-    """Rewrite stored media URLs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``.
+    """Rewrite stored media URLs and private ``object_key`` refs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``.
 
     Fail-closed: when ``bindings is None`` or any configured-storage URL could
     not be signed into a controlled media token, that raw object URL is erased
@@ -2663,6 +2769,28 @@ def rewrite_lines_for_owner_media(
 
     if bindings is None:
         return _strip_raw_storage_urls_from_lines(lines)
+<<<<<<< HEAD
+=======
+    url_map: dict[str, str] = {}
+    upload_id_map: dict[str, str] = {}
+    object_key_map: dict[str, str] = {}
+    for key, (backend, ref_id) in bindings.items():
+        tok = mint_owner_media_token(
+            thread_id=thread_id,
+            viewer_id=viewer_id,
+            backend=backend,
+            ref_id=ref_id,
+            sid_hash=sid_hash,
+            origin_hash=origin_hash,
+        )
+        controlled = f"/api/v1/threads/{thread_id}/media/{tok}"
+        if key.startswith("upload_id:"):
+            upload_id_map[key[len("upload_id:") :]] = controlled
+        elif key.startswith("object_key:"):
+            object_key_map[key[len("object_key:") :]] = controlled
+        else:
+            url_map[key] = controlled
+>>>>>>> refs/lane/83
 
     def _build_maps(turn_idx: int | None) -> tuple[dict[str, str], dict[str, str]]:
         u_map: dict[str, str] = {}
@@ -2724,9 +2852,20 @@ def rewrite_lines_for_owner_media(
         if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
             out.append(ln)
             continue
+<<<<<<< HEAD
         has_http = "http" in ln.data_json.lower()
         maybe_upload = has_binding_uploads and '"upload_id"' in ln.data_json
         if not has_http and not maybe_upload and not has_binding_urls:
+=======
+        needs_rewrite = (
+            (url_map and any(u in ln.data_json for u in url_map))
+            or (bool(upload_id_map) and '"upload_id"' in ln.data_json)
+            or (bool(object_key_map) and '"object_key"' in ln.data_json)
+        )
+        low_json = ln.data_json.lower()
+        has_raw = "http" in low_json or "private-media/" in low_json or '"object_key"' in ln.data_json
+        if not needs_rewrite and not has_raw:
+>>>>>>> refs/lane/83
             out.append(ln)
             continue
         raw_item = ln.item()
@@ -2747,13 +2886,144 @@ def rewrite_lines_for_owner_media(
             out.append(ln)
             continue
         rewritten = (
-            _rewrite_item_urls(raw_item, url_map, upload_id_map)
+            _rewrite_item_urls(raw_item, url_map, upload_id_map, object_key_map)
             if needs_rewrite
             else raw_item
         )
         cleaned = _strip_raw_storage_urls_from_item(rewritten)
         out.append(line_of(cleaned) if cleaned is not raw_item else ln)
     return out
+
+
+def _rewrite_live_image_map(
+    img_map: Mapping[str, Any],
+    *,
+    thread_id: str,
+    viewer_id: str,
+    sid_hash: str,
+    origin_hash: str,
+) -> tuple[dict[str, str], bool]:
+    rewritten: dict[str, str] = {}
+    changed = False
+    for path, raw_val in img_map.items():
+        if not isinstance(raw_val, str) or not raw_val.strip():
+            continue
+        val = raw_val.strip()
+        if _is_private_media_ref(val) or _is_url_from_configured_storage(val):
+            key = extract_upstream_key_from_url(val)
+            if key and _is_thread_prefixed_upstream_key(thread_id, key):
+                tok = mint_owner_media_token(
+                    thread_id=thread_id,
+                    viewer_id=viewer_id,
+                    backend="upstream",
+                    ref_id=key,
+                    sid_hash=sid_hash,
+                    origin_hash=origin_hash,
+                )
+                rewritten[str(path)] = f"/api/v1/threads/{thread_id}/media/{tok}"
+                changed = True
+                continue
+            changed = True
+            continue
+        rewritten[str(path)] = val
+    return rewritten, changed
+
+
+def rewrite_live_run_end_sse_frame(
+    frame: str,
+    *,
+    thread_id: str,
+    viewer_id: str,
+    sid_hash: str = "",
+    origin_hash: str = "",
+) -> str:
+    """Rewrite private/storage image references in a live ``run_end`` SSE frame to AU1 owner media URLs."""
+    if (
+        not isinstance(frame, str)
+        or "event: run_end" not in frame
+        or ('"images"' not in frame and '"images_by_message"' not in frame)
+    ):
+        return frame
+    lines = frame.splitlines(keepends=True)
+    changed = False
+    out_lines: list[str] = []
+    for line in lines:
+        if line.startswith("data: "):
+            raw_json = line[len("data: ") :].strip()
+            try:
+                payload = json.loads(raw_json)
+            except Exception:
+                out_lines.append(line)
+                continue
+            if not isinstance(payload, dict):
+                out_lines.append(line)
+                continue
+            if isinstance(payload.get("images"), Mapping):
+                new_imgs, imgs_changed = _rewrite_live_image_map(
+                    payload["images"],
+                    thread_id=thread_id,
+                    viewer_id=viewer_id,
+                    sid_hash=sid_hash,
+                    origin_hash=origin_hash,
+                )
+                if imgs_changed:
+                    payload["images"] = new_imgs
+                    changed = True
+            if isinstance(payload.get("images_by_message"), Mapping):
+                new_by_msg: dict[str, dict[str, str]] = {}
+                by_msg_changed = False
+                for mid, per_map in payload["images_by_message"].items():
+                    if isinstance(per_map, Mapping):
+                        new_per, p_changed = _rewrite_live_image_map(
+                            per_map,
+                            thread_id=thread_id,
+                            viewer_id=viewer_id,
+                            sid_hash=sid_hash,
+                            origin_hash=origin_hash,
+                        )
+                        if p_changed:
+                            by_msg_changed = True
+                        if new_per:
+                            new_by_msg[str(mid)] = new_per
+                if by_msg_changed:
+                    payload["images_by_message"] = new_by_msg
+                    changed = True
+            if changed:
+                ending = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+                out_lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}{ending}")
+                continue
+        out_lines.append(line)
+    return "".join(out_lines) if changed else frame
+
+
+def wrap_owner_live_sse_media(
+    stream: Any,
+    request: Request | None,
+    *,
+    thread_id: str,
+    viewer_id: str,
+) -> tuple[Any, list[str]]:
+    """Wrap a live/reconnect owner SSE stream to rewrite ``run_end`` media refs to AU1 URLs."""
+    set_cookies: list[str] = []
+    sid_hash, origin_hash = "", ""
+    if request is not None:
+        cookie_holder = Response()
+        oss_session = mint_oss_media_session_cookie(request, cookie_holder)
+        if oss_session:
+            sid_hash, origin_hash = oss_session
+        set_cookies = cookie_holder.headers.getlist("set-cookie")
+
+    async def _wrapped():
+        async for frame in stream:
+            yield rewrite_live_run_end_sse_frame(
+                frame,
+                thread_id=thread_id,
+                viewer_id=viewer_id,
+                sid_hash=sid_hash,
+                origin_hash=origin_hash,
+            )
+
+    return _wrapped(), set_cookies
 
 
 async def prepare_owner_replay_media(

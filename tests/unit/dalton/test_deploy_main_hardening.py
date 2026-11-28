@@ -551,7 +551,24 @@ case "${{1:-}}" in
     if [[ "$*" == *"com.dalton.pg-backup"* ]]; then
       n=$(( $(cat "{backup_seq}") + 1 ))
       echo "$n" > "{backup_seq}"
-      echo "{now_str} ok  16G /backups/fresh-${{n}}.dump" >> "{backup_log}"
+      _nid_file="${{DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}}"
+      _sid="$(tr -d '[:space:]' < "$_nid_file" 2>/dev/null || true)"
+      if [ -n "$_sid" ]; then
+        _broot="{tmp_path}/mock-backups"
+        mkdir -p "$_broot/pg" "$_broot/sets"
+        _dump="$_broot/pg/dalton-pg-${{_sid}}.dump"
+        printf 'PGDMP-%s-%s' "$_sid" "$n" > "$_dump"
+        _man="$_broot/sets/minio-manifest-${{_sid}}.json"
+        printf '{{"version":2,"backup_set_id":"%s","objects":[]}}\\n' "$_sid" > "$_man"
+        _dsha="$(shasum -a 256 "$_dump" | awk '{{print $1}}')"
+        _dsz="$(wc -c < "$_dump" | tr -d '[:space:]')"
+        _msha="$(shasum -a 256 "$_man" | awk '{{print $1}}')"
+        printf '{{"version":1,"backup_set_id":"%s","dump_path":"%s","dump_size_bytes":%s,"dump_sha256":"%s","manifest_path":"%s","manifest_sha256":"%s","object_count":0,"reconcile_ok":true}}\\n' \\
+          "$_sid" "$_dump" "$_dsz" "$_dsha" "$_man" "$_msha" > "$_broot/sets/backup-set-${{_sid}}.json"
+        echo "{now_str} ok  16G ${{_dump}} set=${{_sid}}" >> "{backup_log}"
+      else
+        echo "{now_str} ok  16G /backups/fresh-${{n}}.dump" >> "{backup_log}"
+      fi
       exit 0
     elif [[ "$*" == *"com.dalton.researchdata-bridge"* ]] || [[ "$*" == *"com.dalton.channel-gateway"* ]]; then
       exit 0
@@ -1395,7 +1412,7 @@ def test_reexec_handshake_runs_updated_script_once_under_same_lock(tmp_path: Pat
     assert Path(ctx["wait_idle_trace"]).read_text().splitlines() == ["wait_idle_v1"]
 
     launchctl_lines = Path(ctx["launchctl_trace"]).read_text().splitlines()
-    assert len([line for line in launchctl_lines if "com.dalton.pg-backup" in line]) == 1
+    assert len([line for line in launchctl_lines if "kickstart" in line and "com.dalton.pg-backup" in line]) == 1
     assert len([line for line in launchctl_lines if "com.dalton.researchdata-bridge" in line]) == 1
     assert list((tmp_path / "reexec-tmpdir").glob("dalton-deploy-reexec.*")) == []
     assert not _is_lock_held(Path(ctx["lock_file"]))

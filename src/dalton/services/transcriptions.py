@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Mapping
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -75,6 +76,7 @@ ALLOWED_TICKET_OPERATIONS: tuple[str, ...] = (
     "status",
     "result",
     "retry",
+    "resubmit",
     "cancel",
 )
 
@@ -1883,6 +1885,85 @@ async def complete_transcription_upload(
     }
 
 
+def _is_restored_no_resume_job(job: dict[str, Any]) -> bool:
+    """Return True when ``job`` carries the persisted post-restore no-resume marker.
+
+    Restored in-flight/indeterminate jobs must never be started via normal submit or
+    in-place ``/retry``; callers must use ``/resubmit`` which creates a single canonical
+    replacement attempt.
+    """
+    if job.get("restored_no_resume") is True:
+        return True
+    if str(job.get("error_category") or "").strip().lower() == "restored_inflight":
+        return True
+    usage = job.get("usage")
+    if isinstance(usage, dict) and usage.get("restored_no_resume") is True:
+        return True
+    return False
+
+
+async def _persist_transcription_submit_intent(
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist ``usage.submit_attempted = true`` BEFORE calling the transcription service.
+
+    If a backup snapshot lands between the transcription service accepting the job and
+    ``_sync_job_from_bridge_state`` updating the DB row (or if the bridge response is
+    lost), post-restore convergence uses this durable marker to mark the ``awaiting_upload``
+    row ``failed`` + ``restored_no_resume = true`` so normal submit is rejected and only
+    ``/resubmit`` can start a fresh replacement attempt.
+    """
+    current = job
+    for _ in range(3):
+        cur_status = str(current.get("status") or "")
+        if cur_status == TranscriptionJobStatus.CANCELLED.value:
+            raise HTTPException(
+                status_code=409,
+                detail="Cancelled transcription job cannot be submitted",
+            )
+        if _is_restored_no_resume_job(current):
+            raise HTTPException(
+                status_code=409,
+                detail="Restored transcription job cannot be submitted directly; use /resubmit instead",
+            )
+        if cur_status != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+            return current
+
+        cur_usage = (
+            dict(current.get("usage")) if isinstance(current.get("usage"), dict) else {}
+        )
+        if cur_usage.get("submit_attempted") is True:
+            return current
+
+        cur_usage["submit_attempted"] = True
+        cur_usage["submit_attempted_at"] = datetime.now(timezone.utc).isoformat()
+        updated, latest = await db.update_transcription_job_versioned(
+            str(current["job_id"]),
+            expected_version=int(current["version"]),
+            status=TranscriptionJobStatus.AWAITING_UPLOAD,
+            stage=str(current.get("stage") or TranscriptionJobStatus.AWAITING_UPLOAD.value),
+            usage=cur_usage,
+        )
+        if updated:
+            return (
+                latest
+                if latest is not None
+                else {
+                    **current,
+                    "usage": cur_usage,
+                    "version": int(current["version"]) + 1,
+                }
+            )
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Transcription job not found")
+        current = latest
+
+    raise HTTPException(
+        status_code=409,
+        detail="Concurrent modification conflict while persisting transcription submit intent",
+    )
+
+
 async def submit_transcription_job(
     *,
     caller_user_id: str,
@@ -1970,6 +2051,11 @@ async def submit_transcription_job(
         raise HTTPException(
             status_code=409, detail="Cancelled transcription job cannot be submitted"
         )
+    if _is_restored_no_resume_job(job):
+        raise HTTPException(
+            status_code=409,
+            detail="Restored transcription job cannot be submitted directly; use /resubmit instead",
+        )
 
     # Item 1: Before submitting to the bridge, verify object storage is enabled and
     # the source audio object has completed upload with exact matching byte size.
@@ -2001,6 +2087,10 @@ async def submit_transcription_job(
         if hotwords is not None
         else list(job.get("hotwords") or [])
     )
+
+    # Persist submit intent in PostgreSQL BEFORE invoking the transcription service so
+    # snapshots taken across the submit window converge to restored_no_resume (/resubmit only).
+    job = await _persist_transcription_submit_intent(job)
 
     bridge_payload: dict[str, Any] = {
         "job_id": str(job["job_id"]),
@@ -2201,6 +2291,11 @@ async def retry_transcription_job(
     await authorize_job_access(job, clean_caller, need="read")
 
     cur_status = str(job.get("status") or "")
+    if _is_restored_no_resume_job(job):
+        raise HTTPException(
+            status_code=409,
+            detail="Restored transcription job cannot be retried in place; use /resubmit instead",
+        )
     if cur_status not in RETRYABLE_TRANSCRIPTION_STATUSES:
         raise HTTPException(
             status_code=409,
@@ -2246,6 +2341,332 @@ async def retry_transcription_job(
         job, bridge_job, allow_reset_from_terminal=True
     )
     return {"ok": True, "job": updated}
+
+
+async def resubmit_transcription_job(
+    *,
+    job_id: str,
+    caller_user_id: str,
+) -> dict[str, Any]:
+    """Create and submit a brand-new transcription attempt from an existing job's archived audio.
+
+    Used after restore convergence marks in-flight jobs ``failed`` (``恢复后请重新提交``):
+    the restored transcription service only carries terminal ``asr_jobs`` directories, so
+    in-place ``retry`` would 404 on disk while ``POST /transcriptions`` would collide on the
+    original ``idempotency_key``. This entrypoint creates a fresh row with a new ``job_id``
+    and unique ``idempotency_key`` bound to the already archived ``source_object_key`` and
+    submits it to the transcription service as a new attempt (creator only).
+    """
+    clean_caller = await require_internal_transcription_caller(caller_user_id)
+    job = await db.get_transcription_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Transcription job not found")
+
+    if str(job.get("created_by_user_id") or "").strip() != clean_caller:
+        raise HTTPException(status_code=404, detail="Transcription job not found")
+
+    await authorize_job_access(job, clean_caller, need="read")
+
+    cur_status = str(job.get("status") or "")
+    if cur_status not in RETRYABLE_TRANSCRIPTION_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transcription job in status '{cur_status}' cannot be resubmitted",
+        )
+
+    if not is_transcription_storage_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Object storage is not enabled; transcription cannot be resubmitted",
+        )
+
+    source_object_key = str(job.get("source_object_key") or "").strip()
+    source_size_bytes = int(job.get("source_size_bytes") or 0)
+    source_sha256 = str(job.get("source_sha256") or "").strip().lower()
+    if not source_object_key or source_size_bytes <= 0 or not _SHA256_RE.fullmatch(source_sha256):
+        raise HTTPException(
+            status_code=409,
+            detail="Source audio metadata on the original transcription job is incomplete",
+        )
+
+    # Verify archived audio object exists with exact size OUTSIDE any DB lock/transaction.
+    actual_obj_size = await asyncio.to_thread(object_size, source_object_key)
+    if actual_obj_size != source_size_bytes:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Archived source audio object is missing or size-mismatched in object storage "
+                f"(actual_size={actual_obj_size}, expected_size={source_size_bytes})"
+            ),
+        )
+
+    old_job_id = str(job["job_id"])
+
+    def _resubmit_attempt_id_for_seq(seq: int) -> str:
+        suffix = "" if seq <= 0 else f":v{seq}"
+        return str(
+            uuid5(
+                _TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
+                f"dalton-asr-resubmit-attempt:{old_job_id}{suffix}",
+            )
+        )
+
+    # Persist and reuse a stable attempt ID for this original job so concurrent requests,
+    # double-clicks, and retries after a dropped bridge response all converge on one row
+    # and one idempotency key (never triggering duplicate transcription/billing).
+    cur_old_job: dict[str, Any] = dict(job)
+    existing_old_usage = (
+        cur_old_job.get("usage") if isinstance(cur_old_job.get("usage"), dict) else {}
+    )
+    raw_seq = existing_old_usage.get("resubmit_attempt_seq")
+    attempt_seq = int(raw_seq) if isinstance(raw_seq, int) and raw_seq >= 0 else 0
+    persisted_attempt_id = str(existing_old_usage.get("resubmit_attempt_id") or "").strip()
+    if persisted_attempt_id:
+        attempt_id = persisted_attempt_id
+    else:
+        attempt_id = _resubmit_attempt_id_for_seq(attempt_seq)
+        stamped_old_usage = dict(existing_old_usage)
+        stamped_old_usage["resubmit_attempt_id"] = attempt_id
+        stamped_old_usage["resubmit_attempt_seq"] = attempt_seq
+        ok_stamp, updated_old = await db.update_transcription_job_versioned(
+            old_job_id,
+            expected_version=int(cur_old_job["version"]),
+            status=cur_status,
+            stage=str(cur_old_job.get("stage") or cur_status),
+            usage=stamped_old_usage,
+        )
+        if isinstance(updated_old, dict):
+            cur_old_job = dict(updated_old)
+            latest_usage = (
+                cur_old_job.get("usage") if isinstance(cur_old_job.get("usage"), dict) else {}
+            )
+            winner_id = str(latest_usage.get("resubmit_attempt_id") or "").strip()
+            if winner_id:
+                attempt_id = winner_id
+            if isinstance(latest_usage.get("resubmit_attempt_seq"), int):
+                attempt_seq = max(0, int(latest_usage["resubmit_attempt_seq"]))
+
+    eff_lang = str(job.get("language")).strip() if job.get("language") else None
+    eff_hotwords = list(job.get("hotwords") or [])
+
+    new_job: dict[str, Any] | None = None
+    new_idemp_key = ""
+    for _rotation in range(16):
+        new_idemp_key = str(
+            uuid5(
+                _TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
+                f"dalton-asr-resubmit:{old_job_id}:{attempt_id}",
+            )
+        )
+        initial_resubmit_usage: dict[str, Any] = {
+            "upload": {
+                "completed": True,
+                "aborted": False,
+                "source_size_bytes": source_size_bytes,
+                "verified_size_bytes": actual_obj_size,
+                "reused_from_job_id": old_job_id,
+            },
+            "submit_attempted": True,
+            "submit_attempted_at": datetime.now(timezone.utc).isoformat(),
+            "resubmitted_from_job_id": old_job_id,
+            "resubmit_attempt_id": attempt_id,
+        }
+
+        new_job = await db.create_transcription_job(
+            job_id=attempt_id,
+            created_by_user_id=clean_caller,
+            workspace_id=str(job["workspace_id"]),
+            thread_id=str(job.get("thread_id") or ""),
+            source_object_key=source_object_key,
+            source_size_bytes=source_size_bytes,
+            source_sha256=source_sha256,
+            idempotency_key=new_idemp_key,
+            language=eff_lang,
+            hotwords=eff_hotwords,
+            status=TranscriptionJobStatus.AWAITING_UPLOAD,
+            stage=TranscriptionJobStatus.AWAITING_UPLOAD.value,
+            usage=initial_resubmit_usage,
+        )
+
+        new_status = str(new_job.get("status") or "")
+        if (
+            new_status
+            in (
+                TranscriptionJobStatus.FAILED.value,
+                TranscriptionJobStatus.CANCELLED.value,
+            )
+            and _is_restored_no_resume_job(new_job)
+        ):
+            # Only when post-restore convergence marked the existing replacement attempt
+            # failed (submit_attempted / in-flight) or cancelled (pre-submit awaiting_upload)
+            # with restored_no_resume / error_category=restored_inflight do we rotate to a
+            # fresh deterministic attempt ID and resubmit. Normal ASR failures still use
+            # /retry, and user-initiated cancellations must not spawn a new billed attempt
+            # on request replay.
+            latest_old = await db.get_transcription_job(old_job_id)
+            if isinstance(latest_old, dict):
+                cur_old_job = dict(latest_old)
+            latest_old_usage = (
+                dict(cur_old_job.get("usage"))
+                if isinstance(cur_old_job.get("usage"), dict)
+                else {}
+            )
+            latest_persisted_id = str(latest_old_usage.get("resubmit_attempt_id") or "").strip()
+            latest_seq = (
+                int(latest_old_usage["resubmit_attempt_seq"])
+                if isinstance(latest_old_usage.get("resubmit_attempt_seq"), int)
+                and int(latest_old_usage["resubmit_attempt_seq"]) >= 0
+                else attempt_seq
+            )
+            if latest_persisted_id and latest_persisted_id != attempt_id:
+                attempt_id = latest_persisted_id
+                attempt_seq = latest_seq
+                continue
+            next_seq = max(attempt_seq, latest_seq) + 1
+            next_attempt_id = _resubmit_attempt_id_for_seq(next_seq)
+            while next_attempt_id == attempt_id:
+                next_seq += 1
+                next_attempt_id = _resubmit_attempt_id_for_seq(next_seq)
+            rotated_usage = {
+                **latest_old_usage,
+                "resubmit_attempt_id": next_attempt_id,
+                "resubmit_attempt_seq": next_seq,
+            }
+            ok_rot, updated_old = await db.update_transcription_job_versioned(
+                old_job_id,
+                expected_version=int(cur_old_job["version"]),
+                status=str(cur_old_job.get("status") or cur_status),
+                stage=str(cur_old_job.get("stage") or cur_status),
+                usage=rotated_usage,
+            )
+            if isinstance(updated_old, dict):
+                cur_old_job = dict(updated_old)
+                winner_usage = (
+                    cur_old_job.get("usage")
+                    if isinstance(cur_old_job.get("usage"), dict)
+                    else {}
+                )
+                winner_id = str(winner_usage.get("resubmit_attempt_id") or "").strip()
+                if not ok_rot and winner_id and winner_id != attempt_id:
+                    attempt_id = winner_id
+                    if isinstance(winner_usage.get("resubmit_attempt_seq"), int):
+                        attempt_seq = max(0, int(winner_usage["resubmit_attempt_seq"]))
+                    continue
+            attempt_id = next_attempt_id
+            attempt_seq = next_seq
+            continue
+
+        # If a prior request already submitted this attempt to the bridge and synced its status,
+        # return the existing attempt directly without re-submitting.
+        if new_status != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+            return {
+                "ok": True,
+                "job": new_job,
+                "resubmitted_from_job_id": old_job_id,
+            }
+
+        existing_new_usage = new_job.get("usage") if isinstance(new_job.get("usage"), dict) else {}
+        existing_upload = (
+            existing_new_usage.get("upload")
+            if isinstance(existing_new_usage.get("upload"), dict)
+            else {}
+        )
+        if existing_upload.get("completed") is not True or existing_new_usage.get("submit_attempted") is not True:
+            resubmit_usage: dict[str, Any] = {
+                **existing_new_usage,
+                **initial_resubmit_usage,
+                "submit_attempted_at": str(
+                    existing_new_usage.get("submit_attempted_at")
+                    or initial_resubmit_usage["submit_attempted_at"]
+                ),
+            }
+            updated_ok, stamped_job = await db.update_transcription_job_versioned(
+                str(new_job["job_id"]),
+                expected_version=int(new_job["version"]),
+                status=TranscriptionJobStatus.AWAITING_UPLOAD,
+                stage=TranscriptionJobStatus.AWAITING_UPLOAD.value,
+                usage=resubmit_usage,
+            )
+            if updated_ok and stamped_job is not None:
+                new_job = stamped_job
+            elif stamped_job is not None:
+                new_job = stamped_job
+                stamped_status = str(new_job.get("status") or "")
+                if (
+                    stamped_status
+                    in (
+                        TranscriptionJobStatus.FAILED.value,
+                        TranscriptionJobStatus.CANCELLED.value,
+                    )
+                    and _is_restored_no_resume_job(new_job)
+                ):
+                    continue
+                if stamped_status != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+                    return {
+                        "ok": True,
+                        "job": new_job,
+                        "resubmitted_from_job_id": old_job_id,
+                    }
+            new_job = await _persist_transcription_submit_intent(new_job)
+        break
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail="Unable to allocate a new active transcription resubmit attempt",
+        )
+    assert new_job is not None
+
+    bridge_payload: dict[str, Any] = {
+        "job_id": str(new_job["job_id"]),
+        "caller": {
+            "user_id": str(new_job["created_by_user_id"]),
+            "workspace_id": str(new_job["workspace_id"]),
+            "thread_id": str(new_job.get("thread_id") or ""),
+        },
+        "source_object_key": source_object_key,
+        "source_size_bytes": source_size_bytes,
+        "source_sha256": source_sha256,
+        "language": eff_lang,
+        "hotwords": eff_hotwords,
+        "idempotency_key": str(new_job.get("idempotency_key") or new_idemp_key),
+    }
+
+    try:
+        code, resp = await call_bridge_submit_transcription(bridge_payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Bridge transcription resubmit failed for new_job_id=%s (from=%s): %s",
+            new_job["job_id"],
+            old_job_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bridge transcription service unreachable: {type(exc).__name__}",
+        ) from exc
+
+    if code >= 400 or resp.get("ok") is False:
+        detail = str(resp.get("error") or f"Bridge returned HTTP {code}")
+        raise HTTPException(status_code=502 if code >= 500 else code, detail=detail)
+
+    bridge_job = (
+        resp.get("job")
+        if isinstance(resp.get("job"), dict)
+        else {
+            "status": resp.get("status") or TranscriptionJobStatus.QUEUED.value,
+            "stage": resp.get("stage") or TranscriptionJobStatus.QUEUED.value,
+            "segment_count": resp.get("segment_count", 1),
+            "completed_segments": resp.get("completed_segments", 0),
+        }
+    )
+    synced = await _sync_job_from_bridge_state(new_job, bridge_job)
+    return {
+        "ok": True,
+        "job": synced,
+        "resubmitted_from_job_id": old_job_id,
+    }
 
 
 async def cancel_transcription_job(

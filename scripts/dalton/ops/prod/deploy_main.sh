@@ -3877,8 +3877,10 @@ revert_deploy() {
   fi
 }
 
-# Last backup-log line if it is an ' ok ' dump at most $2 minutes old (relative to $3, epoch
-# seconds); prints nothing and returns 1 otherwise. Log line: "YYYY-mm-dd HH:MM:SS ok  <size> <path>".
+# Last backup-log line if it is an ' ok ' dump/backup-set at most $2 minutes old (relative to $3,
+# epoch seconds); prints nothing and returns 1 otherwise.
+# Accepts both legacy ("YYYY-mm-dd HH:MM:SS ok  <size> <path>") and consistent backup-set
+# ("YYYY-mm-dd HH:MM:SS ok  <size> <path> set=<id>") formats.
 recent_ok_backup() {
   local log="$1" max_min="$2" now="$3" line ts epoch
   line=$(tail -1 "$log" 2>/dev/null) || return 1
@@ -3887,6 +3889,291 @@ recent_ok_backup() {
   epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null || date -d "$ts" +%s 2>/dev/null) || return 1
   [ -n "$epoch" ] && [ "$epoch" -le "$now" ] && [ $(( now - epoch )) -le $(( max_min * 60 )) ] || return 1
   printf '%s\n' "$line"
+}
+
+# True when a dalton-pg-backup.log line represents a completed backup result (ok or failure),
+# ignoring intermediate progress lines prefixed with "[backup]".
+_is_terminal_pg_backup_line() {
+  local line="$1"
+  [ -n "$line" ] || return 1
+  case "$line" in
+    "[backup]"*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# True when launchd reports com.dalton.pg-backup is actively running (has an active PID / state = running).
+_pg_backup_job_running() {
+  local out=""
+  out=$(launchctl print "gui/$(id -u)/com.dalton.pg-backup" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'
+}
+
+# Find the terminal dalton-pg-backup.log line matching a waited-on backup ID (set=<id>).
+# When wait_id is non-empty, ONLY a terminal line with exact token "set=<wait_id>" matches
+# (never falls back to lines without set= or with another set=). When wait_id is empty,
+# falls back to the latest terminal line strictly after $3.
+_find_completed_backup_for_wait() {
+  local log_file="$1" wait_id="$2" before_line="$3"
+  [ -f "$log_file" ] || return 1
+  local found=""
+  if [ -n "$wait_id" ]; then
+    found=$(awk -v target="set=${wait_id}" '
+      !/^\[backup\]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i == target) {
+            last = $0
+            break
+          }
+        }
+      }
+      END { if (last != "") print last }
+    ' "$log_file" 2>/dev/null || true)
+    if [ -n "$found" ] && [ "$found" != "$before_line" ] && _is_terminal_pg_backup_line "$found"; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+    return 1
+  fi
+  local candidate=""
+  if [ -n "$before_line" ]; then
+    local last_before_ln=""
+    last_before_ln=$(grep -n -F -x -- "$before_line" "$log_file" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+    if [ -n "$last_before_ln" ]; then
+      candidate=$(tail -n "+$((last_before_ln + 1))" "$log_file" 2>/dev/null | grep -v '^\[backup\]' | tail -1 || true)
+    else
+      candidate=$(grep -v '^\[backup\]' "$log_file" 2>/dev/null | tail -1 || true)
+    fi
+  else
+    candidate=$(grep -v '^\[backup\]' "$log_file" 2>/dev/null | tail -1 || true)
+  fi
+  [ -n "$candidate" ] || return 1
+  if [ "$candidate" = "$before_line" ]; then
+    return 1
+  fi
+  if ! _is_terminal_pg_backup_line "$candidate"; then
+    return 1
+  fi
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+# Verify that a completed consistent backup-set log line ("... ok <size> <dump_path> set=<id>")
+# has its backup-set metadata AND every referenced artifact (PG dump, object manifest + pool
+# objects, and ASR archive when recorded) intact on disk with matching SHA-256 digests.
+# Legacy mock lines without "set=<id>" pass unless DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE=1.
+_verify_completed_backup_artifact() {
+  local line="$1"
+  [ -n "$line" ] || return 1
+  local set_id="" dump_path=""
+  case "$line" in
+    *" set="*)
+      set_id="${line##* set=}"
+      set_id="${set_id%%[[:space:]]*}"
+      ;;
+  esac
+  # Log format: YYYY-mm-dd HH:MM:SS ok <size> <dump_path> [set=<id>]
+  dump_path="$(printf '%s\n' "$line" | awk '{print $5}')"
+  if [ -n "$set_id" ]; then
+    if [ -z "$dump_path" ] || [ ! -f "$dump_path" ] || [ ! -s "$dump_path" ]; then
+      echo "backup: verified dump file missing or empty for set=${set_id} (path=${dump_path:-<empty>})" >&2
+      return 1
+    fi
+    local parent_dir="" backups_root="" set_json="" py=""
+    parent_dir="$(dirname "$dump_path")"
+    backups_root="$(dirname "$parent_dir")"
+    set_json="${backups_root}/sets/backup-set-${set_id}.json"
+    if [ ! -f "$set_json" ] || [ ! -s "$set_json" ]; then
+      echo "backup: backup-set metadata missing or empty for set=${set_id} (${set_json})" >&2
+      return 1
+    fi
+    py=$(_resolve_deploy_python) || return 1
+    "$py" - "$set_id" "$dump_path" "$set_json" "$backups_root" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+set_id, log_dump_path, set_json_path, backups_root = sys.argv[1:5]
+hex64_re = re.compile(r"^[0-9a-f]{64}$")
+
+def fail(msg: str) -> None:
+    print(f"backup: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def sha256_and_size(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    total = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), total
+
+try:
+    meta = json.loads(Path(set_json_path).read_text(encoding="utf-8"))
+except Exception as exc:
+    fail(f"failed reading backup-set metadata {set_json_path}: {exc}")
+
+if not isinstance(meta, dict):
+    fail(f"invalid backup-set metadata structure in {set_json_path}")
+if str(meta.get("backup_set_id") or "").strip() != set_id:
+    fail(
+        f"backup-set id mismatch in {set_json_path}: "
+        f"got={meta.get('backup_set_id')!r}, expected={set_id!r}"
+    )
+if meta.get("reconcile_ok") is not True:
+    fail(f"backup-set {set_id} is not marked reconcile_ok=true")
+
+# 1. Verify PostgreSQL dump exists, matches log path, size, and SHA-256.
+meta_dump_raw = str(meta.get("dump_path") or "").strip()
+meta_dump_sha = str(meta.get("dump_sha256") or "").strip().lower()
+if not meta_dump_raw:
+    fail(f"backup-set {set_id} metadata missing dump_path")
+if not hex64_re.fullmatch(meta_dump_sha):
+    fail(f"backup-set {set_id} metadata missing valid dump_sha256")
+meta_dump = Path(meta_dump_raw)
+if not meta_dump.is_file() or meta_dump.is_symlink():
+    fail(f"backup-set {set_id} dump file missing: {meta_dump}")
+if os.path.realpath(str(meta_dump)) != os.path.realpath(log_dump_path):
+    fail(
+        f"backup-set {set_id} dump_path mismatch: "
+        f"metadata={meta_dump}, log={log_dump_path}"
+    )
+actual_dump_sha, actual_dump_size = sha256_and_size(meta_dump)
+if actual_dump_size <= 0:
+    fail(f"backup-set {set_id} dump file is empty: {meta_dump}")
+if meta.get("dump_size_bytes") is not None and actual_dump_size != int(meta["dump_size_bytes"]):
+    fail(
+        f"backup-set {set_id} dump size mismatch: "
+        f"actual={actual_dump_size}, expected={meta['dump_size_bytes']}"
+    )
+if actual_dump_sha != meta_dump_sha:
+    fail(
+        f"backup-set {set_id} dump SHA-256 mismatch: "
+        f"actual={actual_dump_sha}, expected={meta_dump_sha}"
+    )
+
+# 2. Verify object manifest exists, optional manifest_sha256 matches, and every
+#    referenced mirror-pool object exists with matching size and archived_sha256.
+manifest_raw = str(meta.get("manifest_path") or "").strip()
+if not manifest_raw:
+    fail(f"backup-set {set_id} metadata missing manifest_path")
+manifest_path = Path(manifest_raw)
+if not manifest_path.is_file() or manifest_path.is_symlink():
+    fail(f"backup-set {set_id} object manifest missing: {manifest_path}")
+meta_manifest_sha = str(meta.get("manifest_sha256") or "").strip().lower()
+if meta_manifest_sha:
+    if not hex64_re.fullmatch(meta_manifest_sha):
+        fail(f"backup-set {set_id} metadata has invalid manifest_sha256")
+    actual_manifest_sha, _ = sha256_and_size(manifest_path)
+    if actual_manifest_sha != meta_manifest_sha:
+        fail(
+            f"backup-set {set_id} object manifest SHA-256 mismatch: "
+            f"actual={actual_manifest_sha}, expected={meta_manifest_sha}"
+        )
+try:
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    fail(f"backup-set {set_id} failed reading object manifest {manifest_path}: {exc}")
+if not isinstance(manifest_data, dict) or not isinstance(manifest_data.get("objects"), list):
+    fail(f"backup-set {set_id} object manifest {manifest_path} missing valid 'objects' list")
+objects = manifest_data["objects"]
+if meta.get("object_count") is not None and len(objects) != int(meta["object_count"]):
+    fail(
+        f"backup-set {set_id} object_count mismatch: "
+        f"manifest={len(objects)}, metadata={meta['object_count']}"
+    )
+pool_dir = Path(backups_root) / "minio-mirror" / "objects"
+verified_pool: dict[str, int] = {}
+seen_pairs: set[tuple[str, str]] = set()
+for obj in objects:
+    if not isinstance(obj, dict):
+        fail(f"backup-set {set_id} manifest contains non-object entry")
+    bkt = str(obj.get("bucket") or "")
+    key = str(obj.get("key") or "").lstrip("/")
+    if not bkt or not key:
+        fail(f"backup-set {set_id} manifest entry missing bucket/key")
+    pair = (bkt, key)
+    if pair in seen_pairs:
+        fail(f"backup-set {set_id} manifest contains duplicate object {bkt}/{key}")
+    seen_pairs.add(pair)
+    sha = str(obj.get("archived_sha256") or "").strip().lower()
+    if not hex64_re.fullmatch(sha):
+        fail(f"backup-set {set_id} manifest entry {bkt}/{key} missing valid archived_sha256")
+    raw_sz = obj.get("size")
+    if raw_sz is None or int(raw_sz) < 0:
+        fail(f"backup-set {set_id} manifest entry {bkt}/{key} missing valid size")
+    exp_sz = int(raw_sz)
+    if sha in verified_pool:
+        if verified_pool[sha] != exp_sz:
+            fail(f"backup-set {set_id} mirror object size mismatch for {bkt}/{key}")
+        continue
+    obj_path = pool_dir / sha[:2] / sha
+    if not obj_path.is_file() or obj_path.is_symlink():
+        fail(f"backup-set {set_id} mirror object missing for {bkt}/{key}: {obj_path}")
+    got_sha, got_sz = sha256_and_size(obj_path)
+    if got_sha != sha:
+        fail(
+            f"backup-set {set_id} mirror object SHA-256 mismatch for {bkt}/{key}: "
+            f"actual={got_sha}, expected={sha}"
+        )
+    if got_sz != exp_sz:
+        fail(
+            f"backup-set {set_id} mirror object size mismatch for {bkt}/{key}: "
+            f"actual={got_sz}, expected={exp_sz}"
+        )
+    verified_pool[sha] = got_sz
+
+# 3. Verify ASR jobs archive when recorded in metadata.
+asr_raw = str(meta.get("asr_archive_path") or "").strip()
+asr_sha = str(meta.get("asr_archive_sha256") or "").strip().lower()
+asr_size = meta.get("asr_archive_size_bytes")
+if asr_raw or asr_sha or asr_size is not None:
+    if not asr_raw:
+        fail(f"backup-set {set_id} metadata has ASR digest/size but missing asr_archive_path")
+    if not hex64_re.fullmatch(asr_sha):
+        fail(f"backup-set {set_id} metadata missing valid asr_archive_sha256")
+    asr_path = Path(asr_raw)
+    if not asr_path.is_file() or asr_path.is_symlink():
+        fail(f"backup-set {set_id} ASR archive missing: {asr_path}")
+    actual_asr_sha, actual_asr_size = sha256_and_size(asr_path)
+    if asr_size is not None and actual_asr_size != int(asr_size):
+        fail(
+            f"backup-set {set_id} ASR archive size mismatch: "
+            f"actual={actual_asr_size}, expected={asr_size}"
+        )
+    if actual_asr_sha != asr_sha:
+        fail(
+            f"backup-set {set_id} ASR archive SHA-256 mismatch: "
+            f"actual={actual_asr_sha}, expected={asr_sha}"
+        )
+PY
+    return $?
+  elif [ "${DALTON_DEPLOY_VERIFY_LEGACY_DUMP_FILE:-0}" = "1" ]; then
+    if [ -z "$dump_path" ] || [ ! -s "$dump_path" ]; then
+      echo "backup: dump file missing or empty (path=${dump_path:-<empty>})" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+_write_deploy_backup_wait_state() {
+  local state_file="$1" wait_id="$2" wait_head="$3" wait_target="$4" wait_before="$5"
+  mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
+  local tmp_file="${state_file}.tmp.$$"
+  {
+    printf 'WAIT_BACKUP_ID=%s\n' "$wait_id"
+    printf 'WAIT_PRE_FF=%s\n' "$wait_head"
+    printf 'WAIT_TARGET=%s\n' "$wait_target"
+    printf 'WAIT_BEFORE_LINE=%s\n' "$wait_before"
+  } > "$tmp_file" && mv -f "$tmp_file" "$state_file"
 }
 
 # Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
@@ -4694,20 +4981,179 @@ run_deploy_main() {
     target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; release_deploy_lock || true; exit 1; }
     echo "target migration heads: ${target_heads}"
     LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
-    reused=""
-    if [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
-      reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
+    local cur_head_for_backup=""
+    cur_head_for_backup=$(git rev-parse HEAD 2>/dev/null || true)
+    local backup_wait_state_file="${DALTON_DEPLOY_BACKUP_WAIT_STATE_FILE:-$HOME/Library/Logs/.dalton-deploy-backup-wait.state}"
+    local backup_next_id_file="${DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}"
+    local backup_active_id_file="${DALTON_PG_BACKUP_ACTIVE_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.active-set-id}"
+    local tracked_wait_id="" tracked_wait_head="" tracked_wait_target="" tracked_wait_before=""
+    local resumed_completed_backup="" resuming_active_wait=0
+    if [ -f "$backup_wait_state_file" ] && [ ! -L "$backup_wait_state_file" ]; then
+      while IFS= read -r _wline; do
+        case "$_wline" in
+          WAIT_BACKUP_ID=*) tracked_wait_id="${_wline#WAIT_BACKUP_ID=}" ;;
+          WAIT_PRE_FF=*) tracked_wait_head="${_wline#WAIT_PRE_FF=}" ;;
+          WAIT_TARGET=*) tracked_wait_target="${_wline#WAIT_TARGET=}" ;;
+          WAIT_BEFORE_LINE=*) tracked_wait_before="${_wline#WAIT_BEFORE_LINE=}" ;;
+        esac
+      done < "$backup_wait_state_file"
+      if [ -n "$tracked_wait_head" ] && [ "$tracked_wait_head" = "$cur_head_for_backup" ]; then
+        local tracked_done_line=""
+        if tracked_done_line=$(_find_completed_backup_for_wait "$LOG" "$tracked_wait_id" "$tracked_wait_before"); then
+          case "$tracked_done_line" in
+            *" ok "*)
+              if _verify_completed_backup_artifact "$tracked_done_line"; then
+                resumed_completed_backup="$tracked_done_line"
+              else
+                echo "backup: tracked completed backup (id=${tracked_wait_id:-tracked}) artifact is no longer available; taking a fresh backup"
+                rm -f "$backup_wait_state_file" 2>/dev/null || true
+                tracked_wait_id=""
+                tracked_wait_before=""
+              fi
+              ;;
+            *)
+              rm -f "$backup_wait_state_file" 2>/dev/null || true
+              tracked_wait_id=""
+              tracked_wait_before=""
+              ;;
+          esac
+        elif _pg_backup_job_running; then
+          resuming_active_wait=1
+        else
+          rm -f "$backup_wait_state_file" 2>/dev/null || true
+          tracked_wait_id=""
+          tracked_wait_before=""
+        fi
+      else
+        rm -f "$backup_wait_state_file" 2>/dev/null || true
+        tracked_wait_id=""
+        tracked_wait_before=""
+      fi
     fi
-    if [ -n "$reused" ]; then
+
+    reused=""
+    local reuse_verify_failed=0
+    if [ -z "$resumed_completed_backup" ] && [ "$resuming_active_wait" -eq 0 ] && [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
+      reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
+      if [ -n "$reused" ]; then
+        local reuse_verify_err=""
+        if ! reuse_verify_err=$(_verify_completed_backup_artifact "$reused" 2>&1); then
+          reuse_verify_failed=1
+          local reuse_reason=""
+          reuse_reason=$(printf '%s\n' "$reuse_verify_err" | tr '\n' ' ' | sed -e 's/[[:space:]]*$//')
+          echo "backup: cannot reuse candidate backup (artifact verification failed: ${reuse_reason:-unknown}); taking a fresh one"
+          reused=""
+        fi
+      fi
+    fi
+    if [ -n "$resumed_completed_backup" ]; then
+      DEPLOY_BACKUP_STATUS="fresh"
+      rm -f "$backup_wait_state_file" 2>/dev/null || true
+      echo "backup: resuming completed deploy backup (id=${tracked_wait_id:-tracked}): $resumed_completed_backup"
+    elif [ -n "$reused" ]; then
       DEPLOY_BACKUP_STATUS="reused"
       echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
     else
-      [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
-      launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-      for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
-      after=$(tail -1 "$LOG"); echo "backup: $after"
-      case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; release_deploy_lock || true; exit 1; };; *) echo "backup failed, abort"; release_deploy_lock || true; exit 1;; esac
-      DEPLOY_BACKUP_STATUS="fresh"
+      if [ -n "$REUSE_BACKUP_MIN" ] && [ "$reuse_verify_failed" -eq 0 ]; then
+        echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
+      fi
+      local backup_tag_file="${DALTON_PG_BACKUP_TAG_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-tag}"
+      # Default wait covers lock phase (2h) + mirror phase (4h) + reconcile/publish margin (1h) = 7h (25200s).
+      local _lock_wait_t="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"
+      local _mirror_wait_t="${DALTON_BACKUP_MIRROR_TIMEOUT_S:-14400}"
+      local _default_backup_wait_s=25200
+      if [[ "$_lock_wait_t" =~ ^[0-9]+$ ]] && [[ "$_mirror_wait_t" =~ ^[0-9]+$ ]]; then
+        _default_backup_wait_s=$(( _lock_wait_t + _mirror_wait_t + 3600 ))
+      fi
+      local backup_wait_s="${DALTON_DEPLOY_BACKUP_WAIT_S:-${_default_backup_wait_s}}"
+      local backup_poll_s="${DALTON_DEPLOY_BACKUP_POLL_S:-5}"
+      local backup_polls=1
+      if [ "$backup_poll_s" -gt 0 ] 2>/dev/null; then
+        backup_polls=$(( (backup_wait_s + backup_poll_s - 1) / backup_poll_s ))
+      fi
+      [ "$backup_polls" -lt 1 ] && backup_polls=1
+
+      local wait_backup_id=""
+      local wait_before_line="$before"
+      if [ "$resuming_active_wait" -eq 1 ]; then
+        wait_backup_id="$tracked_wait_id"
+        wait_before_line="$tracked_wait_before"
+        echo "backup: com.dalton.pg-backup is already running (resuming tracked wait id=${wait_backup_id:-unknown}); waiting without re-triggering"
+      elif _pg_backup_job_running; then
+        if [ -f "$backup_active_id_file" ] && [ ! -L "$backup_active_id_file" ]; then
+          wait_backup_id="$(tr -d '[:space:]' < "$backup_active_id_file" 2>/dev/null || true)"
+        fi
+        _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
+        echo "backup: com.dalton.pg-backup is already running (id=${wait_backup_id:-active}); waiting for it instead of triggering a duplicate run"
+      else
+        wait_backup_id="$(date +%Y%m%d-%H%M%S)-deploy-$$"
+        mkdir -p "$(dirname "$backup_tag_file")" "$(dirname "$backup_next_id_file")" 2>/dev/null || true
+        printf 'deploy\n' > "$backup_tag_file" 2>/dev/null || true
+        printf '%s\n' "$wait_backup_id" > "$backup_next_id_file" 2>/dev/null || true
+        _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
+        launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+      fi
+
+      local backup_done=0
+      local matched_bak_line=""
+      for i in $(seq 1 "$backup_polls"); do
+        if matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
+          backup_done=1
+          break
+        fi
+        sleep "$backup_poll_s"
+      done  # default 7h (25200s): covers 2h lock phase + 4h object mirror + 1h reconcile/publish
+      if [ "$backup_done" -eq 1 ]; then
+        after="$matched_bak_line"
+        echo "backup: $after"
+        rm -f "$backup_wait_state_file" 2>/dev/null || true
+        case "$after" in
+          *" ok "*)
+            if [ "$after" = "$wait_before_line" ]; then
+              echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            if ! _verify_completed_backup_artifact "$after"; then
+              echo "backup artifact unavailable, abort"; release_deploy_lock || true; exit 1
+            fi
+            ;;
+          *)
+            echo "backup failed, abort"; release_deploy_lock || true; exit 1
+            ;;
+        esac
+        DEPLOY_BACKUP_STATUS="fresh"
+      elif _pg_backup_job_running; then
+        # Refresh tracked active ID if backup.sh published one after kickstart, and KEEP state file for retry.
+        if [ -z "$wait_backup_id" ] && [ -f "$backup_active_id_file" ] && [ ! -L "$backup_active_id_file" ]; then
+          wait_backup_id="$(tr -d '[:space:]' < "$backup_active_id_file" 2>/dev/null || true)"
+          _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
+        fi
+        echo "backup: still running after ${backup_wait_s}s wait (id=${wait_backup_id:-active}; not failed; leaving running job intact and deferring deploy without re-triggering)"
+        release_deploy_lock || true
+        exit 75
+      else
+        rm -f "$backup_tag_file" "$backup_next_id_file" "$backup_wait_state_file" 2>/dev/null || true
+        if ! matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
+          echo "backup: no matching terminal record found for id=${wait_backup_id:-unknown} (last log line: $(tail -1 "$LOG" 2>/dev/null || true)); abort"
+          release_deploy_lock || true
+          exit 1
+        fi
+        after="$matched_bak_line"
+        echo "backup: $after"
+        case "$after" in
+          *" ok "*)
+            if [ "$after" = "$wait_before_line" ]; then
+              echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            if ! _verify_completed_backup_artifact "$after"; then
+              echo "backup artifact unavailable, abort"; release_deploy_lock || true; exit 1
+            fi
+            DEPLOY_BACKUP_STATUS="fresh"
+            ;;
+          *)
+            echo "backup failed, abort"; release_deploy_lock || true; exit 1
+            ;;
+        esac
+      fi
     fi
     # ff and staged builds only after the idle wait and backup, right before the restart, so the new
     # frontend never goes live against the old backend and running code is not swapped under a busy backend.

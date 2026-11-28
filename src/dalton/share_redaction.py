@@ -156,7 +156,7 @@ _API_REL_URL_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:"
     r"/api/v1/(?:threads|public/shared|workspaces|wsfiles|artifacts|dalton/monitors/(?:g|public)|share-links|pairings|attachments|dalton/chat-uploads)[^\s<>\"'`)\]}（）「」『』【】，《》。；：！？]*"
     r"|__wsref__/[^\s<>\"'`)\]}（）「」『』【】，《》。；：！？]*"
-    r"|/(?:private-media|response-images|attachments|widgets|chat-uploads|blobs|uploads|provenance|memo|user-skills|org-library|channel-snapshots|transcriptions)/[^\s<>\"'`)\]}（）「」『』【】，《》。；：！？]*"
+    r"|/?(?:private-media|response-images|attachments|widgets|chat-uploads|blobs|uploads|provenance|memo|user-skills|org-library|channel-snapshots|transcriptions)/[^\s<>\"'`)\]}（）「」『』【】，《》。；：！？]*"
     r")",
     re.IGNORECASE,
 )
@@ -3347,8 +3347,11 @@ def collect_thread_protected_urls(
         meta = q.get("metadata") if isinstance(q, Mapping) else None
         if isinstance(meta, Mapping):
             for att in meta.get("attachments") or ():
-                if isinstance(att, Mapping) and att.get("url"):
-                    urls.add(str(att["url"]))
+                if isinstance(att, Mapping):
+                    if att.get("url"):
+                        urls.add(str(att["url"]))
+                    if att.get("object_key"):
+                        urls.add(str(att["object_key"]))
     resp_rows: list[Mapping[str, Any]] = []
     if isinstance(responses_by_turn, Mapping):
         for val in responses_by_turn.values():

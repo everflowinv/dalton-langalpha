@@ -33,9 +33,10 @@ LIVE_LINK_MIN_BYTES = 8 * 1024 * 1024
 
 
 async def _sign(user_id: str, sha256: str, filename: str) -> str | None:
+    # DALTON-HOOK(storage-private-bucket-urls): skip direct bucket presign when public_bucket_urls=false
     # DALTON-HOOK(workspace-file-download-ticket): skip internal-endpoint presign when browser endpoint is unset
-    from src.dalton.download_ticket import has_browser_endpoint_url
-    if not has_browser_endpoint_url():
+    from src.dalton.private_bucket_urls import allow_direct_download_url
+    if not allow_direct_download_url():
         return None
     return await asyncio.to_thread(
         get_signed_url,
@@ -49,6 +50,10 @@ async def _sign(user_id: str, sha256: str, filename: str) -> str | None:
 
 async def mirror_download_link(workspace: dict[str, Any], file_path: str) -> str | None:
     """A link to a stopped workspace's file, when the manifest gives it its own object."""
+    # DALTON-HOOK(storage-private-bucket-urls): route downloads via backend dl_token when public_bucket_urls=false
+    from src.dalton.private_bucket_urls import allow_direct_download_url
+    if not allow_direct_download_url():
+        return None
     if not is_storage_enabled():
         return None
     locator = await get_file_locator(str(workspace["workspace_id"]), file_path)
@@ -75,6 +80,10 @@ async def live_download_link(
     registered, so the next sync finds it already stored. Raises
     ``FileNotFoundError`` when no regular file is there.
     """
+    # DALTON-HOOK(storage-private-bucket-urls): skip direct bucket export/presign when public_bucket_urls=false
+    from src.dalton.private_bucket_urls import allow_direct_download_url
+    if not allow_direct_download_url():
+        return None
     if not is_storage_enabled() or scan_cap_bytes(sandbox, blobs_on=True) is not None:
         return None
     workspace_id = str(workspace["workspace_id"])

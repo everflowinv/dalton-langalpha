@@ -2205,12 +2205,15 @@ class TestSandboxNetworkAndInitScript:
             elif env_u_lock.exists():
                 env_u_lock.unlink()
 
-        # backup.sh identifies restore-created buckets by tag or .dalton-restore.json (never suffix regex)
+        # backup.sh delegates to consistent_backup.py, which identifies restore-created buckets
+        # by tag or .dalton-restore.json (never suffix regex)
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
+        cb_text = (REPO_ROOT / "scripts/standalone/consistent_backup.py").read_text(encoding="utf-8")
         assert "restore_bucket_re" not in backup_text
+        assert "restore_bucket_re" not in cb_text
         is_restore_match = _re.search(
             r"(def is_restore_created_bucket\(.*?\n    return False\n)",
-            backup_text,
+            cb_text,
             flags=_re.DOTALL,
         )
         assert is_restore_match is not None
@@ -3374,9 +3377,11 @@ class TestSandboxNetworkAndInitScript:
         sc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sc)
 
-        # Item 1 & Item 2: backup.sh uses `pg_restore -f - --data-only` and no `printf/echo ... | grep -q`
+        # Item 1 & Item 2: backup.sh delegates full-consumer reconciliation to consistent_backup.py
+        # (removing the legacy duplicate verify-backup-refs check) and has no `printf/echo ... | grep -q`
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
-        assert "pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads" in backup_text
+        assert "scripts/standalone/consistent_backup.py compose-backup" in backup_text
+        assert "verify-backup-refs" not in backup_text
         for script_name in ("backup.sh", "restore.sh", "upgrade.sh"):
             src_text = (REPO_ROOT / "scripts/standalone" / script_name).read_text(encoding="utf-8")
             assert not _re.search(r"\b(?:printf|echo)\b[^\n|]*\|\s*grep\s+-[^\s]*q", src_text), (
@@ -3424,10 +3429,13 @@ class TestSandboxNetworkAndInitScript:
         )
         assert sc.compare_backup_with_target(target_same_path_upper_host, backup_manifest_archive, None) == []
 
-        # Also verify backup.sh embedded `_norm_ep` matches the same case-sensitive path rule
-        m_ep = _re.search(r"(def _norm_ep\(url: str\) -> str:.*?    return raw\n)", backup_text, flags=_re.DOTALL)
-        assert m_ep is not None, "Could not locate _norm_ep in backup.sh"
-        ep_ns: dict[str, Any] = {}
+        # Also verify standalone consistent_backup `_norm_ep` matches the same case-sensitive path rule
+        from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
+
+        cb_text = (REPO_ROOT / "scripts/standalone/consistent_backup.py").read_text(encoding="utf-8")
+        m_ep = _re.search(r"(def _norm_ep\(url: str\) -> str:.*?    return raw\n)", cb_text, flags=_re.DOTALL)
+        assert m_ep is not None, "Could not locate _norm_ep in consistent_backup.py"
+        ep_ns: dict[str, Any] = {"urlsplit": _urlsplit, "urlunsplit": _urlunsplit}
         exec(m_ep.group(1), ep_ns)
         assert ep_ns["_norm_ep"]("https://S3.Example.Test/Archive") == "https://s3.example.test/Archive"
         assert ep_ns["_norm_ep"]("https://s3.example.test/archive") == "https://s3.example.test/archive"
@@ -5718,7 +5726,13 @@ class TestSandboxNetworkAndInitScript:
             text = caddy_path.read_text(encoding="utf-8")
             for m in re.finditer(r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}", text):
                 caddy_vars.add(m.group(1))
-        assert caddy_vars == {"DOMAIN", "DALTON_TLS_MODE", "DALTON_EDGE_HTTPS_PORT"}
+        assert caddy_vars == {
+            "DOMAIN",
+            "DALTON_TLS_MODE",
+            "DALTON_EDGE_HTTPS_PORT",
+            "STORAGE_BUCKET_NAME",
+            "STORAGE_KEY_PREFIX",
+        }
 
         # --- Case 1: Merged compose edge env never contains backend secrets across all overlays ---
         for combo in (

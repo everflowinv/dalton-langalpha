@@ -62,7 +62,10 @@ _NAMED_PATH = re.compile(r"(/api/v1/subagents/)[^?#]+")
 
 
 def _fold_names(target: str) -> str:
-    return _NAMED_PATH.sub(r"\1{name}", target)
+    folded = _NAMED_PATH.sub(r"\1{name}", target)
+    # DALTON-HOOK(storage-private-bucket-urls): redact public share tokens in access logs and spans
+    from src.dalton.private_bucket_urls import redact_share_token_in_text
+    return redact_share_token_in_text(folded)
 
 
 def _logged_target(value: Any) -> Any:

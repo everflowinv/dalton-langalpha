@@ -882,7 +882,7 @@ def test_db_offsite_helpers_and_weekly_excludes_postgres() -> None:
     )[0] is False
 
     # B3 weekly script streams directly via rclone rcat/moveto, excludes Postgres, and never uses --size-only.
-    weekly_src = (OPS_DIR / "dalton_data_backup.sh").read_text(encoding="utf-8")
+    weekly_src = (OPS_DIR / "prod" / "data_backup.sh").read_text(encoding="utf-8")
     assert "latest-pg-dump" not in weekly_src
     assert "pg-backup.ref" not in weekly_src
     assert "--size-only" not in weekly_src
@@ -1028,12 +1028,34 @@ elif cmd == "deletefile":
     if target.is_file():
         target.unlink()
 elif cmd == "lsf":
+    if os.environ.get("FAKE_RCLONE_FAIL_LSF") == "1":
+        sys.stderr.write("simulated lsf failure\\n")
+        sys.exit(1)
+    files_only = "--files-only" in argv
+    dirs_only = "--dirs-only" in argv
     rel = clean[1].split(":", 1)[1].strip("/")
     base = drive_root / rel
-    if base.is_dir():
-        for child in sorted(base.iterdir()):
+    if not base.is_dir():
+        sys.exit(1)
+    for child in sorted(base.iterdir()):
+        if files_only:
+            if child.is_file():
+                print(child.name)
+        elif dirs_only:
             if child.is_dir():
                 print(child.name + "/")
+        else:
+            print(child.name + ("/" if child.is_dir() else ""))
+elif cmd == "cat":
+    if os.environ.get("FAKE_RCLONE_FAIL_CAT") == "1":
+        sys.stderr.write("simulated cat failure\\n")
+        sys.exit(1)
+    rel = clean[1].split(":", 1)[1].strip("/")
+    target = drive_root / rel
+    if not target.is_file():
+        sys.stderr.write(f"not found: {{rel}}\\n")
+        sys.exit(1)
+    sys.stdout.buffer.write(target.read_bytes())
 elif cmd == "purge":
     rel = clean[1].split(":", 1)[1].strip("/")
     target = drive_root / rel
@@ -1195,7 +1217,9 @@ def test_dalton_db_offsite_subprocess_mount_partial_hash_and_cleanup(
     assert size_records[0]["actual"] == expected_sz
 
     assert list(day_dir.glob("*.partial-*")) == []
-    uploaded = day_dir / f"{dump_file.name}.enc"
+    uploaded_matches = list(day_dir.glob(f"{dump_file.name}.*.enc"))
+    assert len(uploaded_matches) == 1
+    uploaded = uploaded_matches[0]
     assert uploaded.is_file()
     dec = subprocess.run(
         [
@@ -1751,6 +1775,7 @@ sys.exit(1)
     )
     with env_file.open("a", encoding="utf-8") as fh:
         fh.write(f'DALTON_PROD_ENV_FILE="{prod_env}"\n')
+        fh.write('DALTON_WEEKLY_MINIO_MODE="volume"\n')
 
     mounted_py = _make_mounted_python_wrapper(tmp_path, ext_mount)
     sub_env = {
@@ -1804,12 +1829,13 @@ sys.exit(1)
     assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
     assert list(week_drive.glob("*.partial-*")) == []
 
-    assert (week_drive / f"minio-{today_str}.tar.gz.enc").is_file()
-    assert (week_drive / f"sandbox-langalpha-sandbox-ok-{today_str}.tar.gz.enc").is_file()
-    assert not (week_drive / f"sandbox-langalpha-sandbox-noworkspace-{today_str}.tar.gz.enc").exists()
-    redis_enc = week_drive / f"redis-{today_str}.rdb.enc"
+    latest_weekly = json.loads((week_drive / "LATEST.json").read_text(encoding="utf-8"))
+    assert (week_drive / latest_weekly["artifacts"]["minio"]["filename"]).is_file()
+    assert len(list(week_drive.glob(f"sandbox-langalpha-sandbox-ok-{today_str}-*.tar.gz.enc"))) == 1
+    assert list(week_drive.glob(f"sandbox-langalpha-sandbox-noworkspace-{today_str}-*.tar.gz.enc")) == []
+    redis_enc = week_drive / latest_weekly["artifacts"]["redis"]["filename"]
     assert redis_enc.is_file()
-    var_enc = week_drive / f"var-dalton-{today_str}.tar.gz.enc"
+    var_enc = week_drive / latest_weekly["artifacts"]["var_dalton"]["filename"]
     assert var_enc.is_file()
 
     # Verify Redis password passed via stdin and NEVER exposed in docker exec argv.
@@ -2804,6 +2830,7 @@ os.execv({real_tar!r}, ["tar", *sys.argv[1:]])
     )
     with env_file.open("a", encoding="utf-8") as fh:
         fh.write(f'DALTON_PROD_ENV_FILE="{prod_dir / ".env"}"\n')
+        fh.write('DALTON_WEEKLY_MINIO_MODE="volume"\n')
 
     delete_log = tmp_path / "rclone_deletes.log"
     mounted_py = _make_mounted_python_wrapper(tmp_path, ext_mount)
@@ -2831,7 +2858,7 @@ os.execv({real_tar!r}, ["tar", *sys.argv[1:]])
     today_str = dt.datetime.now().strftime("%Y-%m-%d")
     week_drive = drive_store / "DaltonBackup" / "weekly" / today_str
     assert list(week_drive.glob("*.partial-*")) == []
-    assert (week_drive / f"var-dalton-{today_str}.tar.gz.enc").is_file()
+    assert len(list(week_drive.glob(f"var-dalton-{today_str}-*.tar.gz.enc"))) == 1
     log_text = log_file.read_text(encoding="utf-8")
     assert "retrying once: tar: ./ephemeral.tmp: Cannot stat: No such file or directory" in log_text
     assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
@@ -2899,7 +2926,7 @@ def test_config_and_data_var_excludes_match_env_example() -> None:
     assert "run-secrets" in backup_lib.DEFAULT_DATA_VAR_EXCLUDES
 
     cfg_sh = (OPS_DIR / "dalton_config_git_backup.sh").read_text(encoding="utf-8")
-    data_sh = (OPS_DIR / "dalton_data_backup.sh").read_text(encoding="utf-8")
+    data_sh = (OPS_DIR / "prod" / "data_backup.sh").read_text(encoding="utf-8")
     env_ex = (OPS_DIR / "offsite-backup.env.example").read_text(encoding="utf-8")
 
     m_cfg_sh = re.search(

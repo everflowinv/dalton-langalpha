@@ -400,20 +400,28 @@ def redact_dl_token_in_text(text: str) -> str:
 
 
 class RedactDownloadTicketLogFilter(logging.Filter):
-    """``logging.Filter`` for ``uvicorn.access`` that strips queries on the download-ticket route."""
+    """``logging.Filter`` for ``uvicorn.access`` that strips download-ticket queries and redacts share tokens."""
+
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        cleaned = value
+        if "?" in cleaned:
+            stripped = strip_download_ticket_target(cleaned)
+            cleaned = stripped if stripped != cleaned else redact_dl_token_in_text(cleaned)
+        from src.dalton.private_bucket_urls import redact_share_token_in_text
+
+        return redact_share_token_in_text(cleaned)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str) and "?" in record.msg:
-            record.msg = redact_dl_token_in_text(record.msg)
+        if isinstance(record.msg, str) and record.msg:
+            record.msg = self._clean_text(record.msg)
         args = record.args
         if isinstance(args, tuple) and args:
             mutated = False
             new_args = []
             for item in args:
-                if isinstance(item, str) and "?" in item:
-                    cleaned = strip_download_ticket_target(item)
-                    if cleaned == item:
-                        cleaned = redact_dl_token_in_text(item)
+                if isinstance(item, str) and item:
+                    cleaned = self._clean_text(item)
                     new_args.append(cleaned)
                     if cleaned != item:
                         mutated = True
@@ -423,11 +431,8 @@ class RedactDownloadTicketLogFilter(logging.Filter):
                 record.args = tuple(new_args)
         elif isinstance(args, dict) and args:
             for k, v in list(args.items()):
-                if isinstance(v, str) and "?" in v:
-                    cleaned = strip_download_ticket_target(v)
-                    if cleaned == v:
-                        cleaned = redact_dl_token_in_text(v)
-                    args[k] = cleaned
+                if isinstance(v, str) and v:
+                    args[k] = self._clean_text(v)
         return True
 
 

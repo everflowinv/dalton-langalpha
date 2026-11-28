@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent template for daily Dalton Postgres pg_dump backup (03:00 local time).
+  LaunchAgent template for daily Dalton consistent backup set (03:00 local time).
   Install to ~/Library/LaunchAgents/com.dalton.pg-backup.plist:
     1. Replace __REPO__, __HOME__, and __LOG_DIR__ with the host paths.
     2. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.pg-backup.plist
@@ -14,6 +14,8 @@
     <array>
         <string>/bin/bash</string>
         <string>__REPO__/scripts/dalton/ops/prod/backup.sh</string>
+        <string>--tag</string>
+        <string>auto</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__REPO__</string>
@@ -23,6 +25,12 @@
         <string>/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>__HOME__</string>
+        <key>DALTON_EXTERNAL_MOUNT_ROOT</key>
+        <string>/Volumes/EveSSD</string>
+        <key>DALTON_BACKUP_ROOT</key>
+        <string>/Volumes/EveSSD/Dalton/backups</string>
+        <key>DALTON_BACKUP_DIR</key>
+        <string>/Volumes/EveSSD/Dalton/backups/pg</string>
     </dict>
     <key>StartCalendarInterval</key>
     <dict>

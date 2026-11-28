@@ -206,7 +206,24 @@ exit 0
         f"""#!/bin/bash
 echo "launchctl:$*" >> "{events_trace}"
 if [[ "$*" == *"com.dalton.pg-backup"* ]]; then
-  printf '%s ok  16G /backups/fresh-%s.dump\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "{backup_log}"
+  _nid_file="${{DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}}"
+  _sid="$(tr -d '[:space:]' < "$_nid_file" 2>/dev/null || true)"
+  if [ -n "$_sid" ]; then
+    _broot="{tmp_path}/mock-backups"
+    mkdir -p "$_broot/pg" "$_broot/sets"
+    _dump="$_broot/pg/dalton-pg-${{_sid}}.dump"
+    printf 'PGDMP-%s' "$_sid" > "$_dump"
+    _man="$_broot/sets/minio-manifest-${{_sid}}.json"
+    printf '{{"version":2,"backup_set_id":"%s","objects":[]}}\\n' "$_sid" > "$_man"
+    _dsha="$(shasum -a 256 "$_dump" | awk '{{print $1}}')"
+    _dsz="$(wc -c < "$_dump" | tr -d '[:space:]')"
+    _msha="$(shasum -a 256 "$_man" | awk '{{print $1}}')"
+    printf '{{"version":1,"backup_set_id":"%s","dump_path":"%s","dump_size_bytes":%s,"dump_sha256":"%s","manifest_path":"%s","manifest_sha256":"%s","object_count":0,"reconcile_ok":true}}\\n' \\
+      "$_sid" "$_dump" "$_dsz" "$_dsha" "$_man" "$_msha" > "$_broot/sets/backup-set-${{_sid}}.json"
+    printf '%s ok  16G %s set=%s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$_dump" "$_sid" >> "{backup_log}"
+  else
+    printf '%s ok  16G /backups/fresh-%s.dump\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "{backup_log}"
+  fi
 fi
 if [ "$1" = "kickstart" ] && [[ "$*" == *"com.dalton.channel-gateway"* ]]; then
 {gw_ks_body}

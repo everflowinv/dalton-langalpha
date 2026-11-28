@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.dalton.pg_config import PgConfigConflictError, resolve_pg_config
 
 _ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
 _COPY_HEADER_RE = re.compile(
@@ -590,10 +598,10 @@ def verify_backup_chat_upload_refs(
         state = _strip(row.get("state"))
         obj_key = _strip(row.get("object_key"))
         upload_id = _strip(row.get("upload_id")) or "<unknown>"
-        if state == "uploading":
+        if state in ("uploading", "completing"):
             skipped_uploading += 1
             continue
-        if state not in ("ready", "completing") or not obj_key:
+        if state != "ready" or not obj_key:
             continue
         full_key = obj_key.lstrip("/")
         if key_prefix and not full_key.startswith(f"{key_prefix}/"):
@@ -705,6 +713,87 @@ def _cmd_compare_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def configured_minio_init_buckets(env_map: Mapping[str, str] | None = None) -> list[str]:
+    """Return sorted bucket names initialized by ``minio_init.py`` on the primary MinIO endpoint.
+
+    Shared by ``scripts/standalone/minio_init.py`` and ``scripts/standalone/restore.sh``
+    empty-target preflight so every configured pre-initialized empty bucket is accepted.
+    """
+    em = os.environ if env_map is None else env_map
+
+    def _first(*keys: str, default: str = "") -> str:
+        for key in keys:
+            val = _strip(em.get(key))
+            if val:
+                return val
+        return default
+
+    primary_ep = _norm_ep(
+        _first(
+            "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
+            "DALTON_ASR_STORAGE_ENDPOINT_URL",
+            "STORAGE_ENDPOINT_URL",
+            "S3_ENDPOINT_URL",
+            default="http://minio:9000",
+        )
+    )
+    buckets: set[str] = set()
+
+    chat_bucket = _first(
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+        "STORAGE_BUCKET_NAME",
+        default="chat-uploads",
+    )
+    if chat_bucket:
+        buckets.add(chat_bucket)
+
+    storage_bucket = _first("STORAGE_BUCKET_NAME", "S3_BUCKET_NAME")
+    if storage_bucket:
+        storage_ep = _norm_ep(
+            _first("STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default=primary_ep)
+        )
+        if storage_ep == primary_ep:
+            buckets.add(storage_bucket)
+
+    asr_bucket = _first("DALTON_ASR_STORAGE_BUCKET_NAME")
+    if asr_bucket:
+        asr_ep = _norm_ep(_first("DALTON_ASR_STORAGE_ENDPOINT_URL", default=primary_ep))
+        if asr_ep == primary_ep:
+            buckets.add(asr_bucket)
+
+    return sorted(buckets)
+
+
+def _cmd_resolve_pg_config(args: argparse.Namespace) -> int:
+    """Stdlib-only PostgreSQL config resolver for host-side backup.sh / restore.sh."""
+    prefix = f"[{args.caller}] " if args.caller else ""
+    merged_env: dict[str, str] = {}
+    if args.env_file:
+        merged_env.update(parse_env_file(Path(args.env_file)))
+    if args.compose_config_json:
+        svc_env = parse_compose_service_env(
+            Path(args.compose_config_json),
+            service_name=args.service or "backend",
+        )
+        merged_env.update(svc_env)
+    use_env: Mapping[str, str] = (
+        merged_env if (args.env_file or args.compose_config_json) else os.environ
+    )
+    try:
+        cfg = resolve_pg_config(
+            args.pg_dsn,
+            env=use_env,
+            default_host=args.default_host or "localhost",
+            allow_backup_override=bool(args.allow_backup_override),
+            check_conflict=bool(args.check_conflict),
+        )
+    except PgConfigConflictError as exc:
+        print(f"{prefix}ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(cfg, ensure_ascii=False))
+    return 0
+
+
 def _cmd_verify_backup_refs(args: argparse.Namespace) -> int:
     prefix = f"[{args.caller}] " if args.caller else ""
     try:
@@ -774,6 +863,17 @@ def main(argv: list[str] | None = None) -> int:
     p_ref.add_argument("--minio-manifest", required=True)
     p_ref.add_argument("--caller", default="")
     p_ref.set_defaults(func=_cmd_verify_backup_refs)
+
+    p_pg = sub.add_parser("resolve-pg-config")
+    p_pg.add_argument("--env-file", default="")
+    p_pg.add_argument("--compose-config-json", default="")
+    p_pg.add_argument("--service", default="backend")
+    p_pg.add_argument("--pg-dsn", default="")
+    p_pg.add_argument("--default-host", default="postgres")
+    p_pg.add_argument("--allow-backup-override", action="store_true")
+    p_pg.add_argument("--check-conflict", action="store_true")
+    p_pg.add_argument("--caller", default="")
+    p_pg.set_defaults(func=_cmd_resolve_pg_config)
 
     ns = parser.parse_args(argv)
     return int(ns.func(ns))

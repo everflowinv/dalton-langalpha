@@ -1304,6 +1304,7 @@ class TestDownloadTicket:
         mock_signed = create_autospec(
             download_link.get_signed_url, return_value="https://browser.example.com/signed"
         )
+        monkeypatch.setenv("DALTON_WSFILES_PUBLIC_BUCKET_URLS", "1")
         monkeypatch.setenv("STORAGE_BROWSER_ENDPOINT_URL", "")
         with patch.object(download_link, "get_signed_url", mock_signed):
             res_empty = await download_link._sign("u-1", "a" * 64, "big.bin")
@@ -1658,12 +1659,14 @@ class TestExclusionGlobs:
         assert "workspace_files" in raw_everflow
         assert "workspace_files" in raw_core
         assert raw_everflow["workspace_files"] == {
+            "public_bucket_urls": False,
             "write_inline_only": False,
             "exclude_dir_names": [],
             "exclude_rel_dirs": [],
             "exclude_rel_globs": [],
         }
         assert raw_core["workspace_files"] == {
+            "public_bucket_urls": False,
             "write_inline_only": False,
             "exclude_dir_names": [],
             "exclude_rel_dirs": [],

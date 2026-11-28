@@ -1584,7 +1584,7 @@ if not args or args[0] != "compose":
 # Strip compose global flags
 i = 1
 while i < len(args):
-    if args[i] in ("-p", "-f", "--env-file", "--project-directory"):
+    if args[i] in ("-p", "-f", "--env-file", "--project-directory", "--profile"):
         i += 2
     else:
         break
@@ -1733,7 +1733,7 @@ if sub == "exec":
         env = dict(os.environ, DALTON_WIKI_DATA_DIR={str(src_wiki)!r})
         rc = subprocess.run([{py_exe!r}, "-c", script], env=env).returncode
         sys.exit(rc)
-    if "pg_dump" in rest:
+    if "postgres" in rest and "pg_dump" in joined:
         sys.stdout.buffer.write(b"PGDMP-FAKE-BACKUP")
         sys.exit(0)
     if "pg_restore" in rest:
@@ -1746,7 +1746,7 @@ if sub == "exec":
         sys.exit(0)
     if "pg_isready" in rest:
         sys.exit(0)
-    if "psql" in rest:
+    if "postgres" in rest and "psql" in joined:
         if "is_superuser" in joined or "rolsuper" in joined:
             sys.stdout.write("on\\n")
         elif "pg_database" in joined:
@@ -1796,6 +1796,47 @@ if sub == "exec":
 
 if sub == "run":
     joined = " ".join(rest)
+    if "backend" in rest and "consistent_backup.py" in joined and "compose-backup" in rest:
+        snap_id = "00000001-00000001-1"
+        sys.stderr.write(f"@@DALTON_CTL@@ SNAPSHOT_READY {{snap_id}}\\n")
+        sys.stderr.flush()
+        tok1 = sys.stdin.readline().strip()
+        if tok1 != "SNAPSHOT_IMPORTED":
+            sys.exit(1)
+        tok2 = sys.stdin.readline().strip()
+        if tok2 != "PG_DUMP_DONE":
+            sys.exit(1)
+        manifest = {{
+            "primary_bucket": "chat-uploads",
+            "primary_key_prefix": "",
+            "targets": {{"chat_upload": {{"bucket": "chat-uploads", "key_prefix": ""}}}},
+            "bucket_count": 1,
+            "object_count": 0,
+            "total_bytes": 0,
+            "objects": [],
+        }}
+        minio_buf = io.BytesIO()
+        with tarfile.open(fileobj=minio_buf, mode="w:gz") as tf:
+            raw = json.dumps(manifest).encode("utf-8")
+            ti = tarfile.TarInfo(name="_minio_manifest.json")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        minio_bytes = minio_buf.getvalue()
+        if "--stream-bundle" in rest:
+            with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as btf:
+                bti = tarfile.TarInfo(name="minio-objects.tar.gz")
+                bti.size = len(minio_bytes)
+                btf.addfile(bti, io.BytesIO(minio_bytes))
+        else:
+            sys.stdout.buffer.write(minio_bytes)
+        sys.stdout.buffer.flush()
+        sys.stderr.write(
+            "@@DALTON_CTL@@ BACKUP_SUMMARY "
+            + json.dumps({{"snapshot_id": snap_id, "object_count": 0, "reconcile_ok": True}})
+            + "\\n"
+        )
+        sys.stderr.flush()
+        sys.exit(0)
     if "research-host" in rest and "-c" in rest:
         c_idx = rest.index("-c")
         cmd_str = rest[c_idx + 1]
@@ -2257,6 +2298,9 @@ def _build_r11_backup_fixture(
         shutil.copy2(src, dst)
         if name.endswith(".sh"):
             dst.chmod(0o755)
+    (work_dir / "src" / "dalton").mkdir(parents=True)
+    for rel in ("src/__init__.py", "src/dalton/__init__.py", "src/dalton/pg_config.py"):
+        shutil.copy2(_REPO_ROOT / rel, work_dir / rel)
     (work_dir / "docker-compose.yml").write_text("services:\n  postgres: {}\n", encoding="utf-8")
     (work_dir / "docker-compose.core.yml").write_text("services:\n  research-host: {}\n", encoding="utf-8")
     (work_dir / ".env").write_text(
@@ -2338,7 +2382,7 @@ if args and args[0] == "compose":
     args = args[1:]
 i = 0
 while i < len(args) and args[i].startswith("-"):
-    if args[i] in ("-p", "-f", "--env-file", "--project-directory"):
+    if args[i] in ("-p", "-f", "--env-file", "--project-directory", "--profile"):
         i += 2
     else:
         i += 1
@@ -2680,14 +2724,14 @@ if sub == "exec":
         rc = subprocess.run([{py_exe!r}, "-c", script], env=env).returncode
         sys.exit(rc)
 
-    if "pg_dump" in rest:
+    if "postgres" in rest and "pg_dump" in joined:
         sys.stdout.buffer.write(b"PGDMP-FAKE-BACKUP")
         sys.exit(0)
     if "pg_restore" in rest:
         if "--list" in rest:
             sys.stdout.write("1; 0 0 TABLE public users postgres\\n")
         sys.exit(0)
-    if "psql" in rest:
+    if "postgres" in rest and "psql" in joined:
         if "alembic_version_dalton" in joined:
             sys.stdout.write("d049\\n")
         elif "alembic_version" in joined:
@@ -2719,6 +2763,50 @@ if sub == "exec":
             ti.size = len(raw)
             tf.addfile(ti, io.BytesIO(raw))
         sys.stdout.buffer.write(buf.getvalue())
+        sys.exit(0)
+    sys.exit(0)
+
+if sub == "run":
+    if "backend" in rest and "consistent_backup.py" in joined and "compose-backup" in rest:
+        snap_id = "00000001-00000001-1"
+        sys.stderr.write(f"@@DALTON_CTL@@ SNAPSHOT_READY {{snap_id}}\\n")
+        sys.stderr.flush()
+        tok1 = sys.stdin.readline().strip()
+        if tok1 != "SNAPSHOT_IMPORTED":
+            sys.exit(1)
+        tok2 = sys.stdin.readline().strip()
+        if tok2 != "PG_DUMP_DONE":
+            sys.exit(1)
+        manifest = {{
+            "primary_bucket": "chat-uploads",
+            "primary_key_prefix": "",
+            "targets": {{"chat_upload": {{"bucket": "chat-uploads", "key_prefix": ""}}}},
+            "bucket_count": 1,
+            "object_count": 0,
+            "total_bytes": 0,
+            "objects": [],
+        }}
+        minio_buf = io.BytesIO()
+        with tarfile.open(fileobj=minio_buf, mode="w:gz") as tf:
+            raw = json.dumps(manifest).encode("utf-8")
+            ti = tarfile.TarInfo(name="_minio_manifest.json")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        minio_bytes = minio_buf.getvalue()
+        if "--stream-bundle" in rest:
+            with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as btf:
+                bti = tarfile.TarInfo(name="minio-objects.tar.gz")
+                bti.size = len(minio_bytes)
+                btf.addfile(bti, io.BytesIO(minio_bytes))
+        else:
+            sys.stdout.buffer.write(minio_bytes)
+        sys.stdout.buffer.flush()
+        sys.stderr.write(
+            "@@DALTON_CTL@@ BACKUP_SUMMARY "
+            + json.dumps({{"snapshot_id": snap_id, "object_count": 0, "reconcile_ok": True}})
+            + "\\n"
+        )
+        sys.stderr.flush()
         sys.exit(0)
     sys.exit(0)
 

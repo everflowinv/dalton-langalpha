@@ -25,21 +25,21 @@
 	header_up -X-User-Id
 }
 
-# Redact ?token=<jwt>, delete sensitive authentication / internal headers, and
-# strip response Location headers from access logs so HTTP->HTTPS redirects or
-# query tokens never leak into logs (Caddy logs the original request before
-# header mutation).
+# Redact ?token=<jwt> / ?dl_token= / ?ticket= and path share tokens
+# (/api/v1/public/shared/<token>, /s/<token>, /a/<token>, /og-meta?path=/s/<token>)
+# in a single filter layer (Caddy 2.9.1 nested filters do not receive full
+# request>uri / request>headers>Referer field paths), delete sensitive
+# authentication / internal headers, and strip response Location headers from
+# access logs so HTTP->HTTPS redirects or tokens never leak into logs
+# (Caddy logs the original request before header mutation).
 (dalton_access_log) {
 	log {
 		output stdout
 		format filter {
 			wrap json
 			fields {
-				request>uri query {
-					replace token REDACTED
-					replace dl_token REDACTED
-					replace ticket REDACTED
-				}
+				request>uri regexp `(^/+api/v1/public/shared/+|^/+(?:s|a)/+|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket)=)[^&#]+` `${1}${2}REDACTED`
+				request>headers>Referer regexp `(https?://[^/?#]+(?:/+api/v1/public/shared/+|/+(?:s|a)/+)|[?&]path=(?:/+|%2[fF])(?:s|a)(?:/+|%2[fF]))[^/?&#]+|([?&](?:token|dl_token|ticket)=)[^&#]+` `${1}${2}REDACTED`
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete
 				request>headers>X-Dalton-Relay-Token delete
@@ -159,6 +159,33 @@
 			import strip_internal_upstream_headers
 			flush_interval -1
 		}
+	}
+
+	# 1b. Read-only avatar proxy (GET/HEAD /storage/<prefix>avatars/* -> MinIO current version only,
+	#     stripping all query parameters including versionId and response-* overrides);
+	#     every other /storage/* path or method returns 404.
+	@storage_avatars {
+		method GET HEAD
+		expression `("{$STORAGE_KEY_PREFIX:}" == "" && {path}.startsWith("/storage/avatars/") && {path} != "/storage/avatars/") || ("{$STORAGE_KEY_PREFIX:}" != "" && {path}.startsWith("/storage/" + ("{$STORAGE_KEY_PREFIX:}".endsWith("/") ? "{$STORAGE_KEY_PREFIX:}" : "{$STORAGE_KEY_PREFIX:}" + "/") + "avatars/") && {path} != "/storage/" + ("{$STORAGE_KEY_PREFIX:}".endsWith("/") ? "{$STORAGE_KEY_PREFIX:}" : "{$STORAGE_KEY_PREFIX:}" + "/") + "avatars/")`
+	}
+	handle @storage_avatars {
+		route {
+			uri strip_prefix /storage
+			rewrite * /{$STORAGE_BUCKET_NAME:dalton-storage}{path}?
+			import strip_internal_request_headers
+			request_header -Authorization
+			request_header -Cookie
+			reverse_proxy minio:9000 {
+				import strip_internal_upstream_headers
+				header_up -Authorization
+				header_up -Cookie
+			}
+		}
+	}
+
+	@storage_blocked path /storage /storage/*
+	handle @storage_blocked {
+		respond 404
 	}
 
 	# 2. Build version manifest (/version.json): never cached, never SPA-fallback.

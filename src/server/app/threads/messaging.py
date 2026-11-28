@@ -1200,32 +1200,41 @@ async def _handle_send_message(
 
     if not is_dispatch:
         from src.dalton.auth.dispatch import make_prestart_chat_cleanup, wrap_local_sse_stream  # DALTON-HOOK(standalone-core): recheck local session <=30s and clean up prestart upload claims on initial reject
-        return SetupKeepaliveResponse(
-            wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate live chat stream promptly on local session revocation
-                end_after_failure_frame(
-                    observe_chat_stream(
-                        gen,
-                        model=_model,
-                        user_id=user_id,
-                        workspace_id=workspace_id,
-                        thread_id=thread_id,
-                    )
-                ),
-                raw_request,
-                user_id,
-                on_initial_reject=make_prestart_chat_cleanup(  # DALTON-HOOK(standalone-core): release provisional upload claims and burst slot if initial session recheck rejects
+        # DALTON-HOOK(storage-private-bucket-urls): rewrite live run_end private media refs to AU1 controlled media URLs
+        from src.dalton.share_media import wrap_owner_live_sse_media
+        live_stream = wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate live chat stream promptly on local session revocation
+            end_after_failure_frame(
+                observe_chat_stream(
+                    gen,
+                    model=_model,
                     user_id=user_id,
-                    upload_claim_key=upload_claim_key,
-                    request_key=request.request_key,
-                    additional_context=request.additional_context,
-                    release_slot=scope.release_slot,
-                ),
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                )
             ),
+            raw_request,
+            user_id,
+            on_initial_reject=make_prestart_chat_cleanup(  # DALTON-HOOK(standalone-core): release provisional upload claims and burst slot if initial session recheck rejects
+                user_id=user_id,
+                upload_claim_key=upload_claim_key,
+                request_key=request.request_key,
+                additional_context=request.additional_context,
+                release_slot=scope.release_slot,
+            ),
+        )
+        live_stream, _live_media_cookies = wrap_owner_live_sse_media(
+            live_stream, raw_request, thread_id=thread_id, viewer_id=user_id
+        )
+        resp = SetupKeepaliveResponse(
+            live_stream,
             media_type="text/event-stream",
             headers=sse_headers_with_loc,
             interval=get_sse_keepalive_interval(),
             setup_over=setup_over,
         )
+        for _sc in _live_media_cookies:
+            resp.headers.append("set-cookie", _sc)
+        return resp
 
     return await _prime_dispatch(
         gen,
@@ -1548,11 +1557,19 @@ async def reconnect_to_stream(
             logger.error(f"[PTC_RECONNECT] Error: {e}", exc_info=True)
             yield f'event: error\ndata: {{"error": "Reconnection failed: {str(e)}"}}\n\n'
 
-    return StreamingResponse(
-        stream_reconnection(),
+    # DALTON-HOOK(storage-private-bucket-urls): rewrite reconnect run_end private media refs to AU1 controlled media URLs
+    from src.dalton.share_media import wrap_owner_live_sse_media
+    wrapped_reconnect, _reconnect_media_cookies = wrap_owner_live_sse_media(
+        stream_reconnection(), request, thread_id=thread_id, viewer_id=x_user_id
+    )
+    resp = StreamingResponse(
+        wrapped_reconnect,
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+    for _sc in _reconnect_media_cookies:
+        resp.headers.append("set-cookie", _sc)
+    return resp
 
 
 
