@@ -123,7 +123,7 @@ def _ws_handshake(
             header_buf.extend(chunk)
 
         sep = header_buf.find(b"\r\n\r\n")
-        _assert(sep != -1, f"Incomplete HTTP response during WS handshake for {path}")
+        _assert(sep != -1, f"Incomplete HTTP response during WS handshake for {path.split('?', 1)[0]}")
         head = header_buf[:sep].decode("iso-8859-1")
         leftover = bytes(header_buf[sep + 4 :])
 
