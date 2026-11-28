@@ -237,7 +237,7 @@ async def get_oauth_connection(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT account_id, email, plan_type, expires_at,"""
+                SELECT account_id, email, plan_type, expires_at, updated_at,"""  # DALTON-HOOK(quota-exhaustion): expose updated_at for credential_identity cooldown key parity
                 + _LIVE_FLAG
                 + """
                 FROM user_oauth_tokens

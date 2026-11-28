@@ -37,6 +37,7 @@ def upgrade() -> None:
             defer_count          INTEGER NOT NULL DEFAULT 0
                                  CHECK (defer_count >= 0),
             last_step_key        TEXT NOT NULL,
+            seen_step_keys       JSONB NOT NULL DEFAULT '[]'::jsonb,
             resume_from_run_id   VARCHAR(255),
             resume_checkpoint_id TEXT,
             last_reset_at        TIMESTAMPTZ,

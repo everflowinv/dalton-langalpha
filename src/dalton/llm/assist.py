@@ -419,24 +419,9 @@ async def assist_json(
             persist_raw=persist_raw,
             skip_journal=skip_journal,
         )
-        def _is_quota_or_auth_failure(c: Any) -> bool:
-            if c.ok:
-                return False
-            text = f"{getattr(c, 'error_kind', '') or ''} {getattr(c, 'error', '') or ''}".lower()
-            return any(
-                tok in text
-                for tok in (
-                    "http_429",
-                    "429",
-                    "quota",
-                    "plan_limit",
-                    "rate_limit",
-                    "oauth",
-                    "reauth",
-                    "out_of_credit",
-                )
-            )
-
+        from src.dalton.llm.unattended_fallback import (
+            is_complete_result_quota_or_auth_trigger,
+        )
         from src.dalton.settings import (
             allow_cash_fallback_on_unattended,
             is_unattended_quota_fallback_enabled,
@@ -456,7 +441,11 @@ async def assist_json(
                 return True
             if own_chain and _is_subscription(m) and _is_timeout_or_rate_limit(c):
                 return True
-            if unattended_assist_fallback and _is_subscription(m) and _is_quota_or_auth_failure(c):
+            if (
+                unattended_assist_fallback
+                and _is_subscription(m)
+                and is_complete_result_quota_or_auth_trigger(c)
+            ):
                 return True
             return False
 

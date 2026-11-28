@@ -218,6 +218,8 @@ class RunOutcome:
     no_model_calls: bool = field(default=False, kw_only=True)
     # DALTON-HOOK(deliverable-text): per-message captured image URL map persisted for replay and I-7 :imgfix isolation.
     images_by_message: Dict[str, Dict[str, str]] = field(default_factory=dict, kw_only=True)
+    # DALTON-HOOK(quota-exhaustion): structured mid-turn wakeup quota failure payload settled atomically in finalize_run tx
+    wakeup_quota_failure: Optional[Dict[str, Any]] = field(default=None, kw_only=True)
 
 
 @asynccontextmanager
@@ -618,6 +620,12 @@ async def start_run(
                             snap_candidates.extend(
                                 str(x).strip() for x in fb_list if isinstance(x, str) and x.strip()
                             )
+                        # DALTON-HOOK(quota-exhaustion): include admitted unattended fallback candidates in turn START snapshot
+                        uf_list = run_metadata.get("unattended_fallback_models")
+                        if isinstance(uf_list, list):
+                            snap_candidates.extend(
+                                str(x).strip() for x in uf_list if isinstance(x, str) and x.strip()
+                            )
                         if snap_candidates:
                             snap = build_effective_catalog_snapshot(snap_candidates)
                             if snap and snap.get("models"):
@@ -987,6 +995,21 @@ async def finalize_run(
                 if jobs:
                     await enqueue_hooks(
                         conn, run_id=run_id, thread_id=thread_id, jobs=jobs
+                    )
+
+                # DALTON-HOOK(quota-exhaustion): atomically record wakeup mid-turn quota exhaustion & wakeup_quota_resume inside finalize tx
+                if final_status == "error" and outcome.wakeup_quota_failure:
+                    from src.dalton.llm.unattended_fallback import (
+                        maybe_record_wakeup_mid_turn_resume_in_tx,
+                    )
+
+                    await maybe_record_wakeup_mid_turn_resume_in_tx(
+                        conn,
+                        run_row=run_row,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        newest_checkpoint_id=commit_checkpoint_id,
+                        quota_failure=outcome.wakeup_quota_failure,
                     )
 
                 # Deferred report-backs (a task's, an analyst's) and market

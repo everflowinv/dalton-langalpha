@@ -1,18 +1,19 @@
 """Real PostgreSQL & dual-worker integration tests for Prod Audit 2 §2 (unattended quota fallback).
 
-Covers all 3 DB/concurrency scenarios from §2.5:
+Exercises real production call paths against a real PostgreSQL ``*_test`` database:
 1. Concurrent regular cash call (``LocalBudgetPort.acquire``) vs unattended cash fallback
-   (``acquire_cash_lease_tx``) for a default-budget user with NO ``dalton_budget_config`` row
-   and headroom for exactly one ``$0.25`` lease -> serialized by ``acquire_budget_advisory_lock``,
-   exactly 1 granted, 1 denied, zero overdraft.
-2. Cross-worker wakeup checkpoint resume preventing duplicate tool execution: worker 1 runs
-   step 1 (side-effect count = 1), hits exhaustion at step 2 and records
-   ``dalton_wakeup_quota_deferrals`` + ``hook_outbox('wakeup_quota_resume')``; worker 2 claims
-   ``wakeup_quota_resume`` and resumes from ``resume_checkpoint_id`` -> step-1 tool executes
-   strictly once.
-3. Resume route mutation injection: mutating candidate ``bound_base_url`` or ``key_fingerprint``
-   while paused causes ``verify_candidate_route_against_snapshot`` / ``acquire_fallback_candidate_live``
-   to skip the mutated candidate.
+   (going through real ``acquire_fallback_candidate_live`` -> ``acquire_cash_lease_tx``) for a
+   default-budget user with NO ``dalton_budget_config`` row and headroom for exactly one ``$0.25``
+   lease -> serialized by ``acquire_budget_advisory_lock``, strictly 1 granted, 1 denied, zero overdraft.
+2. Cross-worker wakeup mid-turn exhaustion & checkpoint resume via REAL ``LocalRunExecutor._finalize_run``
+   -> ``RunCoordinator.finalize_run`` -> ``lifecycle.finalize_run`` atomic transaction (writing
+   ``status='error'``, ``dalton_wakeup_quota_deferrals``, and ``hook_outbox('wakeup_quota_resume')``) ->
+   Worker 2 claiming ``wakeup_quota_resume`` -> ``RetryRequest`` validation -> real LangGraph
+   ``StateGraph`` + ``MemorySaver`` checkpoint replay asserting step-1 tool executes STRICTLY ONCE.
+3. Concurrent first-row deferral creation serialized by ``pg_advisory_xact_lock`` + persisted
+   ``seen_step_keys`` idempotency + 4th cooldown termination.
+4. Resume route mutation injection (``bound_base_url`` / ``key_fingerprint``) + Alembic d062 <-> d061
+   round-trip against real PG.
 
 Skipped automatically when ``DALTON_TEST_PG_DSN`` is unset (run by Lead against a ``*_test`` DB).
 """
@@ -26,12 +27,14 @@ from decimal import Decimal
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import AsyncMock
-from uuid import uuid4
+from typing import Any, TypedDict
+from unittest.mock import create_autospec
+from uuid import UUID, uuid4
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 import psycopg
 from psycopg.rows import dict_row
 import pytest
@@ -43,8 +46,16 @@ from src.dalton.services.team_model_catalog.snapshot import (
     RouteFingerprint,
     verify_candidate_route_against_snapshot,
 )
+from src.llms.provider_errors import ProviderRefusal
+from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhaustedError
 from src.server.database import pool as db_pool_mod
+from src.server.database.runs import lifecycle as tl_db
+from src.server.models.workflow import RetryRequest
+from src.server.services.policy import ALLOW_ALL
 from src.server.services.report_back import notify_turn
+from src.server.services.runs import finalization as finalization_mod
+from src.server.services.runs.coordinator import RunCoordinator, RunHandle
+from src.server.services.runs.executor import LocalRunExecution, LocalRunExecutor, LocalRunStatus
 from tests.integration.dalton._db_guard import extract_effective_test_db_name
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -112,20 +123,23 @@ def bound_pg_pool(migrated_fallback_dsn: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(db_pool_mod, "get_db_connection", _conn_ctx)
     monkeypatch.setattr(budget_port, "get_db_connection", _conn_ctx)
     monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(tl_db.pool, "get_db_connection", _conn_ctx)
     return migrated_fallback_dsn
 
 
 @pytest.mark.asyncio
-async def test_db_concurrent_regular_cash_vs_fallback_cash_default_budget_user(
+async def test_db_concurrent_regular_cash_vs_live_fallback_admission_default_budget_user(
     bound_pg_pool: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two concurrent workers racing the last $0.25 for a user with NO dalton_budget_config row."""
+    """Two concurrent workers racing the last $0.25 through LocalBudgetPort vs acquire_fallback_candidate_live."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    monkeypatch.setenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", "1")
+
     user_id = f"u-race-{uuid4().hex[:10]}"
     run_regular = str(uuid4())
     run_fallback = str(uuid4())
 
-    # Configure default_daily_cap_usd = 0.25 and reserve_chunk_usd = 0.25 (no DB config row)
     fake_budget_cfg = SimpleNamespace(
         default_daily_cap_usd=0.25,
         default_task_cap_usd=1.00,
@@ -136,12 +150,25 @@ async def test_db_concurrent_regular_cash_vs_fallback_cash_default_budget_user(
     )
     fake_settings = SimpleNamespace(budget=fake_budget_cfg)
     monkeypatch.setattr(budget_port, "get_dalton_settings", lambda: fake_settings)
+    monkeypatch.setattr(uf, "get_dalton_settings", lambda: fake_settings)
     from src.dalton.budget import service as budget_service
 
     monkeypatch.setattr(budget_service, "get_dalton_settings", lambda: fake_settings)
 
+    cash_route_fn = create_autospec(
+        uf.resolve_live_route_fingerprint,
+        instance=False,
+        return_value=RouteFingerprint(
+            model_key="deepseek-flash",
+            provider="deepseek",
+            model_id="deepseek-chat",
+            bound_base_url="https://api.deepseek.com",
+            key_fingerprint=None,
+            billing="cash",
+        ),
+    )
+
     try:
-        # Ensure user has NO dalton_budget_config row
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.transaction():
                 async with conn.cursor() as cur:
@@ -156,19 +183,23 @@ async def test_db_concurrent_regular_cash_vs_fallback_cash_default_budget_user(
             )
 
         async def _worker_fallback():
-            return await budget_port.acquire_cash_lease(
-                user_id=user_id,
-                run_ref=run_fallback,
+            return await uf.acquire_fallback_candidate_live(
+                subject_user_id=user_id,
+                payer_user_id=user_id,
+                candidate_model="deepseek-flash",
+                run_id=run_fallback,
                 call_id="deepseek-flash:step-1",
+                allow_cash=True,
                 min_floor_usd=Decimal("0.25"),
+                policy=ALLOW_ALL,
+                resolve_route_fn=cash_route_fn,
             )
 
-        v_reg, v_fb = await asyncio.gather(_worker_regular(), _worker_fallback())
-        assert v_reg is not None and v_fb is not None
-        granted_count = int(bool(v_reg.granted)) + int(bool(v_fb.granted))
-        assert granted_count == 1, f"Expected exactly 1 winner, got regular={v_reg}, fallback={v_fb}"
+        v_reg, res_fb = await asyncio.gather(_worker_regular(), _worker_fallback())
+        assert v_reg is not None and res_fb is not None
+        granted_count = int(bool(v_reg.granted)) + int(bool(res_fb.admitted))
+        assert granted_count == 1, f"Expected strictly 1 winner, got regular={v_reg}, fallback={res_fb}"
 
-        # Verify total open reservations never exceed $0.25
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
@@ -190,46 +221,81 @@ async def test_db_concurrent_regular_cash_vs_fallback_cash_default_budget_user(
 
 
 @pytest.mark.asyncio
-async def test_db_cross_worker_wakeup_checkpoint_resume_runs_step1_tool_once(
+async def test_db_executor_finalize_to_cross_worker_checkpoint_resume_runs_step1_tool_once(
     bound_pg_pool: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Worker 1 exhausts at step 2 after tool-1 side effect; Worker 2 resumes from checkpoint without redoing tool-1."""
+    """Worker 1 runs real LangGraph graph -> fails at step 2 -> real LocalRunExecutor._finalize_run
+    commits status='error' + wakeup_quota_resume in ONE Postgres tx -> Worker 2 claims outbox job,
+    validates RetryRequest, and resumes the real graph checkpoint with step-1 tool executed ONCE."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
     root_job_id = str(uuid4())
     thread_id = str(uuid4())
     failed_run_id = str(uuid4())
     owner_user_id = f"u-wake-{uuid4().hex[:10]}"
     workspace_id = str(uuid4())
-    tool_side_effect_runs: list[str] = []
     now = datetime.now(timezone.utc)
 
-    # Seed minimal parent rows if foreign keys exist on hook_outbox
+    class _State(TypedDict):
+        step1_done: bool
+        answer: str
+
+    tool_side_effect_runs: list[str] = []
+    quota_flag = {"exhausted": True}
+
+    def _tool_node(state: _State) -> dict[str, Any]:
+        tool_side_effect_runs.append("step1-tool-executed")
+        return {"step1_done": True}
+
+    def _llm_node(state: _State) -> dict[str, Any]:
+        if quota_flag["exhausted"]:
+            raise _RemoteQuotaExhaustedError(
+                "Plan limit reached",
+                429,
+                expires_at=(now + timedelta(minutes=15)).timestamp(),
+                provider_refusal=ProviderRefusal("plan_limit", until=now + timedelta(minutes=15)),
+            )
+        return {"answer": "db-resumed-ok"}
+
+    builder = StateGraph(_State)
+    builder.add_node("tool_step", _tool_node)
+    builder.add_node("llm_step", _llm_node)
+    builder.add_edge(START, "tool_step")
+    builder.add_edge("tool_step", "llm_step")
+    builder.add_edge("llm_step", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+
+    start_meta = uf.build_wakeup_quota_start_metadata(
+        SimpleNamespace(
+            query_type="wakeup",
+            wakeup={
+                "v": 1,
+                "root_job_id": root_job_id,
+                "wakeup_id": "wake-ckpt-db",
+                "first_due_at": now.isoformat(),
+                "notices": [{"wakeup_id": "wake-ckpt-db"}],
+            },
+            llm_model="claude-opus-5-5-oauth",
+        ),
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+        effective_model="claude-opus-5-5-oauth",
+    )
+
     try:
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.transaction():
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        """
-                        INSERT INTO users (user_id, email)
-                        VALUES (%s, %s)
-                        ON CONFLICT (user_id) DO NOTHING
-                        """,
+                        "INSERT INTO users (user_id, email) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
                         (owner_user_id, f"{owner_user_id}@test.local"),
                     )
                     await cur.execute(
-                        """
-                        INSERT INTO workspaces (workspace_id, user_id, name)
-                        VALUES (%s::uuid, %s, 'wake-test-ws')
-                        ON CONFLICT (workspace_id) DO NOTHING
-                        """,
+                        "INSERT INTO workspaces (workspace_id, user_id, name) VALUES (%s::uuid, %s, 'wake-test-ws') ON CONFLICT (workspace_id) DO NOTHING",
                         (workspace_id, owner_user_id),
                     )
                     await cur.execute(
-                        """
-                        INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id, title)
-                        VALUES (%s::uuid, %s::uuid, %s, 'wake-test-thread')
-                        ON CONFLICT (conversation_thread_id) DO NOTHING
-                        """,
+                        "INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id, title) VALUES (%s::uuid, %s::uuid, %s, 'wake-test-thread') ON CONFLICT (conversation_thread_id) DO NOTHING",
                         (thread_id, workspace_id, owner_user_id),
                     )
                     await cur.execute(
@@ -238,47 +304,110 @@ async def test_db_cross_worker_wakeup_checkpoint_resume_runs_step1_tool_once(
                             conversation_response_id, conversation_thread_id,
                             turn_index, status, metadata, user_id
                         )
-                        VALUES (%s::uuid, %s::uuid, 1, 'error', '{}'::jsonb, %s)
+                        VALUES (%s::uuid, %s::uuid, 1, 'in_progress', %s, %s)
                         """,
-                        (failed_run_id, thread_id, owner_user_id),
+                        (
+                            failed_run_id,
+                            thread_id,
+                            uf.SafeJson({"workspace_id": workspace_id, "user_id": owner_user_id, **start_meta}),
+                            owner_user_id,
+                        ),
                     )
 
-        # Worker 1 executes step-1 tool once, writes checkpoint, then hits exhaustion at step 2
-        tool_side_effect_runs.append("step1-tool-executed")
-        ckpt_id = "ckpt-step-1-committed"
-        async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
-            async with conn.transaction():
-                dec = await uf.record_wakeup_mid_turn_quota_exhaustion_tx(
-                    conn,
-                    thread_id=thread_id,
-                    run_id=failed_run_id,
-                    owner_user_id=owner_user_id,
-                    root_job_id=root_job_id,
-                    wakeup_id="wake-ckpt-test",
-                    turn_index=1,
-                    availabilities=[
-                        uf.SubscriptionAvailability(
-                            available=False,
-                            kind="quota_cooldown",
-                            refusal_code="plan_limit",
-                            reset_at=now + timedelta(minutes=15),
-                            model_name="claude-opus-5-5-oauth",
-                        )
-                    ],
-                    latest_checkpoint_id=ckpt_id,
-                    first_due_at=now,
-                    now=now,
-                )
-        assert dec.action == "defer"
-        assert dec.defer_count == 1
-        assert dec.resume_checkpoint_id == ckpt_id
+        # Worker 1 runs real graph: tool_step executes ONCE & commits checkpoint, llm_step raises
+        caught_exc: BaseException | None = None
+        try:
+            await graph.ainvoke({"step1_done": False, "answer": ""}, config={"configurable": {"thread_id": thread_id}})
+        except _RemoteQuotaExhaustedError as exc:
+            caught_exc = exc
+        assert caught_exc is not None
+        assert tool_side_effect_runs == ["step1-tool-executed"]
 
-        # Worker 2 reads the durable hook_outbox job and invokes execute_wakeup_quota_resume
+        saved_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        ckpt_id = saved_state.config["configurable"]["checkpoint_id"]
+
+        # Wire RunCoordinator._newest_checkpoint to return the real checkpoint owned by failed_run_id
+        coord = RunCoordinator.get_instance()
+        monkeypatch.setattr(
+            coord,
+            "_newest_checkpoint",
+            create_autospec(
+                coord._newest_checkpoint,
+                instance=False,
+                return_value=tl_db.NewestCheckpoint(checkpoint_id=ckpt_id, run_id=failed_run_id),
+            ),
+        )
+        monkeypatch.setattr(coord, "post_finalize_tail", create_autospec(coord.post_finalize_tail, instance=False))
+        monkeypatch.setattr(
+            finalization_mod,
+            "_delivered_steering_inputs",
+            create_autospec(finalization_mod._delivered_steering_inputs, instance=False, return_value=[]),
+        )
+
+        # Run REAL LocalRunExecutor._finalize_run -> REAL RunCoordinator.finalize_run -> REAL lifecycle.finalize_run
+        executor = LocalRunExecutor.__new__(LocalRunExecutor)
+        executor.task_lock = asyncio.Lock()
+        executor.executions = {}
+        executor.event_storage_backend = "memory"
+        executor._orphan_collectors = {}
+        executor._shielded_tasks = set()
+        monkeypatch.setattr(executor, "append_run_end_event", create_autospec(executor.append_run_end_event, instance=False))
+        monkeypatch.setattr(executor, "_note_credential_refusal", create_autospec(executor._note_credential_refusal, instance=False))
+
+        handle = RunHandle(
+            run_id=failed_run_id,
+            thread_id=thread_id,
+            turn_index=1,
+            attempt_no=1,
+            workspace_id=workspace_id,
+            user_id=owner_user_id,
+            recorded_as=owner_user_id,
+            is_byok=True,
+            started_at=now,
+        )
+        fake_handler = SimpleNamespace(
+            agent_config=SimpleNamespace(
+                llm=SimpleNamespace(name="claude-opus-5-5-oauth"),
+                fallback_llm_clients=[],
+                feature_enabled=lambda name: False,
+            ),
+            saw_interrupt=False,
+            captured_images={},
+            captured_images_by_message={},
+            saved_image_paths=[],
+            record=lambda stop_events=None: tl_db.ProducerRecord(),
+        )
+        executor.executions[(thread_id, failed_run_id)] = LocalRunExecution(
+            thread_id=thread_id,
+            run_id=failed_run_id,
+            status=LocalRunStatus.RUNNING,
+            created_at=now,
+            graph=graph,
+            metadata={
+                "run_handle": handle,
+                "handler": fake_handler,
+                "workspace_id": workspace_id,
+                "user_id": owner_user_id,
+                "recorded_as": owner_user_id,
+                "start_time": now.timestamp(),
+            },
+        )
+
+        await executor._finalize_run(thread_id, failed_run_id, kind="failed", error=str(caught_exc), exc=caught_exc)
+
+        # Verify atomic PG commit: conversation_responses.status == 'error' AND hook_outbox has 1 wakeup_quota_resume
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
+                    "SELECT status FROM conversation_responses WHERE conversation_response_id = %s::uuid",
+                    (failed_run_id,),
+                )
+                r_row = await cur.fetchone()
+                assert r_row is not None and r_row["status"] == "error"
+
+                await cur.execute(
                     """
-                    SELECT hook_outbox_id, run_id, conversation_thread_id, hook_type, payload
+                    SELECT hook_outbox_id, run_id, conversation_thread_id, hook_type, payload, attempts
                     FROM hook_outbox
                     WHERE idempotency_key = %s
                     """,
@@ -287,33 +416,34 @@ async def test_db_cross_worker_wakeup_checkpoint_resume_runs_step1_tool_once(
                 outbox_job = await cur.fetchone()
         assert outbox_job is not None
         assert outbox_job["hook_type"] == "wakeup_quota_resume"
+        assert outbox_job["payload"]["resume_checkpoint_id"] == ckpt_id
 
-        from src.server.database.runs import lifecycle as tl_db
-        from src.server.services.runs import pending_input
+        # Worker 2 reads the real DB outbox row and runs execute_wakeup_quota_resume ->
+        # real RetryRequest validation -> resumes real LangGraph checkpoint!
+        resumed_answer: dict[str, Any] = {}
 
-        monkeypatch.setattr(
-            tl_db,
-            "get_latest_attempt",
-            AsyncMock(return_value={"conversation_response_id": failed_run_id, "status": "error"}),
-        )
-        monkeypatch.setattr(
-            pending_input,
-            "retried_wake_fields",
-            AsyncMock(return_value={"query_type": "wakeup", "wakeup": {"v": 1, "notices": []}}),
-        )
-
-        resumed_checkpoints: list[str] = []
-
-        async def _fake_post(**kw: Any) -> tuple[str, str]:
-            # Resuming from ckpt-step-1 starts directly at step-2 LLM node (tool-1 NOT re-run)
-            resumed_checkpoints.append(str(kw["body"]["checkpoint_id"]))
+        async def _dispatch_retry(*args: Any, **kwargs: Any) -> tuple[str, str | None]:
+            parsed = RetryRequest.model_validate(kwargs["body"])
+            UUID(str(parsed.request_key))
+            assert parsed.workspace_id == workspace_id
+            assert parsed.checkpoint_id == ckpt_id
+            quota_flag["exhausted"] = False
+            out = await graph.ainvoke(
+                None,
+                config={"configurable": {"thread_id": thread_id, "checkpoint_id": parsed.checkpoint_id}},
+            )
+            resumed_answer.update(out)
             return "dispatched", str(uuid4())
 
-        monkeypatch.setattr(notify_turn, "post_notification_turn", _fake_post)
+        monkeypatch.setattr(
+            notify_turn,
+            "post_notification_turn",
+            create_autospec(notify_turn.post_notification_turn, instance=False, side_effect=_dispatch_retry),
+        )
         await uf.execute_wakeup_quota_resume(dict(outbox_job))
 
-        assert resumed_checkpoints == [ckpt_id]
-        assert len(tool_side_effect_runs) == 1
+        assert resumed_answer.get("answer") == "db-resumed-ok"
+        assert tool_side_effect_runs == ["step1-tool-executed"]
     finally:
         async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
             async with conn.transaction():
@@ -337,6 +467,96 @@ async def test_db_cross_worker_wakeup_checkpoint_resume_runs_step1_tool_once(
                     await cur.execute(
                         "DELETE FROM workspaces WHERE workspace_id = %s::uuid",
                         (workspace_id,),
+                    )
+
+
+@pytest.mark.asyncio
+async def test_db_concurrent_first_deferral_serialized_and_4th_terminates(
+    bound_pg_pool: str,
+) -> None:
+    """Two concurrent workers racing on a brand-new root_job_id serialize cleanly under advisory lock."""
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    owner_user_id = f"u-conc-{uuid4().hex[:10]}"
+    t0 = datetime.now(timezone.utc)
+    avail = [
+        uf.SubscriptionAvailability(
+            available=False,
+            kind="quota_cooldown",
+            refusal_code="plan_limit",
+            reset_at=t0 + timedelta(minutes=30),
+            model_name="claude-opus-5-5-oauth",
+        )
+    ]
+    try:
+        d_a, d_b = await asyncio.gather(
+            uf.evaluate_and_record_wakeup_deferral(
+                root_job_id=root_job_id,
+                wakeup_id="wake-race",
+                thread_id=thread_id,
+                owner_user_id=owner_user_id,
+                step_key=f"pre:{root_job_id}:1",
+                availabilities=avail,
+                first_due_at=t0,
+                now=t0,
+            ),
+            uf.evaluate_and_record_wakeup_deferral(
+                root_job_id=root_job_id,
+                wakeup_id="wake-race",
+                thread_id=thread_id,
+                owner_user_id=owner_user_id,
+                step_key=f"pre:{root_job_id}:1",
+                availabilities=avail,
+                first_due_at=t0,
+                now=t0,
+            ),
+        )
+        assert d_a.defer_count == 1 and d_b.defer_count == 1
+        assert int(d_a.idempotent_replay) + int(d_b.idempotent_replay) == 1
+
+        d2 = await uf.evaluate_and_record_wakeup_deferral(
+            root_job_id=root_job_id,
+            wakeup_id="wake-race",
+            thread_id=thread_id,
+            owner_user_id=owner_user_id,
+            step_key=f"pre:{root_job_id}:2",
+            availabilities=avail,
+            first_due_at=t0,
+            now=t0 + timedelta(minutes=35),
+        )
+        assert d2.defer_count == 2
+
+        d3 = await uf.evaluate_and_record_wakeup_deferral(
+            root_job_id=root_job_id,
+            wakeup_id="wake-race",
+            thread_id=thread_id,
+            owner_user_id=owner_user_id,
+            step_key=f"pre:{root_job_id}:3",
+            availabilities=avail,
+            first_due_at=t0,
+            now=t0 + timedelta(minutes=70),
+        )
+        assert d3.defer_count == 3
+
+        d4 = await uf.evaluate_and_record_wakeup_deferral(
+            root_job_id=root_job_id,
+            wakeup_id="wake-race",
+            thread_id=thread_id,
+            owner_user_id=owner_user_id,
+            step_key=f"pre:{root_job_id}:4",
+            availabilities=avail,
+            first_due_at=t0,
+            now=t0 + timedelta(minutes=105),
+        )
+        assert d4.action == "exhausted_failed"
+        assert d4.defer_count == 3
+    finally:
+        async with await psycopg.AsyncConnection.connect(bound_pg_pool) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM dalton_wakeup_quota_deferrals WHERE root_job_id = %s::uuid",
+                        (root_job_id,),
                     )
 
 
@@ -399,7 +619,6 @@ async def test_db_resume_route_mutation_skips_mutated_candidate(
     assert ok_intact is True
     assert diffs_intact == {}
 
-    # Alembic d062 <-> d061 round-trip verification against real PG
     cfg = _dalton_alembic_cfg(bound_pg_pool)
     try:
         alembic_command.downgrade(cfg, "d061")

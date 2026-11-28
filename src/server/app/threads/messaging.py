@@ -1012,6 +1012,9 @@ async def _handle_send_message(
                 from_service=from_service,
                 is_server_retry=is_server_retry,
                 retry_of_run_id=retry_of_run_id,
+                # DALTON-HOOK(quota-exhaustion): pass canonical run_id & payer_user_id for unified cash lease admission
+                run_id=run_id,
+                payer_user_id=identity.recorded_as,
                 # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
                 **(
                     {"retry_source_execution_id": retry_source_execution_id}
@@ -2376,6 +2379,18 @@ async def retry_thread(
 
     if checked is not None:
         request = request.model_copy(update={"checked_computer_id": checked})
+    # DALTON-HOOK(quota-exhaustion): propagate server-only wakeup_resume continuity fields into request.wakeup on trusted service /retry
+    if (
+        body is not None
+        and isinstance(body.wakeup_resume, dict)
+        and _is_service_request(raw_request)
+        and getattr(request, "query_type", None) == "wakeup"
+    ):
+        _merged_wake = dict(request.wakeup) if isinstance(request.wakeup, dict) else {"v": 1, "notices": []}
+        for _wk in ("root_job_id", "job_id", "attempts", "first_due_at", "wakeup_id"):
+            if body.wakeup_resume.get(_wk) is not None:
+                _merged_wake[_wk] = body.wakeup_resume[_wk]
+        request = request.model_copy(update={"wakeup": _merged_wake})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
     # DALTON-HOOK(team-model-catalog): forward retried DB row & explicit retry checkpoint so _handle_send_message runs verify_resume_route on the right run before client build

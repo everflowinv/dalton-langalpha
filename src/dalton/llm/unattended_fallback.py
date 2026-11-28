@@ -43,7 +43,7 @@ from src.dalton.settings import (
     is_unattended_quota_fallback_enabled,
 )
 from src.llms.provider_errors import read_refusal
-from src.ptc_agent.agent.middleware.credit_gate import LeaseVerdict
+from ptc_agent.agent.middleware.credit_gate import LeaseVerdict
 from src.server.contracts.turn_kinds import (
     UNWATCHED_RUN_META,
     classify_origin,
@@ -96,6 +96,7 @@ class UnattendedTurnContext:
     is_unattended: bool
     subject_user_id: str
     source_kind: str
+    payer_user_id: str | None = None
     ignore_custom_models: bool = False
     task_fallbacks: tuple[str, ...] = ()
     run_id: str | None = None
@@ -302,30 +303,79 @@ def _parse_iso_or_epoch(value: Any) -> datetime | None:
     return None
 
 
-def _compute_cooldown_redis_key_without_client(
+def resolve_oauth_credential_id_from_row(conn_row: Mapping[str, Any] | None) -> str:
+    """Compute the exact non-secret credential identity used by ``model_resilience.quota_redis_key``."""
+    if not isinstance(conn_row, Mapping):
+        return ""
+    from src.dalton.llm.oauth_refresh import credential_identity
+
+    account_id = str(conn_row.get("account_id") or "").strip()
+    cred_id = credential_identity(
+        account_id=account_id,
+        email=conn_row.get("email"),
+        updated_at=conn_row.get("updated_at"),
+    )
+    if not cred_id and account_id and not account_id.startswith("muse-api-key"):
+        cred_id = account_id
+    return cred_id
+
+
+def build_quota_cooldown_key(
     *,
     user_id: str,
     model_name: str,
     provider: str,
-    model_id: str,
     is_custom: bool = False,
     credential_id: str = "",
+    account_id: str = "",
 ) -> str | None:
-    if not user_id or not provider or not model_id:
+    """Build the Redis cooldown coordination key shared by pre-dispatch probe and runtime benching."""
+    if not user_id or not provider or not model_name:
         return None
     from src.dalton.credentials import credential_user_id
     from src.dalton.llm.antigravity_series import quota_cooldown_target
     from src.ptc_agent.agent.middleware.model_resilience import _QUOTA_EXHAUSTED_REDIS_PREFIX
 
-    try:
-        cred_user = credential_user_id(str(user_id))
-    except Exception:
-        cred_user = str(user_id)
+    if str(user_id) == "platform":
+        cred_user = "platform"
+    else:
+        try:
+            cred_user = credential_user_id(str(user_id))
+        except Exception:
+            cred_user = str(user_id)
     if not cred_user:
         return None
-    scope_kind, target = quota_cooldown_target(provider, model_id, is_custom=is_custom)
+    eff_cred_id = (credential_id or "").strip()
+    if not eff_cred_id:
+        acct = (account_id or "").strip()
+        if acct and not acct.startswith("muse-api-key"):
+            eff_cred_id = acct
+    scope_kind, target = quota_cooldown_target(provider, model_name, is_custom=is_custom)
     base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}"
-    return f"{base}:{credential_id}" if credential_id else base
+    return f"{base}:{eff_cred_id}" if eff_cred_id else base
+
+
+def _compute_cooldown_redis_key_without_client(
+    *,
+    user_id: str,
+    model_name: str,
+    provider: str,
+    model_id: str = "",
+    is_custom: bool = False,
+    credential_id: str = "",
+    account_id: str = "",
+) -> str | None:
+    # Always key by manifest/catalog ``model_name`` (matching ``model_resilience.quota_redis_key``
+    # and ``quota_cooldown_target``), falling back to ``model_id`` only if ``model_name`` is blank.
+    eff_name = (model_name or model_id or "").strip()
+    return build_quota_cooldown_key(
+        user_id=user_id,
+        model_name=eff_name,
+        provider=provider,
+        is_custom=is_custom,
+        credential_id=credential_id,
+        account_id=account_id,
+    )
 
 
 def _resolve_model_subscription_info(
@@ -375,34 +425,34 @@ async def inspect_subscription_availability(
     )
     provider = sub_provider or catalog_provider or None
 
-    # 1. Check OAuth subscription auth status (if provider is a subscription provider)
+    # 1. Check OAuth subscription auth status using real oauth_tokens / oauth_health APIs
+    #    and extract the exact credential_id used by model_resilience.quota_redis_key.
+    resolved_credential_id = ""
+    resolved_account_id = ""
     if sub_provider and user_id:
         try:
-            from src.dalton.credentials import credential_user_id
-            from src.server.services import oauth_health
+            from src.server.database.oauth_tokens import get_oauth_connection
+            from src.server.services.oauth_health import connection_state
 
-            holder_id = credential_user_id(str(user_id)) or str(user_id)
-            flagged_fn = getattr(oauth_health, "get_flagged_subscription", None)
-            if callable(flagged_fn):
-                flagged = await flagged_fn(holder_id, sub_provider)
-                if flagged:
-                    code = (
-                        flagged.get("code")
-                        if isinstance(flagged, Mapping)
-                        else str(flagged)
-                    )
-                    return SubscriptionAvailability(
-                        available=False,
-                        kind="auth_unavailable",
-                        refusal_code=str(code or "oauth_reauth_required"),
-                        provider=provider,
-                        reset_at=None,
-                        cooldown_key=None,
-                        message=format_unattended_quota_notice(
-                            "oauth_auth_unavailable", model_name=mk
-                        ),
-                        model_name=mk,
-                    )
+            conn_row = await get_oauth_connection(str(user_id), sub_provider)
+            state = connection_state(conn_row)
+            if state == "needs_reauth" and isinstance(conn_row, Mapping):
+                code = str(conn_row.get("last_error_code") or "oauth_reauth_required")
+                return SubscriptionAvailability(
+                    available=False,
+                    kind="auth_unavailable",
+                    refusal_code=code,
+                    provider=provider,
+                    reset_at=None,
+                    cooldown_key=None,
+                    message=format_unattended_quota_notice(
+                        "oauth_auth_unavailable", model_name=mk
+                    ),
+                    model_name=mk,
+                )
+            if isinstance(conn_row, Mapping):
+                resolved_credential_id = resolve_oauth_credential_id_from_row(conn_row)
+                resolved_account_id = str(conn_row.get("account_id") or "").strip()
         except Exception:
             logger.debug(
                 "[UNATTENDED_FALLBACK] OAuth health probe skipped for model=%s",
@@ -410,7 +460,7 @@ async def inspect_subscription_availability(
                 exc_info=True,
             )
 
-    # 2. Compute Redis cooldown coordination key
+    # 2. Compute Redis cooldown coordination key (sharing exact credential_id & model_name rules)
     cooldown_key: str | None = None
     if client is not None:
         try:
@@ -426,6 +476,8 @@ async def inspect_subscription_availability(
             provider=provider,
             model_id=model_id,
             is_custom=is_custom,
+            credential_id=resolved_credential_id,
+            account_id=resolved_account_id,
         )
 
     if not cooldown_key:
@@ -560,27 +612,31 @@ def resolve_unattended_fallback_chain(
 
     Order:
     1. Explicit ``task_fallbacks`` (when non-empty).
-    2. Owner ``user_prefs["fallback_models"]`` (disabled ONLY when ``disable_fallback: true``).
-    3. Active profile (``resolve_profile()``) default fallback chain.
+    2. Owner ``user_prefs["fallback_models"]`` (skipped ONLY when ``disable_fallback: true``).
+    3. Active profile (``resolve_profile()``) default fallback chain (always available as the
+       tail ``$0`` subscription pool when ``disable_fallback: true`` or personal candidates are
+       filtered empty).
 
     Automatically filters out ``primary_model``, non-OAuth models when cash fallback is
     disabled, candidates outside ``allowed_pool``, and candidates sharing a cooldown key
     in ``skip_cooldown_keys``.
     """
     prefs = user_prefs if isinstance(user_prefs, Mapping) else {}
-    if prefs.get("disable_fallback") is True:
-        return []
+    disable_personal = prefs.get("disable_fallback") is True
 
     raw_chain: list[str] = []
     if task_fallbacks:
         raw_chain.extend(str(m).strip() for m in task_fallbacks if isinstance(m, str) and m.strip())
 
-    saved = prefs.get("fallback_models")
-    if isinstance(saved, list) and saved:
-        raw_chain.extend(str(m).strip() for m in saved if isinstance(m, str) and m.strip())
+    if not disable_personal:
+        saved = prefs.get("fallback_models")
+        if isinstance(saved, list) and saved:
+            raw_chain.extend(str(m).strip() for m in saved if isinstance(m, str) and m.strip())
 
-    if not raw_chain:
-        raw_chain.extend(get_profile_default_fallback_chain())
+    # Always append the active profile's default chain as the tail fallback layer so
+    # ``disable_fallback: true`` only disables the personal list and a personal list
+    # filtered empty (e.g. cash-only with cash disabled) still falls back to the $0 pool.
+    raw_chain.extend(get_profile_default_fallback_chain())
 
     eff_allow_cash = (
         allow_cash_fallback_on_unattended() if allow_cash is None else bool(allow_cash)
@@ -641,6 +697,7 @@ def stamp_quota_or_auth_only(
     *,
     candidate_name: str,
     subject_user_id: str,
+    payer_user_id: str | None = None,
     run_id: str | None = None,
     ignore_custom_models: bool = False,
     role: str = "analyst",
@@ -653,6 +710,7 @@ def stamp_quota_or_auth_only(
     meta = {
         "candidate_name": candidate_name,
         "subject_user_id": subject_user_id,
+        "payer_user_id": payer_user_id or subject_user_id,
         "run_id": run_id,
         "ignore_custom_models": bool(ignore_custom_models),
         "role": role,
@@ -669,6 +727,26 @@ def stamp_quota_or_auth_only(
         except Exception:
             pass
     return client
+
+
+def bind_unattended_fallback_run_context(
+    config: Any,
+    *,
+    run_id: str | None,
+    payer_user_id: str | None = None,
+) -> None:
+    """Attach the canonical ``run_id`` / ``payer_user_id`` to stamped fallback clients on ``config``."""
+    clients = getattr(config, "fallback_llm_clients", None)
+    if not isinstance(clients, list):
+        return
+    for client in clients:
+        meta = getattr(client, UNATTENDED_FALLBACK_META_ATTR, None)
+        if not isinstance(meta, dict):
+            continue
+        if run_id and not meta.get("run_id"):
+            meta["run_id"] = str(run_id)
+        if payer_user_id and not meta.get("payer_user_id"):
+            meta["payer_user_id"] = str(payer_user_id)
 
 
 def is_quota_or_auth_only_client(client: Any) -> bool:
@@ -688,8 +766,9 @@ def is_quota_or_auth_switch_trigger(
 ) -> bool:
     """Return True ONLY when *exc* is a confirmed quota cooldown/refusal or OAuth auth failure.
 
-    Transient network errors, timeouts, and 5xx server errors return ``False`` so
-    ``quota_or_auth_only`` fallback candidates are never activated on non-quota faults.
+    Transient network errors, timeouts, generic 429 rate limits without terminal refusal,
+    and 5xx server errors return ``False`` so ``quota_or_auth_only`` fallback candidates
+    are never activated on non-quota faults.
     """
     if quota_benched:
         return True
@@ -700,8 +779,12 @@ def is_quota_or_auth_switch_trigger(
         is_subscription_unavailable_error,
     )
     from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhaustedError
+    from src.server.services.oauth_health import OAuthReauthRequired, OAuthRefreshUnavailable
+    from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
 
     if isinstance(exc, _RemoteQuotaExhaustedError):
+        return True
+    if isinstance(exc, (OAuthReauthRequired, OAuthRefreshUnavailable, OAuthPlanNoApiAccess)):
         return True
     if is_subscription_unavailable_error(exc):
         return True
@@ -710,9 +793,32 @@ def is_quota_or_auth_switch_trigger(
     if refusal is not None and refusal.reason in QUOTA_OR_AUTH_REASONS:
         return True
 
-    # Explicit 401/402/403 HTTP status after OAuth refresh already failed
+    # Explicit 401/402 HTTP status after OAuth refresh already failed
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status in (401, 402):
+        return True
+
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, BaseException) and cause is not exc:
+        if is_quota_or_auth_switch_trigger(cause):
+            return True
+    return False
+
+
+def is_complete_result_quota_or_auth_trigger(result: Any) -> bool:
+    """Return True ONLY when a ``DaltonCompleteResult`` carries structured terminal quota/auth metadata.
+
+    Never matches arbitrary substrings like ``'429'``, ``'quota'``, ``'rate_limit'``,
+    ``'oauth'``, or ``'billing'`` inside free-form error messages.
+    """
+    if result is None or getattr(result, "ok", False):
+        return False
+    if getattr(result, "quota_or_auth_trigger", False) is True:
+        return True
+    refusal_reason = getattr(result, "refusal_reason", None)
+    if isinstance(refusal_reason, str) and refusal_reason.strip() in QUOTA_OR_AUTH_REASONS:
+        return True
+    if getattr(result, "error_kind", None) == "auth_expired":
         return True
     return False
 
@@ -726,8 +832,12 @@ def is_terminal_quota_refusal(exc: BaseException | None) -> bool:
         is_subscription_unavailable_error,
     )
     from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhaustedError
+    from src.server.services.oauth_health import OAuthReauthRequired, OAuthRefreshUnavailable
+    from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
 
     if isinstance(exc, _RemoteQuotaExhaustedError):
+        return True
+    if isinstance(exc, (OAuthReauthRequired, OAuthRefreshUnavailable, OAuthPlanNoApiAccess)):
         return True
     if is_subscription_unavailable_error(exc):
         return True
@@ -750,29 +860,115 @@ def is_terminal_quota_refusal(exc: BaseException | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _policy_allows_model(policy: Any, model_name: str, billing: str) -> tuple[bool, str | None]:
+def _policy_allows_model(
+    policy: Any,
+    model_name: str,
+    billing: str,
+    *,
+    model_pref: Mapping[str, Any] | None = None,
+    ignore_custom_models: bool = False,
+) -> tuple[bool, str | None]:
+    """Re-verify ``model_name`` against ``policy`` using canonical ``availability.policy_refuses``."""
     if policy is None:
         return True, None
-    models_policy = getattr(policy, "models", None)
-    if models_policy is not None:
-        allowed = getattr(models_policy, "allowed", None)
-        if allowed is not None and len(allowed) > 0 and model_name not in allowed:
-            return False, "policy_model_not_allowed"
-        denied = getattr(models_policy, "denied", None)
-        if denied and model_name in denied:
-            return False, "policy_model_denied"
-        allows_fn = getattr(models_policy, "allows", None)
-        if callable(allows_fn):
-            try:
-                if not allows_fn(model_name):
-                    return False, "policy_model_not_allowed"
-            except TypeError:
-                pass
+    from src.server.services.llm.availability import policy_refuses
+    from src.server.services.policy import OWN_SUBSCRIPTIONS, Policy
+
+    if isinstance(policy, Policy):
+        pref_dict = dict(model_pref) if isinstance(model_pref, Mapping) else {}
+        if ignore_custom_models:
+            pref_dict = {
+                k: v
+                for k, v in pref_dict.items()
+                if k not in ("custom_models", "custom_providers")
+            }
+        refused_rule = policy_refuses(policy, pref_dict, model_name)
+        if refused_rule is not None:
+            return False, f"policy_denied:{refused_rule}"
+        if billing == "oauth" and not policy.allows(OWN_SUBSCRIPTIONS):
+            return False, f"policy_denied:{OWN_SUBSCRIPTIONS}"
+        return True, None
+
+    # Fallback for duck-typed policy objects with Policy-compatible methods
+    allows_model_fn = getattr(policy, "allows_model", None)
+    if callable(allows_model_fn) and not allows_model_fn(model_name):
+        return False, "policy_denied:models.allowed"
     if billing == "oauth":
-        oauth_ok = getattr(policy, "oauth_enabled", None)
-        if oauth_ok is False:
-            return False, "policy_oauth_disabled"
+        allows_fn = getattr(policy, "allows", None)
+        if callable(allows_fn) and not allows_fn(OWN_SUBSCRIPTIONS):
+            return False, f"policy_denied:{OWN_SUBSCRIPTIONS}"
     return True, None
+
+
+def _bind_lease_verdict_to_credit_lease(credit_lease: Any, verdict: LeaseVerdict) -> None:
+    """Bind an admitted ``LeaseVerdict`` onto an active credit gate / ``CreditLease`` object."""
+    if credit_lease is None or not verdict.granted:
+        return
+    # Handle either a CreditGateState (holding ``.lease`` / ``._lease``) or a direct CreditLease.
+    target = getattr(credit_lease, "lease", None) or getattr(credit_lease, "_lease", None) or credit_lease
+    record_fn = getattr(target, "_record", None)
+    if callable(record_fn):
+        try:
+            record_fn(verdict)
+            return
+        except Exception:
+            pass
+    try:
+        if hasattr(target, "ceiling_credits"):
+            target.ceiling_credits = max(
+                float(getattr(target, "ceiling_credits", 0.0) or 0.0),
+                float(verdict.ceiling_credits),
+            )
+        if hasattr(target, "grant_generation") and verdict.generation is not None:
+            target.grant_generation = verdict.generation
+        if hasattr(target, "generation") and verdict.generation is not None:
+            target.generation = verdict.generation
+    except Exception:
+        pass
+
+
+def route_fingerprint_to_dict(route: RouteFingerprint) -> dict[str, Any]:
+    """Serialize a 6-tuple :class:`RouteFingerprint` for durable ``active_fallback_route`` storage."""
+    return {
+        "model_key": route.model_key,
+        "provider": route.provider,
+        "model_id": route.model_id,
+        "bound_base_url": route.bound_base_url,
+        "key_fingerprint": route.key_fingerprint,
+        "billing": route.billing,
+    }
+
+
+async def persist_active_fallback_route(
+    run_id: str,
+    route: RouteFingerprint,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Persist ``active_fallback_route`` onto ``conversation_responses.metadata`` for resume verification."""
+    cleaned_run_id = str(run_id or "").strip()
+    if not cleaned_run_id or not route.model_key:
+        return False
+    payload = route_fingerprint_to_dict(route)
+    sql = """
+        UPDATE conversation_responses
+        SET metadata = jsonb_set(
+            COALESCE(metadata, '{}'::jsonb),
+            '{active_fallback_route}',
+            %s::jsonb,
+            true
+        )
+        WHERE conversation_response_id = %s
+    """
+    if conn is not None:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (SafeJson(payload), cleaned_run_id))
+            return cur.rowcount > 0
+    async with get_db_connection() as own_conn:
+        async with own_conn.transaction():
+            async with own_conn.cursor() as cur:
+                await cur.execute(sql, (SafeJson(payload), cleaned_run_id))
+                return cur.rowcount > 0
 
 
 async def acquire_fallback_candidate_live(
@@ -780,6 +976,7 @@ async def acquire_fallback_candidate_live(
     subject_user_id: str,
     candidate_model: str,
     run_id: str | None,
+    payer_user_id: str | None = None,
     call_id: str | None = None,
     role: str = "analyst",
     require_vision: bool = False,
@@ -802,19 +999,22 @@ async def acquire_fallback_candidate_live(
     1. Role modality, role-policy prohibition, system-catalog isolation
        (``ignore_custom_models=True`` rejects user custom models), and snapshot
        ``RouteFingerprint`` consistency.
-    2. Fresh org policy (``require_policy(subject_user_id)``) model allowlist & auth rules.
+    2. Fresh org policy (``require_policy(subject_user_id)`` + ``policy_refuses``) model allowlist & auth rules.
     3. Strict admission-subject / billing-payer identity unity & cash-fallback feature gate.
     4. Billing-specific atomic admission:
-       - ``platform``: ``enforce_credit_limit(subject_user_id, byok=False)``.
-       - ``cash`` (only when enabled): ``acquire_cash_lease`` (shared PG advisory lock +
-         ``INSERT ... ON CONFLICT (run_ref)`` + ``(run_ref, call_id)`` idempotency).
+       - ``platform``: ``enforce_credit_limit(payer_user_id, byok=False)``.
+       - ``cash`` (only when enabled): ``acquire_cash_lease`` -> ``acquire_cash_lease_tx``
+         (shared PG advisory lock + ``INSERT ... ON CONFLICT (run_ref)`` + ``(run_ref, call_id)`` idempotency).
        - ``oauth``: live ``inspect_subscription_availability``.
     """
     mk = str(candidate_model or "").strip()
-    if not mk or not subject_user_id:
+    subj = str(subject_user_id or "").strip()
+    if not mk or not subj:
         return FallbackAdmissionResult(
             admitted=False, model_name=mk, reason="invalid_candidate_or_subject"
         )
+
+    eff_payer = str(payer_user_id or subj).strip()
 
     # Gate 1a: Role policy forbidden variants (L21)
     try:
@@ -855,14 +1055,46 @@ async def acquire_fallback_candidate_live(
         except Exception:
             pass
 
-    # Gate 1d: Snapshot RouteFingerprint consistency check
+    # Gate 1d: Snapshot RouteFingerprint consistency check (bound snapshot or resume target snapshot)
     active_snap = snapshot if snapshot is not None else get_active_catalog_snapshot()
+    if active_snap is None:
+        from src.dalton.services.team_model_catalog.constants import TURN_SNAPSHOT_SCHEMA
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _fetch_persisted_run_row,
+            get_active_resume_verify_target,
+        )
+
+        resume_target = get_active_resume_verify_target()
+        if resume_target is not None:
+            t_row = (
+                dict(resume_target.run_row)
+                if isinstance(resume_target.run_row, Mapping)
+                else None
+            )
+            if t_row is None and resume_target.run_id:
+                try:
+                    t_row = await _fetch_persisted_run_row(
+                        resume_target.run_id,
+                        thread_id=resume_target.thread_id,
+                        conn=conn,
+                    )
+                except Exception:
+                    t_row = None
+            if isinstance(t_row, Mapping):
+                t_meta = t_row.get("metadata")
+                if isinstance(t_meta, Mapping):
+                    cand_snap = t_meta.get("effective_catalog_snapshot")
+                    if (
+                        isinstance(cand_snap, Mapping)
+                        and cand_snap.get("schema") == TURN_SNAPSHOT_SCHEMA
+                    ):
+                        active_snap = cand_snap
     live_route: RouteFingerprint | None = None
     try:
         _resolve_route = resolve_route_fn or resolve_live_route_fingerprint
         live_route = await _resolve_route(
             mk,
-            user_id=subject_user_id,
+            user_id=subj,
             model_pref=prefs or None,
             ignore_custom_models=ignore_custom_models,
             conn=conn,
@@ -896,16 +1128,16 @@ async def acquire_fallback_candidate_live(
                 route=live_route,
             )
 
-    # Gate 2: Fresh org policy
+    # Gate 2: Fresh org policy via canonical policy_refuses
     effective_policy = policy
     if effective_policy is None:
         try:
             if require_policy_fn is not None:
-                effective_policy = await require_policy_fn(subject_user_id)
+                effective_policy = await require_policy_fn(subj)
             else:
                 from src.server.services.account import require_policy
 
-                effective_policy = await require_policy(subject_user_id)
+                effective_policy = await require_policy(subj)
         except Exception:
             return FallbackAdmissionResult(
                 admitted=False, model_name=mk, reason="policy_unavailable"
@@ -921,7 +1153,13 @@ async def acquire_fallback_candidate_live(
         elif rb in ("cash", "platform", "oauth"):
             billing = rb
 
-    allowed_ok, policy_reason = _policy_allows_model(effective_policy, mk, billing)
+    allowed_ok, policy_reason = _policy_allows_model(
+        effective_policy,
+        mk,
+        billing,
+        model_pref=prefs,
+        ignore_custom_models=ignore_custom_models,
+    )
     if not allowed_ok:
         return FallbackAdmissionResult(
             admitted=False,
@@ -931,7 +1169,16 @@ async def acquire_fallback_candidate_live(
             route=live_route,
         )
 
-    # Gate 3: Cash-fallback switch & strict payer/subject unity
+    # Gate 3: Strict admission-subject / billing-payer unity & cash-fallback switch
+    if payer_user_id is not None and eff_payer != subj:
+        return FallbackAdmissionResult(
+            admitted=False,
+            model_name=mk,
+            reason="payer_subject_mismatch",
+            billing=billing,
+            route=live_route,
+        )
+
     eff_allow_cash = (
         allow_cash_fallback_on_unattended() if allow_cash is None else bool(allow_cash)
     )
@@ -948,11 +1195,11 @@ async def acquire_fallback_candidate_live(
     if billing == "platform":
         try:
             if enforce_credit_limit_fn is not None:
-                await enforce_credit_limit_fn(subject_user_id, byok=False)
+                await enforce_credit_limit_fn(eff_payer, byok=False)
             else:
                 from src.server.dependencies.credit import enforce_credit_limit
 
-                await enforce_credit_limit(subject_user_id, byok=False)
+                await enforce_credit_limit(eff_payer, byok=False)
         except Exception as exc:
             detail_type = (
                 exc.detail.get("type")
@@ -985,7 +1232,7 @@ async def acquire_fallback_candidate_live(
             else Decimal(str(get_dalton_settings().budget.admission_floor_usd or 0.25))
         )
         verdict = await acquire_cash_lease(
-            user_id=subject_user_id,
+            user_id=eff_payer,
             run_ref=str(run_id),
             call_id=call_id or f"fb:{run_id}:{mk}",
             min_floor_usd=floor,
@@ -1001,14 +1248,7 @@ async def acquire_fallback_candidate_live(
                 route=live_route,
                 lease_verdict=verdict,
             )
-        if credit_lease is not None:
-            try:
-                if hasattr(credit_lease, "ceiling_credits"):
-                    credit_lease.ceiling_credits = verdict.ceiling_credits
-                if hasattr(credit_lease, "generation"):
-                    credit_lease.generation = verdict.generation
-            except Exception:
-                pass
+        _bind_lease_verdict_to_credit_lease(credit_lease, verdict)
         return FallbackAdmissionResult(
             admitted=True,
             model_name=mk,
@@ -1020,7 +1260,7 @@ async def acquire_fallback_candidate_live(
     # OAuth subscription candidate: verify not auth-broken or cooled down
     _avail_fn = availability_fn or inspect_subscription_availability
     avail = await _avail_fn(
-        subject_user_id,
+        subj,
         mk,
         prefs=prefs or None,
         ignore_custom_models=ignore_custom_models,
@@ -1078,13 +1318,14 @@ async def resolve_unattended_fallback_clients(
         config.fallback_llm_names = []
         return True
 
+    from src.llms.preferences import resolve_turn_tuning
     from src.server.services.llm.clients import _stamp, _tier_for, resolve_model_client
-    from src.server.services.llm.tuning import resolve_turn_tuning
 
     allow_cash = allow_cash_fallback_on_unattended()
     merged_clients: list[Any] = []
     merged_names: list[str] = []
     eff_user_id = ctx.subject_user_id or user_id
+    eff_payer_id = ctx.payer_user_id or eff_user_id
     eff_ignore_custom = bool(ignore_custom_models or ctx.ignore_custom_models)
 
     for model_name in candidates:
@@ -1122,6 +1363,7 @@ async def resolve_unattended_fallback_clients(
             fc.client,
             candidate_name=model_name,
             subject_user_id=eff_user_id,
+            payer_user_id=eff_payer_id,
             run_id=ctx.run_id,
             ignore_custom_models=eff_ignore_custom,
             role=ctx.role,
@@ -1133,6 +1375,10 @@ async def resolve_unattended_fallback_clients(
 
     config.fallback_llm_clients = merged_clients
     config.fallback_llm_names = merged_names
+    try:
+        setattr(config, "_dalton_unattended_fallback_names", list(merged_names))
+    except Exception:
+        pass
     return True
 
 
@@ -1159,16 +1405,34 @@ async def verify_middleware_fallback_switch(
     if not subject_user_id:
         return True
 
+    eff_credit_lease = credit_lease
+    if eff_credit_lease is None:
+        try:
+            from ptc_agent.agent.middleware.credit_gate import current_credit_gate
+
+            eff_credit_lease = current_credit_gate.get()
+        except Exception:
+            eff_credit_lease = None
+
+    eff_run_id = meta.get("run_id")
+    if not eff_run_id and eff_credit_lease is not None:
+        eff_run_id = (
+            getattr(eff_credit_lease, "run_ref", None)
+            or getattr(eff_credit_lease, "run_id", None)
+            or getattr(eff_credit_lease, "_run_id", None)
+        )
+
     result = await acquire_fallback_candidate_live(
         subject_user_id=subject_user_id,
+        payer_user_id=meta.get("payer_user_id"),
         candidate_model=candidate_name,
-        run_id=meta.get("run_id"),
+        run_id=eff_run_id,
         call_id=call_id,
         role=str(meta.get("role") or "analyst"),
         require_vision=bool(meta.get("require_vision", False)),
         ignore_custom_models=bool(meta.get("ignore_custom_models", False)),
         allow_cash=meta.get("allow_cash"),
-        credit_lease=credit_lease,
+        credit_lease=eff_credit_lease,
     )
     if not result.admitted:
         logger.info(
@@ -1176,7 +1440,27 @@ async def verify_middleware_fallback_switch(
             candidate_name,
             result.reason,
         )
-    return result.admitted
+        return False
+
+    # Persist active_fallback_route for crash/wakeup checkpoint resume verification.
+    if result.route is not None:
+        try:
+            meta_dict = getattr(candidate_client, UNATTENDED_FALLBACK_META_ATTR, None)
+            if isinstance(meta_dict, dict):
+                meta_dict["active_fallback_route"] = route_fingerprint_to_dict(result.route)
+        except Exception:
+            pass
+        if eff_run_id:
+            try:
+                await persist_active_fallback_route(str(eff_run_id), result.route)
+            except Exception:
+                logger.debug(
+                    "[UNATTENDED_FALLBACK] Failed persisting active_fallback_route for run=%s candidate=%s",
+                    eff_run_id,
+                    candidate_name,
+                    exc_info=True,
+                )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1617,113 @@ def _select_earliest_cooldown(
     )
 
 
+def deterministic_wakeup_resume_request_key(root_job_id: str, defer_count: int) -> str:
+    """Return a deterministic UUID string accepted by ``RetryRequest.request_key``."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"dalton:wakeup_resume:{str(root_job_id).strip()}:{int(defer_count)}",
+        )
+    )
+
+
+def build_wakeup_quota_start_metadata(
+    request: Any,
+    *,
+    user_id: str,
+    workspace_id: str | None = None,
+    effective_model: str | None = None,
+) -> dict[str, Any]:
+    """Build START-time wakeup quota continuity metadata stored on ``conversation_responses.metadata``.
+
+    Returns ``{}`` when the main switch is off or ``request`` is not a wakeup turn.
+    """
+    if not is_unattended_quota_fallback_enabled():
+        return {}
+    if getattr(request, "query_type", None) != "wakeup":
+        return {}
+    wakeup_meta = getattr(request, "wakeup", None)
+    if not isinstance(wakeup_meta, Mapping):
+        return {}
+
+    root_job_id = str(
+        wakeup_meta.get("root_job_id")
+        or wakeup_meta.get("job_id")
+        or getattr(request, "request_key", None)
+        or ""
+    ).strip()
+    notices = wakeup_meta.get("notices") or []
+    wakeup_id = str(wakeup_meta.get("wakeup_id") or "").strip()
+    if not wakeup_id and isinstance(notices, list) and notices:
+        first_notice = notices[0]
+        if isinstance(first_notice, Mapping):
+            wakeup_id = str(first_notice.get("wakeup_id") or first_notice.get("id") or "").strip()
+
+    first_due = wakeup_meta.get("first_due_at")
+    first_due_iso = (
+        first_due.isoformat()
+        if isinstance(first_due, datetime)
+        else (first_due.strip() if isinstance(first_due, str) and first_due.strip() else None)
+    )
+    ctx: dict[str, Any] = {
+        "root_job_id": root_job_id or None,
+        "wakeup_id": wakeup_id or root_job_id or None,
+        "owner_user_id": str(user_id),
+        "workspace_id": str(workspace_id) if workspace_id else None,
+        "first_due_at": first_due_iso,
+        "llm_model": effective_model or getattr(request, "llm_model", None),
+    }
+    return {"dalton_wakeup_quota_ctx": ctx}
+
+
+def extract_mid_turn_quota_failure_payload(
+    exc: BaseException | None,
+    *,
+    model_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Build structured failure facts for atomic mid-turn wakeup resume inside ``finalize_run``."""
+    if not is_unattended_quota_fallback_enabled():
+        return None
+    if exc is None or not is_terminal_quota_refusal(exc):
+        return None
+
+    from src.dalton.services.automation_subscription_fallback import (
+        is_subscription_unavailable_error,
+    )
+    from src.server.services.oauth_health import OAuthReauthRequired, OAuthRefreshUnavailable
+    from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
+
+    refusal = read_refusal(exc)
+    reset_at = refusal.until if refusal is not None else None
+    if reset_at is None:
+        exp_ts = getattr(exc, "expires_at", None)
+        if isinstance(exp_ts, (int, float)) and exp_ts > 0:
+            reset_at = datetime.fromtimestamp(float(exp_ts), tz=timezone.utc)
+        else:
+            cause = getattr(exc, "__cause__", None)
+            if isinstance(cause, BaseException):
+                c_exp = getattr(cause, "expires_at", None)
+                if isinstance(c_exp, (int, float)) and c_exp > 0:
+                    reset_at = datetime.fromtimestamp(float(c_exp), tz=timezone.utc)
+
+    is_auth = is_subscription_unavailable_error(exc) or isinstance(
+        exc, (OAuthReauthRequired, OAuthRefreshUnavailable, OAuthPlanNoApiAccess)
+    )
+    kind: Literal["auth_unavailable", "quota_cooldown"] = (
+        "auth_unavailable" if is_auth else "quota_cooldown"
+    )
+    return {
+        "kind": kind,
+        "refusal_code": (
+            refusal.reason
+            if refusal is not None
+            else ("oauth_reauth_required" if is_auth else "quota_exceeded")
+        ),
+        "reset_at": reset_at.isoformat() if reset_at is not None else None,
+        "model_name": str(model_name or ""),
+    }
+
+
 async def evaluate_and_record_wakeup_deferral_tx(
     conn: Any,
     *,
@@ -1347,18 +1738,25 @@ async def evaluate_and_record_wakeup_deferral_tx(
     resume_from_run_id: str | None = None,
     resume_checkpoint_id: str | None = None,
     turn_index: int | None = None,
+    workspace_id: str | None = None,
     enqueue_resume_hook: bool = False,
 ) -> WakeupDeferDecision:
     """Atomically evaluate and persist a wakeup quota deferral or checkpoint-resume inside ``conn``'s tx.
 
     Enforces:
-    - Step idempotency via ``last_step_key`` (``pre:{job_id}:{attempts}`` or ``mid:{failed_run_id}``).
+    - Transaction-scoped advisory lock per ``root_job_id`` so concurrent workers racing on
+      first row insertion serialize cleanly before ``SELECT ... FOR UPDATE``.
+    - Full step-key history in ``seen_step_keys`` (plus ``last_step_key``) so replaying ANY
+      prior step key is idempotent without incrementing ``defer_count``.
     - Pure ``auth_unavailable`` fails immediately without deferring and notifies ``owner_user_id``.
     - Unknown ``reset_at`` uses ``now + 30m`` with ``held_known=False``.
     - Shared dual gate: ``defer_count + 1 <= 3`` AND ``effective_reset_at + 1m <= first_due_at + 24h``.
     - When ``enqueue_resume_hook=True`` (mid-turn exhaustion), inserts a ``wakeup_quota_resume``
-      job into ``hook_outbox`` in the same transaction.
+      job into ``hook_outbox`` in the same transaction with a deterministic UUID ``request_key``,
+      ``workspace_id``, and constant ``first_due_at``.
     """
+    from src.server.database.sql_fences import advisory_key
+
     now_dt = now or datetime.now(timezone.utc)
     eff_first_due = first_due_at or now_dt
     eff_deadline = eff_first_due + timedelta(hours=WAKEUP_QUOTA_DEADLINE_HOURS)
@@ -1367,11 +1765,15 @@ async def evaluate_and_record_wakeup_deferral_tx(
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (advisory_key("WAKEUP_QUOTA_DEFER", root_uuid),),
+        )
+        await cur.execute(
             """
             SELECT root_job_id, wakeup_id, thread_id, owner_user_id,
                    first_due_at, deadline_at, defer_count, last_step_key,
-                   resume_from_run_id, resume_checkpoint_id, last_reset_at,
-                   last_reason, status
+                   seen_step_keys, resume_from_run_id, resume_checkpoint_id,
+                   last_reset_at, last_reason, status
             FROM dalton_wakeup_quota_deferrals
             WHERE root_job_id = %s::uuid
             FOR UPDATE
@@ -1380,14 +1782,21 @@ async def evaluate_and_record_wakeup_deferral_tx(
         )
         row = await cur.fetchone()
 
+    seen_steps: list[str] = []
     if row is not None:
         row = dict(row)
         existing_status = str(row["status"])
         existing_count = int(row["defer_count"] or 0)
         existing_deadline = _parse_iso_or_epoch(row.get("deadline_at")) or eff_deadline
         existing_reset = _parse_iso_or_epoch(row.get("last_reset_at"))
+        raw_seen = row.get("seen_step_keys")
+        if isinstance(raw_seen, list):
+            seen_steps = [str(s) for s in raw_seen if isinstance(s, str) and s]
+        last_sk = str(row.get("last_step_key") or "")
+        if last_sk and last_sk not in seen_steps:
+            seen_steps.append(last_sk)
 
-        if str(row.get("last_step_key") or "") == step_key:
+        if step_key and (last_sk == step_key or step_key in seen_steps):
             sched = (
                 existing_reset + timedelta(minutes=1)
                 if existing_reset is not None
@@ -1438,6 +1847,10 @@ async def evaluate_and_record_wakeup_deferral_tx(
     else:
         cur_count = 0
 
+    next_seen_steps = list(seen_steps)
+    if step_key and step_key not in next_seen_steps:
+        next_seen_steps.append(step_key)
+
     pure_auth, effective_reset_at, held_known, primary_model, cooldown_key = (
         _select_earliest_cooldown(availabilities, now=now_dt)
     )
@@ -1450,17 +1863,18 @@ async def evaluate_and_record_wakeup_deferral_tx(
                 INSERT INTO dalton_wakeup_quota_deferrals (
                     root_job_id, wakeup_id, thread_id, owner_user_id,
                     first_due_at, deadline_at, defer_count, last_step_key,
-                    resume_from_run_id, resume_checkpoint_id, last_reset_at,
-                    last_reason, status, updated_at
+                    seen_step_keys, resume_from_run_id, resume_checkpoint_id,
+                    last_reset_at, last_reason, status, updated_at
                 )
                 VALUES (
                     %s::uuid, %s, %s::uuid, %s,
                     %s, %s, %s, %s,
-                    %s, %s, NULL,
-                    %s, 'exhausted_failed', NOW()
+                    %s, %s, %s,
+                    NULL, %s, 'exhausted_failed', NOW()
                 )
                 ON CONFLICT (root_job_id) DO UPDATE
                 SET last_step_key = EXCLUDED.last_step_key,
+                    seen_step_keys = EXCLUDED.seen_step_keys,
                     resume_from_run_id = COALESCE(EXCLUDED.resume_from_run_id, dalton_wakeup_quota_deferrals.resume_from_run_id),
                     resume_checkpoint_id = COALESCE(EXCLUDED.resume_checkpoint_id, dalton_wakeup_quota_deferrals.resume_checkpoint_id),
                     last_reason = EXCLUDED.last_reason,
@@ -1476,6 +1890,7 @@ async def evaluate_and_record_wakeup_deferral_tx(
                     eff_deadline,
                     cur_count,
                     step_key,
+                    SafeJson(next_seen_steps),
                     resume_from_run_id,
                     resume_checkpoint_id,
                     failure_reason,
@@ -1528,17 +1943,18 @@ async def evaluate_and_record_wakeup_deferral_tx(
                 INSERT INTO dalton_wakeup_quota_deferrals (
                     root_job_id, wakeup_id, thread_id, owner_user_id,
                     first_due_at, deadline_at, defer_count, last_step_key,
-                    resume_from_run_id, resume_checkpoint_id, last_reset_at,
-                    last_reason, status, updated_at
+                    seen_step_keys, resume_from_run_id, resume_checkpoint_id,
+                    last_reset_at, last_reason, status, updated_at
                 )
                 VALUES (
                     %s::uuid, %s, %s::uuid, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s, 'exhausted_failed', NOW()
+                    %s, %s, 'exhausted_failed', NOW()
                 )
                 ON CONFLICT (root_job_id) DO UPDATE
                 SET last_step_key = EXCLUDED.last_step_key,
+                    seen_step_keys = EXCLUDED.seen_step_keys,
                     resume_from_run_id = COALESCE(EXCLUDED.resume_from_run_id, dalton_wakeup_quota_deferrals.resume_from_run_id),
                     resume_checkpoint_id = COALESCE(EXCLUDED.resume_checkpoint_id, dalton_wakeup_quota_deferrals.resume_checkpoint_id),
                     last_reset_at = EXCLUDED.last_reset_at,
@@ -1555,6 +1971,7 @@ async def evaluate_and_record_wakeup_deferral_tx(
                     eff_deadline,
                     cur_count,
                     step_key,
+                    SafeJson(next_seen_steps),
                     resume_from_run_id,
                     resume_checkpoint_id,
                     effective_reset_at,
@@ -1605,18 +2022,19 @@ async def evaluate_and_record_wakeup_deferral_tx(
             INSERT INTO dalton_wakeup_quota_deferrals (
                 root_job_id, wakeup_id, thread_id, owner_user_id,
                 first_due_at, deadline_at, defer_count, last_step_key,
-                resume_from_run_id, resume_checkpoint_id, last_reset_at,
-                last_reason, status, updated_at
+                seen_step_keys, resume_from_run_id, resume_checkpoint_id,
+                last_reset_at, last_reason, status, updated_at
             )
             VALUES (
                 %s::uuid, %s, %s::uuid, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, 'deferred', NOW()
+                %s, %s, 'deferred', NOW()
             )
             ON CONFLICT (root_job_id) DO UPDATE
             SET defer_count = EXCLUDED.defer_count,
                 last_step_key = EXCLUDED.last_step_key,
+                seen_step_keys = EXCLUDED.seen_step_keys,
                 resume_from_run_id = COALESCE(EXCLUDED.resume_from_run_id, dalton_wakeup_quota_deferrals.resume_from_run_id),
                 resume_checkpoint_id = COALESCE(EXCLUDED.resume_checkpoint_id, dalton_wakeup_quota_deferrals.resume_checkpoint_id),
                 last_reset_at = EXCLUDED.last_reset_at,
@@ -1633,6 +2051,7 @@ async def evaluate_and_record_wakeup_deferral_tx(
                 eff_deadline,
                 next_count,
                 step_key,
+                SafeJson(next_seen_steps),
                 resume_from_run_id,
                 resume_checkpoint_id,
                 effective_reset_at,
@@ -1642,15 +2061,18 @@ async def evaluate_and_record_wakeup_deferral_tx(
 
         if enqueue_resume_hook and resume_from_run_id:
             idem_key = f"wakeup_resume:{root_uuid}:{next_count}"
+            req_uuid = deterministic_wakeup_resume_request_key(str(root_uuid), next_count)
             payload = {
                 "root_job_id": str(root_uuid),
                 "wakeup_id": str(wakeup_id),
                 "owner_user_id": owner_user_id,
+                "workspace_id": str(workspace_id) if workspace_id else None,
                 "failed_run_id": str(resume_from_run_id),
                 "turn_index": turn_index,
                 "resume_checkpoint_id": resume_checkpoint_id,
                 "defer_count": next_count,
-                "request_key": idem_key,
+                "first_due_at": eff_first_due.isoformat(),
+                "request_key": req_uuid,
             }
             await cur.execute(
                 """
@@ -1703,6 +2125,7 @@ async def evaluate_and_record_wakeup_deferral(
     resume_from_run_id: str | None = None,
     resume_checkpoint_id: str | None = None,
     turn_index: int | None = None,
+    workspace_id: str | None = None,
     enqueue_resume_hook: bool = False,
     conn: Any = None,
 ) -> WakeupDeferDecision:
@@ -1721,6 +2144,7 @@ async def evaluate_and_record_wakeup_deferral(
             resume_from_run_id=resume_from_run_id,
             resume_checkpoint_id=resume_checkpoint_id,
             turn_index=turn_index,
+            workspace_id=workspace_id,
             enqueue_resume_hook=enqueue_resume_hook,
         )
     async with get_db_connection() as own_conn:
@@ -1738,6 +2162,7 @@ async def evaluate_and_record_wakeup_deferral(
                 resume_from_run_id=resume_from_run_id,
                 resume_checkpoint_id=resume_checkpoint_id,
                 turn_index=turn_index,
+                workspace_id=workspace_id,
                 enqueue_resume_hook=enqueue_resume_hook,
             )
 
@@ -1754,6 +2179,7 @@ async def record_wakeup_mid_turn_quota_exhaustion_tx(
     availabilities: Sequence[SubscriptionAvailability],
     latest_checkpoint_id: str | None = None,
     first_due_at: datetime | None = None,
+    workspace_id: str | None = None,
     now: datetime | None = None,
 ) -> WakeupDeferDecision:
     """Record mid-turn wakeup quota exhaustion and enqueue ``wakeup_quota_resume`` in ``conn``'s tx."""
@@ -1770,7 +2196,88 @@ async def record_wakeup_mid_turn_quota_exhaustion_tx(
         resume_from_run_id=run_id,
         resume_checkpoint_id=latest_checkpoint_id,
         turn_index=turn_index,
+        workspace_id=workspace_id,
         enqueue_resume_hook=True,
+    )
+
+
+async def maybe_record_wakeup_mid_turn_resume_in_tx(
+    conn: Any,
+    *,
+    run_row: Mapping[str, Any],
+    thread_id: str,
+    run_id: str,
+    newest_checkpoint_id: str | None = None,
+    quota_failure: Mapping[str, Any] | None = None,
+) -> WakeupDeferDecision | None:
+    """Atomic finalize-transaction hook recording mid-turn wakeup exhaustion & ``wakeup_quota_resume``.
+
+    Called inside ``lifecycle.finalize_run``'s transaction (same commit as ``status='error'``
+    and terminal ``hook_outbox`` jobs). Cleanly no-ops when the main switch is off, the run
+    is not a wakeup turn, or ``quota_failure`` is absent.
+    """
+    if not is_unattended_quota_fallback_enabled():
+        return None
+    if not isinstance(quota_failure, Mapping) or not quota_failure:
+        return None
+
+    run_meta = run_row.get("metadata") if isinstance(run_row, Mapping) else None
+    if not isinstance(run_meta, Mapping):
+        return None
+    wake_ctx = run_meta.get("dalton_wakeup_quota_ctx")
+    if not isinstance(wake_ctx, Mapping):
+        return None
+
+    owner_user_id = str(
+        wake_ctx.get("owner_user_id")
+        or run_meta.get("user_id")
+        or run_row.get("user_id")
+        or ""
+    ).strip()
+    if not owner_user_id:
+        return None
+
+    raw_root = str(wake_ctx.get("root_job_id") or "").strip()
+    root_job_id = (
+        normalize_uuid(raw_root)
+        or str(uuid.uuid5(uuid.NAMESPACE_URL, f"wakeup:{thread_id}:{run_id}"))
+    )
+    wakeup_id = str(wake_ctx.get("wakeup_id") or root_job_id).strip()
+    workspace_id = str(
+        wake_ctx.get("workspace_id") or run_meta.get("workspace_id") or ""
+    ).strip() or None
+    first_due_at = _parse_iso_or_epoch(wake_ctx.get("first_due_at"))
+    turn_index = run_row.get("turn_index")
+
+    raw_kind = str(quota_failure.get("kind") or "quota_cooldown")
+    kind: Literal["auth_unavailable", "quota_cooldown"] = (
+        "auth_unavailable" if raw_kind == "auth_unavailable" else "quota_cooldown"
+    )
+    avail = SubscriptionAvailability(
+        available=False,
+        kind=kind,
+        refusal_code=str(quota_failure.get("refusal_code") or "quota_exceeded"),
+        reset_at=_parse_iso_or_epoch(quota_failure.get("reset_at")),
+        model_name=str(
+            quota_failure.get("model_name")
+            or wake_ctx.get("llm_model")
+            or run_meta.get("llm_model")
+            or ""
+        ),
+    )
+
+    return await record_wakeup_mid_turn_quota_exhaustion_tx(
+        conn,
+        thread_id=thread_id,
+        run_id=run_id,
+        owner_user_id=owner_user_id,
+        root_job_id=root_job_id,
+        wakeup_id=wakeup_id,
+        turn_index=int(turn_index) if isinstance(turn_index, int) else None,
+        availabilities=[avail],
+        latest_checkpoint_id=newest_checkpoint_id,
+        first_due_at=first_due_at,
+        workspace_id=workspace_id,
     )
 
 
@@ -1801,115 +2308,111 @@ async def mark_wakeup_deferral_settled(
                 return cur.rowcount > 0
 
 
-async def maybe_schedule_wakeup_mid_turn_resume(
+async def _check_and_enforce_resume_deadline(
     *,
-    exc: BaseException,
+    root_job_id: str,
+    wakeup_id: str,
     thread_id: str,
-    user_id: str,
-    run_handle: Any,
-    request: Any,
-) -> WakeupDeferDecision | None:
-    """Hook called from ``error_handling.py`` when a wakeup run fails with terminal quota exhaustion."""
-    if not is_unattended_quota_fallback_enabled():
-        return None
-    if run_handle is None or not is_terminal_quota_refusal(exc):
-        return None
-    if getattr(request, "query_type", None) != "wakeup":
-        return None
+    owner_user_id: str,
+    now: datetime,
+) -> tuple[bool, int | None, datetime | None]:
+    """Re-verify the deferral row on claim before dispatching ``/retry``.
 
-    wakeup_meta = getattr(request, "wakeup", None)
-    if not isinstance(wakeup_meta, Mapping):
-        return None
-    root_job_id = str(wakeup_meta.get("root_job_id") or "").strip()
-    if not root_job_id:
-        # Derive deterministic UUID from request_key when root_job_id was not stamped
-        req_key = getattr(request, "request_key", None)
-        root_job_id = (
-            normalize_uuid(str(req_key))
-            or str(uuid.uuid5(uuid.NAMESPACE_URL, f"wakeup:{thread_id}:{run_handle.run_id}"))
-        )
-    notices = wakeup_meta.get("notices") or []
-    wakeup_id = str(wakeup_meta.get("wakeup_id") or "").strip()
-    if not wakeup_id and isinstance(notices, list) and notices:
-        first_notice = notices[0]
-        if isinstance(first_notice, Mapping):
-            wakeup_id = str(first_notice.get("wakeup_id") or first_notice.get("id") or "").strip()
-    wakeup_id = wakeup_id or str(root_job_id)
-
-    latest_checkpoint_id: str | None = None
-    try:
-        from src.server.handlers.checkpoint_handler import get_retry_checkpoint
-
-        latest_checkpoint_id = await get_retry_checkpoint(thread_id, None)
-    except Exception:
-        latest_checkpoint_id = None
-
-    refusal = read_refusal(exc)
-    reset_at = refusal.until if refusal is not None else None
-    if reset_at is None:
-        exp_ts = getattr(exc, "expires_at", None)
-        if isinstance(exp_ts, (int, float)) and exp_ts > 0:
-            reset_at = datetime.fromtimestamp(float(exp_ts), tz=timezone.utc)
-
-    from src.dalton.services.automation_subscription_fallback import (
-        is_subscription_unavailable_error,
-    )
-
-    kind: Literal["auth_unavailable", "quota_cooldown"] = (
-        "auth_unavailable" if is_subscription_unavailable_error(exc) else "quota_cooldown"
-    )
-    avail = SubscriptionAvailability(
-        available=False,
-        kind=kind,
-        refusal_code=(refusal.reason if refusal is not None else "quota_exceeded"),
-        reset_at=reset_at,
-        model_name=str(getattr(request, "llm_model", None) or ""),
-    )
-    first_due_at = _parse_iso_or_epoch(wakeup_meta.get("first_due_at"))
-    turn_index = getattr(run_handle, "turn_index", None)
-
+    Returns ``(should_dispatch, current_defer_count, first_due_at)``.
+    If ``status`` is already terminal or ``deadline_at <= now``, atomically marks the row
+    ``exhausted_failed`` (with Item 3 notice) and returns ``(False, ...)``.
+    """
+    root_uuid = normalize_uuid(str(root_job_id))
+    if root_uuid is None:
+        return True, None, None
     try:
         async with get_db_connection() as conn:
             async with conn.transaction():
-                return await record_wakeup_mid_turn_quota_exhaustion_tx(
-                    conn,
-                    thread_id=thread_id,
-                    run_id=str(run_handle.run_id),
-                    owner_user_id=user_id,
-                    root_job_id=root_job_id,
-                    wakeup_id=wakeup_id,
-                    turn_index=turn_index,
-                    availabilities=[avail],
-                    latest_checkpoint_id=latest_checkpoint_id,
-                    first_due_at=first_due_at,
-                )
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT root_job_id, wakeup_id, thread_id, owner_user_id,
+                               first_due_at, deadline_at, defer_count, status
+                        FROM dalton_wakeup_quota_deferrals
+                        WHERE root_job_id = %s::uuid
+                        FOR UPDATE
+                        """,
+                        (root_uuid,),
+                    )
+                    row = await cur.fetchone()
+                if row is None:
+                    return True, None, None
+                row = dict(row)
+                st = str(row.get("status") or "")
+                cur_count = int(row.get("defer_count") or 0)
+                first_due = _parse_iso_or_epoch(row.get("first_due_at"))
+                deadline = _parse_iso_or_epoch(row.get("deadline_at"))
+                if st in ("settled", "exhausted_failed"):
+                    return False, cur_count, first_due
+                if deadline is not None and now >= deadline:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_wakeup_quota_deferrals
+                            SET status = 'exhausted_failed',
+                                last_reason = 'wakeup_quota_deadline_exceeded',
+                                updated_at = NOW()
+                            WHERE root_job_id = %s::uuid
+                              AND status = 'deferred'
+                            """,
+                            (root_uuid,),
+                        )
+                    await _maybe_enqueue_failure_notice_in_tx(
+                        conn,
+                        subject_kind="wakeup",
+                        subject_id=str(root_uuid),
+                        source_key=str(row.get("wakeup_id") or wakeup_id or root_uuid),
+                        recipient_user_id=str(row.get("owner_user_id") or owner_user_id),
+                        failure_reason="subscription_quota_exhausted",
+                        summary={
+                            "wakeup_id": str(row.get("wakeup_id") or wakeup_id or root_uuid),
+                            "thread_id": str(thread_id),
+                            "defer_count": cur_count,
+                            "limit_reason": "wakeup_quota_deadline_exceeded",
+                            "message": format_unattended_quota_notice(
+                                "subscription_quota_exhausted",
+                                model_name="当前订阅模型",
+                            ),
+                        },
+                    )
+                    return False, cur_count, first_due
+                return True, cur_count, first_due
     except Exception:
-        logger.warning(
-            "[UNATTENDED_FALLBACK] Failed recording wakeup mid-turn resume for thread=%s run=%s",
-            thread_id,
-            getattr(run_handle, "run_id", None),
+        logger.debug(
+            "[UNATTENDED_FALLBACK] Deferral deadline pre-check skipped for root_job=%s",
+            root_job_id,
             exc_info=True,
         )
-        return None
+        return True, None, None
 
 
 async def execute_wakeup_quota_resume(job: Mapping[str, Any]) -> None:
     """Outbox executor for ``wakeup_quota_resume`` jobs across any active worker.
 
-    Verifies the thread has not moved past ``failed_run_id`` (if a user sent a newer
-    turn while paused, marks the deferral ``settled`` and yields). Otherwise triggers
-    the internal ``/retry`` checkpoint-resume path with ``retry_of_run_id`` and
-    ``checkpoint_id`` so already-completed tool calls are never re-executed.
+    Verifies the deferral has not crossed its 24h deadline and that the thread has not
+    moved past ``failed_run_id`` (if a user sent a newer turn while paused, marks the
+    deferral ``settled`` and yields). Otherwise triggers the internal ``/retry``
+    checkpoint-resume path with a valid ``RetryRequest`` body (``workspace_id``,
+    deterministic UUID ``request_key``, ``checkpoint_id``, ``run_id``, and server-only
+    ``wakeup_resume`` continuity fields carrying original ``root_job_id``, incrementing
+    ``attempts``, and constant ``first_due_at``).
     """
     payload = job.get("payload") or {}
     thread_id = str(job.get("conversation_thread_id") or payload.get("thread_id") or "").strip()
+    job_id = str(job.get("hook_outbox_id") or "").strip()
+    attempts = int(job.get("attempts") or 1)
     root_job_id = str(payload.get("root_job_id") or "").strip()
+    wakeup_id = str(payload.get("wakeup_id") or root_job_id).strip()
     failed_run_id = str(payload.get("failed_run_id") or job.get("run_id") or "").strip()
     owner_user_id = str(payload.get("owner_user_id") or "").strip()
     resume_checkpoint_id = payload.get("resume_checkpoint_id")
-    turn_index = payload.get("turn_index")
     defer_count = int(payload.get("defer_count") or 1)
-    req_key = str(payload.get("request_key") or f"wakeup_resume:{root_job_id}:{defer_count}")
+    first_due_at = _parse_iso_or_epoch(payload.get("first_due_at"))
 
     if not thread_id or not failed_run_id or not owner_user_id:
         logger.warning(
@@ -1918,6 +2421,28 @@ async def execute_wakeup_quota_resume(job: Mapping[str, Any]) -> None:
         )
         return
 
+    now_dt = datetime.now(timezone.utc)
+    if root_job_id:
+        should_dispatch, db_defer_count, db_first_due = await _check_and_enforce_resume_deadline(
+            root_job_id=root_job_id,
+            wakeup_id=wakeup_id,
+            thread_id=thread_id,
+            owner_user_id=owner_user_id,
+            now=now_dt,
+        )
+        if not should_dispatch:
+            logger.info(
+                "[UNATTENDED_FALLBACK] Wakeup resume root_job=%s already terminal or past 24h deadline; settling outbox job=%s",
+                root_job_id,
+                job_id,
+            )
+            return
+        if db_defer_count is not None and db_defer_count > defer_count:
+            defer_count = db_defer_count
+        if db_first_due is not None:
+            first_due_at = db_first_due
+
+    from src.server.database import conversation as conv_db
     from src.server.database.runs import lifecycle as tl_db
 
     latest = await tl_db.get_latest_attempt(thread_id)
@@ -1937,25 +2462,44 @@ async def execute_wakeup_quota_resume(job: Mapping[str, Any]) -> None:
             await mark_wakeup_deferral_settled(root_job_id)
         return
 
-    from src.server.services.report_back.notify_turn import post_notification_turn
-    from src.server.services.runs.pending_input import retried_wake_fields
+    workspace_id = str(payload.get("workspace_id") or "").strip()
+    if not workspace_id:
+        latest_meta = latest.get("metadata") if isinstance(latest, Mapping) else None
+        if isinstance(latest_meta, Mapping) and latest_meta.get("workspace_id"):
+            workspace_id = str(latest_meta["workspace_id"]).strip()
+    if not workspace_id:
+        thread_rec = await conv_db.get_thread_by_id(thread_id)
+        if isinstance(thread_rec, Mapping) and thread_rec.get("workspace_id"):
+            workspace_id = str(thread_rec["workspace_id"]).strip()
+    if not workspace_id:
+        logger.warning(
+            "[UNATTENDED_FALLBACK] Thread %s has no workspace_id for wakeup_quota_resume job=%s; dropping",
+            thread_id,
+            job_id,
+        )
+        if root_job_id:
+            await mark_wakeup_deferral_settled(root_job_id)
+        return
 
-    wake_fields: dict[str, Any] = {}
-    if isinstance(turn_index, int):
-        wake_fields = await retried_wake_fields(thread_id, turn_index)
-    wakeup_block = dict(wake_fields.get("wakeup") or {})
-    if root_job_id:
-        wakeup_block["root_job_id"] = root_job_id
-    if payload.get("wakeup_id"):
-        wakeup_block["wakeup_id"] = str(payload["wakeup_id"])
+    req_key = deterministic_wakeup_resume_request_key(root_job_id or failed_run_id, defer_count)
+    resume_meta: dict[str, Any] = {
+        "root_job_id": root_job_id or failed_run_id,
+        "job_id": job_id or root_job_id or failed_run_id,
+        "attempts": attempts,
+        "wakeup_id": wakeup_id or root_job_id or failed_run_id,
+    }
+    if first_due_at is not None:
+        resume_meta["first_due_at"] = first_due_at.isoformat()
 
     retry_body: dict[str, Any] = {
+        "workspace_id": workspace_id,
         "run_id": failed_run_id,
         "checkpoint_id": resume_checkpoint_id,
         "request_key": req_key,
+        "wakeup_resume": resume_meta,
     }
-    if wakeup_block:
-        retry_body["wakeup"] = wakeup_block
+
+    from src.server.services.report_back.notify_turn import post_notification_turn
 
     plan_hold: dict[str, Any] = {}
 
@@ -1982,27 +2526,36 @@ async def execute_wakeup_quota_resume(job: Mapping[str, Any]) -> None:
             new_run_id,
         )
         return
-    if outcome == "plan_limited" and plan_hold.get("held_until"):
-        # Pre-dispatch cooldown hit again on resume; deferral was already accounted for in PG.
-        # Reschedule this outbox job to held_until + 1m if job_id is present.
-        next_at = _parse_iso_or_epoch(plan_hold.get("held_until"))
-        job_id = str(job.get("hook_outbox_id") or "").strip()
-        if next_at is not None and job_id:
-            async with get_db_connection() as conn:
-                async with conn.transaction():
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE hook_outbox
-                            SET status = 'pending',
-                                lease_expires_at = NULL,
-                                next_retry_at = %s + interval '1 minute'
-                            WHERE hook_outbox_id = %s::uuid
-                              AND status = 'claimed'
-                            """,
-                            (next_at, job_id),
-                        )
+    if outcome == "plan_limited":
+        if plan_hold.get("type") == DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE:
+            logger.warning(
+                "[UNATTENDED_FALLBACK] Wakeup resume root_job=%s exhausted deferral cap (%s); settling job=%s",
+                root_job_id,
+                plan_hold.get("reason"),
+                job_id,
+            )
             return
+        if plan_hold.get("held_until"):
+            # Pre-dispatch cooldown hit again on resume; deferral was already accounted for in PG.
+            # Reschedule this outbox job fenced by ``attempts`` so lost leases never overwrite a new claim.
+            next_at = _parse_iso_or_epoch(plan_hold.get("held_until"))
+            if next_at is not None and job_id:
+                async with get_db_connection() as conn:
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE hook_outbox
+                                SET status = 'pending',
+                                    lease_expires_at = NULL,
+                                    next_retry_at = %s + interval '1 minute'
+                                WHERE hook_outbox_id = %s::uuid
+                                  AND status = 'claimed'
+                                  AND attempts = %s
+                                """,
+                                (next_at, job_id, attempts),
+                            )
+                return
     if outcome in ("superseded", "drop"):
         if root_job_id:
             await mark_wakeup_deferral_settled(root_job_id)
@@ -2031,6 +2584,7 @@ def build_wakeup_cooldown_http_exception(decision: WakeupDeferDecision) -> HTTPE
         detail={
             "type": DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE,
             "reason": decision.reason,
+            "held_until": None,
             "root_job_id": decision.root_job_id,
             "defer_count": decision.defer_count,
         },

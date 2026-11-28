@@ -88,7 +88,7 @@ def _error_text(e: Exception, prefix: str = "") -> str:
     return f"{prefix}{type(e).__name__}: {str(e)}"
 
 
-def classify_error(e: Exception) -> dict:
+def classify_error(e: Exception, *, unattended_turn: bool | None = None) -> dict:
     """Classify an exception as recoverable or non-recoverable.
 
     Returns ``{is_recoverable, is_non_recoverable, error_type}`` where
@@ -143,9 +143,22 @@ def classify_error(e: Exception) -> dict:
         or "connection refused" in str(e).lower()
     )
 
-    # DALTON-HOOK(quota-exhaustion): terminal quota/subscription refusals skip outer same-model auto-retry
-    from src.dalton.llm.unattended_fallback import is_terminal_quota_refusal
-    if is_terminal_quota_refusal(e):
+    # DALTON-HOOK(quota-exhaustion): terminal quota/subscription refusals skip outer same-model auto-retry only when enabled on trusted unattended turns
+    from src.dalton.llm.unattended_fallback import (
+        get_active_unattended_turn_context,
+        is_terminal_quota_refusal,
+    )
+    from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+    _is_unattended = (
+        bool(unattended_turn)
+        if unattended_turn is not None
+        else bool(
+            (ctx := get_active_unattended_turn_context()) is not None
+            and ctx.is_unattended
+        )
+    )
+    if is_unattended_quota_fallback_enabled() and _is_unattended and is_terminal_quota_refusal(e):
         return {"is_recoverable": False, "is_non_recoverable": False, "error_type": None}
 
     # API errors (transient server errors, rate limits, etc.)
@@ -377,6 +390,13 @@ async def handle_workflow_error(
             no_model_calls = token_callback.llm_calls_started() == 0
         else:
             no_model_calls = False
+        # DALTON-HOOK(quota-exhaustion): extract structured quota failure so finalize_run commits wakeup resume in the same transaction
+        from src.dalton.llm.unattended_fallback import extract_mid_turn_quota_failure_payload
+
+        wakeup_quota_failure = extract_mid_turn_quota_failure_payload(
+            e,
+            model_name=getattr(request, "llm_model", None),
+        )
         try:
             result = await protected_finalize(
                 RunCoordinator.get_instance().finalize_run(
@@ -389,6 +409,7 @@ async def handle_workflow_error(
                         per_call_records=records,
                         tool_usage=tools,
                         no_model_calls=no_model_calls,  # DALTON-HOOK(budget)
+                        wakeup_quota_failure=wakeup_quota_failure,  # DALTON-HOOK(quota-exhaustion)
                     ),
                 ),
                 label=run_handle.run_id,
@@ -401,11 +422,6 @@ async def handle_workflow_error(
             )
             return False
         if (result.run or {}).get("status") != "cancelled":
-            # DALTON-HOOK(quota-exhaustion): schedule mid-turn wakeup checkpoint resume on terminal quota exhaustion
-            from src.dalton.llm.unattended_fallback import maybe_schedule_wakeup_mid_turn_resume
-            await maybe_schedule_wakeup_mid_turn_resume(
-                exc=e, thread_id=thread_id, user_id=user_id, run_handle=run_handle, request=request
-            )
             return False
         return True
 
@@ -708,7 +724,18 @@ async def handle_workflow_error(
     # post-handoff this no-ops — the executor's terminal hooks own the release)
     await scope.release_slot()
 
-    classification = classify_error(_classified(e))
+    # DALTON-HOOK(quota-exhaustion): pass trusted unattended-turn flag so terminal quota classification never changes interactive or switch-off behavior
+    from src.dalton.llm.unattended_fallback import is_unattended_turn
+
+    _err_run_meta = (
+        {"origin": run_handle.origin}
+        if run_handle is not None and getattr(run_handle, "origin", None)
+        else None
+    )
+    classification = classify_error(
+        _classified(e),
+        unattended_turn=is_unattended_turn(request, run_metadata=_err_run_meta),
+    )
     is_recoverable = classification["is_recoverable"]
     # A START that committed left this run as the thread's latest attempt,
     # which the client names on its next edit; a refused one left nothing.

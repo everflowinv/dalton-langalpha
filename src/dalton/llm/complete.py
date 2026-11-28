@@ -101,6 +101,8 @@ class DaltonCompleteResult:
     attempt: int = 1
     error_kind: str | None = None
     error: str | None = None
+    refusal_reason: str | None = None
+    quota_or_auth_trigger: bool = False
     stream_started: bool = False
     chunks_received: int = 0
 
@@ -2212,6 +2214,12 @@ async def _dalton_complete_impl(
         if target_state == "indeterminate" or final_attempt_unknown:
             result_usage["usage_known"] = not final_attempt_unknown
             result_usage["unknown_usage_calls"] = attempt_unknown_calls
+        from src.dalton.llm.unattended_fallback import is_quota_or_auth_switch_trigger
+        from src.llms.provider_errors import read_refusal
+
+        exc_refusal = read_refusal(exc)
+        exc_refusal_reason = exc_refusal.reason if exc_refusal is not None else None
+        exc_quota_or_auth = is_quota_or_auth_switch_trigger(exc)
         return _finish(
             DaltonCompleteResult(
                 ok=False,
@@ -2226,6 +2234,8 @@ async def _dalton_complete_impl(
                 attempt=attempt,
                 error_kind=error_kind,
                 error=err_summary,
+                refusal_reason=exc_refusal_reason,
+                quota_or_auth_trigger=exc_quota_or_auth,
                 stream_started=stream_started,
                 chunks_received=chunks_received,
             ),

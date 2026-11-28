@@ -229,22 +229,40 @@ async def resolve_with_subscription_fallback(
     model_resolves_fn: Callable[[dict[str, Any], str], bool] = model_resolves,
     failed_subject: str | None = None,
     ignore_custom_models: bool = False,
+    unattended_gate: bool = False,
+    payer_user_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Try each usable fallback model not on *failed_provider*.
 
     Uses the user's saved ``prefs['fallback_models']`` when present (an explicit
-    empty list ``[]`` disables fallback). When the user has never saved
-    ``fallback_models`` (missing key or ``None``), falls back to the merged
-    deployment default ``llm.fallback``.
+    empty list ``[]`` disables fallback when ``unattended_gate`` is False). When
+    ``unattended_gate`` is True, candidate selection and cash admission go through
+    the unified unattended fallback chain and ``acquire_fallback_candidate_live``
+    (enforcing ``allow_cash_fallback_on_unattended()`` and ``acquire_cash_lease_tx``).
 
     Raises *exc_to_raise* if no fallback candidate can serve the turn.
     """
-    saved_candidates = prefs.get("fallback_models")
-    if saved_candidates is None:
-        llm_cfg = deployment_llm()
-        candidates = list(llm_cfg.fallback) if llm_cfg and llm_cfg.fallback else []
+    if unattended_gate:
+        from src.dalton.llm.unattended_fallback import (
+            acquire_fallback_candidate_live,
+            resolve_unattended_fallback_chain,
+            route_fingerprint_to_dict,
+        )
+
+        candidates = resolve_unattended_fallback_chain(
+            user_prefs=prefs,
+            primary_model=original_model,
+            user_id=user_id,
+            ignore_custom_models=ignore_custom_models,
+        )
     else:
-        candidates = saved_candidates
+        saved_candidates = prefs.get("fallback_models")
+        if saved_candidates is None:
+            llm_cfg = deployment_llm()
+            candidates = list(llm_cfg.fallback) if llm_cfg and llm_cfg.fallback else []
+        else:
+            candidates = saved_candidates
     if not isinstance(candidates, list) or not candidates:
         raise exc_to_raise
 
@@ -280,6 +298,25 @@ async def resolve_with_subscription_fallback(
                 **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
             if cand_provider == failed_provider:
+                continue
+
+        admission = None
+        if unattended_gate:
+            admission = await acquire_fallback_candidate_live(
+                subject_user_id=user_id,
+                payer_user_id=payer_user_id or user_id,
+                candidate_model=candidate,
+                run_id=run_id,
+                call_id=f"auth_fb:{run_id}:{candidate}" if run_id else None,
+                ignore_custom_models=ignore_custom_models,
+                model_pref=filter_prefs,
+            )
+            if not admission.admitted:
+                logger.debug(
+                    "[AUTOMATION_SUB_FALLBACK] Candidate %r rejected by live admission (%s)",
+                    candidate,
+                    admission.reason,
+                )
                 continue
 
         try:
@@ -350,6 +387,18 @@ async def resolve_with_subscription_fallback(
                 )
                 continue
 
+        if admission is not None:
+            if admission.lease_verdict is not None:
+                try:
+                    setattr(config, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
+                except Exception:
+                    pass
+            if admission.route is not None:
+                try:
+                    setattr(config, "_dalton_active_fallback_route", route_fingerprint_to_dict(admission.route))
+                except Exception:
+                    pass
+
         chosen_model = getattr(getattr(config, "llm", None), "name", None) or candidate
         orig_label = (
             failed_subject
@@ -389,26 +438,37 @@ async def resolve_automation_turn_llm_config(
     identity: Any = None,
     role: Any = "analyst",
     ignore_custom_models: bool = False,
+    run_id: str | None = None,
+    payer_user_id: str | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve an automation first turn's LLM config with subscription fallback."""
     from contextlib import nullcontext
 
     from src.dalton.llm.unattended_fallback import (
         UnattendedTurnContext,
+        acquire_fallback_candidate_live,
         bind_unattended_turn_context,
         format_unattended_quota_notice,
         inspect_subscription_availability,
         resolve_unattended_fallback_chain,
+        route_fingerprint_to_dict,
     )
     from src.dalton.settings import is_unattended_quota_fallback_enabled
 
     unattended_on = is_unattended_quota_fallback_enabled()
+    eff_payer_id = (
+        payer_user_id
+        or (getattr(identity, "recorded_as", None) if identity is not None else None)
+        or user_id
+    )
     ctx = (
         UnattendedTurnContext(
             is_unattended=True,
             subject_user_id=user_id,
+            payer_user_id=eff_payer_id,
             source_kind="automation",
             ignore_custom_models=ignore_custom_models,
+            run_id=run_id,
             thread_id=thread_id,
             role=str(role or "analyst"),
         )
@@ -461,18 +521,32 @@ async def resolve_automation_turn_llm_config(
                     ignore_custom_models=ignore_custom_models,
                 )
                 for cand in cands:
-                    cand_avail = await inspect_subscription_availability(
-                        user_id,
-                        cand,
-                        prefs=default_pre_prefs,
+                    admission = await acquire_fallback_candidate_live(
+                        subject_user_id=user_id,
+                        payer_user_id=eff_payer_id,
+                        candidate_model=cand,
+                        run_id=run_id,
+                        call_id=f"pre:{run_id}:{cand}" if run_id else None,
+                        role=str(role or "analyst"),
                         ignore_custom_models=ignore_custom_models,
+                        model_pref=default_pre_prefs,
                     )
-                    if not cand_avail.available:
+                    if not admission.admitted:
                         continue
                     try:
                         cfg = await _resolve(cand)
                     except Exception:
                         continue
+                    if admission.lease_verdict is not None:
+                        try:
+                            setattr(cfg, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
+                        except Exception:
+                            pass
+                    if admission.route is not None:
+                        try:
+                            setattr(cfg, "_dalton_active_fallback_route", route_fingerprint_to_dict(admission.route))
+                        except Exception:
+                            pass
                     chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
                     kind = (
                         "oauth_auth_unavailable"
@@ -519,6 +593,9 @@ async def resolve_automation_turn_llm_config(
                 resolve_candidate=_resolve,
                 exc_to_raise=exc,
                 ignore_custom_models=ignore_custom_models,
+                unattended_gate=unattended_on,
+                payer_user_id=eff_payer_id,
+                run_id=run_id,
             )
 
 
@@ -533,6 +610,7 @@ async def resolve_ptc_turn_llm_config(
     identity: Any = None,
     role: Any = "analyst",
     run_metadata: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve LLM config for ``ptc_run`` with automation subscription fallback when eligible."""
     ignore_custom = bool(getattr(request, "llm_model_system_only", False))
@@ -557,6 +635,8 @@ async def resolve_ptc_turn_llm_config(
             identity=identity,
             role=role,
             ignore_custom_models=ignore_custom,
+            run_id=run_id,
+            payer_user_id=(getattr(identity, "recorded_as", None) if identity is not None else None),
         )
         if fallback_record is not None:
             run_metadata = {

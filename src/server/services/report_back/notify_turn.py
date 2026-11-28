@@ -811,10 +811,19 @@ async def post_notification_turn(
                         )
                         return "drop", None
                     if on_plan_limited is not None and (plan := await _plan_limited(resp)):
+                        # DALTON-HOOK(quota-exhaustion): handle exhausted wakeup deferral without held_until
+                        if plan.get("type") == "dalton_wakeup_quota_exhausted":
+                            logger.warning(
+                                f"{log_prefix} Wakeup quota deferral exhausted for "
+                                f"{subject or 'background work'} on thread {thread_id} "
+                                f"(reason={plan.get('reason')})"
+                            )
+                            await on_plan_limited(plan)
+                            return "plan_limited", None
                         logger.info(
                             f"{log_prefix} The Claude plan refused the notification "
                             f"for {subject or 'background work'} on thread {thread_id} "
-                            f"until {plan['held_until']}"
+                            f"until {plan.get('held_until')}"
                         )
                         await on_plan_limited(plan)
                         return "plan_limited", None

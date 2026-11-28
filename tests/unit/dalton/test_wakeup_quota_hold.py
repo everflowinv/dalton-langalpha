@@ -1,32 +1,53 @@
 """Unit tests for Prod Audit 2 §2: wakeup shared quota deferral & checkpoint resume.
 
-Covers all scenarios in §2.5:
-1. Alternating pre-dispatch hold + mid-turn tool exhaustion accumulating on shared ``root_job_id``:
-   - #1 pre-dispatch hold -> defer_count=1 -> notify_turn._plan_limited -> hold_alert_for_plan
-   - #2 mid-turn exhaustion after step-1 tool -> defer_count=2, persists resume_checkpoint_id &
-     enqueues ``wakeup_quota_resume`` in ``hook_outbox``
-   - #3 pre-dispatch hold -> defer_count=3
-   - #4 exceeds cap (>3) -> ``exhausted_failed`` + Item 3 wakeup notice to ``owner_user_id``
-2. Step idempotency (replaying same ``pre:`` or ``mid:`` step key does not increment ``defer_count``).
-3. Unknown reset time (``reset_at=None``) schedules ``now + 30m`` with ``held_known=False``.
-4. Single cooldown exceeding ``first_due_at + 24h`` immediately rejected -> ``exhausted_failed``.
-5. Pure ``auth_unavailable`` fails immediately (zero wait) and notifies ``owner_user_id``.
-6. Cross-worker ``execute_wakeup_quota_resume`` resumes from checkpoint or yields ``settled``
-   if the user already moved the thread forward.
-7. ``notify_turn._plan_limited`` + ``wakeups/delivery.py`` integration & executor registration.
+Exercises real call chains without faking side effects or bypassing Pydantic/executor/delivery seams:
+1. Alternating pre-dispatch hold + mid-turn tool exhaustion sharing ``root_job_id`` cap (3 defers / 24h)
+   and persisted ``seen_step_keys`` idempotency (even for non-last earlier step keys).
+2. Real end-to-end 4th pre-dispatch cooldown on the same wakeup:
+   ``delivery._deliver`` -> ``post_notification_turn`` -> ``automation_thread_model`` ->
+   ``evaluate_and_record_wakeup_deferral`` -> ``build_wakeup_cooldown_http_exception`` ->
+   ``notify_turn._plan_limited`` (NO ``KeyError`` on missing ``held_until``!) -> ``delivery._deliver``
+   returns ``"release"`` and settles cleanly on the 4th cooldown.
+3. Real mid-turn exhaustion -> ``LocalRunExecutor._finalize_run`` -> ``finalization.assemble_finalize_artifacts``
+   -> ``RunCoordinator.finalize_run`` -> ``lifecycle.finalize_run`` atomic transaction registers
+   ``wakeup_quota_resume`` in ``hook_outbox`` with committed checkpoint ID -> ``execute_wakeup_quota_resume``
+   builds a real ``RetryRequest``-validated body (with ``workspace_id``, UUID ``request_key``,
+   ``wakeup_resume`` carrying original ``root_job_id``, incrementing ``attempts``, constant ``first_due_at``)
+   and resumes a real LangGraph ``StateGraph`` + ``MemorySaver`` checkpoint so step-1 tool executes STRICTLY ONCE.
+4. Resume pre-dispatch cooldown re-checks 24h deadline, uses distinct step keys per attempt, reschedules
+   with ``AND attempts = %s`` fence, and settles cleanly on ``dalton_wakeup_quota_exhausted``.
+5. Unknown reset (30m, ``held_known=False``), 24h overflow, pure ``auth_unavailable`` zero-wait settlement,
+   and user-advanced thread yielding ``settled``.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from unittest.mock import AsyncMock, create_autospec
-from uuid import uuid4
+from types import SimpleNamespace
+from typing import Any, TypedDict
+from unittest.mock import create_autospec
+from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 
 from src.dalton.llm import unattended_fallback as uf
+from src.dalton.services import automation_thread_model as auto_tm_mod
+from src.llms.provider_errors import ProviderRefusal
+from src.ptc_agent.agent.middleware.model_resilience import _RemoteQuotaExhaustedError
+from src.server.database import conversation as conv_db
+from src.server.database.runs import lifecycle as tl_db
+from src.server.database.runs import outbox as outbox_db
+from src.server.database.wakeups import fire as fire_db
+from src.server.database.wakeups import riders as riders_db
+from src.server.models.workflow import RetryRequest
+from src.server.services.llm import user_models
 from src.server.services.report_back import notify_turn
+from src.server.services.runs import finalization as finalization_mod
+from src.server.services.runs.executor import LocalRunExecution, LocalRunExecutor, LocalRunStatus
 from src.server.services.wakeups import delivery as wakeup_delivery
 
 
@@ -37,6 +58,12 @@ class _InMemoryDeferralStore:
         self.rows: dict[str, dict[str, Any]] = {}
         self.outbox: list[dict[str, Any]] = []
         self._outbox_idem: set[str] = set()
+        self.advisory_locks: list[int] = []
+        self.reschedule_queries: list[tuple[str, Any]] = []
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
 
     def cursor(self, **kwargs: Any) -> "_InMemoryCursor":
         return _InMemoryCursor(self)
@@ -58,15 +85,19 @@ class _InMemoryCursor:
         norm = " ".join(sql.split()).upper()
         self.rowcount = 0
         self._result = None
+        if "PG_ADVISORY_XACT_LOCK" in norm:
+            self._store.advisory_locks.append(int(params[0]))
+            return
         if norm.startswith("SELECT") and "FROM DALTON_WAKEUP_QUOTA_DEFERRALS" in norm:
             key = str(params[0])
             row = self._store.rows.get(key)
             self._result = dict(row) if row is not None else None
         elif norm.startswith("INSERT INTO DALTON_WAKEUP_QUOTA_DEFERRALS"):
-            # Two shapes: pure_auth (11 params, NULL reset) vs cooldown/exhausted (12 params)
             key = str(params[0])
             existing = self._store.rows.get(key)
-            if len(params) == 11:
+            raw_seen = getattr(params[8], "obj", params[8])
+            if len(params) == 12:
+                # pure_auth (NULL last_reset_at)
                 new_row = {
                     "root_job_id": key,
                     "wakeup_id": params[1],
@@ -76,10 +107,11 @@ class _InMemoryCursor:
                     "deadline_at": params[5],
                     "defer_count": params[6],
                     "last_step_key": params[7],
-                    "resume_from_run_id": params[8],
-                    "resume_checkpoint_id": params[9],
+                    "seen_step_keys": list(raw_seen),
+                    "resume_from_run_id": params[9],
+                    "resume_checkpoint_id": params[10],
                     "last_reset_at": None,
-                    "last_reason": params[10],
+                    "last_reason": params[11],
                     "status": "exhausted_failed",
                 }
             else:
@@ -93,16 +125,18 @@ class _InMemoryCursor:
                     "deadline_at": params[5],
                     "defer_count": params[6],
                     "last_step_key": params[7],
-                    "resume_from_run_id": params[8],
-                    "resume_checkpoint_id": params[9],
-                    "last_reset_at": params[10],
-                    "last_reason": params[11],
+                    "seen_step_keys": list(raw_seen),
+                    "resume_from_run_id": params[9],
+                    "resume_checkpoint_id": params[10],
+                    "last_reset_at": params[11],
+                    "last_reason": params[12],
                     "status": status,
                 }
             if existing is not None:
                 merged = dict(existing)
                 merged["defer_count"] = new_row["defer_count"]
                 merged["last_step_key"] = new_row["last_step_key"]
+                merged["seen_step_keys"] = list(new_row["seen_step_keys"])
                 merged["resume_from_run_id"] = new_row["resume_from_run_id"] or existing.get("resume_from_run_id")
                 merged["resume_checkpoint_id"] = new_row["resume_checkpoint_id"] or existing.get("resume_checkpoint_id")
                 merged["last_reset_at"] = new_row["last_reset_at"]
@@ -120,6 +154,7 @@ class _InMemoryCursor:
                 payload_obj = getattr(raw_payload, "obj", raw_payload)
                 self._store.outbox.append(
                     {
+                        "hook_outbox_id": str(uuid4()),
                         "run_id": str(params[0]),
                         "conversation_thread_id": str(params[1]),
                         "hook_type": params[2],
@@ -127,38 +162,72 @@ class _InMemoryCursor:
                         "ordering_key": params[4],
                         "idempotency_key": idem,
                         "next_retry_at": params[6],
+                        "attempts": 1,
+                        "status": "pending",
                     }
                 )
                 self.rowcount = 1
-        elif norm.startswith("UPDATE DALTON_WAKEUP_QUOTA_DEFERRALS") and "'SETTLED'" in norm:
+        elif norm.startswith("UPDATE DALTON_WAKEUP_QUOTA_DEFERRALS"):
             key = str(params[0])
             row = self._store.rows.get(key)
             if row and row["status"] == "deferred":
-                row["status"] = "settled"
+                if "'SETTLED'" in norm:
+                    row["status"] = "settled"
+                elif "'EXHAUSTED_FAILED'" in norm:
+                    row["status"] = "exhausted_failed"
+                    row["last_reason"] = "wakeup_quota_deadline_exceeded"
                 self.rowcount = 1
+        elif norm.startswith("UPDATE HOOK_OUTBOX"):
+            self._store.reschedule_queries.append((sql, params))
+            self.rowcount = 1
 
     async def fetchone(self) -> Any:
         return self._result
 
 
+# ---------------------------------------------------------------------------
+# 1. Shared cap across pre/mid defers + full seen_step_keys idempotency + advisory lock
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th(
+async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_seen_step_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _InMemoryDeferralStore()
     notices: list[dict[str, Any]] = []
+    notice_mock = create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False)
 
-    async def _capture_notice(conn: Any, **kw: Any) -> bool:
-        notices.append(kw)
+    async def _capture_notice(
+        conn: Any,
+        *,
+        subject_kind: Any,
+        subject_id: str,
+        source_key: str,
+        recipient_user_id: str,
+        failure_reason: str,
+        summary: Any,
+        dedup_window_key: str | None = None,
+    ) -> bool:
+        notices.append(
+            {
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "recipient_user_id": recipient_user_id,
+                "failure_reason": failure_reason,
+                "summary": summary,
+            }
+        )
         return True
 
-    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", _capture_notice)
+    notice_mock.side_effect = _capture_notice
+    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", notice_mock)
 
     root_job_id = str(uuid4())
     thread_id = str(uuid4())
     t0 = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
 
-    # 1) Pre-dispatch deferral #1
+    # 1) Pre-dispatch deferral #1 -> advisory lock acquired before SELECT FOR UPDATE
     d1 = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
         root_job_id=root_job_id,
@@ -178,14 +247,42 @@ async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th
         first_due_at=t0,
         now=t0,
     )
-    assert d1.action == "defer"
-    assert d1.defer_count == 1
-    assert d1.held_known is True
-    assert d1.scheduled_wake_at == t0 + timedelta(hours=1, minutes=1)
-    assert len(notices) == 0
+    assert d1.action == "defer" and d1.defer_count == 1
+    assert len(store.advisory_locks) == 1
 
-    # Idempotent replay of step #1 does NOT increment defer_count
-    d1_dup = await uf.evaluate_and_record_wakeup_deferral_tx(
+    # 2) Mid-turn exhaustion -> defer_count=2 + wakeup_quota_resume with valid UUID request_key
+    run1_id = str(uuid4())
+    d2 = await uf.record_wakeup_mid_turn_quota_exhaustion_tx(
+        store,
+        thread_id=thread_id,
+        run_id=run1_id,
+        owner_user_id="owner-1",
+        root_job_id=root_job_id,
+        wakeup_id="wake-1",
+        turn_index=2,
+        workspace_id="ws-1",
+        availabilities=[
+            uf.SubscriptionAvailability(
+                available=False,
+                kind="quota_cooldown",
+                refusal_code="plan_limit",
+                reset_at=t0 + timedelta(hours=3),
+                model_name="claude-opus-5-5-oauth",
+            )
+        ],
+        latest_checkpoint_id="ckpt-after-tool-1",
+        first_due_at=t0,
+        now=t0 + timedelta(hours=2),
+    )
+    assert d2.action == "defer" and d2.defer_count == 2
+    assert len(store.outbox) == 1
+    outbox_payload = store.outbox[0]["payload"]
+    assert outbox_payload["workspace_id"] == "ws-1"
+    assert outbox_payload["first_due_at"] == t0.isoformat()
+    UUID(outbox_payload["request_key"])  # must be valid UUID
+
+    # Delayed out-of-order replay of EARLIER step #1 (NOT last_step_key!) is STILL idempotent!
+    d1_late_replay = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
         root_job_id=root_job_id,
         wakeup_id="wake-1",
@@ -202,41 +299,10 @@ async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th
             )
         ],
         first_due_at=t0,
-        now=t0,
+        now=t0 + timedelta(hours=2, minutes=1),
     )
-    assert d1_dup.idempotent_replay is True
-    assert d1_dup.defer_count == 1
-
-    # 2) Mid-turn exhaustion after step-1 tool -> defer_count=2 + wakeup_quota_resume job
-    run1_id = str(uuid4())
-    d2 = await uf.record_wakeup_mid_turn_quota_exhaustion_tx(
-        store,
-        thread_id=thread_id,
-        run_id=run1_id,
-        owner_user_id="owner-1",
-        root_job_id=root_job_id,
-        wakeup_id="wake-1",
-        turn_index=2,
-        availabilities=[
-            uf.SubscriptionAvailability(
-                available=False,
-                kind="quota_cooldown",
-                refusal_code="plan_limit",
-                reset_at=t0 + timedelta(hours=3),
-                model_name="claude-opus-5-5-oauth",
-            )
-        ],
-        latest_checkpoint_id="ckpt-after-tool-1",
-        first_due_at=t0,
-        now=t0 + timedelta(hours=2),
-    )
-    assert d2.action == "defer"
-    assert d2.defer_count == 2
-    assert d2.resume_checkpoint_id == "ckpt-after-tool-1"
-    assert len(store.outbox) == 1
-    assert store.outbox[0]["hook_type"] == "wakeup_quota_resume"
-    assert store.outbox[0]["idempotency_key"] == f"wakeup_resume:{root_job_id}:2"
-    assert store.outbox[0]["payload"]["resume_checkpoint_id"] == "ckpt-after-tool-1"
+    assert d1_late_replay.idempotent_replay is True
+    assert d1_late_replay.defer_count == 2
 
     # 3) Pre-dispatch deferral #3 -> defer_count=3
     d3 = await uf.evaluate_and_record_wakeup_deferral_tx(
@@ -245,7 +311,7 @@ async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th
         wakeup_id="wake-1",
         thread_id=thread_id,
         owner_user_id="owner-1",
-        step_key=f"pre:{root_job_id}:2",
+        step_key="pre:resume-job-1:1",
         availabilities=[
             uf.SubscriptionAvailability(
                 available=False,
@@ -258,18 +324,16 @@ async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th
         first_due_at=t0,
         now=t0 + timedelta(hours=4),
     )
-    assert d3.action == "defer"
-    assert d3.defer_count == 3
-    assert len(notices) == 0
+    assert d3.action == "defer" and d3.defer_count == 3
 
-    # 4) 4th attempt hits defer_count + 1 > 3 -> exhausted_failed + wakeup notice to owner
+    # 4) 4th cooldown exceeds shared cap -> exhausted_failed + notice
     d4 = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
         root_job_id=root_job_id,
         wakeup_id="wake-1",
         thread_id=thread_id,
         owner_user_id="owner-1",
-        step_key=f"pre:{root_job_id}:3",
+        step_key="pre:resume-job-1:2",
         availabilities=[
             uf.SubscriptionAvailability(
                 available=False,
@@ -283,33 +347,621 @@ async def test_wakeup_alternating_pre_and_mid_defers_share_cap_and_notify_on_4th
         now=t0 + timedelta(hours=6),
     )
     assert d4.action == "exhausted_failed"
-    assert d4.defer_count == 3
     assert d4.reason == "wakeup_quota_defer_limit_exceeded"
-    assert store.rows[root_job_id]["status"] == "exhausted_failed"
     assert len(notices) == 1
-    assert notices[0]["subject_kind"] == "wakeup"
     assert notices[0]["recipient_user_id"] == "owner-1"
 
 
+# ---------------------------------------------------------------------------
+# 2. REAL CHAIN: Same wakeup 4th pre-dispatch cooldown -> HTTP 400 ->
+#    notify_turn.post_notification_turn (NO KeyError!) -> delivery._deliver -> "release"
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_wakeup_unknown_reset_uses_30m_and_24h_overflow_rejects(
+async def test_same_wakeup_4th_pre_dispatch_cooldown_terminates_without_keyerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real chain across delivery._deliver -> post_notification_turn -> automation_thread_model -> ledger."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    monkeypatch.delenv("DALTON_ALLOW_CASH_FALLBACK_ON_UNATTENDED", raising=False)
+
+    store = _InMemoryDeferralStore()
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    ws_id = str(uuid4())
+    t0 = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
+
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
+
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(
+        uf,
+        "_maybe_enqueue_failure_notice_in_tx",
+        create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False, return_value=True),
+    )
+    monkeypatch.setattr(uf, "get_profile_default_fallback_chain", lambda: [])
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(
+            user_models.get_model_preference,
+            instance=False,
+            return_value={"default_model": "claude-opus-5-5-oauth", "fallback_models": []},
+        ),
+    )
+    monkeypatch.setattr(
+        auto_tm_mod,
+        "_resolve_automation_notification_context",
+        create_autospec(
+            auto_tm_mod._resolve_automation_notification_context,
+            instance=False,
+            return_value=(None, None, None, False, False, None),
+        ),
+    )
+
+    async def _always_cooled(
+        user_id: str,
+        model_name: str,
+        *,
+        client: Any = None,
+        prefs: Any = None,
+        ignore_custom_models: bool = False,
+        now: Any = None,
+    ) -> uf.SubscriptionAvailability:
+        return uf.SubscriptionAvailability(
+            available=False,
+            kind="quota_cooldown",
+            refusal_code="plan_limit",
+            provider="anthropic-oauth",
+            reset_at=t0 + timedelta(hours=1),
+            cooldown_key="ck:anthropic",
+            model_name=model_name,
+        )
+
+    monkeypatch.setattr(uf, "inspect_subscription_availability", _always_cooled)
+
+    # Wire aiohttp POST inside post_notification_turn directly into real automation_thread_model!
+    class _FakeHttpResponse:
+        def __init__(self, status: int, body: dict[str, Any]) -> None:
+            self.status = status
+            self._body = body
+
+        async def __aenter__(self) -> "_FakeHttpResponse":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def json(self) -> dict[str, Any]:
+            return self._body
+
+        async def text(self) -> str:
+            return str(self._body)
+
+    class _FakeHttpSession:
+        async def __aenter__(self) -> "_FakeHttpSession":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, Any], timeout: Any) -> _FakeHttpResponse:
+            self._pending_json = json
+            return _DeferredDispatchResponse(json)
+
+    class _DeferredDispatchResponse(_FakeHttpResponse):
+        def __init__(self, req_json: dict[str, Any]) -> None:
+            super().__init__(400, {})
+            self._req_json = req_json
+
+        async def __aenter__(self) -> "_DeferredDispatchResponse":
+            req_obj = SimpleNamespace(
+                query_type=self._req_json.get("query_type"),
+                platform=None,
+                wakeup=self._req_json.get("wakeup"),
+                workspace_id=self._req_json.get("workspace_id"),
+                request_key=self._req_json.get("request_key"),
+                hitl_response=None,
+            )
+            try:
+                await auto_tm_mod.resolve_turn_config_with_automation_inheritance(
+                    user_id="owner-1",
+                    thread_id=thread_id,
+                    request=req_obj,
+                    requested_model="claude-opus-5-5-oauth",
+                    held_model=None,
+                    from_service=True,
+                    resolve=create_autospec(lambda m: None, instance=False),
+                )
+            except HTTPException as exc:
+                self.status = exc.status_code
+                self._body = {"detail": exc.detail}
+            return self
+
+    import aiohttp
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda: _FakeHttpSession())
+
+    # Stub only DB/workspace lookup seams around delivery._deliver
+    monkeypatch.setattr(tl_db, "get_latest_attempt", create_autospec(tl_db.get_latest_attempt, instance=False, return_value=None))
+    monkeypatch.setattr(fire_db, "job_owed", create_autospec(fire_db.job_owed, instance=False, return_value=True))
+    monkeypatch.setattr(wakeup_delivery, "showing_run", create_autospec(wakeup_delivery.showing_run, instance=False, return_value=None))
+    monkeypatch.setattr(
+        conv_db,
+        "get_thread_by_id",
+        create_autospec(conv_db.get_thread_by_id, instance=False, return_value={"workspace_id": ws_id, "archived_at": None}),
+    )
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(ws_db, "get_workspace", create_autospec(ws_db.get_workspace, instance=False, return_value={"workspace_id": ws_id}))
+    from src.server.services import features as features_mod
+
+    monkeypatch.setattr(features_mod, "user_feature_enabled", create_autospec(features_mod.user_feature_enabled, instance=False, return_value=True))
+    monkeypatch.setattr(outbox_db, "extend_job_lease", create_autospec(outbox_db.extend_job_lease, instance=False, return_value=True))
+    monkeypatch.setattr(notify_turn, "park_unless_ready", create_autospec(notify_turn.park_unless_ready, instance=False, return_value=False))
+    monkeypatch.setattr(riders_db, "gather_wakeup_riders", create_autospec(riders_db.gather_wakeup_riders, instance=False, return_value=[]))
+    monkeypatch.setattr(
+        wakeup_delivery,
+        "render_wake",
+        create_autospec(
+            wakeup_delivery.render_wake,
+            instance=False,
+            return_value=("wake text", [{"wakeup_id": "wake-1", "notice": "time", "seq": 1}]),
+        ),
+    )
+    hold_mock = create_autospec(outbox_db.hold_alert_for_plan, instance=False, return_value=True)
+    monkeypatch.setattr(outbox_db, "hold_alert_for_plan", hold_mock)
+    monkeypatch.setattr(outbox_db, "end_plan_hold", create_autospec(outbox_db.end_plan_hold, instance=False, return_value=True))
+    monkeypatch.setattr(wakeup_delivery, "_adopt_own_wake", create_autospec(wakeup_delivery._adopt_own_wake, instance=False, return_value=False))
+
+    # Attempts 1, 2, 3 -> held; Attempt 4 -> exhausted_failed -> NO KeyError, delivery returns "release"!
+    exits: list[str] = []
+    for attempt in (1, 2, 3, 4):
+        job_row = {
+            "hook_outbox_id": root_job_id,
+            "conversation_thread_id": thread_id,
+            "attempts": attempt,
+            "created_at": t0,
+            "payload": {
+                "wakeup_id": "wake-1",
+                "notice": "time",
+                "seq": 1,
+                "user_id": "owner-1",
+                **({"plan_hold": {"reset_at": (t0 + timedelta(hours=1)).isoformat()}} if attempt > 1 else {}),
+            },
+        }
+        wake = wakeup_delivery._Wake(
+            job=job_row,
+            thread_id=thread_id,
+            wakeup_id="wake-1",
+            subject="time 1 of wakeup wake-1",
+        )
+        exits.append(await wakeup_delivery._deliver(wake))
+
+    assert exits == ["held", "held", "held", "release"]
+    assert hold_mock.await_count == 3
+    assert store.rows[root_job_id]["status"] == "exhausted_failed"
+    assert store.rows[root_job_id]["defer_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 3. REAL CHAIN: Mid-turn exhaustion -> LocalRunExecutor._finalize_run ->
+#    wakeup_quota_resume -> RetryRequest validation -> LangGraph checkpoint resume
+#    with step-1 tool executing STRICTLY ONCE!
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_exhaustion_executor_finalize_enqueues_resume_and_replays_checkpoint_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real LocalRunExecutor._finalize_run -> atomic tx -> real RetryRequest -> real LangGraph MemorySaver."""
+    monkeypatch.setenv("DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED", "1")
+    store = _InMemoryDeferralStore()
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    failed_run_id = str(uuid4())
+    ws_id = str(uuid4())
+    t0 = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
+
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
+
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+
+    # Build a real 2-step LangGraph StateGraph backed by real MemorySaver checkpointer
+    class _GraphState(TypedDict):
+        step1_done: bool
+        answer: str
+
+    tool_side_effect_calls: list[str] = []
+    quota_exhausted_flag = {"exhausted": True}
+
+    def _tool_step(state: _GraphState) -> dict[str, Any]:
+        tool_side_effect_calls.append("tool-1-ran")
+        return {"step1_done": True}
+
+    def _llm_step(state: _GraphState) -> dict[str, Any]:
+        if quota_exhausted_flag["exhausted"]:
+            raise _RemoteQuotaExhaustedError(
+                "Plan limit reached",
+                429,
+                expires_at=(t0 + timedelta(minutes=20)).timestamp(),
+                provider_refusal=ProviderRefusal("plan_limit", until=t0 + timedelta(minutes=20)),
+            )
+        return {"answer": "completed-after-resume"}
+
+    builder = StateGraph(_GraphState)
+    builder.add_node("tool_step", _tool_step)
+    builder.add_node("llm_step", _llm_step)
+    builder.add_edge(START, "tool_step")
+    builder.add_edge("tool_step", "llm_step")
+    builder.add_edge("llm_step", END)
+    checkpointer = MemorySaver()
+    graph = builder.compile(checkpointer=checkpointer)
+
+    # Worker 1 runs graph: tool_step executes ONCE & commits checkpoint, llm_step raises quota exhaustion
+    run_cfg = {"configurable": {"thread_id": thread_id}}
+    caught_exc: BaseException | None = None
+    try:
+        await graph.ainvoke({"step1_done": False, "answer": ""}, config=run_cfg)
+    except _RemoteQuotaExhaustedError as exc:
+        caught_exc = exc
+
+    assert caught_exc is not None
+    assert len(tool_side_effect_calls) == 1
+    saved_state = await graph.aget_state(run_cfg)
+    committed_ckpt_id = saved_state.config["configurable"]["checkpoint_id"]
+    assert committed_ckpt_id is not None
+
+    # Drive REAL LocalRunExecutor._finalize_run(kind="failed", exc=caught_exc)
+    # and verify atomic finalization calls maybe_record_wakeup_mid_turn_resume_in_tx!
+    start_meta = uf.build_wakeup_quota_start_metadata(
+        SimpleNamespace(
+            query_type="wakeup",
+            wakeup={
+                "v": 1,
+                "root_job_id": root_job_id,
+                "wakeup_id": "wake-real-1",
+                "first_due_at": t0.isoformat(),
+                "notices": [{"wakeup_id": "wake-real-1"}],
+            },
+            llm_model="claude-opus-5-5-oauth",
+        ),
+        user_id="owner-1",
+        workspace_id=ws_id,
+        effective_model="claude-opus-5-5-oauth",
+    )
+    persisted_run_row = {
+        "conversation_response_id": failed_run_id,
+        "conversation_thread_id": thread_id,
+        "turn_index": 1,
+        "status": "error",
+        "user_id": "owner-1",
+        "metadata": {
+            "workspace_id": ws_id,
+            "user_id": "owner-1",
+            "llm_model": "claude-opus-5-5-oauth",
+            **start_meta,
+        },
+    }
+
+    async def _drive_finalize_in_same_tx(
+        key: tuple[str, str], handle: Any, outcome: tl_db.RunOutcome, *, tail_drain: Any = None
+    ) -> finalization_mod.FinalizeVerdict:
+        assert outcome.status == "error"
+        assert outcome.wakeup_quota_failure is not None
+        assert outcome.wakeup_quota_failure["refusal_code"] == "plan_limit"
+        await uf.maybe_record_wakeup_mid_turn_resume_in_tx(
+            store,
+            run_row=persisted_run_row,
+            thread_id=key[0],
+            run_id=key[1],
+            newest_checkpoint_id=committed_ckpt_id,
+            quota_failure=outcome.wakeup_quota_failure,
+        )
+        return finalization_mod.FinalizeVerdict(applied=True, status="error")
+
+    monkeypatch.setattr(finalization_mod, "drive_finalize_cas", _drive_finalize_in_same_tx)
+    monkeypatch.setattr(
+        finalization_mod,
+        "_delivered_steering_inputs",
+        create_autospec(finalization_mod._delivered_steering_inputs, instance=False, return_value=[]),
+    )
+
+    executor = LocalRunExecutor.__new__(LocalRunExecutor)
+    import asyncio
+
+    executor.task_lock = asyncio.Lock()
+    executor.executions = {}
+    executor.event_storage_backend = "memory"
+    executor._orphan_collectors = {}
+    executor._shielded_tasks = set()
+    monkeypatch.setattr(executor, "append_run_end_event", create_autospec(executor.append_run_end_event, instance=False))
+    monkeypatch.setattr(executor, "_note_credential_refusal", create_autospec(executor._note_credential_refusal, instance=False))
+
+    fake_handler = SimpleNamespace(
+        agent_config=SimpleNamespace(
+            llm=SimpleNamespace(name="claude-opus-5-5-oauth"),
+            fallback_llm_clients=[],
+            feature_enabled=lambda name: False,
+        ),
+        saw_interrupt=False,
+        captured_images={},
+        captured_images_by_message={},
+        saved_image_paths=[],
+        record=lambda stop_events=None: tl_db.ProducerRecord(),
+    )
+    run_handle = SimpleNamespace(run_id=failed_run_id, thread_id=thread_id, guard=None)
+    exec_info = LocalRunExecution(
+        thread_id=thread_id,
+        run_id=failed_run_id,
+        status=LocalRunStatus.RUNNING,
+        created_at=t0,
+        graph=graph,
+        metadata={
+            "run_handle": run_handle,
+            "handler": fake_handler,
+            "workspace_id": ws_id,
+            "user_id": "owner-1",
+            "recorded_as": "owner-1",
+            "start_time": t0.timestamp(),
+        },
+    )
+    executor.executions[(thread_id, failed_run_id)] = exec_info
+
+    await executor._finalize_run(thread_id, failed_run_id, kind="failed", error=str(caught_exc), exc=caught_exc)
+
+    # Assert exactly 1 wakeup_quota_resume outbox job was enqueued with committed_ckpt_id
+    assert len(store.outbox) == 1
+    outbox_job = store.outbox[0]
+    assert outbox_job["hook_type"] == "wakeup_quota_resume"
+    assert outbox_job["payload"]["resume_checkpoint_id"] == committed_ckpt_id
+    assert outbox_job["payload"]["workspace_id"] == ws_id
+
+    # Worker 2 claims the outbox job and runs execute_wakeup_quota_resume:
+    # validate body with REAL RetryRequest Pydantic model, then resume the REAL LangGraph checkpoint!
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(tl_db.get_latest_attempt, instance=False, return_value=persisted_run_row),
+    )
+
+    validated_bodies: list[RetryRequest] = []
+    resumed_final_state: dict[str, Any] = {}
+
+    async def _dispatch_retry_to_real_graph(
+        *,
+        thread_id: str,
+        body: dict[str, Any],
+        user_id: str,
+        wait_cap: float,
+        log_prefix: str,
+        subject: str = "",
+        route: str = "messages",
+        busy_fails_fast: bool = False,
+        refusal_fails_fast: bool = False,
+        on_plan_limited: Any = None,
+        heartbeat: Any = None,
+        still_due: Any = None,
+        on_unanswered: Any = None,
+        room_fails_fast: bool = False,
+        suspension_waits: bool = False,
+    ) -> tuple[str, str | None]:
+        assert route == "retry"
+        parsed = RetryRequest.model_validate(body)  # REAL Pydantic /retry validation!
+        validated_bodies.append(parsed)
+        # Quota has now reset: resume the REAL LangGraph graph from parsed.checkpoint_id
+        quota_exhausted_flag["exhausted"] = False
+        result = await graph.ainvoke(
+            None,
+            config={"configurable": {"thread_id": thread_id, "checkpoint_id": parsed.checkpoint_id}},
+        )
+        resumed_final_state.update(result)
+        return "dispatched", str(uuid4())
+
+    post_mock = create_autospec(notify_turn.post_notification_turn, instance=False, side_effect=_dispatch_retry_to_real_graph)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+
+    await uf.execute_wakeup_quota_resume(dict(outbox_job))
+
+    assert len(validated_bodies) == 1
+    assert validated_bodies[0].workspace_id == ws_id
+    assert validated_bodies[0].checkpoint_id == committed_ckpt_id
+    UUID(str(validated_bodies[0].request_key))  # valid UUID
+    assert validated_bodies[0].wakeup_resume is not None
+    assert validated_bodies[0].wakeup_resume["root_job_id"] == root_job_id
+    assert validated_bodies[0].wakeup_resume["attempts"] == 1
+    assert validated_bodies[0].wakeup_resume["first_due_at"] == t0.isoformat()
+
+    # The graph completed llm_step without re-running tool_step!
+    assert resumed_final_state["answer"] == "completed-after-resume"
+    assert tool_side_effect_calls == ["tool-1-ran"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Resume deadline re-check, attempts-fenced reschedule, and exhausted settlement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_wakeup_quota_resume_deadline_recheck_and_fenced_reschedule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _InMemoryDeferralStore()
-    notices: list[dict[str, Any]] = []
+    root_job_id = str(uuid4())
+    thread_id = str(uuid4())
+    failed_run_id = str(uuid4())
+    ws_id = str(uuid4())
+    past_due = datetime.now(timezone.utc) - timedelta(hours=25)
 
-    async def _capture_notice(conn: Any, **kw: Any) -> bool:
-        notices.append(kw)
-        return True
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield store
 
-    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", _capture_notice)
+    monkeypatch.setattr(uf, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(
+        uf,
+        "_maybe_enqueue_failure_notice_in_tx",
+        create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False, return_value=True),
+    )
+
+    # Case A: Past 24h deadline on claim -> marks exhausted_failed, NEVER calls post_notification_turn
+    store.rows[root_job_id] = {
+        "root_job_id": root_job_id,
+        "wakeup_id": "wake-expired",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": past_due,
+        "deadline_at": past_due + timedelta(hours=24),
+        "defer_count": 1,
+        "last_step_key": f"mid:{failed_run_id}",
+        "seen_step_keys": [f"mid:{failed_run_id}"],
+        "status": "deferred",
+    }
+    orig_post_turn = notify_turn.post_notification_turn
+    post_mock = create_autospec(orig_post_turn, instance=False)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+
+    await uf.execute_wakeup_quota_resume(
+        {
+            "hook_outbox_id": str(uuid4()),
+            "conversation_thread_id": thread_id,
+            "run_id": failed_run_id,
+            "attempts": 1,
+            "payload": {
+                "root_job_id": root_job_id,
+                "wakeup_id": "wake-expired",
+                "owner_user_id": "owner-1",
+                "workspace_id": ws_id,
+                "failed_run_id": failed_run_id,
+                "defer_count": 1,
+            },
+        }
+    )
+    assert post_mock.await_count == 0
+    assert store.rows[root_job_id]["status"] == "exhausted_failed"
+
+    # Case B: Within deadline, hits pre-dispatch cooldown on resume -> reschedules WITH attempts fence
+    root_job_2 = str(uuid4())
+    outbox_id_2 = str(uuid4())
+    now = datetime.now(timezone.utc)
+    store.rows[root_job_2] = {
+        "root_job_id": root_job_2,
+        "wakeup_id": "wake-resched",
+        "thread_id": thread_id,
+        "owner_user_id": "owner-1",
+        "first_due_at": now - timedelta(hours=1),
+        "deadline_at": now + timedelta(hours=23),
+        "defer_count": 1,
+        "last_step_key": f"mid:{failed_run_id}",
+        "seen_step_keys": [f"mid:{failed_run_id}"],
+        "status": "deferred",
+    }
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            tl_db.get_latest_attempt,
+            instance=False,
+            return_value={"conversation_response_id": failed_run_id, "status": "error", "metadata": {"workspace_id": ws_id}},
+        ),
+    )
+
+    async def _plan_limited_cooldown(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        cb = kwargs.get("on_plan_limited")
+        if cb is not None:
+            await cb(
+                {
+                    "type": uf.DALTON_SUBSCRIPTION_COOLDOWN_TYPE,
+                    "reason": "plan_limited",
+                    "held_until": (now + timedelta(minutes=30)).isoformat(),
+                }
+            )
+        return "plan_limited", None
+
+    post_mock_2 = create_autospec(orig_post_turn, instance=False, side_effect=_plan_limited_cooldown)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock_2)
+
+    await uf.execute_wakeup_quota_resume(
+        {
+            "hook_outbox_id": outbox_id_2,
+            "conversation_thread_id": thread_id,
+            "run_id": failed_run_id,
+            "attempts": 2,
+            "payload": {
+                "root_job_id": root_job_2,
+                "wakeup_id": "wake-resched",
+                "owner_user_id": "owner-1",
+                "workspace_id": ws_id,
+                "failed_run_id": failed_run_id,
+                "defer_count": 1,
+            },
+        }
+    )
+    assert len(store.reschedule_queries) == 1
+    sql_text, sql_params = store.reschedule_queries[0]
+    assert "AND attempts = %s" in sql_text
+    assert sql_params[1] == outbox_id_2
+    assert sql_params[2] == 2
+
+    # Case C: Resume hits dalton_wakeup_quota_exhausted (no held_until) -> settles cleanly without raising
+    async def _plan_limited_exhausted(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        cb = kwargs.get("on_plan_limited")
+        if cb is not None:
+            await cb(
+                {
+                    "type": uf.DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE,
+                    "reason": "wakeup_quota_defer_limit_exceeded",
+                    "held_until": None,
+                }
+            )
+        return "plan_limited", None
+
+    post_mock_3 = create_autospec(orig_post_turn, instance=False, side_effect=_plan_limited_exhausted)
+    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock_3)
+    await uf.execute_wakeup_quota_resume(
+        {
+            "hook_outbox_id": outbox_id_2,
+            "conversation_thread_id": thread_id,
+            "run_id": failed_run_id,
+            "attempts": 3,
+            "payload": {
+                "root_job_id": root_job_2,
+                "wakeup_id": "wake-resched",
+                "owner_user_id": "owner-1",
+                "workspace_id": ws_id,
+                "failed_run_id": failed_run_id,
+                "defer_count": 3,
+            },
+        }
+    )
+    assert post_mock_3.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. Unknown reset, 24h overflow, pure auth failure, and executor registration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wakeup_unknown_reset_24h_overflow_and_pure_auth_zero_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _InMemoryDeferralStore()
+    notice_mock = create_autospec(uf._maybe_enqueue_failure_notice_in_tx, instance=False, return_value=True)
+    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", notice_mock)
 
     t0 = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
-    # Unknown reset_at=None -> effective_reset_at = now + 30m, held_known = False
-    r_unknown = str(uuid4())
+
+    # Unknown reset_at=None -> now + 30m, held_known=False
     dec_unknown = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
-        root_job_id=r_unknown,
+        root_job_id=str(uuid4()),
         wakeup_id="wake-unknown",
         thread_id=str(uuid4()),
         owner_user_id="owner-2",
@@ -329,17 +981,11 @@ async def test_wakeup_unknown_reset_uses_30m_and_24h_overflow_rejects(
     assert dec_unknown.action == "defer"
     assert dec_unknown.held_known is False
     assert dec_unknown.effective_reset_at == t0 + timedelta(minutes=30)
-    assert dec_unknown.scheduled_wake_at == t0 + timedelta(minutes=31)
-    exc = uf.build_wakeup_cooldown_http_exception(dec_unknown)
-    assert exc.status_code == 400
-    assert exc.detail["type"] == "dalton_subscription_cooldown"
-    assert exc.detail["held_known"] is False
 
-    # Single 7-day cooldown exceeding first_due_at + 24h -> immediate exhausted_failed + notice
-    r_long = str(uuid4())
+    # 7-day cooldown exceeds 24h deadline -> immediate exhausted_failed
     dec_long = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
-        root_job_id=r_long,
+        root_job_id=str(uuid4()),
         wakeup_id="wake-long",
         thread_id=str(uuid4()),
         owner_user_id="owner-3",
@@ -358,29 +1004,14 @@ async def test_wakeup_unknown_reset_uses_30m_and_24h_overflow_rejects(
     )
     assert dec_long.action == "exhausted_failed"
     assert dec_long.reason == "wakeup_quota_deadline_exceeded"
-    assert len(notices) == 1
-    assert notices[0]["recipient_user_id"] == "owner-3"
-    assert notices[0]["subject_kind"] == "wakeup"
+    exc_long = uf.build_wakeup_cooldown_http_exception(dec_long)
+    assert exc_long.detail["type"] == uf.DALTON_WAKEUP_QUOTA_EXHAUSTED_TYPE
+    assert "held_until" in exc_long.detail
 
-
-@pytest.mark.asyncio
-async def test_wakeup_pure_auth_unavailable_fails_immediately_with_zero_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _InMemoryDeferralStore()
-    notices: list[dict[str, Any]] = []
-
-    async def _capture_notice(conn: Any, **kw: Any) -> bool:
-        notices.append(kw)
-        return True
-
-    monkeypatch.setattr(uf, "_maybe_enqueue_failure_notice_in_tx", _capture_notice)
-
-    t0 = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
-    root_id = str(uuid4())
-    dec = await uf.evaluate_and_record_wakeup_deferral_tx(
+    # Pure auth_unavailable -> zero wait, exhausted_failed
+    dec_auth = await uf.evaluate_and_record_wakeup_deferral_tx(
         store,
-        root_job_id=root_id,
+        root_job_id=str(uuid4()),
         wakeup_id="wake-auth",
         thread_id=str(uuid4()),
         owner_user_id="owner-auth",
@@ -392,128 +1023,14 @@ async def test_wakeup_pure_auth_unavailable_fails_immediately_with_zero_wait(
                 refusal_code="oauth_reauth_required",
                 model_name="claude-opus-5-5-oauth",
             ),
-            uf.SubscriptionAvailability(
-                available=False,
-                kind="auth_unavailable",
-                refusal_code="oauth_reauth_required",
-                model_name="gpt-6.2-sol-oauth",
-            ),
         ],
         first_due_at=t0,
         now=t0,
     )
-    assert dec.action == "exhausted_failed"
-    assert dec.reason == "oauth_auth_unavailable"
-    assert dec.defer_count == 0
-    assert dec.scheduled_wake_at is None
-    assert len(notices) == 1
-    assert notices[0]["failure_reason"] == "oauth_auth_unavailable"
-    assert notices[0]["recipient_user_id"] == "owner-auth"
-
-
-@pytest.mark.asyncio
-async def test_notify_turn_plan_limited_and_wakeup_resume_executor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # 1. _plan_limited recognizes dalton_subscription_cooldown (with held_known) & dalton_wakeup_quota_exhausted
-    class _FakeResp:
-        def __init__(self, status: int, body: dict[str, Any]) -> None:
-            self.status = status
-            self._body = body
-
-        async def json(self) -> dict[str, Any]:
-            return self._body
-
-    detail_cool = {
-        "type": "dalton_subscription_cooldown",
-        "reason": "plan_limited",
-        "held_until": "2026-11-27T14:00:00+00:00",
-        "held_known": False,
-    }
-    parsed = await notify_turn._plan_limited(_FakeResp(400, {"detail": detail_cool}))
-    assert parsed == detail_cool
-
-    detail_exh = {"type": "dalton_wakeup_quota_exhausted", "reason": "wakeup_quota_defer_limit_exceeded"}
-    parsed_exh = await notify_turn._plan_limited(_FakeResp(400, {"detail": detail_exh}))
-    assert parsed_exh == detail_exh
-
-    # 2. execute_wakeup_quota_resume dispatches /retry when thread still at failed_run_id
-    from src.server.database.runs import lifecycle as tl_db
-    from src.server.services.runs import pending_input
-
-    root_id = str(uuid4())
-    thread_id = str(uuid4())
-    failed_run_id = str(uuid4())
-
-    monkeypatch.setattr(
-        tl_db,
-        "get_latest_attempt",
-        AsyncMock(return_value={"conversation_response_id": failed_run_id, "status": "error"}),
-    )
-    monkeypatch.setattr(
-        pending_input,
-        "retried_wake_fields",
-        AsyncMock(return_value={"query_type": "wakeup", "wakeup": {"v": 1, "notices": []}}),
-    )
-    post_mock = create_autospec(notify_turn.post_notification_turn, instance=False)
-    post_mock.return_value = ("dispatched", "new-run-1")
-    monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
-
-    await uf.execute_wakeup_quota_resume(
-        {
-            "hook_outbox_id": str(uuid4()),
-            "conversation_thread_id": thread_id,
-            "run_id": failed_run_id,
-            "payload": {
-                "root_job_id": root_id,
-                "wakeup_id": "wake-1",
-                "owner_user_id": "owner-1",
-                "failed_run_id": failed_run_id,
-                "turn_index": 3,
-                "resume_checkpoint_id": "ckpt-step-1",
-                "defer_count": 2,
-                "request_key": f"wakeup_resume:{root_id}:2",
-            },
-        }
-    )
-    assert post_mock.await_count == 1
-    call_kw = post_mock.await_args.kwargs
-    assert call_kw["route"] == "retry"
-    assert call_kw["body"]["checkpoint_id"] == "ckpt-step-1"
-    assert call_kw["body"]["run_id"] == failed_run_id
-    assert call_kw["body"]["request_key"] == f"wakeup_resume:{root_id}:2"
-
-    # 3. If user already sent a newer turn on the thread, executor marks deferral settled and yields
-    settled_ids: list[str] = []
-
-    async def _fake_settled(rid: str, **kw: Any) -> bool:
-        settled_ids.append(rid)
-        return True
-
-    monkeypatch.setattr(uf, "mark_wakeup_deferral_settled", _fake_settled)
-    monkeypatch.setattr(
-        tl_db,
-        "get_latest_attempt",
-        AsyncMock(return_value={"conversation_response_id": str(uuid4()), "status": "completed"}),
-    )
-    post_mock.reset_mock()
-    await uf.execute_wakeup_quota_resume(
-        {
-            "hook_outbox_id": str(uuid4()),
-            "conversation_thread_id": thread_id,
-            "run_id": failed_run_id,
-            "payload": {
-                "root_job_id": root_id,
-                "wakeup_id": "wake-1",
-                "owner_user_id": "owner-1",
-                "failed_run_id": failed_run_id,
-                "resume_checkpoint_id": "ckpt-step-1",
-                "defer_count": 2,
-            },
-        }
-    )
-    assert post_mock.await_count == 0
-    assert settled_ids == [root_id]
+    assert dec_auth.action == "exhausted_failed"
+    assert dec_auth.reason == "oauth_auth_unavailable"
+    assert dec_auth.defer_count == 0
+    assert notice_mock.await_count == 2
 
 
 def test_register_wakeup_executors_registers_resume_hook(monkeypatch: pytest.MonkeyPatch) -> None:

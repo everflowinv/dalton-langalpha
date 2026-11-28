@@ -591,6 +591,7 @@ async def astream_ptc_workflow(
                         config, run_metadata = await resolve_ptc_turn_llm_config(
                             setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
                             workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
+                            run_id=run_id,
                         )
 
                 # Persist query start
@@ -792,6 +793,16 @@ async def astream_ptc_workflow(
                     # turn it replaced.
                     query_metadata[UNTYPED_KEY] = True
 
+                # DALTON-HOOK(quota-exhaustion): compute START-time wakeup quota continuity metadata
+                from src.dalton.llm.unattended_fallback import build_wakeup_quota_start_metadata
+
+                _wakeup_quota_start_meta = build_wakeup_quota_start_metadata(
+                    request,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    effective_model=effective_model,
+                )
+
                 run_handle = await begin_run(
                     request,
                     scope=scope,
@@ -839,6 +850,18 @@ async def astream_ptc_workflow(
                             if config and getattr(config, "llm", None) and getattr(config.llm, "fallback", None)
                             else {}
                         ),
+                        # DALTON-HOOK(quota-exhaustion): persist admitted unattended fallback candidates, active route, and wakeup continuity at START
+                        **(
+                            {"unattended_fallback_models": list(config.fallback_llm_names)}
+                            if config and getattr(config, "fallback_llm_names", None)
+                            else {}
+                        ),
+                        **(
+                            {"active_fallback_route": dict(config._dalton_active_fallback_route)}
+                            if config and isinstance(getattr(config, "_dalton_active_fallback_route", None), dict)
+                            else {}
+                        ),
+                        **_wakeup_quota_start_meta,
                         **firing,
                         **home.run_metadata(),
                         **identity.stamp(run_metadata),
@@ -924,6 +947,20 @@ async def astream_ptc_workflow(
             is_byok=own_key,
             sender=user_id,
         )
+        # DALTON-HOOK(quota-exhaustion): bind canonical run_id/payer onto stamped fallback clients & apply any pre-dispatch cash lease verdict
+        from src.dalton.llm.unattended_fallback import (
+            _bind_lease_verdict_to_credit_lease,
+            bind_unattended_fallback_run_context,
+        )
+
+        bind_unattended_fallback_run_context(
+            config,
+            run_id=run_id,
+            payer_user_id=identity.recorded_as,
+        )
+        _pre_cash_verdict = getattr(config, "_dalton_pre_cash_lease_verdict", None)
+        if _pre_cash_verdict is not None and credit_gate is not None:
+            _bind_lease_verdict_to_credit_lease(credit_gate, _pre_cash_verdict)
 
         _mark_phase("db_setup")
 

@@ -314,8 +314,6 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
     if client is None:
         return None
-    from src.dalton.credentials import credential_user_id
-    from src.dalton.llm.antigravity_series import quota_cooldown_target  # DALTON-HOOK(antigravity-series)
     from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
 
     spec = oauth_rebuild_spec(client)
@@ -351,21 +349,16 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
 
     if not raw_user or not provider or not model_id:
         return None
-    if raw_user != "platform":
-        try:
-            cred_user = credential_user_id(str(raw_user))
-        except Exception:
-            cred_user = str(raw_user)
-    else:
-        cred_user = "platform"
-    if not cred_user:
-        return None
-    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth models share a
-    # disjoint `:vendor:{vendor}` namespace; other providers and custom models
-    # use `:model:{model_id}`.
-    scope_kind, target = quota_cooldown_target(provider, model_id, is_custom=is_custom)
-    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}"
-    return f"{base}:{cred_id}" if cred_id else base
+    # DALTON-HOOK(quota-exhaustion): share the exact cooldown key builder with pre-dispatch probing
+    from src.dalton.llm.unattended_fallback import build_quota_cooldown_key
+
+    return build_quota_cooldown_key(
+        user_id=str(raw_user),
+        model_name=model_id,
+        provider=provider,
+        is_custom=is_custom,
+        credential_id=cred_id,
+    )
 
 
 def format_quota_cooldown_message(  # DALTON-HOOK(quota-exhaustion)
@@ -2270,12 +2263,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 continue
             # DALTON-HOOK(automation-subscription-fallback): enforce quota/auth trigger & live 4-gate admission before activating quota_or_auth_only fallback
             if index > 0:
+                from ptc_agent.agent.middleware.credit_gate import current_credit_gate
                 from src.dalton.llm.unattended_fallback import verify_middleware_fallback_switch
                 if not await verify_middleware_fallback_switch(
                     candidate_name=name, candidate_client=cand_client,
                     last_exc=records[-1].exc if records else None,
                     primary_quota_skipped=primary_skipped, quota_benched=last_benched,
                     call_id=f"{name}:{_last_message_id(request) or index}",
+                    credit_lease=current_credit_gate.get(),
                 ):
                     continue
             if not tried_any:

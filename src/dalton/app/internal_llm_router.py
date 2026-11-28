@@ -171,24 +171,43 @@ async def internal_llm_complete(
         )
 
     from src.dalton.llm.unattended_fallback import (
+        _classify_candidate_billing,
         _maybe_enqueue_failure_notice_in_tx,
         format_unattended_quota_notice,
         inspect_subscription_availability,
+        is_complete_result_quota_or_auth_trigger,
         resolve_unattended_fallback_chain,
     )
     from src.dalton.settings import is_unattended_quota_fallback_enabled
     from src.server.database.pool import get_db_connection
+
+    def _is_verified_system_subscription_model(model_key: str) -> bool:
+        try:
+            from src.llms.llm import LLM as LLMFactory
+
+            if LLMFactory.get_model_config().get_model_config(model_key) is None:
+                return False
+        except Exception:
+            return False
+        billing, _ = _classify_candidate_billing(
+            model_key, ignore_custom_models=True
+        )
+        return billing == "oauth"
 
     unattended_on = is_unattended_quota_fallback_enabled()
     primary_avail = None
     active_model = requested_model
     if unattended_on:
         primary_avail = await inspect_subscription_availability(
-            primary_admin_id, requested_model
+            primary_admin_id, requested_model, ignore_custom_models=True
         )
         if not primary_avail.available:
             skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
-            ordered_pool = [m for m in sorted(allowed_models) if m != requested_model]
+            ordered_pool = [
+                m
+                for m in sorted(allowed_models)
+                if m != requested_model and _is_verified_system_subscription_model(m)
+            ]
             pre_candidates = resolve_unattended_fallback_chain(
                 task_fallbacks=ordered_pool,
                 primary_model=requested_model,
@@ -199,8 +218,10 @@ async def internal_llm_complete(
                 ignore_custom_models=True,
             )
             for cand_model in pre_candidates:
+                if not _is_verified_system_subscription_model(cand_model):
+                    continue
                 cand_avail = await inspect_subscription_availability(
-                    primary_admin_id, cand_model
+                    primary_admin_id, cand_model, ignore_custom_models=True
                 )
                 if cand_avail.available:
                     active_model = cand_model
@@ -215,31 +236,23 @@ async def internal_llm_complete(
         slot="background",
         purpose=payload.purpose,
         timeout_s=payload.timeout_s,
+        ignore_custom_models=True,
     )
 
     if not result.ok and unattended_on:
-        err_blob = f"{getattr(result, 'error_kind', '') or ''} {result.error or ''}".lower()
-        is_quota_or_auth = any(
-            tok in err_blob
-            for tok in (
-                "429",
-                "quota",
-                "plan_limit",
-                "rate_limit",
-                "oauth",
-                "reauth",
-                "out_of_credit",
-                "billing",
-            )
-        )
+        is_quota_or_auth = is_complete_result_quota_or_auth_trigger(result)
         if is_quota_or_auth:
             if primary_avail is None:
                 primary_avail = await inspect_subscription_availability(
-                    primary_admin_id, active_model
+                    primary_admin_id, active_model, ignore_custom_models=True
                 )
             skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
             tried = {active_model}
-            ordered_pool = [m for m in sorted(allowed_models) if m not in tried]
+            ordered_pool = [
+                m
+                for m in sorted(allowed_models)
+                if m not in tried and _is_verified_system_subscription_model(m)
+            ]
             candidates = resolve_unattended_fallback_chain(
                 task_fallbacks=ordered_pool,
                 primary_model=active_model,
@@ -250,8 +263,10 @@ async def internal_llm_complete(
                 ignore_custom_models=True,
             )
             for cand_model in candidates:
+                if not _is_verified_system_subscription_model(cand_model):
+                    continue
                 cand_avail = await inspect_subscription_availability(
-                    primary_admin_id, cand_model
+                    primary_admin_id, cand_model, ignore_custom_models=True
                 )
                 if not cand_avail.available:
                     continue
@@ -264,6 +279,7 @@ async def internal_llm_complete(
                     slot="background",
                     purpose=payload.purpose,
                     timeout_s=payload.timeout_s,
+                    ignore_custom_models=True,
                 )
                 result = cand_res
                 if cand_res.ok:

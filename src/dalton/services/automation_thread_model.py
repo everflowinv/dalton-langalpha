@@ -1210,6 +1210,8 @@ async def resolve_turn_config_with_automation_inheritance(
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
     retry_source_execution_id: str | None = None,
+    run_id: str | None = None,
+    payer_user_id: str | None = None,
     resolve: Callable[..., Awaitable[Any]],
     flagged_subscription: tuple[Any, str | None] | None = None,
     on_fallback: Callable[[dict[str, Any]], None] | None = None,
@@ -1304,6 +1306,7 @@ async def resolve_turn_config_with_automation_inheritance(
 
     from src.dalton.llm.unattended_fallback import (
         UnattendedTurnContext,
+        acquire_fallback_candidate_live,
         bind_unattended_turn_context,
         build_wakeup_cooldown_http_exception,
         classify_unattended_source_kind,
@@ -1312,9 +1315,11 @@ async def resolve_turn_config_with_automation_inheritance(
         inspect_subscription_availability,
         is_unattended_turn,
         resolve_unattended_fallback_chain,
+        route_fingerprint_to_dict,
     )
     from src.dalton.settings import is_unattended_quota_fallback_enabled
 
+    eff_payer_id = payer_user_id or user_id
     unattended_quota_on = is_unattended_quota_fallback_enabled() and is_unattended_turn(
         request,
         from_service=from_service,
@@ -1323,8 +1328,10 @@ async def resolve_turn_config_with_automation_inheritance(
         UnattendedTurnContext(
             is_unattended=True,
             subject_user_id=user_id,
+            payer_user_id=eff_payer_id,
             source_kind=classify_unattended_source_kind(request),
             ignore_custom_models=inherited_system_only,
+            run_id=run_id,
             thread_id=thread_id,
         )
         if unattended_quota_on
@@ -1415,10 +1422,39 @@ async def resolve_turn_config_with_automation_inheritance(
                     availabilities.append(cand_avail)
                     if not cand_avail.available:
                         continue
+                    async def _cached_cand_avail(*_a: Any, **_kw: Any) -> Any:
+                        return cand_avail
+
+                    admission = await acquire_fallback_candidate_live(
+                        subject_user_id=user_id,
+                        payer_user_id=eff_payer_id,
+                        candidate_model=cand,
+                        run_id=run_id,
+                        call_id=f"pre:{run_id}:{cand}" if run_id else None,
+                        ignore_custom_models=inherited_system_only,
+                        model_pref=default_pref_for_probe,
+                        availability_fn=_cached_cand_avail,
+                    )
+                    if not admission.admitted:
+                        continue
                     try:
                         cfg = await _effective_resolve(cand)
                     except Exception:
                         continue
+                    if admission.lease_verdict is not None:
+                        try:
+                            setattr(cfg, "_dalton_pre_cash_lease_verdict", admission.lease_verdict)
+                        except Exception:
+                            pass
+                    if admission.route is not None:
+                        try:
+                            setattr(
+                                cfg,
+                                "_dalton_active_fallback_route",
+                                route_fingerprint_to_dict(admission.route),
+                            )
+                        except Exception:
+                            pass
                     chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
                     kind = (
                         "oauth_auth_unavailable"
@@ -1474,6 +1510,7 @@ async def resolve_turn_config_with_automation_inheritance(
                             step_key=f"pre:{job_id}:{attempts}",
                             availabilities=availabilities,
                             first_due_at=_parse_iso_or_epoch(wakeup_map.get("first_due_at")),
+                            workspace_id=getattr(request, "workspace_id", None),
                         )
                         raise build_wakeup_cooldown_http_exception(decision)
 
@@ -1519,6 +1556,9 @@ async def resolve_turn_config_with_automation_inheritance(
             model_resolves_fn=model_resolves,
             failed_subject=failed_subject,
             ignore_custom_models=inherited_system_only,
+            unattended_gate=unattended_quota_on,
+            payer_user_id=eff_payer_id,
+            run_id=run_id,
         )
         if target_exec and target_exec.get("automation_execution_id"):
             record = {

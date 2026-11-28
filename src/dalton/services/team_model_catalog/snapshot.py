@@ -590,6 +590,18 @@ async def verify_resume_route(
         return None
 
     snap_route = extract_snapshot_route_fingerprint(snap, orig_model_key)
+    # When an unattended turn switches during resume to a fallback candidate that was
+    # already recorded in the interrupted run's snapshot, verify that candidate's 6-tuple
+    # against the original snapshot instead of rejecting the model_key change itself.
+    if live.model_key and live.model_key != orig_model_key and live.model_key in models:
+        from src.dalton.llm.unattended_fallback import get_active_unattended_turn_context
+        from src.dalton.settings import is_unattended_quota_fallback_enabled
+
+        _uf_ctx = get_active_unattended_turn_context()
+        if is_unattended_quota_fallback_enabled() and _uf_ctx is not None and _uf_ctx.is_unattended:
+            cand_snap = extract_snapshot_route_fingerprint(snap, live.model_key)
+            if cand_snap is not None:
+                snap_route = cand_snap
     if snap_route is None:
         # Original run was not on a snapshotted team catalog model (e.g. personal custom model).
         return None

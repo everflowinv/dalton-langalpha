@@ -499,3 +499,8 @@ class RetryRequest(BaseModel):
         None,
         description="The failed send's chart views, as its additional context.",
     )
+    # DALTON-HOOK(quota-exhaustion): server-only wakeup quota resume provenance (root_job_id, job_id, attempts, first_due_at)
+    wakeup_resume: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Server-only wakeup quota resume continuity metadata.",
+    )
