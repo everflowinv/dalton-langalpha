@@ -18447,6 +18447,7 @@ async def register_automation_run(
                         and (t.get("reached") is True or bool(t.get("via")))
                         for t in existing_targets
                     )
+                    has_default_entry = any(":" not in e for e in incoming_entries)
                     can_re_resolve = (
                         existing_status == "registered"
                         and not any_reached
@@ -18455,6 +18456,7 @@ async def register_automation_run(
                     if not can_re_resolve or (
                         existing_entries == incoming_entries
                         and existing_ws == norm_ws_id
+                        and not has_default_entry
                     ):
                         if (
                             can_re_resolve

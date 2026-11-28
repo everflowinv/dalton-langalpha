@@ -6,7 +6,13 @@
 SLEEP_SECONDS="${WAIT_BACKEND_IDLE_SLEEP_SECONDS:-60}"
 MAX_CHECKS="${WAIT_BACKEND_IDLE_MAX_CHECKS:-720}"
 POSTGRES_CONTAINER="${WAIT_BACKEND_IDLE_POSTGRES_CONTAINER:-dalton-langalpha-postgres-1}"
-THREAD_BUSY_SQL="SELECT count(*) FROM conversation_threads ct WHERE ct.current_status = 'in_progress' AND NOT (ct.updated_at < NOW() - INTERVAL '15 minutes' AND EXISTS (SELECT 1 FROM automation_executions ae WHERE ae.conversation_thread_id = ct.conversation_thread_id) AND NOT EXISTS (SELECT 1 FROM automation_executions ae WHERE ae.conversation_thread_id = ct.conversation_thread_id AND ae.status NOT IN ('completed', 'failed', 'skipped', 'cancelled', 'timeout')) AND NOT EXISTS (SELECT 1 FROM conversation_responses cr WHERE cr.conversation_thread_id = ct.conversation_thread_id AND cr.status = 'in_progress'))"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+THREAD_BUSY_SQL_FILE="${WAIT_BACKEND_IDLE_SQL_FILE:-${SCRIPT_DIR}/backend_busy_threads.sql}"
+if [ ! -f "$THREAD_BUSY_SQL_FILE" ]; then
+  echo "ERROR: missing ${THREAD_BUSY_SQL_FILE}" >&2
+  exit 1
+fi
+THREAD_BUSY_SQL="$(tr '\n' ' ' < "$THREAD_BUSY_SQL_FILE" | sed 's/  */ /g; s/^ //; s/ $//')"
 SUBAGENT_BUSY_SQL="SELECT count(*) FROM subagent_runs WHERE status='in_progress'"
 ok=0
 for i in $(seq 1 "$MAX_CHECKS"); do

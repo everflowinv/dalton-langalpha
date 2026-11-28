@@ -39,9 +39,10 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import HTTPException
 from psycopg.rows import dict_row
@@ -54,8 +55,9 @@ from src.server.database import automation_executions as exec_db
 from src.server.database.pool import get_db_connection
 from src.server.services import automation_delivery
 from src.server.services.automation_computer_wait import stopped_meanwhile
-from src.server.services.automation_outcomes import Outcome, clean_error_text
+from src.server.services.automation_outcomes import POLICIES, Outcome, clean_error_text
 from src.server.services.automation_settlement import settle
+from src.server.services.webhook_client import WebhookClient
 from src.server.services.writer_guard import WriterGuardUnavailable
 
 logger = logging.getLogger(__name__)
@@ -63,11 +65,15 @@ logger = logging.getLogger(__name__)
 CAPACITY_WAIT_REASON = "capacity_limit"
 CAPACITY_RETRY_KEY = "capacity_retry"
 DELIVERY_META_KEY = "delivery_meta"
+FAILURE_NOTIFY_KEY = "failure_notify"
 
 DEFAULT_INITIAL_BACKOFF_SECONDS = 30.0
 DEFAULT_MAX_BACKOFF_SECONDS = 240.0
 DEFAULT_MAX_WAIT_SECONDS = 15 * 60  # 15-minute total wait cap
 DEFAULT_DISPATCH_LEASE_SECONDS = 30.0
+FAILURE_NOTIFY_MAX_ATTEMPTS = 5
+FAILURE_NOTIFY_LEASE_SECONDS = 60.0
+FAILURE_NOTIFY_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 60.0, 180.0)
 
 _CAPACITY_429_TYPES = frozenset({"burst_limit", "service_unavailable"})
 
@@ -267,6 +273,8 @@ async def reset_thread_status_after_prestart_exit(
         return False
     fallback = _fallback_thread_status(outcome)
     if conn is not None:
+        if not callable(getattr(conn, "cursor", None)):
+            return False
         return await _reset_thread_status_on_conn(
             conn, str(thread_id), fallback=fallback
         )
@@ -309,6 +317,11 @@ def _extract_delivery_meta(delivery_obj: Any) -> dict[str, Any]:
         return {}
     meta = delivery_obj.get(DELIVERY_META_KEY)
     return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def has_default_delivery_entry(entries: Sequence[str]) -> bool:
+    """Return True when any delivery entry is an app-only default target (no ':')."""
+    return any(isinstance(e, str) and bool(e.strip()) and ":" not in e for e in entries)
 
 
 def delivery_id_for_start(execution_id: str, delivery_starts: int) -> str:
@@ -522,7 +535,11 @@ async def reconcile_delivery_for_settled_failure(
             )
         return None
 
-    if current_delivery is not None and prior_entries == entries:
+    if (
+        current_delivery is not None
+        and prior_entries == entries
+        and not has_default_delivery_entry(entries)
+    ):
         return current_delivery
 
     next_starts = prior_starts + 1
@@ -835,16 +852,18 @@ async def release_capacity_parked_execution(
     *,
     lease_seconds: float = DEFAULT_DISPATCH_LEASE_SECONDS,
     max_wait_seconds: int = DEFAULT_MAX_WAIT_SECONDS,
-) -> bool:
+) -> Optional[str]:
     """Atomically claim a due capacity-parked (or lease-expired pending) row.
 
-    Sets ``status = 'pending'``, refreshes ``heartbeat_at``, and stamps
-    ``delivery.capacity_retry.dispatch_lease_until = NOW() + lease_seconds`` in
-    one guarded ``UPDATE``. Concurrent sweeps across workers observe at most one
-    winner (``rowcount == 1``); if that winner crashes before
-    ``begin_execution_if_not_deleted`` (``pending -> running``), another worker
-    reclaims the row once ``dispatch_lease_until`` elapses.
+    Sets ``status = 'pending'``, refreshes ``heartbeat_at``, and stamps a fresh
+    ``claim_token`` + bounded ``dispatch_lease_until`` in
+    ``delivery.capacity_retry`` in one guarded ``UPDATE``. Concurrent sweeps
+    across workers observe at most one winner (returns ``claim_token``); if
+    that winner stalls past the lease before ``begin_execution_if_not_deleted``
+    (``pending -> running``), another worker reclaims with a new token and the
+    stale worker's ``claim_token`` is rejected at start and lease-release time.
     """
+    claim_token = str(uuid4())
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -858,6 +877,7 @@ async def release_capacity_parked_execution(
                         COALESCE(e.delivery->'capacity_retry', '{{}}'::jsonb)
                         || jsonb_build_object(
                             'claimed_at', to_jsonb(NOW()),
+                            'claim_token', to_jsonb(%(claim_token)s::text),
                             'dispatch_lease_until',
                             to_jsonb(NOW() + make_interval(secs => %(lease_s)s::double precision))
                         ),
@@ -891,15 +911,24 @@ async def release_capacity_parked_execution(
                 {
                     "execution_id": execution_id,
                     "wait_reason": CAPACITY_WAIT_REASON,
+                    "claim_token": claim_token,
                     "lease_s": float(lease_seconds),
                     "max_wait_s": float(max_wait_seconds),
                 },
             )
-            return cur.rowcount == 1
+            return claim_token if cur.rowcount == 1 else None
 
 
-async def release_dispatch_lease(execution_id: str) -> None:
-    """Expire an active dispatch lease immediately when local dispatch fails."""
+async def release_dispatch_lease(
+    execution_id: str,
+    *,
+    claim_token: Optional[str] = None,
+) -> bool:
+    """Expire an active dispatch lease immediately when local dispatch fails.
+
+    Fenced on ``claim_token`` so a stale worker can never clear a newer worker's
+    reclaimed lease.
+    """
     try:
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
@@ -916,15 +945,443 @@ async def release_dispatch_lease(execution_id: str) -> None:
                     WHERE automation_execution_id = %s::uuid
                       AND status = 'pending'
                       AND wait_reason = %s
+                      AND (%s::text IS NULL OR delivery->'capacity_retry'->>'claim_token' = %s::text)
                     """,
-                    (execution_id, CAPACITY_WAIT_REASON),
+                    (execution_id, CAPACITY_WAIT_REASON, claim_token, claim_token),
                 )
+                return bool(getattr(cur, "rowcount", 0))
     except Exception as exc:
         logger.warning(
             "[CAPACITY_RETRY] Releasing dispatch lease failed: execution_id=%s error=%s",
             execution_id,
             exc,
         )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Durable, retryable failure notification task (keyed by execution_id;
+# supports executions with no thread_id / no run_id)
+# ---------------------------------------------------------------------------
+
+
+async def enqueue_settled_failure_notification(
+    conn: Any,
+    *,
+    execution_id: str,
+    automation: Mapping[str, Any],
+    outcome: Outcome,
+    error: Optional[str],
+    thread_id: Optional[str],
+    workspace_id: Optional[str],
+) -> bool:
+    """Write a durable retryable failure-notification task inside the settlement
+    transaction on ``automation_executions.delivery -> 'failure_notify'``.
+
+    Keyed by ``execution_id`` (no foreign key to ``conversation_threads`` or
+    ``conversation_responses``), so pre-START / threadless executions never lose
+    their failure notice if the settling process crashes right after commit.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    effective_ws = workspace_id or (
+        str(automation["workspace_id"]) if automation.get("workspace_id") else None
+    )
+    job_payload = {
+        "status": "pending",
+        "execution_id": execution_id,
+        "automation_id": str(automation["automation_id"]),
+        "user_id": str(automation["user_id"]),
+        "thread_id": str(thread_id) if thread_id else None,
+        "workspace_id": str(effective_ws) if effective_ws else None,
+        "outcome": outcome.value,
+        "error": error,
+        "attempts": 0,
+        "recorded": False,
+        "answered": False,
+        "next_retry_at": now_iso,
+        "created_at": now_iso,
+    }
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE automation_executions
+            SET delivery = jsonb_set(
+                COALESCE(delivery, '{}'::jsonb),
+                '{failure_notify}',
+                %s::jsonb,
+                true
+            )
+            WHERE automation_execution_id = %s::uuid
+            """,
+            (Json(job_payload), execution_id),
+        )
+        return bool(getattr(cur, "rowcount", 0))
+
+
+async def list_pending_failure_notifications(
+    limit: int = 50,
+    *,
+    max_attempts: int = FAILURE_NOTIFY_MAX_ATTEMPTS,
+) -> list[str]:
+    """List execution IDs with due pending or lease-expired failure notifications."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT e.automation_execution_id
+                FROM automation_executions e
+                WHERE e.status IN ('failed', 'timeout')
+                  AND e.delivery ? 'failure_notify'
+                  AND (
+                      (
+                          (e.delivery->'failure_notify'->>'status') = 'pending'
+                          AND COALESCE(
+                              (e.delivery->'failure_notify'->>'next_retry_at')::timestamptz <= NOW(),
+                              TRUE
+                          )
+                      )
+                      OR (
+                          (e.delivery->'failure_notify'->>'status') = 'claimed'
+                          AND COALESCE(
+                              (e.delivery->'failure_notify'->>'lease_until')::timestamptz <= NOW(),
+                              TRUE
+                          )
+                          AND COALESCE((e.delivery->'failure_notify'->>'attempts')::int, 0) < %(max_attempts)s
+                      )
+                  )
+                ORDER BY e.completed_at ASC NULLS LAST
+                LIMIT %(limit)s
+                """,
+                {"max_attempts": int(max_attempts), "limit": int(limit)},
+            )
+            return [str(r["automation_execution_id"]) for r in await cur.fetchall()]
+
+
+async def claim_failure_notification(
+    execution_id: str,
+    *,
+    lease_seconds: float = FAILURE_NOTIFY_LEASE_SECONDS,
+    max_attempts: int = FAILURE_NOTIFY_MAX_ATTEMPTS,
+) -> Optional[dict[str, Any]]:
+    """Atomically claim one due failure notification with a fenced claim token."""
+    claim_token = str(uuid4())
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE automation_executions e
+                SET delivery = jsonb_set(
+                    e.delivery,
+                    '{failure_notify}',
+                    (e.delivery->'failure_notify')
+                    || jsonb_build_object(
+                        'status', 'claimed',
+                        'claim_token', to_jsonb(%(claim_token)s::text),
+                        'attempts', to_jsonb(COALESCE((e.delivery->'failure_notify'->>'attempts')::int, 0) + 1),
+                        'lease_until', to_jsonb(NOW() + make_interval(secs => %(lease_s)s::double precision))
+                    ),
+                    true
+                )
+                WHERE e.automation_execution_id = %(execution_id)s::uuid
+                  AND e.delivery ? 'failure_notify'
+                  AND (
+                      (
+                          (e.delivery->'failure_notify'->>'status') = 'pending'
+                          AND COALESCE(
+                              (e.delivery->'failure_notify'->>'next_retry_at')::timestamptz <= NOW(),
+                              TRUE
+                          )
+                      )
+                      OR (
+                          (e.delivery->'failure_notify'->>'status') = 'claimed'
+                          AND COALESCE(
+                              (e.delivery->'failure_notify'->>'lease_until')::timestamptz <= NOW(),
+                              TRUE
+                          )
+                          AND COALESCE((e.delivery->'failure_notify'->>'attempts')::int, 0) < %(max_attempts)s
+                      )
+                  )
+                RETURNING e.automation_execution_id,
+                          e.automation_id,
+                          e.conversation_thread_id,
+                          e.conversation_response_id,
+                          e.delivery,
+                          e.error_message
+                """,
+                {
+                    "execution_id": execution_id,
+                    "claim_token": claim_token,
+                    "lease_s": float(lease_seconds),
+                    "max_attempts": int(max_attempts),
+                },
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def _update_failure_notification_state(
+    execution_id: str,
+    *,
+    claim_token: str,
+    status: str,
+    delay_seconds: Optional[float] = None,
+    delivery_result: Optional[list[dict[str, Any]]] = None,
+    clear_retrying: bool = False,
+    recorded: Optional[bool] = None,
+    answered: Optional[bool] = None,
+) -> bool:
+    """Update failure_notify status (and optionally delivery_result) fenced on claim_token."""
+    patch_obj: dict[str, Any] = {"status": status}
+    if recorded is not None:
+        patch_obj["recorded"] = bool(recorded)
+    if answered is not None:
+        patch_obj["answered"] = bool(answered)
+    if status in ("done", "dead"):
+        patch_obj["completed_at"] = datetime.now(timezone.utc).isoformat()
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                if delay_seconds is not None:
+                    next_retry_expr = (
+                        "jsonb_build_object('next_retry_at', "
+                        "to_jsonb(NOW() + make_interval(secs => %(delay_s)s::double precision)))"
+                    )
+                else:
+                    next_retry_expr = "'{}'::jsonb"
+                await cur.execute(
+                    f"""
+                    UPDATE automation_executions
+                    SET delivery = jsonb_set(
+                        delivery,
+                        '{{failure_notify}}',
+                        ((delivery->'failure_notify') - 'lease_until' - 'claim_token')
+                        || %(patch)s::jsonb
+                        || {next_retry_expr},
+                        true
+                    )
+                    WHERE automation_execution_id = %(execution_id)s::uuid
+                      AND delivery->'failure_notify'->>'claim_token' = %(claim_token)s::text
+                    """,
+                    {
+                        "execution_id": execution_id,
+                        "claim_token": claim_token,
+                        "patch": Json(patch_obj),
+                        "delay_s": float(delay_seconds or 0.0),
+                    },
+                )
+                if cur.rowcount != 1:
+                    return False
+                if delivery_result is not None:
+                    await exec_db.record_delivery(
+                        execution_id, delivery_result, conn=conn
+                    )
+                elif clear_retrying:
+                    await exec_db.clear_delivery_retrying(execution_id, conn=conn)
+    return True
+
+
+def _failure_notify_backoff(attempts: int) -> float:
+    idx = max(0, min(int(attempts) - 1, len(FAILURE_NOTIFY_RETRY_DELAYS) - 1))
+    return FAILURE_NOTIFY_RETRY_DELAYS[idx]
+
+
+async def deliver_settled_failure_notification(execution_id: str) -> bool:
+    """Claim and deliver a durable failure-notification task for ``execution_id``.
+
+    Re-resolves current delivery recipients (including Feishu/Discord workspace
+    default groups), posts via the channel gateway or webhook, persists
+    ``delivery_result``, and schedules bounded retries on transient failure.
+    """
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
+    from src.server.services.automation_settlement import (
+        _replaces_record,
+        _stamp_delivery_retry,
+    )
+
+    claimed = await claim_failure_notification(execution_id)
+    if claimed is None:
+        return False
+
+    delivery_col = claimed.get("delivery")
+    job = (
+        delivery_col.get(FAILURE_NOTIFY_KEY)
+        if isinstance(delivery_col, Mapping)
+        else None
+    )
+    if not isinstance(job, Mapping):
+        return False
+    claim_token = str(job.get("claim_token") or "")
+    attempts = int(job.get("attempts") or 1)
+    recorded = job.get("recorded") is True
+    answered = job.get("answered") is True
+    automation_id = str(job.get("automation_id") or claimed.get("automation_id") or "")
+    user_id = str(job.get("user_id") or "")
+
+    try:
+        if not automation_id or await automation_is_soft_deleted(automation_id):
+            await _update_failure_notification_state(
+                execution_id, claim_token=claim_token, status="done"
+            )
+            return True
+        automation = await auto_db.get_automation(automation_id, user_id)
+        if automation is None:
+            await _update_failure_notification_state(
+                execution_id, claim_token=claim_token, status="done"
+            )
+            return True
+
+        raw_outcome = str(job.get("outcome") or Outcome.FAILED_OURS.value)
+        try:
+            outcome = Outcome(raw_outcome)
+        except ValueError:
+            outcome = Outcome.FAILED_OURS
+        policy = POLICIES[outcome]
+        thread_id = (
+            str(job["thread_id"])
+            if job.get("thread_id")
+            else (
+                str(claimed["conversation_thread_id"])
+                if claimed.get("conversation_thread_id")
+                else None
+            )
+        )
+        workspace_id = (
+            str(job["workspace_id"])
+            if job.get("workspace_id")
+            else (
+                str(automation["workspace_id"])
+                if automation.get("workspace_id")
+                else None
+            )
+        )
+        error = job.get("error") or claimed.get("error_message") or policy.error
+        current_delivery = automation_delivery.read_stamp(delivery_col, execution_id)
+        delivery = await reconcile_delivery_for_settled_failure(
+            automation,
+            execution_id,
+            settled_row=claimed,
+            thread_id=thread_id,
+            current_delivery=current_delivery,
+        )
+
+        if delivery is not None and delivery.held and policy.finish is not None:
+            finish = await automation_delivery.finish_run(
+                automation,
+                delivery.id,
+                policy.finish,
+                targets=delivery.targets,
+                final_text=None,
+                thread_id=thread_id,
+                run_id=None,
+            )
+            will_retry = finish.retry and attempts < FAILURE_NOTIFY_MAX_ATTEMPTS
+            should_write = not recorded or _replaces_record(finish, answered)
+            stamped_result = (
+                _stamp_delivery_retry(finish.result, retrying=will_retry)
+                if should_write
+                else None
+            )
+            next_answered = answered or finish.answered
+            next_recorded = recorded or should_write
+            if will_retry:
+                await _update_failure_notification_state(
+                    execution_id,
+                    claim_token=claim_token,
+                    status="pending",
+                    delay_seconds=_failure_notify_backoff(attempts),
+                    delivery_result=stamped_result,
+                    recorded=next_recorded,
+                    answered=next_answered,
+                )
+            else:
+                await _update_failure_notification_state(
+                    execution_id,
+                    claim_token=claim_token,
+                    status="done" if not finish.retry else "dead",
+                    delivery_result=stamped_result,
+                    clear_retrying=not should_write,
+                    recorded=next_recorded,
+                    answered=next_answered,
+                )
+            return True
+
+        delivery_result = await WebhookClient().fire_event(
+            policy.webhook,
+            automation,
+            execution_id,
+            thread_id,
+            workspace_id,
+            error=error,
+            run_id=None,
+            failure_reason=policy.failure_reason,
+        )
+        if delivery_result is None and delivery is not None and not delivery.held:
+            delivery_result = automation_delivery.unsent(delivery) or None
+        await _update_failure_notification_state(
+            execution_id,
+            claim_token=claim_token,
+            status="done",
+            delivery_result=delivery_result,
+            recorded=bool(delivery_result is not None or recorded),
+            answered=answered,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[CAPACITY_RETRY] Delivering settled failure notification failed "
+            "(attempt %d/%d): execution_id=%s error=%s",
+            attempts,
+            FAILURE_NOTIFY_MAX_ATTEMPTS,
+            execution_id,
+            exc,
+        )
+        if attempts < FAILURE_NOTIFY_MAX_ATTEMPTS:
+            await _update_failure_notification_state(
+                execution_id,
+                claim_token=claim_token,
+                status="pending",
+                delay_seconds=_failure_notify_backoff(attempts),
+            )
+        else:
+            await _update_failure_notification_state(
+                execution_id,
+                claim_token=claim_token,
+                status="dead",
+                clear_retrying=True,
+            )
+        return False
+
+
+async def drain_pending_failure_notifications(limit: int = 50) -> int:
+    """Drain due durable failure notifications across workers and restarts."""
+    try:
+        execution_ids = await list_pending_failure_notifications(limit=limit)
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return 0
+        logger.error(
+            "[CAPACITY_RETRY] Listing pending failure notifications failed: %s", exc
+        )
+        return 0
+    except Exception as exc:
+        logger.error(
+            "[CAPACITY_RETRY] Listing pending failure notifications failed: %s", exc
+        )
+        return 0
+
+    delivered = 0
+    for eid in execution_ids:
+        try:
+            if await deliver_settled_failure_notification(eid):
+                delivered += 1
+        except Exception as exc:
+            logger.error(
+                "[CAPACITY_RETRY] Draining failure notification failed: "
+                "execution_id=%s error=%s",
+                eid,
+                exc,
+            )
+    return delivered
 
 
 Dispatch = Callable[..., None]
@@ -937,27 +1394,16 @@ async def _settle_capacity_failure(
     thread_id: Optional[str],
     workspace_id: Optional[str],
     error: str,
+    expected_claim_token: Optional[str] = None,
+    require_capacity_expired: bool = False,
 ) -> bool:
     """Settle an expired or switch-drained capacity-parked row as FAILED_OURS.
 
-    Thread reset and pre-START signal release commit in the same settlement
-    transaction, and delivery initialization / reconciliation executes strictly
-    on the single worker that wins settlement.
+    Under FOR UPDATE, re-verifies ``wait_reason == 'capacity_limit'``, the
+    observed ``claim_token``, and (for expiry) the capacity deadline. Thread
+    reset, pre-START signal release, and durable retryable failure-notification
+    enqueuing all commit in the exact same settlement transaction.
     """
-
-    async def _prepare_delivery(
-        settled_row: dict[str, Any],
-        settled_thread_id: Optional[str],
-        current_delivery: Optional[automation_delivery.Delivery],
-    ) -> Optional[automation_delivery.Delivery]:
-        return await reconcile_delivery_for_settled_failure(
-            automation,
-            execution_id,
-            settled_row=settled_row,
-            thread_id=settled_thread_id,
-            current_delivery=current_delivery,
-        )
-
     return await settle(
         automation,
         execution_id,
@@ -966,9 +1412,12 @@ async def _settle_capacity_failure(
         workspace_id=workspace_id,
         error=error,
         from_statuses=("waiting", "pending"),
+        expected_wait_reason=CAPACITY_WAIT_REASON,
+        expected_claim_token=expected_claim_token,
+        require_capacity_expired=require_capacity_expired,
         release_pre_start_signals=True,
         reset_prestart_thread_status=True,
-        prepare_delivery_after_settle=_prepare_delivery,
+        enqueue_failure_notify=True,
     )
 
 
@@ -998,6 +1447,11 @@ async def sweep_one_capacity_parked(
         if isinstance(delivery_obj, Mapping)
         else None
     )
+    row_claim_token = (
+        str(retry_meta.get("claim_token"))
+        if isinstance(retry_meta, Mapping) and retry_meta.get("claim_token")
+        else None
+    )
     last_error = (
         str(retry_meta.get("last_error"))
         if isinstance(retry_meta, Mapping) and retry_meta.get("last_error")
@@ -1011,6 +1465,8 @@ async def sweep_one_capacity_parked(
             thread_id=thread_id,
             workspace_id=workspace_id,
             error=last_error,
+            expected_claim_token=row_claim_token,
+            require_capacity_expired=not force_fail,
         )
         return
 
@@ -1023,6 +1479,8 @@ async def sweep_one_capacity_parked(
             workspace_id=workspace_id,
             skip_reason="user",
             from_statuses=("waiting", "pending"),
+            expected_wait_reason=CAPACITY_WAIT_REASON,
+            expected_claim_token=row_claim_token,
             release_pre_start_signals=True,
             reset_prestart_thread_status=True,
         )
@@ -1036,7 +1494,8 @@ async def sweep_one_capacity_parked(
     if not row.get("due") or stopping():
         return
 
-    if not await release_capacity_parked_execution(execution_id):
+    claim_token = await release_capacity_parked_execution(execution_id)
+    if not claim_token:
         return
 
     logger.info(
@@ -1049,9 +1508,10 @@ async def sweep_one_capacity_parked(
             automation,
             execution_id,
             name=f"automation_exec_{str(automation['automation_id'])[:8]}",
+            claim_token=claim_token,
         )
     except Exception:
-        await release_dispatch_lease(execution_id)
+        await release_dispatch_lease(execution_id, claim_token=claim_token)
         raise
 
 
@@ -1060,11 +1520,12 @@ async def sweep_capacity_parked(
     *,
     stopping: Callable[[], bool],
 ) -> None:
-    """Refresh heartbeats and release/expire/drain capacity-parked executions.
+    """Refresh heartbeats, release/expire/drain capacity-parked executions, and
+    drain pending durable failure notifications.
 
     When ``DALTON_AUTOMATION_CAPACITY_RETRY`` is disabled, stops dispatching
     retries and drains every already-parked ``capacity_limit`` execution to
-    ``Outcome.FAILED_OURS`` through the shared failure-delivery path so no
+    ``Outcome.FAILED_OURS`` through the durable failure-notification path so no
     execution stays permanently stuck in ``waiting``.
     """
     enabled = is_automation_capacity_retry_enabled()
@@ -1102,3 +1563,5 @@ async def sweep_capacity_parked(
                 execution_id,
                 exc,
             )
+
+    await drain_pending_failure_notifications()

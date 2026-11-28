@@ -26,6 +26,7 @@ from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database import conversation as conv_db
 from src.server.database.runs import lifecycle as tl_db
+from src.server.database.runs import outbox as outbox_db
 from src.server.services import automation_delivery as delivery_mod
 from src.server.services import automation_settlement as settle_mod
 from src.server.services.automation_outcomes import Outcome
@@ -35,7 +36,7 @@ from src.server.services.thread_lifecycle_feed import publish_automation_wait
 from src.server.services.webhook_client import WebhookClient
 
 # Ensure pool-holding modules are loaded before patched_get_db_connection sweeps sys.modules.
-_POOL_HOLDERS = (cr, cg_db, watch_db, auto_db, exec_db, conv_db, tl_db)
+_POOL_HOLDERS = (cr, cg_db, watch_db, auto_db, exec_db, conv_db, tl_db, outbox_db)
 
 pytestmark = pytest.mark.integration
 
@@ -59,6 +60,13 @@ async def _fetch_one(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] |
             await cur.execute(sql, params)
             row = await cur.fetchone()
             return dict(row) if row is not None else None
+
+
+async def _fetch_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    async with exec_db.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, params)
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def _create_automation(
@@ -159,10 +167,10 @@ async def test_concurrent_two_workers_claim_only_one_dispatches_pg(
     dispatched_a: list[str] = []
     dispatched_b: list[str] = []
     disp_a = _make_dispatch_mock(
-        side_effect=lambda a, e, *, name: dispatched_a.append(e),
+        side_effect=lambda a, e, *, name, claim_token=None: dispatched_a.append(e),
     )
     disp_b = _make_dispatch_mock(
-        side_effect=lambda a, e, *, name: dispatched_b.append(e),
+        side_effect=lambda a, e, *, name, claim_token=None: dispatched_b.append(e),
     )
 
     both_listed = asyncio.Event()
@@ -229,15 +237,16 @@ async def test_claim_then_worker_exit_reclaimed_by_second_worker_pg(
     )
 
     # Worker 1 claims waiting -> pending, then simulates crashing before dispatch()
-    assert await cr.release_capacity_parked_execution(eid, lease_seconds=30.0) is True
+    tok1 = await cr.release_capacity_parked_execution(eid, lease_seconds=30.0)
+    assert isinstance(tok1, str) and tok1
     # While lease is active, Worker 2 cannot reclaim it
-    assert await cr.release_capacity_parked_execution(eid, lease_seconds=30.0) is False
+    assert await cr.release_capacity_parked_execution(eid, lease_seconds=30.0) is None
 
     # Abandoned sweep must NOT kill the orphaned capacity pending row
     abandoned = await exec_db.list_abandoned_executions(quiet_seconds=0)
     assert eid not in {str(r["automation_execution_id"]) for r in abandoned}
 
-    # Once dispatch lease expires, Worker 2 reclaims and dispatches it
+    # Once dispatch lease expires, Worker 2 reclaims and dispatches it with a fresh token
     await _exec_sql(
         """
         UPDATE automation_executions
@@ -249,19 +258,29 @@ async def test_claim_then_worker_exit_reclaimed_by_second_worker_pg(
         """,
         (eid,),
     )
-    reclaimed: list[str] = []
+    reclaimed: list[tuple[str, str | None]] = []
     disp = _make_dispatch_mock(
-        side_effect=lambda a, e, *, name: reclaimed.append(e),
+        side_effect=lambda a, e, *, name, claim_token=None: reclaimed.append((e, claim_token)),
     )
     await cr.sweep_capacity_parked(disp, stopping=lambda: False)
-    assert reclaimed == [eid]
+    assert len(reclaimed) == 1
+    assert reclaimed[0][0] == eid
+    tok2 = reclaimed[0][1]
+    assert isinstance(tok2, str) and tok2 != tok1
 
-    # Conditionally starting pending -> running succeeds strictly once
+    # Worker 1's stale token cannot clear Worker 2's lease or enter running
+    assert await cr.release_dispatch_lease(eid, claim_token=tok1) is False
+    stale_start = await exec_db.begin_execution_if_not_deleted(
+        eid, started_at=datetime.now(timezone.utc), claim_token=tok1
+    )
+    assert stale_start is None
+
+    # Conditionally starting pending -> running succeeds strictly once for the current token holder
     first_start = await exec_db.begin_execution_if_not_deleted(
-        eid, started_at=datetime.now(timezone.utc)
+        eid, started_at=datetime.now(timezone.utc), claim_token=tok2
     )
     second_start = await exec_db.begin_execution_if_not_deleted(
-        eid, started_at=datetime.now(timezone.utc)
+        eid, started_at=datetime.now(timezone.utc), claim_token=tok2
     )
     assert first_start is not None
     assert second_start is None
@@ -314,9 +333,10 @@ async def test_retry_succeeds_reaches_completed_and_delivers_once_pg(
         """,
         (eid,),
     )
-    assert await cr.release_capacity_parked_execution(eid) is True
+    claim_token = await cr.release_capacity_parked_execution(eid)
+    assert isinstance(claim_token, str) and claim_token
     started = await exec_db.begin_execution_if_not_deleted(
-        eid, started_at=datetime.now(timezone.utc)
+        eid, started_at=datetime.now(timezone.utc), claim_token=claim_token
     )
     assert started is not None
 
@@ -357,15 +377,44 @@ async def test_retry_succeeds_reaches_completed_and_delivers_once_pg(
         )
         await settle_mod.drain_tails()
 
-    assert outcome is Outcome.COMPLETED
-    erow = await _fetch_one(
-        "SELECT status, failure_reason, conversation_response_id FROM automation_executions WHERE automation_execution_id = %s::uuid",
-        (eid,),
-    )
-    assert erow["status"] == "completed"
-    assert erow["failure_reason"] is None
-    assert str(erow["conversation_response_id"]) == run_id
-    finish_mock.assert_awaited_once()
+        assert outcome is Outcome.COMPLETED
+        erow = await _fetch_one(
+            "SELECT status, failure_reason, conversation_response_id FROM automation_executions WHERE automation_execution_id = %s::uuid",
+            (eid,),
+        )
+        assert erow["status"] == "completed"
+        assert erow["failure_reason"] is None
+        assert str(erow["conversation_response_id"]) == run_id
+
+        # Production success path enqueues strictly ONE automation_finish outbox job (never in-process finish_run)
+        finish_mock.assert_not_awaited()
+        outbox_rows = await _fetch_all(
+            """
+            SELECT hook_outbox_id, hook_type, status, idempotency_key, payload
+            FROM hook_outbox
+            WHERE run_id = %s::uuid
+              AND hook_type = %s
+            """,
+            (run_id, settle_mod.FINISH_HOOK),
+        )
+        assert len(outbox_rows) == 1
+        assert outbox_rows[0]["idempotency_key"] == f"{run_id}:{settle_mod.FINISH_HOOK}"
+        assert outbox_rows[0]["payload"]["execution_id"] == eid
+        assert outbox_rows[0]["payload"]["status"] == "completed"
+
+        # Claiming & executing that single outbox job delivers once and records delivery_result
+        claimed_jobs = await outbox_db.claim_outbox_jobs(limit=10)
+        matching_jobs = [
+            j for j in claimed_jobs if str(j["hook_outbox_id"]) == str(outbox_rows[0]["hook_outbox_id"])
+        ]
+        assert len(matching_jobs) == 1
+        await settle_mod._finish_held_run(matching_jobs[0])
+        finish_mock.assert_awaited_once()
+        delivered_row = await _fetch_one(
+            "SELECT delivery_result FROM automation_executions WHERE automation_execution_id = %s::uuid",
+            (eid,),
+        )
+        assert delivered_row["delivery_result"][0]["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +486,7 @@ async def test_computer_park_then_capacity_fail_expires_in_15m_and_reverse_pg(
     webhook_client = create_autospec(WebhookClient, instance=True)
     webhook_client.fire_event.return_value = None
     with (
+        patch.object(cr, "WebhookClient", new=create_autospec(WebhookClient, return_value=webhook_client)),
         patch.object(settle_mod, "WebhookClient", new=create_autospec(WebhookClient, return_value=webhook_client)),
         patch.object(settle_mod, "publish_automation_wait", new=create_autospec(publish_automation_wait, return_value=None)),
     ):
@@ -511,6 +561,7 @@ async def test_switch_off_drains_and_settles_waiting_executions_as_failed_ours_p
     webhook_client = create_autospec(WebhookClient, instance=True)
     webhook_client.fire_event.return_value = None
     with (
+        patch.object(cr, "WebhookClient", new=create_autospec(WebhookClient, return_value=webhook_client)),
         patch.object(settle_mod, "WebhookClient", new=create_autospec(WebhookClient, return_value=webhook_client)),
         patch.object(settle_mod, "publish_automation_wait", new=create_autospec(publish_automation_wait, return_value=None)),
     ):
@@ -751,14 +802,17 @@ async def test_channel_gateway_register_updates_on_entry_change_and_revokes_on_c
 async def test_wait_backend_idle_sql_on_real_postgres(
     seed_user, seed_workspace, patched_get_db_connection
 ) -> None:
-    """Execute the exact THREAD_BUSY_SQL from wait_backend_idle.sh against real Postgres."""
-    script_text = (
-        Path(__file__).resolve().parents[3] / "scripts/dalton/ops/prod/wait_backend_idle.sh"
-    ).read_text(encoding="utf-8")
-    sql_line = next(
-        line for line in script_text.splitlines() if line.startswith('THREAD_BUSY_SQL="')
+    """Execute the exact shared backend_busy_threads.sql (used by wait_backend_idle.sh
+    and deploy_main.sh) against real Postgres."""
+    sql_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts/dalton/ops/prod/backend_busy_threads.sql"
     )
-    thread_busy_sql = sql_line.split('THREAD_BUSY_SQL="', 1)[1].rstrip('"')
+    thread_busy_sql = " ".join(sql_path.read_text(encoding="utf-8").split())
+    total_busy_sql = (
+        f"SELECT ({thread_busy_sql}) + "
+        "(SELECT count(*) FROM subagent_runs WHERE status='in_progress')"
+    )
 
     user_id = seed_user["user_id"]
     ws_id = str(seed_workspace["workspace_id"])
@@ -773,6 +827,8 @@ async def test_wait_backend_idle_sql_on_real_postgres(
     )
     res = await _fetch_one(thread_busy_sql)
     assert int(next(iter(res.values()))) == 0
+    total_res = await _fetch_one(total_busy_sql)
+    assert int(next(iter(total_res.values()))) == 0
 
     # 2) Interactive chat thread (>15m, no automation_executions) -> BUSY (count = 1)
     chat_tid = await _create_thread(ws_id, user_id, status="in_progress")
@@ -782,3 +838,492 @@ async def test_wait_backend_idle_sql_on_real_postgres(
     )
     res2 = await _fetch_one(thread_busy_sql)
     assert int(next(iter(res2.values()))) == 1
+    total_res2 = await _fetch_one(total_busy_sql)
+    assert int(next(iter(total_res2.values()))) == 1
+
+
+# ---------------------------------------------------------------------------
+# 9. R3 PG: claim-token fencing & capacity deadline on begin_execution (Item 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_begin_execution_rejects_expired_capacity_deadline_and_stale_token_pg(
+    seed_user, seed_workspace, patched_get_db_connection
+) -> None:
+    """Real PG: two workers reclaiming get distinct tokens (only current token
+    enters running); a claimed pending row whose 15m deadline expired refuses to
+    enter running."""
+    user_id = seed_user["user_id"]
+    ws_id = str(seed_workspace["workspace_id"])
+    auto = await _create_automation(user_id, ws_id)
+    eid = await _insert_execution(str(auto["automation_id"]), status="running")
+
+    parked, _ = await cr.park_execution_for_capacity(
+        eid, parked_status="active", error_message="WriterGuardUnavailable: full"
+    )
+    assert parked is True
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,next_retry_at}',
+            to_jsonb(NOW() - INTERVAL '5 seconds'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+    tok1 = await cr.release_capacity_parked_execution(eid, lease_seconds=30.0)
+    assert isinstance(tok1, str) and tok1
+
+    # Even with valid token, once deadline_at passes, begin_execution refuses to start
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,deadline_at}',
+            to_jsonb(NOW() - INTERVAL '1 second'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+    expired_start = await exec_db.begin_execution_if_not_deleted(
+        eid, started_at=datetime.now(timezone.utc), claim_token=tok1
+    )
+    assert expired_start is None
+    row = await _fetch_one(
+        "SELECT status FROM automation_executions WHERE automation_execution_id = %s::uuid",
+        (eid,),
+    )
+    assert row["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# 10. R3 PG: locked expiry settlement re-checks wait_reason, token, deadline (Item 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expiry_settlement_never_clobbers_computer_offline_wait_pg(
+    seed_user, seed_workspace, patched_get_db_connection
+) -> None:
+    """Real PG: after a capacity-claimed pending row starts and parks for an
+    offline computer (wait_reason='computer_unreachable'), a stale capacity
+    expiry sweep cannot settle it as capacity failure."""
+    user_id = seed_user["user_id"]
+    ws_id = str(seed_workspace["workspace_id"])
+    auto = await _create_automation(user_id, ws_id)
+    eid = await _insert_execution(str(auto["automation_id"]), status="running")
+    comp_id = str(uuid4())
+
+    parked, _ = await cr.park_execution_for_capacity(
+        eid, parked_status="active", error_message="WriterGuardUnavailable: full"
+    )
+    assert parked is True
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,next_retry_at}',
+            to_jsonb(NOW() - INTERVAL '5 seconds'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+    tok = await cr.release_capacity_parked_execution(eid, lease_seconds=30.0)
+    assert isinstance(tok, str) and tok
+
+    # Snapshot stale sweep row as if capacity sweep read it right as deadline elapsed
+    stale_row = await _fetch_one(
+        """
+        SELECT e.automation_execution_id, e.automation_id, e.status, e.parked_status,
+               e.conversation_thread_id, e.delivery, a.user_id, a.workspace_id
+        FROM automation_executions e
+        JOIN automations a ON a.automation_id = e.automation_id
+        WHERE e.automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+    assert stale_row is not None
+    stale_row["expired"] = True
+    stale_row["due"] = True
+
+    # Meanwhile, the dispatched worker starts and parks for offline computer
+    started = await exec_db.begin_execution_if_not_deleted(
+        eid, started_at=datetime.now(timezone.utc), claim_token=tok
+    )
+    assert started is not None
+    assert (
+        await exec_db.park_execution(
+            eid, awaits_computer=comp_id, parked_status="active", wait_seconds=24 * 3600
+        )
+        is True
+    )
+    # Even if old capacity deadline is now past NOW(), locked recheck sees wait_reason='computer_unreachable'
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,deadline_at}',
+            to_jsonb(NOW() - INTERVAL '1 second'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+    disp = _make_dispatch_mock()
+    await cr.sweep_one_capacity_parked(stale_row, disp, stopping=lambda: False)
+    await settle_mod.drain_tails()
+
+    after = await _fetch_one(
+        "SELECT status, wait_reason FROM automation_executions WHERE automation_execution_id = %s::uuid",
+        (eid,),
+    )
+    assert after["status"] == "waiting"
+    assert after["wait_reason"] == "computer_unreachable"
+
+
+# ---------------------------------------------------------------------------
+# 11. R3 PG: default Feishu group re-resolution & durable threadless failure
+#     notify & pending skip / abandoned thread reset (Items 4, 6, 7, 8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_gateway_re_resolves_default_feishu_group_when_entries_unchanged_pg(
+    seed_user, seed_workspace, patched_get_db_connection
+) -> None:
+    """Real PG: register_automation_run re-resolves unchanged default entry ['feishu']
+    when workspace default group changes before start, updating the unstarted row."""
+    user_id = seed_user["user_id"]
+    ws_id = str(seed_workspace["workspace_id"])
+    eid = str(uuid4())
+
+    await _exec_sql(
+        """
+        INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id, platform_username)
+        VALUES (%s, 'feishu', 'ou_user_1', 'alice')
+        ON CONFLICT DO NOTHING
+        """,
+        (user_id,),
+    )
+    await _exec_sql(
+        """
+        INSERT INTO dalton_channel_user_settings (user_id, apps, updated_at)
+        VALUES (%s, %s::jsonb, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET apps = EXCLUDED.apps, updated_at = NOW()
+        """,
+        (
+            user_id,
+            f'{{"feishu": {{"automation_output": {{"{ws_id}": "feishu:oc_old_grp"}}}}}}',
+        ),
+    )
+
+    verify_mock = create_autospec(
+        cg_db._verify_group_target_deliverable,
+        side_effect=lambda cur, *, chat_address, **kw: (True, None, f"Group {chat_address}"),
+    )
+    with patch.object(cg_db, "_verify_group_target_deliverable", new=verify_mock):
+        first = await cg_db.register_automation_run(
+            execution_id=eid,
+            user_id=user_id,
+            workspace_id=ws_id,
+            automation_name="delta",
+            entries=["feishu"],
+        )
+        assert [t["address"] for t in first["targets"]] == ["feishu:oc_old_grp"]
+
+        # User switches workspace default Feishu group while methods stays ["feishu"]
+        await _exec_sql(
+            """
+            UPDATE dalton_channel_user_settings
+            SET apps = %s::jsonb, updated_at = NOW()
+            WHERE user_id = %s
+            """,
+            (
+                f'{{"feishu": {{"automation_output": {{"{ws_id}": "feishu:oc_new_grp"}}}}}}',
+                user_id,
+            ),
+        )
+        second = await cg_db.register_automation_run(
+            execution_id=f"{eid}.2",
+            user_id=user_id,
+            workspace_id=ws_id,
+            automation_name="delta",
+            entries=["feishu"],
+        )
+        assert [t["address"] for t in second["targets"]] == ["feishu:oc_new_grp"]
+
+    stored = await _fetch_one(
+        "SELECT targets FROM dalton_channel_automation_runs WHERE execution_id = %s::uuid",
+        (eid,),
+    )
+    assert stored is not None
+    assert [t["address"] for t in stored["targets"]] == ["feishu:oc_new_grp"]
+
+
+@pytest.mark.asyncio
+async def test_durable_failure_notify_threadless_survives_crash_and_delivers_on_sweep_pg(
+    seed_user, seed_workspace, patched_get_db_connection, monkeypatch
+) -> None:
+    """Real PG: expiry settlement of a threadless execution writes delivery.failure_notify
+    inside the settlement transaction; even if _after_settling crashes before sending,
+    drain_pending_failure_notifications delivers it once and marks it done."""
+    monkeypatch.delenv("DALTON_AUTOMATION_CAPACITY_RETRY", raising=False)
+    user_id = seed_user["user_id"]
+    ws_id = str(seed_workspace["workspace_id"])
+    auto = await _create_automation(
+        user_id, ws_id, delivery_config={"methods": ["feishu"]}
+    )
+    eid = await _insert_execution(
+        str(auto["automation_id"]), status="running", thread_id=None
+    )
+
+    parked, _ = await cr.park_execution_for_capacity(
+        eid, parked_status="active", error_message="HTTPException: Credit gate 503"
+    )
+    assert parked is True
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,deadline_at}',
+            to_jsonb(NOW() - INTERVAL '1 second'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid,),
+    )
+
+    # Simulate process crashing right after settlement commit (deliver never runs in _after_settling)
+    with patch.object(
+        cr,
+        "deliver_settled_failure_notification",
+        new=create_autospec(cr.deliver_settled_failure_notification, return_value=False),
+    ):
+        settled = await cr._settle_capacity_failure(
+            auto,
+            eid,
+            thread_id=None,
+            workspace_id=ws_id,
+            error="HTTPException: Credit gate 503",
+            expected_claim_token=None,
+            require_capacity_expired=True,
+        )
+        await settle_mod.drain_tails()
+    assert settled is True
+
+    after_commit = await _fetch_one(
+        "SELECT status, conversation_thread_id, delivery FROM automation_executions WHERE automation_execution_id = %s::uuid",
+        (eid,),
+    )
+    assert after_commit["status"] == "failed"
+    assert after_commit["conversation_thread_id"] is None
+    assert after_commit["delivery"][cr.FAILURE_NOTIFY_KEY]["status"] == "pending"
+
+    # Next worker sweeps and delivers the durable failure notification
+    resolved = delivery_mod.Delivery(
+        id=eid,
+        targets=[delivery_mod.Target(entry="feishu", address="feishu:oc_new", name="Group", ok=True)],
+    )
+    start_mock = create_autospec(delivery_mod.start_run, return_value=resolved)
+    finish_mock = create_autospec(
+        delivery_mod.finish_run,
+        return_value=delivery_mod.Finish(
+            [{"method": "feishu", "address": "feishu:oc_new", "name": "Group", "success": True, "via": "notice", "error": None}],
+            answered=True,
+        ),
+    )
+    with (
+        patch.object(delivery_mod, "start_run", new=start_mock),
+        patch.object(delivery_mod, "finish_run", new=finish_mock),
+    ):
+        drained = await cr.drain_pending_failure_notifications()
+    assert drained == 1
+    start_mock.assert_awaited_once()
+    finish_mock.assert_awaited_once()
+
+    final_row = await _fetch_one(
+        "SELECT delivery, delivery_result FROM automation_executions WHERE automation_execution_id = %s::uuid",
+        (eid,),
+    )
+    assert final_row["delivery"][cr.FAILURE_NOTIFY_KEY]["status"] == "done"
+    assert final_row["delivery_result"][0]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_skip_capacity_pending_and_abandoned_reset_concurrent_start_pg(
+    seed_user, seed_workspace, patched_get_db_connection, test_db_uri
+) -> None:
+    """Real PG:
+    1) skip_execution skips capacity-claimed pending (releasing signals) while
+       refusing ordinary pending.
+    2) settle_abandoned without a conversation_response resets thread status in-tx,
+       and respects a concurrent START holding the conversation_threads row lock."""
+    user_id = seed_user["user_id"]
+    ws_id = str(seed_workspace["workspace_id"])
+    auto = await _create_automation(user_id, ws_id, name="dalton-nvda-delta")
+
+    # 1a) Capacity-claimed pending CAN be skipped manually and releases signal
+    eid_cap = await _insert_execution(str(auto["automation_id"]), status="running")
+    sig_id = str(uuid4())
+    await _exec_sql(
+        """
+        INSERT INTO dalton_signals (
+            signal_id, workspace_id, ticker, probe, signal_key,
+            priority, summary, payload, woken_execution_id, woken_at
+        )
+        VALUES (
+            %s::uuid, %s::uuid, 'NVDA', 'price', %s,
+            'P1', 'Price move', '{"status": "woken"}'::jsonb, %s::uuid, NOW()
+        )
+        """,
+        (sig_id, ws_id, f"cap-pending-{uuid4().hex[:8]}", eid_cap),
+    )
+    assert (
+        await cr.park_execution_for_capacity(
+            eid_cap, parked_status="active", error_message="WriterGuardUnavailable"
+        )
+    )[0] is True
+    await _exec_sql(
+        """
+        UPDATE automation_executions
+        SET delivery = jsonb_set(
+            delivery, '{capacity_retry,next_retry_at}',
+            to_jsonb(NOW() - INTERVAL '5 seconds'), true
+        )
+        WHERE automation_execution_id = %s::uuid
+        """,
+        (eid_cap,),
+    )
+    tok = await cr.release_capacity_parked_execution(eid_cap)
+    assert isinstance(tok, str) and tok
+    with patch.object(
+        settle_mod,
+        "publish_automation_wait",
+        new=create_autospec(publish_automation_wait, return_value=None),
+    ):
+        skipped = await auto_lifecycle.skip_execution(
+            str(auto["automation_id"]), eid_cap, user_id
+        )
+        await settle_mod.drain_tails()
+    assert skipped is not None and skipped["status"] == "skipped"
+    srow = await _fetch_one(
+        "SELECT woken_execution_id, payload->>'status' AS st FROM dalton_signals WHERE signal_id = %s::uuid",
+        (sig_id,),
+    )
+    assert srow["woken_execution_id"] is None
+    assert srow["st"] == "pending"
+
+    # 1b) Ordinary pending (wait_reason IS NULL) is still refused by skip_execution
+    eid_ord = await _insert_execution(str(auto["automation_id"]), status="pending")
+    with pytest.raises(ValueError, match="no longer waiting"):
+        await auto_lifecycle.skip_execution(str(auto["automation_id"]), eid_ord, user_id)
+
+    # 2a) Abandoned execution without conversation_response resets thread status in-tx
+    tid_clean = await _create_thread(ws_id, user_id, status="in_progress")
+    eid_ab1 = await _insert_execution(
+        str(auto["automation_id"]), status="running", thread_id=tid_clean
+    )
+    await _exec_sql(
+        "UPDATE automation_executions SET heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE automation_execution_id = %s::uuid",
+        (eid_ab1,),
+    )
+    ab_row1 = {
+        "automation_execution_id": eid_ab1,
+        "automation_id": str(auto["automation_id"]),
+        "status": "running",
+        "conversation_thread_id": tid_clean,
+        "conversation_response_id": None,
+        "started_at": datetime.now(timezone.utc) - timedelta(minutes=10),
+        "created_at": datetime.now(timezone.utc) - timedelta(minutes=10),
+        "delivery": None,
+        "user_id": user_id,
+        "workspace_id": ws_id,
+    }
+    webhook_client = create_autospec(WebhookClient, instance=True)
+    webhook_client.fire_event.return_value = None
+    with patch.object(
+        settle_mod,
+        "WebhookClient",
+        new=create_autospec(WebhookClient, return_value=webhook_client),
+    ):
+        out1 = await settle_mod.settle_abandoned(auto, ab_row1, 300)
+        await settle_mod.drain_tails()
+    assert out1 is Outcome.INTERRUPTED
+    trow_clean = await _fetch_one(
+        "SELECT current_status FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+        (tid_clean,),
+    )
+    assert trow_clean["current_status"] == "cancelled"
+
+    # 2b) Two real PG connections: concurrent START vs settle_abandoned thread reset
+    tid_race = await _create_thread(ws_id, user_id, status="in_progress")
+    eid_ab2 = await _insert_execution(
+        str(auto["automation_id"]), status="running", thread_id=tid_race
+    )
+    await _exec_sql(
+        "UPDATE automation_executions SET heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE automation_execution_id = %s::uuid",
+        (eid_ab2,),
+    )
+    new_run_id = str(uuid4())
+    conn1_locked = asyncio.Event()
+    release_conn1 = asyncio.Event()
+
+    async def _concurrent_start() -> None:
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=False) as c1:
+            async with c1.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO conversation_responses (
+                        conversation_response_id, conversation_thread_id,
+                        turn_index, status, created_at
+                    )
+                    VALUES (%s::uuid, %s::uuid, 0, 'in_progress', NOW())
+                    """,
+                    (new_run_id, tid_race),
+                )
+                await cur.execute(
+                    """
+                    UPDATE conversation_threads
+                    SET current_status = 'in_progress', updated_at = NOW()
+                    WHERE conversation_thread_id = %s::uuid
+                    """,
+                    (tid_race,),
+                )
+            conn1_locked.set()
+            await release_conn1.wait()
+            await c1.commit()
+
+    start_task = asyncio.create_task(_concurrent_start())
+    await conn1_locked.wait()
+
+    ab_row2 = {
+        **ab_row1,
+        "automation_execution_id": eid_ab2,
+        "conversation_thread_id": tid_race,
+    }
+    with patch.object(
+        settle_mod,
+        "WebhookClient",
+        new=create_autospec(WebhookClient, return_value=webhook_client),
+    ):
+        settle_task = asyncio.create_task(
+            settle_mod.settle_abandoned(auto, ab_row2, 300)
+        )
+        await asyncio.sleep(0.15)
+        assert not settle_task.done()
+        release_conn1.set()
+        await start_task
+        out2 = await settle_task
+        await settle_mod.drain_tails()
+
+    assert out2 is Outcome.INTERRUPTED
+    trow_race = await _fetch_one(
+        "SELECT current_status FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+        (tid_race,),
+    )
+    assert trow_race["current_status"] == "in_progress"

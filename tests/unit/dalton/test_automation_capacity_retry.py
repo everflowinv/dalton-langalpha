@@ -512,10 +512,10 @@ async def test_sweep_only_dispatches_when_claim_returns_true_and_releases_lease_
     }
     auto = _automation()
 
-    # Worker A wins claim (True), Worker B loses claim (False)
+    # Worker A wins claim (returns token), Worker B loses claim (None)
     disp_a = _make_dispatch_mock()
     disp_b = _make_dispatch_mock()
-    claim_results = iter([True, False])
+    claim_results = iter(["tok-worker-a", None])
     claim_mock = create_autospec(
         cr.release_capacity_parked_execution, side_effect=lambda eid: next(claim_results)
     )
@@ -529,12 +529,15 @@ async def test_sweep_only_dispatches_when_claim_returns_true_and_releases_lease_
         await cr.sweep_one_capacity_parked(row, disp_b, stopping=lambda: False)
 
     disp_a.assert_called_once()
+    assert disp_a.call_args.kwargs["claim_token"] == "tok-worker-a"
     disp_b.assert_not_called()
 
-    # If dispatch fails after claim, release_dispatch_lease is called so another worker reclaims
+    # If dispatch fails after claim, release_dispatch_lease is called with the claim_token
     failing_disp = _make_dispatch_mock(side_effect=RuntimeError("loop closing"))
-    release_lease_mock = create_autospec(cr.release_dispatch_lease, return_value=None)
-    claim_win = create_autospec(cr.release_capacity_parked_execution, return_value=True)
+    release_lease_mock = create_autospec(cr.release_dispatch_lease, return_value=True)
+    claim_win = create_autospec(
+        cr.release_capacity_parked_execution, return_value="tok-fail-dispatch"
+    )
     with (
         patch.object(cr.auto_db, "get_automation", new=get_auto_mock),
         patch.object(cr, "release_capacity_parked_execution", new=claim_win),
@@ -543,7 +546,7 @@ async def test_sweep_only_dispatches_when_claim_returns_true_and_releases_lease_
         with pytest.raises(RuntimeError, match="loop closing"):
             await cr.sweep_one_capacity_parked(row, failing_disp, stopping=lambda: False)
 
-    release_lease_mock.assert_awaited_once_with(_EXEC)
+    release_lease_mock.assert_awaited_once_with(_EXEC, claim_token="tok-fail-dispatch")
 
 
 # ---------------------------------------------------------------------------
@@ -850,11 +853,15 @@ async def test_switch_off_stops_new_parks_and_drains_existing_waiting_as_failed_
     settle_mock = create_autospec(cr.settle, return_value=True)
     disp_mock = _make_dispatch_mock()
 
+    drain_notify_mock = create_autospec(
+        cr.drain_pending_failure_notifications, return_value=0
+    )
     with (
         patch.object(cr, "list_capacity_parked_executions", new=list_mock),
         patch.object(cr, "touch_capacity_parked_executions", new=touch_mock),
         patch.object(cr.auto_db, "get_automation", new=get_auto_mock),
         patch.object(cr, "settle", new=settle_mock),
+        patch.object(cr, "drain_pending_failure_notifications", new=drain_notify_mock),
     ):
         await cr.sweep_capacity_parked(disp_mock, stopping=lambda: False)
 
@@ -865,21 +872,25 @@ async def test_switch_off_stops_new_parks_and_drains_existing_waiting_as_failed_
     assert settle_mock.await_args.args[2] is Outcome.FAILED_OURS
     kw = settle_mock.await_args.kwargs
     assert kw["from_statuses"] == ("waiting", "pending")
+    assert kw["expected_wait_reason"] == cr.CAPACITY_WAIT_REASON
+    assert kw["expected_claim_token"] is None
+    assert kw["require_capacity_expired"] is False
     assert kw["release_pre_start_signals"] is True
     assert kw["reset_prestart_thread_status"] is True
-    assert kw["prepare_delivery_after_settle"] is not None
+    assert kw["enqueue_failure_notify"] is True
+    drain_notify_mock.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
-# 6. Expiry sweep shares failure delivery init & runs ONLY on settlement winner
+# 6. Expiry sweep enqueues durable failure notify in-tx & delivers once on winner
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_expiry_sweep_initializes_delivery_only_on_winning_worker() -> None:
-    """When credit-gate 503 parked an execution before delivery start, two workers
-    racing to settle at expiry result in delivery init & finish_run running strictly
-    once (on the winning worker; loser performs zero delivery calls)."""
+    """When credit-gate 503 parked a threadless execution before delivery start,
+    two workers racing to settle at expiry enqueue the durable failure-notify
+    task strictly once in the winning settlement transaction and deliver once."""
     auto = _automation(delivery_config={"methods": ["slack:T/C1"]})
     expired_row = {
         "automation_execution_id": _EXEC,
@@ -906,11 +917,20 @@ async def test_expiry_sweep_initializes_delivery_only_on_winning_worker() -> Non
         "previous_failure_reason": None,
         "previous_delivery_result": None,
     }
-    # Worker 1 wins settle_execution (gets row), Worker 2 loses (gets None)
-    settle_exec_results = iter([settled_return, None])
+    tx_conn, tx_executed = _make_tx_conn(rowcounts=[1, 1, 1])
+    won_once = [False]
+
+    async def _settle_exec_race(_eid, *, in_transaction=None, **kw):
+        if won_once[0]:
+            return None
+        won_once[0] = True
+        if in_transaction is not None:
+            await in_transaction(tx_conn, settled_return)
+        return settled_return
+
     settle_exec_mock = create_autospec(
         exec_db_mod.settle_execution,
-        side_effect=lambda *a, **kw: next(settle_exec_results),
+        side_effect=_settle_exec_race,
     )
     resolved_delivery = delivery_mod.Delivery(
         id=_EXEC,
@@ -924,17 +944,51 @@ async def test_expiry_sweep_initializes_delivery_only_on_winning_worker() -> Non
             answered=True,
         ),
     )
+    claimed_row = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "conversation_thread_id": None,
+        "conversation_response_id": None,
+        "error_message": "HTTPException: Credit gate 503",
+        "delivery": {
+            **expired_row["delivery"],
+            cr.FAILURE_NOTIFY_KEY: {
+                "status": "claimed",
+                "claim_token": "fn-tok-1",
+                "execution_id": _EXEC,
+                "automation_id": _AUTO,
+                "user_id": _USER,
+                "thread_id": None,
+                "workspace_id": _HOME,
+                "outcome": Outcome.FAILED_OURS.value,
+                "error": "HTTPException: Credit gate 503",
+                "attempts": 1,
+                "recorded": False,
+                "answered": False,
+            },
+        },
+    }
+    claim_fn_results = iter([claimed_row, None])
+    claim_fn_mock = create_autospec(
+        cr.claim_failure_notification,
+        side_effect=lambda eid, **kw: next(claim_fn_results),
+    )
+    update_fn_mock = create_autospec(
+        cr._update_failure_notification_state, return_value=True
+    )
     disp_mock = _make_dispatch_mock()
     webhook_cls, webhook_client = _make_webhook_client_cls()
 
     with (
         patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
         patch.object(settle_mod.exec_db, "settle_execution", new=settle_exec_mock),
-        patch.object(settle_mod.exec_db, "record_delivery", new=create_autospec(exec_db_mod.record_delivery, return_value=None)),
+        patch.object(cr, "claim_failure_notification", new=claim_fn_mock),
+        patch.object(cr, "_update_failure_notification_state", new=update_fn_mock),
         patch.object(delivery_mod, "start_run", new=start_run_mock),
         patch.object(delivery_mod, "finish_run", new=finish_run_mock),
         patch.object(cr, "resolve_delivery_workspace_id", new=create_autospec(cr.resolve_delivery_workspace_id, return_value=None)),
         patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr, "WebhookClient", new=webhook_cls),
         patch.object(settle_mod, "WebhookClient", new=webhook_cls),
         patch.object(settle_mod, "publish_automation_wait", new=create_autospec(publish_automation_wait, return_value=None)),
     ):
@@ -943,8 +997,12 @@ async def test_expiry_sweep_initializes_delivery_only_on_winning_worker() -> Non
         await settle_mod.drain_tails()
 
     disp_mock.assert_not_called()
+    # Durable failure_notify task was written inside the winning settlement transaction (thread_id=None!)
+    assert any("'{failure_notify}'" in sql for sql, _p in tx_executed)
     start_run_mock.assert_awaited_once()
     finish_run_mock.assert_awaited_once()
+    update_fn_mock.assert_awaited_once()
+    assert update_fn_mock.await_args.kwargs["status"] == "done"
     webhook_client.fire_event.assert_not_awaited()
 
 
@@ -1133,3 +1191,459 @@ def test_capacity_error_classification_and_backoff_schedule() -> None:
     assert 25.5 <= jittered <= 37.5
     assert cg_db._normalize_automation_run_uuid(f"{_EXEC}.2") == _EXEC
     assert cg_db._normalize_automation_run_uuid("not-a-uuid.2") is None
+
+
+# ---------------------------------------------------------------------------
+# 9. R3 fixes: claim-token fencing, locked expiry recheck, default target
+#    re-resolution, durable failure retry, pending skip & rollback signals,
+#    and abandoned thread reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_token_propagates_to_begin_and_fences_lease_release() -> None:
+    """Executor forwards claim_token into begin_execution_if_not_deleted, whose
+    SQL checks both claim_token and capacity deadline; release_dispatch_lease
+    also checks claim_token."""
+    begin_mock = create_autospec(
+        exec_db_mod.begin_execution_if_not_deleted, return_value=None
+    )
+    with (
+        patch.object(exec_mod.exec_db, "begin_execution_if_not_deleted", new=begin_mock),
+        patch.object(
+            exec_mod.exec_db,
+            "touch_execution",
+            new=create_autospec(exec_db_mod.touch_execution, return_value=None),
+        ),
+    ):
+        await AutomationExecutor().execute(
+            _automation(), _EXEC, claim_token="tok-stale-1"
+        )
+    begin_mock.assert_awaited_once()
+    assert begin_mock.await_args.kwargs["claim_token"] == "tok-stale-1"
+
+    # Verify SQL emitted by begin_execution_if_not_deleted checks claim_token & deadline
+    get_conn, executed = _make_recording_db(fetchone_results=[None])
+    with (
+        patch.object(exec_db_mod, "get_db_connection", side_effect=get_conn),
+        patch(
+            "src.dalton.settings.is_coverage_units_enabled",
+            new=create_autospec(
+                __import__(
+                    "src.dalton.settings", fromlist=["is_coverage_units_enabled"]
+                ).is_coverage_units_enabled,
+                return_value=False,
+            ),
+        ),
+    ):
+        res = await exec_db_mod.begin_execution_if_not_deleted(
+            _EXEC, started_at=_NOW, claim_token="tok-live-2"
+        )
+    assert res is None
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert "claim_token" in sql
+    assert "deadline_at" in sql
+    assert "> NOW()" in sql
+    assert "tok-live-2" in params
+
+    # Verify release_dispatch_lease fences on claim_token
+    get_conn2, executed2 = _make_recording_db(rowcounts=[0])
+    with patch.object(cr, "get_db_connection", side_effect=get_conn2):
+        ok = await cr.release_dispatch_lease(_EXEC, claim_token="tok-stale-1")
+    assert ok is False
+    assert "claim_token" in executed2[0][0]
+    assert "tok-stale-1" in executed2[0][1]
+
+
+@pytest.mark.asyncio
+async def test_settle_execution_rechecks_wait_reason_claim_token_and_deadline_in_lock() -> None:
+    """Under FOR UPDATE, settle_execution refuses capacity settlement when
+    wait_reason moved to computer_unreachable, claim_token changed, or deadline
+    is not yet expired."""
+    # Case 1: wait_reason moved to computer_unreachable
+    get_conn_cw, exec_cw = _make_recording_db(
+        fetchone_results=[
+            {"?column?": 1},
+            {
+                "status": "waiting",
+                "wait_reason": "computer_unreachable",
+                "created_at": _NOW - timedelta(minutes=20),
+                "delivery": {
+                    cr.CAPACITY_RETRY_KEY: {
+                        "deadline_at": (_NOW - timedelta(minutes=1)).isoformat(),
+                        "claim_token": "tok-1",
+                    }
+                },
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+                "coverage_unit_id": None,
+                "coverage_unit_version": None,
+                "db_now": _NOW,
+            },
+        ]
+    )
+    with patch.object(exec_db_mod, "get_db_connection", side_effect=get_conn_cw):
+        settled = await exec_db_mod.settle_execution(
+            _EXEC,
+            automation_id=_AUTO,
+            from_statuses=("waiting", "pending"),
+            to="failed",
+            expected_wait_reason=cr.CAPACITY_WAIT_REASON,
+            expected_claim_token="tok-1",
+            require_capacity_expired=True,
+        )
+    assert settled is None
+    assert not any(sql.startswith("UPDATE automation_executions") for sql, _ in exec_cw)
+
+    # Case 2: claim_token changed (another worker reclaimed)
+    get_conn_tok, exec_tok = _make_recording_db(
+        fetchone_results=[
+            {"?column?": 1},
+            {
+                "status": "pending",
+                "wait_reason": cr.CAPACITY_WAIT_REASON,
+                "created_at": _NOW - timedelta(minutes=20),
+                "delivery": {
+                    cr.CAPACITY_RETRY_KEY: {
+                        "deadline_at": (_NOW - timedelta(minutes=1)).isoformat(),
+                        "claim_token": "tok-new",
+                    }
+                },
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+                "coverage_unit_id": None,
+                "coverage_unit_version": None,
+                "db_now": _NOW,
+            },
+        ]
+    )
+    with patch.object(exec_db_mod, "get_db_connection", side_effect=get_conn_tok):
+        settled2 = await exec_db_mod.settle_execution(
+            _EXEC,
+            automation_id=_AUTO,
+            from_statuses=("waiting", "pending"),
+            to="failed",
+            expected_wait_reason=cr.CAPACITY_WAIT_REASON,
+            expected_claim_token="tok-old",
+            require_capacity_expired=True,
+        )
+    assert settled2 is None
+    assert not any(sql.startswith("UPDATE automation_executions") for sql, _ in exec_tok)
+
+    # Case 3: deadline not yet reached
+    get_conn_not_exp, exec_not_exp = _make_recording_db(
+        fetchone_results=[
+            {"?column?": 1},
+            {
+                "status": "waiting",
+                "wait_reason": cr.CAPACITY_WAIT_REASON,
+                "created_at": _NOW - timedelta(minutes=5),
+                "delivery": {
+                    cr.CAPACITY_RETRY_KEY: {
+                        "deadline_at": (_NOW + timedelta(minutes=10)).isoformat(),
+                    }
+                },
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+                "coverage_unit_id": None,
+                "coverage_unit_version": None,
+                "db_now": _NOW,
+            },
+        ]
+    )
+    with patch.object(exec_db_mod, "get_db_connection", side_effect=get_conn_not_exp):
+        settled3 = await exec_db_mod.settle_execution(
+            _EXEC,
+            automation_id=_AUTO,
+            from_statuses=("waiting", "pending"),
+            to="failed",
+            expected_wait_reason=cr.CAPACITY_WAIT_REASON,
+            expected_claim_token=None,
+            require_capacity_expired=True,
+        )
+    assert settled3 is None
+    assert not any(sql.startswith("UPDATE automation_executions") for sql, _ in exec_not_exp)
+
+
+@pytest.mark.asyncio
+async def test_default_feishu_and_discord_targets_re_resolve_on_retry_and_expiry(
+    monkeypatch,
+) -> None:
+    """When methods contains a bare default app entry ('feishu' / 'discord'),
+    both retry execution and expiry failure settlement re-resolve the default
+    group even though methods stayed unchanged."""
+    monkeypatch.delenv("DALTON_AUTOMATION_CAPACITY_RETRY", raising=False)
+    auto = _automation(delivery_config={"methods": ["feishu", "discord"]})
+    old_delivery = delivery_mod.Delivery(
+        id=_EXEC,
+        targets=[
+            delivery_mod.Target(entry="feishu", address="feishu:oc_old", name="Old Feishu", ok=True),
+            delivery_mod.Target(entry="discord", address="discord:g/old", name="Old Discord", ok=True),
+        ],
+    )
+    new_delivery = delivery_mod.Delivery(
+        id=f"{_EXEC}.2",
+        targets=[
+            delivery_mod.Target(entry="feishu", address="feishu:oc_new", name="New Feishu", ok=True),
+            delivery_mod.Target(entry="discord", address="discord:g/new", name="New Discord", ok=True),
+        ],
+    )
+    persisted_old = {
+        **delivery_mod.stamp(old_delivery),
+        cr.DELIVERY_META_KEY: {"entries": ["feishu", "discord"], "starts": 1, "registered": True},
+    }
+
+    def _turn_ok(**kwargs):
+        async def _gen():
+            yield "event: message_chunk\ndata: {}\n\n"
+
+        return _gen()
+
+    # 1) Retry attempt re-resolves unchanged default entries ['feishu', 'discord']
+    with ExitStack() as stack:
+        mocks = _bind_executor_mocks(
+            stack,
+            automation=auto,
+            turns=[_turn_ok],
+            execution_row={
+                "automation_execution_id": _EXEC,
+                "automation_id": _AUTO,
+                "status": "pending",
+                "conversation_thread_id": _THREAD,
+                "conversation_response_id": None,
+                "scheduled_at": _NOW,
+                "wait_reason": cr.CAPACITY_WAIT_REASON,
+                "awaits_computer": None,
+                "checked_computer_id": None,
+                "delivery": dict(persisted_old),
+            },
+            start_run_side_effect=lambda a, did, ws, thread_id=None: new_delivery,
+        )
+        mocks["get_run"].return_value = {
+            "conversation_response_id": _RUN,
+            "status": "completed",
+            "metadata": {},
+        }
+        await AutomationExecutor().execute(auto, _EXEC)
+        mocks["start_run"].assert_awaited_once()
+        assert mocks["start_run"].await_args.args[1] == f"{_EXEC}.2"
+        stamped = delivery_mod.read_stamp(mocks["row"]["delivery"], _EXEC)
+        assert stamped is not None
+        assert [t.address for t in stamped.targets] == ["feishu:oc_new", "discord:g/new"]
+
+    # 2) Expiry failure reconciliation also re-resolves unchanged default entries
+    start_run_exp = create_autospec(delivery_mod.start_run, return_value=new_delivery)
+    with (
+        patch.object(
+            recycle_mod,
+            "automation_is_soft_deleted",
+            new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False),
+        ),
+        patch.object(
+            cr,
+            "resolve_delivery_workspace_id",
+            new=create_autospec(cr.resolve_delivery_workspace_id, return_value=_HOME),
+        ),
+        patch.object(delivery_mod, "start_run", new=start_run_exp),
+    ):
+        reconciled = await cr.reconcile_delivery_for_settled_failure(
+            auto,
+            _EXEC,
+            settled_row={"delivery": dict(persisted_old)},
+            thread_id=None,
+            current_delivery=old_delivery,
+        )
+    start_run_exp.assert_awaited_once()
+    assert start_run_exp.await_args.args[1] == f"{_EXEC}.2"
+    assert reconciled == new_delivery
+
+
+@pytest.mark.asyncio
+async def test_durable_failure_notification_retries_on_transient_503_and_completes() -> None:
+    """A durable failure_notify task retries via status='pending' + backoff when
+    finish_run returns retry=True, and marks status='done' once confirmed."""
+    auto = _automation(delivery_config={"methods": ["feishu"]})
+    claimed = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "conversation_thread_id": None,
+        "conversation_response_id": None,
+        "error_message": "HTTPException: 503",
+        "delivery": {
+            cr.FAILURE_NOTIFY_KEY: {
+                "status": "claimed",
+                "claim_token": "tok-retry-1",
+                "execution_id": _EXEC,
+                "automation_id": _AUTO,
+                "user_id": _USER,
+                "thread_id": None,
+                "workspace_id": _HOME,
+                "outcome": Outcome.FAILED_OURS.value,
+                "error": "HTTPException: 503",
+                "attempts": 1,
+                "recorded": False,
+                "answered": False,
+            }
+        },
+    }
+    held = delivery_mod.Delivery(
+        id=_EXEC,
+        targets=[delivery_mod.Target(entry="feishu", address="feishu:oc_new", name="Group", ok=True)],
+    )
+    finish_retry = create_autospec(
+        delivery_mod.finish_run,
+        return_value=delivery_mod.Finish(
+            [{"method": "feishu", "address": "feishu:oc_new", "name": "Group", "success": False, "via": None, "error": "Delivery couldn't be confirmed."}],
+            retry=True,
+            answered=False,
+        ),
+    )
+    update_state_mock = create_autospec(
+        cr._update_failure_notification_state, return_value=True
+    )
+    with (
+        patch.object(cr, "claim_failure_notification", new=create_autospec(cr.claim_failure_notification, return_value=claimed)),
+        patch.object(cr, "_update_failure_notification_state", new=update_state_mock),
+        patch.object(recycle_mod, "automation_is_soft_deleted", new=create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False)),
+        patch.object(cr.auto_db, "get_automation", new=create_autospec(auto_db_mod.get_automation, return_value=auto)),
+        patch.object(cr, "reconcile_delivery_for_settled_failure", new=create_autospec(cr.reconcile_delivery_for_settled_failure, return_value=held)),
+        patch.object(delivery_mod, "finish_run", new=finish_retry),
+    ):
+        ok = await cr.deliver_settled_failure_notification(_EXEC)
+    assert ok is True
+    update_state_mock.assert_awaited_once()
+    kw = update_state_mock.await_args.kwargs
+    assert kw["claim_token"] == "tok-retry-1"
+    assert kw["status"] == "pending"
+    assert kw["delay_seconds"] > 0
+    assert kw["delivery_result"][0]["retrying"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_skip_allows_capacity_pending_and_rollback_releases_prestart_signals() -> None:
+    """1) skip_execution passes allow_capacity_pending=True; settle_execution accepts
+    status='pending' + wait_reason='capacity_limit' while rejecting ordinary pending.
+    2) Rollback to a paused version checks START and releases pre-START signals in-tx."""
+    from src.dalton.services import automation_recycle as recycle_svc
+    from src.server.services.automations import lifecycle as auto_lifecycle
+
+    # Part 1a: skip_execution forwards allow_capacity_pending=True
+    settle_spy = create_autospec(auto_lifecycle.settle, return_value=True)
+    with (
+        patch.object(
+            auto_lifecycle.auto_db,
+            "get_automation",
+            new=create_autospec(auto_db_mod.get_automation, return_value=_automation()),
+        ),
+        patch.object(auto_lifecycle, "settle", new=settle_spy),
+    ):
+        res = await auto_lifecycle.skip_execution(_AUTO, _EXEC, _USER)
+    assert res is not None and res["status"] == "skipped"
+    assert settle_spy.await_args.kwargs["allow_capacity_pending"] is True
+
+    # Part 1b: settle_execution rejects ordinary pending (wait_reason=None) even with allow_capacity_pending=True
+    get_conn_ord, exec_ord = _make_recording_db(
+        fetchone_results=[
+            {"?column?": 1},
+            {
+                "status": "pending",
+                "wait_reason": None,
+                "created_at": _NOW,
+                "delivery": None,
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+                "coverage_unit_id": None,
+                "coverage_unit_version": None,
+                "db_now": _NOW,
+            },
+        ]
+    )
+    with patch.object(exec_db_mod, "get_db_connection", side_effect=get_conn_ord):
+        rejected = await exec_db_mod.settle_execution(
+            _EXEC,
+            automation_id=_AUTO,
+            from_statuses=("waiting",),
+            to="skipped",
+            allow_capacity_pending=True,
+        )
+    assert rejected is None
+    assert not any(sql.startswith("UPDATE automation_executions") for sql, _ in exec_ord)
+
+    # Part 2: _release_skipped_unstarted_executions checks START and releases signals in same tx
+    tx_conn, _ = _make_tx_conn(
+        fetchone_results=[None, {"current_status": "in_progress"}],
+        rowcounts=[0, 1, 1],
+    )
+    release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
+    dalton_auto = _automation(name="dalton-nvda-delta", status="paused")
+    unfinished = [
+        {
+            "automation_execution_id": _EXEC,
+            "status": "waiting",
+            "conversation_thread_id": _THREAD,
+            "conversation_response_id": None,
+        },
+        {
+            "automation_execution_id": "00000000-0000-0000-0000-000000000299",
+            "status": "running",
+            "conversation_thread_id": _THREAD,
+            "conversation_response_id": _RUN,
+        },
+    ]
+    with patch.object(watch_db, "release_signals_claimed_by", new=release_mock):
+        await recycle_svc._release_skipped_unstarted_executions(
+            tx_conn,
+            automation=dalton_auto,
+            unfinished=unfinished,
+        )
+    release_mock.assert_awaited_once_with(_EXEC, conn=tx_conn)
+
+
+@pytest.mark.asyncio
+async def test_settle_abandoned_without_run_enables_prestart_thread_reset() -> None:
+    """Abandoned executions that never created a conversation_response row enable
+    reset_prestart_thread_status=True in the settlement transaction."""
+    settle_spy = create_autospec(settle_mod.settle, return_value=True)
+    abandoned_running = {
+        "automation_execution_id": _EXEC,
+        "automation_id": _AUTO,
+        "status": "running",
+        "conversation_thread_id": _THREAD,
+        "conversation_response_id": None,
+        "started_at": _NOW,
+        "created_at": _NOW,
+        "delivery": None,
+        "user_id": _USER,
+        "workspace_id": _HOME,
+    }
+    abandoned_waiting = {
+        **abandoned_running,
+        "status": "waiting",
+    }
+    with (
+        patch.object(settle_mod, "settle", new=settle_spy),
+        patch.object(
+            settle_mod.exec_db,
+            "get_settling_run",
+            new=create_autospec(exec_db_mod.get_settling_run, return_value=None),
+        ),
+        patch(
+            "src.dalton.services.automation_subscription_fallback.apply_execution_fallback_notice",
+            new=create_autospec(
+                __import__(
+                    "src.dalton.services.automation_subscription_fallback",
+                    fromlist=["apply_execution_fallback_notice"],
+                ).apply_execution_fallback_notice,
+                return_value=(None, None),
+            ),
+        ),
+    ):
+        out_running = await settle_mod.settle_abandoned(_automation(), abandoned_running, 300)
+        out_waiting = await settle_mod.settle_abandoned(_automation(), abandoned_waiting, 300)
+
+    assert out_running is Outcome.INTERRUPTED
+    assert out_waiting is Outcome.SKIPPED
+    assert settle_spy.await_count == 2
+    assert settle_spy.await_args_list[0].kwargs["reset_prestart_thread_status"] is True
+    assert settle_spy.await_args_list[1].kwargs["reset_prestart_thread_status"] is True

@@ -29,6 +29,8 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WAIT_IDLE_SCRIPT = _REPO_ROOT / "scripts/dalton/ops/prod/wait_backend_idle.sh"
+_DEPLOY_MAIN_SCRIPT = _REPO_ROOT / "scripts/dalton/ops/prod/deploy_main.sh"
+_SHARED_SQL_FILE = _REPO_ROOT / "scripts/dalton/ops/prod/backend_busy_threads.sql"
 
 _FAKE_DOCKER_PY = r'''#!{python}
 import os
@@ -258,3 +260,115 @@ def test_wait_backend_idle_still_waits_for_in_progress_subagent_runs(
     res = _run_wait_backend_idle(tmp_path, db_path, max_checks=2)
     assert res.returncode == 1
     assert "threads=0 subagents=1" in res.stdout
+
+
+def test_deploy_main_pre_restart_busy_loop_exits_with_stale_automation_thread(
+    tmp_path: Path,
+) -> None:
+    """deploy_main.sh's pre-restart busy() shares backend_busy_threads.sql with
+    wait_backend_idle.sh, so the pre-restart while-busy loop exits even when a
+    >15m stale automation thread (all terminal executions, no live response) exists."""
+    assert _SHARED_SQL_FILE.is_file()
+    assert "backend_busy_threads.sql" in _WAIT_IDLE_SCRIPT.read_text(encoding="utf-8")
+    assert "backend_busy_threads.sql" in _DEPLOY_MAIN_SCRIPT.read_text(encoding="utf-8")
+
+    db_path = tmp_path / "deploy_busy.sqlite3"
+    conn = _init_fake_db(db_path)
+    conn.execute(
+        "INSERT INTO conversation_threads VALUES ('t-stale', 'in_progress', datetime('now', '-20 minutes'))"
+    )
+    conn.execute(
+        "INSERT INTO automation_executions VALUES ('e-1', 't-stale', 'failed')"
+    )
+    conn.commit()
+    conn.close()
+
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        _FAKE_DOCKER_PY.format(python=sys.executable),
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["FAKE_PG_SQLITE_DB"] = str(db_path)
+    env["WAIT_BACKEND_IDLE_SLEEP_SECONDS"] = "0"
+    env["WAIT_BACKEND_IDLE_MAX_CHECKS"] = "2"
+
+    # Case 1: Only the >15m stale automation thread exists -> busy() is false and loop exits immediately
+    script = f"""
+set -euo pipefail
+DALTON_DEPLOY_LIB_ONLY=1
+source "{_DEPLOY_MAIN_SCRIPT}"
+WAIT_IDLE_SCRIPT="{_WAIT_IDLE_SCRIPT}"
+busy() {{ _pre_restart_busy; }}
+loops=0
+while busy; do
+  loops=$((loops + 1))
+  if [ "$loops" -gt 3 ]; then
+    echo "STUCK_IN_LOOP"
+    exit 1
+  fi
+  bash "$WAIT_IDLE_SCRIPT"
+done
+echo "EXITED_LOOPS=$loops"
+"""
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res.returncode == 0, f"stderr={res.stderr} stdout={res.stdout}"
+    assert "EXITED_LOOPS=0" in res.stdout
+
+    # Case 2: Live chat thread initially makes busy() true -> wait_backend_idle.sh runs ->
+    # once live chat finishes (leaving the stale automation thread), loop exits after 1 iteration.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO conversation_threads VALUES ('t-live-chat', 'in_progress', datetime('now', '-25 minutes'))"
+    )
+    conn.commit()
+    conn.close()
+
+    finish_chat_wrapper = tmp_path / "wait_idle_and_finish_chat.sh"
+    finish_chat_wrapper.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+"{sys.executable}" -c "import sqlite3; c=sqlite3.connect('{db_path}'); c.execute(\\"UPDATE conversation_threads SET current_status='completed' WHERE conversation_thread_id='t-live-chat'\\"); c.commit(); c.close()"
+exec bash "{_WAIT_IDLE_SCRIPT}"
+""",
+        encoding="utf-8",
+    )
+    finish_chat_wrapper.chmod(0o755)
+
+    script2 = f"""
+set -euo pipefail
+DALTON_DEPLOY_LIB_ONLY=1
+source "{_DEPLOY_MAIN_SCRIPT}"
+WAIT_IDLE_SCRIPT="{finish_chat_wrapper}"
+busy() {{ _pre_restart_busy; }}
+loops=0
+while busy; do
+  loops=$((loops + 1))
+  if [ "$loops" -gt 3 ]; then
+    echo "STUCK_IN_LOOP"
+    exit 1
+  fi
+  bash "$WAIT_IDLE_SCRIPT"
+done
+echo "EXITED_LOOPS=$loops"
+"""
+    res2 = subprocess.run(
+        ["bash", "-c", script2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res2.returncode == 0, f"stderr={res2.stderr} stdout={res2.stdout}"
+    assert "EXITED_LOOPS=1" in res2.stdout

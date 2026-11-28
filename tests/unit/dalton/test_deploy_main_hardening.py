@@ -354,6 +354,10 @@ def _setup_strict_deploy_env(
     wait_idle_trace = tmp_path / "wait_idle.trace"
 
     shutil.copy2(_DEPLOY_SCRIPT, seed / "scripts/dalton/ops/prod/deploy_main.sh")
+    shutil.copy2(
+        _REPO_ROOT / "scripts/dalton/ops/prod/backend_busy_threads.sql",
+        seed / "scripts/dalton/ops/prod/backend_busy_threads.sql",
+    )
     wait_barrier_code = ""
     if wait_idle_barrier is not None:
         w_ready, w_go = wait_idle_barrier
@@ -762,6 +766,11 @@ def _wrapper_env_and_cmd(
         repo / "scripts/dalton/ops/prod/wait_backend_idle.sh",
         wrapper_tmp / "wait_backend_idle.sh",
     )
+    if (repo / "scripts/dalton/ops/prod/backend_busy_threads.sql").is_file():
+        shutil.copy2(
+            repo / "scripts/dalton/ops/prod/backend_busy_threads.sql",
+            wrapper_tmp / "backend_busy_threads.sql",
+        )
     reexec_tmpdir = tmp_path / "reexec-tmpdir"
     reexec_tmpdir.mkdir(exist_ok=True)
 

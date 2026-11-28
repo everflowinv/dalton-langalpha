@@ -590,6 +590,54 @@ async def _finish_agent(
     return response
 
 
+async def _release_skipped_unstarted_executions(
+    db: Any,
+    *,
+    automation: Mapping[str, Any],
+    unfinished: Sequence[Mapping[str, Any]],
+) -> None:
+    """Release pre-START claimed signals and reset stuck thread status in-tx for
+    every pending/waiting execution just skipped by delete or paused-version rollback."""
+    from src.dalton.automations.capacity_retry import (
+        reset_thread_status_after_prestart_exit,
+    )
+    from src.dalton.services.automation_subscription_fallback import (
+        release_claimed_signals_on_executor_failed_settle,
+    )
+    from src.server.services.automation_outcomes import Outcome
+
+    for item in unfinished:
+        if item.get("status") not in ("pending", "waiting"):
+            continue
+        eid = str(item.get("automation_execution_id") or "").strip()
+        if not eid:
+            continue
+        tid = (
+            str(item["conversation_thread_id"])
+            if item.get("conversation_thread_id") is not None
+            else None
+        )
+        rid = (
+            str(item["conversation_response_id"])
+            if item.get("conversation_response_id") is not None
+            else None
+        )
+        await release_claimed_signals_on_executor_failed_settle(
+            db,
+            automation=automation,
+            execution_id=eid,
+            thread_id=tid,
+            run_id=rid,
+            settled_row=item,
+        )
+        if rid is None and tid:
+            await reset_thread_status_after_prestart_exit(
+                tid,
+                outcome=Outcome.SKIPPED,
+                conn=db,
+            )
+
+
 async def soft_delete_automation(
     automation_id: str,
     *,
@@ -692,11 +740,17 @@ async def soft_delete_automation(
                 restored_from_version=None,
                 conn=db,
             )
-            await recycle_db.skip_unstarted_executions(
+            skipped_count = await recycle_db.skip_unstarted_executions(
                 automation_id,
                 skip_reason="task_deleted",
                 conn=db,
             )
+            if skipped_count:
+                await _release_skipped_unstarted_executions(
+                    db,
+                    automation=row,
+                    unfinished=unfinished,
+                )
             fields = _base_fields(row)
             fields.update(
                 {
@@ -1110,12 +1164,20 @@ async def rollback_automation(
                 keep_paused_once_next=False,
             )
             if status not in ("active", "executing"):
-                await recycle_db.lock_unfinished_executions(automation_id, conn=db)
-                await recycle_db.skip_unstarted_executions(
+                unfinished = await recycle_db.lock_unfinished_executions(
+                    automation_id, conn=db
+                )
+                skipped_count = await recycle_db.skip_unstarted_executions(
                     automation_id,
                     skip_reason="paused",
                     conn=db,
                 )
+                if skipped_count:
+                    await _release_skipped_unstarted_executions(
+                        db,
+                        automation=row,
+                        unfinished=unfinished,
+                    )
             post_notify = (
                 bool(snapshot.get("notify_enabled")),
                 [

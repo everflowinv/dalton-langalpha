@@ -10666,7 +10666,7 @@ export class ChannelGatewayOrchestrator {
   ): Promise<void> {
     if (autoRun.status !== "finishing") return;
     await this.agentRoutes.executeAutomationRunFinish({
-      executionId: autoRun.execution_id,
+      executionId: autoRun.execution_id.trim(),
       userId: autoRun.user_id,
       threadId: autoRun.thread_id,
       runId: autoRun.run_id ?? null,

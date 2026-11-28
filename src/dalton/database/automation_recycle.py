@@ -94,7 +94,8 @@ async def lock_unfinished_executions(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT automation_execution_id, status
+            SELECT automation_execution_id, status,
+                   conversation_thread_id, conversation_response_id
             FROM automation_executions
             WHERE automation_id = %s::uuid
               AND status IN ('pending', 'waiting', 'running')

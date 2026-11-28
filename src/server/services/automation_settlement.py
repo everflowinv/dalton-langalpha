@@ -174,8 +174,13 @@ async def settle(
     release_pre_start_signals: bool = False,
     # DALTON-HOOK(coverage-units): allow caller to narrow/specify source statuses without relaxing policy defaults
     from_statuses: Optional[tuple[ExecutionStatus, ...]] = None,
-    # DALTON-HOOK(automation-capacity-retry): atomically reset pre-START thread status in-tx and run winner-only failure delivery init
+    # DALTON-HOOK(automation-capacity-retry): in-lock capacity guards, capacity-pending skip, in-tx thread reset, and durable failure notification
+    expected_wait_reason: Optional[str] = None,
+    expected_claim_token: Any = exec_db.UNSET_CLAIM_TOKEN,
+    require_capacity_expired: bool = False,
+    allow_capacity_pending: bool = False,
     reset_prestart_thread_status: bool = False,
+    enqueue_failure_notify: bool = False,
     prepare_delivery_after_settle: Optional[
         Callable[
             [Dict[str, Any], Optional[str], Optional[automation_delivery.Delivery]],
@@ -203,9 +208,10 @@ async def settle(
     policy = POLICIES[outcome]
     error = error or policy.error
     finish_left = False
+    failure_notify_left = False  # DALTON-HOOK(automation-capacity-retry)
 
     async def leave_finish(conn: Any, settled: Dict[str, Any]) -> None:
-        nonlocal finish_left
+        nonlocal finish_left, failure_notify_left
         finish_left = await _leave_finish(
             conn, policy, automation, execution_id,
             *_settled_as(settled, execution_id, thread_id, run_id, delivery),
@@ -249,12 +255,44 @@ async def settle(
                 outcome=outcome,
                 conn=conn,
             )
+        # DALTON-HOOK(automation-capacity-retry): write durable retryable failure-notification task in the same tx (supports threadless executions)
+        if (
+            enqueue_failure_notify
+            and not finish_left
+            and policy.webhook
+            and not _repeats_a_refusal(policy.failure_reason, settled_run_id, settled)
+        ):
+            from src.dalton.automations.capacity_retry import (
+                enqueue_settled_failure_notification,
+            )
+            from src.dalton.database.automation_recycle import automation_is_soft_deleted
+
+            parent_id = str(automation.get("automation_id") or "")
+            if not (parent_id and await automation_is_soft_deleted(parent_id, conn=conn)):
+                failure_notify_left = await enqueue_settled_failure_notification(
+                    conn,
+                    execution_id=execution_id,
+                    automation=automation,
+                    outcome=outcome,
+                    error=error,
+                    thread_id=settled_thread_id,
+                    workspace_id=workspace_id,
+                )
 
     extra_settle_kwargs: Dict[str, Any] = {}
     if expected_run_id is not exec_db.UNSET_RUN_ID:
         extra_settle_kwargs["expected_run_id"] = expected_run_id
     if check_run_state_in_lock is not None:
         extra_settle_kwargs["check_run_state_in_lock"] = check_run_state_in_lock
+    # DALTON-HOOK(automation-capacity-retry): forward in-lock capacity guards & capacity-pending skip flag
+    if expected_wait_reason is not None:
+        extra_settle_kwargs["expected_wait_reason"] = expected_wait_reason
+    if expected_claim_token is not exec_db.UNSET_CLAIM_TOKEN:
+        extra_settle_kwargs["expected_claim_token"] = expected_claim_token
+    if require_capacity_expired:
+        extra_settle_kwargs["require_capacity_expired"] = True
+    if allow_capacity_pending:
+        extra_settle_kwargs["allow_capacity_pending"] = True
 
     row = await exec_db.settle_execution(
         execution_id,
@@ -294,6 +332,7 @@ async def settle(
         _after_settling(outcome, automation, execution_id, row,
                         thread_id, run_id, workspace_id, error,
                         delivery, final_text, finish_left,
+                        failure_notify_left=failure_notify_left,
                         prepare_delivery_after_settle=prepare_delivery_after_settle),  # DALTON-HOOK(automation-capacity-retry)
         name=f"settle_tail_{execution_id}",
     ))
@@ -367,7 +406,8 @@ async def _after_settling(
     delivery: Optional[automation_delivery.Delivery],
     final_text: Optional[str],
     finish_left: bool,
-    # DALTON-HOOK(automation-capacity-retry): optional winner-only failure delivery init/reconciliation callback
+    # DALTON-HOOK(automation-capacity-retry): durable failure-notification flag & optional fallback callback
+    failure_notify_left: bool = False,
     prepare_delivery_after_settle: Optional[
         Callable[
             [Dict[str, Any], Optional[str], Optional[automation_delivery.Delivery]],
@@ -387,7 +427,15 @@ async def _after_settling(
 
     parent_id = str(automation.get("automation_id") or "")
     deleted = bool(parent_id) and await automation_is_soft_deleted(parent_id)
-    if (
+    if failure_notify_left:
+        # DALTON-HOOK(automation-capacity-retry): immediately claim & deliver the durable failure-notification task;
+        # if this process exits before finishing, sweep_capacity_parked retries it across workers/restarts.
+        from src.dalton.automations.capacity_retry import (
+            deliver_settled_failure_notification,
+        )
+
+        await deliver_settled_failure_notification(execution_id)
+    elif (
         not deleted
         and policy.webhook
         and not _repeats_a_refusal(policy.failure_reason, run_id, row)
@@ -827,6 +875,8 @@ async def settle_by_run(
     check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
     # DALTON-HOOK(automation-subscription-fallback): carry loaded execution row to avoid redundant notice lookups
     exec_row: Optional[Mapping[str, Any]] = None,
+    # DALTON-HOOK(automation-capacity-retry): allow run-less abandoned settlement to reset pre-START thread status in-tx
+    reset_prestart_thread_status: bool = False,
 ) -> Optional[Outcome]:
     """Settle a firing as ``run``, its turn's ledger row, ended; the outcome,
     or None while the run is still going or once someone else settled it.
@@ -903,6 +953,8 @@ async def settle_by_run(
         settle_kwargs["expected_run_id"] = expected_run_id
     if check_run_state_in_lock is not None:
         settle_kwargs["check_run_state_in_lock"] = check_run_state_in_lock
+    if reset_prestart_thread_status:
+        settle_kwargs["reset_prestart_thread_status"] = True
     settled = await settle(
         automation, execution_id, outcome,
         thread_id=thread_id, run_id=run_id, workspace_id=workspace_id,
@@ -926,6 +978,8 @@ async def _settle_timeout_for_run(
     expected_run_id: Any = exec_db.UNSET_RUN_ID,
     # DALTON-HOOK(automation-subscription-fallback): carry loaded execution row to avoid redundant notice lookups
     exec_row: Optional[Mapping[str, Any]] = None,
+    # DALTON-HOOK(automation-capacity-retry): allow run-less timeout settlement to reset pre-START thread status in-tx
+    reset_prestart_thread_status: bool = False,
 ) -> bool:
     """Settle a stalled execution with no live turn that exceeded its timeout cap."""
     if run is None and run_id:
@@ -940,6 +994,8 @@ async def _settle_timeout_for_run(
     settle_kwargs: Dict[str, Any] = {"check_run_state_in_lock": "timeout"}
     if expected_run_id is not exec_db.UNSET_RUN_ID:
         settle_kwargs["expected_run_id"] = expected_run_id
+    if reset_prestart_thread_status:
+        settle_kwargs["reset_prestart_thread_status"] = True
     return await settle(
         automation,
         execution_id,
@@ -968,6 +1024,8 @@ async def _resolve_execution_settlement(
     retry_read: bool = False,
     excluding_run_id: Optional[str] = None,
     expected_run_id: Any = exec_db.UNSET_RUN_ID,
+    # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status in-tx when settling run-less abandoned executions
+    reset_prestart_thread_status: bool = False,
 ) -> Optional[Outcome]:
     """Shared decision order for finished turns, idle callbacks, and sweep:
 
@@ -1052,6 +1110,7 @@ async def _resolve_execution_settlement(
             quiet_for=None,
             expected_run_id=expected_run_id,
             exec_row=exec_row,
+            reset_prestart_thread_status=reset_prestart_thread_status,
         )
         return Outcome.TIMEOUT if settled else None
     return await settle_by_run(
@@ -1065,6 +1124,7 @@ async def _resolve_execution_settlement(
         retry_read=retry_read,
         expected_run_id=expected_run_id,
         exec_row=exec_row,
+        reset_prestart_thread_status=reset_prestart_thread_status,
     )
 
 
@@ -1085,11 +1145,16 @@ async def settle_abandoned(
     )
     workspace_id = row.get("workspace_id") or automation.get("workspace_id")
     if row["status"] == "waiting":
+        # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status in-tx for run-less abandoned waiting rows
+        waiting_kwargs: Dict[str, Any] = {}
+        if run_id is None:
+            waiting_kwargs["reset_prestart_thread_status"] = True
         settled = await settle(
             automation, execution_id, Outcome.SKIPPED,
             thread_id=thread_id, run_id=run_id, workspace_id=workspace_id,
             skip_reason="interrupted", quiet_for=quiet_for,
             expected_run_id=run_id,
+            **waiting_kwargs,
         )
         return Outcome.SKIPPED if settled else None
     run = await exec_db.get_settling_run(run_id) if run_id else None
@@ -1103,6 +1168,8 @@ async def settle_abandoned(
         workspace_id=workspace_id,
         quiet_for=quiet_for,
         expected_run_id=run_id,
+        # DALTON-HOOK(automation-capacity-retry): reset pre-START thread status in-tx when abandoned firing never reached START
+        reset_prestart_thread_status=(run is None and run_id is None),
     )
 
 

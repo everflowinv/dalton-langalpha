@@ -740,6 +740,19 @@ export class AgentRoutesHandler {
     return { status: 200, data: { targets: res.targets } };
   }
 
+  private canonicalAutomationExecutionId(rawExecutionId: string): string {
+    const trimmed = String(rawExecutionId || "").trim();
+    const dot = trimmed.lastIndexOf(".");
+    if (dot > 0) {
+      const base = trimmed.slice(0, dot);
+      const suffix = trimmed.slice(dot + 1);
+      if (/^\d+$/.test(suffix) && Number(suffix) >= 2 && /^[0-9a-fA-F-]{36}$/.test(base)) {
+        return base.toLowerCase();
+      }
+    }
+    return trimmed;
+  }
+
   async handleFinishAutomationRun(
     userId: string,
     executionId: string,
@@ -752,10 +765,14 @@ export class AgentRoutesHandler {
       retryable?: boolean;
     };
   }> {
+    const lockExecutionId = this.canonicalAutomationExecutionId(executionId);
     // Shape B check: if another caller in this gateway process is already finishing `executionId`,
     // never enter execution or write `finished`; return a retryable response while in flight
     // (or Shape C if the first caller already transitioned the row to `finished`).
-    if (this.activeFinishExecutors.has(executionId)) {
+    if (
+      this.activeFinishExecutors.has(lockExecutionId) ||
+      this.activeFinishExecutors.has(executionId)
+    ) {
       const current = await this.backend.finishAutomationRun(
         executionId,
         {
@@ -833,7 +850,8 @@ export class AgentRoutesHandler {
     // BW2: Acquire in-process execution ownership synchronously BEFORE the first `await`
     // (I-8 `finishAutomationRun`) so two concurrent `/finish` calls cannot both pass the
     // active check before I-8 returns.
-    this.activeFinishExecutors.add(executionId);
+    const heldLockIds = new Set<string>([lockExecutionId]);
+    this.activeFinishExecutors.add(lockExecutionId);
     try {
       const claimed = await this.backend.finishAutomationRun(
         executionId,
@@ -869,10 +887,37 @@ export class AgentRoutesHandler {
         return { status: 200, data: { targets: finishedRows } };
       }
 
+      // Unify delivery dedup key with startup recovery by always using the canonical
+      // execution_id returned by the backend (never a `<uuid>.2` retry alias).
+      const resolvedExecutionId =
+        claimed.data.execution_id?.trim() || lockExecutionId;
+      if (!heldLockIds.has(resolvedExecutionId)) {
+        if (this.activeFinishExecutors.has(resolvedExecutionId)) {
+          return {
+            status: 503,
+            data: {
+              detail:
+                "Another finish request is already delivering this automation run; retry finish to settle.",
+              retryable: true,
+              targets: (claimed.data.targets ?? []).map((t) => ({
+                entry: t.entry,
+                address: t.address ?? null,
+                name: t.name ?? null,
+                reached: Boolean(t.reached),
+                via: t.via ?? null,
+                error: t.ok === false ? (t.message ?? "Target was not resolved at start.") : (t.error ?? null),
+              })),
+            },
+          };
+        }
+        heldLockIds.add(resolvedExecutionId);
+        this.activeFinishExecutors.add(resolvedExecutionId);
+      }
+
       // Shape A: execute finish deliveries and finalize in DB
       const detailed = await this.executeAutomationRunFinishDetailed(
         {
-          executionId,
+          executionId: resolvedExecutionId,
           userId: claimed.data.user_id || userId,
           threadId: claimed.data.thread_id ?? body.thread_id ?? null,
           runId: claimed.data.run_id ?? null,
@@ -905,7 +950,9 @@ export class AgentRoutesHandler {
 
       return { status: 200, data: { targets: detailed.targets } };
     } finally {
-      this.activeFinishExecutors.delete(executionId);
+      for (const id of heldLockIds) {
+        this.activeFinishExecutors.delete(id);
+      }
     }
   }
 
@@ -926,7 +973,8 @@ export class AgentRoutesHandler {
     strictDeliverableTextEnabled?: boolean;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
-    if (this.activeFinishExecutors.has(params.executionId)) {
+    const canonicalId = this.canonicalAutomationExecutionId(params.executionId);
+    if (this.activeFinishExecutors.has(canonicalId)) {
       return params.targets.map((t) => ({
         entry: t.entry,
         address: t.address ?? null,
@@ -936,7 +984,10 @@ export class AgentRoutesHandler {
         error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
       }));
     }
-    const detailed = await this.executeAutomationRunFinishDetailed(params);
+    const detailed = await this.executeAutomationRunFinishDetailed({
+      ...params,
+      executionId: canonicalId,
+    });
     return detailed.targets;
   }
 

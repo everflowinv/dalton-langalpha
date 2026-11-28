@@ -771,16 +771,21 @@ class AutomationExecutor:
                 f"execution_id={execution_id}"
             )
             return
-        # DALTON-HOOK(automation-capacity-retry): hydrate persisted delivery registration across retries so edits re-resolve and clears revoke
+        # DALTON-HOOK(automation-capacity-retry): hydrate persisted delivery registration across retries so edits and default targets re-resolve and clears revoke
         from src.dalton.automations.capacity_retry import (
             delivery_id_for_start,
+            has_default_delivery_entry,
             hydrate_delivery_state_for_firing,
             sync_delivery_state_after_start,
         )
 
         await hydrate_delivery_state_for_firing(execution_id, firing)
         entries = automation_delivery.entries_of(firing.automation)
-        if firing.delivery_starts and entries == firing.delivery_entries:
+        if (
+            firing.delivery_starts
+            and entries == firing.delivery_entries
+            and not has_default_delivery_entry(entries)
+        ):
             return
         firing.delivery_starts += 1
         firing.delivery_entries = entries
@@ -1271,7 +1276,13 @@ class AutomationExecutor:
             has_byok, has_cred = await _credentials(user_id)
             await enforce_credit_limit(recorded_as, byok=has_cred)
 
-    async def execute(self, automation: Dict[str, Any], execution_id: str) -> None:
+    async def execute(
+        self,
+        automation: Dict[str, Any],
+        execution_id: str,
+        *,
+        claim_token: Optional[str] = None,  # DALTON-HOOK(automation-capacity-retry)
+    ) -> None:
         """Run one firing of ``automation`` until it settles or its run does.
 
         It starts only from ``pending``: the sweep may have settled it while
@@ -1298,9 +1309,13 @@ class AutomationExecutor:
         )
         try:
             # DALTON-HOOK(company-automations): pending→running only while the parent is not deleted
+            # DALTON-HOOK(automation-capacity-retry): pass claim_token when dispatched from capacity queue
+            begin_kwargs: Dict[str, Any] = {"started_at": datetime.now(timezone.utc)}
+            if claim_token is not None:
+                begin_kwargs["claim_token"] = claim_token
             started = await exec_db.begin_execution_if_not_deleted(
                 execution_id,
-                started_at=datetime.now(timezone.utc),
+                **begin_kwargs,
             )
             if not started:
                 logger.warning(
