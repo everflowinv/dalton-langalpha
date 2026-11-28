@@ -1210,7 +1210,6 @@ async def resolve_turn_config_with_automation_inheritance(
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
     retry_source_execution_id: str | None = None,
-    run_id: str | None = None,
     payer_user_id: str | None = None,
     resolve: Callable[..., Awaitable[Any]],
     flagged_subscription: tuple[Any, str | None] | None = None,
@@ -1298,22 +1297,32 @@ async def resolve_turn_config_with_automation_inheritance(
         and effort_configured
         and _accepts_effort_override(resolve)
     )
-    apply_system_only_override = (
-        inherited_system_only and _accepts_ignore_custom_models_override(resolve)
-    )
+    can_override_system_only = _accepts_ignore_custom_models_override(resolve)
+    apply_system_only_override = inherited_system_only and can_override_system_only
+    if apply_effort_override or apply_system_only_override:
+        async def _effective_resolve(model_name: str | None) -> Any:
+            extra_kw: dict[str, Any] = {}
+            if apply_effort_override:
+                extra_kw["reasoning_effort_override"] = inherited_effort
+            if apply_system_only_override:
+                extra_kw["ignore_custom_models_override"] = True
+            return await resolve(model_name, **extra_kw)
+    else:
+        _effective_resolve = resolve
 
-    from contextlib import nullcontext
+    async def _resolve_unattended_candidate(model_name: str) -> Any:
+        if can_override_system_only and not apply_system_only_override:
+            extra_kw: dict[str, Any] = {"ignore_custom_models_override": True}
+            if apply_effort_override:
+                extra_kw["reasoning_effort_override"] = inherited_effort
+            return await resolve(model_name, **extra_kw)
+        return await _effective_resolve(model_name)
 
     from src.dalton.llm.unattended_fallback import (
-        UnattendedTurnContext,
         acquire_fallback_candidate_live,
-        bind_unattended_turn_context,
-        build_wakeup_cooldown_http_exception,
-        check_wakeup_deferral_admission_deadline,
-        classify_unattended_source_kind,
-        evaluate_and_record_wakeup_deferral,
         format_unattended_quota_notice,
         inspect_subscription_availability,
+        is_terminal_auth_http_error,
         is_unattended_turn,
         resolve_unattended_fallback_chain,
         route_fingerprint_to_dict,
@@ -1321,39 +1330,15 @@ async def resolve_turn_config_with_automation_inheritance(
     from src.dalton.settings import is_unattended_quota_fallback_enabled
 
     eff_payer_id = payer_user_id or user_id
-    unattended_quota_on = is_unattended_quota_fallback_enabled() and is_unattended_turn(
-        request,
-        from_service=from_service,
-    )
-    unattended_ctx = (
-        UnattendedTurnContext(
-            is_unattended=True,
-            subject_user_id=user_id,
-            payer_user_id=eff_payer_id,
-            source_kind=classify_unattended_source_kind(request),
-            ignore_custom_models=inherited_system_only,
-            run_id=run_id,
-            thread_id=thread_id,
+    unattended_quota_on = (
+        is_unattended_quota_fallback_enabled()
+        and not retry_of_run_id
+        and not getattr(request, "hitl_response", None)
+        and is_unattended_turn(
+            request,
+            from_service=from_service,
         )
-        if unattended_quota_on
-        else None
     )
-
-    if apply_effort_override or apply_system_only_override or unattended_ctx is not None:
-        async def _effective_resolve(model_name: str | None) -> Any:
-            extra_kw: dict[str, Any] = {}
-            if apply_effort_override:
-                extra_kw["reasoning_effort_override"] = inherited_effort
-            if apply_system_only_override:
-                extra_kw["ignore_custom_models_override"] = True
-            with (
-                bind_unattended_turn_context(unattended_ctx)
-                if unattended_ctx is not None
-                else nullcontext()
-            ):
-                return await resolve(model_name, **extra_kw)
-    else:
-        _effective_resolve = resolve
 
     # Once a continuation is linked to an automation execution, its model and
     # reasoning effort come solely from the execution snapshot — ignoring
@@ -1373,32 +1358,7 @@ async def resolve_turn_config_with_automation_inheritance(
         else held_model
     )
 
-    # Pre-dispatch wakeup deferral deadline check (runs BEFORE model availability so
-    # previously held wakeups and checkpoint resumes cannot bypass the 24h deadline
-    # when a model becomes available again or across internal HTTP retries).
-    if unattended_quota_on and getattr(request, "query_type", None) == "wakeup":
-        _admit_wake = getattr(request, "wakeup", None)
-        if isinstance(_admit_wake, Mapping):
-            _admit_root = str(
-                _admit_wake.get("root_job_id") or _admit_wake.get("job_id") or ""
-            ).strip()
-            if _admit_root:
-                _admit_notices = _admit_wake.get("notices") or []
-                _admit_wid = str(_admit_wake.get("wakeup_id") or "").strip()
-                if not _admit_wid and isinstance(_admit_notices, list) and _admit_notices:
-                    _first_n = _admit_notices[0]
-                    if isinstance(_first_n, Mapping):
-                        _admit_wid = str(
-                            _first_n.get("wakeup_id") or _first_n.get("id") or ""
-                        ).strip()
-                await check_wakeup_deferral_admission_deadline(
-                    root_job_id=_admit_root,
-                    wakeup_id=_admit_wid or _admit_root,
-                    thread_id=thread_id,
-                    owner_user_id=user_id,
-                )
-
-    # Pre-dispatch structured cooldown & wakeup shared-deferral gate when enabled.
+    # Pre-dispatch structured cooldown check when unattended quota fallback is enabled.
     if unattended_quota_on and flagged_subscription is None:
         pref_for_probe = (
             prefs
@@ -1428,54 +1388,28 @@ async def resolve_turn_config_with_automation_inheritance(
                 ignore_custom_models=inherited_system_only,
             )
             if not primary_avail.available:
-                availabilities = [primary_avail]
                 cands = resolve_unattended_fallback_chain(
-                    user_prefs=pref_for_probe,
                     primary_model=primary_probe_model,
                     skip_cooldown_keys=[primary_avail.cooldown_key]
                     if primary_avail.cooldown_key
                     else (),
                     user_id=user_id,
-                    ignore_custom_models=inherited_system_only,
+                    ignore_custom_models=True,
                 )
                 for cand in cands:
-                    cand_avail = await inspect_subscription_availability(
-                        user_id,
-                        cand,
-                        prefs=default_pref_for_probe,
-                        ignore_custom_models=inherited_system_only,
-                    )
-                    availabilities.append(cand_avail)
-                    if not cand_avail.available:
-                        continue
-                    async def _cached_cand_avail(*_a: Any, **_kw: Any) -> Any:
-                        return cand_avail
-
                     admission = await acquire_fallback_candidate_live(
                         subject_user_id=user_id,
                         payer_user_id=eff_payer_id,
                         candidate_model=cand,
-                        run_id=run_id,
-                        call_id=f"pre:{run_id}:{cand}" if run_id else None,
-                        ignore_custom_models=inherited_system_only,
+                        ignore_custom_models=True,
                         model_pref=default_pref_for_probe,
-                        availability_fn=_cached_cand_avail,
                     )
                     if not admission.admitted:
                         continue
                     try:
-                        cfg = await _effective_resolve(cand)
+                        cfg = await _resolve_unattended_candidate(cand)
                     except Exception:
                         continue
-                    if admission.route is not None:
-                        try:
-                            setattr(
-                                cfg,
-                                "_dalton_active_fallback_route",
-                                route_fingerprint_to_dict(admission.route),
-                            )
-                        except Exception:
-                            pass
                     chosen = getattr(getattr(cfg, "llm", None), "name", None) or cand
                     kind = (
                         "oauth_auth_unavailable"
@@ -1494,46 +1428,13 @@ async def resolve_turn_config_with_automation_inheritance(
                             fallback_model=chosen,
                         ),
                     }
+                    if admission.route is not None:
+                        record["selected_route"] = route_fingerprint_to_dict(admission.route)
                     if target_exec and target_exec.get("automation_execution_id"):
                         record["execution_id"] = str(target_exec["automation_execution_id"])
                     if on_fallback is not None:
                         on_fallback(record)
                     return cfg
-
-                # All candidates unavailable pre-dispatch: for wakeup turns, consult shared
-                # 3-defer / 24h ledger and return dalton_subscription_cooldown (or exhausted).
-                if getattr(request, "query_type", None) == "wakeup":
-                    wakeup_meta = getattr(request, "wakeup", None)
-                    wakeup_map = wakeup_meta if isinstance(wakeup_meta, Mapping) else {}
-                    root_job_id = str(
-                        wakeup_map.get("root_job_id")
-                        or wakeup_map.get("job_id")
-                        or getattr(request, "request_key", None)
-                        or ""
-                    ).strip()
-                    if root_job_id:
-                        job_id = str(wakeup_map.get("job_id") or root_job_id)
-                        attempts = int(wakeup_map.get("attempts") or 1)
-                        notices = wakeup_map.get("notices") or []
-                        wakeup_id = str(wakeup_map.get("wakeup_id") or "").strip()
-                        if not wakeup_id and isinstance(notices, list) and notices:
-                            first = notices[0]
-                            if isinstance(first, Mapping):
-                                wakeup_id = str(first.get("wakeup_id") or first.get("id") or "").strip()
-                        wakeup_id = wakeup_id or root_job_id
-                        from src.dalton.llm.unattended_fallback import _parse_iso_or_epoch
-
-                        decision = await evaluate_and_record_wakeup_deferral(
-                            root_job_id=root_job_id,
-                            wakeup_id=wakeup_id,
-                            thread_id=thread_id,
-                            owner_user_id=user_id,
-                            step_key=f"pre:{job_id}:{attempts}",
-                            availabilities=availabilities,
-                            first_due_at=_parse_iso_or_epoch(wakeup_map.get("first_due_at")),
-                            workspace_id=getattr(request, "workspace_id", None),
-                        )
-                        raise build_wakeup_cooldown_http_exception(decision)
 
     async def _try_subscription_fallback(
         *,
@@ -1572,14 +1473,15 @@ async def resolve_turn_config_with_automation_inheritance(
             original_model=orig,
             failed_provider=failed_provider,
             reason=reason,
-            resolve_candidate=_effective_resolve,
+            resolve_candidate=(
+                _resolve_unattended_candidate if unattended_quota_on else _effective_resolve
+            ),
             exc_to_raise=exc_to_raise,
             model_resolves_fn=model_resolves,
             failed_subject=failed_subject,
             ignore_custom_models=inherited_system_only,
             unattended_gate=unattended_quota_on,
             payer_user_id=eff_payer_id,
-            run_id=run_id,
         )
         if target_exec and target_exec.get("automation_execution_id"):
             record = {
@@ -1593,15 +1495,9 @@ async def resolve_turn_config_with_automation_inheritance(
     effective_fallback_eligible = fallback_eligible or unattended_quota_on
 
     def _is_sub_unavailable_for_turn(exc: HTTPException) -> bool:
-        if is_subscription_unavailable_error(exc):
-            return True
-        if (
-            unattended_quota_on
-            and isinstance(exc.detail, dict)
-            and exc.detail.get("type") == "oauth_required"
-        ):
-            return True
-        return False
+        if unattended_quota_on:
+            return is_terminal_auth_http_error(exc)
+        return is_subscription_unavailable_error(exc)
 
     if flagged_subscription is not None:
         subscription, error_code = flagged_subscription

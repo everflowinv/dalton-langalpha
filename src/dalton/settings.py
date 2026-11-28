@@ -2226,7 +2226,7 @@ def get_monitor_multi_binding_publish_mode() -> Literal["per_panel", "all_or_not
 
 
 def is_unattended_quota_fallback_enabled() -> bool:
-    """Switch for unattended-turn subscription quota fallback & wakeup deferral (default ``False``).
+    """Switch for unattended-turn pre-dispatch subscription quota fallback (default ``False``).
 
     Reads ``DALTON_UNATTENDED_QUOTA_FALLBACK_ENABLED`` -> YAML
     ``autonomy.unattended_quota_fallback_enabled`` -> ``False``.

@@ -218,8 +218,6 @@ class RunOutcome:
     no_model_calls: bool = field(default=False, kw_only=True)
     # DALTON-HOOK(deliverable-text): per-message captured image URL map persisted for replay and I-7 :imgfix isolation.
     images_by_message: Dict[str, Dict[str, str]] = field(default_factory=dict, kw_only=True)
-    # DALTON-HOOK(quota-exhaustion): structured mid-turn wakeup quota failure payload settled atomically in finalize_run tx
-    wakeup_quota_failure: Optional[Dict[str, Any]] = field(default=None, kw_only=True)
 
 
 @asynccontextmanager
@@ -603,44 +601,6 @@ async def start_run(
                 # DALTON-HOOK(team-model-catalog): persist turn-scoped effective_catalog_snapshot
                 # (including pricing, modalities, reasoning, fixed route, bound_base_url & key_fingerprint)
                 run_metadata = dict(metadata or {})
-                # DALTON-HOOK(quota-exhaustion): preserve original run's effective_catalog_snapshot across unattended retries instead of rebuilding from live catalog
-                if "effective_catalog_snapshot" not in run_metadata and retry_of_run_id:
-                    try:
-                        from src.dalton.services.team_model_catalog.constants import (
-                            TURN_SNAPSHOT_SCHEMA,
-                        )
-                        from src.dalton.settings import is_unattended_quota_fallback_enabled
-
-                        if is_unattended_quota_fallback_enabled():
-                            async with conn.cursor(row_factory=dict_row) as cur:
-                                await cur.execute(
-                                    """
-                                    SELECT metadata->'effective_catalog_snapshot' AS snap
-                                    FROM conversation_responses
-                                    WHERE conversation_response_id = %s::uuid
-                                    """,
-                                    (str(retry_of_run_id),),
-                                )
-                                _src_snap_row = await cur.fetchone()
-                            _src_snap = (
-                                _src_snap_row.get("snap")
-                                if isinstance(_src_snap_row, dict)
-                                else None
-                            )
-                            if (
-                                isinstance(_src_snap, dict)
-                                and _src_snap.get("schema") == TURN_SNAPSHOT_SCHEMA
-                                and isinstance(_src_snap.get("models"), dict)
-                                and _src_snap.get("models")
-                            ):
-                                run_metadata["effective_catalog_snapshot"] = dict(_src_snap)
-                                if _src_snap.get("catalog_revision") is not None:
-                                    run_metadata["catalog_revision"] = _src_snap["catalog_revision"]
-                    except Exception as _retry_snap_exc:
-                        logger.debug(
-                            "[turn_lifecycle] retry source catalog snapshot lookup skipped: %s",
-                            _retry_snap_exc,
-                        )
                 if "effective_catalog_snapshot" not in run_metadata:
                     try:
                         from src.dalton.services.team_model_catalog.snapshot import (
@@ -657,12 +617,6 @@ async def start_run(
                         if isinstance(fb_list, list):
                             snap_candidates.extend(
                                 str(x).strip() for x in fb_list if isinstance(x, str) and x.strip()
-                            )
-                        # DALTON-HOOK(quota-exhaustion): include admitted unattended fallback candidates in turn START snapshot
-                        uf_list = run_metadata.get("unattended_fallback_models")
-                        if isinstance(uf_list, list):
-                            snap_candidates.extend(
-                                str(x).strip() for x in uf_list if isinstance(x, str) and x.strip()
                             )
                         if snap_candidates:
                             snap = build_effective_catalog_snapshot(snap_candidates)
@@ -1033,21 +987,6 @@ async def finalize_run(
                 if jobs:
                     await enqueue_hooks(
                         conn, run_id=run_id, thread_id=thread_id, jobs=jobs
-                    )
-
-                # DALTON-HOOK(quota-exhaustion): atomically record wakeup mid-turn quota exhaustion & wakeup_quota_resume inside finalize tx
-                if final_status == "error" and outcome.wakeup_quota_failure:
-                    from src.dalton.llm.unattended_fallback import (
-                        maybe_record_wakeup_mid_turn_resume_in_tx,
-                    )
-
-                    await maybe_record_wakeup_mid_turn_resume_in_tx(
-                        conn,
-                        run_row=run_row,
-                        thread_id=thread_id,
-                        run_id=run_id,
-                        newest_checkpoint_id=commit_checkpoint_id,
-                        quota_failure=outcome.wakeup_quota_failure,
                     )
 
                 # Deferred report-backs (a task's, an analyst's) and market

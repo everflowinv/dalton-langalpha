@@ -1355,15 +1355,6 @@ async def _resolve_fallback_clients(
     Everything under that resolves on the fallback's own name, so the primary's
     speed is not charged to a model whose profile did not ask for it.
     """
-    # DALTON-HOOK(automation-subscription-fallback): delegate unattended fallback client build & quota_or_auth_only tagging when enabled
-    from src.dalton.llm.unattended_fallback import resolve_unattended_fallback_clients
-    if await resolve_unattended_fallback_clients(
-        config, user_id, model_pref, byok_cache, is_byok=is_byok, cache_key=cache_key,
-        policy=policy, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
-        ignore_custom_models=ignore_custom_models,
-    ):
-        return
-
     fallback_models = config.llm.fallback or []
     if not fallback_models:
         config.fallback_llm_clients = []

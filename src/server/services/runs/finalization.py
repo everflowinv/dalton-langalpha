@@ -273,24 +273,6 @@ async def assemble_finalize_artifacts(
     if by_msg:
         metadata["persisted_images_by_message"] = by_msg
 
-    # DALTON-HOOK(quota-exhaustion): carry active_fallback_route & structured mid-turn wakeup quota failure into finalize tx
-    from src.dalton.llm.unattended_fallback import (
-        extract_mid_turn_quota_failure_payload,
-        get_unattended_fallback_meta,
-    )
-
-    if agent_config is not None:
-        for _fb_client in getattr(agent_config, "fallback_llm_clients", None) or ():
-            _fb_meta = get_unattended_fallback_meta(_fb_client)
-            if isinstance(_fb_meta, dict) and isinstance(_fb_meta.get("active_fallback_route"), dict):
-                persist_metadata["active_fallback_route"] = dict(_fb_meta["active_fallback_route"])
-    _eff_model_name = getattr(getattr(agent_config, "llm", None), "name", None) if agent_config is not None else None
-    wakeup_quota_failure = (
-        extract_mid_turn_quota_failure_payload(exc, model_name=_eff_model_name)
-        if status == "error" and exc is not None
-        else None
-    )
-
     return RunOutcome(
         status=status,
         interrupt_reason=interrupt_reason,
@@ -303,7 +285,6 @@ async def assemble_finalize_artifacts(
         record=await _producer_record(key, handler, stop_events, status),
         images=await _turn_images(key, metadata, handler),
         images_by_message=dict(by_msg) if by_msg else {},  # DALTON-HOOK(deliverable-text)
-        wakeup_quota_failure=wakeup_quota_failure,  # DALTON-HOOK(quota-exhaustion)
     )
 
 

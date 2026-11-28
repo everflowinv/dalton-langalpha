@@ -171,30 +171,20 @@ async def internal_llm_complete(
         )
 
     from src.dalton.llm.unattended_fallback import (
-        _classify_candidate_billing,
-        _maybe_enqueue_failure_notice_in_tx,
-        format_unattended_quota_notice,
+        get_admin_subscription_whitelist,
         inspect_subscription_availability,
         is_complete_result_quota_or_auth_trigger,
+        is_verified_system_subscription_model,
         resolve_unattended_fallback_chain,
     )
     from src.dalton.settings import is_unattended_quota_fallback_enabled
-    from src.server.database.pool import get_db_connection
-
-    def _is_verified_system_subscription_model(model_key: str) -> bool:
-        try:
-            from src.llms.llm import LLM as LLMFactory
-
-            if LLMFactory.get_model_config().get_model_config(model_key) is None:
-                return False
-        except Exception:
-            return False
-        billing, _ = _classify_candidate_billing(
-            model_key, ignore_custom_models=True
-        )
-        return billing == "oauth"
 
     unattended_on = is_unattended_quota_fallback_enabled()
+    configured_order = [m for m in get_admin_subscription_whitelist() if m in allowed_models]
+    for m in sorted(allowed_models):
+        if m not in configured_order:
+            configured_order.append(m)
+
     primary_avail = None
     active_model = requested_model
     if unattended_on:
@@ -203,21 +193,15 @@ async def internal_llm_complete(
         )
         if not primary_avail.available:
             skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
-            ordered_pool = [
-                m
-                for m in sorted(allowed_models)
-                if m != requested_model and _is_verified_system_subscription_model(m)
-            ]
             pre_candidates = resolve_unattended_fallback_chain(
-                task_fallbacks=ordered_pool,
                 primary_model=requested_model,
-                allowed_pool=allowed_models,
+                allowed_pool=configured_order,
                 skip_cooldown_keys=skip_keys,
                 user_id=primary_admin_id,
                 ignore_custom_models=True,
             )
             for cand_model in pre_candidates:
-                if not _is_verified_system_subscription_model(cand_model):
+                if not is_verified_system_subscription_model(cand_model):
                     continue
                 cand_avail = await inspect_subscription_availability(
                     primary_admin_id, cand_model, ignore_custom_models=True
@@ -238,91 +222,50 @@ async def internal_llm_complete(
         **({"ignore_custom_models": True} if unattended_on else {}),
     )
 
-    if not result.ok and unattended_on:
-        is_quota_or_auth = is_complete_result_quota_or_auth_trigger(result)
-        if is_quota_or_auth:
-            if primary_avail is None:
-                primary_avail = await inspect_subscription_availability(
-                    primary_admin_id, active_model, ignore_custom_models=True
-                )
-            skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
-            tried = {active_model}
-            ordered_pool = [
-                m
-                for m in sorted(allowed_models)
-                if m not in tried and _is_verified_system_subscription_model(m)
-            ]
-            candidates = resolve_unattended_fallback_chain(
-                task_fallbacks=ordered_pool,
-                primary_model=active_model,
-                allowed_pool=allowed_models,
-                skip_cooldown_keys=skip_keys,
+    if not result.ok and unattended_on and is_complete_result_quota_or_auth_trigger(result):
+        if primary_avail is None:
+            primary_avail = await inspect_subscription_availability(
+                primary_admin_id, active_model, ignore_custom_models=True
+            )
+        skip_keys = [primary_avail.cooldown_key] if primary_avail.cooldown_key else []
+        tried = {active_model}
+        remaining_pool = [m for m in configured_order if m not in tried]
+        candidates = resolve_unattended_fallback_chain(
+            primary_model=active_model,
+            allowed_pool=remaining_pool,
+            skip_cooldown_keys=skip_keys,
+            user_id=primary_admin_id,
+            ignore_custom_models=True,
+        )
+        for cand_model in candidates:
+            if not is_verified_system_subscription_model(cand_model):
+                continue
+            cand_avail = await inspect_subscription_availability(
+                primary_admin_id, cand_model, ignore_custom_models=True
+            )
+            if not cand_avail.available:
+                continue
+            cand_res = await dalton_complete(
                 user_id=primary_admin_id,
+                system_prompt=payload.system_prompt,
+                user_prompt=payload.user_prompt,
+                model=cand_model,
+                response_schema=schema_model,
+                slot="background",
+                purpose=payload.purpose,
+                timeout_s=payload.timeout_s,
                 ignore_custom_models=True,
             )
-            for cand_model in candidates:
-                if not _is_verified_system_subscription_model(cand_model):
-                    continue
-                cand_avail = await inspect_subscription_availability(
-                    primary_admin_id, cand_model, ignore_custom_models=True
+            result = cand_res
+            if cand_res.ok:
+                logger.info(
+                    "[InternalLLM] Primary %s quota/auth failed; succeeded on whitelisted fallback %s",
+                    requested_model,
+                    cand_model,
                 )
-                if not cand_avail.available:
-                    continue
-                cand_res = await dalton_complete(
-                    user_id=primary_admin_id,
-                    system_prompt=payload.system_prompt,
-                    user_prompt=payload.user_prompt,
-                    model=cand_model,
-                    response_schema=schema_model,
-                    slot="background",
-                    purpose=payload.purpose,
-                    timeout_s=payload.timeout_s,
-                    ignore_custom_models=True,
-                )
-                result = cand_res
-                if cand_res.ok:
-                    logger.info(
-                        "[InternalLLM] Primary %s quota/auth failed; succeeded on whitelisted fallback %s",
-                        requested_model,
-                        cand_model,
-                    )
-                    break
-                if not is_complete_result_quota_or_auth_trigger(cand_res):
-                    break
-
-            if not result.ok and is_complete_result_quota_or_auth_trigger(result):
-                # Best-effort Item 3 call-site (no-op when Item 3 is absent/disabled)
-                try:
-                    async with get_db_connection() as conn:
-                        async with conn.transaction():
-                            await _maybe_enqueue_failure_notice_in_tx(
-                                conn,
-                                subject_kind="data_task",
-                                subject_id=f"internal_llm:{payload.purpose}:{requested_model}",
-                                source_key=payload.purpose,
-                                recipient_user_id=primary_admin_id,
-                                failure_reason="subscription_quota_exhausted",
-                                summary={
-                                    "model": requested_model,
-                                    "purpose": payload.purpose,
-                                    "message": format_unattended_quota_notice(
-                                        "subscription_quota_exhausted",
-                                        model_name=requested_model,
-                                        reset_at=primary_avail.reset_at if primary_avail else None,
-                                    ),
-                                },
-                                dedup_window_key=(
-                                    f"data_task_quota:{primary_avail.cooldown_key}"
-                                    if primary_avail and primary_avail.cooldown_key
-                                    else None
-                                ),
-                            )
-                except Exception:
-                    logger.debug(
-                        "[InternalLLM] Optional failure-notice hook skipped for purpose=%s",
-                        payload.purpose,
-                        exc_info=True,
-                    )
+                break
+            if not is_complete_result_quota_or_auth_trigger(cand_res):
+                break
 
     if result.ok:
         return InternalLLMCompleteResponse(
