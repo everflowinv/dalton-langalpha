@@ -8,7 +8,8 @@
 #
 # 形态（profiles）取值来自 src.dalton.profile.DeploymentProfile（everflow / core）；
 # 能力门控（capability）取值来自 src.dalton.capabilities.CapabilityId；
-# route_fields 列出对应 Dalton PUT/PATCH 接口 Pydantic 请求体中由本条目覆盖的可写字段。
+# route_fields 列出对应 Dalton PUT/PATCH 接口 Pydantic 请求体（含嵌套模型与 model_validate 校验模型）中由本条目覆盖的可写字段；
+# schema_fields 列出前端 other_preference 子模式（Zod）中由本条目覆盖的可校验子字段路径。
 
 version: 1
 
@@ -203,6 +204,18 @@ settings:
     stored_in: user_preferences.agent_preference.output_format
     web_entry: 设置 → 对话与助手 → 输出格式优先级
     cos: tool:edit_file(.agents/user/profile/preference.json)
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.deliverable
+    stored_in: user_preferences.agent_preference.deliverable
+    web_entry: 历史兼容只读字段（已由 output_format 替代）
+    cos: excluded:历史输出格式兼容字段，已由 output_format 替代
+    profiles: [everflow, core]
+
+  - key: user_preferences.agent_preference.subagent_models
+    stored_in: user_preferences.agent_preference.subagent_models
+    web_entry: 历史兼容字段（当前子 Agent 模型入口见 侧栏「插件」→ 子 Agent）
+    cos: excluded:历史子 Agent 模型映射兼容字段，仅由团队模型目录退役迁移维护；用户子 Agent 模型配置见 integrations.subagents
     profiles: [everflow, core]
 
   # ===========================================================================
@@ -545,6 +558,16 @@ settings:
     web_entry: 设置 → 通用与外观 → 新手引导与页面提示
     cos: excluded:前端新手引导内部状态记录，由前端引导流程维护
     profiles: [everflow, core]
+    schema_fields:
+      - version
+      - pageIntrosSeen
+      - gettingStartedDoneAt
+      - gettingStartedDismissedAt
+      - lastSeenReleaseVersion
+      - firstRunAt
+      - welcomeSkippedAt
+      - chatAppsPromptDismissedAt
+      - chatAppsPromptThreadId
 
   - key: user_preferences.other_preference.dashboard
     stored_in: user_preferences.other_preference.dashboard
@@ -557,6 +580,16 @@ settings:
     web_entry: 仪表盘页面 → 自定义看板切换与列表
     cos: excluded:前端仪表盘展示列表，由用户在仪表盘页面管理
     profiles: [everflow, core]
+    schema_fields:
+      - current
+      - list
+      - code
+      - title
+      - path
+      - workspaceId
+      - threadId
+      - kind
+      - artifactId
 
   - key: user_preferences.other_preference.claude_sign_in_notice_dismissed
     stored_in: user_preferences.other_preference.claude_sign_in_notice_dismissed
@@ -704,9 +737,45 @@ settings:
     cos: tool:edit_file(.agents/user/automations/*.json)
     profiles: [everflow, core]
 
-  - key: automation.trigger_config
-    stored_in: automations.trigger_config
-    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 价格条件与复触发设置
+  - key: automation.trigger_config.symbol
+    stored_in: automations.trigger_config.symbol
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 监控标的
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.market
+    stored_in: automations.trigger_config.market
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 市场类型（stock / index）
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.conditions.type
+    stored_in: automations.trigger_config.conditions[].type
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 触发条件类型
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.conditions.value
+    stored_in: automations.trigger_config.conditions[].value
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 触发阈值
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.conditions.reference
+    stored_in: automations.trigger_config.conditions[].reference
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 涨跌幅基准价（previous_close / day_open）
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.retrigger.mode
+    stored_in: automations.trigger_config.retrigger.mode
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 复触发模式（one_shot / recurring）
+    cos: tool:edit_file(.agents/user/automations/*.json)
+    profiles: [everflow, core]
+
+  - key: automation.trigger_config.retrigger.cooldown_seconds
+    stored_in: automations.trigger_config.retrigger.cooldown_seconds
+    web_entry: 侧栏「自动化」→ 新建/编辑价格提醒 → 复触发冷却时间
     cos: tool:edit_file(.agents/user/automations/*.json)
     profiles: [everflow, core]
 
@@ -760,8 +829,8 @@ settings:
     cos: tool:edit_file(.agents/user/automations/*.json)
     profiles: [everflow, core]
 
-  - key: automation.delivery_config
-    stored_in: automations.delivery_config
+  - key: automation.delivery_config.methods
+    stored_in: automations.delivery_config.methods
     web_entry: 侧栏「自动化」→ 新建/编辑任务 → 结果投递渠道
     cos: tool:edit_file(.agents/user/automations/*.json)
     profiles: [everflow, core]
@@ -953,6 +1022,13 @@ settings:
       - reported
     note: 需启用 autonomy
 
+  - key: dalton.workspace.coverage_tracking
+    stored_in: automations 表（工作区标准覆盖追踪任务组的 status、cron_expression 与 metadata.paused_by_user）
+    web_entry: 对应公司或行业工作区对话列表顶部 / 对话页顶栏 → 自动跟踪开关（POST /api/v1/dalton/tracking/{workspace_id}，支持 enabled、tier、override_pause_versions）
+    cos: tool:dalton_coverage_tracking
+    profiles: [everflow, core]
+    note: 需启用 autonomy；研究总监支持对任意公司（按 ticker/workspace_id）或行业工作区（按 workspace_id）执行 status、enable、disable 及 override_pause_versions；追踪档位 tier 随覆盖名单由 dalton_coverage 调整；仅工作区所有者、覆盖单元主责分析师或管理员可修改
+
   - key: dalton.feishu.read_scopes
     stored_in: dalton_feishu_read_scopes
     web_entry: 设置 → 团队管理 → 成员与权限 → 飞书读取权限
@@ -962,31 +1038,129 @@ settings:
     routes:
       - PUT /api/v1/dalton/feishu/read-scopes
     route_fields:
-      - scopes
+      - scopes.space_id
+      - scopes.name
 
   - key: dalton.team_models.model
-    stored_in: dalton_team_model_catalog.payload
+    stored_in: dalton_team_model_catalog.payload（payload.models / payload.model_overrides / payload.pricing / payload.dalton_meta；内联变体同步写入 payload.providers.provider_variants 与 dalton_catalog_provider_credentials，推荐成员同步写入 payload.curated_setup）
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录
     cos: excluded:管理员专用团队模型目录配置，涉及定价、评分、退役与全员可用性
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/team-models/{model_key}
+    route_fields:
+      - model_key
+      - model_id
+      - provider
+      - display_name
+      - visible
+      - prompt_guidance
+      - intelligence
+      - speed
+      - plain_language
+      - context
+      - compaction_profile
+      - input_modalities
+      - parameters
+      - extra_body
+      - reasoning
+      - pricing.input
+      - pricing.output
+      - pricing.cached_input
+      - pricing.cache_read
+      - pricing.cache_5m
+      - pricing.cache_1h
+      - pricing.unit
+      - pricing.input_tiers.max_tokens
+      - pricing.input_tiers.rate
+      - pricing.input_tiers.cached_input
+      - pricing.input_tiers.cache_read
+      - pricing.output_tiers.max_tokens
+      - pricing.output_tiers.rate
+      - pricing.output_tiers.cached_input
+      - pricing.output_tiers.cache_read
+      - pricing.input_pricing_mode
+      - pricing.output_pricing_mode
+      - pricing.source_kind
+      - pricing.estimated
+      - pricing.source
+      - pricing.source_url
+      - pricing.verified_at
+      - pricing.note
+      - pricing_meta.source_kind
+      - pricing_meta.estimated
+      - pricing_meta.source
+      - pricing_meta.source_url
+      - pricing_meta.verified_at
+      - pricing_meta.note
+      - alias
+      - dalton_meta.family
+      - dalton_meta.billing
+      - dalton_meta.tool_calling
+      - dalton_meta.forbidden_for_roles
+      - dalton_meta.notional_pricing.input
+      - dalton_meta.notional_pricing.output
+      - dalton_meta.notional_pricing.cached_input
+      - dalton_meta.notional_pricing.cache_read
+      - dalton_meta.notional_pricing.cache_5m
+      - dalton_meta.notional_pricing.cache_1h
+      - dalton_meta.notional_pricing.unit
+      - dalton_meta.notional_pricing.input_tiers.max_tokens
+      - dalton_meta.notional_pricing.input_tiers.rate
+      - dalton_meta.notional_pricing.input_tiers.cached_input
+      - dalton_meta.notional_pricing.input_tiers.cache_read
+      - dalton_meta.notional_pricing.output_tiers.max_tokens
+      - dalton_meta.notional_pricing.output_tiers.rate
+      - dalton_meta.notional_pricing.output_tiers.cached_input
+      - dalton_meta.notional_pricing.output_tiers.cache_read
+      - dalton_meta.notional_pricing.input_pricing_mode
+      - dalton_meta.notional_pricing.output_pricing_mode
+      - dalton_meta.notional_pricing.source_kind
+      - dalton_meta.notional_pricing.estimated
+      - dalton_meta.notional_pricing.source
+      - dalton_meta.notional_pricing.source_url
+      - dalton_meta.notional_pricing.verified_at
+      - dalton_meta.notional_pricing.note
+      - dalton_meta.notional_ref
+      - dalton_meta.series
+      - dalton_meta.awaiting_release
+      - task_costs_bound
+      - provider_variant_update.provider_slug
+      - provider_variant_update.display_name
+      - provider_variant_update.sdk
+      - provider_variant_update.parent_provider
+      - provider_variant_update.access_type
+      - provider_variant_update.billing
+      - provider_variant_update.base_url
+      - provider_variant_update.api_key
+      - curated_setup_member
 
   - key: dalton.team_models.provider_variant
-    stored_in: dalton_team_model_catalog.payload（provider_variants；凭据存于 dalton_catalog_provider_credentials）
+    stored_in: dalton_team_model_catalog.payload.providers.provider_variants（凭据存于 dalton_catalog_provider_credentials）
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（供应商变体）
     cos: excluded:管理员专用模型供应商变体与路由配置
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/team-models/provider-variants/{provider_slug}
+    route_fields:
+      - provider_slug
+      - display_name
+      - sdk
+      - parent_provider
+      - access_type
+      - billing
+      - base_url
+      - api_key
 
   - key: dalton.team_models.curated
-    stored_in: dalton_team_model_catalog.payload（curated）
+    stored_in: dalton_team_model_catalog.payload.curated_setup
     web_entry: 设置 → 团队管理 → 模型与供应商 → 团队模型目录（入门推荐模型）
     cos: excluded:管理员专用入门推荐模型列表配置
     profiles: [everflow, core]
     routes:
       - PUT /api/v1/dalton/team-models/curated
+    route_fields:
+      - curated_setup
 
   - key: dalton.watchlist.tier_policy
     stored_in: dalton_watchlist_tier_policies（core / watch / radar 各档监控策略）
@@ -1032,7 +1206,7 @@ settings:
 
   - key: dalton.monitors.sort_order
     stored_in: dalton_monitors.sort_order
-    web_entry: 侧栏「监控面板」→ 面板设置 → 排序权重
+    web_entry: 当前通过 API 修改
     cos: missing
     profiles: [everflow, core]
     routes:
@@ -1241,3 +1415,66 @@ settings:
     web_entry: 自部署引导 / 设置 → 服务器 → 云沙箱密钥
     cos: excluded:部署级云沙箱供应商 API 密钥，由管理员在服务器设置页配置
     profiles: [core]
+
+  # ===========================================================================
+  # 11. 桌面端本机设置（desktop/src/store.js，当前设备 settings.json）
+  # ===========================================================================
+  - key: desktop.notifications.turn
+    stored_in: 桌面端本机 settings.json（desktop.notifications.turn，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 通知 → 回复完成（仅桌面端）
+    cos: excluded:桌面端本机系统通知开关，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.notifications.needs_input
+    stored_in: 桌面端本机 settings.json（desktop.notifications.needs_input，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 通知 → 需要你的输入（仅桌面端）
+    cos: excluded:桌面端本机系统通知开关，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.notifications.wakeup
+    stored_in: 桌面端本机 settings.json（desktop.notifications.wakeup，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 通知 → 唤醒与价格提醒（仅桌面端）
+    cos: excluded:桌面端本机系统通知开关，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.notifications.automation
+    stored_in: 桌面端本机 settings.json（desktop.notifications.automation，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 通知 → 自动化（仅桌面端）
+    cos: excluded:桌面端本机系统通知开关，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.notifications.started
+    stored_in: 桌面端本机 settings.json（desktop.notifications.started，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 通知 → 后台任务开始时也通知（仅桌面端）
+    cos: excluded:桌面端本机系统通知开关，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.menubar
+    stored_in: 桌面端本机 settings.json（desktop.menubar，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 菜单栏（图标、展示项、轮播与盘前盘后，仅桌面端）
+    cos: excluded:桌面端本机菜单栏与系统托盘展示偏好，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.panel
+    stored_in: 桌面端本机 settings.json（desktop.panel，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 面板（板块、行情卡片与自选列表，仅桌面端）
+    cos: excluded:桌面端本机菜单栏面板展示偏好，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.open_at_login
+    stored_in: 桌面端本机 settings.json（desktop.openAtLogin，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 启动 → 开机自启动（仅桌面端）
+    cos: excluded:桌面端本机系统启动项偏好，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.shortcut
+    stored_in: 桌面端本机 settings.json（desktop.shortcut，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 菜单栏 → 全局快捷键（仅桌面端）
+    cos: excluded:桌面端本机全局快捷键绑定，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]
+
+  - key: desktop.keep_running_in_tray
+    stored_in: 桌面端本机 settings.json（desktop.keepRunningInTray，位于 Electron userData 目录，仅限当前设备）
+    web_entry: 设置 → 通用与外观 → 启动 → 关闭窗口后保留在托盘运行（仅桌面端）
+    cos: excluded:桌面端本机托盘常驻偏好，仅保存在当前设备，由用户在当前设备管理
+    profiles: [everflow, core]

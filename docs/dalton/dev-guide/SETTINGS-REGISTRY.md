@@ -6,27 +6,29 @@
 
 ## 1. 守卫测试检查范围与同步登记范围
 
-守卫测试自动扫描以下设置来源，并在发现未登记字段或路由时报错：
+守卫测试自动扫描以下设置来源，并在发现未登记字段、子字段或路由时报错：
 
 1. **前端偏好与线程设置**（`web/src/`）：
-   - 所有涉及偏好或线程存储的 Zod 模式文件（含递归展开的 `z.object` / `z.looseObject` / `z.strictObject`、`.extend` / `.merge`、对象展开与计算属性）；
-   - `ModelPreferences` / `AccountTuning` / `ModelProfile` 接口与 `MOVED_KEYS`、`MODEL_PREF_KEYS`、`TUNING_FIELDS`；
+   - 按非注释代码词法识别所有导入 `zod` 并引用偏好或线程存储的模式文件，逐项提取并核对字段路径（含递归展开的 `z.object` / `z.looseObject` / `z.strictObject` / `z.array`、`.extend` / `.merge`、对象展开与计算属性，以及 `other_preference` 子模式条目的 `schema_fields`）；
+   - `ModelPreferences` / `AccountTuning` / `ModelProfile` 接口（支持带分号与省略分号的属性写法）与 `MOVED_KEYS`、`MODEL_PREF_KEYS`、`TUNING_FIELDS`；
    - `PROFILE_FIELDS`（`web/src/pages/Onboarding/welcome/profile.ts`）与 `ThreadField`（`web/src/lib/threadFieldMutations.ts`）；
    - `web/src/` 全量非测试代码中的 `usePreferenceKey`、`readOtherPreference`、`otherPreferencePatch` 调用点，以及 `{ other_preference: { ... } }`、`{ model_preference: { ... } }` 对象字面量。
-2. **后端用户与偏好字段**（`src/`）：
+2. **桌面端本机通知设置**（`desktop/src/`）：
+   - `desktop/src/desktopSettings.js` 中的 `NOTIFICATION_KINDS` 通知开关清单。
+3. **后端用户与偏好字段**（`src/`）：
    - `UserUpdate.model_fields` 与 `src.server.database.user.update_user` 参数；
    - `UserPreferencesUpdate` 下全部 Pydantic 偏好模型字段（含 `RiskPreference`、`InvestmentPreference`、`AgentPreference`、`OtherPreference` 与 `ModelPreference`）；
    - 运行时键集（`STRUCTURED_PREFERENCES`、`MOVED_MODEL_KEYS`、`TUNING_FIELDS`、`DALTON_MODEL_PREF_KEYS`、`DEFAULT_OTHER_PREFERENCE`、`_NEVER_MOVED`）；
-   - `src/` 中对 `user_preferences` 五个 JSON 列的 Python 字典读写路径与 SQL JSON 路径。
-3. **对话线程与自动化任务可写字段**：
+   - `src/` 中对 `user_preferences` 五个 JSON 列的 Python 字典读写与合并路径（含 `dict.update()`、`|=`、解包构造、`copy.deepcopy()`、条件表达式、变量传入 `upsert_user_preferences` / `update_user_preferences` 及 SQL JSON 路径）。
+4. **对话线程与自动化任务可写字段**：
    - `ThreadUpdateRequest`、`ThreadVisibilityRequest`、`ThreadShareRequest` 与 `SharePermissions` 全部可写字段；
-   - `AutomationCreate`、`AutomationUpdate`、`CompanyScriptUpdate`、`.agents/user/automations/*.json` 虚拟文件 `_EDITABLE` 字段，以及暂停与恢复入口（`POST /api/v1/automations/{automation_id}/pause`、`/resume`）。
-4. **工作区、电脑与自部署配置项**：
-   - `WorkspaceUpdate`、`AUTO_INGEST_CONFIG_KEY`、`BrowserChoicesUpdate` 与 `src/server/services/setup_settings/catalog.py`。
-5. **Dalton 挂载路由与请求体字段**：
-   - 按每种部署形态（`everflow`、`core`）实际组装 `src.server.app.setup.app`，提取最终挂载的 Dalton `PUT` / `PATCH` 路径及其 Pydantic 请求体可写字段。
+   - `AutomationCreate`、`AutomationUpdate`、`CompanyScriptUpdate`、嵌套模型（`DeliveryConfig`）与 `@field_validator` 独立校验模型（如 `PriceTriggerConfig` 及其嵌套 `PriceCondition` / `RetriggerConfig`），按存储路径核对字段，同时核对 `.agents/user/automations/*.json` 虚拟文件 `_EDITABLE` 字段及暂停与恢复入口（`POST /api/v1/automations/{automation_id}/pause`、`/resume`）。
+5. **工作区、电脑与自部署配置项**：
+   - `WorkspaceUpdate`、`WorkspaceTrackingUpdateRequest`（工作区覆盖追踪）、`AUTO_INGEST_CONFIG_KEY`、`BrowserChoicesUpdate` 与 `src/server/services/setup_settings/catalog.py`。
+6. **Dalton 挂载路由与请求体字段**：
+   - 按每种部署形态（`everflow`、`core`）实际组装 `src.server.app.setup.app`，提取最终挂载的 Dalton `PUT` / `PATCH` 路径及其递归 Pydantic 请求体可写字段（同时覆盖函数签名中的 Pydantic 模型与函数体内对字典载荷调用 `model_validate()` 的校验模型）。
 
-除上述自动扫描来源外，在浏览器 `localStorage`、开放字典载荷（`dict[str, Any]`）或非 `PUT`/`PATCH` 入口新增用户可调设置时，由开发者在同一变更中同步补登到 `src/dalton/settings_registry.yaml`。
+除上述自动扫描来源外，在浏览器 `localStorage`、桌面端本机 `settings.json` 其余分组、开放字典载荷（`dict[str, Any]`）或非 `PUT`/`PATCH` 入口新增用户可调设置时，由开发者在同一变更中同步补登到 `src/dalton/settings_registry.yaml`。
 
 ## 2. 登记步骤
 
@@ -41,24 +43,27 @@
   capability: channel_gateway   # 依赖可选能力时填写
   routes:                       # 对应 Dalton PUT/PATCH 路由时填写
     - PUT /api/v1/dalton/example
-  route_fields:                 # 对应接口使用 Pydantic 请求体时填写
+  route_fields:                 # 对应接口使用 Pydantic 请求体或 model_validate() 时填写
     - example_field
+  schema_fields:                # 对应前端 other_preference 子模式（Zod）时填写
+    - example_subfield
   note: 可选补充说明（如成员层级限制或部分动作范围）
 ```
 
 各字段要求如下：
 
-1. **`key`**：全仓唯一的点分键名（如 `user.*`、`user_preferences.<列>.<键>`、`thread.*`、`automation.*`、`workspace.*`、`dalton.*`、`channels.*`、`deployment_settings.*`）。
-2. **`stored_in`**：对照真实数据库迁移与写入 SQL，写明实际落库表名、列名或 JSON 路径（纯前端本地设置写明 `localStorage` 键名）。
-3. **`web_entry`**：写明用户在网页端修改该设置的页面路径与区块名称。
+1. **`key`**：全仓唯一的点分键名（如 `user.*`、`user_preferences.<列>.<键>`、`thread.*`、`automation.*`、`workspace.*`、`dalton.*`、`channels.*`、`deployment_settings.*`、`desktop.*`）。
+2. **`stored_in`**：对照真实数据库迁移与写入 SQL，写明实际落库表名、列名或 JSON 路径（前端本地设置写明 `localStorage` 键名，桌面端本机设置写明 `settings.json` 路径）。
+3. **`web_entry`**：写明用户在网页端修改该设置的页面路径与区块名称；仅通过 API 修改的字段填写「当前通过 API 修改」。
 4. **`cos`**：在代码合入前明确研究总监对该设置的处理方式：
    - `tool:<工具名>`（或 `tool:edit_file(.agents/user/...)`）：研究总监已经具备对应工具或虚拟数据文件编辑能力；
    - `missing`：计划由研究总监在对话中代改、后续补齐工具的设置项；
-   - `excluded:<原因>`：由网页端、服务端或管理员维护的设置项（如凭据与密钥、账单与预算上限、安全授权开关、管理员配置、设备本地与前端外观偏好），写明归属原因。
+   - `excluded:<原因>`：由网页端、服务端、管理员或当前设备本地维护的设置项（如凭据与密钥、账单与预算上限、安全授权开关、管理员配置、设备本地与前端外观偏好），写明归属原因。
 5. **`profiles`**：使用 `src.dalton.profile.DeploymentProfile` 枚举值（`everflow`、`core`）标明该设置默认出现的部署形态；仅在 Everflow 形态默认启用的设置标注 `[everflow]`。
 6. **`capability`**（可选）：依赖可选能力门控时，填写 `src.dalton.capabilities.CapabilityId` 中对应的枚举值。
-7. **`routes`** 与 **`route_fields`**（可选）：对应 Dalton `PUT` / `PATCH` 接口时，按 `METHOD /api/v1/dalton/...` 列出最终挂载路径，并在接口使用 Pydantic 请求体时通过 `route_fields` 列出该条目覆盖的可写字段；同一接口上工具支持状态不同的字段分别登记条目并各自填写 `route_fields`。
-8. **`note`**（可选）：记录成员层级门控（如 `min_tier=non_external`）、配置前置开关或部分动作范围。
+7. **`routes`** 与 **`route_fields`**（可选）：对应 Dalton `PUT` / `PATCH` 接口时，按 `METHOD /api/v1/dalton/...` 列出最终挂载路径，并在接口使用 Pydantic 请求体（或对字典体调用 `model_validate()`）时通过 `route_fields` 列出该条目覆盖的递归可写字段路径；同一接口上工具支持状态不同的字段分别登记条目并各自填写 `route_fields`。
+8. **`schema_fields`**（可选）：对应前端 `other_preference` 子模式（如 `onboarding`、`custom_dashboards`）时，列出该子模式内由 Zod 校验的全部子字段路径。
+9. **`note`**（可选）：记录成员层级门控（如 `min_tier=non_external`）、配置前置开关或部分动作范围。
 
 ## 3. 核实 `tool:` 条目能够修改对应设置
 

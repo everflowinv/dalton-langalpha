@@ -1,20 +1,24 @@
 """Guard tests for ``src/dalton/settings_registry.yaml``.
 
 Checks that user-configurable settings discovered from:
-- frontend preference / thread Zod schemas, TypeScript preference interfaces,
-  ``PROFILE_FIELDS``, ``ThreadField``, and ``other_preference`` / ``model_preference``
-  read/write sites under ``web/src/``;
+- frontend preference / thread Zod schemas (including nested sub-schema field paths),
+  TypeScript preference interfaces, ``PROFILE_FIELDS``, ``ThreadField``, and
+  ``other_preference`` / ``model_preference`` read/write sites under ``web/src/``;
+- desktop local notification toggles in ``desktop/src/desktopSettings.js``;
 - backend ``UserUpdate``, ``update_user``, ``UserPreferencesUpdate`` (including
-  ``ModelPreference.model_fields``), and ``user_preferences`` JSON read/write
+  ``ModelPreference.model_fields``), and ``user_preferences`` JSON read/write/merge
   paths in ``src/``;
 - thread writable models (``ThreadUpdateRequest``, ``ThreadVisibilityRequest``,
   ``ThreadShareRequest``, ``SharePermissions``);
 - automation writable models (``AutomationCreate``, ``AutomationUpdate``,
-  ``CompanyScriptUpdate``), ``.agents/user/automations/*.json`` editable fields,
-  and pause/resume endpoints;
-- workspace, computer browser, and self-hosted ``deployment_settings`` catalogs;
+  ``CompanyScriptUpdate``, ``DeliveryConfig``, and independently validated
+  sub-models such as ``PriceTriggerConfig``), ``.agents/user/automations/*.json``
+  editable fields, and pause/resume endpoints;
+- workspace (including ``WorkspaceTrackingUpdateRequest``), computer browser,
+  and self-hosted ``deployment_settings`` catalogs;
 - Dalton ``PUT``/``PATCH`` routes mounted on ``src.server.app.setup.app`` across
-  every :class:`DeploymentProfile`, including their Pydantic request body fields;
+  every :class:`DeploymentProfile`, including recursive Pydantic request body
+  fields from both route signatures and in-handler ``model_validate()`` calls;
 
 are registered in ``src/dalton/settings_registry.yaml`` with an explicit Chief
 of Staff decision (``tool:<name>``, ``missing``, or ``excluded:<reason>``).
@@ -27,6 +31,7 @@ import importlib
 import inspect
 import os
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
@@ -43,6 +48,7 @@ from src.dalton.profile import DeploymentProfile
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REGISTRY_PATH = REPO_ROOT / "src" / "dalton" / "settings_registry.yaml"
 WEB_SRC = REPO_ROOT / "web" / "src"
+DESKTOP_SRC = REPO_ROOT / "desktop" / "src"
 PY_SRC = REPO_ROOT / "src"
 
 FAILURE_GUIDANCE = (
@@ -102,7 +108,7 @@ NON_SETTING_DALTON_ROUTES: frozenset[tuple[str, str]] = frozenset(
 )
 
 # Pure protocol / CAS / target-identity fields on Dalton PUT/PATCH Pydantic body models
-# that are wire-level concurrency tokens rather than stored settings.
+# that are wire-level concurrency or audit-comment tokens rather than stored settings.
 _DALTON_ROUTE_PROTOCOL_FIELDS: dict[tuple[str, str], frozenset[str]] = {
     ("PUT", "/api/v1/dalton/channels/settings"): frozenset({"user_id", "version"}),
     ("PUT", "/api/v1/dalton/channels/internal/settings"): frozenset(
@@ -110,6 +116,15 @@ _DALTON_ROUTE_PROTOCOL_FIELDS: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("PUT", "/api/v1/dalton/watchlist/tier-policies/{tier}"): frozenset(
         {"snapshot_id", "expected_policy_version", "expected_roster_hash"}
+    ),
+    ("PUT", "/api/v1/dalton/team-models/{model_key}"): frozenset(
+        {"expected_revision", "comment"}
+    ),
+    ("PUT", "/api/v1/dalton/team-models/provider-variants/{provider_slug}"): frozenset(
+        {"expected_revision", "comment"}
+    ),
+    ("PUT", "/api/v1/dalton/team-models/curated"): frozenset(
+        {"expected_revision", "comment"}
     ),
 }
 
@@ -845,7 +860,7 @@ def _extract_object_literal_entries(
 
 _ZOD_OBJECT_CTORS: frozenset[str] = frozenset({"object", "looseObject", "strictObject"})
 _ZOD_WRAPPER_FNS: frozenset[str] = frozenset(
-    {"catch", "optional", "nullable", "pipe", "readonly", "default", "prefault"}
+    {"catch", "optional", "nullable", "pipe", "readonly", "default", "prefault", "array"}
 )
 _ZOD_PASSTHROUGH_METHODS: frozenset[str] = frozenset(
     {
@@ -1248,16 +1263,34 @@ def _extract_ts_interface_fields(
                     nxt += 1
                 if nxt < end_idx and _tok_is(tokens[nxt], "punct", ":"):
                     keys.add(t.value)
-                    # Skip property type until top-level `;` or newline boundary
+                    # Skip property type until top-level `;` / `,` or newline boundary
+                    # starting the next property (valid TS interfaces may omit semicolons).
                     idx = nxt + 1
+                    angle_depth = 0
                     while idx < end_idx:
                         pt = tokens[idx]
+                        if (
+                            depth == 0
+                            and angle_depth == 0
+                            and idx > nxt + 1
+                            and pt.line > tokens[idx - 1].line
+                            and pt.kind in ("ident", "string")
+                        ):
+                            look = idx + 1
+                            if look < end_idx and _tok_is(tokens[look], "punct", "?"):
+                                look += 1
+                            if look < end_idx and _tok_is(tokens[look], "punct", ":"):
+                                break
                         if pt.kind == "punct":
                             if pt.value in ("{", "[", "("):
                                 depth += 1
                             elif pt.value in ("}", "]", ")"):
                                 depth = max(0, depth - 1)
-                            elif pt.value == ";" and depth == 0:
+                            elif pt.value == "<" and depth == 0:
+                                angle_depth += 1
+                            elif pt.value == ">" and depth == 0 and angle_depth > 0:
+                                angle_depth -= 1
+                            elif pt.value in (";", ",") and depth == 0 and angle_depth == 0:
                                 idx += 1
                                 break
                         idx += 1
@@ -1301,11 +1334,11 @@ def _extract_type_string_union_from_source(source: str, type_name: str) -> set[s
     raise AssertionError(f"Could not locate type union {type_name!r}")
 
 
-def _extract_profile_fields(path: Path) -> set[str]:
+def _extract_profile_fields_from_source(source: str, label: str) -> set[str]:
     """Extract ``(section, key)`` pairs from ``PROFILE_FIELDS`` in ``welcome/profile.ts``."""
-    tokens = _tokenize_ts(path.read_text(encoding="utf-8"))
+    tokens = _tokenize_ts(source)
     inits = _collect_ts_const_inits(tokens)
-    assert "PROFILE_FIELDS" in inits, f"Missing PROFILE_FIELDS in {path}"
+    assert "PROFILE_FIELDS" in inits, f"Missing PROFILE_FIELDS in {label}"
     idx, _end = inits["PROFILE_FIELDS"]
     assert _tok_is(tokens[idx], "punct", "{")
     end_idx = _find_matching(tokens, idx, "{", "}")
@@ -1332,7 +1365,7 @@ def _extract_profile_fields(path: Path) -> set[str]:
                         and tokens[j + 2].kind == "string"
                     ):
                         key = tokens[j + 2].value
-                assert section and key, f"Incomplete PROFILE_FIELDS entry in {path}"
+                assert section and key, f"Incomplete PROFILE_FIELDS entry in {label}"
                 discovered.add(f"user_preferences.{section}.{key}")
                 i = entry_end + 1
                 continue
@@ -1340,7 +1373,7 @@ def _extract_profile_fields(path: Path) -> set[str]:
         elif _tok_is(tok, "punct", "}"):
             depth -= 1
         i += 1
-    assert discovered, f"No PROFILE_FIELDS entries extracted from {path}"
+    assert discovered, f"No PROFILE_FIELDS entries extracted from {label}"
     return discovered
 
 
@@ -1505,10 +1538,8 @@ def _discover_web_preference_keys() -> tuple[set[str], set[str]]:
     return other_discovered, model_discovered
 
 
-def _discover_web_pref_zod_files() -> set[str]:
-    """Find every non-test file in ``web/src/`` that imports ``zod`` and references
-    preference or thread setting storage."""
-    pref_markers = (
+_PREF_ZOD_MARKERS: frozenset[str] = frozenset(
+    {
         "model_preference",
         "other_preference",
         "risk_preference",
@@ -1520,15 +1551,139 @@ def _discover_web_pref_zod_files() -> set[str]:
         "ModelPreferences",
         "OnboardingPrefs",
         "ThreadField",
+    }
+)
+
+
+def _is_pref_zod_source(source: str) -> bool:
+    """Return True iff TS/TSX ``source`` imports ``zod`` (or ``zod/*``) AND contains
+    at least one non-comment identifier/string token referencing preference or thread
+    setting storage (ignoring comments)."""
+    tokens = _tokenize_ts(source)
+    imports_zod = False
+    for i, tok in enumerate(tokens):
+        if tok.kind == "string" and (tok.value == "zod" or tok.value.startswith("zod/")):
+            if i > 0 and _tok_is(tokens[i - 1], "ident", "from"):
+                imports_zod = True
+                break
+            if (
+                i >= 2
+                and _tok_is(tokens[i - 2], "ident", "require")
+                and _tok_is(tokens[i - 1], "punct", "(")
+            ):
+                imports_zod = True
+                break
+    if not imports_zod:
+        return False
+    return any(
+        tok.kind in ("ident", "string") and tok.value in _PREF_ZOD_MARKERS
+        for tok in tokens
     )
+
+
+def _discover_web_pref_zod_files() -> set[str]:
+    """Find every non-test file in ``web/src/`` that imports ``zod`` and references
+    preference or thread setting storage in non-comment code."""
     found: set[str] = set()
     for ts_file in sorted(WEB_SRC.rglob("*.ts*")):
         if "__tests__" in ts_file.parts or ".test." in ts_file.name:
             continue
         text = ts_file.read_text(encoding="utf-8")
-        if "zod" in text and any(m in text for m in pref_markers):
+        if "zod" not in text:
+            continue
+        if _is_pref_zod_source(text):
             found.add(str(ts_file.relative_to(WEB_SRC)))
     return found
+
+
+def _verify_frontend_pref_zod_file(
+    rel_path: str,
+    kind: str,
+    source: str,
+    *,
+    global_consts: dict[str, str],
+    registry_items: list[dict[str, Any]],
+) -> None:
+    """Extract and verify every field declared by one file in
+    ``_KNOWN_FRONTEND_PREF_ZOD_FILES``. Fails explicitly on any unimplemented
+    ``kind`` or unregistered sub-schema field path."""
+    registered_keys = _registry_keys(registry_items)
+    items_by_key = {str(item["key"]): item for item in registry_items}
+
+    if kind == "model_preference_schemas":
+        zod_schemas = _extract_all_zod_object_fields_in_source(
+            source, extra_string_consts=global_consts, recursive=True
+        )
+        assert zod_schemas, f"Expected parsed Zod object schemas in {rel_path}"
+        extracted = {
+            f"user_preferences.model_preference.{f}"
+            for fields in zod_schemas.values()
+            for f in fields
+        }
+        _assert_all_registered(
+            extracted,
+            source=f"web/src/{rel_path} (Zod model_preference schemas)",
+            registered_keys=registered_keys,
+        )
+        return
+
+    if kind == "profile_fields":
+        profile_keys = _extract_profile_fields_from_source(source, rel_path)
+        _assert_all_registered(
+            profile_keys,
+            source=f"web/src/{rel_path} (PROFILE_FIELDS)",
+            registered_keys=registered_keys,
+        )
+        extra_zod = _extract_all_zod_object_fields_in_source(
+            source, extra_string_consts=global_consts, recursive=True
+        )
+        assert not extra_zod, (
+            f"web/src/{rel_path} 新增了未纳入校验的 Zod 对象模式：{sorted(extra_zod)}\n"
+            f"{FAILURE_GUIDANCE}"
+        )
+        return
+
+    if kind.startswith("other_preference_subschema:"):
+        pref_key = kind.split(":", 1)[1].strip()
+        assert pref_key, f"Empty pref_key in kind={kind!r} ({rel_path})"
+        parent_key = f"user_preferences.other_preference.{pref_key}"
+        _assert_all_registered(
+            {parent_key},
+            source=f"web/src/{rel_path}",
+            registered_keys=registered_keys,
+        )
+        schemas = _extract_all_zod_object_fields_in_source(
+            source, extra_string_consts=global_consts, recursive=True
+        )
+        extracted_subfields = {
+            field for fields in schemas.values() for field in fields
+        }
+        entry = items_by_key[parent_key]
+        raw_declared = entry.get("schema_fields")
+        if raw_declared is None:
+            declared_subfields: set[str] = set()
+        else:
+            assert isinstance(raw_declared, list), (
+                f"Entry {parent_key!r}: schema_fields must be a list"
+            )
+            declared_subfields = {
+                str(f).strip() for f in raw_declared if str(f).strip()
+            }
+
+        missing_sub = sorted(extracted_subfields - declared_subfields)
+        assert not missing_sub, (
+            f"发现未登记的 Zod 子模式字段（来源：web/src/{rel_path} -> {parent_key}）："
+            f"{missing_sub}\n{FAILURE_GUIDANCE}"
+        )
+        stale_sub = sorted(declared_subfields - extracted_subfields)
+        assert not stale_sub, (
+            f"settings_registry.yaml 中 {parent_key} 存在已失效的 schema_fields：{stale_sub}"
+        )
+        return
+
+    raise AssertionError(
+        f"_KNOWN_FRONTEND_PREF_ZOD_FILES 中存在未实现提取逻辑的 kind={kind!r}（{rel_path}）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1549,17 +1704,55 @@ _SQL_JSON_PARAM_RE = re.compile(
 )
 
 
-def _unwrap_pydantic_model_type(annotation: Any) -> type[BaseModel] | None:
-    """Recursively unwrap ``Model``, ``Optional[Model]``, or ``Annotated[Model, ...]``."""
+def _unwrap_pydantic_model_types(annotation: Any) -> list[type[BaseModel]]:
+    """Recursively collect every Pydantic ``BaseModel`` subclass inside an annotation
+    (``Model``, ``Optional[Model]``, ``Annotated[Model, ...]``, ``list[Model]``,
+    ``dict[str, Model]``, ``Union[A, B]``, etc.)."""
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        return annotation
+        return [annotation]
+    out: list[type[BaseModel]] = []
     origin = get_origin(annotation)
     if origin is not None:
         for arg in get_args(annotation):
-            unwrapped = _unwrap_pydantic_model_type(arg)
-            if unwrapped is not None:
-                return unwrapped
-    return None
+            for sub in _unwrap_pydantic_model_types(arg):
+                if sub not in out:
+                    out.append(sub)
+    return out
+
+
+def _unwrap_pydantic_model_type(annotation: Any) -> type[BaseModel] | None:
+    """Recursively unwrap the first Pydantic ``BaseModel`` in ``annotation``."""
+    found = _unwrap_pydantic_model_types(annotation)
+    return found[0] if found else None
+
+
+def _extract_pydantic_model_fields_recursive(
+    model_cls: type[BaseModel],
+    *,
+    prefix: str = "",
+    seen: frozenset[type[BaseModel]] = frozenset(),
+    skip_fields: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Recursively extract dot-separated writable field paths from ``model_cls``,
+    expanding nested ``BaseModel`` fields (including inside ``Optional`` / ``list``
+    / ``dict`` / ``Union`` containers)."""
+    if model_cls in seen:
+        return set()
+    next_seen = seen | {model_cls}
+    discovered: set[str] = set()
+    for field_name, field_info in model_cls.model_fields.items():
+        if not prefix and field_name in skip_fields:
+            continue
+        path = f"{prefix}.{field_name}" if prefix else field_name
+        sub_models = _unwrap_pydantic_model_types(field_info.annotation)
+        if sub_models:
+            for sub in sub_models:
+                discovered |= _extract_pydantic_model_fields_recursive(
+                    sub, prefix=path, seen=next_seen
+                )
+        else:
+            discovered.add(path)
+    return discovered
 
 
 def _extract_pydantic_preference_fields(
@@ -1636,8 +1829,23 @@ def _py_expr_section(node: ast.AST, var_sec: dict[str, str]) -> str | None:
             if sec:
                 return sec
         return None
+    if isinstance(node, ast.IfExp):
+        return _py_expr_section(node.body, var_sec) or _py_expr_section(
+            node.orelse, var_sec
+        )
     if isinstance(node, ast.Await):
         return _py_expr_section(node.value, var_sec)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _py_expr_section(node.left, var_sec) or _py_expr_section(
+            node.right, var_sec
+        )
+    if isinstance(node, ast.Dict):
+        for dk, dv in zip(node.keys, node.values):
+            if dk is None:
+                sec = _py_expr_section(dv, var_sec)
+                if sec:
+                    return sec
+        return None
     if isinstance(node, ast.Call):
         fn = node.func
         fname = (
@@ -1656,8 +1864,10 @@ def _py_expr_section(node: ast.AST, var_sec: dict[str, str]) -> str | None:
             arg0 = node.args[0]
             if isinstance(arg0, ast.Constant) and arg0.value in _PREFERENCE_SECTIONS:
                 return str(arg0.value)
-        if fname == "dict" and node.args:
+        if fname in ("dict", "deepcopy", "copy") and node.args:
             return _py_expr_section(node.args[0], var_sec)
+        if fname == "copy" and not node.args and isinstance(fn, ast.Attribute):
+            return _py_expr_section(fn.value, var_sec)
     if (
         isinstance(node, ast.Subscript)
         and isinstance(node.slice, ast.Constant)
@@ -1665,6 +1875,44 @@ def _py_expr_section(node: ast.AST, var_sec: dict[str, str]) -> str | None:
     ):
         return str(node.slice.value)
     return None
+
+
+def _collect_py_dict_source_names(node: ast.AST) -> list[str]:
+    """Collect local variable names whose dict contents flow into ``node``."""
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Call):
+        fn = node.func
+        fname = (
+            fn.attr
+            if isinstance(fn, ast.Attribute)
+            else (fn.id if isinstance(fn, ast.Name) else "")
+        )
+        if fname in ("dict", "deepcopy", "copy") and node.args:
+            return _collect_py_dict_source_names(node.args[0])
+        if fname == "copy" and not node.args and isinstance(fn, ast.Attribute):
+            return _collect_py_dict_source_names(fn.value)
+        return []
+    if isinstance(node, ast.Dict):
+        out: list[str] = []
+        for dk, dv in zip(node.keys, node.values):
+            if dk is None:
+                out.extend(_collect_py_dict_source_names(dv))
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _collect_py_dict_source_names(node.left) + _collect_py_dict_source_names(
+            node.right
+        )
+    if isinstance(node, ast.IfExp):
+        return _collect_py_dict_source_names(node.body) + _collect_py_dict_source_names(
+            node.orelse
+        )
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        out = []
+        for v in node.values:
+            out.extend(_collect_py_dict_source_names(v))
+        return out
+    return []
 
 
 def _resolve_py_str(node: ast.AST, consts: dict[str, str]) -> str | None:
@@ -1766,8 +2014,12 @@ def _scan_python_preference_json_keys(
                     if vals:
                         loop_key_sets.setdefault(kvar, set()).update(vals)
 
-        # Propagate assignments inside the function (two passes)
-        for _ in range(2):
+        # Fixed-point forward + backward propagation inside the function:
+        # - forward from preference reads / copies / conditional expressions / merges
+        # - backward from upsert_user_preferences(..., <sec>=expr), update(), and `|=`
+        changed = True
+        while changed:
+            changed = False
             for sub in ast.walk(fn):
                 if (
                     isinstance(sub, ast.Assign)
@@ -1775,16 +2027,49 @@ def _scan_python_preference_json_keys(
                     and isinstance(sub.targets[0], ast.Name)
                 ):
                     sec = _py_expr_section(sub.value, var_sec)
-                    if sec:
+                    if sec and sub.targets[0].id not in var_sec:
                         var_sec[sub.targets[0].id] = sec
+                        changed = True
                 elif (
                     isinstance(sub, ast.AnnAssign)
                     and isinstance(sub.target, ast.Name)
                     and sub.value is not None
                 ):
                     sec = _py_expr_section(sub.value, var_sec)
-                    if sec:
+                    if sec and sub.target.id not in var_sec:
                         var_sec[sub.target.id] = sec
+                        changed = True
+                elif isinstance(sub, ast.Call):
+                    fname = (
+                        sub.func.attr
+                        if isinstance(sub.func, ast.Attribute)
+                        else (sub.func.id if isinstance(sub.func, ast.Name) else "")
+                    )
+                    if fname in ("upsert_user_preferences", "update_user_preferences"):
+                        for kw in sub.keywords:
+                            if kw.arg in _PREFERENCE_SECTIONS:
+                                for nm in _collect_py_dict_source_names(kw.value):
+                                    if nm not in var_sec:
+                                        var_sec[nm] = kw.arg
+                                        changed = True
+                    elif (
+                        fname == "update"
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.args
+                    ):
+                        sec = _py_expr_section(sub.func.value, var_sec)
+                        if sec:
+                            for nm in _collect_py_dict_source_names(sub.args[0]):
+                                if nm not in var_sec:
+                                    var_sec[nm] = sec
+                                    changed = True
+                elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.BitOr):
+                    sec = _py_expr_section(sub.target, var_sec)
+                    if sec:
+                        for nm in _collect_py_dict_source_names(sub.value):
+                            if nm not in var_sec:
+                                var_sec[nm] = sec
+                                changed = True
 
         def _keys_of(
             arg_node: ast.AST,
@@ -1797,8 +2082,67 @@ def _scan_python_preference_json_keys(
                 return set(_loop_sets[arg_node.id])
             return set()
 
+        def _record_dict_expr(sec: str, expr: ast.AST) -> None:
+            if isinstance(expr, ast.Dict):
+                for dk, dv in zip(expr.keys, expr.values):
+                    if dk is not None:
+                        for k in _keys_of(dk):
+                            _record(sec, k)
+                    else:
+                        _record_dict_expr(sec, dv)
+            elif isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.BitOr):
+                _record_dict_expr(sec, expr.left)
+                _record_dict_expr(sec, expr.right)
+            elif isinstance(expr, ast.IfExp):
+                _record_dict_expr(sec, expr.body)
+                _record_dict_expr(sec, expr.orelse)
+            elif isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.Or):
+                for v in expr.values:
+                    _record_dict_expr(sec, v)
+            elif isinstance(expr, (ast.List, ast.Tuple)):
+                # e.g. `model_pref.update([("new_key", val)])`
+                for elt in expr.elts:
+                    if isinstance(elt, (ast.Tuple, ast.List)) and len(elt.elts) == 2:
+                        for k in _keys_of(elt.elts[0]):
+                            _record(sec, k)
+            elif isinstance(expr, ast.Call):
+                efn = expr.func
+                efname = (
+                    efn.attr
+                    if isinstance(efn, ast.Attribute)
+                    else (efn.id if isinstance(efn, ast.Name) else "")
+                )
+                if efname == "dict":
+                    if expr.args:
+                        _record_dict_expr(sec, expr.args[0])
+                    for kw in expr.keywords:
+                        if kw.arg:
+                            _record(sec, kw.arg)
+                elif efname in ("deepcopy", "copy") and expr.args:
+                    _record_dict_expr(sec, expr.args[0])
+
         for sub in ast.walk(fn):
             if (
+                isinstance(sub, ast.Assign)
+                and len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Name)
+            ):
+                sec = var_sec.get(sub.targets[0].id)
+                if sec:
+                    _record_dict_expr(sec, sub.value)
+            elif (
+                isinstance(sub, ast.AnnAssign)
+                and isinstance(sub.target, ast.Name)
+                and sub.value is not None
+            ):
+                sec = var_sec.get(sub.target.id)
+                if sec:
+                    _record_dict_expr(sec, sub.value)
+            elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.BitOr):
+                sec = _py_expr_section(sub.target, var_sec)
+                if sec:
+                    _record_dict_expr(sec, sub.value)
+            elif (
                 isinstance(sub, ast.Call)
                 and isinstance(sub.func, ast.Attribute)
                 and sub.func.attr in ("get", "pop", "setdefault")
@@ -1808,6 +2152,18 @@ def _scan_python_preference_json_keys(
                 if sec:
                     for k in _keys_of(sub.args[0]):
                         _record(sec, k)
+            elif (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "update"
+            ):
+                sec = _py_expr_section(sub.func.value, var_sec)
+                if sec:
+                    if sub.args:
+                        _record_dict_expr(sec, sub.args[0])
+                    for kw in sub.keywords:
+                        if kw.arg:
+                            _record(sec, kw.arg)
             elif isinstance(sub, ast.Subscript):
                 sec = _py_expr_section(sub.value, var_sec)
                 if sec:
@@ -1830,11 +2186,8 @@ def _scan_python_preference_json_keys(
                 )
                 if fname in ("upsert_user_preferences", "update_user_preferences"):
                     for kw in sub.keywords:
-                        if kw.arg in _PREFERENCE_SECTIONS and isinstance(kw.value, ast.Dict):
-                            for dk in kw.value.keys:
-                                if dk is not None:
-                                    for k in _keys_of(dk):
-                                        _record(kw.arg, k)
+                        if kw.arg in _PREFERENCE_SECTIONS:
+                            _record_dict_expr(kw.arg, kw.value)
 
     return discovered
 
@@ -1866,14 +2219,64 @@ def _discover_backend_preference_json_keys(
 # ---------------------------------------------------------------------------
 
 
+def _discover_endpoint_validated_models(endpoint: Any) -> list[type[BaseModel]]:
+    """Inspect an unwrapped FastAPI endpoint's AST for ``Model.model_validate(...)``
+    (or ``Model.parse_obj(...)``) calls so ``dict[str, Any]`` request bodies that
+    validate through a Pydantic model are guarded identically to typed signatures."""
+    fn = inspect.unwrap(endpoint)
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError):
+        return []
+    tree = ast.parse(src)
+    local_imports: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name != "*":
+                    local_imports[alias.asname or alias.name] = (
+                        node.module,
+                        alias.name,
+                    )
+    try:
+        closure = inspect.getclosurevars(fn)
+        nonlocals = closure.nonlocals
+    except (TypeError, ValueError):
+        nonlocals = {}
+    fn_globals = getattr(fn, "__globals__", {})
+
+    models: list[type[BaseModel]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("model_validate", "parse_obj")
+            and isinstance(node.func.value, ast.Name)
+        ):
+            name = node.func.value.id
+            obj: Any = None
+            if name in local_imports:
+                mod_name, attr_name = local_imports[name]
+                obj = getattr(importlib.import_module(mod_name), attr_name, None)
+            elif name in nonlocals:
+                obj = nonlocals[name]
+            elif name in fn_globals:
+                obj = fn_globals[name]
+            if isinstance(obj, type) and issubclass(obj, BaseModel) and obj not in models:
+                models.append(obj)
+    return models
+
+
 def _extract_dalton_put_patch_route_fields(
     app: FastAPI,
 ) -> dict[tuple[str, str], set[str] | None]:
-    """Extract mounted Dalton ``PUT``/``PATCH`` routes and their Pydantic request body fields.
+    """Extract mounted Dalton ``PUT``/``PATCH`` routes and their recursive Pydantic
+    request body fields — covering both typed signature models and in-handler
+    ``Model.model_validate(...)`` calls on ``dict`` bodies.
 
-    Returns ``{(method, path): set_of_body_fields | None}``, where ``None``
-    indicates the endpoint accepts no Pydantic ``BaseModel`` body (e.g. raw
-    ``dict[str, Any]`` or binary stream).
+    Returns ``{(method, path): set_of_body_field_paths | None}``, where ``None``
+    indicates the endpoint accepts no Pydantic ``BaseModel`` body (e.g. raw binary
+    upload).
     """
     found: dict[tuple[str, str], set[str] | None] = {}
     for route in app.routes:
@@ -1884,13 +2287,21 @@ def _extract_dalton_put_patch_route_fields(
         methods = set(route.methods) & {"PUT", "PATCH"}
         if not methods:
             continue
-        body_fields: set[str] | None = None
+        models: list[type[BaseModel]] = []
         for param in route.dependant.body_params:
-            model_cls = _unwrap_pydantic_model_type(param.field_info.annotation)
-            if model_cls is not None:
-                if body_fields is None:
-                    body_fields = set()
-                body_fields.update(model_cls.model_fields.keys())
+            for model_cls in _unwrap_pydantic_model_types(param.field_info.annotation):
+                if model_cls not in models:
+                    models.append(model_cls)
+        for model_cls in _discover_endpoint_validated_models(route.endpoint):
+            if model_cls not in models:
+                models.append(model_cls)
+
+        body_fields: set[str] | None = None
+        if models:
+            body_fields = set()
+            for model_cls in models:
+                body_fields |= _extract_pydantic_model_fields_recursive(model_cls)
+
         for method in methods:
             key = (method, route.path)
             if key in found and found[key] is not None and body_fields is not None:
@@ -1898,6 +2309,135 @@ def _extract_dalton_put_patch_route_fields(
             else:
                 found[key] = body_fields
     return found
+
+
+def _discover_field_validator_submodels(
+    model_cls: type[BaseModel],
+) -> dict[str, list[type[BaseModel]]]:
+    """Inspect ``@field_validator`` methods on ``model_cls`` (and its bases) to find
+    independently validated Pydantic models such as ``PriceTriggerConfig(**v)``."""
+    found: dict[str, list[type[BaseModel]]] = {}
+    for cls in model_cls.__mro__:
+        if not (isinstance(cls, type) and issubclass(cls, BaseModel)) or cls is BaseModel:
+            continue
+        mod = inspect.getmodule(cls)
+        mod_globals = vars(mod) if mod is not None else {}
+        for attr_val in cls.__dict__.values():
+            fn = getattr(attr_val, "__func__", attr_val)
+            if not inspect.isfunction(fn):
+                continue
+            try:
+                src = textwrap.dedent(inspect.getsource(fn))
+            except (OSError, TypeError):
+                continue
+            tree = ast.parse(src)
+            if not tree.body or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            fdef = tree.body[0]
+            validated_fields: list[str] = []
+            for dec in fdef.decorator_list:
+                if isinstance(dec, ast.Call):
+                    df = dec.func
+                    dname = (
+                        df.attr
+                        if isinstance(df, ast.Attribute)
+                        else (df.id if isinstance(df, ast.Name) else "")
+                    )
+                    if dname == "field_validator":
+                        for arg in dec.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                validated_fields.append(arg.value)
+            if not validated_fields:
+                continue
+            fn_globals = {**mod_globals, **getattr(fn, "__globals__", {})}
+            try:
+                nonlocals = inspect.getclosurevars(fn).nonlocals
+            except (TypeError, ValueError):
+                nonlocals = {}
+            sub_models: list[type[BaseModel]] = []
+            for node in ast.walk(fdef):
+                if isinstance(node, ast.Call):
+                    target_name: str | None = None
+                    if isinstance(node.func, ast.Name):
+                        target_name = node.func.id
+                    elif (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("model_validate", "parse_obj")
+                        and isinstance(node.func.value, ast.Name)
+                    ):
+                        target_name = node.func.value.id
+                    if target_name is None:
+                        continue
+                    obj = nonlocals.get(target_name, fn_globals.get(target_name))
+                    if (
+                        isinstance(obj, type)
+                        and issubclass(obj, BaseModel)
+                        and obj not in sub_models
+                    ):
+                        sub_models.append(obj)
+            for vf in validated_fields:
+                if sub_models:
+                    bucket = found.setdefault(vf, [])
+                    for sm in sub_models:
+                        if sm not in bucket:
+                            bucket.append(sm)
+    return found
+
+
+def _extract_automation_writable_fields(
+    request_models: tuple[type[BaseModel], ...],
+    *,
+    editable_fields: tuple[str, ...] = (),
+    file_field_aliases: dict[str, str] | None = None,
+    extra_field_submodels: dict[str, type[BaseModel]] | None = None,
+    skip_fields: frozenset[str] = _AUTOMATION_NON_SETTING_FIELDS,
+) -> set[str]:
+    """Extract canonical ``automation.<storage_path>`` keys from automation request
+    models, their nested Pydantic fields (e.g. ``DeliveryConfig``), independently
+    validated sub-models (e.g. ``PriceTriggerConfig``), and virtual file editable
+    fields."""
+    validator_submodels: dict[str, list[type[BaseModel]]] = {}
+    for m in request_models:
+        for fname, sms in _discover_field_validator_submodels(m).items():
+            bucket = validator_submodels.setdefault(fname, [])
+            for sm in sms:
+                if sm not in bucket:
+                    bucket.append(sm)
+    for fname, sm in (extra_field_submodels or {}).items():
+        bucket = validator_submodels.setdefault(fname, [])
+        if sm not in bucket:
+            bucket.append(sm)
+
+    expanded_containers: set[str] = set()
+    fields: set[str] = set()
+    for m in request_models:
+        for fname, finfo in m.model_fields.items():
+            if fname in skip_fields:
+                continue
+            sub_models = list(_unwrap_pydantic_model_types(finfo.annotation))
+            for sm in validator_submodels.get(fname, ()):
+                if sm not in sub_models:
+                    sub_models.append(sm)
+            if sub_models:
+                expanded_containers.add(fname)
+                for sm in sub_models:
+                    fields |= _extract_pydantic_model_fields_recursive(sm, prefix=fname)
+            else:
+                fields.add(fname)
+
+    # Map virtual file aliases (`thread`, `delivery`) back to canonical model fields.
+    file_alias_to_model: dict[str, set[str]] = {}
+    for model_field, file_field in (file_field_aliases or {}).items():
+        file_alias_to_model.setdefault(file_field, set()).add(model_field)
+
+    for ef in editable_fields:
+        mapped = file_alias_to_model.get(ef, {ef})
+        for mf in mapped:
+            if mf in skip_fields or mf in expanded_containers:
+                continue
+            fields.add(mf)
+
+    return {f"automation.{f}" for f in fields}
 
 
 def _discover_mounted_dalton_routes_across_profiles() -> (
@@ -2132,9 +2672,13 @@ def test_settings_registry_tool_references_and_capabilities_match_runtime():
 
 
 def test_frontend_zod_preference_schemas_are_registered():
-    """Scan frontend Zod preference/thread schemas, preference interfaces, and
-    all ``other_preference`` / ``model_preference`` call sites in ``web/src/``."""
+    """Scan frontend Zod preference/thread schemas (including sub-schema field paths),
+    preference interfaces, and all ``other_preference`` / ``model_preference`` call
+    sites in ``web/src/``."""
+    registry_items = _load_registry()
+
     # 1. Auto-discover every Zod file under web/src/ touching preference/thread storage
+    #    in non-comment code.
     discovered_zod_files = _discover_web_pref_zod_files()
     unknown_zod_files = sorted(discovered_zod_files - set(_KNOWN_FRONTEND_PREF_ZOD_FILES))
     assert not unknown_zod_files, (
@@ -2144,8 +2688,21 @@ def test_frontend_zod_preference_schemas_are_registered():
 
     global_consts = _collect_web_exported_string_consts()
 
-    # 2. All Zod object schemas in modelPreferences.ts + ModelPreferences/AccountTuning/ModelProfile
-    #    interfaces + MOVED_KEYS / MODEL_PREF_KEYS / TUNING_FIELDS
+    # 2. Every entry in _KNOWN_FRONTEND_PREF_ZOD_FILES must run field extraction and
+    #    verify its fields (including Zod sub-schema field paths) against the registry.
+    for rel_path, kind in _KNOWN_FRONTEND_PREF_ZOD_FILES.items():
+        file_path = WEB_SRC / rel_path
+        assert file_path.is_file(), f"Missing known frontend Zod file: {rel_path}"
+        _verify_frontend_pref_zod_file(
+            rel_path,
+            kind,
+            file_path.read_text(encoding="utf-8"),
+            global_consts=global_consts,
+            registry_items=registry_items,
+        )
+
+    # 3. ModelPreferences / AccountTuning / ModelProfile interfaces + MOVED_KEYS /
+    #    MODEL_PREF_KEYS / TUNING_FIELDS
     model_prefs_ts = WEB_SRC / "lib" / "modelPreferences.ts"
     model_tuning_ts = WEB_SRC / "lib" / "modelTuning.ts"
     model_prefs_src = model_prefs_ts.read_text(encoding="utf-8")
@@ -2165,7 +2722,10 @@ def test_frontend_zod_preference_schemas_are_registered():
         {"modelPreferences.ts": model_prefs_src, "modelTuning.ts": model_tuning_src},
         "ModelPreferences",
     )
-    assert iface_fields, "ModelPreferences interface must define keys"
+    assert "preferred_model" in iface_fields
+    assert "dalton_notify_routes" in iface_fields
+    assert "prompt_guidance" in iface_fields
+    assert "cold_compaction" in iface_fields
 
     moved_keys = _extract_string_list_const(
         model_prefs_ts, "MOVED_KEYS", extra_string_consts=global_consts
@@ -2186,33 +2746,7 @@ def test_frontend_zod_preference_schemas_are_registered():
         source="web/src/lib/modelPreferences.ts (Zod schemas / ModelPreferences / MODEL_PREF_KEYS) & modelTuning.ts",
     )
 
-    # 3. Structured investing/agent profile fields (welcome/profile.ts)
-    welcome_profile_ts = WEB_SRC / "pages" / "Onboarding" / "welcome" / "profile.ts"
-    profile_keys = _extract_profile_fields(welcome_profile_ts)
-    _assert_all_registered(
-        profile_keys,
-        source="web/src/pages/Onboarding/welcome/profile.ts (PROFILE_FIELDS)",
-    )
-
-    # 4. Validate all sub-schema Zod files parse recursively and their parent preference key is registered
-    for rel_path, kind in _KNOWN_FRONTEND_PREF_ZOD_FILES.items():
-        if not kind.startswith("other_preference_subschema:"):
-            continue
-        pref_key = kind.split(":", 1)[1]
-        src_text = (WEB_SRC / rel_path).read_text(encoding="utf-8")
-        schemas = _extract_all_zod_object_fields_in_source(
-            src_text, extra_string_consts=global_consts, recursive=True
-        )
-        # appBridge/useAppScopes.ts uses z.record(...) rather than z.object(...);
-        # object-based subschemas must yield non-empty parsed fields.
-        if "z.object(" in src_text or "z.looseObject(" in src_text or "z.strictObject(" in src_text:
-            assert schemas, f"Expected parsed Zod object schemas in {rel_path}"
-        _assert_all_registered(
-            {f"user_preferences.other_preference.{pref_key}"},
-            source=f"web/src/{rel_path}",
-        )
-
-    # 5. Frontend ThreadField union (and any Zod object schema in threadFieldMutations.ts)
+    # 4. Frontend ThreadField union (and any Zod object schema in threadFieldMutations.ts)
     thread_fields_ts = WEB_SRC / "lib" / "threadFieldMutations.ts"
     thread_fields_src = thread_fields_ts.read_text(encoding="utf-8")
     thread_field_names = _extract_type_string_union_from_source(
@@ -2229,7 +2763,7 @@ def test_frontend_zod_preference_schemas_are_registered():
         source="web/src/lib/threadFieldMutations.ts (ThreadField)",
     )
 
-    # 6. Full web/src/ scan for other_preference & model_preference readers/writers
+    # 5. Full web/src/ scan for other_preference & model_preference readers/writers
     other_pref_keys, direct_model_keys = _discover_web_preference_keys()
     assert "user_preferences.other_preference.app_scopes" in other_pref_keys
     assert "user_preferences.other_preference.search_provider" in other_pref_keys
@@ -2253,7 +2787,7 @@ def test_frontend_zod_preference_schemas_are_registered():
 def test_backend_user_and_preferences_keys_are_registered():
     """Scan backend Pydantic models (including ``ModelPreference.model_fields``),
     ``update_user`` params, canonical runtime key sets, and ``user_preferences``
-    JSON read/write paths in ``src/`` without hand-written key lists."""
+    JSON read/write/merge paths in ``src/`` without hand-written key lists."""
     from src.dalton.llm.model_prefs import DALTON_MODEL_PREF_KEYS
     from src.llms.preferences import MOVED_MODEL_KEYS, TUNING_FIELDS
     from src.server.database.user import DEFAULT_OTHER_PREFERENCE, update_user
@@ -2282,12 +2816,13 @@ def test_backend_user_and_preferences_keys_are_registered():
     for key in (*_NEVER_MOVED, *DEFAULT_OTHER_PREFERENCE.keys()):
         discovered.add(f"user_preferences.other_preference.{key}")
 
-    # 4. AST scan of all user_preferences JSON read/write paths in src/
+    # 4. AST scan of all user_preferences JSON read/write/merge paths in src/
     json_path_keys = _discover_backend_preference_json_keys(PY_SRC)
     # Sanity-check that open JSON keys are discovered directly from code paths (not hardcoded)
     assert "user_preferences.model_preference.profiles" in json_path_keys
     assert "user_preferences.model_preference.default_model_scope" in json_path_keys
     assert "user_preferences.model_preference.background_follows" in json_path_keys
+    assert "user_preferences.agent_preference.subagent_models" in json_path_keys
     assert "user_preferences.other_preference.subagents_default" in json_path_keys
     assert "user_preferences.other_preference.artifact_comment_destination" in json_path_keys
     assert "user_preferences.other_preference.skills" in json_path_keys
@@ -2340,8 +2875,9 @@ def test_thread_writable_fields_are_registered():
 
 def test_automation_writable_fields_are_registered():
     """Every writable field on AutomationCreate, AutomationUpdate, CompanyScriptUpdate,
+    nested/independently validated sub-models (``DeliveryConfig``, ``PriceTriggerConfig``),
     and ``.agents/user/automations/*.json`` (including ``status`` for pause/resume)
-    is registered."""
+    is registered by storage path."""
     from src.server.app import automations as automations_router_mod
     from src.server.models.automation import (
         AutomationCreate,
@@ -2350,23 +2886,17 @@ def test_automation_writable_fields_are_registered():
     )
     from src.server.services.automations import file as automation_file
 
-    fields = (
-        set(AutomationCreate.model_fields)
-        | set(AutomationUpdate.model_fields)
-        | set(CompanyScriptUpdate.model_fields)
-    ) - _AUTOMATION_NON_SETTING_FIELDS
+    discovered = _extract_automation_writable_fields(
+        (AutomationCreate, AutomationUpdate, CompanyScriptUpdate),
+        editable_fields=automation_file._EDITABLE,
+        file_field_aliases=automation_file._FILE_FIELD,
+    )
 
-    # Include every editable field from `.agents/user/automations/*.json`
-    # mapping file-level aliases (`thread`, `delivery`) back to canonical model fields.
-    file_alias_to_model: dict[str, set[str]] = {}
-    for model_field, file_field in automation_file._FILE_FIELD.items():
-        file_alias_to_model.setdefault(file_field, set()).add(model_field)
-
-    for editable_field in automation_file._EDITABLE:
-        if editable_field in file_alias_to_model:
-            fields |= file_alias_to_model[editable_field]
-        else:
-            fields.add(editable_field)
+    # Sanity-check independently validated PriceTriggerConfig & DeliveryConfig sub-paths
+    assert "automation.trigger_config.symbol" in discovered
+    assert "automation.trigger_config.conditions.type" in discovered
+    assert "automation.trigger_config.retrigger.mode" in discovered
+    assert "automation.delivery_config.methods" in discovered
 
     # Verify pause / resume HTTP endpoints are present and represented by automation.status
     post_paths = {
@@ -2376,22 +2906,24 @@ def test_automation_writable_fields_are_registered():
     }
     assert any(p.endswith("/automations/{automation_id}/pause") for p in post_paths)
     assert any(p.endswith("/automations/{automation_id}/resume") for p in post_paths)
-    assert "status" in fields
+    assert "automation.status" in discovered
 
-    discovered = {f"automation.{f}" for f in fields}
     _assert_all_registered(
         discovered,
-        source="src/server/models/automation.py & src/server/services/automations/file.py (_EDITABLE) & pause/resume",
+        source="src/server/models/automation.py (incl. PriceTriggerConfig / DeliveryConfig) & file.py (_EDITABLE)",
     )
 
 
 # ---------------------------------------------------------------------------
-# Tests: Workspace, Computer, and Deployment settings
+# Tests: Workspace, Computer, Desktop local, and Deployment settings
 # ---------------------------------------------------------------------------
 
 
 def test_workspace_computer_and_deployment_settings_are_registered():
-    """Workspace writable metadata, computer browser settings, and deployment_settings catalog keys are registered."""
+    """Workspace writable metadata (including coverage tracking), computer browser
+    settings, desktop local notification toggles, and deployment_settings catalog
+    keys are registered."""
+    from src.dalton.app.router import WorkspaceTrackingUpdateRequest
     from src.dalton.tools.ingest_tools import AUTO_INGEST_CONFIG_KEY
     from src.server.models.computer import BrowserChoicesUpdate
     from src.server.models.workspace import WorkspaceUpdate
@@ -2406,8 +2938,26 @@ def test_workspace_computer_and_deployment_settings_are_registered():
         discovered.add(f"workspace.{field}")
     discovered.add(f"workspace.{AUTO_INGEST_CONFIG_KEY}")
 
+    # Workspace coverage tracking (POST /api/v1/dalton/tracking/{workspace_id})
+    tracking_fields = set(WorkspaceTrackingUpdateRequest.model_fields) - {
+        "override_pause_versions"
+    }
+    assert tracking_fields == {"enabled", "tier"}, (
+        f"WorkspaceTrackingUpdateRequest 新增了未核对字段：{sorted(tracking_fields)}\n"
+        f"{FAILURE_GUIDANCE}"
+    )
+    discovered.add("dalton.workspace.coverage_tracking")
+
     for field in BrowserChoicesUpdate.model_fields:
         discovered.add(f"computer.browser.{field}")
+
+    # Desktop local notification toggles (desktop/src/desktopSettings.js)
+    desktop_settings_js = DESKTOP_SRC / "desktopSettings.js"
+    assert desktop_settings_js.is_file(), f"Missing {desktop_settings_js}"
+    notif_kinds = _extract_string_list_const(desktop_settings_js, "NOTIFICATION_KINDS")
+    assert notif_kinds, "NOTIFICATION_KINDS must define desktop notification toggles"
+    for kind in notif_kinds:
+        discovered.add(f"desktop.notifications.{kind}")
 
     for name in (
         catalog.PROVIDER_SETTING,
@@ -2419,7 +2969,7 @@ def test_workspace_computer_and_deployment_settings_are_registered():
 
     _assert_all_registered(
         discovered,
-        source="WorkspaceUpdate / BrowserChoicesUpdate / setup_settings.catalog",
+        source="WorkspaceUpdate / WorkspaceTrackingUpdateRequest / BrowserChoicesUpdate / desktopSettings.js / setup_settings.catalog",
     )
 
 
@@ -2430,10 +2980,28 @@ def test_workspace_computer_and_deployment_settings_are_registered():
 
 def test_dalton_put_patch_routes_and_body_fields_are_registered():
     """Every Dalton PUT/PATCH route mounted on ``src.server.app.setup.app`` across
-    all deployment profiles — and every Pydantic request body field on each setting
-    route — must be registered in ``settings_registry.yaml``."""
+    all deployment profiles — and every recursive Pydantic request body field on
+    each setting route (signature models AND in-handler ``model_validate()``) —
+    must be registered in ``settings_registry.yaml``."""
     live_route_fields = _discover_mounted_dalton_routes_across_profiles()
     assert live_route_fields, "Expected mounted Dalton PUT/PATCH routes to be discovered"
+    # Sanity-check that dict+model_validate() routes and nested fields were extracted.
+    assert "curated_setup" in (
+        live_route_fields.get(("PUT", "/api/v1/dalton/team-models/curated")) or set()
+    )
+    assert "base_url" in (
+        live_route_fields.get(
+            ("PUT", "/api/v1/dalton/team-models/provider-variants/{provider_slug}")
+        )
+        or set()
+    )
+    assert "pricing.input_tiers.rate" in (
+        live_route_fields.get(("PUT", "/api/v1/dalton/team-models/{model_key}"))
+        or set()
+    )
+    assert "scopes.space_id" in (
+        live_route_fields.get(("PUT", "/api/v1/dalton/feishu/read-scopes")) or set()
+    )
     _assert_dalton_routes_and_fields_registered(live_route_fields, _load_registry())
 
 
@@ -2462,28 +3030,46 @@ def test_guard_fails_on_unregistered_pydantic_model_preference_field():
 
 
 def test_guard_fails_on_unregistered_backend_preference_json_paths():
-    """Adding a backend read or write on ``other_preference`` / ``model_preference`` fails the guard."""
+    """Adding a backend read, inline write, ``dict.update()`` merge, ``copy.deepcopy()``,
+    conditional expression, or variable ``upsert_user_preferences`` write fails the guard."""
     fake_py = """
+import copy
 from src.server.database.user import upsert_user_preferences
 
 def read_pref(prefs: dict):
     other = prefs.get("other_preference") or {}
-    return other.get("unregistered_backend_read_key")
+    ap = copy.deepcopy(
+        prefs.get("agent_preference") if isinstance(prefs.get("agent_preference"), dict) else {}
+    )
+    return other.get("unregistered_backend_read_key"), ap.get("unregistered_deepcopy_key")
 
-async def write_pref(user_id: str):
+async def write_pref(user_id: str, model_pref: dict):
+    model_pref.update({"unregistered_update_dict_key": True})
+    model_pref.update(unregistered_update_kw_key="v")
+    model_pref |= {"unregistered_bitor_key": 1}
+    extra_patch = {"unregistered_var_upsert_key": "x"}
     await upsert_user_preferences(
         user_id,
-        model_preference={"unregistered_backend_write_key": True},
+        model_preference=model_pref,
+        other_preference=extra_patch,
     )
 """
     discovered = _scan_python_preference_json_keys(fake_py, filename="fake_pref.py")
-    assert "user_preferences.other_preference.unregistered_backend_read_key" in discovered
-    assert "user_preferences.model_preference.unregistered_backend_write_key" in discovered
+    expected = {
+        "user_preferences.other_preference.unregistered_backend_read_key",
+        "user_preferences.agent_preference.unregistered_deepcopy_key",
+        "user_preferences.model_preference.unregistered_update_dict_key",
+        "user_preferences.model_preference.unregistered_update_kw_key",
+        "user_preferences.model_preference.unregistered_bitor_key",
+        "user_preferences.other_preference.unregistered_var_upsert_key",
+    }
+    assert expected <= discovered
 
     with pytest.raises(AssertionError) as exc_info:
         _assert_all_registered(discovered, source="fake backend JSON paths")
-    assert "unregistered_backend_read_key" in str(exc_info.value)
-    assert "unregistered_backend_write_key" in str(exc_info.value)
+    msg = str(exc_info.value)
+    for key in expected:
+        assert key in msg
 
 
 def test_guard_fails_on_unregistered_frontend_zod_schema_and_rejects_unparseable():
@@ -2532,6 +3118,116 @@ export const BrokenSchema = z.object({
         _extract_all_zod_object_fields_in_source(unparseable_ts, recursive=True)
 
 
+def test_guard_fails_on_unregistered_frontend_subschema_field_and_ignores_comments():
+    """Adding a field to a real Zod sub-schema (``custom_dashboards`` or ``onboarding``)
+    fails the guard; adding a comment mentioning ``other_preference`` to an unrelated
+    dashboard Zod schema file does NOT trigger a false positive; unknown whitelist
+    ``kind`` fails explicitly."""
+    registry_items = _load_registry()
+
+    # 1. Adding a field to the real custom_dashboards Zod schema fails the guard
+    saved_src = (WEB_SRC / "lib" / "dashboards" / "saved.ts").read_text(encoding="utf-8")
+    mutated_saved = saved_src.replace(
+        "artifactId: id });",
+        "artifactId: id, unregistered_dashboard_flag: z.boolean() });",
+        1,
+    )
+    assert mutated_saved != saved_src
+    with pytest.raises(AssertionError, match="unregistered_dashboard_flag"):
+        _verify_frontend_pref_zod_file(
+            "lib/dashboards/saved.ts",
+            "other_preference_subschema:custom_dashboards",
+            mutated_saved,
+            global_consts={},
+            registry_items=registry_items,
+        )
+
+    # 2. Adding a field to the real OnboardingPrefsSchema fails the guard
+    onboarding_src = (
+        WEB_SRC / "pages" / "Onboarding" / "onboardingPrefsSchema.ts"
+    ).read_text(encoding="utf-8")
+    mutated_onboarding = onboarding_src.replace(
+        "firstRunAt: epochOrNull,",
+        "firstRunAt: epochOrNull,\n  unregistered_onboarding_flag: epochOrNull,",
+        1,
+    )
+    assert mutated_onboarding != onboarding_src
+    with pytest.raises(AssertionError, match="unregistered_onboarding_flag"):
+        _verify_frontend_pref_zod_file(
+            "pages/Onboarding/onboardingPrefsSchema.ts",
+            "other_preference_subschema:onboarding",
+            mutated_onboarding,
+            global_consts={},
+            registry_items=registry_items,
+        )
+
+    # 3. Adding a comment mentioning `other_preference` to a widget schema file does NOT
+    #    falsely flag it as a preference storage Zod file.
+    widget_schema_src = (
+        WEB_SRC / "pages" / "Dashboard" / "widgets" / "framework" / "configSchemas.ts"
+    ).read_text(encoding="utf-8")
+    commented_widget_src = (
+        "// Stored inside user_preferences.other_preference.dashboard\n"
+        + widget_schema_src
+    )
+    assert not _is_pref_zod_source(commented_widget_src)
+
+    # 4. Unimplemented whitelist `kind` raises explicitly instead of silently skipping
+    with pytest.raises(AssertionError, match="未实现提取逻辑"):
+        _verify_frontend_pref_zod_file(
+            "lib/dashboards/saved.ts",
+            "unimplemented_custom_kind",
+            saved_src,
+            global_consts={},
+            registry_items=registry_items,
+        )
+
+
+def test_guard_fails_on_semicolonless_ts_interface_field():
+    """TypeScript interface properties without trailing semicolons are all extracted,
+    and an unregistered field fails the guard."""
+    fake_tuning = """
+export interface ModelProfile {
+  prompt_guidance?: string | null
+  unregistered_profile_knob?: boolean | null
+}
+export interface AccountTuning extends ModelProfile {
+  cold_compaction?: boolean | null
+}
+"""
+    fake_prefs = """
+export interface ModelPreferences extends AccountTuning {
+  preferred_model?: string | null
+  profiles?: Record<
+    string,
+    ModelProfile | null
+  > | null
+  unregistered_model_iface_knob?: string | null
+}
+"""
+    fields = _extract_ts_interface_fields(
+        {"modelTuning.ts": fake_tuning, "modelPreferences.ts": fake_prefs},
+        "ModelPreferences",
+    )
+    assert {
+        "prompt_guidance",
+        "unregistered_profile_knob",
+        "cold_compaction",
+        "preferred_model",
+        "profiles",
+        "unregistered_model_iface_knob",
+    } <= fields
+
+    with pytest.raises(AssertionError) as exc_info:
+        _assert_all_registered(
+            {f"user_preferences.model_preference.{f}" for f in fields},
+            source="fake semicolonless ModelPreferences",
+        )
+    msg = str(exc_info.value)
+    assert "unregistered_profile_knob" in msg
+    assert "unregistered_model_iface_knob" in msg
+
+
 def test_guard_handles_semicolonless_thread_field_and_catches_unregistered():
     """Omitting the semicolon after ``ThreadField`` never leaks subsequent strings,
     while an added unregistered member fails the guard."""
@@ -2577,15 +3273,27 @@ export function useDemo() {
     assert "unregistered_literal_pref" in str(exc_info.value)
 
 
+class _FakeNestedRouteOption(BaseModel):
+    unregistered_nested_route_field: str | None = None
+
+
 class _FakeMonitorPatchBody(BaseModel):
     title: str | None = None
     unregistered_monitor_field: str | None = None
+    nested_opt: _FakeNestedRouteOption | None = None
+
+
+class _FakeDictValidatedBody(BaseModel):
+    curated_setup: list[str] | None = None
+    unregistered_validated_field: str | None = None
+    nested_opt: _FakeNestedRouteOption | None = None
 
 
 def test_guard_fails_on_unregistered_dalton_route_field_and_ignores_unmounted_routers():
     """Route discovery reads only mounted final paths from FastAPI app (ignoring
-    unmounted draft routers and pre-mount sub-router paths), and fails when an
-    existing Dalton PUT/PATCH endpoint adds an unregistered body field."""
+    unmounted draft routers and pre-mount sub-router paths), extracts recursive
+    nested Pydantic fields as well as in-handler ``model_validate()`` models on
+    ``dict`` bodies, and fails on any unregistered writable field."""
     app = FastAPI()
     parent = APIRouter(prefix="/api/v1/dalton")
     sub = APIRouter(prefix="/monitors")
@@ -2595,6 +3303,11 @@ def test_guard_fails_on_unregistered_dalton_route_field_and_ignores_unmounted_ro
     async def _patch_monitor(slug: str, body: _FakeMonitorPatchBody):
         return {"slug": slug, "body": body}
 
+    @parent.put("/team-models/curated")
+    async def _put_curated(body: dict[str, Any]):
+        parsed = _FakeDictValidatedBody.model_validate(body)
+        return {"parsed": parsed}
+
     @unmounted_draft.put("/ignored")
     async def _draft_put():
         return {}
@@ -2603,12 +3316,21 @@ def test_guard_fails_on_unregistered_dalton_route_field_and_ignores_unmounted_ro
     app.include_router(parent)
 
     discovered = _extract_dalton_put_patch_route_fields(app)
-    # Only the final mounted path exists; neither pre-mount `/monitors/{slug}` nor
+    # Only mounted final paths exist; neither pre-mount `/monitors/{slug}` nor
     # unmounted `/api/v1/dalton/draft/ignored` is collected.
-    assert set(discovered) == {("PATCH", "/api/v1/dalton/monitors/{slug}")}
+    assert set(discovered) == {
+        ("PATCH", "/api/v1/dalton/monitors/{slug}"),
+        ("PUT", "/api/v1/dalton/team-models/curated"),
+    }
     assert discovered[("PATCH", "/api/v1/dalton/monitors/{slug}")] == {
         "title",
         "unregistered_monitor_field",
+        "nested_opt.unregistered_nested_route_field",
+    }
+    assert discovered[("PUT", "/api/v1/dalton/team-models/curated")] == {
+        "curated_setup",
+        "unregistered_validated_field",
+        "nested_opt.unregistered_nested_route_field",
     }
 
     fake_registry = [
@@ -2616,9 +3338,13 @@ def test_guard_fails_on_unregistered_dalton_route_field_and_ignores_unmounted_ro
             "key": "dalton.monitors.settings",
             "routes": ["PATCH /api/v1/dalton/monitors/{slug}"],
             "route_fields": ["title"],
-        }
+        },
+        {
+            "key": "dalton.team_models.curated",
+            "routes": ["PUT /api/v1/dalton/team-models/curated"],
+            "route_fields": ["curated_setup"],
+        },
     ]
-    # Also include NON_SETTING_DALTON_ROUTES as live so only the body-field check fails.
     live_with_non_settings = dict(discovered)
     for nr in NON_SETTING_DALTON_ROUTES:
         live_with_non_settings[nr] = None
@@ -2627,4 +3353,66 @@ def test_guard_fails_on_unregistered_dalton_route_field_and_ignores_unmounted_ro
         _assert_dalton_routes_and_fields_registered(
             live_with_non_settings, fake_registry
         )
-    assert "unregistered_monitor_field" in str(exc_info.value)
+    msg = str(exc_info.value)
+    assert "unregistered_monitor_field" in msg
+    assert "nested_opt.unregistered_nested_route_field" in msg
+
+    # Verify the dict+model_validate() route also fails on its own unregistered fields
+    fake_registry[0]["route_fields"] = [
+        "title",
+        "unregistered_monitor_field",
+        "nested_opt.unregistered_nested_route_field",
+    ]
+    with pytest.raises(AssertionError) as exc_info_2:
+        _assert_dalton_routes_and_fields_registered(
+            live_with_non_settings, fake_registry
+        )
+    msg2 = str(exc_info_2.value)
+    assert "unregistered_validated_field" in msg2
+    assert "nested_opt.unregistered_nested_route_field" in msg2
+
+
+def test_guard_fails_on_unregistered_automation_price_trigger_config_field():
+    """Adding a field to ``PriceTriggerConfig`` (an independently validated sub-model
+    checked inside ``@field_validator('trigger_config')``) fails the guard."""
+    from pydantic import field_validator
+
+    from src.server.models.automation import PriceTriggerConfig
+
+    class FakePriceTriggerConfig(PriceTriggerConfig):
+        unregistered_price_knob: float | None = None
+
+    class FakeAutomationCreate(BaseModel):
+        trigger_config: dict[str, Any] | None = None
+
+        @field_validator("trigger_config")
+        @classmethod
+        def _validate_tc(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+            if v is not None:
+                FakePriceTriggerConfig(**v)
+            return v
+
+    discovered = _extract_automation_writable_fields((FakeAutomationCreate,))
+    assert "automation.trigger_config.unregistered_price_knob" in discovered
+
+    with pytest.raises(AssertionError) as exc_info:
+        _assert_all_registered(discovered, source="fake PriceTriggerConfig")
+    assert "automation.trigger_config.unregistered_price_knob" in str(exc_info.value)
+
+
+def test_guard_fails_on_unregistered_desktop_notification_kind(tmp_path: Path):
+    """Adding a new notification kind to ``NOTIFICATION_KINDS`` in
+    ``desktop/src/desktopSettings.js`` fails the guard."""
+    fake_js = tmp_path / "desktopSettings.js"
+    fake_js.write_text(
+        "const NOTIFICATION_KINDS = ['turn', 'unregistered_desktop_alert'];\n",
+        encoding="utf-8",
+    )
+    kinds = _extract_string_list_const(fake_js, "NOTIFICATION_KINDS")
+    assert kinds == {"turn", "unregistered_desktop_alert"}
+    with pytest.raises(AssertionError) as exc_info:
+        _assert_all_registered(
+            {f"desktop.notifications.{k}" for k in kinds},
+            source="fake desktopSettings.js",
+        )
+    assert "desktop.notifications.unregistered_desktop_alert" in str(exc_info.value)
