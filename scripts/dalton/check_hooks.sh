@@ -583,6 +583,10 @@ ALLOWED_HOOKS=(
   # propagation, thin retry/SSE control delegates (sse_control.py, near_empty_reply.py), thread output
   # answer/image parity, and web phase-aware collapsed projection.
   "deliverable-text"
+  # Production fix: defer and retry automation capacity failures (WriterGuardUnavailable,
+  # quota burst 429, credit-gate 503) in Postgres via wait_reason='capacity_limit' up to 15m,
+  # and reset conversation_threads.current_status on pre-START automation failure/exit.
+  "automation-capacity-retry"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

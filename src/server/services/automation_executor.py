@@ -1478,11 +1478,31 @@ class AutomationExecutor:
             await hand_off(
                 firing.automation, execution_id, firing.thread_id, from_status="running"
             )
+            # DALTON-HOOK(automation-capacity-retry): clear pre-START in_progress thread status on hand-off
+            from src.dalton.automations.capacity_retry import (
+                reset_thread_status_after_prestart_exit,
+            )
+
+            await reset_thread_status_after_prestart_exit(firing.thread_id, outcome=None)
             _exec_span.set_attribute("status", "handed_off")
         except Exception as e:
             _exec_span.record_exception(e)
             if await self._left_to_run(execution_id, e, firing):
                 _exec_span.set_attribute("status", "handed_to_run")
+                return
+            # DALTON-HOOK(automation-capacity-retry): defer and retry capacity failures in Postgres before settling
+            from src.dalton.automations.capacity_retry import (
+                reset_thread_status_after_prestart_exit,
+                try_park_for_capacity,
+            )
+
+            if await try_park_for_capacity(
+                e,
+                automation=firing.automation,
+                execution_id=execution_id,
+                thread_id=firing.thread_id,
+            ):
+                _exec_span.set_attribute("status", "waiting_for_capacity")
                 return
             outcome, error_msg = await _failure_outcome(e, user_id)
             failed = outcome in (Outcome.FAILED, Outcome.FAILED_OURS)
@@ -1521,6 +1541,11 @@ class AutomationExecutor:
                 error=error_msg, delivery=firing.delivery, excerpt=excerpt,
                 release_pre_start_signals=True,
             )
+            # DALTON-HOOK(automation-capacity-retry): reset thread current_status when pre-START exit never ran finalize_run
+            await reset_thread_status_after_prestart_exit(
+                firing.thread_id,
+                outcome=outcome,
+            )
             _exec_span.set_attribute(
                 "status",
                 "settled_elsewhere" if not settled
@@ -1541,6 +1566,15 @@ class AutomationExecutor:
                         thread_id=firing.thread_id,
                         workspace_id=firing.workspace_id or automation.get("workspace_id"),
                         delivery=firing.delivery,
+                    )
+                    # DALTON-HOOK(automation-capacity-retry): reset thread current_status on pre-START cancellation
+                    from src.dalton.automations.capacity_retry import (
+                        reset_thread_status_after_prestart_exit,
+                    )
+
+                    await reset_thread_status_after_prestart_exit(
+                        firing.thread_id,
+                        outcome=Outcome.INTERRUPTED,
                     )
             except Exception as e:
                 # The sweep settles it once the heartbeat stops.

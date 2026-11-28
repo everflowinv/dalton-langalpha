@@ -145,6 +145,12 @@ class AutomationScheduler:
     async def _sweep(self) -> None:
         await self._sweep_abandoned_firings()
         await self._sweep_parked_firings()
+        # DALTON-HOOK(automation-capacity-retry): sweep DB-parked capacity backoff retries across workers
+        from src.dalton.automations.capacity_retry import sweep_capacity_parked
+
+        await sweep_capacity_parked(
+            self.dispatch, stopping=self._shutdown_event.is_set
+        )
 
     async def _sweep_abandoned_firings(self) -> None:
         """Settle firings whose process stopped holding them.

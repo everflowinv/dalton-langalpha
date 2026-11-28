@@ -899,23 +899,39 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
         async with conn.cursor() as cur:
             if stamp is not None:
                 # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
+                # DALTON-HOOK(automation-capacity-retry): preserve capacity_retry state across delivery re-stamps
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'capacity_retry' THEN
+                            %s::jsonb || jsonb_build_object(
+                                'subscription_fallback', delivery->'subscription_fallback',
+                                'capacity_retry', delivery->'capacity_retry'
+                            )
                         WHEN delivery ? 'subscription_fallback' THEN
                             %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'capacity_retry' THEN
+                            %s::jsonb || jsonb_build_object('capacity_retry', delivery->'capacity_retry')
                         ELSE %s::jsonb
                     END
                     WHERE automation_execution_id = %s
                       AND status IN {UNSETTLED_STATUSES}
-                """, (Json(stamp), Json(stamp), execution_id))
+                """, (Json(stamp), Json(stamp), Json(stamp), Json(stamp), execution_id))
             else:
                 # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
+                # DALTON-HOOK(automation-capacity-retry): keep capacity_retry state even when clearing delivery targets
                 await cur.execute(f"""
                     UPDATE automation_executions
                     SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' AND delivery ? 'capacity_retry' THEN
+                            jsonb_build_object(
+                                'subscription_fallback', delivery->'subscription_fallback',
+                                'capacity_retry', delivery->'capacity_retry'
+                            )
                         WHEN delivery ? 'subscription_fallback' THEN
                             jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        WHEN delivery ? 'capacity_retry' THEN
+                            jsonb_build_object('capacity_retry', delivery->'capacity_retry')
                         ELSE NULL
                     END
                     WHERE automation_execution_id = %s
@@ -1225,6 +1241,8 @@ async def has_earlier_waiting_execution(
                   ON me.automation_execution_id = %s
                 WHERE w.automation_id = %s AND w.status = 'waiting'
                   AND NOT {_PARKED.format(e="w")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked rows are not in the thread_busy line
+                  AND NOT {_CAPACITY_PARKED.format(e="w")}
                   AND (w.created_at, w.automation_execution_id)
                       < (me.created_at, me.automation_execution_id)
                 LIMIT 1
@@ -1273,6 +1291,8 @@ async def touch_execution(execution_id: str) -> None:
                 WHERE automation_execution_id = %s
                   AND status IN {UNSETTLED_STATUSES}
                   AND NOT {_PARKED.format(e="automation_executions")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked heartbeats are maintained by the capacity sweep
+                  AND NOT {_CAPACITY_PARKED.format(e="automation_executions")}
             """, (execution_id,))
 
 
@@ -1352,6 +1372,8 @@ async def list_abandoned_executions(
                     ON t.conversation_thread_id = e.conversation_thread_id
                 WHERE e.status IN {UNSETTLED_STATUSES}
                   AND NOT {_PARKED.format(e="e")}
+                  -- DALTON-HOOK(automation-capacity-retry): capacity-parked rows are expired/released by sweep_capacity_parked
+                  AND NOT {_CAPACITY_PARKED.format(e="e")}
                   AND NOT EXISTS (
                       SELECT 1 FROM conversation_responses r
                       WHERE (
@@ -1641,6 +1663,11 @@ async def take_over_execution_run(
 _PARKED = (
     "({e}.status = 'waiting'"
     " AND {e}.wait_reason IS NOT DISTINCT FROM 'computer_unreachable')"
+)
+# DALTON-HOOK(automation-capacity-retry): capacity-backoff waits are owned by the DB sweep, not an in-process loop
+_CAPACITY_PARKED = (
+    "({e}.status = 'waiting'"
+    " AND {e}.wait_reason IS NOT DISTINCT FROM 'capacity_limit')"
 )
 
 # A firing of the same automation came after ``e``, whatever became of it: it

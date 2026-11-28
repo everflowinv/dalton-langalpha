@@ -34,10 +34,10 @@ export type ExecutionStatus = 'pending' | 'waiting' | 'running' | 'completed' | 
  *  user's own computer it runs on could not be reached, or precheck skipped it. */
 export type SkipReason = 'user' | 'thread_busy' | 'interrupted' | 'computer_unreachable' | 'precheck'; // DALTON-HOOK(precheck-label)
 
-/** What a waiting run waits for: the turn running in its thread, or the
- *  computer its turn runs on. Kept once the wait ends; null on a run that
- *  never waited, or from a server that predates it. */
-export type WaitReason = 'thread_busy' | 'computer_unreachable';
+/** What a waiting run waits for: the turn running in its thread, the
+ *  computer its turn runs on, or server capacity to open. Kept once the wait
+ *  ends; null on a run that never waited, or from a server that predates it. */
+export type WaitReason = 'thread_busy' | 'computer_unreachable' | 'capacity_limit'; // DALTON-HOOK(automation-capacity-retry)
 
 /** A failed run's cause, where the server knows it: a usage limit refused
  *  the firing or paused its run (`error_message` is then the quota service's

@@ -167,6 +167,7 @@
   "runUnknown": "未知",
   "waitingNote": "所在对话中正在进行的轮次结束后运行。",
   "waitingForComputerNote": "它所在的电脑现在连不上，等电脑恢复连接后运行。",
+  "waitingForCapacityNote": "排队等待中，服务端并发名额释放后将自动重试。",
   "skippedThreadBusy": "所在对话一直有轮次在运行，本次已跳过。",
   "skippedInterrupted": "等待期间服务重启，本次已跳过。",
   "skippedComputerUnreachable": "它所在的电脑一直连不上，本次已跳过。",
