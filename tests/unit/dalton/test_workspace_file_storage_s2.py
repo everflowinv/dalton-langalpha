@@ -1506,12 +1506,14 @@ class TestStorageBucketRules:
         assert res_sec.versioning_status == "Enabled"
         assert client.versioning["dalton-asr"] == "Enabled"
         assert res_sec.managed_rule_ids == (
+            "dalton-transcription-audio-expire",
             "dalton-noncurrent-expire",
             "dalton-expired-delete-marker",
         )
         assert res_sec.removed_secondary_uploads_rule is True
         sec_ids = [r["ID"] for r in client.lifecycle["dalton-asr"]]
         assert "custom-operator-rule" in sec_ids
+        assert "dalton-transcription-audio-expire" in sec_ids
         assert "dalton-uploads-expire" not in sec_ids
         assert "dalton-asr" not in client.policy
 

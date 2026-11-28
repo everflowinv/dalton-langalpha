@@ -44,10 +44,12 @@ import tarfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import unquote, urlsplit
 
+from src.dalton.storage_bucket_rules import TRANSCRIPTION_AUDIO_EXPIRE_DAYS
 from src.dalton.storage_keys import storage_user_id
 from src.server.database.pool import get_db_connection, open_session_connection
 from src.utils.storage import is_storage_enabled
@@ -2045,7 +2047,12 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 TERMINAL_ASR_ARCHIVE_STATUSES: frozenset[str] = frozenset(
     {"succeeded", "failed", "cancelled"}
 )
-ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
+# Terminal ASR statuses that have produced a result and whose source audio expires
+# on the secondary bucket after ``TRANSCRIPTION_AUDIO_EXPIRE_DAYS`` (7 days).
+TERMINAL_ASR_RESULT_STATUSES: frozenset[str] = frozenset({"succeeded"})
+# Non-terminal ASR statuses (in-flight + indeterminate) whose source audio MUST
+# still exist in the ASR bucket regardless of age.
+INFLIGHT_ASR_STATUSES: frozenset[str] = frozenset(
     {
         "queued",
         "downloading",
@@ -2054,10 +2061,67 @@ ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
         "submitting",
         "transcribing",
         "assembling",
-        "succeeded",
         "indeterminate",
     }
 )
+ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = (
+    INFLIGHT_ASR_STATUSES | TERMINAL_ASR_RESULT_STATUSES
+)
+
+
+def _coerce_utc_datetime(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return (
+            val.replace(tzinfo=timezone.utc)
+            if val.tzinfo is None
+            else val.astimezone(timezone.utc)
+        )
+    if isinstance(val, str):
+        raw = val.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (
+            parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None
+            else parsed.astimezone(timezone.utc)
+        )
+    return None
+
+
+def is_terminal_asr_source_audio_expired(
+    *,
+    status: str,
+    created_at: Any,
+    completed_at: Any = None,
+    updated_at: Any = None,
+    now: datetime | None = None,
+    expire_days: int = TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+) -> bool:
+    """Return True when a terminal result-bearing ASR job's source audio has exceeded
+    the managed secondary-bucket lifecycle window (``TRANSCRIPTION_AUDIO_EXPIRE_DAYS``).
+
+    In-flight, ``awaiting_upload``, and ``indeterminate`` jobs never expire here.
+    Uses ``created_at`` (closest to source upload time, when MinIO starts the
+    lifecycle clock), falling back to ``completed_at`` / ``updated_at`` when absent.
+    """
+    st_s = str(status or "").strip().lower()
+    if st_s not in TERMINAL_ASR_RESULT_STATUSES:
+        return False
+    ref_ts = (
+        _coerce_utc_datetime(created_at)
+        or _coerce_utc_datetime(completed_at)
+        or _coerce_utc_datetime(updated_at)
+    )
+    if ref_ts is None:
+        return False
+    effective_now = _coerce_utc_datetime(now) or datetime.now(timezone.utc)
+    return (effective_now - ref_ts) > timedelta(days=expire_days)
 
 
 def parse_skill_content_hash(content_hash: str | None) -> str:
@@ -2507,6 +2571,7 @@ class SnapshotRefInventory:
     terminal_asr_job_ids: list[str] = field(default_factory=list)
     succeeded_asr_job_ids: list[str] = field(default_factory=list)
     skipped_pending: dict[str, int] = field(default_factory=dict)
+    skipped_expired: dict[str, int] = field(default_factory=dict)
     skipped_missing_tables: list[str] = field(default_factory=list)
 
     def keys_by_bucket_role(self) -> dict[str, set[str]]:
@@ -2517,13 +2582,16 @@ class SnapshotRefInventory:
         return out
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "references": [r.to_dict() for r in self.references],
             "terminal_asr_job_ids": list(self.terminal_asr_job_ids),
             "succeeded_asr_job_ids": list(self.succeeded_asr_job_ids),
             "skipped_pending": dict(self.skipped_pending),
             "skipped_missing_tables": list(self.skipped_missing_tables),
         }
+        if self.skipped_expired:
+            out["skipped_expired"] = dict(self.skipped_expired)
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SnapshotRefInventory:
@@ -2537,6 +2605,9 @@ class SnapshotRefInventory:
             succeeded_asr_job_ids=[str(x) for x in (data.get("succeeded_asr_job_ids") or [])],
             skipped_pending={
                 str(k): int(v) for k, v in (data.get("skipped_pending") or {}).items()
+            },
+            skipped_expired={
+                str(k): int(v) for k, v in (data.get("skipped_expired") or {}).items()
             },
             skipped_missing_tables=[str(x) for x in (data.get("skipped_missing_tables") or [])],
         )
@@ -2613,6 +2684,7 @@ async def enumerate_snapshot_refs(
     serde: Any | None = None,
     include_main: bool = True,
     include_aux: bool = True,
+    now: datetime | None = None,
 ) -> SnapshotRefInventory:
     """Enumerate all live object references and terminal ASR job IDs inside the caller's DB snapshot.
 
@@ -2621,6 +2693,7 @@ async def enumerate_snapshot_refs(
     """
     inv = SnapshotRefInventory()
     blob_registry: dict[tuple[str, str], int] = {}
+    effective_now = _coerce_utc_datetime(now) or datetime.now(timezone.utc)
 
     async with conn.cursor() as cur:
         # 1. workspace_file_blobs (live rows: condemned_at IS NULL)
@@ -3359,12 +3432,37 @@ async def enumerate_snapshot_refs(
             if await _table_exists(cur, "public.dalton_transcription_jobs"):
                 await cur.execute(
                     "SELECT job_id, status, source_object_key, source_size_bytes, "
-                    "source_sha256, usage FROM dalton_transcription_jobs "
+                    "source_sha256, usage, created_at, completed_at, updated_at "
+                    "FROM dalton_transcription_jobs "
                     "ORDER BY created_at ASC, job_id ASC"
                 )
                 pending_asr = 0
+                expired_asr = 0
                 for row in await cur.fetchall():
-                    jid, st, okey, sz, sha, usage = _extract_tuple(row, 6)
+                    if isinstance(row, Mapping):
+                        jid = row.get("job_id")
+                        st = row.get("status")
+                        okey = row.get("source_object_key")
+                        sz = row.get("source_size_bytes")
+                        sha = row.get("source_sha256")
+                        usage = row.get("usage")
+                        created_at = row.get("created_at")
+                        completed_at = row.get("completed_at")
+                        updated_at = row.get("updated_at")
+                    else:
+                        raw_vals = tuple(row)
+                        padded = raw_vals + (None,) * max(0, 9 - len(raw_vals))
+                        (
+                            jid,
+                            st,
+                            okey,
+                            sz,
+                            sha,
+                            usage,
+                            created_at,
+                            completed_at,
+                            updated_at,
+                        ) = padded[:9]
                     jid_s = str(jid)
                     st_s = str(st or "").strip().lower()
                     if isinstance(usage, str):
@@ -3390,8 +3488,23 @@ async def enumerate_snapshot_refs(
                     if st_s == "awaiting_upload" and not (upload_completed or submit_attempted):
                         pending_asr += 1
                         continue
-                    if st_s in ACTIVE_OR_SUBMITTED_ASR_STATUSES or (
-                        st_s == "awaiting_upload" and (upload_completed or submit_attempted)
+                    if is_terminal_asr_source_audio_expired(
+                        status=st_s,
+                        created_at=created_at,
+                        completed_at=completed_at,
+                        updated_at=updated_at,
+                        now=effective_now,
+                        expire_days=TRANSCRIPTION_AUDIO_EXPIRE_DAYS,
+                    ):
+                        expired_asr += 1
+                        continue
+                    if (
+                        st_s in INFLIGHT_ASR_STATUSES
+                        or st_s in TERMINAL_ASR_RESULT_STATUSES
+                        or (
+                            st_s == "awaiting_upload"
+                            and (upload_completed or submit_attempted)
+                        )
                     ):
                         inv.references.append(
                             ObjectReference(
@@ -3410,6 +3523,8 @@ async def enumerate_snapshot_refs(
                         )
                 if pending_asr:
                     inv.skipped_pending["dalton_transcription_jobs"] = pending_asr
+                if expired_asr:
+                    inv.skipped_expired["dalton_transcription_jobs"] = expired_asr
             else:
                 inv.skipped_missing_tables.append("public.dalton_transcription_jobs")
 

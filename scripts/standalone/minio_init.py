@@ -25,17 +25,25 @@ try:
     from src.dalton.storage_bucket_rules import (
         BucketRuleVerificationError,
         ROLE_MAIN,
+        ROLE_SECONDARY,
+        RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
         build_bucket_policy,
+        merge_lifecycle_rules,
         normalize_key_prefix,
         verify_bucket_policy,
+        verify_lifecycle_rules,
     )
 except ImportError:
     from dalton.storage_bucket_rules import (  # type: ignore[no-redef]
         BucketRuleVerificationError,
         ROLE_MAIN,
+        ROLE_SECONDARY,
+        RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE,
         build_bucket_policy,
+        merge_lifecycle_rules,
         normalize_key_prefix,
         verify_bucket_policy,
+        verify_lifecycle_rules,
     )
 
 
@@ -145,6 +153,92 @@ def _ensure_main_avatars_policy(
     return 0
 
 
+def _ensure_secondary_lifecycle(
+    client: object,
+    *,
+    bucket: str,
+    key_prefix: str,
+    endpoint: str,
+) -> int:
+    """Apply and read-back verify managed secondary lifecycle rules on ``bucket``."""
+    prefix = normalize_key_prefix(key_prefix)
+    try:
+        resp = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("NoSuchLifecycleConfiguration", "404"):
+            resp = {}
+        else:
+            print(
+                f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing_rules = (
+        list(resp.get("Rules"))
+        if isinstance(resp, dict) and isinstance(resp.get("Rules"), list)
+        else []
+    )
+    merged_rules, _preserved, _removed = merge_lifecycle_rules(
+        existing_rules,
+        role=ROLE_SECONDARY,
+        key_prefix=prefix,
+    )
+    try:
+        client.put_bucket_lifecycle_configuration(  # type: ignore[attr-defined]
+            Bucket=bucket,
+            LifecycleConfiguration={"Rules": merged_rules},
+        )
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR setting lifecycle rules on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        verify_resp = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR verifying lifecycle rules on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if isinstance(verify_resp, dict):
+        actual_rules = (
+            list(verify_resp.get("Rules"))
+            if isinstance(verify_resp.get("Rules"), list)
+            else []
+        )
+        try:
+            verify_lifecycle_rules(
+                actual_rules,
+                role=ROLE_SECONDARY,
+                key_prefix=prefix,
+            )
+        except BucketRuleVerificationError as exc:
+            print(
+                f"[minio-init] ERROR lifecycle verification failed on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"[minio-init] Verified secondary lifecycle rules (including '{RULE_ID_TRANSCRIPTION_AUDIO_EXPIRE}') "
+        f"on bucket '{bucket}' (prefix='{prefix}') at {endpoint}.",
+        flush=True,
+    )
+    return 0
+
+
 def _resolve_main_storage_bucket() -> str:
     if "STORAGE_BUCKET_NAME" in os.environ:
         return (os.environ.get("STORAGE_BUCKET_NAME") or "").strip()
@@ -221,11 +315,13 @@ def main() -> int:
     # except current-version anonymous s3:GetObject on <STORAGE_KEY_PREFIX>avatars/*.
     storage_provider = (os.getenv("STORAGE_PROVIDER") or "").strip().lower()
     storage_bucket = _resolve_main_storage_bucket() if storage_provider != "none" else ""
+    main_bucket_on_endpoint = ""
     if storage_bucket:
         storage_endpoint = _env(
             "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default=endpoint
         ).rstrip("/")
         if storage_endpoint == endpoint:
+            main_bucket_on_endpoint = storage_bucket
             if (storage_endpoint, storage_bucket) not in initialized:
                 storage_region = _env("STORAGE_REGION", "S3_REGION", default=region)
                 rc = _ensure_private_bucket(
@@ -251,14 +347,24 @@ def main() -> int:
     asr_bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME")
     if asr_bucket:
         asr_endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if asr_endpoint == endpoint and (asr_endpoint, asr_bucket) not in initialized:
-            asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
-            rc = _ensure_private_bucket(
-                client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
-            )
-            if rc != 0:
-                return rc
-            initialized.add((asr_endpoint, asr_bucket))
+        if asr_endpoint == endpoint:
+            if (asr_endpoint, asr_bucket) not in initialized:
+                asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
+                rc = _ensure_private_bucket(
+                    client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
+                )
+                if rc != 0:
+                    return rc
+                initialized.add((asr_endpoint, asr_bucket))
+            if asr_bucket != main_bucket_on_endpoint:
+                rc = _ensure_secondary_lifecycle(
+                    client,
+                    bucket=asr_bucket,
+                    key_prefix=os.getenv("DALTON_ASR_STORAGE_KEY_PREFIX", ""),
+                    endpoint=asr_endpoint,
+                )
+                if rc != 0:
+                    return rc
 
     return 0
 
