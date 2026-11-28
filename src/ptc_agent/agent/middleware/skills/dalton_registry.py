@@ -282,6 +282,14 @@ def build_dalton_skill_definitions(
     """Build ``SkillDefinition`` entries for all Dalton skills from ``SKILL.md`` frontmatter."""
     definitions: dict[str, SkillDefinition] = {}
     for name, command, requires in _DALTON_SKILL_SPECS:
+        if (
+            DALTON_SKILL_CAPABILITY_MAP.get(name) is not None
+            and not (skills_dir / name / "SKILL.md").is_file()
+        ):
+            # The core release package strips Everflow-only skills
+            # (scripts/standalone/package_release.sh DENY_PATHS); a skill that
+            # needs a capability is simply absent there. Core skills still fail loud.
+            continue
         definitions[name] = SkillDefinition(
             name=name,
             description=read_skill_description(name, skills_dir=skills_dir),
