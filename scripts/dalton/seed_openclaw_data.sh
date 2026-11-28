@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Deploy Dalton-owned data-task scripts, skills, and helpers from
 # <repo>/scripts/dalton/data_assets/ into <repo>/var/dalton/openclaw-data/,
-# excluding credential filenames, ensuring state/a-share-volume-watch exists,
-# and creating state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python.
+# excluding credential filenames and ensuring state/a-share-volume-watch exists.
 #
 # Defaults to --dry-run (safe preview); pass --apply to execute.
 
@@ -20,7 +19,7 @@ Usage: scripts/dalton/seed_openclaw_data.sh [--dry-run | --apply] [--target <dir
 
 Options:
   --dry-run          Preview asset deployment without writing (default).
-  --apply            Install Dalton data assets and create the cos-venv python launcher.
+  --apply            Install Dalton data assets into the target directory.
   --target <dir>     Target Dalton data root directory (default: <repo>/var/dalton/openclaw-data).
   -h, --help         Show this help message.
 EOF
@@ -35,10 +34,6 @@ while [[ $# -gt 0 ]]; do
     --apply)
       MODE="apply"
       shift
-      ;;
-    --source)
-      echo "ERROR: --source sync from OpenClaw workspace has been removed; manage assets under scripts/dalton/data_assets/" >&2
-      exit 2
       ;;
     --target)
       if [[ $# -lt 2 ]]; then
@@ -107,7 +102,6 @@ is_credential_relpath() {
   return 1
 }
 
-LAUNCHER_REL="state/sentiment-dashboard/cos-venv/bin/python"
 ASSETS_DIR="${SCRIPT_DIR}/data_assets"
 EVERFLOW_ONLY_LIST="${ASSETS_DIR}/everflow_only.txt"
 ANTIGRAVITY_SERIES_MODULE_SRC="${REPO_ROOT}/src/dalton/llm/antigravity_series.py"
@@ -487,7 +481,6 @@ if [[ "${MODE}" == "dry-run" ]]; then
     echo "[seed_openclaw_data] DRY-RUN skip (core profile): ${ANTIGRAVITY_SERIES_MODULE_REL}"
   fi
   echo "[seed_openclaw_data] DRY-RUN ensure dir: ${TARGET_DIR}/state/a-share-volume-watch"
-  echo "[seed_openclaw_data] DRY-RUN launcher: ${TARGET_DIR}/${LAUNCHER_REL} executes /app/.venv/bin/python"
   exit 0
 fi
 
@@ -513,11 +506,9 @@ mkdir -p "${TARGET_DIR}"
 mkdir -p "${TARGET_DIR}/state/a-share-volume-watch"
 
 ASSET_TMP=""
-LAUNCHER_TMP=""
 SERIES_JSON_TMP=""
 cleanup_tmps() {
   [[ -z "${ASSET_TMP}" ]] || rm -f "${ASSET_TMP}"
-  [[ -z "${LAUNCHER_TMP}" ]] || rm -f "${LAUNCHER_TMP}"
   [[ -z "${SERIES_JSON_TMP}" ]] || rm -f "${SERIES_JSON_TMP}"
 }
 trap cleanup_tmps EXIT
@@ -590,14 +581,3 @@ PYEOF
   SERIES_JSON_TMP=""
   echo "[seed_openclaw_data] Exported catalog: ${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}"
 fi
-
-mkdir -p "$(dirname "${TARGET_DIR}/${LAUNCHER_REL}")"
-LAUNCHER_TMP="$(mktemp "${TARGET_DIR}/${LAUNCHER_REL}.XXXXXX")"
-cat > "${LAUNCHER_TMP}" <<'EOF'
-#!/bin/sh
-exec /app/.venv/bin/python "$@"
-EOF
-chmod 755 "${LAUNCHER_TMP}"
-mv -f "${LAUNCHER_TMP}" "${TARGET_DIR}/${LAUNCHER_REL}"
-LAUNCHER_TMP=""
-echo "[seed_openclaw_data] Created launcher: ${TARGET_DIR}/${LAUNCHER_REL} executes /app/.venv/bin/python"

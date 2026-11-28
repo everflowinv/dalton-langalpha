@@ -62,7 +62,6 @@ SCALAR_PREF_KEYS: tuple[str, ...] = (
     "dalton_audit_model",
     "dalton_language_model",
     "dalton_assist_model",
-    "dalton_extract_model",
 )
 
 LIST_PREF_KEYS: tuple[str, ...] = (

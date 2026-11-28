@@ -45,7 +45,6 @@ ALLOWED_SCRIPT_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "cron_expr",
     "timezone",
     "notify_enabled",
-    "cos_mode",
     "notify_storage_mode",
 )
 ALLOWED_SCRIPT_SNAPSHOT_FIELD_SET: frozenset[str] = frozenset(

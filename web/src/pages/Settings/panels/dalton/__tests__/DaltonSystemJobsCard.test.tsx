@@ -82,8 +82,6 @@ vi.mock('@/hooks/useLocale', () => ({
 
 vi.mock('@/pages/Settings/utils/daltonApi', () => ({
   fetchDaltonSystemJobs: async () => h.jobsResponse,
-  toggleDaltonSystemJob: (key: string, enabled: boolean) => h.toggleJob(key, enabled),
-  runDaltonSystemJobNow: (key: string) => h.runJob(key),
 }));
 
 vi.mock('react-i18next', () => ({

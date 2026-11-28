@@ -10,7 +10,6 @@ import argparse
 import html
 import json
 import math
-import os
 import re
 import sys
 import warnings
@@ -1496,31 +1495,13 @@ def self_test() -> dict[str, Any]:
     check("long_notes_passes_short", long_notes('<p class="note">短</p>', 100) == [])
     check("long_notes_strips_markup", long_notes('<p class="note"><b>短</b></p>', 3) == [])
 
-    # 上线通道
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        import kweb_cos_upload as _up
-        check("upload_module_imports", True)
-        check("upload_key_is_kweb", _up.KEY == "kweb.html",
-              "index.html 是 sentiment-dashboard 的站点根，不能被这个看板占用")
-        check("upload_public_url", str(getattr(_up, "PUBLIC_URL", "")).endswith("/kweb.html"))
-        check("upload_bucket_shared", _up.BUCKET == "everflow-1320643462")
-        check("upload_creds_from_keychain",
-              "put_bucket_website" not in Path(_up.__file__).read_text(encoding="utf-8"),
-              "不许改 bucket 的 IndexDocument，改了站点根就废了")
-        check("upload_no_inline_secret",
-              not re.search(r"Secret(Id|Key)\s*=\s*[\"']", Path(_up.__file__).read_text(encoding="utf-8")),
-              "凭据只能从 Keychain 读")
-    except Exception as exc:  # pragma: no cover
-        check("upload_module_imports", False, str(exc))
-
-    # deploy 默认拒绝带 warnings 的上传
+    # deploy 默认拒绝带 warnings 的发布
     check("deploy_blocks_on_warnings",
           "allow_warnings" in deploy.__code__.co_varnames,
-          "build 有 warnings 时默认不上传")
+          "build 有 warnings 时默认不推进")
     check("deploy_supports_no_upload",
           "no_upload" in deploy.__code__.co_varnames,
-          "deploy 支持 --no-upload，只生成页面并更新虚拟组合、不上传 COS")
+          "deploy 兼容 --no-upload 参数，只生成本地页面并更新虚拟组合")
 
     # 依赖
     try:
@@ -1528,11 +1509,6 @@ def self_test() -> dict[str, Any]:
         check("yfinance_import", True)
     except Exception as exc:  # pragma: no cover
         check("yfinance_import", False, str(exc))
-    try:
-        import qcloud_cos  # noqa: F401
-        check("qcloud_cos_import", True)
-    except Exception as exc:  # pragma: no cover
-        check("qcloud_cos_import", False, str(exc))
 
     # ── ETF 页
     try:
@@ -1705,68 +1681,31 @@ def self_test() -> dict[str, Any]:
 
 # ─────────────────────────── 上线 ───────────────────────────
 
-ENV_ALLOW_COS_UPLOAD = "DALTON_ALLOW_COS_UPLOAD"
-
-
-def _require_cos_upload_allowed() -> None:
-    if os.environ.get(ENV_ALLOW_COS_UPLOAD, "").strip() != "1":
-        raise RuntimeError(
-            "COS 上传已停用（看板统一在 Everflow 监控面板查看，不再上传 eve.lumos.space）；"
-            "请改用 `deploy --no-upload`。如需临时恢复上传请设置 DALTON_ALLOW_COS_UPLOAD=1。"
-        )
-
-
-def upload_html(path: Path) -> dict[str, Any]:
-    """[已停用] 传到 COS 的 kweb.html。未设 DALTON_ALLOW_COS_UPLOAD=1 时直接拒绝。"""
-    _require_cos_upload_allowed()
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import kweb_cos_upload
-
-    return kweb_cos_upload.upload(path)
-
-
 def deploy(
     output: Path,
     allow_warnings: bool = False,
-    no_upload: bool = False,
+    no_upload: bool = True,
 ) -> dict[str, Any]:
-    """先 build（含推进虚拟组合）；默认拒绝上传，传 no_upload=True 时只本地生成不上传。"""
-    if not no_upload:
-        _require_cos_upload_allowed()
+    """先 build（含推进虚拟组合），仅在本地生成页面（no_upload 为兼容空参数）。"""
+    _ = no_upload
     result = build(output, load_config(), update_portfolio=True)
     blockers = list(result.get("warnings", [])) + list(result.get("overlong_notes", []))
     if blockers and not allow_warnings:
         result["ok"] = False
         result["uploaded"] = False
-        result["upload_skipped"] = bool(no_upload)
-        result["error"] = (
-            "build 有 warnings，已跳过上传；确认无误后加 --allow-warnings。"
-            if no_upload
-            else "build 有 warnings，未上传。确认无误后加 --allow-warnings。"
-        )
-        return result
-    if no_upload:
-        result["upload"] = None
-        result["uploaded"] = False
         result["upload_skipped"] = True
-    else:
-        result["upload"] = upload_html(output)
-        result["uploaded"] = bool(result["upload"].get("ok"))
-        result["upload_skipped"] = False
-        result["ok"] = result["ok"] and result["uploaded"]
+        result["error"] = "build 有 warnings，已跳过发布；确认无误后加 --allow-warnings。"
+        return result
+    result["upload"] = None
+    result["uploaded"] = False
+    result["upload_skipped"] = True
     etf = result.get("etf_board")
     if etf is not None and not etf.get("ok"):
         errors = [str(e).strip() for e in etf.get("errors", []) if str(e).strip()]
         issue = "ETF 看板有取数问题：" + ("；".join(errors) if errors else "未知错误")
         result["etf_error"] = issue
         result["ok"] = False
-        if no_upload:
-            result["error"] = issue
-        elif result["uploaded"]:
-            result["error"] = "页面已上传，但" + issue
-        else:
-            upload_error = (result.get("upload") or {}).get("error", "上传失败")
-            result["error"] = f"上传失败：{upload_error}；另外{issue}"
+        result["error"] = issue
     return result
 
 
@@ -1794,12 +1733,6 @@ def main(argv: list[str] | None = None) -> int:
         "refresh-constituents", help="刷新 S&P 500 金融板块成分快照", parents=[common]
     )
     refresh_cmd.add_argument("--local", help="用本地保存的维基 HTML，不联网")
-    upload_cmd = sub.add_parser(
-        "upload",
-        help="[已停用] 传到 COS kweb.html（需 DALTON_ALLOW_COS_UPLOAD=1，默认拒绝）",
-        parents=[common],
-    )
-    upload_cmd.add_argument("--file", default=str(DEFAULT_OUTPUT))
     aum_cmd = sub.add_parser(
         "refresh-etf-aum", help="用新的 Bloomberg ETF 导出表更新 AUM 快照", parents=[common]
     )
@@ -1807,7 +1740,7 @@ def main(argv: list[str] | None = None) -> int:
     aum_cmd.add_argument("--as-of", required=True, help="导出表的数据日期 YYYY-MM-DD")
     deploy_cmd = sub.add_parser(
         "deploy",
-        help="build（含更新虚拟组合）；请传 --no-upload（未传且未设 DALTON_ALLOW_COS_UPLOAD=1 时拒绝）",
+        help="build（含更新虚拟组合）",
         parents=[common],
     )
     deploy_cmd.add_argument("--output", default=str(DEFAULT_OUTPUT))
@@ -1819,7 +1752,7 @@ def main(argv: list[str] | None = None) -> int:
     deploy_cmd.add_argument(
         "--no-upload",
         action="store_true",
-        help="只做 build(update_portfolio=True)，不上传腾讯云 COS",
+        help="兼容保留参数（deploy 默认仅本地生成页面）",
     )
 
     args = parser.parse_args(argv)
@@ -1834,8 +1767,6 @@ def main(argv: list[str] | None = None) -> int:
 
             local = Path(args.local).expanduser() if args.local else None
             result = refresh_constituents.refresh(local)
-        elif args.command == "upload":
-            result = upload_html(Path(args.file).expanduser())
         elif args.command == "refresh-etf-aum":
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import kweb_etf_board
@@ -1847,7 +1778,7 @@ def main(argv: list[str] | None = None) -> int:
             result = deploy(
                 Path(args.output).expanduser(),
                 allow_warnings=getattr(args, "allow_warnings", False),
-                no_upload=getattr(args, "no_upload", False),
+                no_upload=True,
             )
         else:
             result = build(Path(args.output).expanduser(), load_config())
@@ -1867,8 +1798,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"self-test {result['passed']}/{result['total']}")
         for item in result["failed"]:
             print(f"  FAIL {item['name']}: {item['detail']}")
-    elif args.command == "upload":
-        print(f"上传 {result['key']}（{result['bytes']} 字节）→ {result['public_url']}")
     elif args.command == "refresh-constituents":
         print(f"{result['members']} 只成分、{result['sub_industries']} 个子行业 "
               f"（{result['as_of']}）→ {result['output']}")
@@ -1882,18 +1811,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"生成 {result['output']}（{result['bytes']} 字节）")
         for warn in result["warnings"]:
             print(f"  warning: {warn}")
-        if result.get("uploaded"):
-            print(f"上传 {result['upload']['key']} → {result['upload']['public_url']}")
-            if result.get("error"):
-                print(f"  {result['error']}")
-        elif result.get("upload_skipped"):
-            print("  已跳过上传（--no-upload）")
-            if result.get("etf_error"):
-                print(f"  {result['etf_error']}")
-            if result.get("error"):
-                print(f"  {result['error']}")
-        else:
-            print(f"  未上传：{result.get('error', '')}")
+        if result.get("etf_error"):
+            print(f"  {result['etf_error']}")
+        if result.get("error"):
+            print(f"  {result['error']}")
     else:
         print(f"生成 {result['output']}（{result['bytes']} 字节，{result['pairs']} 个标的）")
         for warn in result["warnings"]:

@@ -56,7 +56,7 @@ _AGENT_LOCK_COLUMNS = """
 
 _SCRIPT_LOCK_COLUMNS = """
     job_key, title, cron_expr, timezone, enabled, paused_by_user,
-    notify_enabled, notify_routes, notify_storage_mode, cos_mode,
+    notify_enabled, notify_routes, notify_storage_mode,
     config_version, active_version, audit_history, updated_by, updated_at,
     migration_state, deleted_at, deleted_by, pre_delete_enabled
 """

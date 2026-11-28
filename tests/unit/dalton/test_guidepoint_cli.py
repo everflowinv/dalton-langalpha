@@ -139,15 +139,10 @@ def test_guidepoint_proxy_and_oauth_path_resolution_and_compat(
     for mod in (proxy_mod, oauth_mod):
         monkeypatch.delenv("GUIDEPOINT_TOKENS_FILE", raising=False)
         monkeypatch.delenv("DALTON_RESEARCH_HOME", raising=False)
-        monkeypatch.delenv("DALTON_OCW_ROOT", raising=False)
         default_path = mod.resolve_token_store()
         assert default_path == (
             Path.home() / "Library" / "Application Support" / "Everflow" / "research" / "config" / "guidepoint_mcp_tokens.json"
         ).resolve()
-
-        ocw_dir = tmp_path / "ocw"
-        monkeypatch.setenv("DALTON_OCW_ROOT", str(ocw_dir))
-        assert mod.resolve_token_store() == (ocw_dir / "config" / "guidepoint_mcp_tokens.json").resolve()
 
         research_dir = tmp_path / "dalton_research"
         monkeypatch.setenv("DALTON_RESEARCH_HOME", str(research_dir))
@@ -269,25 +264,3 @@ def test_guidepoint_proxy_run_sh_resolves_env_and_python_override(tmp_path: Path
     assert res.returncode == 0, res.stderr
     assert f"script={RESEARCH_SCRIPTS / 'guidepoint_mcp_proxy.py'}" in res.stdout
     assert "has_id=1 has_sec=1" in res.stdout
-
-    # Legacy compat: DALTON_OCW_ROOT without DALTON_RESEARCH_HOME
-    ocw_root = tmp_path / "ocw_root"
-    (ocw_root / "config").mkdir(parents=True)
-    (ocw_root / "config" / "guidepoint_mcp.env").write_text(
-        "GUIDEPOINT_CLIENT_ID=cid_ocw\nGUIDEPOINT_CLIENT_SECRET=csec_ocw\n",
-        encoding="utf-8",
-    )
-    res_ocw = subprocess.run(
-        ["/bin/bash", str(run_sh)],
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(tmp_path),
-            "DALTON_OCW_ROOT": str(ocw_root),
-            "GUIDEPOINT_PYTHON": str(stub_py),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_ocw.returncode == 0, res_ocw.stderr
-    assert "has_id=1 has_sec=1" in res_ocw.stdout

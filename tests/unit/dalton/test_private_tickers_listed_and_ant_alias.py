@@ -6,7 +6,7 @@ import importlib.util
 from pathlib import Path
 from typing import Any
 
-from src.dalton.conversations import extractor
+from src.dalton.coverage.aliases import SUPPLEMENTAL_TICKER_ALIASES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -20,39 +20,12 @@ def _load_module(name: str, rel_path: str) -> Any:
     return mod
 
 
-def test_extractor_does_not_treat_spacex_spcx_or_anthropic_ant_as_private() -> None:
-    """SPCX / SpaceX and ANT / Anthropic must not be hardcoded in PRIVATE_COMPANIES."""
-    for sym in ("SPCX", "SPACEX", "ANT", "ANTHROPIC"):
-        assert sym not in extractor.PRIVATE_COMPANIES
-        assert not extractor._is_private_company_ticker(sym, alias_map=extractor.SUPPLEMENTAL_TICKER_ALIASES)
-
-    tickers, entities = extractor.normalize_tickers_and_entities(
-        ["SPCX", "ANT", "OPENAI"],
-        [],
-        alias_map=extractor.SUPPLEMENTAL_TICKER_ALIASES,
-    )
-    assert "SPCX" in tickers
-    assert "ANT" in tickers
-    assert "OPENAI" not in tickers
-    assert any(e.upper() == "OPENAI" for e in entities)
-
-
-def test_anthropic_to_ant_alias_mapping_resolves_company_name_to_ticker() -> None:
+def test_anthropic_to_ant_alias_mapping_exists() -> None:
     """SUPPLEMENTAL_TICKER_ALIASES must map ANT <-> Anthropic (matching SPCX <-> SpaceX)."""
-    assert "ANT" in extractor.SUPPLEMENTAL_TICKER_ALIASES
-    assert "Anthropic" in extractor.SUPPLEMENTAL_TICKER_ALIASES["ANT"]
-    assert "SPCX" in extractor.SUPPLEMENTAL_TICKER_ALIASES
-    assert "SpaceX" in extractor.SUPPLEMENTAL_TICKER_ALIASES["SPCX"]
-
-    # Company name -> ticker backfill in extractor resolves Anthropic -> ANT
-    backfilled, added = extractor.backfill_tickers_from_quote(
-        [],
-        "Anthropic 发布了新的企业级 Claude 合同，年化收入大幅增长。",
-        claim="Anthropic 企业合同推动收入增长。",
-        alias_map=extractor.SUPPLEMENTAL_TICKER_ALIASES,
-    )
-    assert added >= 1
-    assert "ANT" in backfilled
+    assert "ANT" in SUPPLEMENTAL_TICKER_ALIASES
+    assert "Anthropic" in SUPPLEMENTAL_TICKER_ALIASES["ANT"]
+    assert "SPCX" in SUPPLEMENTAL_TICKER_ALIASES
+    assert "SpaceX" in SUPPLEMENTAL_TICKER_ALIASES["SPCX"]
 
 
 def test_move_quant_allows_spcx_and_ant_as_listed_us_tickers() -> None:
@@ -186,44 +159,6 @@ def test_richard_coverage_weekly_screen_movers_does_not_mark_anthropic_private()
     assert "Anthropic" not in rcw.PRIVATE_ROWS
     assert "Anthropic" in rcw.TICKERS
     assert rcw.TICKERS["Anthropic"][0] == "ANT"
-
-
-def test_extractor_normalizes_anthropic_company_name_in_tickers_to_only_ant() -> None:
-    """When the LLM puts 'Anthropic' directly into tickers, normalization + validation + backfill
-    must collapse it to 'ANT' and never keep 'ANTHROPIC' alongside 'ANT'."""
-    alias_map = extractor.SUPPLEMENTAL_TICKER_ALIASES
-    norm_tickers, _entities = extractor.normalize_tickers_and_entities(
-        ["Anthropic"],
-        [],
-        alias_map=alias_map,
-    )
-    assert norm_tickers == ["ANT"]
-
-    norm_dedup, _ = extractor.normalize_tickers_and_entities(
-        ["Anthropic", "ANT"],
-        [],
-        alias_map=alias_map,
-    )
-    assert norm_dedup == ["ANT"]
-
-    quote = "Anthropic 发布了新一代企业级 Claude 模型，推动年化经常性收入高速增长。"
-    kept, dropped = extractor.validate_tickers_against_quote(
-        ["Anthropic"],
-        quote,
-        claim="Anthropic 新产品带动收入增长。",
-        alias_map=alias_map,
-    )
-    assert dropped == 0
-    assert kept == ["ANT"]
-
-    final_tickers, added = extractor.backfill_tickers_from_quote(
-        kept,
-        quote,
-        claim="Anthropic 新产品带动收入增长。",
-        alias_map=alias_map,
-    )
-    assert added == 0
-    assert final_tickers == ["ANT"]
 
 
 def test_ai_app_weekly_monitor_universe_moves_anthropic_from_private_watchlist_to_listed_ant() -> None:

@@ -316,7 +316,6 @@
   "fieldDelivery": "Delivery",
   "fieldEnabled": "Enabled",
   "fieldPaused": "Paused",
-  "fieldCosMode": "Execution mode",
   "fieldNotifyStorage": "Notification channel storage",
   "fieldStatus": "Status",
   "deliveryRetryingVia": "Delivering to {{method}}",

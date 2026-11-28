@@ -393,10 +393,7 @@ export interface DaltonSystemJobItem {
   can_toggle: boolean;
   can_run_now: boolean;
   config?: {
-    extractor_model?: string;
     model?: string;
-    prompt_version?: string;
-    extract_concurrency?: number;
     concurrency?: number;
   };
   exit_code?: number | null;
@@ -450,27 +447,6 @@ export interface DaltonSystemJobRunResponse {
 
 export async function fetchDaltonSystemJobs(): Promise<DaltonSystemJobsResponse> {
   const { data } = await api.get<DaltonSystemJobsResponse>('/api/v1/dalton/system-jobs');
-  return data;
-}
-
-export async function toggleDaltonSystemJob(
-  key: string,
-  enabled: boolean,
-): Promise<DaltonSystemJobToggleResponse> {
-  const { data } = await api.post<DaltonSystemJobToggleResponse>(
-    `/api/v1/dalton/system-jobs/${encodeURIComponent(key)}`,
-    { enabled },
-  );
-  return data;
-}
-
-export async function runDaltonSystemJobNow(
-  key: string,
-): Promise<DaltonSystemJobRunResponse> {
-  const { data } = await api.post<DaltonSystemJobRunResponse>(
-    `/api/v1/dalton/system-jobs/${encodeURIComponent(key)}/run`,
-    {},
-  );
   return data;
 }
 
@@ -607,19 +583,6 @@ export async function sendDaltonNotifyTest(target: string): Promise<DaltonNotify
   const { data } = await api.post<DaltonNotifyTestResponse>(
     '/api/v1/dalton/notify/test',
     { target },
-  );
-  return data;
-}
-
-export interface DaltonFeishuBotResponse {
-  ok: boolean;
-  app_name: string | null;
-}
-
-/** The chat-sending Feishu bot's display name (null when unavailable; falls back to generic copy). */
-export async function fetchDaltonFeishuBotName(): Promise<DaltonFeishuBotResponse> {
-  const { data } = await api.get<DaltonFeishuBotResponse>(
-    '/api/v1/dalton/notify/feishu-bot',
   );
   return data;
 }
@@ -954,17 +917,6 @@ export interface DaltonWeixinAdminConfigUpdateResponse {
 export async function fetchDaltonChannelBindings(): Promise<DaltonChannelBindingsResponse> {
   const { data } = await api.get<DaltonChannelBindingsResponse>(
     '/api/v1/dalton/channels/bindings',
-  );
-  return data;
-}
-
-export async function updateDaltonChannelSettings(payload: {
-  version: string;
-  settings: Record<string, unknown>;
-}): Promise<DaltonChannelSettingsUpdateResponse> {
-  const { data } = await api.put<DaltonChannelSettingsUpdateResponse>(
-    '/api/v1/dalton/channels/settings',
-    payload,
   );
   return data;
 }

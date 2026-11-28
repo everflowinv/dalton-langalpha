@@ -264,7 +264,6 @@ def test_batch4_manifest_matches_openclaw_schedule() -> None:
         assert entry.enabled is False
         assert entry.notify_enabled is False
         assert entry.title == expected["job_key"]
-        assert entry.cos_mode == "skip"
         assert resolve_task_payload_source(str(expected["job_key"])) == expected["payload_source"]
         assert resolve_task_payload_source(code) == expected["payload_source"]
 

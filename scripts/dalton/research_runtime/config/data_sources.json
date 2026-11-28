@@ -302,24 +302,6 @@
       "source_version": "3.27.2-argon-20261013"
     },
     {
-      "id": "agent-reach",
-      "category": "community",
-      "title": "按需读取跨平台工具用法",
-      "source": "agent-reach / 已安装的各平台客户端",
-      "kind": "skill",
-      "skill": "skills/agent-reach/SKILL.md",
-      "operations": [],
-      "tool": null,
-      "rules": [
-        "这是按需交接入口，尚未封装平台执行器；读取 skill 后调用原客户端，executed=false 不代表已经取数。",
-        "YouTube/B站字幕、GitHub单页、公众号、RSS及其他平台按需查原说明；先用 agent-reach doctor 确认可用渠道。",
-        "本机 AGENTS 的来源规则优先：X走xreach+x_search；雪球走独立适配；Reddit未覆盖；Exa已退役。",
-        "公开网页仍按web_fetch、Firecrawl回退；保留现有认证，不自动读取浏览器cookie、配置新服务或发帖。",
-        "本机1.5.0；上游1.6.0重构CLI和浏览器/登录管理，尚未迁移。沿用本机已验证命令，不直接套用1.6命令或自动初始化浏览器。"
-      ],
-      "health": "not_probed"
-    },
-    {
       "id": "x-timeline",
       "category": "community",
       "title": "X固定账号、帖子与主题底表",

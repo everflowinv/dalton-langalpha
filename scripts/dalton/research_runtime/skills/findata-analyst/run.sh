@@ -6,12 +6,8 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REQ_FILE="${SKILL_DIR}/requirements.txt"
 SCRIPT_FILE="${SKILL_DIR}/scripts/findata_cli.py"
 
-if [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_CODE:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]]; then
-    VENV_DIR="${DALTON_OCW_ROOT}/skills/findata-analyst/venv"
-else
-    RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-    VENV_DIR="${RESEARCH_HOME}/venvs/findata-analyst"
-fi
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+VENV_DIR="${RESEARCH_HOME}/venvs/findata-analyst"
 
 _find_pinned_python() {
     local ver="$1"

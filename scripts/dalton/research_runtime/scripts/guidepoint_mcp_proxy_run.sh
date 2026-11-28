@@ -5,8 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -n "${DALTON_RESEARCH_HOME:-}" ]]; then
   RESEARCH_HOME="$DALTON_RESEARCH_HOME"
-elif [[ -n "${DALTON_OCW_ROOT:-}" ]]; then
-  RESEARCH_HOME="$DALTON_OCW_ROOT"
 else
   RESEARCH_HOME="$HOME/Library/Application Support/Everflow/research"
 fi

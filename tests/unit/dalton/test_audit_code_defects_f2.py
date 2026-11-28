@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from src.dalton.conversations.extractor import enforce_speaker_and_agent_citation
 from src.dalton.conversations.render import render_conversation_digest_md
 from src.dalton.database.conversations import build_card_search_text
 from src.dalton.knowledge.render import render_verdicts_md
@@ -642,99 +641,6 @@ def test_card_conflict_names_recovery_and_has_no_delete_entry() -> None:
 # ── 6. 转写说话人与上传者 ───────────────────────────────────────────
 
 
-def _owner_event(text: str) -> dict[str, Any]:
-    return {
-        "text": text,
-        "speaker": {
-            "name": "Ever",
-            "role": "owner",
-            "is_owner": True,
-            "sender_id_hash": "owner-1",
-        },
-    }
-
-
-def test_transcript_separates_viewpoint_author_from_uploader() -> None:
-    text = "转写：\nAlice: 我们看好云资本开支。\nBob: 我不同意。\n"
-    speaker, eff_type, _sources = enforce_speaker_and_agent_citation(
-        "opinion",
-        [],
-        _owner_event(text),
-        quote="我们看好云资本开支。",
-    )
-    assert eff_type == "opinion"
-    assert speaker["name"] == "Alice"
-    assert speaker["role"] == "participant"
-    assert speaker["is_owner"] is False
-    assert speaker["material"] is True
-    assert speaker["uploaded_by"]["name"] == "Ever"
-    assert speaker["uploaded_by"]["role"] == "owner"
-
-    both, _, _ = enforce_speaker_and_agent_citation(
-        "opinion",
-        [],
-        _owner_event(text),
-        quote="我们看好云资本开支。\nBob: 我不同意。",
-    )
-    assert both["name"] == "未识别"
-    assert both["uploaded_by"]["name"] == "Ever"
-
-    ordinary, _, _ = enforce_speaker_and_agent_citation(
-        "opinion",
-        [],
-        _owner_event("结论：维持覆盖。"),
-        quote="维持覆盖。",
-    )
-    assert ordinary["name"] == "Ever"
-    assert ordinary["role"] == "owner"
-    assert "uploaded_by" not in ordinary
-
-    agent, agent_type, _ = enforce_speaker_and_agent_citation(
-        "opinion",
-        [],
-        {"message_role": "assistant", "text": text},
-        quote="我们看好云资本开支。",
-    )
-    assert agent["role"] == "agent"
-    assert "uploaded_by" not in agent
-    assert agent_type == "opinion"
-
-
-def test_headings_minutes_mention_and_bold_view_keep_the_sender() -> None:
-    """小标题、只提到纪要、Markdown 强调的观点，作者仍是发送者。"""
-    cases = (
-        "收入：增长。利润：改善。",
-        "收入：增长。\n利润：改善。\n",
-        "看了下专家纪要，认为公司会加快资本开支。",
-        "**观点**：维持覆盖。",
-    )
-    for text in cases:
-        speaker, _, _ = enforce_speaker_and_agent_citation(
-            "opinion",
-            [],
-            _owner_event(text),
-            quote="维持覆盖。" if "观点" in text else text[:8],
-        )
-        assert speaker["name"] == "Ever", text
-        assert speaker["role"] == "owner", text
-        assert "uploaded_by" not in speaker, text
-
-
-def test_attachment_without_speakers_keeps_sender_and_records_uploader() -> None:
-    event = _owner_event("请看附件。")
-    event["files"] = [{"name": "memo.pdf"}]
-    speaker, _, _ = enforce_speaker_and_agent_citation(
-        "opinion",
-        [],
-        event,
-        quote="请看附件。",
-    )
-    assert speaker["name"] == "Ever"
-    assert speaker["role"] == "owner"
-    assert speaker["uploaded_by"]["name"] == "Ever"
-    assert "material" not in speaker
-
-
 def test_search_and_digest_show_uploader_and_author() -> None:
     card = {
         "card_id": "c1",
@@ -824,22 +730,6 @@ async def test_conversation_search_annotates_uploader(monkeypatch: pytest.Monkey
     assert found["attribution"]["uploaded_by"]["name"] == "Ever"
 
 
-def test_heading_labels_and_repeated_label_are_not_a_transcript() -> None:
-    from src.dalton.conversations.extractor import _body_is_multi_speaker_transcript
-
-    assert not _body_is_multi_speaker_transcript("看了专家纪要\n公司：增长\n产品：改善")
-    assert not _body_is_multi_speaker_transcript("专家纪要\n张总：第一点\n张总：第二点")
-    assert _body_is_multi_speaker_transcript("专家纪要\n张总：需求在改善\n李经理：价格还在跌")
-
-
-def test_quote_said_by_two_speakers_has_no_single_author() -> None:
-    from src.dalton.conversations.extractor import _viewpoint_author
-
-    body = "会议纪要\nAlice: 同意。\nBob: 同意。"
-    assert _viewpoint_author(body, "同意。") == "未识别"
-    assert _viewpoint_author("会议纪要\nAlice: 需求改善。\nBob: 价格下跌。", "价格下跌。") == "Bob"
-
-
 def test_card_create_never_replaces_an_existing_file(tmp_path: Any) -> None:
     io = _card_io()
     target = tmp_path / "card.json"
@@ -847,16 +737,3 @@ def test_card_create_never_replaces_an_existing_file(tmp_path: Any) -> None:
     assert io.write_bytes_new(target, b"second") is False
     assert target.read_bytes() == b"first"
     assert [p.name for p in tmp_path.iterdir()] == ["card.json"]
-
-
-def test_material_marker_words_are_never_speakers() -> None:
-    from src.dalton.conversations.extractor import _body_is_multi_speaker_transcript
-
-    assert not _body_is_multi_speaker_transcript("转发：老板的邮件。\n张三：明天开会。")
-
-
-def test_quote_matching_two_speakers_up_to_whitespace_has_no_single_author() -> None:
-    from src.dalton.conversations.extractor import _viewpoint_author
-
-    body = "会议纪要\nAlice: demand  improved.\nBob: demand improved."
-    assert _viewpoint_author(body, "demand improved.") == "未识别"

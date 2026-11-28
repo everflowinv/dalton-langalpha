@@ -192,9 +192,6 @@ def discover(job,store):
             (store.root/'temp/alphaengine-mcp-downloads').resolve(),
             (store.code_root/'temp/alphaengine-mcp-downloads').resolve(),
         ]
-        raw_ocw=os.environ.get('DALTON_OCW_ROOT','').strip()
-        if raw_ocw:
-            allowed_dl_dirs.append((Path(raw_ocw).expanduser()/'temp/alphaengine-mcp-downloads').resolve())
         if not any(path.is_relative_to(d) for d in allowed_dl_dirs):
             raise ValueError('unexpected_download_path')
         # Preserve original HTML/PDF as received, separately from image assets.

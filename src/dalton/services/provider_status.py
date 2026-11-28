@@ -87,10 +87,6 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
     for rev_m in settings.publish.reviewer_models:
         roles.append({"role": "reviewer_candidate", "model": str(rev_m)})
 
-    extractor_m = str(settings.conversations.extractor_model or "").strip()
-    if extractor_m:
-        roles.append({"role": "conversations.extractor_model", "model": extractor_m})
-
     return roles
 
 

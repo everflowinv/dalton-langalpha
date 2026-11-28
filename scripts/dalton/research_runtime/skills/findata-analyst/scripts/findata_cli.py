@@ -46,10 +46,6 @@ pd.set_option("display.width", 2000)
 # ---------------------------------------------------------------------------
 def _resolve_cache_dir() -> Path:
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
-    raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    if raw_ocw and not raw_home and not raw_code:
-        return Path(__file__).resolve().parent / ".cache"
     home_root = (
         Path(raw_home).expanduser().resolve()
         if raw_home

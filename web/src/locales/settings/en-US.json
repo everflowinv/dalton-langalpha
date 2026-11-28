@@ -276,9 +276,7 @@
     "daltonAssistFallbackModelsDesc": "Tried in order when the main lightweight model fails or times out.",
     "daltonReviewerModels": "Independent reviewer candidates",
     "daltonReviewerModelsDesc": "Ordered candidate list; selects the first available model from a different family than the drafting model.",
-    "daltonExtractModel": "Research memory extraction model",
-    "daltonExtractModelDesc": "Extracts key findings and team research memory when archiving conversations.",
-    "daltonRoutingDesc": "Models used for automated monitoring checks, pre-publish verification, and research memory extraction. Leave blank to inherit team defaults.",
+    "daltonRoutingDesc": "Models used for automated monitoring checks and pre-publish verification. Leave blank to inherit team defaults.",
     "daltonAuditTimeoutError": "Enter an integer between 60 and 1800 seconds (1–30 minutes)",
     "expandGroup": "Expand",
     "collapseGroup": "Collapse"

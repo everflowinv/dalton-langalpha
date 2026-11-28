@@ -166,7 +166,6 @@ class ClaimedTaskRun:
     timeout_seconds: int | None
     no_output_timeout_seconds: int | None
     required_secrets: list[str]
-    cos_mode: str
     notify_enabled: bool
     scheduled_slot_utc: datetime
     deadline_utc: datetime
@@ -767,7 +766,6 @@ async def claim_next_queued_run(
                 d.timeout_seconds,
                 d.no_output_timeout_seconds,
                 d.required_secrets,
-                d.cos_mode,
                 d.notify_enabled,
                 d.timezone,
                 d.deleted_at
@@ -1082,7 +1080,6 @@ async def claim_next_queued_run(
             timeout_seconds=cand.get("timeout_seconds"),
             no_output_timeout_seconds=cand.get("no_output_timeout_seconds"),
             required_secrets=[str(s) for s in raw_secrets],
-            cos_mode=str(cand.get("cos_mode") or "skip"),
             notify_enabled=bool(cand.get("notify_enabled")),
             scheduled_slot_utc=cand["scheduled_slot_utc"],
             deadline_utc=cand["deadline_utc"],
@@ -1135,7 +1132,6 @@ async def start_claimed_container_run(
         timeout_seconds=claimed.timeout_seconds,
         no_output_timeout_seconds=claimed.no_output_timeout_seconds,
         notify_enabled=effective_notify_enabled,
-        cos_mode=claimed.cos_mode,
         path_map=paths,
     )
 

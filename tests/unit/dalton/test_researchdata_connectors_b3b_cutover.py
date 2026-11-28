@@ -4,7 +4,7 @@ Covers:
 - `scripts/dalton/ops/prod/preflight.py` (`--stage-a`, `--switch`, `--report-json`,
   `validate_timing_budgets_env`)
 - LaunchAgent templates & renderers (`com.dalton.research-host`, `guidepoint-mcp-proxy`,
-  `researchdata-bridge`) and `research_runtime_migrate.sh` `--check-runtime` env
+  `researchdata-bridge`)
 - `scripts/dalton/ops/prod/wait_backend_idle.sh` (legacy no-arg + maintenance mode)
 - `scripts/dalton/ops/prod/_research_host_handoff_lib.sh` (`.ops.lock`, `recovery-bin/`,
   `rh_journal_set`, `rh_require_change_allowed`, `rh_require_no_incomplete_journal`)
@@ -44,7 +44,6 @@ WAIT_IDLE_SH = PROD_OPS / "wait_backend_idle.sh"
 HANDOFF_LIB_SH = PROD_OPS / "_research_host_handoff_lib.sh"
 SWITCH_SH = PROD_OPS / "switch_research_host.sh"
 INSTALL_BRIDGE_SH = SCRIPTS_DALTON / "install_bridge.sh"
-MIGRATE_SH = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
 HOST_SERVICES_SWITCH_SH = SCRIPTS_DALTON / "ops" / "host_services_switch.sh"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
@@ -1135,14 +1134,6 @@ def test_render_bridge_plist_fails_when_repo_venv_python_missing(tmp_path: Path)
             home_dir=home,
             logs_dir=base / "logs",
         )
-
-
-def test_research_runtime_migrate_check_runtime_matches_bridge_plist_env() -> None:
-    text = MIGRATE_SH.read_text(encoding="utf-8")
-    assert 'local bridge_py="${REPO_ROOT}/.venv/bin/python"' in text
-    assert 'PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}"' in text
-    assert 'DALTON_REPO_ENV_FILE="${repo_env_file}"' in text
-    assert '"${bridge_py}" "${REPO_ROOT}/scripts/dalton/researchdata_bridge.py" --check-runtime' in text
 
 
 # ---------------------------------------------------------------------------
@@ -3028,11 +3019,6 @@ def test_install_bridge_propagates_repo_env_and_ownership_and_fails_before_write
     assert ev["DALTON_BRIDGE_ENV_FILE"] == str(custom_bridge_env)
     assert "DALTON_BRIDGE_TOKEN=" in custom_repo_env.read_text(encoding="utf-8")
 
-    # 3. Verify research_runtime_migrate.sh forwards the same overrides to install_bridge.sh
-    mig_text = MIGRATE_SH.read_text(encoding="utf-8")
-    assert 'DALTON_REPO_ENV_FILE="${repo_env_file}"' in mig_text
-    assert 'DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}"' in mig_text
-
 
 # ---------------------------------------------------------------------------
 # r3: Codex High (1-5), Medium (1-4), and B-class confirmed regression tests
@@ -4265,7 +4251,6 @@ def test_legacy_proxy_launcher_vars_env_file_tokens_reject_undefined_and_stage_b
         HANDOFF_LIB_SH,
         SWITCH_SH,
         HOST_SERVICES_SWITCH_SH,
-        MIGRATE_SH,
         INSTALL_BRIDGE_SH,
     ],
 )

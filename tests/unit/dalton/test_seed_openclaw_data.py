@@ -41,33 +41,6 @@ def _seed_env() -> dict[str, str]:
 
 
 class SeedOpenClawDataTests(unittest.TestCase):
-    def test_python_launcher_replaces_link_without_changing_interpreter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "target"
-            interpreter = root / "interpreter"
-            interpreter.write_text("preserve existing interpreter\n")
-            launcher = target / "state/sentiment-dashboard/cos-venv/bin/python"
-            launcher.parent.mkdir(parents=True)
-            launcher.symlink_to(interpreter)
-            _write_preflight_config(target)
-
-            for _ in range(2):
-                result = subprocess.run(
-                    ["bash", str(SCRIPT), "--apply", "--target", str(target)],
-                    env=_seed_env(),
-                    capture_output=True, text=True, check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse(launcher.is_symlink())
-                self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
-                self.assertEqual(
-                    launcher.read_text(), '#!/bin/sh\nexec /app/.venv/bin/python "$@"\n'
-                )
-                self.assertEqual(interpreter.read_text(), "preserve existing interpreter\n")
-                self.assertEqual(list(launcher.parent.glob("python.*")), [])
-                self.assertTrue((target / "state/a-share-volume-watch").is_dir())
-
     def test_preview_preserves_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -79,16 +52,6 @@ class SeedOpenClawDataTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Mode: DRY-RUN", result.stdout)
             self.assertFalse(target.exists())
-
-    def test_legacy_source_flag_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            result = subprocess.run(
-                ["bash", str(SCRIPT), "--dry-run", "--source", str(root), "--target", str(root / "target")],
-                capture_output=True, text=True, check=False,
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("--source sync from OpenClaw workspace has been removed", result.stderr)
 
     def test_applies_digest_and_kweb_data_assets_to_target(self):
         with tempfile.TemporaryDirectory() as directory:

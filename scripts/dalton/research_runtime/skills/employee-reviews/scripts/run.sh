@@ -4,12 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-if [[ -n "${DALTON_OCW_ROOT:-}" && -z "${DALTON_RESEARCH_CODE:-}" && -z "${DALTON_RESEARCH_HOME:-}" ]]; then
-    VENV_DIR="${DALTON_OCW_ROOT}/skills/employee-reviews/venv"
-else
-    RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-    VENV_DIR="${RESEARCH_HOME}/venvs/employee-reviews"
-fi
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+VENV_DIR="${RESEARCH_HOME}/venvs/employee-reviews"
 REQ_FILE="${SCRIPT_DIR}/requirements.txt"
 REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 SCRIPT_FILE="${SCRIPT_DIR}/employee_reviews_cli.py"

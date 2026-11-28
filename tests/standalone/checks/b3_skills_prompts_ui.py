@@ -811,7 +811,6 @@ def _check_frontend_capability_gating(dist_root: Path) -> None:
     )
     for gated in (
         "daltonHomeTeamMemory",
-        "daltonExtractModel",
         "daltonNotifyTargets",
         "daltonChannelBindings",
         "daltonWeixinBind",

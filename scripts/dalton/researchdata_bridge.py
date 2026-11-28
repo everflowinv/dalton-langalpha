@@ -28063,51 +28063,40 @@ def _probe_launchd_label_loaded(
 
 
 def _check_host_services_status() -> dict[str, Any]:
-    """Check host research services (8950/8943 TCP reachability and new vs old launchd labels)."""
+    """Check host research services (8950/8943 TCP reachability and com.dalton.* launchd labels)."""
     ae_port = int(os.environ.get("ALPHAENGINE_MCP_PORT", "8950"))
     gp_port = int(os.environ.get("GUIDEPOINT_PROXY_PORT", "8943"))
 
-    specs: tuple[tuple[str, int | None, str, str], ...] = (
+    specs: tuple[tuple[str, int | None, str], ...] = (
         (
             "alphaengine_mcp",
             ae_port,
             "com.dalton.alphaengine-mcp",
-            "ai.openclaw.alphaengine-mcp",
         ),
         (
             "alphaengine_desktop_watchdog",
             None,
             "com.dalton.alphaengine-desktop-watchdog",
-            "ai.openclaw.alphaengine-desktop-watchdog",
         ),
         (
             "guidepoint_mcp_proxy",
             gp_port,
             "com.dalton.guidepoint-mcp-proxy",
-            "ai.openclaw.guidepoint-mcp-proxy",
         ),
     )
 
     out: dict[str, Any] = {}
-    for key, port, new_label, old_label in specs:
-        new_loaded = _probe_launchd_label_loaded(new_label)
-        old_loaded = _probe_launchd_label_loaded(old_label)
-        if new_loaded and old_loaded:
-            active_label = new_label
-            label_kind = "both"
-        elif new_loaded:
-            active_label = new_label
+    for key, port, label in specs:
+        loaded = _probe_launchd_label_loaded(label)
+        if loaded:
+            active_label = label
             label_kind = "new"
-        elif old_loaded:
-            active_label = old_label
-            label_kind = "old"
         else:
             active_label = "unknown"
             label_kind = "unknown"
 
         entry: dict[str, Any] = {
-            "new_label": new_label,
-            "old_label": old_label,
+            "new_label": label,
             "active_label": active_label,
             "label_kind": label_kind,
         }
@@ -28147,7 +28136,6 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         "scripts/xueqiu_posts.py",
         "scripts/feishu_send_card.py",
         "scripts/eve_tracking_mirror.py",
-        "skills/agent-reach/SKILL.md",
         "skills/13f-tracker/scripts/name_to_ticker.json",
         "skills/findata-analyst/run.sh",
         "skills/findata-analyst/scripts/findata_cli.py",

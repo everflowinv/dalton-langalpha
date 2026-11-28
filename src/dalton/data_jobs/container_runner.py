@@ -149,7 +149,6 @@ def build_container_create_config(
     timeout_seconds: int | None = None,
     no_output_timeout_seconds: int | None = None,
     notify_enabled: bool = False,
-    cos_mode: str = "skip",
     path_map: DataTaskPathMap | None = None,
     image: str = DEFAULT_TASK_CONTAINER_IMAGE,
     env_source: Mapping[str, str] | None = None,
@@ -183,8 +182,6 @@ def build_container_create_config(
         str(effective_timeout),
         "--notify-dry-run",
         notify_dry_run,
-        "--cos-mode",
-        str(cos_mode or "skip"),
     ]
     if no_output_timeout_seconds is not None:
         cmd.extend(["--no-output-timeout-seconds", str(int(no_output_timeout_seconds))])
@@ -204,7 +201,6 @@ def build_container_create_config(
         "DALTON_PYTHON_BIN": CONTAINER_PYTHON_BIN,
         "DALTON_NO_DIRECT_SEND": "1",
         "DALTON_NOTIFY_DRY_RUN": notify_dry_run,
-        "DALTON_COS_UPLOAD_MODE": str(cos_mode or "skip"),
         "DALTON_OUTBOX_FILE": paths.container_staging_outbox_file(),
         "DALTON_RUN_ID": run_id_str,
         "DALTON_JOB_KEY": str(job_key),

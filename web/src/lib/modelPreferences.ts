@@ -69,7 +69,6 @@ export interface ModelPreferences extends AccountTuning {
   dalton_assist_model?: string | null;
   dalton_assist_fallback_models?: string[] | null;
   dalton_reviewer_models?: string[] | null;
-  dalton_extract_model?: string | null;
   dalton_notify_enabled?: boolean | null;
   dalton_notify_targets?: string[] | null;
   dalton_notify_overrides?: Record<string, boolean> | null;
@@ -115,7 +114,6 @@ export const DaltonModelPrefsSchema = z.object({
   dalton_assist_model: daltonStrOrNull,
   dalton_assist_fallback_models: daltonStrListOrNull,
   dalton_reviewer_models: daltonStrListOrNull,
-  dalton_extract_model: daltonStrOrNull,
   dalton_notify_enabled: daltonBoolOrNull,
   dalton_notify_targets: daltonStrListOrNull,
   dalton_notify_overrides: daltonBoolMapOrNull,
@@ -176,7 +174,6 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'dalton_assist_model',
   'dalton_assist_fallback_models',
   'dalton_reviewer_models',
-  'dalton_extract_model',
   'dalton_notify_enabled',
   'dalton_notify_targets',
   'dalton_notify_overrides',

@@ -10,7 +10,6 @@ backend embedding calls while preserving production vector parity:
 - Locks active provider/model/dimensions in ``dalton_embedding_metadata``
   (migration ``d052``) and supports both Everflow 3072-d and Standalone Core
   1536-d pgvector ``halfvec`` HNSW indexes.
-- Supports emergency rollback via ``DALTON_EMBED_VIA_BRIDGE=true``.
 """
 
 from src.dalton.embeddings.client import (
@@ -43,7 +42,6 @@ from src.dalton.embeddings.config import (
     SUPPORTED_GEMINI_TASK_TYPES,
     EmbeddingConfig,
     EmbeddingConfigError,
-    is_embed_via_bridge_enabled,
     resolve_api_model_name,
     resolve_embedding_api_key,
     resolve_embedding_config,
@@ -106,7 +104,6 @@ __all__ = [
     "embed_texts_direct",
     "ensure_conversation_embedding_schema",
     "get_embedding_metadata",
-    "is_embed_via_bridge_enabled",
     "is_metadata_db_unavailable_error",
     "parse_vector_dimensions",
     "resolve_api_model_name",

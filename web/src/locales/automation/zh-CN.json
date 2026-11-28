@@ -313,7 +313,6 @@
   "fieldDelivery": "推送",
   "fieldEnabled": "启用",
   "fieldPaused": "已暂停",
-  "fieldCosMode": "执行模式",
   "fieldNotifyStorage": "推送渠道保存方式",
   "fieldStatus": "状态",
   "deliveryRetryingVia": "{{method}} 投递中",

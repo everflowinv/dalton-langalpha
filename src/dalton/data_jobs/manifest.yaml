@@ -21,7 +21,6 @@ tasks:
       - "bash scripts/bbg_remote_refresh.sh"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -47,7 +46,6 @@ tasks:
       - "state/cn-leverage/quant_unwind_signals.csv"
       - "state/cn-leverage/*.csv"
       - "research-outputs/cn-leverage/index.html"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -69,7 +67,6 @@ tasks:
       - "bash skills/jp-leverage-monitor/run.sh run"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -91,7 +88,6 @@ tasks:
       - "bash skills/kr-leverage-monitor/run.sh run"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -145,7 +141,6 @@ tasks:
         echo "index-crowding refreshed: $trade_date"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -169,7 +164,6 @@ tasks:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -192,7 +186,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "temp/megacap-relative-signal-monitor/latest.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -214,7 +207,6 @@ tasks:
       - "bash scripts/run_json_task.sh bash skills/us-bottom-monitor/run.sh --json run"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -236,7 +228,6 @@ tasks:
       - "bash scripts/run_json_task.sh bash skills/us-top-monitor/run.sh --json run"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -258,7 +249,6 @@ tasks:
       - "bash skills/sentiment-dashboard/scripts/run.sh self-test --json && bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -280,7 +270,6 @@ tasks:
       - "us-topbottom-dm-v23"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -302,7 +291,6 @@ tasks:
       - "bash scripts/run_json_task.sh python3 scripts/asia_leverage_crossview.py --charts"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -328,7 +316,6 @@ tasks:
       - "bash skills/tw-leverage-monitor/run.sh update --quiet --json"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -351,7 +338,6 @@ tasks:
       - "bash scripts/bbg_remote_refresh.sh"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -373,7 +359,6 @@ tasks:
       - "bash scripts/run_json_task.sh bash scripts/quantum_ew_monitor.sh"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -395,7 +380,6 @@ tasks:
       - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -419,7 +403,6 @@ tasks:
       - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -443,7 +426,6 @@ tasks:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -467,7 +449,6 @@ tasks:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -495,7 +476,6 @@ tasks:
       - "skills/ai-chain/state/ingest_health.json"
       - "skills/ai-chain/events/bus.jsonl"
       - "research-outputs/*-ai-chain-daily.md"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -517,7 +497,6 @@ tasks:
       - "us-etf-monthly-flows"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -542,7 +521,6 @@ tasks:
       - "skills/hedging-analysis/data/index.json"
       - "skills/hedging-analysis/data/snapshots/**/*.parquet"
       - "skills/hedging-analysis/data/regimes/*.parquet"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -572,7 +550,6 @@ tasks:
       - "research-outputs/gs-pb-weekly/gs_pb_charts_daily_latest.csv"
       - "research-outputs/gs-pb-weekly/gs_pb_core_weekly_latest.csv"
       - "research-outputs/gs-pb-weekly/issues/*.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -599,7 +576,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "skills/fde-hiring-tracker/state/snapshots/*.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -621,7 +597,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "temp/fde_hiring_weekly.err"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -647,7 +622,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "research-outputs/semi-rescue-alert/**/*"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -673,7 +647,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "research-outputs/semi-rescue-alert/**/*"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -695,7 +668,6 @@ tasks:
       - "run"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -722,7 +694,6 @@ tasks:
       - "temp/e_watch_latest.txt"
       - "state/e_watch_signal_state.json"
       - "state/e_watch_daily_history.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -745,7 +716,6 @@ tasks:
       - "intraday"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -769,7 +739,6 @@ tasks:
     freeze_paths:
       - "temp/pt_watchlist_latest.txt"
       - "state/pt_watchlist_signal_state.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -793,7 +762,6 @@ tasks:
     freeze_paths:
       - "temp/pt_watchlist_latest.txt"
       - "state/pt_watchlist_signal_state.json"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -817,7 +785,6 @@ tasks:
     freeze_paths:
       - "state/china_2c_monitor_state.json"
       - "temp/china_2c_monitor_latest.txt"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -841,7 +808,6 @@ tasks:
     freeze_paths:
       - "state/china_2c_monitor_state.json"
       - "temp/china_2c_monitor_latest.txt"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -863,7 +829,6 @@ tasks:
       - "mkdir -p state/a-share-volume-watch && python3 scripts/a_share_volume_watch.py 2>>state/a-share-volume-watch/stderr.log"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -890,7 +855,6 @@ tasks:
     secret_names: []
     freeze_paths:
       - "research-outputs/kweb-dashboard/index.html"
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -931,7 +895,6 @@ tasks:
       - "VOLC_TOS_SK"
       - "VOLC_TOS_BUCKET"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -959,7 +922,6 @@ tasks:
     secret_names:
       - "INTERNAL_SERVICE_TOKEN"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -986,7 +948,6 @@ tasks:
       - "--json"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -1012,7 +973,6 @@ tasks:
       - "--json"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -1038,7 +998,6 @@ tasks:
       - "--json"
     secret_names: []
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false
 
@@ -1065,6 +1024,5 @@ tasks:
     secret_names:
       - "INTERNAL_SERVICE_TOKEN"
     freeze_paths: []
-    cos_mode: "skip"
     notify_enabled: false
     enabled: false

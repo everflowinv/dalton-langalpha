@@ -25,7 +25,6 @@
 | `command` / `command_argv` | Shell 命令串与显式 `argv` 列表 | 容器里用 `/app/.venv/bin/python`（`CONTAINER_PYTHON_BIN`）跑 Python 脚本 |
 | `secret_names` / `env` | 要注入的 Vault 密钥名列表与明文环境字典 | URL 等非敏感环境声明在 `env` 里 |
 | `freeze_paths` | 产物冻结路径 glob 列表 | 任务跑完后核对关键数据和 HTML 输出 |
-| `cos_mode` | `"skip"` \| `"prod"` | 跑完要不要上传腾讯云 COS（兼容旧发布目标） |
 | `notify_enabled` / `enabled` | 默认通知开关与初始启用状态 | 控制跑完要不要发通知、要不要自动排期 |
 
 ## 3. 容器执行器与宿主机执行器

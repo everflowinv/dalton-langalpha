@@ -477,8 +477,6 @@
 | `DALTON_BRIDGE_TOKEN` | `src/dalton/settings.py`, `plugins/dalton_data/mcp.json` | 后端与沙箱访问宿主机研究桥的 Bearer 鉴权令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 桥接启动加载 + 后端每次读取 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_ADMIN_TOKEN` | `src/dalton/settings.py`, `researchdata_bridge.py` | 研究桥高权限管理与运维接口专用令牌 | `src/dalton/settings.py`, `researchdata_bridge.py` | 同上 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_BRIDGE_EMBED_URL` | `src/dalton/settings.py` | 经宿主机研究桥本机模型生成向量嵌入的接口地址 | `src/dalton/settings.py`, `embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_EMBED_VIA_BRIDGE` | `src/dalton/embeddings/config.py` | 控制向量嵌入是否走宿主机研究桥本机推理 | `src/dalton/embeddings/config.py` | 每次向量化调用时 | 修改 `.env` 后重建 `backend` 容器 | 否 |
-| `DALTON_BROKER_TOKEN` | `src/dalton/settings.py` | 宿主机内部券商/研究代理令牌 | `src/dalton/settings.py`, `scripts/dalton/` | 每次内部任务调用时 | 重启宿主机桥接守护进程并重建 `backend` 容器 | 否 |
 | `DALTON_DATA_JOBS_ENABLED` | `src/dalton/settings.py` | 内部数据采集调度器旧版兼容开关 | `src/dalton/settings.py`, `data_jobs/scheduler.py` | 启动一次 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_DATA_TASK_MIN_FREE_MEM_MB` | `src/dalton/settings.py` | 触发宿主机数据任务前的最小可用内存保护阈值 | `src/dalton/settings.py` | 每次调度前检查 | 修改 `.env` 后重建 `backend` 容器 | 否 |
 | `DALTON_COVERAGE_UNITS_ENABLED` | `src/dalton/settings.py`, `docker-compose.dalton.yml` | 内部研究员行业覆盖组管理开关 | `src/dalton/settings.py` | 每次请求读取 | 修改 `.env` 后重建 `backend` 容器 | 否 |

@@ -293,7 +293,7 @@ export const SETTINGS = {
   marketDataKeys: { section: 'server', anchor: 'market-data', labelKey: 'setup:services.marketData', descKey: 'settings:server.marketDataDesc' },
   webSearchKeys: { section: 'server', anchor: 'web-search', labelKey: 'setup:services.webSearch', descKey: 'settings:server.webSearchDesc' },
   // DALTON-HOOK(settings-section): register Dalton model routing under Personal -> Models advanced disclosure
-  daltonRouting: { section: 'model', anchor: 'dalton-routing', labelKey: 'settings:modelTuning.daltonHeading', descKey: 'settings:dalton.routingDesc', advanced: true, keywords: '后台任务模型 模型路由 核验 审校 复核 model routing audit reviewer assist extract' },
+  daltonRouting: { section: 'model', anchor: 'dalton-routing', labelKey: 'settings:modelTuning.daltonHeading', descKey: 'settings:dalton.routingDesc', advanced: true, keywords: '后台任务模型 模型路由 核验 审校 复核 model routing audit reviewer assist' },
   daltonAuditModel: { section: 'model', anchor: 'dalton-audit-model', labelKey: 'settings:modelTuning.daltonAuditModel', descKey: 'settings:modelTuning.daltonAuditModelDesc', advanced: true, keywords: '数据核验模型 审计模型 figure audit model' },
   daltonLanguageModel: { section: 'model', anchor: 'dalton-language-model', labelKey: 'settings:modelTuning.daltonLanguageModel', descKey: 'settings:modelTuning.daltonLanguageModelDesc', advanced: true, keywords: '文字审校模型 语言审查模型 language review model' },
   daltonAuditFallbackModels: { section: 'model', anchor: 'dalton-audit-fallback-models', labelKey: 'settings:modelTuning.daltonAuditFallbackModels', descKey: 'settings:modelTuning.daltonAuditFallbackModelsDesc', advanced: true, keywords: '数据核验备用模型 figure audit fallback models' },
@@ -301,8 +301,6 @@ export const SETTINGS = {
   daltonAssistModel: { section: 'model', anchor: 'dalton-assist-model', labelKey: 'settings:modelTuning.daltonAssistModel', descKey: 'settings:modelTuning.daltonAssistModelDesc', advanced: true, keywords: '轻量后台任务模型 辅助模型 auxiliary task model assist' },
   daltonAssistFallbackModels: { section: 'model', anchor: 'dalton-assist-fallback-models', labelKey: 'settings:modelTuning.daltonAssistFallbackModels', descKey: 'settings:modelTuning.daltonAssistFallbackModelsDesc', advanced: true, keywords: '轻量后台任务备用模型 auxiliary task fallback models' },
   daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings:modelTuning.daltonReviewerModels', descKey: 'settings:modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '独立复核候选模型 审稿模型 independent reviewer candidates' },
-  // DALTON-HOOK(standalone-core): gate archive extraction, channels, native sync, and Feishu scopes on capabilities
-  daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings:modelTuning.daltonExtractModel', descKey: 'settings:modelTuning.daltonExtractModelDesc', advanced: true, keywords: '研究记忆整理模型 对话归档抽卡模型 conversation archive extraction model', capability: 'conversation_archive' },
 
   plan: { section: 'budget', anchor: 'plan', labelKey: 'settings:planUsage.plan', descKey: 'settings:planUsage.planDesc', visibleWhen: () => isPlatformMode },
   usage: { section: 'budget', anchor: 'usage', labelKey: 'settings:planUsage.usage', descKey: 'settings:planUsage.usageDesc', visibleWhen: () => isPlatformMode },

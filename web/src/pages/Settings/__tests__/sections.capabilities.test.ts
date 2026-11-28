@@ -95,7 +95,6 @@ describe('Settings sections & search capability gating', () => {
     const efAnchors = new Set(
       searchableSettings(false, everflowAdminCtx).map((entry) => entry.anchor),
     );
-    expect(efAnchors.has('dalton-extract-model')).toBe(true);
     expect(efAnchors.has('dalton-notify-targets')).toBe(true);
     expect(efAnchors.has('dalton-channel-bindings')).toBe(true);
     expect(efAnchors.has('dalton-weixin-bind')).toBe(true);

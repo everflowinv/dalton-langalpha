@@ -455,8 +455,6 @@ def annotate_model_metadata_tool_calling(
 
 _ROLE_PREF_SPEC: dict[str, tuple[str, Literal["primary", "background"]]] = {
     "assist": ("dalton_assist_model", "background"),
-    "extract": ("dalton_extract_model", "background"),
-    "conversation_extract": ("dalton_extract_model", "background"),
     "audit": ("dalton_audit_model", "primary"),
     "language": ("dalton_language_model", "primary"),
     "reviewer": ("dalton_reviewer_models", "primary"),
@@ -1139,9 +1137,9 @@ def check_roles(
             }
         )
 
-    # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch,
-    # conversations.extractor_model (P0H §4 P3, P0J.J2).
-    # Note: assist (and compaction/background/conversations.extractor_model) are non-tool
+    # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch
+    # (P0H §4 P3, P0J.J2).
+    # Note: assist (and compaction/background) are non-tool
     # structured/background slots, so they do not require tool-calling, but they MUST NOT
     # use forbidden contributor models.
     from src.dalton.settings import get_dalton_settings
@@ -1162,15 +1160,6 @@ def check_roles(
             or ""
         ).strip()
     )
-    conv_cfg = cfg.get("conversations") if isinstance(cfg.get("conversations"), dict) else {}
-    extractor_model = str(
-        conv_cfg.get("extractor_model")
-        or cfg.get("conversations.extractor_model")
-        or llm_cfg.get("conversations.extractor_model")
-        or llm_cfg.get("extractor_model")
-        or (get_dalton_settings().conversations.extractor_model if config is None else "")
-        or ""
-    ).strip()
 
     aux_slots: list[tuple[str, str]] = [
         ("assist", eff_assist_model),
@@ -1181,7 +1170,6 @@ def check_roles(
             str(llm_cfg.get("compaction") or llm_cfg.get("summarization") or "").strip(),
         ),
         ("fetch", str(llm_cfg.get("fetch") or "").strip()),
-        ("conversations.extractor_model", extractor_model),
     ]
     for role_name, role_model in aux_slots:
         if not role_model:

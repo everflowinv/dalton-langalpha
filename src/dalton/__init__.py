@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from src.dalton.settings import (
         DaltonConfig,
-        get_dalton_broker_token,
         get_dalton_config,
         get_dalton_researchdata_url,
         get_sec_user_agent,
@@ -22,7 +21,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DaltonConfig",
-    "get_dalton_broker_token",
     "get_dalton_config",
     "get_dalton_researchdata_url",
     "get_sec_user_agent",

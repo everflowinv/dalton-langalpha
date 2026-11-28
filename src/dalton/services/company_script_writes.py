@@ -405,7 +405,7 @@ def _script_snapshot(
     cron_expr: str,
     timezone: str,
 ) -> dict[str, Any]:
-    """Store the definition's current notify and cos values, not an effective route."""
+    """Store the definition's current notify values, not an effective route."""
     routes = row.get("notify_routes")
     if isinstance(routes, list):
         routes = list(routes)
@@ -416,7 +416,6 @@ def _script_snapshot(
         "cron_expr": cron_expr,
         "timezone": timezone,
         "notify_enabled": bool(row.get("notify_enabled")),
-        "cos_mode": row.get("cos_mode"),
         "notify_storage_mode": row.get("notify_storage_mode"),
     }
     return {name: values[name] for name in ALLOWED_SCRIPT_SNAPSHOT_FIELDS}

@@ -749,7 +749,6 @@ def test_manifest_podcast_weekly_pipeline_entry() -> None:
     assert entry.timeout_seconds == 10800
     assert entry.enabled is False
     assert entry.notify_enabled is False
-    assert entry.cos_mode == "skip"
     assert entry.command_argv == [
         "bash",
         "skills/podcast-weekly-digest/scripts/run.sh",

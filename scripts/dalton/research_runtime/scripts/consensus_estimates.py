@@ -281,18 +281,13 @@ def main() -> int:
     default_code = Path(__file__).resolve().parent.parent
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
-    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
-    if raw_ocw and not raw_code and not raw_home:
-        code_root = Path(raw_ocw).expanduser().resolve()
-        runtime = code_root / "state/venvs/consensus-estimates"
-    else:
-        code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code.resolve()
-        home_root = (
-            Path(raw_home).expanduser().resolve()
-            if raw_home
-            else (Path.home() / "Library" / "Application Support" / "Everflow" / "research")
-        )
-        runtime = home_root / "venvs/consensus-estimates"
+    code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code.resolve()
+    home_root = (
+        Path(raw_home).expanduser().resolve()
+        if raw_home
+        else (Path.home() / "Library" / "Application Support" / "Everflow" / "research")
+    )
+    runtime = home_root / "venvs/consensus-estimates"
     if Path(sys.prefix).resolve() != runtime.resolve():
         os.execv("/bin/bash", ["bash", str(code_root / "scripts/consensus_estimates.sh"), *sys.argv[1:]])
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])

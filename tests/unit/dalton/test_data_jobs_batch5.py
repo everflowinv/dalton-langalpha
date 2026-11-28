@@ -127,7 +127,6 @@ def test_t34_manifest_matches_openclaw_schedule() -> None:
     assert "cron_command_tasks.py" not in entry.command
     assert list(entry.freeze_paths) == FREEZE_PATHS
     assert list(entry.secret_names) == []
-    assert entry.cos_mode == "skip"
     assert entry.notify_enabled is False
     assert entry.enabled is False
     job_keys = {task.job_key for task in manifest.tasks}
@@ -412,7 +411,6 @@ async def test_scheduler_forwards_t34_manifest_argv_and_data_copy_cwd(
         timeout_seconds=900,
         no_output_timeout_seconds=600,
         required_secrets=[],
-        cos_mode="skip",
         notify_enabled=False,
         scheduled_slot_utc=now,
         deadline_utc=now + timedelta(minutes=15),
@@ -445,7 +443,7 @@ def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path
     script_path = REPO_ROOT / "scripts" / "dalton" / "seed_openclaw_data.sh"
     script_text = script_path.read_text(encoding="utf-8")
     assert "data_assets" in script_text
-    assert "--source" in script_text
+    assert "--source" not in script_text
 
     dst = tmp_path / "openclaw-data"
     dry = subprocess.run(
@@ -646,11 +644,6 @@ def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
         },
     )
     monkeypatch.setattr(cli, "build", build_spy)
-    upload_spy = create_autospec(
-        cli.upload_html,
-        side_effect=AssertionError("upload_html must not be called with --no-upload"),
-    )
-    monkeypatch.setattr(cli, "upload_html", upload_spy)
 
     rc = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
     assert rc == 0
@@ -666,9 +659,8 @@ def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
         {"site_title": "Richard 相对看板"},
         update_portfolio=True,
     )
-    upload_spy.assert_not_called()
 
-    # Warnings still fail deploy without calling upload_html.
+    # Warnings still fail deploy without uploading.
     build_spy.return_value = {
         "ok": True,
         "output": str(out_html),
@@ -681,7 +673,6 @@ def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
     assert warn_result["ok"] is False
     assert warn_result["uploaded"] is False
     assert warn_result["upload_skipped"] is True
-    upload_spy.assert_not_called()
 
 
 def _load_kweb_cli_for_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -856,68 +847,6 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
     assert etf_exc_block.index("stale-banner") < etf_exc_block.index("ETF 看板这次没生成")
 
 
-def test_kweb_cos_upload_and_default_deploy_disabled_unless_opted_in(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    cli = _load_kweb_cli_for_test(tmp_path, monkeypatch)
-    out_html = tmp_path / "research-outputs" / "kweb-dashboard" / "index.html"
-    monkeypatch.delenv("DALTON_ALLOW_COS_UPLOAD", raising=False)
-
-    real_build = cli.build
-    build_spy = create_autospec(
-        real_build,
-        side_effect=AssertionError("build must not run when default deploy is disabled"),
-    )
-    monkeypatch.setattr(cli, "build", build_spy)
-
-    # 1) upload subcommand rejected immediately
-    rc_upload = cli.main(["upload", "--file", str(out_html), "--json"])
-    assert rc_upload == 1
-    err_upload = json.loads(capsys.readouterr().out)
-    assert err_upload["ok"] is False
-    assert "已停用" in err_upload["error"]
-
-    # 2) deploy without --no-upload rejected immediately before build
-    rc_deploy = cli.main(["deploy", "--output", str(out_html), "--json"])
-    assert rc_deploy == 1
-    err_deploy = json.loads(capsys.readouterr().out)
-    assert err_deploy["ok"] is False
-    assert "已停用" in err_deploy["error"]
-    build_spy.assert_not_called()
-
-    # 3) Explicit DALTON_ALLOW_COS_UPLOAD=1 unlocks legacy upload path (tested with mock upload)
-    monkeypatch.setenv("DALTON_ALLOW_COS_UPLOAD", "1")
-    monkeypatch.setattr(
-        cli,
-        "load_config",
-        create_autospec(cli.load_config, return_value={"site_title": "Richard 相对看板"}),
-    )
-    monkeypatch.setattr(
-        cli,
-        "build",
-        create_autospec(
-            real_build,
-            return_value={
-                "ok": True,
-                "output": str(out_html),
-                "bytes": 100,
-                "warnings": [],
-                "overlong_notes": [],
-            },
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "upload_html",
-        create_autospec(cli.upload_html, return_value={"ok": True, "key": "kweb.html"}),
-    )
-    rc_opt_in = cli.main(["deploy", "--output", str(out_html), "--json"])
-    assert rc_opt_in == 0
-    assert json.loads(capsys.readouterr().out)["uploaded"] is True
-
-
 @pytest.mark.asyncio
 async def test_scheduler_host_run_does_not_inject_etf_outbox_when_notify_disabled(
     tmp_path: Path,
@@ -982,7 +911,6 @@ async def test_scheduler_host_run_does_not_inject_etf_outbox_when_notify_disable
         timeout_seconds=900,
         no_output_timeout_seconds=600,
         required_secrets=[],
-        cos_mode="skip",
         notify_enabled=False,
         scheduled_slot_utc=now,
         deadline_utc=now + timedelta(minutes=15),
@@ -1078,7 +1006,6 @@ async def test_scheduler_host_run_reads_bridge_outbox_and_queues_notification(
         timeout_seconds=900,
         no_output_timeout_seconds=600,
         required_secrets=[],
-        cos_mode="skip",
         notify_enabled=True,
         scheduled_slot_utc=now,
         deadline_utc=now + timedelta(minutes=15),
@@ -1115,6 +1042,5 @@ def test_kweb_overlay_skill_md_recommends_deploy_no_upload() -> None:
     assert skill_md.is_file()
     text = skill_md.read_text(encoding="utf-8")
     assert "deploy --no-upload" in text
-    assert "已停用" in text
     assert "relative-strength" in text
     assert "ETF 数据未更新" in text

@@ -266,7 +266,7 @@
   3. 执行数据库备份，运行 `uv run alembic -c src/dalton/alembic.ini upgrade d052`（或由 `scripts/dalton/docker_entrypoint_dalton.sh:20` 在容器启动时执行）；
   4. 执行 `docker compose up -d --no-deps backend` 重建后端容器使新 `.env` 与代码生效。
 - **回退步骤顺序**：
-  - *仅切回桥 `/embed` 与 `/jobs/ops`（保持 `d052` 表）*：在 `.env` 设 `DALTON_EMBED_VIA_BRIDGE=true`、`DALTON_OPS_JOBS_VIA_BRIDGE=true`，执行 `docker compose up -d --no-deps backend` 重建后端容器。
+  - *仅切回桥 `/jobs/ops`（保持 `d052` 表）*：在 `.env` 设 `DALTON_OPS_JOBS_VIA_BRIDGE=true`，执行 `docker compose up -d --no-deps backend` 重建后端容器（向量嵌入桥接应急开关已退役，固定走后端直连）。
   - *连同数据库与版本回退*：Everflow（3072 维保持原样）先停 `backend`，执行 `uv run alembic -c src/dalton/alembic.ini downgrade <pre_rev>`，切回上一版代码并 `docker compose up -d --no-deps backend`；**核心安装按 1536 维写入数据后，如需回退至 3072 维旧版本，须先使用升级前备份恢复数据库，再回退容器版本**。
 - **验收条件**：① 对同一批多段中英文研究文本，对比旧桥 `/embed` 与新客户端输出向量的余弦相似度（浮点误差内 = 1.0）及历史归档查询 Top-K 结果完全一致；② 容器内 `sys.platform == "linux"` 下 Everflow `alphaengine` 保持开启；③ 核心安装 1536 维纯语义检索命中 HNSW 索引；④ 观察 14 天达标后移除桥上 `/embed` 与 `/jobs/ops`。
 

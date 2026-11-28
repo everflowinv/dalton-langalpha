@@ -6,9 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = process.env.DALTON_RESEARCH_HOME?.trim()
   ? path.resolve(process.env.DALTON_RESEARCH_HOME.trim())
-  : (process.env.DALTON_OCW_ROOT?.trim()
-    ? path.resolve(process.env.DALTON_OCW_ROOT.trim())
-    : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'));
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 try {
   const id = process.argv[2];

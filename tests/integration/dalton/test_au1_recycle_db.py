@@ -366,13 +366,13 @@ async def test_data_task_delete_restore_and_purge_leaves_it(
         INSERT INTO dalton_data_task_defs (
             job_key, task_code, title, batch_no, runner,
             cron_expr, timezone, command_argv, workdir,
-            required_secrets, cos_mode, notify_enabled, enabled, paused_by_user,
+            required_secrets, notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version, audit_history,
             updated_at
         ) VALUES (
             %s, 'BBG', 'BBG Asia', 1, 'container',
             '15 8 * * 1-5', 'Asia/Shanghai', '["echo"]'::jsonb, '/tmp',
-            '[]'::jsonb, 'skip', FALSE, TRUE, FALSE,
+            '[]'::jsonb, FALSE, TRUE, FALSE,
             0, 1, 1, '[]'::jsonb, NOW()
         )
         """,

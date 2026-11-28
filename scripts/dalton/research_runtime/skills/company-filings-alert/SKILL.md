@@ -170,7 +170,7 @@ X 家公司有新动态。
 
 ## State
 
-检查状态保存在 `$DALTON_RESEARCH_HOME/state/company-filings-alert/last_check.json`（旧 `DALTON_OCW_ROOT` 模式下为 `skills/company-filings-alert/state/last_check.json`），记录每个 ticker 的最后检查时间。
+检查状态保存在 `$DALTON_RESEARCH_HOME/state/company-filings-alert/last_check.json`，记录每个 ticker 的最后检查时间。
 
 补充层另用两个可重建缓存：
 - `cik_map.json`：ticker → CIK，最长缓存 7 天
